@@ -53,8 +53,10 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.core.execution import app_scientific_version
 
 DEPENDENCY_APPS = ("gromacs",)
+_SCIENTIFIC_SCHEMA_VERSION = "1"
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -640,7 +642,13 @@ def build_shortmd_workflow(
     """Build a ShortMD workflow DAG from local PDB payloads."""
     if replicates < 1:
         raise ValueError("replicates must be at least 1")
-    workflow = Workflow("shortmd")
+    workflow = Workflow(
+        "shortmd",
+        scientific_versions={
+            "biomodals.workflow.shortmd": _SCIENTIFIC_SCHEMA_VERSION,
+            "gromacs": app_scientific_version(gromacs_app.CONF),
+        },
+    )
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else None
     )

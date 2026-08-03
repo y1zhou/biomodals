@@ -96,6 +96,7 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.core.execution import app_scientific_version
 from biomodals.workflow.ppiflow import coordinators as ppiflow_coordinators
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
@@ -118,6 +119,7 @@ PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
 )
 APP_RUN_OUTPUT_STRUCTURE_PATTERNS = PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS
 _ROSETTA_PLAN_SCHEMA_VERSION = 1
+_SCIENTIFIC_SCHEMA_VERSION = "1"
 
 DEPENDENCY_APPS = (
     "ppiflow",
@@ -3931,7 +3933,20 @@ def build_ppiflow_workflow(
         task,
         steps_doc,
     )
-    workflow = Workflow("ppiflow-v2")
+    workflow = Workflow(
+        "ppiflow-v2",
+        scientific_versions={
+            "af3score": app_scientific_version(af3score_app.CONF),
+            "alphafold3": app_scientific_version(alphafold3_app.CONF),
+            "alphafold3.model": DECLARED_MODEL_IDENTITY,
+            "biomodals.workflow.ppiflow": _SCIENTIFIC_SCHEMA_VERSION,
+            "dockq": app_scientific_version(dockq_app.CONF),
+            "flowpacker": app_scientific_version(flowpacker_app.CONF),
+            "ligandmpnn": app_scientific_version(ligandmpnn_app.CONF),
+            "ppiflow": app_scientific_version(ppiflow_app.CONF),
+            "rosetta": app_scientific_version(rosetta_app.CONF),
+        },
+    )
     report_table_inputs: dict[str, Any] = {}
 
     stage1_tail = None

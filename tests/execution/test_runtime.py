@@ -17,6 +17,7 @@ from biomodals.execution import (
     NodeStatus,
     ProviderCallStatus,
     RunStatus,
+    RunStatusReason,
     SqliteExecutionRepository,
 )
 from biomodals.execution.coordinator import drive_execution_run
@@ -904,6 +905,50 @@ def test_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
         ProviderCallStatus.SUBMITTING,
         ProviderCallStatus.OUTCOME_UNKNOWN,
     ]
+
+
+def test_batch_recovery_marks_abandoned_preclaim_outcome_unknown() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    preclaim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        now=110,
+    )
+    assert preclaim is not None
+    checkpoints: list[ProviderCallStatus] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: checkpoints.append(
+            repository.get_provider_call(preclaim.call.provider_call_id).status
+        ),
+    )
+
+    ((original, recovered),) = runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
+        encode_result=lambda result: result,
+        now=120,
+    )
+
+    assert original.status == ProviderCallStatus.SUBMITTING
+    assert recovered.status == ProviderCallStatus.OUTCOME_UNKNOWN
+    assert repository.get_run(RUN_ID).status == RunStatus.STATE_UNKNOWN
+    assert (
+        repository.get_run(RUN_ID).status_reason
+        == RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN
+    )
+    assert checkpoints == [ProviderCallStatus.OUTCOME_UNKNOWN]
 
 
 def test_recovery_collects_attached_call_once_then_replays_durable_envelope() -> None:

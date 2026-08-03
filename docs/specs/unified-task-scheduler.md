@@ -131,6 +131,10 @@ These existing decisions remain binding during the refactor:
 - A successor requires the same Workload Plan Fingerprint over normalized
   result-affecting inputs and declared scientific versions. Changed science
   requires a new root Run.
+- A workflow declares the versions of its workflow-local scientific logic and
+  every app or model that can affect its publications. These versions enter
+  the Workload Plan Fingerprint even when a particular Node class has no
+  node-local version hook.
 - Workflow Node parallelism and Run-level Provider Call limits are different
   controls.
 - AlphaFold3 raw searches, assemblies, templates, and seeds retain their
@@ -1499,6 +1503,12 @@ the publication, and reports the outcome:
   Run with `result_validation_unknown`;
 - one call may therefore be `succeeded` while its Tasks independently become
   succeeded, failed, or temporarily unresolved.
+
+Once explicit cancellation is durable, an unfinished Task whose direct call
+or pull worker is already terminal becomes `cancelled` instead of entering
+publication validation. The same rule applies when the owner becomes terminal
+after the cancellation request. A Task whose publication was already
+validated remains terminal and is never rewritten.
 
 A provider return that is conclusively malformed may be represented by a
 durable diagnostic envelope. The call still succeeded as a provider

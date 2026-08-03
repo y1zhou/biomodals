@@ -110,6 +110,87 @@ def test_cancel_request_waits_for_attached_call_confirmation() -> None:
     )
 
 
+def test_cancellation_closes_task_after_call_success_before_publication() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+    repository.record_provider_call_result(
+        claim.call.provider_call_id,
+        result_envelope={"tasks": {"seed-0": "outputs/seed-0"}},
+        now=112,
+    )
+    assert (
+        repository.get_task(RUN_ID, "inference", "seed-0").status == TaskStatus.RUNNING
+    )
+
+    provider_call_ids = repository.request_run_cancellation(RUN_ID, now=120)
+    completed = repository.finalize_run_from_results(RUN_ID, now=121)
+
+    assert provider_call_ids == ()
+    assert (
+        repository.get_task(RUN_ID, "inference", "seed-0").status
+        == TaskStatus.CANCELLED
+    )
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.CANCELLED
+    assert completed.status == RunStatus.CANCELLED
+
+
+def test_call_success_after_cancellation_does_not_reopen_publication_work() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+    repository.request_run_cancellation(RUN_ID, now=120)
+
+    repository.record_provider_call_result(
+        claim.call.provider_call_id,
+        result_envelope={"tasks": {"seed-0": "outputs/seed-0"}},
+        now=121,
+    )
+
+    assert (
+        repository.get_task(RUN_ID, "inference", "seed-0").status
+        == TaskStatus.CANCELLED
+    )
+
+
 def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

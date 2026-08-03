@@ -211,6 +211,29 @@ def test_shortmd_node_parallelism_is_not_scientific_identity() -> None:
     assert fingerprint(1) == fingerprint(8)
 
 
+def test_shortmd_gromacs_version_changes_plan_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fingerprint() -> str:
+        workflow = build_shortmd_workflow(
+            input_pdbs=[("alpha.pdb", b"ATOM\n")],
+            replicates=1,
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint()
+    monkeypatch.setattr(
+        gromacs_app,
+        "CONF",
+        gromacs_app.CONF.model_copy(update={"repo_commit_hash": "changed-gromacs"}),
+    )
+
+    assert fingerprint() != baseline
+
+
 def test_build_shortmd_workflow_rejects_duplicate_sanitized_stems() -> None:
     with pytest.raises(ValueError, match="Duplicate"):
         build_shortmd_workflow(

@@ -2197,6 +2197,21 @@ class SqliteExecutionRepository:
                         AND local_owned = 0
                     )
                     OR (status = ? AND local_owned = 1)
+                    OR (
+                        status = ?
+                        AND (
+                            provider_call_id IN (
+                                SELECT provider_call_id
+                                FROM execution_provider_calls
+                                WHERE status IN (?, ?, ?)
+                            )
+                            OR worker_provider_call_id IN (
+                                SELECT provider_call_id
+                                FROM execution_provider_calls
+                                WHERE status IN (?, ?, ?)
+                            )
+                        )
+                    )
                 )
             """,
             (
@@ -2206,6 +2221,13 @@ class SqliteExecutionRepository:
                 str(execution_run_id),
                 TaskStatus.PENDING.value,
                 TaskStatus.RUNNING.value,
+                TaskStatus.RUNNING.value,
+                ProviderCallStatus.SUCCEEDED.value,
+                ProviderCallStatus.FAILED.value,
+                ProviderCallStatus.CANCELLED.value,
+                ProviderCallStatus.SUCCEEDED.value,
+                ProviderCallStatus.FAILED.value,
+                ProviderCallStatus.CANCELLED.value,
             ),
         )
         self._connection.execute(
@@ -2520,7 +2542,33 @@ class SqliteExecutionRepository:
                 str(provider_call_id),
             ),
         )
-        if call.dispatch_mode == DispatchMode.PULL_WORKER:
+        run = self.get_run(call.execution_run_id)
+        cancellation_is_durable = run.status == RunStatus.CANCEL_REQUESTED or (
+            run.status == RunStatus.STATE_UNKNOWN
+            and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+        )
+        if cancellation_is_durable:
+            self._connection.execute(
+                """
+                UPDATE execution_tasks
+                SET status = ?,
+                    status_reason = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE (provider_call_id = ? OR worker_provider_call_id = ?)
+                    AND status IN (?, ?)
+                """,
+                (
+                    TaskStatus.CANCELLED.value,
+                    now,
+                    now,
+                    str(provider_call_id),
+                    str(provider_call_id),
+                    TaskStatus.PENDING.value,
+                    TaskStatus.RUNNING.value,
+                ),
+            )
+        elif call.dispatch_mode == DispatchMode.PULL_WORKER:
             self._connection.execute(
                 """
                 UPDATE execution_tasks

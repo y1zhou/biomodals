@@ -301,6 +301,7 @@ def test_unknown_run_prunes_workers_after_task_publications_appear(
         )
         for assignment in claim.assignments:
             _publish_assignment(runtime, assignment)
+    for call in calls:
         with runtime.store.transaction():
             runtime.store.execution.mark_provider_call_state_unknown(
                 call.provider_call_id,

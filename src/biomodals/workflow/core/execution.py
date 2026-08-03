@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
+from biomodals.schema import AppConfig
 from biomodals.workflow.core.builder import WorkflowDefinition
 from biomodals.workflow.core.hashing import dag_hash
 
 _EXECUTION_PLAN_SCHEMA_VERSION = "1"
+
+
+def app_scientific_version(config: AppConfig) -> str:
+    """Return the code/package identity that affects an app's publications."""
+    version = config.repo_commit_hash or config.version
+    if version is None:  # AppConfig validation normally makes this unreachable.
+        raise ValueError(f"App {config.name!r} has no scientific version")
+    return version
 
 
 def execution_plan(
@@ -40,6 +49,7 @@ def execution_plan(
         nodes=nodes,
         scientific_payload={"dag_hash": dag_hash(definition)},
         scientific_versions={
+            **definition.scientific_versions,
             "biomodals.workflow.execution_plan": _EXECUTION_PLAN_SCHEMA_VERSION,
         },
     )

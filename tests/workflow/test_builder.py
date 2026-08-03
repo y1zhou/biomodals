@@ -97,7 +97,7 @@ def test_cycles_raise_value_error() -> None:
 
 
 def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None:
-    workflow = Workflow("demo")
+    workflow = Workflow("demo", scientific_versions={"model": "v1"})
     first = workflow.add_node(DummyNode(), id="first")
     workflow.add_node(
         DummyNode(),
@@ -121,6 +121,10 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
     assert plan.nodes[1].aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
     assert plan.nodes[1].allow_empty_result is True
     assert plan.scientific_payload["dag_hash"]
+    assert plan.scientific_versions == {
+        "biomodals.workflow.execution_plan": "1",
+        "model": "v1",
+    }
 
 
 def test_workflow_hash_can_exclude_declared_operational_config_keys() -> None:

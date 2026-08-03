@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,14 +55,21 @@ class WorkflowDefinition:
     name: str
     nodes: dict[str, WorkflowNodeSpec]
     dependencies: dict[str, set[str]]
+    scientific_versions: dict[str, str]
 
 
 class Workflow:
     """Python-first workflow DAG builder."""
 
-    def __init__(self, name: str):
+    def __init__(
+        self,
+        name: str,
+        *,
+        scientific_versions: Mapping[str, str] | None = None,
+    ):
         """Initialize an empty workflow definition."""
         self.name = sanitize_filename(name)
+        self.scientific_versions = dict(scientific_versions or {})
         self._nodes: dict[str, WorkflowNodeSpec] = {}
 
     def add_node(
@@ -137,6 +145,7 @@ class Workflow:
             name=self.name,
             nodes=dict(self._nodes),
             dependencies=dependencies,
+            scientific_versions=dict(self.scientific_versions),
         )
 
     def _dependencies(self) -> dict[str, set[str]]:

@@ -24,6 +24,7 @@ from biomodals.schema import (
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow import rfd_ligandmpnn_workflow
+from biomodals.workflow.core.execution import execution_plan
 from biomodals.workflow.core.nodes import NodeRunContext
 from biomodals.workflow.rfd_ligandmpnn_workflow import (
     LigandMPNNDesignNode,
@@ -160,7 +161,6 @@ def test_build_rfd_ligandmpnn_workflow_models_trajectory_design_fanout() -> None
         "ligandmpnn-demo-rfd002-d000",
         "ligandmpnn-demo-rfd002-d001",
     }
-
     rfd_node = definition.nodes["rfd-demo-rfd001"].node
     selection_node = definition.nodes["select-demo-rfd001-d000"].node
     mpnn_node = definition.nodes["ligandmpnn-demo-rfd001-d000"].node
@@ -193,6 +193,32 @@ def test_build_rfd_ligandmpnn_workflow_models_trajectory_design_fanout() -> None
 
     assert isinstance(summary_node, RFDLigandMPNNSummaryNode)
     assert summary_node.max_parallel == 8
+
+
+def test_rfd_ligandmpnn_app_version_changes_plan_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fingerprint() -> str:
+        workflow = build_rfd_ligandmpnn_workflow(
+            input_pdb=("input.pdb", b"ATOM\n"),
+            contigs="100-150",
+            hotspot_res="A1",
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint()
+    monkeypatch.setattr(
+        rfdiffusion_app,
+        "CONF",
+        rfdiffusion_app.CONF.model_copy(
+            update={"repo_commit_hash": "changed-rfdiffusion"}
+        ),
+    )
+
+    assert fingerprint() != baseline
 
 
 def test_rfdiffusion_node_prepares_kernel_call_with_hydra_overrides(

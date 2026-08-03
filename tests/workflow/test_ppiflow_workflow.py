@@ -43,6 +43,7 @@ from biomodals.workflow.core import (
     RemoteWorkflowNode,
     hashing,
 )
+from biomodals.workflow.core.execution import execution_plan
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow_workflow import (
     CONF,
@@ -2145,6 +2146,8 @@ def test_ppiflow_stages_local_inputs_by_content_identity(
             output_volume=FakeVolume(),
             output_volume_mountpoint=volume_root,
             output_volume_name="PPIFlow-outputs",
+            repo_commit_hash=ppiflow_app.CONF.repo_commit_hash,
+            version=ppiflow_app.CONF.version,
         ),
     )
     first = tmp_path / "first.pdb"
@@ -2705,6 +2708,29 @@ RosettaFixStep:
 
     assert workflow_hash(4) == baseline
     assert workflow_hash(2, max_structures=6) != baseline
+
+
+def test_ppiflow_app_version_changes_plan_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fingerprint() -> str:
+        workflow = build_ppiflow_workflow(
+            task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
+            steps_yaml_bytes=b"PPIFlowStep: {}\n",
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint()
+    monkeypatch.setattr(
+        ppiflow_app,
+        "CONF",
+        ppiflow_app.CONF.model_copy(update={"repo_commit_hash": "changed-ppiflow"}),
+    )
+
+    assert fingerprint() != baseline
 
 
 def test_af3score_model_identity_changes_scientific_dag_hash(

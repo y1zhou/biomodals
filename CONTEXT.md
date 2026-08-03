@@ -31,7 +31,9 @@ A stable digest of every normalized result-affecting input and declared
 scientific tool, model, adapter, or schema version for an Execution Run.
 Successor Execution Runs require the same fingerprint. File contents are
 represented by content digests; operational concurrency, batching, resources,
-and Deployment Identity are excluded.
+and Deployment Identity are excluded. Workflow definitions bind both
+workflow-local scientific logic and every result-affecting app or model
+version, rather than relying on Deployment Identity as a proxy for science.
 _Avoid_: command-text hash, file path alone, Execution Run ID, deployment version alone
 
 **Execution Run Status**:
@@ -220,7 +222,8 @@ diagnostics needed to resume decoding and publication. It may name scientific
 files but never contains large scientific payloads, and it is excluded from
 scientific fingerprints. A successful call releases its slots after this
 envelope crosses the host durability boundary; unfinished Tasks remain
-`running` until their Workload Publications validate.
+`running` until their Workload Publications validate, unless explicit
+cancellation closes them after their owner becomes terminal.
 _Avoid_: Workload Publication, result archive, raw scientific output
 
 **Dispatch Batch**:

@@ -47,8 +47,10 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.core.execution import app_scientific_version
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
+_SCIENTIFIC_SCHEMA_VERSION = "1"
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -503,7 +505,14 @@ def build_rfd_ligandmpnn_workflow(
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else input_stem
     )
-    workflow = Workflow("rfd_ligandmpnn")
+    workflow = Workflow(
+        "rfd_ligandmpnn",
+        scientific_versions={
+            "biomodals.workflow.rfd_ligandmpnn": _SCIENTIFIC_SCHEMA_VERSION,
+            "ligandmpnn": app_scientific_version(ligandmpnn_app.CONF),
+            "rfdiffusion": app_scientific_version(rfdiffusion_app.CONF),
+        },
+    )
     mpnn_handles = {}
 
     for trajectory_idx in range(1, num_rfdiffusion_trajectories + 1):

@@ -1096,14 +1096,13 @@ class ExecutionRuntime:
         with self._synchronize():
             originals = self.repository.list_provider_calls(execution_run_id)
         observations: dict[UUID, tuple[ModalCallObservation, Any]] = {}
+        abandoned_submissions: set[UUID] = set()
         for call in originals:
             if call.status.is_terminal:
                 continue
             if call.status == ProviderCallStatus.SUBMITTING:
-                observation = ModalCallObservation(
-                    ModalCallObservationKind.STATE_UNKNOWN,
-                    message="Recovered an abandoned submitting Provider Call",
-                )
+                abandoned_submissions.add(call.provider_call_id)
+                continue
             elif call.provider_call_handle_id is None:
                 continue
             else:
@@ -1126,14 +1125,31 @@ class ExecutionRuntime:
                     raise
             observations[call.provider_call_id] = (observation, envelope)
 
-        if not observations:
+        if not observations and not abandoned_submissions:
             return tuple((call, call) for call in originals)
 
         reconciled = []
-        terminal_observed = False
+        checkpoint_needed = bool(abandoned_submissions)
         with self._synchronize():
             with self._transaction():
                 for original in originals:
+                    if original.provider_call_id in abandoned_submissions:
+                        current = self.repository.get_provider_call(
+                            original.provider_call_id
+                        )
+                        updated = (
+                            self.repository.mark_submission_outcome_unknown(
+                                original.provider_call_id,
+                                message=(
+                                    "Recovered an abandoned submitting Provider Call"
+                                ),
+                                now=now,
+                            )
+                            if current.status == ProviderCallStatus.SUBMITTING
+                            else current
+                        )
+                        reconciled.append((original, updated))
+                        continue
                     prepared = observations.get(original.provider_call_id)
                     if prepared is None:
                         updated = original
@@ -1156,11 +1172,11 @@ class ExecutionRuntime:
                                 now=now,
                             )
                         )
-                        terminal_observed = terminal_observed or (
+                        checkpoint_needed = checkpoint_needed or (
                             observation.kind != ModalCallObservationKind.RUNNING
                         )
                     reconciled.append((original, updated))
-            if terminal_observed:
+            if checkpoint_needed:
                 self._checkpoint_state()
         return tuple(reconciled)
 

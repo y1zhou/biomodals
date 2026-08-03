@@ -40,7 +40,6 @@ from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
-    PayloadTooLargeResponse,
     request_id_from,
     require_unsafe_session,
 )
@@ -169,7 +168,6 @@ def create_router(
             401: {"model": ErrorResponse},
             403: {"model": SubmissionForbiddenResponse},
             409: {"model": SubmissionConflictResponse},
-            413: {"model": PayloadTooLargeResponse},
             503: {"model": ComputeUnavailableResponse},
         },
     )

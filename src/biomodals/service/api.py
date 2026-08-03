@@ -112,7 +112,10 @@ def create_app(
         version="1.0.0",
         lifespan=lifespan,
         responses={
-            status.HTTP_413_CONTENT_TOO_LARGE: {"model": PayloadTooLargeResponse},
+            status.HTTP_413_CONTENT_TOO_LARGE: {
+                "model": PayloadTooLargeResponse,
+                "description": "Request Entity Too Large",
+            },
             status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
         },
     )

@@ -1954,8 +1954,11 @@ def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> No
     }
 
     for (path, method), statuses in expected.items():
-        documented = set(schema["paths"][path][method]["responses"])
+        responses = schema["paths"][path][method]["responses"]
+        documented = set(responses)
         assert statuses <= documented, (path, statuses - documented)
+        if "413" in documented:
+            assert responses["413"]["description"] == "Request Entity Too Large"
 
 
 def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(

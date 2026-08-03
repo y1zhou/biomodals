@@ -604,6 +604,62 @@ def test_provider_result_finalization_holds_the_repository_writer() -> None:
     assert repository.list_provider_calls(RUN_ID)[0].result_envelope == {"answer": 42}
 
 
+def test_provider_result_finalization_failure_retains_unknown_ownership() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+    (submitted,) = runtime.submit_provider_calls(
+        RUN_ID,
+        (
+            ProviderCallSubmission(
+                candidate=_candidate(),
+                submission_token="batch",
+            ),
+        ),
+        now=110,
+    )
+    assert submitted is not None
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.SUCCEEDED,
+        result={"answer": 42},
+    )
+    prepared = object()
+    discarded: list[object] = []
+
+    def fail_finalization(_prepared: object) -> object:
+        raise OSError("Volume is full")
+
+    with pytest.raises(OSError, match="Volume is full"):
+        runtime.reconcile_provider_calls(
+            RUN_ID,
+            required_node_keys={"inference"},
+            encode_result=lambda _result: prepared,
+            finalize_result=fail_finalization,
+            discard_result=discarded.append,
+            now=120,
+        )
+
+    call = repository.get_provider_call(submitted.provider_call_id)
+    run = repository.get_run(RUN_ID)
+    task = repository.get_task(RUN_ID, "inference", "seed-0")
+    assert call.status == ProviderCallStatus.STATE_UNKNOWN
+    assert call.result_envelope is None
+    assert run.status == RunStatus.STATE_UNKNOWN
+    assert run.status_reason == RunStatusReason.PROVIDER_OUTCOME_UNKNOWN
+    assert task.status.value == "running"
+    assert discarded == [prepared]
+
+
 def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

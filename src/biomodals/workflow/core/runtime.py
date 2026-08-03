@@ -610,6 +610,7 @@ class WorkflowRuntime:
             required_node_keys=required,
             encode_result=self._prepare_result_envelope,
             finalize_result=self._finalize_result_envelope,
+            discard_result=self._discard_prepared_result,
             now=self._now(),
         )
         if any(
@@ -1684,8 +1685,12 @@ class WorkflowRuntime:
         content = orjson.dumps(result)
         digest = hashlib.sha256(content).hexdigest()
         temporary_file = tempfile.TemporaryFile()
-        temporary_file.write(content)
-        temporary_file.seek(0)
+        try:
+            temporary_file.write(content)
+            temporary_file.seek(0)
+        except BaseException:
+            temporary_file.close()
+            raise
         return _PreparedProviderResult(
             temporary_file=temporary_file,
             sha256=digest,
@@ -1713,7 +1718,6 @@ class WorkflowRuntime:
                 shutil.copyfileobj(prepared.temporary_file, volume_temporary)
             temporary_path.replace(result_path)
         finally:
-            prepared.temporary_file.close()
             temporary_path.unlink(missing_ok=True)
         return {
             "result_file": {
@@ -1722,6 +1726,11 @@ class WorkflowRuntime:
                 "size_bytes": prepared.size_bytes,
             }
         }
+
+    @staticmethod
+    def _discard_prepared_result(prepared: _PreparedProviderResult) -> None:
+        """Release one coordinator-local serialization temporary file."""
+        prepared.temporary_file.close()
 
     def _raw_result(self, envelope: object) -> object:
         """Load and verify one workflow-owned provider return."""

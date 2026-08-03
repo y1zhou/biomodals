@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 from uuid import UUID
@@ -1005,102 +1005,144 @@ class ExecutionRuntime:
         encode_result: Callable[[Any], Any],
         now: int,
         finalize_result: Callable[[Any], Any] | None = None,
+        discard_result: Callable[[Any], None] | None = None,
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
         """Observe and prepare outside the writer, then durably finalize results."""
-        with self._synchronize():
-            originals = self.repository.list_provider_calls_requiring_reconciliation(
-                execution_run_id
-            )
-        observations: dict[UUID, tuple[ModalCallObservation, Any]] = {}
-        abandoned_submissions: set[UUID] = set()
-        for call in originals:
-            if call.status.is_terminal:
-                continue
-            if call.status == ProviderCallStatus.SUBMITTING:
-                abandoned_submissions.add(call.provider_call_id)
-                continue
-            elif call.provider_call_handle_id is None:
-                continue
-            else:
+        with ExitStack() as prepared_cleanup:
+            with self._synchronize():
+                originals = (
+                    self.repository.list_provider_calls_requiring_reconciliation(
+                        execution_run_id
+                    )
+                )
+            observations: dict[UUID, tuple[ModalCallObservation, Any]] = {}
+            abandoned_submissions: set[UUID] = set()
+            for call in originals:
+                if call.status.is_terminal:
+                    continue
+                if call.status == ProviderCallStatus.SUBMITTING:
+                    abandoned_submissions.add(call.provider_call_id)
+                    continue
+                if call.provider_call_handle_id is None:
+                    continue
                 observation = self._modal.observe(call.provider_call_handle_id)
-            envelope = None
-            if observation.kind == ModalCallObservationKind.SUCCEEDED:
-                try:
-                    envelope = encode_result(observation.result)
-                except Exception as error:
-                    with self._synchronize():
-                        with self._transaction():
-                            self.repository.mark_provider_call_state_unknown(
-                                call.provider_call_id,
-                                message=(
-                                    f"Could not create a Result Envelope: {error}"
-                                ),
-                                now=now,
-                            )
+                prepared_result = None
+                if observation.kind == ModalCallObservationKind.SUCCEEDED:
+                    try:
+                        prepared_result = encode_result(observation.result)
+                    except Exception as error:
+                        self._mark_result_envelope_unknown(
+                            call.provider_call_id,
+                            error=error,
+                            now=now,
+                        )
+                        raise
+                    if discard_result is not None:
+                        prepared_cleanup.callback(
+                            discard_result,
+                            prepared_result,
+                        )
+                observations[call.provider_call_id] = (
+                    observation,
+                    prepared_result,
+                )
+
+            if not observations and not abandoned_submissions:
+                return tuple((call, call) for call in originals)
+
+            reconciled = []
+            checkpoint_needed = bool(abandoned_submissions)
+            finalization_failure_call_id: UUID | None = None
+            try:
+                with self._synchronize():
+                    with self._transaction():
+                        for original in originals:
+                            if original.provider_call_id in abandoned_submissions:
+                                current = self.repository.get_provider_call(
+                                    original.provider_call_id
+                                )
+                                updated = (
+                                    self.repository.mark_submission_outcome_unknown(
+                                        original.provider_call_id,
+                                        message=(
+                                            "Recovered an abandoned submitting "
+                                            "Provider Call"
+                                        ),
+                                        now=now,
+                                    )
+                                    if current.status == ProviderCallStatus.SUBMITTING
+                                    else current
+                                )
+                                reconciled.append((original, updated))
+                                continue
+                            prepared = observations.get(original.provider_call_id)
+                            if prepared is None:
+                                updated = original
+                            else:
+                                observation, prepared_result = prepared
+                                current = self.repository.get_provider_call(
+                                    original.provider_call_id
+                                )
+                                if current.status.is_terminal:
+                                    updated = current
+                                else:
+                                    try:
+                                        envelope = (
+                                            finalize_result(prepared_result)
+                                            if finalize_result is not None
+                                            and observation.kind
+                                            == ModalCallObservationKind.SUCCEEDED
+                                            else prepared_result
+                                        )
+                                    except Exception:
+                                        finalization_failure_call_id = (
+                                            original.provider_call_id
+                                        )
+                                        raise
+                                    updated = _record_provider_call_observation(
+                                        self.repository,
+                                        original.provider_call_id,
+                                        observation,
+                                        result_envelope=envelope,
+                                        result_already_satisfied=(
+                                            original.node_key not in required_node_keys
+                                        ),
+                                        now=now,
+                                    )
+                                checkpoint_needed = checkpoint_needed or (
+                                    observation.kind != ModalCallObservationKind.RUNNING
+                                )
+                            reconciled.append((original, updated))
+                    if checkpoint_needed:
                         self._checkpoint_state()
-                    raise
-            observations[call.provider_call_id] = (observation, envelope)
+            except Exception as error:
+                if finalization_failure_call_id is not None:
+                    self._mark_result_envelope_unknown(
+                        finalization_failure_call_id,
+                        error=error,
+                        now=now,
+                    )
+                raise
+            return tuple(reconciled)
 
-        if not observations and not abandoned_submissions:
-            return tuple((call, call) for call in originals)
-
-        reconciled = []
-        checkpoint_needed = bool(abandoned_submissions)
+    def _mark_result_envelope_unknown(
+        self,
+        provider_call_id: UUID,
+        *,
+        error: Exception,
+        now: int,
+    ) -> None:
+        """Retain ownership when a provider result cannot become durable."""
         with self._synchronize():
             with self._transaction():
-                for original in originals:
-                    if original.provider_call_id in abandoned_submissions:
-                        current = self.repository.get_provider_call(
-                            original.provider_call_id
-                        )
-                        updated = (
-                            self.repository.mark_submission_outcome_unknown(
-                                original.provider_call_id,
-                                message=(
-                                    "Recovered an abandoned submitting Provider Call"
-                                ),
-                                now=now,
-                            )
-                            if current.status == ProviderCallStatus.SUBMITTING
-                            else current
-                        )
-                        reconciled.append((original, updated))
-                        continue
-                    prepared = observations.get(original.provider_call_id)
-                    if prepared is None:
-                        updated = original
-                    else:
-                        observation, prepared_result = prepared
-                        envelope = (
-                            finalize_result(prepared_result)
-                            if finalize_result is not None
-                            and observation.kind == ModalCallObservationKind.SUCCEEDED
-                            else prepared_result
-                        )
-                        current = self.repository.get_provider_call(
-                            original.provider_call_id
-                        )
-                        updated = (
-                            current
-                            if current.status.is_terminal
-                            else _record_provider_call_observation(
-                                self.repository,
-                                original.provider_call_id,
-                                observation,
-                                result_envelope=envelope,
-                                result_already_satisfied=(
-                                    original.node_key not in required_node_keys
-                                ),
-                                now=now,
-                            )
-                        )
-                        checkpoint_needed = checkpoint_needed or (
-                            observation.kind != ModalCallObservationKind.RUNNING
-                        )
-                    reconciled.append((original, updated))
-            if checkpoint_needed:
-                self._checkpoint_state()
-        return tuple(reconciled)
+                call = self.repository.get_provider_call(provider_call_id)
+                if not call.status.is_terminal:
+                    self.repository.mark_provider_call_state_unknown(
+                        provider_call_id,
+                        message=f"Could not create a Result Envelope: {error}",
+                        now=now,
+                    )
+            self._checkpoint_state()
 
     def request_provider_call_cancellation(
         self,

@@ -87,9 +87,14 @@ flags also follow `--` so the BioModals CLI can separate them from its own
 options.
 
 ```bash
+uv run biomodals workflow deploy <workflow-name> --env <environment>
 uv run biomodals workflow run <workflow-name> \
   --environment <environment> -- <workflow-specific-options>
 ```
+
+A workflow deployment includes the callable functions declared by its
+dependency apps. Those apps do not need separate deployments for that workflow.
+Deploy them separately only when they must also run as standalone apps.
 
 Use `--dry-run` to build and print a workflow DAG without resolving a Modal
 deployment or starting remote work:

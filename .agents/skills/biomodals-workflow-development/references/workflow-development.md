@@ -490,6 +490,11 @@ auto-deploy dependency apps from workflow submission paths. Including dependency
 apps makes their functions and classes part of the containing workflow deployment
 while letting Modal reuse normal image caching behavior.
 
+Deploy the containing workflow with
+`biomodals workflow deploy <workflow-name> --env <environment>`. The command
+resolves its stable package module and uses Modal module mode. Do not instruct
+Users to deploy dependency apps separately for workflow execution.
+
 Import dependency app modules directly for app metadata, volume objects, volume
 names, and mountpoints. Do not duplicate volume names or mount paths. A
 `RemoteNodeCall` must still declare the exact deployed function name; reuse an

@@ -48,7 +48,7 @@ console = Console()
 
 @app.callback(invoke_without_command=True, no_args_is_help=True)
 def callback():
-    """Discover, run, and administer BioModals apps and workflows.
+    """Discover, deploy, run, and administer BioModals compute.
 
     Use the command groups to run Modal compute, control durable runs, or
     operate the optional API service.
@@ -56,9 +56,13 @@ def callback():
     ...
 
 
-app.add_typer(app_commands, name="app", help="Discover and run BioModals apps.")
 app.add_typer(
-    workflow_commands, name="workflow", help="Discover and run BioModals workflows."
+    app_commands, name="app", help="Discover, deploy, and run BioModals apps."
+)
+app.add_typer(
+    workflow_commands,
+    name="workflow",
+    help="Discover, deploy, and run BioModals workflows.",
 )
 app.add_typer(
     run_commands,
@@ -1193,11 +1197,50 @@ def deploy_app(
     """Deploy a biomodals application to Modal."""
     app = _load_entry("app", app_name_or_path)
     cmd = build_modal_deploy_command(
-        app_path=app.path,
+        app_ref=app.path,
         name=name,
         tag=tag,
         env=env,
         strategy=strategy,
+    )
+    run_command(list(cmd), output_mode="inherit")
+
+
+@workflow_commands.command(
+    name="deploy",
+    no_args_is_help=True,
+    help="Deploy a BioModals workflow to Modal (alias: d).",
+)
+@workflow_commands.command(name="d", no_args_is_help=True, hidden=True)
+def deploy_workflow(
+    workflow_name_or_path: Annotated[
+        str, typer.Argument(help="Name or path of the workflow to deploy.")
+    ],
+    name: Annotated[
+        str | None, typer.Option("--name", "-n", help="Name of the deployment.")
+    ] = None,
+    tag: Annotated[
+        str | None,
+        typer.Option("--tag", "-t", help="Tag the deployment with a version."),
+    ] = None,
+    env: Annotated[
+        str | None,
+        typer.Option("--env", "-e", help="Modal Environment to deploy into."),
+    ] = None,
+    strategy: Annotated[
+        Literal["rolling", "recreate"] | None,
+        typer.Option("--strategy", help="Deployment strategy."),
+    ] = None,
+) -> None:
+    """Deploy a BioModals workflow as an importable Modal module."""
+    workflow = _load_entry("workflow", workflow_name_or_path)
+    cmd = build_modal_deploy_command(
+        app_ref=workflow.module,
+        name=name,
+        tag=tag,
+        env=env,
+        strategy=strategy,
+        module_mode=True,
     )
     run_command(list(cmd), output_mode="inherit")
 

@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,53 @@ def test_app_deploy_command_is_namespaced() -> None:
     assert "--strategy" in output
     assert "rolling" in output
     assert "recreate" in output
+
+
+def test_workflow_deploy_uses_importable_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "deploy",
+            "rfd_ligandmpnn",
+            "--name",
+            "RFDLigandMPNN-staging",
+            "--tag",
+            "candidate",
+            "--env",
+            "staging",
+            "--strategy",
+            "recreate",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert commands == [
+        [
+            sys.executable,
+            "-m",
+            "modal",
+            "deploy",
+            "--name",
+            "RFDLigandMPNN-staging",
+            "--tag",
+            "candidate",
+            "--env",
+            "staging",
+            "--strategy",
+            "recreate",
+            "-m",
+            "biomodals.workflow.rfd_ligandmpnn_workflow",
+        ]
+    ]
 
 
 def test_workflow_run_rejects_files_outside_workflow_package(tmp_path: Path) -> None:

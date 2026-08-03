@@ -160,7 +160,7 @@ def test_modal_env_overrides_only_contains_requested_values() -> None:
 
 def test_build_modal_deploy_command() -> None:
     assert build_modal_deploy_command(
-        app_path="src/biomodals/app/fold/demo_app.py",
+        app_ref="src/biomodals/app/fold/demo_app.py",
         name="demo-prod",
         tag="v1",
         env="production",

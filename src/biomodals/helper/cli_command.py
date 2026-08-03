@@ -159,13 +159,14 @@ def modal_env_overrides(*, gpu: str | None, timeout: int | None) -> dict[str, st
 
 def build_modal_deploy_command(
     *,
-    app_path: str | Path,
+    app_ref: str | Path,
     name: str | None,
     tag: str | None,
     env: str | None = None,
     strategy: str | None = None,
+    module_mode: bool = False,
 ) -> tuple[str, ...]:
-    """Build the command for `biomodals app deploy` without side effects."""
+    """Build one Modal app or workflow deployment command."""
     cmd = _modal_base_command(modal_mode="deploy", detach=False, python_executable=None)
     if name:
         cmd.extend(["--name", name])
@@ -175,5 +176,7 @@ def build_modal_deploy_command(
         cmd.extend(["--env", env])
     if strategy:
         cmd.extend(["--strategy", strategy])
-    cmd.append(str(app_path))
+    if module_mode:
+        cmd.append("-m")
+    cmd.append(str(app_ref))
     return tuple(cmd)

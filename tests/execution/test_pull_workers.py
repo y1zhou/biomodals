@@ -238,6 +238,38 @@ def test_publication_recovery_uses_its_status_index() -> None:
     )
 
 
+def test_pull_worker_rejects_an_unobserved_pending_task() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=1)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=1,
+    )
+    connection.execute(
+        """
+        UPDATE execution_tasks
+        SET result_observation = NULL
+        WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+        """,
+        (str(RUN_ID), "inference", "seed-0"),
+    )
+
+    with pytest.raises(ValueError, match="was not cache-validated"):
+        repository.preclaim_pull_worker(
+            RUN_ID,
+            "inference",
+            submission_token="must-not-spawn",
+            binding=GPU_BINDING,
+            compatibility_key="af3-seeds",
+            claim_capacity=1,
+            now=110,
+        )
+
+    assert repository.list_provider_calls(RUN_ID) == ()
+
+
 def test_worker_can_claim_after_spawn_before_call_attachment() -> None:
     repository = create_repository(task_count=1)
     persist_pull_policy(

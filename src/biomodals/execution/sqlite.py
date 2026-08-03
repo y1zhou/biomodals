@@ -1532,6 +1532,7 @@ class SqliteExecutionRepository:
         binding: ProviderBinding,
         compatibility_key: str,
         claim_capacity: int,
+        unfinished_task_count: int | None = None,
         now: int,
     ) -> ProviderCallPreclaim | None:
         """Admit one derived pull-worker call without assigning Tasks yet."""
@@ -1591,28 +1592,6 @@ class SqliteExecutionRepository:
             or node_policy["dispatch_policy_json"] != expected_node_policy_json
         ):
             raise ValueError("pull-worker dispatch policy cannot change within a Run")
-        invalid_task = self._connection.execute(
-            """
-            SELECT task_key
-            FROM execution_tasks
-            WHERE execution_run_id = ?
-                AND node_key = ?
-                AND status = ?
-                AND result_observation != ?
-            LIMIT 1
-            """,
-            (
-                str(execution_run_id),
-                node_key,
-                TaskStatus.PENDING.value,
-                AvailabilityStatus.MISSING.value,
-            ),
-        ).fetchone()
-        if invalid_task is not None:
-            raise ValueError(
-                f"Task {invalid_task['task_key']!r} was not cache-validated"
-            )
-
         batch = self._connection.execute(
             """
             SELECT *
@@ -1628,22 +1607,14 @@ class SqliteExecutionRepository:
         if batch is not None and batch["policy_json"] != policy_json:
             raise ValueError("pull-worker policy cannot change within a Run")
 
-        unfinished = self._connection.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM execution_tasks
-            WHERE execution_run_id = ?
-                AND node_key = ?
-                AND status IN (?, ?)
-            """,
-            (
-                str(execution_run_id),
+        if unfinished_task_count is None:
+            unfinished_task_count = self.unfinished_pull_task_count(
+                execution_run_id,
                 node_key,
-                TaskStatus.PENDING.value,
-                TaskStatus.RUNNING.value,
-            ),
-        ).fetchone()["count"]
-        desired_workers = (unfinished + claim_capacity - 1) // claim_capacity
+            )
+        elif unfinished_task_count < 0:
+            raise ValueError("unfinished_task_count cannot be negative")
+        desired_workers = (unfinished_task_count + claim_capacity - 1) // claim_capacity
         existing_workers = (
             0
             if batch is None
@@ -2123,13 +2094,13 @@ class SqliteExecutionRepository:
         node_key: str,
         *,
         now: int,
-    ) -> tuple[str, ...]:
+    ) -> None:
         """Stop unowned sibling admission after a fail-fast Task failure."""
         node = self.get_node(execution_run_id, node_key)
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             raise ValueError("Node Task policy cannot run before discovery")
         if node.aggregation_policy != NodeAggregationPolicy.FAIL_FAST:
-            return ()
+            return
         failed = self._connection.execute(
             """
             SELECT 1 FROM execution_tasks
@@ -2139,25 +2110,7 @@ class SqliteExecutionRepository:
             (str(execution_run_id), node_key, TaskStatus.FAILED.value),
         ).fetchone()
         if failed is None:
-            return ()
-        skipped = tuple(
-            str(row["task_key"])
-            for row in self._connection.execute(
-                """
-                SELECT task_key FROM execution_tasks
-                WHERE execution_run_id = ?
-                    AND node_key = ?
-                    AND status = ?
-                    AND provider_call_id IS NULL
-                    AND worker_provider_call_id IS NULL
-                    AND local_owned = 0
-                ORDER BY ordinal
-                """,
-                (str(execution_run_id), node_key, TaskStatus.PENDING.value),
-            ).fetchall()
-        )
-        if not skipped:
-            return ()
+            return
         self._connection.execute(
             """
             UPDATE execution_tasks
@@ -2180,7 +2133,6 @@ class SqliteExecutionRepository:
                 TaskStatus.PENDING.value,
             ),
         )
-        return skipped
 
     def summarize_node_tasks(
         self,
@@ -3084,6 +3036,21 @@ class SqliteExecutionRepository:
         ).fetchall()
         return tuple(_task_from_row(row) for row in rows)
 
+    def node_has_tasks(self, execution_run_id: UUID, node_key: str) -> bool:
+        """Return whether a Node has at least one discovered Task."""
+        return (
+            self._connection.execute(
+                """
+                SELECT 1
+                FROM execution_tasks
+                WHERE execution_run_id = ? AND node_key = ?
+                LIMIT 1
+                """,
+                (str(execution_run_id), node_key),
+            ).fetchone()
+            is not None
+        )
+
     def list_tasks_requiring_publication_recovery(
         self,
         execution_run_id: UUID,
@@ -3114,7 +3081,33 @@ class SqliteExecutionRepository:
         execution_run_id: UUID,
         node_key: str,
     ) -> int:
-        """Count pending and running pull Tasks without decoding payloads."""
+        """Validate and count unfinished pull Tasks without decoding payloads."""
+        recovery_rows = self._connection.execute(
+            """
+            SELECT task_key, status
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND (
+                    status = 'running'
+                    OR (
+                        status = 'pending'
+                        AND result_observation IS NOT 'missing'
+                    )
+                )
+                AND dispatch_policy_json IS NULL
+            ORDER BY ordinal
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchall()
+        invalid_task = next(
+            (row for row in recovery_rows if row["status"] == TaskStatus.PENDING.value),
+            None,
+        )
+        if invalid_task is not None:
+            raise ValueError(
+                f"Task {invalid_task['task_key']!r} was not cache-validated"
+            )
         row = self._connection.execute(
             """
             SELECT COUNT(*) AS count

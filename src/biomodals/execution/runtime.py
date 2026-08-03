@@ -793,10 +793,24 @@ class ExecutionRuntime:
         preclaims: list[ProviderCallPreclaim | None] = []
         with self._synchronize():
             with self._transaction():
+                pull_unfinished_by_node: dict[str, int] = {}
                 for submission in submissions:
                     candidate = submission.candidate
                     if candidate.max_tasks_per_call is None:
                         claim_capacity = cast(int, submission.claim_capacity)
+                        unfinished_task_count = pull_unfinished_by_node.get(
+                            candidate.node_key
+                        )
+                        if unfinished_task_count is None:
+                            unfinished_task_count = (
+                                self.repository.unfinished_pull_task_count(
+                                    execution_run_id,
+                                    candidate.node_key,
+                                )
+                            )
+                            pull_unfinished_by_node[candidate.node_key] = (
+                                unfinished_task_count
+                            )
                         preclaim = self.repository.preclaim_pull_worker(
                             execution_run_id,
                             candidate.node_key,
@@ -804,6 +818,7 @@ class ExecutionRuntime:
                             binding=candidate.binding,
                             compatibility_key=candidate.compatibility_key,
                             claim_capacity=claim_capacity,
+                            unfinished_task_count=unfinished_task_count,
                             now=now,
                         )
                     else:

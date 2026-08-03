@@ -770,13 +770,11 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 )
             )
         try:
-            submitted = self._provider.submit_provider_calls(
+            self._provider.submit_provider_calls(
                 self.execution_run_id,
                 tuple(submissions),
                 now=self._now(),
             )
-            if any(call is None for call in submitted):
-                return
         except (
             ModalDefiniteSubmissionError,
             ModalSubmissionOutcomeUnknownError,

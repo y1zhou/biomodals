@@ -16,6 +16,7 @@ import orjson
 
 from biomodals.app.bioinfo.gromacs_execution import (
     EXECUTION_PLAN_SCHEMA_VERSION,
+    GROMACS_SCIENTIFIC_VERSION,
     NPT_ANALYSIS,
     NVT_ANALYSIS,
     PREPARE_RESULT,
@@ -616,7 +617,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        submitted = self._provider.submit_provider_calls(
+        self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(
                 ProviderCallSubmission(
@@ -628,8 +629,6 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        if any(call is None for call in submitted):
-            return
 
     def _invocation_kwargs(self, node_key: str) -> dict[str, object]:
         request = self.request
@@ -685,6 +684,7 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
             deployment=deployment,
             volume_root=volume_root,
             target_scientific_versions={
+                "gromacs": GROMACS_SCIENTIFIC_VERSION,
                 "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
             },
         )

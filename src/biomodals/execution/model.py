@@ -419,19 +419,11 @@ class ProviderCallRecord:
 class ProviderCallOverview:
     """Bounded Provider Call state without Task ownership or binding details."""
 
-    provider_call_id: UUID
-    execution_run_id: UUID
     node_key: str
     submission_token: str
     status: ProviderCallStatus
     provider_call_handle_id: str | None
     result_envelope: Any
-    error_message: str | None
-    created_at: int
-    updated_at: int
-    attached_at: int | None
-    started_at: int | None
-    completed_at: int | None
 
 
 @dataclass(frozen=True)

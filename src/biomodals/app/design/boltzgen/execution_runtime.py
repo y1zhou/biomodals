@@ -409,7 +409,7 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        submitted = self._provider.submit_provider_calls(
+        self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(
                 ProviderCallSubmission(
@@ -429,8 +429,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        if any(call is None for call in submitted):
-            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
         return ProviderBinding(

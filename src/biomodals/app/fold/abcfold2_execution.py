@@ -512,7 +512,7 @@ class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
         )
         for candidate in selected:
             self._ensure_publication_claim(candidate.node_key)
-        submitted = self._provider.submit_provider_calls(
+        self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(
                 ProviderCallSubmission(
@@ -527,8 +527,6 @@ class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        if any(call is None for call in submitted):
-            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

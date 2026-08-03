@@ -502,7 +502,7 @@ class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 candidate.node_key,
                 candidate.task_keys[0],
             )
-        submitted = self._provider.submit_provider_calls(
+        self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(
                 ProviderCallSubmission(
@@ -517,8 +517,6 @@ class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        if any(call is None for call in submitted):
-            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

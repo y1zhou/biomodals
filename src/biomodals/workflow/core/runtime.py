@@ -1208,13 +1208,11 @@ class WorkflowRuntime:
                     kwargs=invocation.kwargs,
                 )
             )
-        submitted = self._provider.submit_provider_calls(
+        self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(submissions),
             now=self._now(),
         )
-        if any(call is None for call in submitted):
-            return
 
     def _publish_result(self, node_id: str, result: AppRunResult) -> None:
         if result.status != AppRunStatus.SUCCEEDED:

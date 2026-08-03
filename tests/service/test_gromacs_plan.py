@@ -5,6 +5,7 @@
 import pytest
 
 from biomodals.app.bioinfo.gromacs_execution import (
+    GROMACS_SCIENTIFIC_VERSION,
     PREPARE_RESULT,
     REQUIRED_FUNCTIONS,
     execution_plan,
@@ -115,6 +116,7 @@ def test_execution_plan_preserves_parallel_gromacs_dag() -> None:
         "run_pdbfixer": True,
         "simulation_time_ns": 20,
     }
+    assert plan.scientific_versions["gromacs"] == GROMACS_SCIENTIFIC_VERSION
 
 
 def test_execution_plan_fingerprint_excludes_workload_run_name() -> None:

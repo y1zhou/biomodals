@@ -408,7 +408,7 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             available_gpu_slots=0,
         )
-        submitted = self._provider.submit_provider_calls(
+        self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(
                 ProviderCallSubmission(
@@ -428,8 +428,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        if any(call is None for call in submitted):
-            return
 
     def _task_specs(self) -> dict[str, RosettaTaskSpec]:
         return {task.task_key: task for task in self.request.tasks}

@@ -679,7 +679,13 @@ class SqliteExecutionRepository:
             call_rows.extend(
                 self._connection.execute(
                     f"""
-                    SELECT call.*, call.rowid AS provider_call_rowid
+                    SELECT
+                        call.execution_run_id,
+                        call.node_key,
+                        call.submission_token,
+                        call.status,
+                        call.provider_call_handle_id,
+                        call.result_envelope_json
                     FROM execution_provider_calls AS call
                     JOIN (
                         SELECT execution_run_id, node_key,
@@ -695,8 +701,7 @@ class SqliteExecutionRepository:
                         GROUP BY execution_run_id, node_key
                     ) AS representative
                         ON representative.representative_rowid = call.rowid
-                    ORDER BY call.execution_run_id, call.created_at,
-                             provider_call_rowid
+                    ORDER BY call.execution_run_id, call.created_at, call.rowid
                     """,  # noqa: S608 - generated placeholders
                     (*terminal, *chunk),
                 ).fetchall()
@@ -4062,8 +4067,6 @@ def _run_from_row(row: sqlite3.Row) -> ExecutionRunRecord:
 
 def _provider_call_overview_from_row(row: sqlite3.Row) -> ProviderCallOverview:
     return ProviderCallOverview(
-        provider_call_id=UUID(row["provider_call_id"]),
-        execution_run_id=UUID(row["execution_run_id"]),
         node_key=row["node_key"],
         submission_token=row["submission_token"],
         status=ProviderCallStatus(row["status"]),
@@ -4073,12 +4076,6 @@ def _provider_call_overview_from_row(row: sqlite3.Row) -> ProviderCallOverview:
             if row["result_envelope_json"] is None
             else orjson.loads(row["result_envelope_json"])
         ),
-        error_message=row["error_message"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        attached_at=row["attached_at"],
-        started_at=row["started_at"],
-        completed_at=row["completed_at"],
     )
 
 

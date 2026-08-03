@@ -123,6 +123,10 @@ def test_gromacs_execution_request_round_trips_scientific_and_operational_data(
     assert decoded == request
     assert decoded.execution_plan.workload_run_key == "example"
     assert decoded.run_root(tmp_path) == tmp_path / "example"
+    assert decoded.execution_plan.scientific_versions == {
+        "gromacs": request.gromacs_version,
+        "biomodals.gromacs.execution_plan": request.execution_plan_version,
+    }
 
 
 def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
@@ -139,6 +143,20 @@ def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
     )
     assert (
         replace(request, genion_seed=29).execution_plan.workload_plan_fingerprint
+        != fingerprint
+    )
+    assert (
+        replace(
+            request,
+            gromacs_version="different-gromacs",
+        ).execution_plan.workload_plan_fingerprint
+        != fingerprint
+    )
+    assert (
+        replace(
+            request,
+            execution_plan_version="different-plan",
+        ).execution_plan.workload_plan_fingerprint
         != fingerprint
     )
 

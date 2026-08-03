@@ -82,6 +82,8 @@ def execution_plan(
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
+    gromacs_version: str = GROMACS_SCIENTIFIC_VERSION,
+    execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION,
 ) -> ExecutionPlan:
     """Express the established service workflow as one immutable kernel plan."""
     operations = _operation_plan(cpu_only=cpu_only)
@@ -121,8 +123,8 @@ def execution_plan(
             "simulation_time_ns": simulation_time_ns,
         },
         scientific_versions={
-            "gromacs": GROMACS_SCIENTIFIC_VERSION,
-            "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
+            "gromacs": gromacs_version,
+            "biomodals.gromacs.execution_plan": execution_plan_version,
         },
     )
 

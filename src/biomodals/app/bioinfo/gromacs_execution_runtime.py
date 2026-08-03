@@ -47,7 +47,7 @@ from biomodals.helper.app_execution import (
 )
 from biomodals.helper.shell import sanitize_filename
 
-REQUEST_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 _REQUEST_FILE = ExecutionRequestFile(
     "request.json",
@@ -75,6 +75,8 @@ class GromacsExecutionRequest:
     genion_seed: int
     max_active_provider_calls: int
     max_active_gpu_provider_calls: int
+    gromacs_version: str = GROMACS_SCIENTIFIC_VERSION
+    execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
@@ -86,6 +88,8 @@ class GromacsExecutionRequest:
             raise ValueError("simulation time and thread count must be positive")
         if self.max_active_provider_calls < 1:
             raise ValueError("max_active_provider_calls must be positive")
+        if not self.gromacs_version or not self.execution_plan_version:
+            raise ValueError("GROMACS scientific versions cannot be empty")
         if (
             not 0
             <= self.max_active_gpu_provider_calls
@@ -105,6 +109,8 @@ class GromacsExecutionRequest:
             ld_seed=self.ld_seed,
             gen_seed=self.gen_seed,
             genion_seed=self.genion_seed,
+            gromacs_version=self.gromacs_version,
+            execution_plan_version=self.execution_plan_version,
         )
 
     def run_root(self, volume_root: str | Path) -> Path:
@@ -128,6 +134,8 @@ class GromacsExecutionRequest:
                 "genion_seed": self.genion_seed,
                 "max_active_provider_calls": self.max_active_provider_calls,
                 "max_active_gpu_provider_calls": self.max_active_gpu_provider_calls,
+                "gromacs_version": self.gromacs_version,
+                "execution_plan_version": self.execution_plan_version,
             },
             option=orjson.OPT_SORT_KEYS,
         )

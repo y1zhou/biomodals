@@ -1600,7 +1600,7 @@ class SqliteExecutionRepository:
             raise ValueError("claim request ID cannot be empty")
         if capacity <= 0:
             raise ValueError("claim capacity must be positive")
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         existing = self._connection.execute(
             """
             SELECT provider_call_id, capacity
@@ -1753,7 +1753,7 @@ class SqliteExecutionRepository:
         """Apply one idempotent pull-worker completion after publication."""
         if not request_id:
             raise ValueError("completion request ID cannot be empty")
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         existing = self._connection.execute(
             """
             SELECT provider_call_id, task_key, observation, message
@@ -2410,7 +2410,7 @@ class SqliteExecutionRepository:
         now: int,
     ) -> ProviderCallRecord:
         """Preserve ownership when a cancellation outcome is inconclusive."""
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status in {
             ProviderCallStatus.SUBMITTING,
             ProviderCallStatus.OUTCOME_UNKNOWN,
@@ -2442,7 +2442,7 @@ class SqliteExecutionRepository:
             message=message,
             now=now,
         )
-        return self.get_provider_call(provider_call_id)
+        return self.get_provider_call(provider_call_id, include_task_keys=False)
 
     def active_provider_call_counts(
         self,
@@ -2485,7 +2485,13 @@ class SqliteExecutionRepository:
         self,
         execution_run_id: UUID,
     ) -> tuple[ProviderCallRecord, ...]:
-        """Load observable calls plus successful calls awaiting publication."""
+        """Load observable calls plus successful calls awaiting publication.
+
+        Active calls do not need their owned Task keys to query Modal. Successful
+        calls carry only still-running Tasks, which are the only Tasks awaiting
+        publication. This keeps pull-worker polling independent of its completed
+        assignment history.
+        """
         active = tuple(
             status.value for status in ProviderCallStatus if not status.is_terminal
         )
@@ -2524,17 +2530,32 @@ class SqliteExecutionRepository:
             )
             selected.update(row["provider_call_id"] for row in succeeded_rows)
         rows.sort(key=lambda row: (row["created_at"], row["provider_call_rowid"]))
-        return self._provider_calls_from_rows(rows)
+        return self._provider_calls_from_rows(
+            rows,
+            task_owner_ids={
+                row["provider_call_id"]
+                for row in rows
+                if row["status"] == ProviderCallStatus.SUCCEEDED.value
+            },
+            task_status=TaskStatus.RUNNING,
+        )
 
     def _provider_calls_from_rows(
         self,
         rows: Collection[sqlite3.Row],
+        *,
+        task_owner_ids: Collection[str] | None = None,
+        task_status: TaskStatus | None = None,
     ) -> tuple[ProviderCallRecord, ...]:
         """Attach owned Task keys to an already-selected Provider Call set."""
         rows = tuple(rows)
         if not rows:
             return ()
-        call_ids = tuple(row["provider_call_id"] for row in rows)
+        call_ids = tuple(
+            row["provider_call_id"]
+            for row in rows
+            if task_owner_ids is None or row["provider_call_id"] in task_owner_ids
+        )
         task_rows: list[sqlite3.Row] = []
         for offset in range(0, len(call_ids), 400):
             chunk = call_ids[offset : offset + 400]
@@ -2550,8 +2571,12 @@ class SqliteExecutionRepository:
                                provider_call_id, worker_provider_call_id
                         FROM execution_tasks
                         WHERE {ownership_column} IN ({placeholders})
+                            {"AND status = ?" if task_status is not None else ""}
                         """,  # noqa: S608 - generated placeholders, closed column
-                        chunk,
+                        (
+                            *chunk,
+                            *((task_status.value,) if task_status is not None else ()),
+                        ),
                     ).fetchall()
                 )
         task_rows.sort(key=lambda row: (row["node_key"], row["ordinal"]))
@@ -2567,8 +2592,13 @@ class SqliteExecutionRepository:
             for row in rows
         )
 
-    def get_provider_call(self, provider_call_id: UUID) -> ProviderCallRecord:
-        """Load one durable Provider Call."""
+    def get_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        include_task_keys: bool = True,
+    ) -> ProviderCallRecord:
+        """Load one durable Provider Call, optionally without owned Task keys."""
         row = self._connection.execute(
             """
             SELECT *
@@ -2579,7 +2609,10 @@ class SqliteExecutionRepository:
         ).fetchone()
         if row is None:
             raise LookupError(f"Provider Call not found: {provider_call_id}")
-        return self._provider_call_from_row(row)
+        return self._provider_call_from_row(
+            row,
+            task_keys=None if include_task_keys else (),
+        )
 
     def attach_provider_call(
         self,
@@ -2629,7 +2662,7 @@ class SqliteExecutionRepository:
         now: int,
     ) -> ProviderCallRecord:
         """Record a conclusive active provider observation."""
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.RUNNING:
             return call
         if call.status not in {
@@ -2653,7 +2686,7 @@ class SqliteExecutionRepository:
             ),
         )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
-        return self.get_provider_call(provider_call_id)
+        return self.get_provider_call(provider_call_id, include_task_keys=False)
 
     def mark_submission_outcome_unknown(
         self,
@@ -2807,7 +2840,10 @@ class SqliteExecutionRepository:
                 ),
             )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
-        return self.get_provider_call(provider_call_id)
+        return self.get_provider_call(
+            provider_call_id,
+            include_task_keys=call.dispatch_mode != DispatchMode.PULL_WORKER,
+        )
 
     def fail_provider_call(
         self,

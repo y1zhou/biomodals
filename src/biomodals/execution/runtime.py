@@ -879,7 +879,8 @@ class ExecutionRuntime:
                         for preclaim in authorized:
                             provider_call_id = preclaim.call.provider_call_id
                             current = self.repository.get_provider_call(
-                                provider_call_id
+                                provider_call_id,
+                                include_task_keys=False,
                             )
                             if current.status.is_terminal:
                                 continue
@@ -1095,7 +1096,10 @@ class ExecutionRuntime:
                             continue
 
                         observation, prepared_result = prepared
-                        current = self.repository.get_provider_call(provider_call_id)
+                        current = self.repository.get_provider_call(
+                            provider_call_id,
+                            include_task_keys=False,
+                        )
                         if current.status.is_terminal:
                             updated = current
                         else:
@@ -1144,7 +1148,10 @@ class ExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord:
         """Retain ownership when a provider result cannot become durable."""
-        call = self.repository.get_provider_call(provider_call_id)
+        call = self.repository.get_provider_call(
+            provider_call_id,
+            include_task_keys=False,
+        )
         if call.status.is_terminal:
             return call
         return self.repository.mark_provider_call_state_unknown(
@@ -1392,7 +1399,10 @@ class AsyncExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord:
         """Observe or collect an existing async call without resubmission."""
-        call = self.repository.get_provider_call(provider_call_id)
+        call = self.repository.get_provider_call(
+            provider_call_id,
+            include_task_keys=False,
+        )
         if call.status.is_terminal:
             return call
         if call.status == ProviderCallStatus.SUBMITTING:

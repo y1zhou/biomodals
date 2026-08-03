@@ -317,7 +317,10 @@ class WorkflowRuntime:
         """Publish one worker result and checkpoint its idempotent completion."""
         result = AppRunResult.model_validate(result)
         with self.store.synchronize():
-            call = self.store.execution.get_provider_call(provider_call_id)
+            call = self.store.execution.get_provider_call(
+                provider_call_id,
+                include_task_keys=False,
+            )
             task = self.store.execution.get_task(
                 self.execution_run_id,
                 call.node_key,

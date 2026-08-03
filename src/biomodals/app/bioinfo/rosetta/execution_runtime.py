@@ -119,7 +119,10 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
     ):
         """Validate one worker publication and checkpoint its completion."""
         with self.store.synchronize():
-            call = self.store.execution.get_provider_call(provider_call_id)
+            call = self.store.execution.get_provider_call(
+                provider_call_id,
+                include_task_keys=False,
+            )
             task = self.store.execution.get_task(
                 self.execution_run_id,
                 ROSETTA_TASKS_NODE,

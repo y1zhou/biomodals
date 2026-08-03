@@ -305,6 +305,32 @@ def test_worker_completion_report_is_idempotent_and_publication_driven() -> None
         )
 
 
+def test_active_pull_worker_reconciliation_skips_assignment_history() -> None:
+    repository = create_repository(task_count=2)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+        now=140,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="complete-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=145,
+    )
+
+    [active] = repository.list_provider_calls_requiring_reconciliation(RUN_ID)
+
+    assert active.task_keys == ()
+    assert repository.get_provider_call(worker.call.provider_call_id).task_keys == (
+        "seed-0",
+        "seed-1",
+    )
+
+
 def test_successful_worker_fails_any_unreported_assignment() -> None:
     repository = create_repository(task_count=2)
     (worker,) = _admit_workers(repository, 1)

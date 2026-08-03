@@ -48,23 +48,24 @@ console = Console()
 
 @app.callback(invoke_without_command=True, no_args_is_help=True)
 def callback():
-    """Biomodals CLI - List and get help for biomodals applications.
+    """Discover, run, and administer BioModals apps and workflows.
 
-    This CLI helps users discover available biomodals applications and view their help documentation.
+    Use the command groups to run Modal compute, control durable runs, or
+    operate the optional API service.
     """
     ...
 
 
-app.add_typer(app_commands, name="app", help="Discover and run Biomodals apps.")
+app.add_typer(app_commands, name="app", help="Discover and run BioModals apps.")
 app.add_typer(
-    workflow_commands, name="workflow", help="Discover Biomodals workflow entrypoints."
+    workflow_commands, name="workflow", help="Discover and run BioModals workflows."
 )
 app.add_typer(
     run_commands,
     name="run",
-    help="Inspect and control a durable Biomodals Execution Run.",
+    help="Inspect and control a durable BioModals Execution Run.",
 )
-app.add_typer(api_commands, name="api", help="Run and administer the Biomodals API.")
+app.add_typer(api_commands, name="api", help="Run and administer the BioModals API.")
 api_commands.add_typer(
     admin_commands,
     name="admin",
@@ -249,11 +250,6 @@ def _list_available_entries(
 )
 @app_commands.command(name="ls", hidden=True)
 @app_commands.command(name="l", hidden=True)
-@app.command(
-    name="list", help="Deprecated alias for 'biomodals app list'.", deprecated=True
-)
-@app.command(name="ls", hidden=True, deprecated=True)
-@app.command(name="l", hidden=True, deprecated=True)
 def list_available_apps(
     use_absolute_paths: Annotated[
         bool,
@@ -396,13 +392,6 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
     help="Show help for a specific biomodals application (alias: h).",
 )
 @app_commands.command(name="h", no_args_is_help=True, hidden=True)
-@app.command(
-    name="help",
-    no_args_is_help=True,
-    help="Deprecated alias for 'biomodals app help'.",
-    deprecated=True,
-)
-@app.command(name="h", no_args_is_help=True, hidden=True, deprecated=True)
 def show_app_help(
     app_name: Annotated[
         str, typer.Argument(help="Name or path of the app to show help for.")
@@ -1181,13 +1170,6 @@ def run_workflow(
     help="Deploy a biomodals application to Modal (alias: d).",
 )
 @app_commands.command(name="d", no_args_is_help=True, hidden=True)
-@app.command(
-    name="deploy",
-    no_args_is_help=True,
-    help="Deprecated alias for 'biomodals app deploy'.",
-    deprecated=True,
-)
-@app.command(name="d", no_args_is_help=True, hidden=True, deprecated=True)
 def deploy_app(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to deploy.")

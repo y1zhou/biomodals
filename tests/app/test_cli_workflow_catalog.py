@@ -46,11 +46,12 @@ def test_app_list_command_is_namespaced() -> None:
     assert "rosetta" in result.output
 
 
-def test_top_level_list_remains_app_compatibility_alias() -> None:
-    result = runner.invoke(app, ["list", "--short"])
+@pytest.mark.parametrize("command", ["list", "ls", "l", "help", "h", "deploy", "d"])
+def test_top_level_app_compatibility_aliases_are_removed(command: str) -> None:
+    result = runner.invoke(app, [command])
 
-    assert result.exit_code == 0
-    assert "rosetta" in result.output
+    assert result.exit_code == 2
+    assert f"No such command '{command}'" in strip_ansi(result.output)
 
 
 def test_app_deploy_command_is_namespaced() -> None:
@@ -63,13 +64,6 @@ def test_app_deploy_command_is_namespaced() -> None:
     assert "--strategy" in output
     assert "rolling" in output
     assert "recreate" in output
-
-
-def test_top_level_deploy_remains_app_compatibility_alias() -> None:
-    result = runner.invoke(app, ["deploy", "--help"])
-
-    assert result.exit_code == 0
-    assert "Name or path of the app to deploy" in result.output
 
 
 def test_workflow_run_rejects_files_outside_workflow_package(tmp_path: Path) -> None:

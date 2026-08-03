@@ -45,7 +45,15 @@ from biomodals.execution.scheduler import (
     terminal_run_outcome,
 )
 
-EXECUTION_SCHEMA_VERSION = 2
+EXECUTION_SCHEMA_VERSION = 3
+
+
+def _cancellation_is_durable(run: ExecutionRunRecord) -> bool:
+    """Return whether unfinished work must retain the Run's cancellation."""
+    return run.status == RunStatus.CANCEL_REQUESTED or (
+        run.status == RunStatus.STATE_UNKNOWN
+        and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+    )
 
 
 class UnsupportedExecutionSchemaVersionError(RuntimeError):
@@ -279,12 +287,13 @@ _SCHEMA_STATEMENTS = (
     WHERE worker_provider_call_id IS NOT NULL
     """,
     """
-    CREATE INDEX execution_tasks_ready_dispatch_idx
+    CREATE INDEX execution_tasks_ready_dispatch_resource_idx
     ON execution_tasks(
         execution_run_id,
         node_key,
         status,
         result_observation,
+        json_extract(dispatch_policy_json, '$.binding.uses_gpu'),
         ordinal
     )
     WHERE dispatch_policy_json IS NOT NULL
@@ -895,7 +904,6 @@ class SqliteExecutionRepository:
             tuple[TaskDispatchDescriptor, str, sqlite3.Row, sqlite3.Row]
         ] = []
         seen: set[tuple[str, str]] = set()
-        node_keys: list[str] = []
         fixed_node_policy_json = _dump_json({"mode": DispatchMode.FIXED_BATCH.value})
         for descriptor in descriptors:
             identity = (descriptor.node_key, descriptor.task_key)
@@ -906,8 +914,8 @@ class SqliteExecutionRepository:
             seen.add(identity)
             if descriptor.max_tasks_per_call <= 0:
                 raise ValueError("max_tasks_per_call must be positive")
-            if descriptor.node_key not in node_keys:
-                node_keys.append(descriptor.node_key)
+
+        node_keys = list(dict.fromkeys(item.node_key for item in descriptors))
 
         node_placeholders = ", ".join("?" for _ in node_keys)
         node_rows = self._connection.execute(
@@ -2673,11 +2681,7 @@ class SqliteExecutionRepository:
             ),
         )
         run = self.get_run(call.execution_run_id)
-        cancellation_is_durable = run.status == RunStatus.CANCEL_REQUESTED or (
-            run.status == RunStatus.STATE_UNKNOWN
-            and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
-        )
-        if cancellation_is_durable:
+        if _cancellation_is_durable(run):
             self._connection.execute(
                 """
                 UPDATE execution_tasks
@@ -3347,6 +3351,15 @@ class SqliteExecutionRepository:
             message=message,
             now=now,
         )
+        run = self.get_run(call.execution_run_id)
+        effective_task_status = (
+            TaskStatus.CANCELLED if _cancellation_is_durable(run) else task_status
+        )
+        effective_message = (
+            "Run cancellation stopped this Task"
+            if effective_task_status == TaskStatus.CANCELLED
+            else message
+        )
         self._connection.execute(
             """
             UPDATE execution_tasks
@@ -3358,8 +3371,8 @@ class SqliteExecutionRepository:
                 AND status IN (?, ?)
             """,
             (
-                task_status.value,
-                message,
+                effective_task_status.value,
+                effective_message,
                 now,
                 now,
                 str(provider_call_id),
@@ -3378,8 +3391,8 @@ class SqliteExecutionRepository:
                 AND status IN (?, ?)
             """,
             (
-                task_status.value,
-                message,
+                effective_task_status.value,
+                effective_message,
                 now,
                 now,
                 str(provider_call_id),

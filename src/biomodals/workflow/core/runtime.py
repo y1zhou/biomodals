@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 from uuid import UUID
 
 import orjson
@@ -87,6 +89,15 @@ class _PreparedNode:
     context: NodeRunContext
     tasks: tuple[_PreparedTask, ...]
     error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedProviderResult:
+    """A serialized provider return awaiting coordinator-owned publication."""
+
+    temporary_file: BinaryIO
+    sha256: str
+    size_bytes: int
 
 
 class WorkflowRuntime:
@@ -597,7 +608,8 @@ class WorkflowRuntime:
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
-            encode_result=self._result_envelope,
+            encode_result=self._prepare_result_envelope,
+            finalize_result=self._finalize_result_envelope,
             now=self._now(),
         )
         if any(
@@ -1665,23 +1677,49 @@ class WorkflowRuntime:
             return AvailabilityStatus.MISSING
         return AvailabilityStatus.AVAILABLE
 
-    def _result_envelope(self, result: object) -> dict[str, object]:
-        """Store a provider return outside SQLite and envelope its location."""
+    def _prepare_result_envelope(self, result: object) -> _PreparedProviderResult:
+        """Serialize a provider return without touching the shared Volume."""
         if isinstance(result, BaseModel):
             result = result.model_dump(mode="json")
         content = orjson.dumps(result)
         digest = hashlib.sha256(content).hexdigest()
+        temporary_file = tempfile.TemporaryFile()
+        temporary_file.write(content)
+        temporary_file.seek(0)
+        return _PreparedProviderResult(
+            temporary_file=temporary_file,
+            sha256=digest,
+            size_bytes=len(content),
+        )
+
+    def _finalize_result_envelope(
+        self,
+        prepared: _PreparedProviderResult,
+    ) -> dict[str, object]:
+        """Publish a prepared return within the coordinator writer boundary."""
+        digest = prepared.sha256
         relative_path = Path("provider-results") / f"{digest}.json"
         result_path = self.store.output_root / relative_path
         result_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = result_path.with_suffix(".json.tmp")
-        temporary_path.write_bytes(content)
-        temporary_path.replace(result_path)
+        volume_temporary = tempfile.NamedTemporaryFile(
+            dir=result_path.parent,
+            prefix=f".{digest}.",
+            suffix=".tmp",
+            delete=False,
+        )
+        temporary_path = Path(volume_temporary.name)
+        try:
+            with volume_temporary:
+                shutil.copyfileobj(prepared.temporary_file, volume_temporary)
+            temporary_path.replace(result_path)
+        finally:
+            prepared.temporary_file.close()
+            temporary_path.unlink(missing_ok=True)
         return {
             "result_file": {
                 "path": relative_path.as_posix(),
                 "sha256": digest,
-                "size_bytes": len(content),
+                "size_bytes": prepared.size_bytes,
             }
         }
 

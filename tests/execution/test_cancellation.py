@@ -95,8 +95,9 @@ def test_cancel_request_waits_for_attached_call_confirmation() -> None:
         repository.get_task(RUN_ID, "inference", "seed-0").status == TaskStatus.RUNNING
     )
 
-    runtime.reconcile_provider_call(
-        claim.call.provider_call_id,
+    runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
         encode_result=lambda value: value,
         now=121,
     )
@@ -189,6 +190,50 @@ def test_call_success_after_cancellation_does_not_reopen_publication_work() -> N
         repository.get_task(RUN_ID, "inference", "seed-0").status
         == TaskStatus.CANCELLED
     )
+
+
+def test_call_failure_after_cancellation_keeps_owned_task_cancelled() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+    repository.request_run_cancellation(RUN_ID, now=120)
+
+    repository.fail_provider_call(
+        claim.call.provider_call_id,
+        message="provider failed while cancellation was in flight",
+        now=121,
+    )
+    repository.reconcile_node_tasks(RUN_ID, "inference", now=122)
+    completed = repository.finalize_run_from_results(RUN_ID, now=123)
+
+    assert (
+        repository.get_provider_call(claim.call.provider_call_id).status
+        == ProviderCallStatus.FAILED
+    )
+    assert (
+        repository.get_task(RUN_ID, "inference", "seed-0").status
+        == TaskStatus.CANCELLED
+    )
+    assert completed.status == RunStatus.CANCELLED
 
 
 def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
@@ -328,10 +373,10 @@ def test_result_pruning_waits_for_conclusive_provider_cancellation() -> None:
         repository.get_task(RUN_ID, "inference", "seed-0").status == TaskStatus.RUNNING
     )
 
-    cancelled = runtime.reconcile_provider_call(
-        claim.call.provider_call_id,
+    ((_, cancelled),) = runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys=set(),
         encode_result=lambda value: value,
-        result_already_satisfied=True,
         now=121,
     )
     task = repository.get_task(RUN_ID, "inference", "seed-0")

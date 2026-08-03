@@ -1066,11 +1066,12 @@ def test_durable_provider_envelope_is_published_without_another_spawn(
     runtime._workload_run_key = "recover"
     runtime._ensure_run(definition, "recover")
     runtime.advance_once()
-    call = runtime.store.execution.list_provider_calls(RUN_ID)[0]
     runtime._provider.repository = runtime.store.execution
-    completed = runtime._provider.reconcile_provider_call(
-        call.provider_call_id,
-        encode_result=runtime._result_envelope,
+    ((_, completed),) = runtime._provider.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"remote"},
+        encode_result=runtime._prepare_result_envelope,
+        finalize_result=runtime._finalize_result_envelope,
         now=200,
     )
     assert completed.status == ProviderCallStatus.SUCCEEDED

@@ -143,3 +143,17 @@ def test_repository_rejects_unknown_schema_version() -> None:
         match="Unsupported execution schema version 999",
     ):
         SqliteExecutionRepository(connection).initialize_schema()
+
+
+def test_repository_rejects_pre_file_envelope_schema() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE execution_schema (singleton INTEGER PRIMARY KEY, version INTEGER)"
+    )
+    connection.execute("INSERT INTO execution_schema VALUES (1, 2)")
+
+    with pytest.raises(
+        UnsupportedExecutionSchemaVersionError,
+        match="Unsupported execution schema version 2",
+    ):
+        SqliteExecutionRepository(connection).initialize_schema()

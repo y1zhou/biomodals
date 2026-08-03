@@ -3,9 +3,12 @@
 # ruff: noqa: D101, D102, D103, D107, S106
 
 import sqlite3
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, RLock, Thread
+from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -15,6 +18,8 @@ from biomodals.execution import (
     ExecutionPlan,
     NodePlan,
     NodeStatus,
+    ProviderBinding,
+    ProviderCallRecord,
     ProviderCallStatus,
     RunStatus,
     RunStatusReason,
@@ -94,6 +99,90 @@ def _candidate(task_index: int = 0) -> ProviderCallCandidate:
         depth=0,
         unblocking_span=0,
         max_tasks_per_call=1,
+    )
+
+
+def _submit_fixed(
+    runtime: ExecutionRuntime,
+    candidate: ProviderCallCandidate,
+    *,
+    submission_token: str,
+    kwargs: Mapping[str, Any] | None = None,
+    provider_call_id_kwarg: str | None = None,
+    now: int,
+) -> ProviderCallRecord | None:
+    (call,) = runtime.submit_provider_calls(
+        RUN_ID,
+        (
+            ProviderCallSubmission(
+                candidate=candidate,
+                submission_token=submission_token,
+                kwargs={} if kwargs is None else kwargs,
+                provider_call_id_kwarg=provider_call_id_kwarg,
+            ),
+        ),
+        now=now,
+    )
+    return call
+
+
+def _submit_pull_worker(
+    runtime: ExecutionRuntime,
+    *,
+    node_key: str,
+    submission_token: str,
+    binding: ProviderBinding,
+    compatibility_key: str,
+    claim_capacity: int,
+    kwargs: Mapping[str, Any] | None = None,
+    now: int,
+) -> ProviderCallRecord | None:
+    candidate = ProviderCallCandidate(
+        candidate_key=submission_token,
+        node_key=node_key,
+        node_ordinal=0,
+        task_keys=(),
+        task_ordinal=0,
+        binding=binding,
+        compatibility_key=compatibility_key,
+        depth=0,
+        unblocking_span=0,
+    )
+    (call,) = runtime.submit_provider_calls(
+        RUN_ID,
+        (
+            ProviderCallSubmission(
+                candidate=candidate,
+                submission_token=submission_token,
+                kwargs={} if kwargs is None else kwargs,
+                provider_call_id_kwarg="provider_call_id",
+                claim_capacity=claim_capacity,
+            ),
+        ),
+        now=now,
+    )
+    return call
+
+
+def _reconcile_one(
+    runtime: ExecutionRuntime,
+    provider_call_id: UUID,
+    *,
+    encode_result: Callable[[Any], Any],
+    result_already_satisfied: bool = False,
+    now: int,
+) -> ProviderCallRecord:
+    call = runtime.repository.get_provider_call(provider_call_id)
+    reconciled = runtime.reconcile_provider_calls(
+        call.execution_run_id,
+        required_node_keys=set() if result_already_satisfied else {call.node_key},
+        encode_result=encode_result,
+        now=now,
+    )
+    return next(
+        updated
+        for original, updated in reconciled
+        if original.provider_call_id == provider_call_id
     )
 
 
@@ -275,6 +364,7 @@ def test_fixed_candidate_policy_is_prepared_once_then_admitted_in_windows() -> N
         now=110,
     )
     for candidate in first:
+        assert candidate.max_tasks_per_call is not None
         preclaim = repository.preclaim_fixed_batch(
             RUN_ID,
             candidate.node_key,
@@ -324,15 +414,15 @@ def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> N
         checkpoint=lambda: checkpoints.append(driver.spawn_count),
     )
 
-    first = runtime.submit_fixed_batch(
-        RUN_ID,
+    first = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         kwargs={"seed": 0},
         now=110,
     )
-    duplicate = runtime.submit_fixed_batch(
-        RUN_ID,
+    duplicate = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         kwargs={"seed": 0},
@@ -436,8 +526,8 @@ def test_modal_operations_never_hold_the_repository_writer() -> None:
         ),
         synchronize=synchronize,
     )
-    runtime.submit_fixed_batch(
-        RUN_ID,
+    _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         now=110,
@@ -451,6 +541,67 @@ def test_modal_operations_never_hold_the_repository_writer() -> None:
     )
 
     assert operations == ["resolve", "spawn", "cancel", "observe"]
+
+
+def test_provider_result_finalization_holds_the_repository_writer() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    writer_active = False
+
+    @contextmanager
+    def synchronize():
+        nonlocal writer_active
+        assert not writer_active
+        writer_active = True
+        try:
+            yield
+        finally:
+            writer_active = False
+
+    driver = FakeModalDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+        synchronize=synchronize,
+    )
+    runtime.submit_provider_calls(
+        RUN_ID,
+        (
+            ProviderCallSubmission(
+                candidate=_candidate(),
+                submission_token="batch",
+            ),
+        ),
+        now=110,
+    )
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.SUCCEEDED,
+        result={"answer": 42},
+    )
+
+    runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
+        encode_result=lambda result: (
+            pytest.fail("result preparation held the writer")
+            if writer_active
+            else result
+        ),
+        finalize_result=lambda result: (
+            result
+            if writer_active
+            else pytest.fail("result finalization escaped the writer")
+        ),
+        now=111,
+    )
+
+    assert repository.list_provider_calls(RUN_ID)[0].result_envelope == {"answer": 42}
 
 
 def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
@@ -476,8 +627,8 @@ def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
         checkpoint=lambda: None,
     )
 
-    call = runtime.submit_fixed_batch(
-        RUN_ID,
+    call = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         now=110,
@@ -487,6 +638,50 @@ def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
     assert call.status == ProviderCallStatus.ATTACHED
     assert repository.get_run(RUN_ID).status.value == "cancel_requested"
     assert driver.cancelled == [call.provider_call_handle_id]
+
+
+def test_definite_spawn_rejection_after_cancellation_keeps_task_cancelled() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    runtime: ExecutionRuntime
+
+    class CancellingRejectDriver(FakeModalDriver):
+        def spawn(self, function, *, args, kwargs):
+            self.spawn_count += 1
+            runtime.cancel_run(RUN_ID, now=111)
+            raise ModalDefiniteSubmissionError("rejected")
+
+    driver = CancellingRejectDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+
+    (call,) = runtime.submit_provider_calls(
+        RUN_ID,
+        (
+            ProviderCallSubmission(
+                candidate=_candidate(),
+                submission_token="batch",
+            ),
+        ),
+        now=110,
+    )
+    assert call is not None
+    repository.reconcile_node_tasks(RUN_ID, "inference", now=112)
+    completed = repository.finalize_run_from_results(RUN_ID, now=113)
+
+    assert call.status == ProviderCallStatus.FAILED
+    assert repository.get_task(RUN_ID, "inference", "seed-0").status.value == (
+        "cancelled"
+    )
+    assert completed.status == RunStatus.CANCELLED
 
 
 def test_terminal_call_set_uses_one_volume_checkpoint() -> None:
@@ -566,8 +761,8 @@ def test_checkpoint_may_replace_a_volume_backed_repository(tmp_path) -> None:
         checkpoint=checkpoint,
     )
 
-    call = runtime.submit_fixed_batch(
-        RUN_ID,
+    call = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         now=110,
@@ -600,8 +795,8 @@ def test_resolution_failure_happens_before_durable_preclaim() -> None:
     )
 
     with pytest.raises(RuntimeError, match="deployment unavailable"):
-        runtime.submit_fixed_batch(
-            RUN_ID,
+        _submit_fixed(
+            runtime,
             _candidate(),
             submission_token="batch",
             kwargs={"seed": 0},
@@ -640,7 +835,9 @@ def test_publication_recovery_reopens_repository_after_concurrent_checkpoint(
     )
 
     def observe_node(_node_key):
-        runtime.checkpoint()
+        replacement = checkpoint()
+        if replacement is not None:
+            runtime.repository = replacement
         return AvailabilityStatus.AVAILABLE
 
     required = runtime.recover_publications(
@@ -676,8 +873,8 @@ def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
     )
 
     assert (
-        runtime.submit_fixed_batch(
-            RUN_ID,
+        _submit_fixed(
+            runtime,
             _candidate(),
             submission_token="batch",
             now=110,
@@ -707,8 +904,8 @@ def test_unavailable_deployment_first_drains_attached_calls() -> None:
         modal_driver=driver,
         checkpoint=lambda: None,
     )
-    first = runtime.submit_fixed_batch(
-        RUN_ID,
+    first = _submit_fixed(
+        runtime,
         _candidate(0),
         submission_token="first",
         now=110,
@@ -717,8 +914,8 @@ def test_unavailable_deployment_first_drains_attached_calls() -> None:
 
     driver.resolve_error = ModalDeploymentUnavailableError("version 23 is unavailable")
     assert (
-        runtime.submit_fixed_batch(
-            RUN_ID,
+        _submit_fixed(
+            runtime,
             _candidate(1),
             submission_token="second",
             now=120,
@@ -734,8 +931,8 @@ def test_unavailable_deployment_first_drains_attached_calls() -> None:
         now=130,
     )
     assert (
-        runtime.submit_fixed_batch(
-            RUN_ID,
+        _submit_fixed(
+            runtime,
             _candidate(1),
             submission_token="second",
             now=140,
@@ -767,8 +964,8 @@ def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -
     )
 
     with pytest.raises(RuntimeError, match="checkpoint failed"):
-        runtime.submit_fixed_batch(
-            RUN_ID,
+        _submit_fixed(
+            runtime,
             _candidate(),
             submission_token="batch",
             kwargs={"seed": 0},
@@ -776,11 +973,13 @@ def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -
         )
 
     assert driver.spawn_count == 0
-    recovered = ExecutionRuntime(
+    recovery_runtime = ExecutionRuntime(
         repository,
         modal_driver=driver,
         checkpoint=lambda: None,
-    ).reconcile_provider_call(
+    )
+    recovered = _reconcile_one(
+        recovery_runtime,
         repository.list_provider_calls(RUN_ID)[0].provider_call_id,
         encode_result=lambda value: value,
         now=120,
@@ -825,8 +1024,8 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
         checkpoint=lambda: None,
     )
 
-    submitted = runtime.submit_fixed_batch(
-        RUN_ID,
+    submitted = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         kwargs={"seed": 0},
@@ -836,8 +1035,8 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
     call = repository.list_provider_calls(RUN_ID)[0]
     assert submitted == call
     assert call.status == expected_status
-    replay = runtime.submit_fixed_batch(
-        RUN_ID,
+    replay = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         kwargs={"seed": 0},
@@ -982,8 +1181,8 @@ def test_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
     monkeypatch.setattr(repository, "attach_provider_call", fail_attachment)
 
     with pytest.raises(RuntimeError, match="attachment failed"):
-        runtime.submit_fixed_batch(
-            RUN_ID,
+        _submit_fixed(
+            runtime,
             _candidate(),
             submission_token="batch",
             now=110,
@@ -1056,8 +1255,8 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
         modal_driver=driver,
         checkpoint=lambda: None,
     )
-    call = runtime.submit_fixed_batch(
-        RUN_ID,
+    call = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         kwargs={"seed": 0},
@@ -1069,12 +1268,14 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
         result={"path": "/outputs/seed-0"},
     )
 
-    completed = runtime.reconcile_provider_call(
+    completed = _reconcile_one(
+        runtime,
         call.provider_call_id,
         encode_result=lambda result: {"tasks": {"seed-0": result}},
         now=120,
     )
-    replay = runtime.reconcile_provider_call(
+    replay = _reconcile_one(
+        runtime,
         call.provider_call_id,
         encode_result=lambda result: {"tasks": {"seed-0": result}},
         now=121,
@@ -1100,8 +1301,8 @@ def test_running_poll_does_not_cross_host_checkpoint() -> None:
         modal_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
-    call = runtime.submit_fixed_batch(
-        RUN_ID,
+    call = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch",
         now=110,
@@ -1109,7 +1310,8 @@ def test_running_poll_does_not_cross_host_checkpoint() -> None:
     assert call is not None
     checkpoints.clear()
 
-    running = runtime.reconcile_provider_call(
+    running = _reconcile_one(
+        runtime,
         call.provider_call_id,
         encode_result=lambda result: result,
         now=120,
@@ -1135,8 +1337,8 @@ def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
 
-    call = runtime.submit_pull_worker(
-        RUN_ID,
+    call = _submit_pull_worker(
+        runtime,
         node_key="inference",
         submission_token="worker-0",
         binding=GPU_BINDING,
@@ -1172,8 +1374,8 @@ def test_fixed_submission_can_receive_its_durable_call_identity() -> None:
         checkpoint=lambda: None,
     )
 
-    call = runtime.submit_fixed_batch(
-        RUN_ID,
+    call = _submit_fixed(
+        runtime,
         _candidate(),
         submission_token="batch-with-owner",
         kwargs={"seed": 0},
@@ -1205,8 +1407,8 @@ def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
         modal_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
-    call = runtime.submit_pull_worker(
-        RUN_ID,
+    call = _submit_pull_worker(
+        runtime,
         node_key="inference",
         submission_token="worker-0",
         binding=GPU_BINDING,

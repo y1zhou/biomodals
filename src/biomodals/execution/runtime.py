@@ -189,10 +189,6 @@ class ExecutionRuntime:
         self._transaction = transaction
         self._synchronize = synchronize
 
-    def checkpoint(self) -> None:
-        """Cross the host durability boundary for caller-owned transitions."""
-        self._checkpoint_state()
-
     def create_or_verify_run(
         self,
         *,
@@ -725,32 +721,6 @@ class ExecutionRuntime:
             )
         return persisted
 
-    def submit_fixed_batch(
-        self,
-        execution_run_id: UUID,
-        candidate: ProviderCallCandidate,
-        *,
-        submission_token: str,
-        args: tuple[Any, ...] = (),
-        kwargs: Mapping[str, Any] | None = None,
-        provider_call_id_kwarg: str | None = None,
-        now: int,
-    ) -> ProviderCallRecord | None:
-        """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
-        return self.submit_provider_calls(
-            execution_run_id,
-            (
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=submission_token,
-                    args=args,
-                    kwargs={} if kwargs is None else kwargs,
-                    provider_call_id_kwarg=provider_call_id_kwarg,
-                ),
-            ),
-            now=now,
-        )[0]
-
     def resolve_provider_binding(
         self,
         execution_run_id: UUID,
@@ -760,46 +730,6 @@ class ExecutionRuntime:
     ) -> Any | None:
         """Preflight one exact binding before workload writer coordination."""
         return self._resolve_provider(execution_run_id, binding, now=now)
-
-    def submit_pull_worker(
-        self,
-        execution_run_id: UUID,
-        *,
-        node_key: str,
-        submission_token: str,
-        binding: ProviderBinding,
-        compatibility_key: str,
-        claim_capacity: int,
-        args: tuple[Any, ...] = (),
-        kwargs: Mapping[str, Any] | None = None,
-        now: int,
-    ) -> ProviderCallRecord | None:
-        """Submit one pull worker after its dispatch policy is durable."""
-        candidate = ProviderCallCandidate(
-            candidate_key=submission_token,
-            node_key=node_key,
-            node_ordinal=0,
-            task_keys=(),
-            task_ordinal=0,
-            binding=binding,
-            compatibility_key=compatibility_key,
-            depth=0,
-            unblocking_span=0,
-        )
-        return self.submit_provider_calls(
-            execution_run_id,
-            (
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=submission_token,
-                    args=args,
-                    kwargs={} if kwargs is None else kwargs,
-                    provider_call_id_kwarg="provider_call_id",
-                    claim_capacity=claim_capacity,
-                ),
-            ),
-            now=now,
-        )[0]
 
     def submit_provider_calls(
         self,
@@ -1067,61 +997,6 @@ class ExecutionRuntime:
             self._checkpoint_state()
         return task
 
-    def reconcile_provider_call(
-        self,
-        provider_call_id: UUID,
-        *,
-        encode_result: Callable[[Any], Any],
-        result_already_satisfied: bool = False,
-        now: int,
-    ) -> ProviderCallRecord:
-        """Observe or collect the existing call without ever resubmitting it."""
-        with self._synchronize():
-            call = self.repository.get_provider_call(provider_call_id)
-        if call.status.is_terminal:
-            return call
-        if call.status == ProviderCallStatus.SUBMITTING:
-            with self._synchronize():
-                with self._transaction():
-                    unknown = self.repository.mark_submission_outcome_unknown(
-                        provider_call_id,
-                        message="Recovered an abandoned submitting Provider Call",
-                        now=now,
-                    )
-                self._checkpoint_state()
-            return unknown
-        if call.provider_call_handle_id is None:
-            return call
-
-        observation = self._modal.observe(call.provider_call_handle_id)
-        envelope = None
-        if observation.kind == ModalCallObservationKind.SUCCEEDED:
-            try:
-                envelope = encode_result(observation.result)
-            except Exception as error:
-                with self._synchronize():
-                    with self._transaction():
-                        self.repository.mark_provider_call_state_unknown(
-                            provider_call_id,
-                            message=f"Could not create a Result Envelope: {error}",
-                            now=now,
-                        )
-                    self._checkpoint_state()
-                raise
-        with self._synchronize():
-            with self._transaction():
-                updated = _record_provider_call_observation(
-                    self.repository,
-                    provider_call_id,
-                    observation,
-                    result_envelope=envelope,
-                    result_already_satisfied=result_already_satisfied,
-                    now=now,
-                )
-            if observation.kind != ModalCallObservationKind.RUNNING:
-                self._checkpoint_state()
-        return updated
-
     def reconcile_provider_calls(
         self,
         execution_run_id: UUID,
@@ -1129,8 +1004,9 @@ class ExecutionRuntime:
         required_node_keys: Collection[str],
         encode_result: Callable[[Any], Any],
         now: int,
+        finalize_result: Callable[[Any], Any] | None = None,
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
-        """Observe calls outside the writer and checkpoint terminal results once."""
+        """Observe and prepare outside the writer, then durably finalize results."""
         with self._synchronize():
             originals = self.repository.list_provider_calls_requiring_reconciliation(
                 execution_run_id
@@ -1194,7 +1070,13 @@ class ExecutionRuntime:
                     if prepared is None:
                         updated = original
                     else:
-                        observation, envelope = prepared
+                        observation, prepared_result = prepared
+                        envelope = (
+                            finalize_result(prepared_result)
+                            if finalize_result is not None
+                            and observation.kind == ModalCallObservationKind.SUCCEEDED
+                            else prepared_result
+                        )
                         current = self.repository.get_provider_call(
                             original.provider_call_id
                         )

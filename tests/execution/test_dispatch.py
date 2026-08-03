@@ -190,6 +190,45 @@ def test_fixed_batch_policy_validates_tasks_with_bulk_queries() -> None:
     assert len(task_selects) == 1
 
 
+def test_ready_dispatch_query_uses_the_resource_class_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=100)
+    descriptors = tuple(
+        replace(_task(f"seed-{index}", index), node_ordinal=0) for index in range(100)
+    )
+    repository.persist_fixed_dispatch_policy(RUN_ID, descriptors, now=110)
+
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT task.*, node.ordinal AS node_ordinal
+        FROM execution_tasks AS task
+        JOIN execution_nodes AS node
+            ON node.execution_run_id = task.execution_run_id
+            AND node.node_key = task.node_key
+        WHERE task.execution_run_id = ?
+            AND task.node_key IN (?)
+            AND node.status = ?
+            AND node.discovery_complete = 1
+            AND task.status = ?
+            AND task.result_observation = ?
+            AND task.dispatch_policy_json IS NOT NULL
+            AND json_extract(
+                task.dispatch_policy_json,
+                '$.binding.uses_gpu'
+            ) = ?
+        ORDER BY node.ordinal, task.ordinal
+        LIMIT ?
+        """,
+        (str(RUN_ID), "inference", "running", "pending", "missing", 1, 8),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_ready_dispatch_resource_idx" in str(row[3])
+        for row in query_plan
+    )
+
+
 def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(connection=connection, task_count=3)

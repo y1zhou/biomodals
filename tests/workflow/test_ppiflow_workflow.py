@@ -2332,12 +2332,12 @@ PPIFlowStep:
         run_id="demo",
         wait=False,
         use_deployed_coordinator=True,
-        deployment_environment="production",
         deployment_name="ppiflow-prod",
         deployment_version=7,
         restart_from=predecessor,
     )
 
+    assert calls["coordinator"]["deployment"].environment == "main"
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "demo"
     assert calls["prepare"]["workflow"].name == "ppiflow-v2"

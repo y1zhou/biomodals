@@ -873,13 +873,12 @@ def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles
         replicates=1,
         wait=False,
         use_deployed_coordinator=True,
-        deployment_environment="production",
         deployment_name="shortmd-prod",
         deployment_version=7,
     )
 
     deployment = calls["coordinator"]["deployment"]
-    assert deployment.environment == "production"
+    assert deployment.environment == "main"
     assert deployment.deployment_name == "shortmd-prod"
     assert deployment.deployment_version == 7
     assert calls["coordinator"]["use_deployed_coordinator"] is True

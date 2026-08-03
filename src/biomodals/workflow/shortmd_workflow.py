@@ -744,7 +744,7 @@ def submit_shortmd_workflow(
     max_parallel: int = 16,
     dry_run: bool = False,
     use_deployed_coordinator: bool = False,
-    deployment_environment: str = "development",
+    deployment_environment: str = "main",
     deployment_name: str | None = None,
     deployment_version: int = 1,
     restart_from: str | None = None,

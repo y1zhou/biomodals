@@ -4645,7 +4645,7 @@ def submit_ppiflow_workflow(
     max_child_calls: int | None = None,
     dry_run: bool = False,
     use_deployed_coordinator: bool = False,
-    deployment_environment: str = "development",
+    deployment_environment: str = "main",
     deployment_name: str | None = None,
     deployment_version: int = 1,
     restart_from: str | None = None,

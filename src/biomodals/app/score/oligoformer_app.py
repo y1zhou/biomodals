@@ -3626,31 +3626,6 @@ def _targetscan_tile_ready(spec: TargetscanBatchSpec) -> bool:
     )
 
 
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def run_oligoformer_targetscan_context_shard_batch(
-    specs: list[TargetscanContextShardSpec],
-    local_workers: int,
-    attempts: int = APP_INFO.default_targetscan_context_attempts,
-) -> int:
-    """Run a fixed batch of TargetScan context-score shards on one CPU node."""
-    local_workers = _validated_worker_count(local_workers)
-    if attempts < 1:
-        raise ValueError("attempts must be a positive integer")
-    CONF.output_volume.reload()
-    outputs = bounded_map(
-        specs,
-        lambda spec: _run_targetscan_context_shard(spec, attempts),
-        max_parallel=local_workers,
-    )
-    CONF.output_volume.commit()
-    return len(outputs)
-
-
 def _merge_targetscan_context_outputs(
     *,
     context_outputs: list[str],
@@ -5567,34 +5542,6 @@ def build_oligoformer_final_tables(
         postprocess_key=plan.postprocess_key,
         reference_identity=plan.reference_identity,
         model_identity=plan.model_identity,
-    )
-
-
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True),
-)
-def package_oligoformer_outputs(plan: OligoformerRunPlan) -> bytes:
-    """Return cached OligoFormer outputs as standalone tarball bytes."""
-    CONF.output_volume.reload()
-    refreshed_plan = _build_plan(
-        plan.cache_key,
-        plan.efficacy_key,
-        plan.output_stems,
-        plan.run_root,
-        config=plan.config,
-        postprocess_key=plan.postprocess_key,
-        reference_identity=plan.reference_identity,
-        model_identity=plan.model_identity,
-    )
-    if not refreshed_plan.final_ready:
-        raise FileNotFoundError(
-            f"OligoFormer final outputs are incomplete for {refreshed_plan.cache_key}"
-        )
-    return _package_output_tables(
-        Path(refreshed_plan.output_dir), refreshed_plan.output_stems
     )
 
 

@@ -840,7 +840,7 @@ class ExecutionRuntime:
                 continue
             with self._synchronize():
                 run = self.repository.get_run(execution_run_id)
-                if _cancellation_is_durable(run):
+                if run.cancellation_is_durable:
                     with self._transaction():
                         self.repository.cancel_unsubmitted_provider_call(
                             preclaim.call.provider_call_id,
@@ -914,7 +914,7 @@ class ExecutionRuntime:
                                     now=now,
                                 )
                         run = self.repository.get_run(execution_run_id)
-                        cancellation_requested = _cancellation_is_durable(run)
+                        cancellation_requested = run.cancellation_is_durable
                     self._checkpoint_state()
             except Exception:
                 for handle_id in spawned.values():
@@ -1559,12 +1559,4 @@ def _fixed_descriptors_for_candidate(
                 task_key,
             ),
         )
-    )
-
-
-def _cancellation_is_durable(run: ExecutionRunRecord) -> bool:
-    """Return whether this Run must admit no further provider side effects."""
-    return run.status == RunStatus.CANCEL_REQUESTED or (
-        run.status == RunStatus.STATE_UNKNOWN
-        and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
     )

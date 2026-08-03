@@ -48,14 +48,6 @@ from biomodals.execution.scheduler import (
 EXECUTION_SCHEMA_VERSION = 4
 
 
-def _cancellation_is_durable(run: ExecutionRunRecord) -> bool:
-    """Return whether unfinished work must retain the Run's cancellation."""
-    return run.status == RunStatus.CANCEL_REQUESTED or (
-        run.status == RunStatus.STATE_UNKNOWN
-        and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
-    )
-
-
 class UnsupportedExecutionSchemaVersionError(RuntimeError):
     """Raised when a repository uses another execution schema version."""
 
@@ -2768,7 +2760,7 @@ class SqliteExecutionRepository:
             ),
         )
         run = self.get_run(call.execution_run_id)
-        if _cancellation_is_durable(run):
+        if run.cancellation_is_durable:
             self._connection.execute(
                 """
                 UPDATE execution_tasks
@@ -3446,7 +3438,7 @@ class SqliteExecutionRepository:
         )
         run = self.get_run(call.execution_run_id)
         effective_task_status = (
-            TaskStatus.CANCELLED if _cancellation_is_durable(run) else task_status
+            TaskStatus.CANCELLED if run.cancellation_is_durable else task_status
         )
         effective_message = (
             "Run cancellation stopped this Task"

@@ -334,6 +334,14 @@ class ExecutionRunRecord:
     started_at: int | None
     completed_at: int | None
 
+    @property
+    def cancellation_is_durable(self) -> bool:
+        """Return whether unfinished work must retain cancellation intent."""
+        return self.status == RunStatus.CANCEL_REQUESTED or (
+            self.status == RunStatus.STATE_UNKNOWN
+            and self.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+        )
+
 
 @dataclass(frozen=True)
 class ExecutionNodeRecord:

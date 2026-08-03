@@ -245,29 +245,6 @@ def _reload_ppiflow_source_volumes() -> None:
 
 
 @app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
-    timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def select_ppiflow_structure_files(
-    *,
-    artifacts: list[WorkflowArtifact],
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> list[tuple[str, bytes]]:
-    """Read structure files from mounted PPIFlow workflow artifacts."""
-    _reload_ppiflow_source_volumes()
-    return ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=patterns,
-        max_files=max_files,
-    )
-
-
-@app.function(
     image=ppiflow_task_image,
     gpu=ppiflow_app.CONF.gpu,
     cpu=(0.125, 16.125),
@@ -437,63 +414,6 @@ def check_ppiflow_external_artifact(
         artifact,
         workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
         volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-    )
-
-
-@app.function(
-    image=runtime_image,
-    cpu=0.125,
-    memory=(512, 8192),
-    timeout=CONF.timeout,
-    volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def copy_ppiflow_structure_artifacts(
-    *,
-    artifacts: list[WorkflowArtifact],
-    run_id: str,
-    node_id: str,
-    output_name: str,
-    metadata: dict[str, object] | None = None,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> AppRunResult:
-    """Copy selected structure artifacts into the workflow output volume."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts=artifacts,
-        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=patterns,
-        max_files=max_files,
-    )
-    output_dir = (
-        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
-        / "ppiflow"
-        / sanitize_filename(run_id)
-        / sanitize_filename(node_id)
-        / sanitize_filename(output_name)
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for file_name, file_bytes in selected:
-        (output_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
-    WORKFLOW_OUTPUT_VOLUME.commit()
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            volume_app_output(
-                name=output_name,
-                kind=ArtifactKind.STRUCTURES,
-                remote_path=str(output_dir),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                metadata={
-                    "structure_count": len(selected),
-                    "files": [file_name for file_name, _ in selected],
-                }
-                | dict(metadata or {}),
-            )
-        ],
     )
 
 

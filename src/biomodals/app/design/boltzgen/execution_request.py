@@ -203,11 +203,6 @@ def prepare_execution_request(
     )
 
 
-def request_relative_path(execution_run_id: UUID) -> PurePosixPath:
-    """Return the reserved per-Run request path."""
-    return _REQUEST_FILE.path(execution_run_id)
-
-
 def stage_execution_request(
     output_volume: Any,
     execution_run_id: UUID,

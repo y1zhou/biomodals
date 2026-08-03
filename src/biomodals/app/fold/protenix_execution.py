@@ -30,8 +30,8 @@ from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
-    ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
+    StandardExecutionRuntimeLifecycle,
     persist_execution_launch,
 )
 from biomodals.helper.output_claim import (
@@ -248,7 +248,7 @@ def load_execution_request(
     )
 
 
-class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
+class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
     """Drive one Protenix request through optional MSA fan-out."""
 
     def __init__(
@@ -285,18 +285,6 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
             checkpoint=self._checkpoint,
             transaction=store.transaction,
             synchronize=store.synchronize,
-        )
-
-    def advance_once(self) -> None:
-        """Apply one publication, recovery, and admission cycle."""
-        self._provider.advance_once(
-            self.execution_run_id,
-            recover_publications=self._recover_publications,
-            reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=self._decode_completed_calls,
-            start_ready_nodes=self._start_ready_nodes,
-            admit_remote_tasks=self._admit_remote_tasks,
-            now=self._now,
         )
 
     def _initialize(self):

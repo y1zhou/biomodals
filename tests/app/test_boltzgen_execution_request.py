@@ -13,7 +13,6 @@ from biomodals.app.design.boltzgen.execution_request import (
     BoltzGenExecutionRequest,
     load_execution_request,
     prepare_execution_request,
-    request_relative_path,
     stage_execution_request,
 )
 
@@ -107,15 +106,11 @@ def test_request_round_trips_and_stages_idempotently(tmp_path: Path) -> None:
     volume = FakeVolume(tmp_path)
 
     assert BoltzGenExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert stage_execution_request(volume, RUN_ID, request) == (
-        request_relative_path(RUN_ID)
-    )
-    assert stage_execution_request(volume, RUN_ID, request) == (
-        request_relative_path(RUN_ID)
-    )
+    request_relative_path = stage_execution_request(volume, RUN_ID, request)
+    assert stage_execution_request(volume, RUN_ID, request) == request_relative_path
     assert load_execution_request(tmp_path, RUN_ID) == request
 
-    request_path = tmp_path.joinpath(*request_relative_path(RUN_ID).parts)
+    request_path = tmp_path.joinpath(*request_relative_path.parts)
     request_path.write_bytes(_request(yaml_content=b"changed: true\n").to_bytes())
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_execution_request(volume, RUN_ID, request)

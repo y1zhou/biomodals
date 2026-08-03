@@ -455,6 +455,37 @@ class ExecutionRuntimeLifecycle:
                 self._provider.repository = self.store.execution
 
 
+class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
+    """Share the standard publication, recovery, and admission cycle."""
+
+    def advance_once(self) -> None:
+        """Apply one standard workload-owned execution cycle."""
+        self._provider.advance_once(
+            self.execution_run_id,
+            recover_publications=self._recover_publications,
+            reconcile_provider_calls=self._reconcile_provider_calls,
+            decode_completed_calls=self._decode_completed_calls,
+            start_ready_nodes=self._start_ready_nodes,
+            admit_remote_tasks=self._admit_remote_tasks,
+            now=self._now,
+        )
+
+    def _recover_publications(self) -> None:
+        raise NotImplementedError
+
+    def _reconcile_provider_calls(self, required: set[str]) -> None:
+        raise NotImplementedError
+
+    def _decode_completed_calls(self) -> None:
+        raise NotImplementedError
+
+    def _start_ready_nodes(self, required: set[str]) -> None:
+        raise NotImplementedError
+
+    def _admit_remote_tasks(self, required: set[str]) -> None:
+        raise NotImplementedError
+
+
 class ExecutionCoordinatorLifecycle:
     """Share app-coordinator locking, status, and drive mechanics."""
 

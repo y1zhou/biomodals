@@ -16,8 +16,8 @@ from biomodals.app.fold.alphafold3.execution_coordinator import (
     _restart_request,
 )
 from biomodals.app.fold.alphafold3.execution_request import (
+    EXECUTION_REQUEST_FILENAME,
     AlphaFold3ExecutionRequest,
-    execution_request_path,
     persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
@@ -319,10 +319,11 @@ def test_launch_restart_uses_candidate_operational_limits(
     assert snapshot.run.max_active_provider_calls == 4
     assert snapshot.run.max_active_gpu_provider_calls == 3
     assert FakeRuntime.created[0]["request"] == candidate_request
-    assert (
-        tmp_path.joinpath(*execution_request_path(SUCCESSOR_ID).parts).read_bytes()
-        == candidate_request.to_bytes()
+    request_path = (
+        ExecutionRunStore(tmp_path, SUCCESSOR_ID).state_root
+        / EXECUTION_REQUEST_FILENAME
     )
+    assert request_path.read_bytes() == candidate_request.to_bytes()
 
 
 def test_launch_restart_rejects_changed_science_before_creating_state(
@@ -355,7 +356,11 @@ def test_launch_restart_rejects_changed_science_before_creating_state(
         tmp_path,
         SUCCESSOR_ID,
     ).ledger_path.exists()
-    assert not tmp_path.joinpath(*execution_request_path(SUCCESSOR_ID).parts).exists()
+    request_path = (
+        ExecutionRunStore(tmp_path, SUCCESSOR_ID).state_root
+        / EXECUTION_REQUEST_FILENAME
+    )
+    assert not request_path.exists()
 
 
 def test_restart_rejects_a_gpu_limit_above_the_total_limit() -> None:

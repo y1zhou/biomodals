@@ -170,11 +170,6 @@ class AlphaFold3ExecutionRequest:
         return request
 
 
-def execution_request_path(execution_run_id: UUID) -> PurePosixPath:
-    """Return the Volume-relative immutable request path for one App Run."""
-    return _REQUEST_FILE.path(execution_run_id)
-
-
 def stage_execution_request(
     output_volume: Any,
     execution_run_id: UUID,

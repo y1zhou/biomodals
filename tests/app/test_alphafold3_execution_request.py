@@ -12,7 +12,6 @@ from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
-    execution_request_path,
     load_execution_request,
     persist_execution_request,
     stage_execution_request,
@@ -109,15 +108,11 @@ def test_execution_request_staging_is_immutable_and_remotely_revalidated(
     request = _request()
     volume = FakeVolume(tmp_path)
 
-    assert stage_execution_request(volume, RUN_ID, request) == (
-        execution_request_path(RUN_ID)
-    )
-    assert stage_execution_request(volume, RUN_ID, request) == (
-        execution_request_path(RUN_ID)
-    )
+    request_path = stage_execution_request(volume, RUN_ID, request)
+    assert stage_execution_request(volume, RUN_ID, request) == request_path
     assert load_execution_request(tmp_path, RUN_ID) == request
 
-    path = tmp_path.joinpath(*execution_request_path(RUN_ID).parts)
+    path = tmp_path.joinpath(*request_path.parts)
     path.write_bytes(_request(search_workers=1).to_bytes())
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_execution_request(volume, RUN_ID, request)
@@ -127,10 +122,6 @@ def test_coordinator_request_persistence_is_idempotent(tmp_path: Path) -> None:
     """Mounted coordinators can stage a successor request before its ledger."""
     request = _request()
 
-    assert persist_execution_request(tmp_path, RUN_ID, request) == (
-        execution_request_path(RUN_ID)
-    )
-    assert persist_execution_request(tmp_path, RUN_ID, request) == (
-        execution_request_path(RUN_ID)
-    )
+    request_path = persist_execution_request(tmp_path, RUN_ID, request)
+    assert persist_execution_request(tmp_path, RUN_ID, request) == request_path
     assert load_execution_request(tmp_path, RUN_ID) == request

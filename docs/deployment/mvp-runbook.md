@@ -75,6 +75,23 @@ Use `journalctl -u <unit-name>` to inspect startup failures and request IDs.
 Never paste Password Links, cookies, PDB data, or Modal secrets into a support
 record.
 
+### Pre-release service schema
+
+If startup reports service database version 3, stop the API process and run
+the explicit offline transition with the same configuration:
+
+```console
+uv run biomodals api transition-execution-state --yes
+```
+
+The transition preserves Users, Password Links, Sessions, and service and
+workload settings. It removes legacy Jobs and their local execution history,
+then installs the current execution schema. It does not change Modal Volumes.
+
+The command accepts only the known version 3 schema. Do not delete a database
+merely because startup rejects an unknown version; first confirm the selected
+configuration and exact database path.
+
 ## Static frontend and reverse proxy
 
 Build the frontend repository with its committed Bun lockfile, then stage the
@@ -161,8 +178,10 @@ The checklist must order these actions:
 Rollback restores the prior backend checkout and frontend static release as a
 pair, restores the prior service or container configuration if it changed,
 restarts the one API process, and waits for readiness. Do not point a
-rolled-back binary at an
-incompatible newer database. During the current disposable-state phase, stop
-the pre-release service and explicitly remove only the exact pre-release
-database named by its configuration when a schema reset is required. Never
-apply that reset instruction to production state or cache.
+rolled-back binary at an incompatible newer database. The documented
+pre-release transition is one-way.
+
+During the current disposable-state phase, an Administrator may stop the
+pre-release service and remove only its exact configured database when an
+unsupported schema requires a reset. This also deletes its Users and settings.
+Never apply that reset instruction to production state or cache.

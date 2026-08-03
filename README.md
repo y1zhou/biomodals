@@ -1,51 +1,98 @@
-# biomodals
+# BioModals
 
-Bioinformatics tools running on modal.
-Note that this repository is heavily refactored from [the upstream repository](https://github.com/hgbrian/biomodals).
-All new apps have the `_app.py` suffix to distinguish from the original ones.
+BioModals packages computational biology tools as independently deployable
+[Modal](https://modal.com/) apps and composes them into durable workflows.
+
+This repository also contains a reusable execution kernel and an optional
+FastAPI service. The service powers the separate
+[BioModals frontend](https://github.com/y1zhou/biomodals-frontend).
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/y1zhou/biomodals)
 
-## Installation
+## What is in this repository?
 
-```bash
-git clone https://github.com/y1zhou/biomodals.git
-cd biomodals
-pip install .
-biomodals --help
+BioModals supports three ways to run scientific work:
+
+| Goal | Start here |
+| --- | --- |
+| Run one packaged tool from a terminal | `biomodals app` |
+| Run a multi-tool DAG from a terminal | `biomodals workflow` |
+| Offer a tool through the web interface | `biomodals api` and the frontend repository |
+
+The same execution kernel provides durable task state, dependency scheduling,
+Modal call tracking, cancellation, and recovery for all three paths.
+
+## Architecture
+
+There are two main execution paths:
+
+```text
+CLI -> deployed app/workflow coordinator -> biomodals.execution -> Modal functions
+
+Browser -> static frontend -> FastAPI service -> biomodals.execution -> Modal functions
 ```
 
-Or alternatively, use [uv](https://github.com/astral-sh/uv), e.g.:
+`biomodals.execution` is an embedded Python library, not a central scheduler
+service. Each coordinator embeds it and owns the database for the work it
+coordinates.
+
+| Component | Responsibility |
+| --- | --- |
+| `biomodals.app` | Independently deployed scientific Modal apps |
+| `biomodals.workflow` | DAGs that compose app functions into larger pipelines |
+| `biomodals.execution` | Shared task, DAG, SQLite, scheduling, and Modal-call mechanics |
+| `biomodals.service` | Accounts, web Jobs, administration, Results, and HTTP routes |
+
+The kernel owns execution state only. Scientific cache validation, input and
+output formats, and publication rules remain with each app or workflow. User
+accounts and other non-execution service data remain in `biomodals.service`.
+
+## Quick start
+
+BioModals requires Python 3.12 or newer, a Modal account, and configured Modal
+credentials. The examples below use [uv](https://github.com/astral-sh/uv).
 
 ```bash
 git clone https://github.com/y1zhou/biomodals.git
 cd biomodals
+uv sync
 uv run biomodals --help
 ```
 
-## Getting started
+`pip install .` is also supported when uv is not available.
 
-To see a list of all available commands, run:
-
-```bash
-biomodals --help
-```
-
-To list and inspect apps:
+Discover the installed apps and workflows before running paid compute:
 
 ```bash
-biomodals app list
-biomodals app help <app-name>
+uv run biomodals app list
+uv run biomodals app help <app-name>
+
+uv run biomodals workflow list
+uv run biomodals workflow help <workflow-name>
 ```
 
-To list and inspect workflows:
+## Apps and workflows
+
+An **app** packages one scientific tool and its Modal functions. Apps can be
+deployed and run independently.
 
 ```bash
-biomodals workflow list
-biomodals workflow help <workflow-name>
+uv run biomodals app deploy <app-name> --env <environment>
+uv run biomodals app run <app-name> \
+  --environment <environment> -- <app-specific-options>
 ```
 
-To run a workflow, pass workflow-specific flags after `--`:
+A **workflow** constructs a scientific DAG from one or more tools. Workflow
+flags also follow `--` so the BioModals CLI can separate them from its own
+options.
+
+```bash
+uv run biomodals workflow run <workflow-name> \
+  --environment <environment> -- <workflow-specific-options>
+```
+
+Use `--dry-run` to build and print a workflow DAG without resolving a Modal
+deployment or starting remote work:
 
 ```bash
 uv run biomodals workflow run ppiflow --dry-run -- \
@@ -53,11 +100,22 @@ uv run biomodals workflow run ppiflow --dry-run -- \
   --steps-yaml examples/data/ppiflow_workflow_steps.yaml
 ```
 
-### Durable app and workflow runs
+Normal app and workflow runs target a deployed coordinator. The CLI resolves
+an exact deployment version before admitting work, even when the latest
+version is selected implicitly.
 
-Coordinator-aware apps and workflows target an exact deployed Modal version by
-default. A launch prints three values needed to address the durable Run from
-another process:
+Pass `--development` to run current app or workflow source through an
+ephemeral Modal app. Development runs are useful while editing code, but they
+do not provide durable cross-command recovery.
+
+An app entrypoint that has not yet adopted a deployment coordinator fails
+closed in normal mode. Use `--development` explicitly for that source-backed
+path.
+
+## Durable execution
+
+A coordinated launch prints the identity needed to inspect the run from a
+different process:
 
 ```text
 Deployment Identity: <environment>/<deployment-name>/v<version>
@@ -65,8 +123,7 @@ Execution Run ID: <uuid>
 Coordinator FunctionCall ID: <provider-call-id>
 ```
 
-Use the deployment fields and Execution Run ID with the shared lifecycle
-commands:
+Use the deployment identity and Execution Run ID with the lifecycle commands:
 
 ```bash
 biomodals run status \
@@ -74,13 +131,13 @@ biomodals run status \
   --deployment-name <deployment-name> \
   --deployment-version <version> \
   --execution-run-id <uuid>
-
-biomodals run cancel  <the same four locator options>
-biomodals run resume  <the same four locator options>
 ```
 
-`resume` continues the same suspended Run and never retries a conclusively
-failed Task. To retry missing work, create a linked Successor Run:
+The same locator options apply to `biomodals run cancel` and
+`biomodals run resume`.
+
+`resume` continues a suspended run. It never retries a task that failed
+conclusively. To retry missing work, create a linked successor run:
 
 ```bash
 biomodals run restart \
@@ -93,114 +150,159 @@ biomodals run restart \
   --target-deployment-version <target-version>
 ```
 
-Restart first verifies that the result-affecting workload plan is unchanged,
-then reuses valid publications and schedules only conclusively missing work.
-Repeating a launch without `--restart-from` creates a new root Run.
+Restart verifies that the result-affecting plan is unchanged. It reuses valid
+publications and schedules only conclusively missing work. Repeating the
+original launch without `--restart-from` creates a separate root run.
 
-Pass `--development` to `biomodals app run` for explicit source-backed
-development through an ephemeral `modal run`. Normal app and workflow commands
-execute their thin client locally and call the exact deployed coordinator; they
-do not create an ephemeral launcher app. Development mode has no cross-process
-recovery. An app entrypoint that does not yet expose a Deployment Coordinator
-Adapter fails closed unless `--development` is explicit. Workflow `--dry-run`
-validates and prints the DAG locally without resolving a deployment or starting
-Modal work.
+Durable state follows the coordinator that owns the run:
 
-## API server
+| Caller | Execution database |
+| --- | --- |
+| Direct CLI app run | One remote, per-run app ledger |
+| CLI workflow run | One remote, per-run workflow ledger |
+| FastAPI service | Shared execution tables inside `service.sqlite3` |
 
-The API is one local FastAPI control plane for GROMACS and future workloads.
-It submits scientific work to separately deployed Modal Apps; it is not a
-Modal web endpoint.
+The local CLI does not create an execution database. Provider workers also do
+not write SQLite; their owning coordinator records observations and outcomes.
 
-### Local development
+For the complete model, see
+[ADR 0006](docs/adr/0006-unified-execution-kernel.md) and the
+[unified task scheduler specification](docs/specs/unified-task-scheduler.md).
 
-Install the API dependencies and deploy the GROMACS compute App in the Modal
-Environment used by your development server:
+## Web API
+
+The optional FastAPI service is a single-host control plane for the BioModals
+web interface. It currently exposes the GROMACS MD simulation and is designed
+to add more workload adapters without changing account or Job routes.
+
+The service owns Users, Sessions, Jobs, runtime settings, Result staging, and
+the mapping from a web Job to its kernel Execution Run. It calls established,
+separately deployed Modal functions; it is not a Modal web endpoint.
+
+The browser application lives in the
+[biomodals-frontend repository](https://github.com/y1zhou/biomodals-frontend).
+It uses same-origin `/api` requests and generated OpenAPI types.
+
+### Local API development
+
+Install the API dependencies and deploy the GROMACS app in the Modal
+Environment selected by the development configuration:
 
 ```bash
 uv sync --extra api
 uv run biomodals app deploy gromacs --env production
 ```
 
-Copy [`.env.example`](.env.example), fill in a Modal service-user token, and
-point the API at the private file. The copied `.env` is ignored by Git and
-must remain readable only by its owner:
+Copy [`.env.example`](.env.example), replace both Modal token placeholders,
+and keep the private copy out of Git:
 
 ```bash
 install -m 600 .env.example .env
-# Edit .env and replace both Modal token placeholders.
 export BIOMODALS_API_CONF_ENV="$PWD/.env"
-
 uv run biomodals api serve
 ```
 
-Explicit process environment variables override values in the file. Relative
-state and cache paths are resolved from the directory containing `.env`.
-The example keeps both under the repository-root `.biomodals/` directory.
-The backend refuses to start unless both `MODAL_TOKEN_ID` and
-`MODAL_TOKEN_SECRET` are present. The token secret remains process-only and is
-never stored in SQLite or returned by the API. `BIOMODALS_PUBLIC_URL` is the
-single browser origin used for Password Links and mutation Origin checks.
+The backend refuses to start unless `MODAL_TOKEN_ID` and
+`MODAL_TOKEN_SECRET` are present. The secret remains process-only and is never
+stored in SQLite or returned by the API.
 
-The development server listens on `127.0.0.1:4144` by default. Use `--host`
-or `--port` to override either value; the command keeps the required worker
-count at one.
+Relative state and cache paths are resolved from the directory containing the
+configured `.env` file. The development example keeps them under the
+repository-root `.biomodals/` directory.
+
+Explicit process environment variables override values from the file.
+Administrator-editable runtime settings resolve in this order: process
+environment, database value, `.env` value, then built-in default.
+
+`BIOMODALS_PUBLIC_URL` is the single browser origin used for Password Links
+and mutation Origin checks. The development server listens on
+`127.0.0.1:4144` by default and uses one worker.
 
 Configure the frontend development server to proxy `/api` to
-`http://127.0.0.1:4144`. The browser then uses ordinary same-origin,
-HTTP-only session cookies. `BIOMODALS_SECURE_COOKIES` defaults to `false` for
-local HTTP; set it to `true` behind the production HTTPS reverse proxy.
+`http://127.0.0.1:4144`. The browser can then use same-origin, HTTP-only
+Session cookies.
 
-There is no public registration. An administrator provisions an employee and
-delivers the printed one-hour password link through a trusted internal channel:
+`BIOMODALS_SECURE_COOKIES` defaults to `false` for local HTTP. Set it to
+`true` behind the production HTTPS reverse proxy.
+
+### Create the first administrator
+
+There is no public registration. The first User must be created as an
+Administrator:
 
 ```bash
 uv run biomodals api admin create-user alice@example.com \
   --display-name "Alice Example" --admin
 ```
 
-The admin command must use the same `BIOMODALS_API_CONF_ENV` or explicit state
-configuration as the server. Related commands include `reset-password`,
-`disable-user`, `enable-user`, `promote-user`, and `demote-user`. The final
-active administrator cannot be disabled or demoted, and the first User must be
-created with `--admin`.
+The command prints a one-hour Password Link for delivery through a trusted
+internal channel. It must use the same `BIOMODALS_API_CONF_ENV` or explicit
+state configuration as the API process.
 
-### Pre-release execution-state transition
+Related commands include `reset-password`, `disable-user`, `enable-user`,
+`promote-user`, and `demote-user`. The final active Administrator cannot be
+disabled or demoted.
 
-The unified execution kernel intentionally does not migrate pre-release Job
-history. If startup reports service database version 3, stop the API process
-and run the explicit offline transition with the same configuration:
+### Pre-release database transition
+
+The execution kernel intentionally does not migrate pre-release Job history.
+If startup reports service database version 3, stop the API and run:
 
 ```bash
 uv run biomodals api transition-execution-state --yes
 ```
 
-The command preserves Users, password tokens, sessions, service settings, and
-per-workload settings. It discards legacy Jobs and their local execution
-history, then installs the current shared execution schema. Remote Modal
-Volumes and workload publications are not changed. The command rejects an
-unexpected source schema rather than guessing how to rewrite it.
+The transition preserves Users, Password Links, Sessions, and service and
+workload settings. It discards legacy Jobs and their local execution history.
 
-Administrators can manage Users, per-Tool Job Log visibility, and non-secret
-live Modal configuration in the web interface. Modal runtime setting precedence
-is process environment, database Admin value, configured `.env` file, then
-built-in default. Process-controlled fields are read-only in the Admin
-interface. Job Log visibility is a live database override over the Tool's
-built-in default; it has no process-environment or `.env` override.
+Remote Modal Volumes and workload publications are unchanged. The command
+rejects an unexpected source schema instead of guessing how to rewrite it.
 
-### Production deployment
+## Production deployment
 
-The [production deployment examples](deploy/README.md) cover a native systemd
-service, Docker Compose, and a Podman Quadlet. Each example binds the API only
-to `127.0.0.1:4100` for a same-origin HTTPS reverse proxy. Copy and review an
-example before use; never commit real Modal credentials.
+Production examples cover a native systemd service, Docker Compose, and a
+Podman Quadlet. They bind one API process to `127.0.0.1:4100` behind a
+same-origin HTTPS reverse proxy.
 
-Run the API as one process under a dedicated Linux and Modal service user. Only
-boot-critical host values belong in the service definition. Leaving the Modal
-Environment, deployed App name, and admission limits out of the process
-environment keeps those fields editable in the Admin interface.
-
-The local cache contains rebuildable Result ZIP files; Modal Volume storage
-remains authoritative for Results and intermediates. See the
+Start with the [deployment examples](deploy/README.md). Use the
 [MVP deployment runbook](docs/deployment/mvp-runbook.md) for readiness,
-change-aware manual checks, and rollback guidance.
+cross-repository checks, manual smoke tests, and rollback guidance.
+
+Run the API as a dedicated Linux and Modal service user. Keep SQLite state
+separate from the rebuildable local Result cache. Modal Volume storage remains
+authoritative for Results and scientific intermediates.
+
+## Repository map
+
+| Path | Contents |
+| --- | --- |
+| `src/biomodals/app/` | Scientific Modal apps |
+| `src/biomodals/workflow/` | Multi-app scientific workflows |
+| `src/biomodals/execution/` | Shared execution kernel |
+| `src/biomodals/service/` | FastAPI control plane and workload adapters |
+| `src/biomodals/schema/` | Shared scientific input and output schemas |
+| `examples/` | Example app and workflow inputs |
+| `deploy/` | Production deployment examples |
+| `docs/` | Decisions, specifications, research, and runbooks |
+
+Use the documentation by purpose:
+
+- [`docs/adr/`](docs/adr/) records accepted architecture decisions. ADR 0001
+  is explicitly superseded by ADR 0006.
+- [`docs/specs/unified-task-scheduler.md`](docs/specs/unified-task-scheduler.md)
+  is the implementation contract for durable execution.
+- [`docs/specs/mvp-release-readiness.md`](docs/specs/mvp-release-readiness.md)
+  is the backend and frontend MVP contract.
+- [`docs/research/api-service-architecture.md`](docs/research/api-service-architecture.md)
+  explains the service boundary and identifies the execution sections
+  superseded by ADR 0006.
+- [`docs/agents/app-development.md`](docs/agents/app-development.md) and
+  [`docs/agents/workflow-development.md`](docs/agents/workflow-development.md)
+  route contributors to the current development guidance.
+
+## Project history
+
+This repository is heavily refactored from the
+[upstream BioModals project](https://github.com/hgbrian/biomodals). The
+`*_app.py` suffix distinguishes the maintained app modules introduced by this
+fork from inherited modules.

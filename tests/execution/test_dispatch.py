@@ -8,7 +8,15 @@ from dataclasses import replace
 import orjson
 import pytest
 
-from biomodals.execution import ProviderBinding
+from biomodals.execution import (
+    AvailabilityStatus,
+    DeploymentIdentity,
+    ExecutionPlan,
+    NodePlan,
+    ProviderBinding,
+    SqliteExecutionRepository,
+    TaskPlan,
+)
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
@@ -207,7 +215,7 @@ def test_ready_dispatch_query_uses_the_resource_class_index() -> None:
             ON node.execution_run_id = task.execution_run_id
             AND node.node_key = task.node_key
         WHERE task.execution_run_id = ?
-            AND task.node_key IN (?)
+            AND task.node_key = ?
             AND node.status = ?
             AND node.discovery_complete = 1
             AND task.status = ?
@@ -217,7 +225,7 @@ def test_ready_dispatch_query_uses_the_resource_class_index() -> None:
                 task.dispatch_policy_json,
                 '$.binding.uses_gpu'
             ) = ?
-        ORDER BY node.ordinal, task.ordinal
+        ORDER BY task.ordinal
         LIMIT ?
         """,
         (str(RUN_ID), "inference", "running", "pending", "missing", 1, 8),
@@ -227,6 +235,78 @@ def test_ready_dispatch_query_uses_the_resource_class_index() -> None:
         "execution_tasks_ready_dispatch_resource_idx" in str(row[3])
         for row in query_plan
     )
+    assert all("USE TEMP B-TREE" not in str(row[3]) for row in query_plan)
+
+
+def test_ready_dispatch_window_stops_after_its_node_limit() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SqliteExecutionRepository(connection)
+    repository.initialize_schema()
+    node_keys = tuple(f"node-{index}" for index in range(10))
+    repository.create_run(
+        execution_run_id=RUN_ID,
+        plan=ExecutionPlan(
+            workload_name="fanout",
+            nodes=tuple(NodePlan(node_key=node_key) for node_key in node_keys),
+        ),
+        deployment=DeploymentIdentity("production", "fanout", 1),
+        max_active_provider_calls=10,
+        max_active_gpu_provider_calls=10,
+        now=100,
+    )
+    descriptors = []
+    for ordinal, node_key in enumerate(node_keys):
+        repository.start_node(RUN_ID, node_key, now=101)
+        repository.discover_tasks(
+            RUN_ID,
+            node_key,
+            (TaskPlan("task", {"node": node_key}),),
+            now=102,
+        )
+        repository.record_task_result_observation(
+            RUN_ID,
+            node_key,
+            "task",
+            AvailabilityStatus.MISSING,
+            now=103,
+        )
+        descriptors.append(
+            TaskDispatchDescriptor(
+                node_key=node_key,
+                node_ordinal=ordinal,
+                task_key="task",
+                task_ordinal=0,
+                binding=GPU,
+                compatibility_key=node_key,
+                max_tasks_per_call=1,
+                depth=1,
+                unblocking_span=1,
+            )
+        )
+    repository.persist_fixed_dispatch_policy(RUN_ID, tuple(descriptors), now=104)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    window = repository.list_ready_fixed_dispatch_descriptors(
+        RUN_ID,
+        node_keys,
+        uses_gpu=True,
+        depth=1,
+        unblocking_span=1,
+        limit=2,
+    )
+
+    connection.set_trace_callback(None)
+    window_queries = [
+        statement
+        for statement in statements
+        if "SELECT task.*, node.ordinal AS node_ordinal" in statement
+    ]
+    assert [(item.node_key, item.task_key) for item in window] == [
+        ("node-0", "task"),
+        ("node-1", "task"),
+    ]
+    assert len(window_queries) == 2
 
 
 def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:

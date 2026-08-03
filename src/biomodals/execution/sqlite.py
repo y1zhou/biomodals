@@ -2985,44 +2985,50 @@ class SqliteExecutionRepository:
         unblocking_span: int,
         limit: int,
     ) -> tuple[TaskDispatchDescriptor, ...]:
-        """Load one bounded graph/resource window from durable Task policy."""
+        """Load a bounded window in the caller's stable Node order."""
         if limit < 1:
             raise ValueError("dispatch descriptor limit must be positive")
         ordered_keys = tuple(dict.fromkeys(node_keys))
         if not ordered_keys:
             return ()
-        placeholders = ", ".join("?" for _ in ordered_keys)
-        rows = self._connection.execute(
-            f"""
-            SELECT task.*, node.ordinal AS node_ordinal
-            FROM execution_tasks AS task
-            JOIN execution_nodes AS node
-                ON node.execution_run_id = task.execution_run_id
-                AND node.node_key = task.node_key
-            WHERE task.execution_run_id = ?
-                AND task.node_key IN ({placeholders})
-                AND node.status = ?
-                AND node.discovery_complete = 1
-                AND task.status = ?
-                AND task.result_observation = ?
-                AND task.dispatch_policy_json IS NOT NULL
-                AND json_extract(
-                    task.dispatch_policy_json,
-                    '$.binding.uses_gpu'
-                ) = ?
-            ORDER BY node.ordinal, task.ordinal
-            LIMIT ?
-            """,  # noqa: S608 - placeholders are generated, not user input
-            (
-                str(execution_run_id),
-                *ordered_keys,
-                NodeStatus.RUNNING.value,
-                TaskStatus.PENDING.value,
-                AvailabilityStatus.MISSING.value,
-                int(uses_gpu),
-                limit,
-            ),
-        ).fetchall()
+        rows: list[sqlite3.Row] = []
+        for node_key in ordered_keys:
+            remaining = limit - len(rows)
+            if remaining == 0:
+                break
+            rows.extend(
+                self._connection.execute(
+                    """
+                    SELECT task.*, node.ordinal AS node_ordinal
+                    FROM execution_tasks AS task
+                    JOIN execution_nodes AS node
+                        ON node.execution_run_id = task.execution_run_id
+                        AND node.node_key = task.node_key
+                    WHERE task.execution_run_id = ?
+                        AND task.node_key = ?
+                        AND node.status = ?
+                        AND node.discovery_complete = 1
+                        AND task.status = ?
+                        AND task.result_observation = ?
+                        AND task.dispatch_policy_json IS NOT NULL
+                        AND json_extract(
+                            task.dispatch_policy_json,
+                            '$.binding.uses_gpu'
+                        ) = ?
+                    ORDER BY task.ordinal
+                    LIMIT ?
+                    """,
+                    (
+                        str(execution_run_id),
+                        node_key,
+                        NodeStatus.RUNNING.value,
+                        TaskStatus.PENDING.value,
+                        AvailabilityStatus.MISSING.value,
+                        int(uses_gpu),
+                        remaining,
+                    ),
+                ).fetchall()
+            )
         return tuple(
             _task_dispatch_descriptor_from_row(
                 row,

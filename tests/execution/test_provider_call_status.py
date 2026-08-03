@@ -140,7 +140,7 @@ def test_call_lifecycle_rejects_missing_attachment_identity_and_illegal_rewrites
         )
 
 
-def test_listing_provider_calls_bulk_loads_owned_task_keys() -> None:
+def test_listing_provider_calls_uses_bounded_ownership_queries() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(
         connection=connection,
@@ -182,4 +182,4 @@ def test_listing_provider_calls_bulk_loads_owned_task_keys() -> None:
         ("seed-1",),
         ("seed-2",),
     ]
-    assert len(task_selects) == 1
+    assert len(task_selects) == 2

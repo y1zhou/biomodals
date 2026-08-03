@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103, S106
 
+import sqlite3
+
 from biomodals.execution import (
     AvailabilityStatus,
     NodeAggregationPolicy,
@@ -55,6 +57,31 @@ def test_task_aggregation_policies_are_strict_and_non_vacuous() -> None:
         is None
     )
     assert aggregate_task_outcome(NodeAggregationPolicy.COLLECT_ALL, ()) is None
+
+
+def test_node_reconciliation_reads_status_counts_not_task_payloads() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=100)
+    connection.execute(
+        """
+        UPDATE execution_tasks
+        SET status = ?, completed_at = ?, updated_at = ?
+        WHERE execution_run_id = ? AND node_key = ?
+        """,
+        (TaskStatus.SUCCEEDED.value, 110, 110, str(RUN_ID), "inference"),
+    )
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    node = repository.reconcile_node_tasks(RUN_ID, "inference", now=111)
+
+    connection.set_trace_callback(None)
+    task_selects = [
+        statement for statement in statements if "FROM execution_tasks" in statement
+    ]
+    assert node.status == NodeStatus.SUCCEEDED
+    assert task_selects
+    assert all("scientific_payload_json" not in statement for statement in task_selects)
 
 
 def test_fail_fast_skips_only_unowned_siblings_and_drains_owned_work() -> None:

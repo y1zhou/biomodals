@@ -40,7 +40,7 @@ from biomodals.execution.model import (
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
-    aggregate_task_outcome,
+    aggregate_task_status_counts,
     propagated_skip_node_keys,
     terminal_run_outcome,
 )
@@ -1937,10 +1937,10 @@ class SqliteExecutionRepository:
             node_key,
             now=now,
         )
-        tasks = self.list_tasks(execution_run_id, node_key)
-        outcome = aggregate_task_outcome(
+        _task_count, outcome = self.summarize_node_tasks(
+            execution_run_id,
+            node_key,
             node.aggregation_policy,
-            tuple(task.status for task in tasks),
         )
         if outcome is None:
             return self.get_node(execution_run_id, node_key)
@@ -1978,18 +1978,33 @@ class SqliteExecutionRepository:
         node = self.get_node(execution_run_id, node_key)
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             raise ValueError("Node Task policy cannot run before discovery")
-        tasks = self.list_tasks(execution_run_id, node_key)
-        if node.aggregation_policy != NodeAggregationPolicy.FAIL_FAST or not any(
-            task.status == TaskStatus.FAILED for task in tasks
-        ):
+        if node.aggregation_policy != NodeAggregationPolicy.FAIL_FAST:
+            return ()
+        failed = self._connection.execute(
+            """
+            SELECT 1 FROM execution_tasks
+            WHERE execution_run_id = ? AND node_key = ? AND status = ?
+            LIMIT 1
+            """,
+            (str(execution_run_id), node_key, TaskStatus.FAILED.value),
+        ).fetchone()
+        if failed is None:
             return ()
         skipped = tuple(
-            task.task_key
-            for task in tasks
-            if task.status == TaskStatus.PENDING
-            and task.provider_call_id is None
-            and task.worker_provider_call_id is None
-            and not task.local_owned
+            str(row["task_key"])
+            for row in self._connection.execute(
+                """
+                SELECT task_key FROM execution_tasks
+                WHERE execution_run_id = ?
+                    AND node_key = ?
+                    AND status = ?
+                    AND provider_call_id IS NULL
+                    AND worker_provider_call_id IS NULL
+                    AND local_owned = 0
+                ORDER BY ordinal
+                """,
+                (str(execution_run_id), node_key, TaskStatus.PENDING.value),
+            ).fetchall()
         )
         if not skipped:
             return ()
@@ -2016,6 +2031,25 @@ class SqliteExecutionRepository:
             ),
         )
         return skipped
+
+    def summarize_node_tasks(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        policy: NodeAggregationPolicy,
+    ) -> tuple[int, NodeStatus | None]:
+        """Return Task count and aggregate outcome from compact SQL counts."""
+        rows = self._connection.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM execution_tasks
+            WHERE execution_run_id = ? AND node_key = ?
+            GROUP BY status
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchall()
+        counts = {TaskStatus(row["status"]): int(row["count"]) for row in rows}
+        return sum(counts.values()), aggregate_task_status_counts(policy, counts)
 
     def skip_unreachable_nodes(
         self,

@@ -1,6 +1,6 @@
 """Pure DAG readiness and admission decisions."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -410,12 +410,24 @@ def aggregate_task_outcome(
     task_statuses: tuple[TaskStatus, ...],
 ) -> NodeStatus | None:
     """Return a Node outcome once every discovered Task is terminal."""
-    if not task_statuses or not all(status.is_terminal for status in task_statuses):
+    return aggregate_task_status_counts(policy, Counter(task_statuses))
+
+
+def aggregate_task_status_counts(
+    policy: NodeAggregationPolicy,
+    status_counts: Mapping[TaskStatus, int],
+) -> NodeStatus | None:
+    """Aggregate Task states without materializing every Task record."""
+    total = sum(status_counts.values())
+    terminal = sum(
+        count for status, count in status_counts.items() if status.is_terminal
+    )
+    if not total or terminal != total:
         return None
-    if TaskStatus.CANCELLED in task_statuses:
+    if status_counts.get(TaskStatus.CANCELLED, 0):
         return NodeStatus.CANCELLED
-    succeeded = task_statuses.count(TaskStatus.SUCCEEDED)
-    if succeeded == len(task_statuses):
+    succeeded = status_counts.get(TaskStatus.SUCCEEDED, 0)
+    if succeeded == total:
         return NodeStatus.SUCCEEDED
     if policy == NodeAggregationPolicy.ALLOW_PARTIAL and succeeded:
         return NodeStatus.PARTIAL

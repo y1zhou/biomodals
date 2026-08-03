@@ -35,7 +35,6 @@ from biomodals.execution import (
     SqliteExecutionRepository,
     TaskPlan,
     TaskStatus,
-    aggregate_task_outcome,
     drive_execution_run,
     ready_node_keys,
     required_node_keys,
@@ -1400,15 +1399,14 @@ class WorkflowRuntime:
                 now=self._now(),
             )
         with self.store.synchronize():
-            tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
-        empty_result = not tasks
-        outcome = (
-            NodeStatus.SUCCEEDED
-            if empty_result and allow_empty_result
-            else aggregate_task_outcome(
+            task_count, outcome = self.store.execution.summarize_node_tasks(
+                self.execution_run_id,
+                node_id,
                 aggregation_policy,
-                tuple(task.status for task in tasks),
             )
+        empty_result = task_count == 0
+        outcome = (
+            NodeStatus.SUCCEEDED if empty_result and allow_empty_result else outcome
         )
         if outcome is None:
             return
@@ -1465,6 +1463,8 @@ class WorkflowRuntime:
                         )
                 return
 
+        with self.store.synchronize():
+            tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
         results: dict[str, AppRunResult] = {}
         errors: dict[str, str] = {}
         task_artifacts: list[WorkflowArtifact] = []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Collection, Mapping
+from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -1179,7 +1180,11 @@ class SqliteExecutionRepository:
             if task["ordinal"] != descriptor.task_ordinal:
                 raise ValueError("fixed-batch Task ordinal does not match discovery")
 
-            policy_json = _fixed_dispatch_policy_json(descriptor)
+            policy_json = _fixed_dispatch_policy_json_from_parts(
+                binding=descriptor.binding,
+                compatibility_key=descriptor.compatibility_key,
+                max_tasks_per_call=descriptor.max_tasks_per_call,
+            )
             existing_policy = task["dispatch_policy_json"]
             if existing_policy is not None and existing_policy != policy_json:
                 raise ValueError(
@@ -1285,7 +1290,12 @@ class SqliteExecutionRepository:
         }:
             raise ValueError("dispatch mode cannot change within a Run")
 
-        policy_json = _pull_worker_dispatch_policy_json(descriptor)
+        policy_json = _pull_worker_dispatch_policy_json_from_parts(
+            binding=descriptor.binding,
+            compatibility_key=descriptor.compatibility_key,
+            claim_capacity=descriptor.claim_capacity,
+            max_worker_calls=descriptor.max_worker_calls,
+        )
         existing_policy = node["dispatch_policy_json"]
         if existing_policy is not None and existing_policy != policy_json:
             raise ValueError("pull-worker dispatch policy cannot change within a Run")
@@ -1568,17 +1578,10 @@ class SqliteExecutionRepository:
         )
         if node_policy["dispatch_policy_json"] != expected_node_policy_json:
             raise ValueError("pull-worker dispatch policy cannot change within a Run")
-        policy_json = _dump_json({
-            "binding": _binding_json_value(binding),
-            "claim_capacity": claim_capacity,
-            "compatibility_key": compatibility_key,
-            "max_worker_calls": max_worker_calls,
-            "node_key": node_key,
-        })
+        policy_json = node_policy["dispatch_policy_json"]
         preclaim_json = _dump_json({
-            "mode": DispatchMode.PULL_WORKER.value,
-            "policy": orjson.loads(policy_json),
-            "submission_token": submission_token,
+            "node_key": node_key,
+            "policy": node_policy_value,
         })
         existing = self._connection.execute(
             """
@@ -4098,16 +4101,6 @@ def _binding_from_json_value(value: Mapping[str, Any]) -> ProviderBinding:
     )
 
 
-def _fixed_dispatch_policy_json(
-    descriptor: TaskDispatchDescriptor,
-) -> str:
-    return _fixed_dispatch_policy_json_from_parts(
-        binding=descriptor.binding,
-        compatibility_key=descriptor.compatibility_key,
-        max_tasks_per_call=descriptor.max_tasks_per_call,
-    )
-
-
 def _fixed_dispatch_policy_json_from_parts(
     *,
     binding: ProviderBinding,
@@ -4129,16 +4122,11 @@ def _task_dispatch_descriptor_from_policy(
     value = orjson.loads(policy_json)
     if value.get("mode") != DispatchMode.FIXED_BATCH.value:
         raise RuntimeError("stored fixed-batch dispatch policy is invalid")
-    return TaskDispatchDescriptor(
-        node_key=descriptor.node_key,
-        node_ordinal=descriptor.node_ordinal,
-        task_key=descriptor.task_key,
-        task_ordinal=descriptor.task_ordinal,
+    return replace(
+        descriptor,
         binding=_binding_from_json_value(value["binding"]),
         compatibility_key=value["compatibility_key"],
         max_tasks_per_call=value["max_tasks_per_call"],
-        depth=descriptor.depth,
-        unblocking_span=descriptor.unblocking_span,
     )
 
 
@@ -4167,17 +4155,6 @@ def _task_dispatch_descriptor_from_row(
     )
 
 
-def _pull_worker_dispatch_policy_json(
-    descriptor: PullWorkerDispatchDescriptor,
-) -> str:
-    return _pull_worker_dispatch_policy_json_from_parts(
-        binding=descriptor.binding,
-        compatibility_key=descriptor.compatibility_key,
-        claim_capacity=descriptor.claim_capacity,
-        max_worker_calls=descriptor.max_worker_calls,
-    )
-
-
 def _pull_worker_dispatch_policy_json_from_parts(
     *,
     binding: ProviderBinding,
@@ -4201,16 +4178,10 @@ def _pull_worker_descriptor_from_policy(
     value = orjson.loads(policy_json)
     if value.get("mode") != DispatchMode.PULL_WORKER.value:
         raise RuntimeError("stored pull-worker dispatch policy is invalid")
-    return PullWorkerDispatchDescriptor(
-        node_key=descriptor.node_key,
-        node_ordinal=descriptor.node_ordinal,
+    return replace(
+        descriptor,
         binding=_binding_from_json_value(value["binding"]),
         compatibility_key=value["compatibility_key"],
         claim_capacity=value["claim_capacity"],
         max_worker_calls=value["max_worker_calls"],
-        unfinished_task_count=descriptor.unfinished_task_count,
-        nonterminal_worker_count=descriptor.nonterminal_worker_count,
-        next_worker_ordinal=descriptor.next_worker_ordinal,
-        depth=descriptor.depth,
-        unblocking_span=descriptor.unblocking_span,
     )

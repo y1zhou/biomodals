@@ -101,7 +101,7 @@ from dataclasses import dataclass
 from itertools import count, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeVar, cast
+from typing import cast
 from uuid import UUID, uuid4
 
 import modal
@@ -154,7 +154,6 @@ TARGETSCAN_RNAPLFOLD_MAX_WORKERS = 32
 TARGETSCAN_RNAPLFOLD_MANIFEST_VERSION = 1
 TARGETSCAN_RNAPLFOLD_CACHE_MARKER_VERSION = 2
 
-T = TypeVar("T")
 TARGETSCAN_COLUMNS = ("refseq", "siRNA", "targetscan_score")
 TARGETSCAN_HEADER = "\t".join(TARGETSCAN_COLUMNS)
 
@@ -2279,15 +2278,6 @@ def _targetscan_ref_shard_size(
     return max(1, (utr_count + prepare_nodes - 1) // prepare_nodes)
 
 
-def _bounded_node_count(task_count: int, configured_nodes: int) -> int:
-    """Return a per-run Modal node count capped to the task count."""
-    if configured_nodes < 1:
-        raise ValueError("configured_nodes must be a positive integer")
-    if task_count < 1:
-        return 1
-    return max(1, min(configured_nodes, task_count))
-
-
 def _validated_worker_count(
     value: int,
     *,
@@ -2307,16 +2297,6 @@ def _targetscan_rnaplfold_worker_count(configured_workers: int) -> int:
         name="targetscan_rnaplfold_workers",
         maximum=TARGETSCAN_RNAPLFOLD_MAX_WORKERS,
     )
-
-
-def _targetscan_rnaplfold_node_count(task_count: int, configured_nodes: int) -> int:
-    """Return validated RNAplfold fanout within the deployment limit."""
-    if not 1 <= configured_nodes <= TARGETSCAN_RNAPLFOLD_MAX_NODES:
-        raise ValueError(
-            "targetscan_rnaplfold_nodes must be between 1 and "
-            f"{TARGETSCAN_RNAPLFOLD_MAX_NODES}"
-        )
-    return _bounded_node_count(task_count, configured_nodes)
 
 
 def _unique_tmp_path(path: Path) -> Path:
@@ -2690,58 +2670,6 @@ def _targetscan_batch_logs_dir(spec: TargetscanBatchSpec) -> Path:
         / f"size_{spec.ref_shard_size}"
         / f"{spec.shard_index:05d}"
     )
-
-
-def _batch_items_for_local_workers(  # noqa: UP047 - runtime image uses Python 3.10.
-    items: list[T],
-    *,
-    max_nodes: int,
-    local_workers: int,
-) -> list[list[T]]:
-    """Split work so each Modal node can keep local workers busy."""
-    if not items:
-        return []
-    if max_nodes < 1:
-        raise ValueError("max_nodes must be at least 1")
-    if local_workers < 1:
-        raise ValueError("local_workers must be at least 1")
-
-    worker_sized_node_count = (len(items) + local_workers - 1) // local_workers
-    if worker_sized_node_count <= max_nodes:
-        batch_size = local_workers
-    else:
-        batch_size = (len(items) + max_nodes - 1) // max_nodes
-    return [
-        items[index : index + batch_size] for index in range(0, len(items), batch_size)
-    ]
-
-
-def _bounded_worker_topology(
-    *,
-    task_count: int,
-    configured_nodes: int,
-    configured_workers: int,
-    max_process_slots: int | None,
-) -> tuple[int, int]:
-    """Cap Modal nodes times local workers to one branch-wide slot budget."""
-    if task_count < 1:
-        return 0, 1
-    if configured_nodes < 1 or configured_workers < 1:
-        raise ValueError("Configured nodes and workers must be positive")
-    slot_count = (
-        configured_nodes * configured_workers
-        if max_process_slots is None
-        else max_process_slots
-    )
-    if slot_count < 1:
-        raise ValueError("max_process_slots must be a positive integer")
-    local_workers = min(configured_workers, task_count, slot_count)
-    node_count = min(
-        configured_nodes,
-        (task_count + local_workers - 1) // local_workers,
-        max(1, slot_count // local_workers),
-    )
-    return node_count, local_workers
 
 
 def _write_pita_stage0_script(
@@ -4366,31 +4294,6 @@ def _cleanup_off_target_transients(raw_off_target_dir: Path) -> None:
             shutil.rmtree(child, ignore_errors=True)
         else:
             child.unlink(missing_ok=True)
-
-
-def _discard_invalid_off_target_evidence(
-    raw_off_target_dir: Path,
-    *,
-    expected_identity: str,
-) -> bool:
-    """Discard one invalid published evidence set after acquiring rebuild ownership."""
-    marker_path = raw_off_target_dir / "off_target.done"
-    if _raw_off_target_ready(
-        raw_off_target_dir,
-        expected_identity=expected_identity,
-    ):
-        return False
-    evidence_paths = (
-        marker_path,
-        raw_off_target_dir / "pita.tab",
-        raw_off_target_dir / "targetscan.tab",
-    )
-    had_artifacts = any(path.exists() for path in evidence_paths)
-    # Invalidate publication first; tables without the manifest are never reusable.
-    marker_path.unlink(missing_ok=True)
-    raw_off_target_dir.joinpath("pita.tab").unlink(missing_ok=True)
-    raw_off_target_dir.joinpath("targetscan.tab").unlink(missing_ok=True)
-    return had_artifacts
 
 
 def _run_pita_row_shard(

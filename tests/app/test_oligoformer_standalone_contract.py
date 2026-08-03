@@ -1270,92 +1270,6 @@ def test_off_target_manifest_accepts_no_hit_pita_evidence(tmp_path: Path):
     assert manifest["tables"]["pita.tab"]["row_count"] == 0
 
 
-def test_orphaned_off_target_tables_are_discarded_without_marker(
-    tmp_path: Path,
-) -> None:
-    raw_dir = tmp_path / "run" / "prepare" / "off_target" / "target"
-    raw_dir.mkdir(parents=True)
-    raw_dir.joinpath("pita.tab").write_text("orphaned\n", encoding="utf-8")
-    raw_dir.joinpath("targetscan.tab").write_text("orphaned\n", encoding="utf-8")
-
-    assert oligoformer_app._discard_invalid_off_target_evidence(
-        raw_dir,
-        expected_identity="evidence-v1",
-    )
-    assert not raw_dir.joinpath("pita.tab").exists()
-    assert not raw_dir.joinpath("targetscan.tab").exists()
-
-
-def test_corrupt_completed_evidence_advances_one_repair_generation(
-    tmp_path: Path,
-    monkeypatch,
-):
-    raw_dir = tmp_path / "run" / "prepare" / "off_target" / "target"
-    raw_dir.mkdir(parents=True)
-    pita_contents = "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-1\n"
-    targetscan_contents = "ref\tRNA0\t0.5\n"
-    raw_dir.joinpath("pita.tab").write_text(pita_contents, encoding="utf-8")
-    raw_dir.joinpath("targetscan.tab").write_text(
-        targetscan_contents,
-        encoding="utf-8",
-    )
-    identity = "evidence-v1"
-    oligoformer_app._publish_off_target_manifest(raw_dir, identity=identity)
-    raw_dir.joinpath("targetscan.tab").write_text("truncated\n", encoding="utf-8")
-
-    lock_identity = "run\ntarget"
-    lock_key = oligoformer_app.hash_string(f"off-target-evidence\n{lock_identity}")
-    values = {
-        f"{lock_key}:head": 0,
-        f"{lock_key}:owner:0": {"id": "original", "acquired_at": 0.0},
-        f"{lock_key}:status:0": {"state": "complete"},
-    }
-
-    class FakeDictInstance:
-        def put(self, key, value, *, skip_if_exists=False):
-            if skip_if_exists and key in values:
-                return False
-            values[key] = value
-            return True
-
-        def get(self, key, default=None):
-            return values.get(key, default)
-
-    class FakeDict:
-        @staticmethod
-        def from_name(_name, create_if_missing=False):
-            assert create_if_missing
-            return FakeDictInstance()
-
-    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
-
-    with oligoformer_app._cache_build_lock(
-        "off-target-evidence",
-        lock_identity,
-        rebuild=True,
-    ) as owns_repair:
-        assert owns_repair
-        assert oligoformer_app._discard_invalid_off_target_evidence(
-            raw_dir,
-            expected_identity=identity,
-        )
-        raw_dir.joinpath("pita.tab").write_text(pita_contents, encoding="utf-8")
-        raw_dir.joinpath("targetscan.tab").write_text(
-            targetscan_contents,
-            encoding="utf-8",
-        )
-        oligoformer_app._publish_off_target_manifest(raw_dir, identity=identity)
-
-    assert oligoformer_app._raw_off_target_ready(
-        raw_dir,
-        expected_identity=identity,
-    )
-    repair_status = values[f"{lock_key}:status:1"]
-    assert isinstance(repair_status, dict)
-    assert repair_status["state"] == "complete"
-    assert f"{lock_key}:owner:2" not in values
-
-
 def test_apply_off_target_filters_handles_header_only_pita(tmp_path: Path, monkeypatch):
     volume = FakeVolume()
     repo_dir = tmp_path / "repo"
@@ -1791,31 +1705,16 @@ def test_merge_pita_shards_sorts_like_upstream_score_table(tmp_path: Path):
     ]
 
 
-def test_oligoformer_execution_defaults_use_distributed_cpu_nodes():
+def test_oligoformer_execution_defaults_validate_cpu_workers():
     execution = oligoformer_app.OligoformerExecutionConfig()
 
     assert execution == oligoformer_app.DEFAULT_EXECUTION_CONFIG
-    assert oligoformer_app._bounded_node_count(100, execution.off_target_nodes) == 32
-    assert (
-        oligoformer_app._bounded_node_count(
-            100,
-            execution.targetscan_context_nodes,
-        )
-        == 100
-    )
     assert (
         oligoformer_app._targetscan_ref_shard_size(
             100,
             prepare_nodes=execution.targetscan_prepare_nodes,
         )
         == 4
-    )
-    assert (
-        oligoformer_app._targetscan_rnaplfold_node_count(
-            1000,
-            execution.targetscan_rnaplfold_nodes,
-        )
-        == 32
     )
     assert (
         oligoformer_app._targetscan_rnaplfold_worker_count(
@@ -2504,25 +2403,6 @@ def test_finalize_pita_discovery_warms_and_writes_row_inputs_in_one_pass(
     assert [
         Path(row.input_path).read_text(encoding="utf-8") for row in prepared.row_shards
     ] == ["RNA0\tutr1\nRNA0\tutr2\n", "RNA0\tutr3\n"]
-
-
-def test_worker_aware_batches_fill_containers_before_spawning_more():
-    assert [
-        len(batch)
-        for batch in oligoformer_app._batch_items_for_local_workers(
-            list(range(45)),
-            max_nodes=32,
-            local_workers=32,
-        )
-    ] == [32, 13]
-
-    large_batches = oligoformer_app._batch_items_for_local_workers(
-        list(range(1317)),
-        max_nodes=32,
-        local_workers=32,
-    )
-    assert len(large_batches) == 32
-    assert max(len(batch) for batch in large_batches) == 42
 
 
 def test_pita_row_shard_retries_interrupted_commands_atomically(

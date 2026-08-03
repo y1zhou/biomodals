@@ -39,7 +39,6 @@ from biomodals.execution.runtime import (
 )
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
-    aggregate_task_outcome,
     form_pull_worker_candidates,
     propagated_skip_node_keys,
     ready_node_keys,
@@ -88,7 +87,6 @@ __all__ = [
     "TaskStatus",
     "WorkerAssignmentRecord",
     "WorkStatusReason",
-    "aggregate_task_outcome",
     "drive_execution_run",
     "form_pull_worker_candidates",
     "propagated_skip_node_keys",

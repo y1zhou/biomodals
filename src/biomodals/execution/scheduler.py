@@ -1,6 +1,6 @@
 """Pure DAG readiness and admission decisions."""
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -403,14 +403,6 @@ def terminal_run_outcome(
     if NodeStatus.PARTIAL in statuses:
         return RunStatus.PARTIAL
     return RunStatus.SUCCEEDED
-
-
-def aggregate_task_outcome(
-    policy: NodeAggregationPolicy,
-    task_statuses: tuple[TaskStatus, ...],
-) -> NodeStatus | None:
-    """Return a Node outcome once every discovered Task is terminal."""
-    return aggregate_task_status_counts(policy, Counter(task_statuses))
 
 
 def aggregate_task_status_counts(

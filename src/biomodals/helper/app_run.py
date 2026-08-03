@@ -145,19 +145,3 @@ def inline_zstd_output(
         ),
         metadata=output_metadata,
     )
-
-
-def has_completed_output_files(
-    output_dir: str | Path,
-    input_id: str,
-    *,
-    sample_subdir: str,
-    required_files: tuple[str, ...],
-) -> bool:
-    """Return whether all required completion files exist for one input.
-
-    This encodes artifact-based completion only. It does not create marker files
-    or infer success from the presence of a run directory.
-    """
-    sample_dir = Path(output_dir) / input_id / sample_subdir
-    return all((sample_dir / file_name).exists() for file_name in required_files)

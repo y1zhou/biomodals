@@ -9,8 +9,8 @@ from biomodals.execution import (
     NodeAggregationPolicy,
     NodeStatus,
     TaskStatus,
-    aggregate_task_outcome,
 )
+from biomodals.execution.scheduler import aggregate_task_status_counts
 
 from .provider_call_helpers import (
     GPU_BINDING,
@@ -22,41 +22,41 @@ from .provider_call_helpers import (
 
 def test_task_aggregation_policies_are_strict_and_non_vacuous() -> None:
     assert (
-        aggregate_task_outcome(
+        aggregate_task_status_counts(
             NodeAggregationPolicy.COLLECT_ALL,
-            (TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED),
+            {TaskStatus.SUCCEEDED: 2},
         )
         == NodeStatus.SUCCEEDED
     )
     assert (
-        aggregate_task_outcome(
+        aggregate_task_status_counts(
             NodeAggregationPolicy.COLLECT_ALL,
-            (TaskStatus.SUCCEEDED, TaskStatus.FAILED),
+            {TaskStatus.SUCCEEDED: 1, TaskStatus.FAILED: 1},
         )
         == NodeStatus.FAILED
     )
     assert (
-        aggregate_task_outcome(
+        aggregate_task_status_counts(
             NodeAggregationPolicy.ALLOW_PARTIAL,
-            (TaskStatus.SUCCEEDED, TaskStatus.FAILED),
+            {TaskStatus.SUCCEEDED: 1, TaskStatus.FAILED: 1},
         )
         == NodeStatus.PARTIAL
     )
     assert (
-        aggregate_task_outcome(
+        aggregate_task_status_counts(
             NodeAggregationPolicy.ALLOW_PARTIAL,
-            (TaskStatus.FAILED, TaskStatus.SKIPPED),
+            {TaskStatus.FAILED: 1, TaskStatus.SKIPPED: 1},
         )
         == NodeStatus.FAILED
     )
     assert (
-        aggregate_task_outcome(
+        aggregate_task_status_counts(
             NodeAggregationPolicy.FAIL_FAST,
-            (TaskStatus.FAILED, TaskStatus.RUNNING),
+            {TaskStatus.FAILED: 1, TaskStatus.RUNNING: 1},
         )
         is None
     )
-    assert aggregate_task_outcome(NodeAggregationPolicy.COLLECT_ALL, ()) is None
+    assert aggregate_task_status_counts(NodeAggregationPolicy.COLLECT_ALL, {}) is None
 
 
 def test_node_reconciliation_reads_status_counts_not_task_payloads() -> None:

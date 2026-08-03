@@ -111,7 +111,7 @@ def test_active_poll_cycles_do_not_cross_the_durability_boundary() -> None:
     assert checkpoints == [RunStatus.SUCCEEDED]
 
 
-def test_coordinator_releases_host_lock_between_scheduling_cycles() -> None:
+def test_coordinator_holds_host_lock_only_for_repository_boundaries() -> None:
     repository = create_repository(task_count=1)
     lock_active = False
     cycles = 0
@@ -131,7 +131,7 @@ def test_coordinator_releases_host_lock_between_scheduling_cycles() -> None:
 
     def advance_once() -> None:
         nonlocal cycles
-        assert lock_active is True
+        assert lock_active is False
         cycles += 1
         if cycles == 2:
             repository.record_task_result_observation(
@@ -160,7 +160,19 @@ def test_coordinator_releases_host_lock_between_scheduling_cycles() -> None:
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert cycles == 2
-    assert events == ["enter", "exit", "sleep", "enter", "exit", "enter", "exit"]
+    assert events == [
+        "enter",
+        "exit",
+        "enter",
+        "exit",
+        "sleep",
+        "enter",
+        "exit",
+        "enter",
+        "exit",
+        "enter",
+        "exit",
+    ]
 
 
 def test_coordinator_accepts_a_reopened_volume_repository(tmp_path) -> None:
@@ -428,8 +440,20 @@ def test_explicit_resume_reconciles_unknown_provider_ownership_in_place() -> Non
         now=112,
     )
     checkpoints: list[RunStatus] = []
+    writer_held = False
+
+    @contextmanager
+    def synchronize():
+        nonlocal writer_held
+        assert not writer_held
+        writer_held = True
+        try:
+            yield
+        finally:
+            writer_held = False
 
     def reconcile_once() -> None:
+        assert not writer_held
         repository.mark_provider_call_running(
             preclaim.call.provider_call_id,
             now=120,
@@ -439,7 +463,12 @@ def test_explicit_resume_reconciles_unknown_provider_ownership_in_place() -> Non
         repository,
         RUN_ID,
         reconcile_once=reconcile_once,
-        checkpoint=lambda: checkpoints.append(repository.get_run(RUN_ID).status),
+        checkpoint=lambda: (
+            checkpoints.append(repository.get_run(RUN_ID).status)
+            if writer_held
+            else pytest.fail("checkpoint ran outside the writer")
+        ),
+        synchronize=synchronize,
         now=120,
     )
 

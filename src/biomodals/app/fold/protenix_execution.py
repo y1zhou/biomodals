@@ -23,6 +23,7 @@ from biomodals.execution import (
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
+    ProviderCallSubmission,
     TaskPlan,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
@@ -293,13 +294,12 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
             store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=store.commit,
             transaction=store.transaction,
+            synchronize=store.synchronize,
         )
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._provider.repository = self.store.execution
         self._provider.advance_once(
             self.execution_run_id,
             recover_publications=self._recover_publications,
@@ -311,7 +311,6 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._reload_volumes()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -324,7 +323,6 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _recover_publications(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.recover_publications(
             self.execution_run_id,
             observe_node=self._node_observation,
@@ -375,21 +373,24 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._node_observation(node_key)
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
             encode_result=_result_envelope,
             now=self._now(),
         )
-        if any(
-            not original.status.is_terminal and updated.status.is_terminal
+        succeeded_nodes = {
+            updated.node_key
             for original, updated in reconciled
-        ):
-            self._reload_volumes()
+            if not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
+        }
+        if INFERENCE_NODE in succeeded_nodes:
+            self._reload_output()
+        if succeeded_nodes & {PLAN_NODE, MSA_NODE, FINALIZE_NODE}:
+            self.msa_cache_volume.reload()
 
     def _decode_completed_calls(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.decode_completed_calls(
             self.execution_run_id,
             observe_task=self._completed_task_observation,
@@ -425,7 +426,6 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._task_observation(node_key, task)
 
     def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         self._provider.start_ready_nodes(
             self.execution_run_id,
             required_node_keys=required,
@@ -487,7 +487,9 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
             return None
 
     def _preparation_plan(self) -> ProtenixPreparationPlan:
-        for call in self.store.execution.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == PLAN_NODE
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -496,10 +498,10 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
         raise LookupError("Protenix preparation plan is unavailable")
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -523,19 +525,23 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
                 candidate.node_key,
                 candidate.task_keys[0],
             )
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                kwargs=self._invocation_kwargs(
-                    candidate.node_key,
-                    candidate.task_keys[0],
-                ),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=self._invocation_kwargs(
+                        candidate.node_key,
+                        candidate.task_keys[0],
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {
@@ -575,11 +581,12 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
                 "use_rna_msa": self.request.use_rna_msa,
             }
         if node_key == MSA_NODE:
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                MSA_NODE,
-                task_key,
-            )
+            with self.store.synchronize():
+                task = self.store.execution.get_task(
+                    self.execution_run_id,
+                    MSA_NODE,
+                    task_key,
+                )
             return {"task": ProtenixMsaTaskSpec(**task.execution_payload["task"])}
         if node_key == FINALIZE_NODE:
             return {
@@ -624,11 +631,12 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def _ensure_publication_claim(self, node_key: str, task_key: str) -> None:
         if node_key == MSA_NODE:
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                MSA_NODE,
-                task_key,
-            )
+            with self.store.synchronize():
+                task = self.store.execution.get_task(
+                    self.execution_run_id,
+                    MSA_NODE,
+                    task_key,
+                )
             publication_key = str(task.scientific_payload["publication_key"])
             claim_key = f"protenix-msa:{publication_key}"
         elif node_key == INFERENCE_NODE:
@@ -644,11 +652,6 @@ class ProtenixExecutionRuntime(ExecutionRuntimeLifecycle):
             replace_owner=self.request.replace_claim_owner,
         )
         self._claimed_publications.add(claim_key)
-
-    def _reload_volumes(self) -> None:
-        self._volume_sync.reload()
-        self.msa_cache_volume.reload()
-        self._provider.repository = self.store.execution
 
 
 def _preparation_plan_from_envelope(envelope: object) -> ProtenixPreparationPlan:

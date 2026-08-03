@@ -203,12 +203,12 @@ def test_root_run_loads_staged_request_and_binds_remote_ledger(
     assert snapshot.run.predecessor_execution_run_id is None
     assert snapshot.run.plan == request.execution_plan
     assert len(FakeRuntime.created) == 1
-    assert volume.commits == 1
+    assert volume.commits == 0
     assert coordinator.status() == snapshot
 
 
 def test_close_waits_for_the_active_driver(tmp_path: Path) -> None:
-    """The exit checkpoint cannot close SQLite under an active drive loop."""
+    """Cleanup cannot close SQLite under an active drive loop."""
     volume = FakeVolume()
     coordinator = _coordinator(
         tmp_path,
@@ -239,7 +239,7 @@ def test_close_waits_for_the_active_driver(tmp_path: Path) -> None:
 
     assert not thread.is_alive()
     assert closed.is_set()
-    assert volume.commits == 1
+    assert volume.commits == 0
 
 
 def test_restart_links_a_new_ledger_and_only_changes_operational_limits(

@@ -35,6 +35,7 @@ from biomodals.execution.model import (
 from biomodals.execution.runtime import (
     AsyncExecutionRuntime,
     ExecutionRuntime,
+    ProviderCallSubmission,
 )
 from biomodals.execution.scheduler import (
     PullWorkerDispatchDescriptor,
@@ -71,6 +72,7 @@ __all__ = [
     "NodePlan",
     "NodeStatus",
     "ProviderCallStatus",
+    "ProviderCallSubmission",
     "ProviderBinding",
     "ProviderCallPreclaim",
     "ProviderCallRecord",

@@ -728,9 +728,10 @@ class ExecutionCoordinator:
 
     @modal.enter()
     def enter(self) -> None:
-        """Validate coordinator identity before accepting lifecycle methods."""
+        """Refresh output state before accepting lifecycle methods."""
         initialize_execution_coordinator_host(self)
         self._identity()
+        CONF.output_volume.reload()
 
     @modal.method()
     def run(self, development: bool = False) -> ExecutionSnapshot:
@@ -818,12 +819,10 @@ class ExecutionCoordinator:
 
     @modal.exit()
     def exit(self) -> None:
-        """Checkpoint state without cancelling attached child calls."""
+        """Close local state without cancelling attached child calls."""
         adapter = getattr(self, "_coordinator_adapter", None)
         if adapter is not None:
             adapter.close()
-        else:
-            CONF.output_volume.commit()
 
     def _identity(self) -> tuple[UUID, DeploymentIdentity]:
         return execution_coordinator_identity(self)

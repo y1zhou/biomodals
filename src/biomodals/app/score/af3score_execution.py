@@ -23,6 +23,7 @@ from biomodals.execution import (
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
+    ProviderCallSubmission,
     TaskPlan,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
@@ -295,8 +296,8 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=store.commit,
             transaction=store.transaction,
+            synchronize=store.synchronize,
         )
 
     @property
@@ -306,7 +307,6 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._provider.repository = self.store.execution
         self._provider.advance_once(
             self.execution_run_id,
             recover_publications=self._recover_publications,
@@ -318,7 +318,6 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._reload_output()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -331,7 +330,6 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _recover_publications(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.recover_publications(
             self.execution_run_id,
             observe_node=self._node_observation,
@@ -392,7 +390,6 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
@@ -400,13 +397,13 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
         if any(
-            not original.status.is_terminal and updated.status.is_terminal
+            not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
             for original, updated in reconciled
         ):
             self._reload_output()
 
     def _decode_completed_calls(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.decode_completed_calls(
             self.execution_run_id,
             observe_task=lambda node_key, task, envelope: (
@@ -440,7 +437,6 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._task_observation(node_key, task_key)
 
     def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         self._provider.start_ready_nodes(
             self.execution_run_id,
             required_node_keys=required,
@@ -488,8 +484,9 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         return tuple(plans)
 
     def _prepare_task_spec(self) -> TaskSpec:
-        repository = self.store.execution
-        for call in repository.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == PREPARE_NODE
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -589,10 +586,13 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            tasks = repository.list_tasks(self.execution_run_id, BATCHES_NODE)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
         chunk_sizes: dict[str, int] = {}
-        for task in repository.list_tasks(self.execution_run_id, BATCHES_NODE):
+        for task in tasks:
             name = task.execution_payload["chunk"]["batch_name"]
             chunk_sizes[name] = chunk_sizes.get(name, 0) + 1
 
@@ -615,8 +615,6 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
                 unblocking_span=rank.unblocking_span,
             )
 
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -627,20 +625,23 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
         )
         if selected:
             self._ensure_output_claim()
-        for candidate in selected:
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                kwargs=self._invocation_kwargs(
-                    candidate.node_key,
-                    candidate.task_keys[0],
-                ),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=self._invocation_kwargs(
+                        candidate.node_key,
+                        candidate.task_keys[0],
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {
@@ -679,11 +680,12 @@ class AF3ScoreExecutionRuntime(ExecutionRuntimeLifecycle):
                 "input_digests": self._input_digests,
                 "publication_key": self._publication_key,
             }
-        task = self.store.execution.get_task(
-            self.execution_run_id,
-            BATCHES_NODE,
-            task_key,
-        )
+        with self.store.synchronize():
+            task = self.store.execution.get_task(
+                self.execution_run_id,
+                BATCHES_NODE,
+                task_key,
+            )
         chunk = task.execution_payload["chunk"]
         input_ids = self._chunk_input_ids(ChunkSpec(**chunk))
         return {

@@ -192,13 +192,19 @@ def _execution_launch_bytes(predecessor_execution_run_id: UUID | None) -> bytes:
 class ExecutionRunStore:
     """Own one Run's kernel connection and reserved state path."""
 
-    def __init__(self, volume_root: str | Path, execution_run_id: UUID) -> None:
+    def __init__(
+        self,
+        volume_root: str | Path,
+        execution_run_id: UUID,
+        *,
+        lock: Any | None = None,
+    ) -> None:
         """Bind storage only to the host Volume root and opaque Run ID."""
         self.volume_root = Path(volume_root)
         self.execution_run_id = execution_run_id
         self._connection: sqlite3.Connection | None = None
         self._execution: SqliteExecutionRepository | None = None
-        self._lock = RLock()
+        self._lock = RLock() if lock is None else lock
         self._volume_sync_active = False
 
     @property
@@ -246,6 +252,12 @@ class ExecutionRunStore:
                 raise
             else:
                 connection.commit()
+
+    @contextmanager
+    def synchronize(self) -> Iterator[None]:
+        """Serialize one compound repository and Volume state boundary."""
+        with self._lock:
+            yield
 
     @contextmanager
     def closed_for_volume_sync(self) -> Iterator[None]:
@@ -329,22 +341,21 @@ class ExecutionVolumeSync:
         """Bind one optional Volume to its closeable local Run store."""
         self.volume = volume
         self.store = store
-        self._lock = RLock()
 
     def commit(self) -> None:
         """Persist pending Volume writes when a Volume is attached."""
-        with self._lock:
-            with self.store.closed_for_volume_sync():
-                if self.volume is not None:
-                    self.volume.commit()
+        if self.volume is None:
+            self.store.commit()
+            return
+        with self.store.closed_for_volume_sync():
+            self.volume.commit()
 
     def reload(self) -> None:
         """Refresh the Volume view when a Volume is attached."""
         if self.volume is None:
             return
-        with self._lock:
-            with self.store.closed_for_volume_sync():
-                self.volume.reload()
+        with self.store.closed_for_volume_sync():
+            self.volume.reload()
 
 
 class ExecutionRuntimeLifecycle:
@@ -384,13 +395,15 @@ class ExecutionRuntimeLifecycle:
         """Resume this Run without retrying conclusive failures."""
         with synchronize():
             repository = self._initialize()
-            resume_execution_run(
-                repository,
-                self.execution_run_id,
-                reconcile_once=self.advance_once,
-                checkpoint=self._checkpoint,
-                now=self._now(),
-            )
+        resume_execution_run(
+            repository,
+            self.execution_run_id,
+            reconcile_once=self.advance_once,
+            checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
+            synchronize=synchronize,
+            now=self._now(),
+        )
         return drive_execution_run(
             self.store.execution,
             self.execution_run_id,
@@ -404,14 +417,15 @@ class ExecutionRuntimeLifecycle:
 
     def cancel(self) -> ExecutionSnapshot:
         """Request cancellation while retaining uncertain call ownership."""
-        repository = self.store.execution
-        try:
-            repository.get_run(self.execution_run_id)
-        except ExecutionRunNotFoundError:
-            repository = self._initialize()
-        self._provider.repository = repository
+        with self.store.synchronize():
+            repository = self.store.execution
+            try:
+                repository.get_run(self.execution_run_id)
+            except ExecutionRunNotFoundError:
+                repository = self._initialize()
         self._provider.cancel_run(self.execution_run_id, now=self._now())
-        return self.store.execution.snapshot(self.execution_run_id)
+        with self.store.synchronize():
+            return self.store.execution.snapshot(self.execution_run_id)
 
     def close(self) -> None:
         """Close SQLite without cancelling attached Provider Calls."""
@@ -425,14 +439,20 @@ class ExecutionRuntimeLifecycle:
         raise NotImplementedError
 
     def _checkpoint(self) -> SqliteExecutionRepository:
-        self._volume_sync.commit()
-        repository = self.store.execution
-        self._provider.repository = repository
+        with self.store.synchronize():
+            try:
+                self._volume_sync.commit()
+            finally:
+                repository = self.store.execution
+                self._provider.repository = repository
         return repository
 
     def _reload_output(self) -> None:
-        self._volume_sync.reload()
-        self._provider.repository = self.store.execution
+        with self.store.synchronize():
+            try:
+                self._volume_sync.reload()
+            finally:
+                self._provider.repository = self.store.execution
 
 
 class ExecutionCoordinatorLifecycle:
@@ -480,7 +500,9 @@ class ExecutionCoordinatorLifecycle:
         """Request cancellation and reconcile it to a terminal result."""
         with self._writer_lock:
             runtime = self._open_current_runtime(recover=True)
-            self._verify_snapshot(runtime.cancel())
+        cancelled = runtime.cancel()
+        with self._writer_lock:
+            self._verify_snapshot(cancelled)
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
@@ -539,7 +561,11 @@ class ExecutionCoordinatorLifecycle:
                 self._close_runtime()
 
     def _run_store(self) -> ExecutionRunStore:
-        return ExecutionRunStore(self.volume_root, self.execution_run_id)
+        return ExecutionRunStore(
+            self.volume_root,
+            self.execution_run_id,
+            lock=self._writer_lock,
+        )
 
     @contextmanager
     def _open_successor_source(
@@ -555,6 +581,7 @@ class ExecutionCoordinatorLifecycle:
         store = ExecutionRunStore(
             self.volume_root,
             predecessor_execution_run_id,
+            lock=self._writer_lock,
         )
         if not store.ledger_path.is_file():
             raise ExecutionRunNotFoundError(str(predecessor_execution_run_id))

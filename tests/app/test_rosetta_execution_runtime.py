@@ -143,19 +143,19 @@ def _publish_assignment(runtime, assignment) -> dict[str, object]:
     )
 
 
-def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) -> None:
+def test_initialization_reuses_the_host_volume_view(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, RecordingDriver())
 
     runtime._initialize()
 
     output = cast(FakeVolume, runtime.output_volume)
-    assert output.reloads == 1
+    assert output.reloads == 0
     assert output.commits == 0
     runtime.attach()
     runtime.attach()
-    assert output.reloads == 1
+    assert output.reloads == 0
     runtime.refresh_publications()
-    assert output.reloads == 2
+    assert output.reloads == 1
     runtime.close()
 
 
@@ -301,11 +301,12 @@ def test_unknown_run_prunes_workers_after_task_publications_appear(
         )
         for assignment in claim.assignments:
             _publish_assignment(runtime, assignment)
-        runtime.store.execution.mark_provider_call_state_unknown(
-            call.provider_call_id,
-            message="Modal state lookup was inconclusive",
-            now=11,
-        )
+        with runtime.store.transaction():
+            runtime.store.execution.mark_provider_call_state_unknown(
+                call.provider_call_id,
+                message="Modal state lookup was inconclusive",
+                now=11,
+            )
     driver.state_unknown = True
 
     snapshot = runtime.resume()

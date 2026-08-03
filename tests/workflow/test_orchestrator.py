@@ -268,7 +268,7 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert calls["workload_run_key"] == "friendly-name"
     assert calls["closed"] is True
     assert volume.reload_count == 1
-    assert volume.commit_count == 1
+    assert volume.commit_count == 0
 
     store = WorkflowRunStore(tmp_path, RUN_ID)
     plan = pickle.loads(store.read_workflow_plan())  # noqa: S301

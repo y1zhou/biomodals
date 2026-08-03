@@ -596,6 +596,43 @@ version uses one fixed standard-library SHA-256/canonical-JSON implementation;
 it has no codec or hashing plugin layer and never reads large files while
 fingerprinting Tasks.
 
+### Admission-set and synchronization boundaries
+
+A scheduling cycle treats all selected Provider Call candidates as one
+admission set:
+
+1. Resolve each distinct Provider Binding once, outside the SQLite writer.
+2. Create all authorized preclaims in one transaction and issue one explicit
+   Volume checkpoint.
+3. Submit calls outside the writer.
+4. Attach all returned handles or classify submission errors in one transaction
+   and issue one explicit Volume checkpoint.
+5. Observe calls outside the writer, then apply one reconciliation transaction
+   and at most one terminal-result checkpoint for that observation set.
+
+An interruption after step 2 cannot authorize the same paid call again.
+Unattached `submitting` records become `outcome_unknown` during recovery.
+If cancellation becomes durable during step 3, every newly attached handle is
+cancelled immediately after step 4 without placing the Modal RPC under the
+writer.
+Ordinary planning, cache observation, policy persistence, and unchanged or
+running provider polls use only their local SQLite transactions. They do not
+issue a remote Volume commit.
+
+The run-scoped drive lock excludes a second scheduling loop. Status and
+pull-worker callbacks do not acquire it; cancellation acquires it only when
+taking over driving after its request is durable. The SQLite writer protects
+short state snapshots and transitions plus explicit transition-and-Volume
+barriers; Modal resolve, spawn, observe, cancel, and result encoding never run
+while that writer is held. SQLite is closed only for an explicit Volume commit
+or reload. Initial Volume refresh belongs to the coordinator host, and reloads
+thereafter occur only when another container may have published data.
+Workload callbacks snapshot immutable ledger records under the writer, perform
+filesystem or provider work after releasing it, and reacquire the current
+repository for mutations. A repository reference must not cross a Volume
+barrier because that barrier closes and reopens SQLite. Cache and model Volumes
+are refreshed only for successful Nodes whose functions write those Volumes.
+
 ## Responsibility boundary
 
 | Concern | Execution kernel owns | Workload or host owns |

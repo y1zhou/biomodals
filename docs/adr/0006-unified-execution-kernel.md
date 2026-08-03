@@ -465,6 +465,19 @@ unfinished Tasks to `failed`; an ambiguous exception preserves unknown
 ownership. Provider resolution and input preparation happen before preclaim.
 Retrying failed Tasks requires a Successor Execution Run.
 
+The admission-set durability policy was accepted on 2026-08-03. One scheduling
+cycle resolves each distinct Provider Binding once, writes every selected
+preclaim in one SQLite transaction, and crosses one Volume checkpoint before
+any spawn. It then submits the authorized calls without holding the SQLite
+writer, records every returned handle or classified submission error in one
+transaction, and crosses one attachment checkpoint. Interruption during spawn
+therefore leaves durable `submitting` ownership and never authorizes duplicate
+spend; recovery marks any unattached call `outcome_unknown`. The coordinator
+also cancels a newly attached handle immediately when cancellation became
+durable during the unlocked spawn interval. The coordinator
+applies provider observations in one transaction and checkpoints terminal
+Result Envelopes once per reconciliation set rather than once per call.
+
 The resource scope was accepted on 2026-07-29. The first kernel persists and
 enforces Provider Call admission limits within one Execution Run and
 coordinator. Service-wide admission limits remain service-owned, and Modal
@@ -587,7 +600,10 @@ checkpoint remains required when state must survive before an external side
 effect or cross-container response, including provider preclaim, returned call
 attachment, pull assignment, pull completion acknowledgement, cancellation,
 and terminal or error handoff. A reload is reserved for observing publications
-made by another container and invalidates any caller-owned planning cache.
+made by another container and invalidates any caller-owned planning cache. The
+coordinator host owns the initial reload; a workload runtime does not
+immediately reload the same Volume again. SQLite stays open for local-only
+commits and is closed only across an explicit Volume commit or reload.
 
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by
@@ -598,6 +614,21 @@ in-process writer loop serializes every SQLite transition and Volume
 checkpoint. Different Run IDs have independent pools and may execute
 concurrently. The provider routing and single-container assumptions require a
 manual Modal smoke test before remote adoption.
+
+The writer is a state boundary, not a scheduling-cycle mutex. Provider resolve,
+spawn, observe, cancellation, and result encoding run without it. The writer is
+held only for short repository snapshots or transitions and across a compound
+transition-plus-Volume barrier whose durability must be atomic. Consequently,
+concurrent status calls remain available while Modal RPCs are slow. The
+separate drive lock still spans one run or resume input so two scheduling loops
+cannot admit the same Run concurrently.
+
+Workload adapters copy immutable records while holding the writer, release it
+for filesystem validation, result materialization, and worker communication,
+then acquire a fresh repository for the applying transaction. They must not
+retain a repository backed by a connection that an interleaved Volume barrier
+may close. A secondary cache or model Volume is reloaded only after a newly
+successful Node that writes that specific Volume.
 
 The active-run lifecycle was accepted on 2026-07-29. Each remote top-level CLI
 app or workflow run submits one detached coordinator-loop input to its

@@ -241,10 +241,9 @@ def test_ppiflow_candidates_are_independent_kernel_tasks(
     result = runtime.run(workload_run_key="candidate-stage")
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert driver.events[:4] == [
+    assert driver.events[:3] == [
         f"resolve:{expected_function}",
         "spawn:candidate-b",
-        f"resolve:{expected_function}",
         "spawn:candidate-a",
     ]
     tasks = runtime.store.execution.list_tasks(RUN_ID, "candidate-stage")

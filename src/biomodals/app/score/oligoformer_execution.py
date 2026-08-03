@@ -24,6 +24,7 @@ from biomodals.execution import (
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
+    ProviderCallSubmission,
     TaskPlan,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
@@ -367,13 +368,12 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
             store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=store.commit,
             transaction=store.transaction,
+            synchronize=store.synchronize,
         )
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._provider.repository = self.store.execution
         self._provider.advance_once(
             self.execution_run_id,
             recover_publications=self._recover_publications,
@@ -385,7 +385,6 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._reload_volumes()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -398,21 +397,24 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
             encode_result=_result_envelope,
             now=self._now(),
         )
-        if any(
-            not original.status.is_terminal and updated.status.is_terminal
+        succeeded_nodes = {
+            updated.node_key
             for original, updated in reconciled
-        ):
-            self._reload_volumes()
+            if not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
+        }
+        if succeeded_nodes:
+            self._reload_output()
+        if DOWNLOAD_NODE in succeeded_nodes:
+            self.model_volume.reload()
 
     def _recover_publications(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.recover_publications(
             self.execution_run_id,
             observe_node=self._node_observation,
@@ -531,10 +533,12 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
 
     def _planned_task_records(self, node_key: str) -> tuple[Any, ...] | None:
-        node = self.store.execution.get_node(self.execution_run_id, node_key)
-        if not node.discovery_complete:
-            return None
-        return self.store.execution.list_tasks(self.execution_run_id, node_key)
+        with self.store.synchronize():
+            repository = self.store.execution
+            node = repository.get_node(self.execution_run_id, node_key)
+            if not node.discovery_complete:
+                return None
+            return repository.list_tasks(self.execution_run_id, node_key)
 
     def _task_observation(self, node_key: str, task: Any) -> AvailabilityStatus:
         app = _workload_module()
@@ -560,7 +564,6 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
 
     def _decode_completed_calls(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.decode_completed_calls(
             self.execution_run_id,
             observe_task=self._completed_task_observation,
@@ -602,7 +605,6 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._task_observation(node_key, task)
 
     def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         self._provider.start_ready_nodes(
             self.execution_run_id,
             required_node_keys=required,
@@ -694,7 +696,9 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
             return None
 
     def _run_plan(self):
-        for call in self.store.execution.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == PREPARE_NODE
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -703,7 +707,9 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         raise LookupError("OligoFormer run plan is unavailable")
 
     def _reference_plan(self):
-        for call in self.store.execution.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == REFERENCE_PLAN_NODE
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -712,7 +718,9 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         raise LookupError("OligoFormer reference plan is unavailable")
 
     def _evidence_plan(self):
-        for call in self.store.execution.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == EVIDENCE_PLAN_NODE
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -721,8 +729,9 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         raise LookupError("OligoFormer evidence plan is unavailable")
 
     def _pita_reference(self, stem: str):
-        repository = self.store.execution
-        for call in repository.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == PITA_REFERENCE_NODE
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -732,10 +741,11 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         raise LookupError(f"OligoFormer PITA reference plan is unavailable: {stem}")
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
+            calls = repository.list_provider_calls(self.execution_run_id)
         ordered = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -759,9 +769,7 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         )
         available_total = max(0, run.max_active_provider_calls - counts.total)
         active_by_node = Counter(
-            call.node_key
-            for call in repository.list_provider_calls(self.execution_run_id)
-            if not call.status.is_terminal
+            call.node_key for call in calls if not call.status.is_terminal
         )
         selected = []
         for candidate in ordered:
@@ -778,19 +786,23 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
                 candidate.node_key,
                 candidate.task_keys[0],
             )
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                kwargs=self._invocation_kwargs(
-                    candidate.node_key,
-                    candidate.task_keys[0],
-                ),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=self._invocation_kwargs(
+                        candidate.node_key,
+                        candidate.task_keys[0],
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _node_call_limit(self, node_key: str) -> int:
         execution = self.request.execution_config
@@ -931,11 +943,12 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
         raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
 
     def _task(self, node_key: str, task_key: str):
-        return self.store.execution.get_task(
-            self.execution_run_id,
-            node_key,
-            task_key,
-        )
+        with self.store.synchronize():
+            return self.store.execution.get_task(
+                self.execution_run_id,
+                node_key,
+                task_key,
+            )
 
     def _ensure_publication_claim(self, node_key: str, task_key: str) -> None:
         claim_key = None
@@ -971,11 +984,6 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
             replace_owner=self.request.replace_claim_owner,
         )
         self._claimed_publications.add(claim_key)
-
-    def _reload_volumes(self) -> None:
-        self._volume_sync.reload()
-        self.model_volume.reload()
-        self._provider.repository = self.store.execution
 
 
 def _pita_task_key(spec: Any) -> str:

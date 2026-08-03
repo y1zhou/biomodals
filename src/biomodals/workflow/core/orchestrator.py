@@ -197,7 +197,13 @@ class ExecutionCoordinator:
                     self._development_function_handles = dict(
                         development_function_handles
                     )
-                runtime = self._open_runtime(plan, resolve_external_checker=True)
+            external_checker = self._resolve_external_checker(plan)
+            with self._lock():
+                runtime = self._open_runtime(
+                    plan,
+                    resolve_external_checker=True,
+                    external_checker=external_checker,
+                )
             try:
                 return runtime.run(
                     workload_run_key=plan.workload_run_key,
@@ -220,7 +226,8 @@ class ExecutionCoordinator:
             self._require_ledger()
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
-            runtime.cancel()
+        runtime.cancel()
+        with self._lock():
             self._verified_snapshot()
         with self._drive_lock:
             with self._lock():
@@ -248,7 +255,13 @@ class ExecutionCoordinator:
             with self._lock():
                 self._require_ledger()
                 plan = self._load_plan()
-                runtime = self._open_runtime(plan, resolve_external_checker=True)
+            external_checker = self._resolve_external_checker(plan)
+            with self._lock():
+                runtime = self._open_runtime(
+                    plan,
+                    resolve_external_checker=True,
+                    external_checker=external_checker,
+                )
             try:
                 return runtime.resume(
                     workload_run_key=plan.workload_run_key,
@@ -270,12 +283,12 @@ class ExecutionCoordinator:
             self._require_ledger()
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
-            runtime.attach(workload_run_key=plan.workload_run_key)
-            return runtime.claim_pull_tasks(
-                UUID(provider_call_id),
-                request_id=request_id,
-                capacity=capacity,
-            )
+        runtime.attach(workload_run_key=plan.workload_run_key)
+        return runtime.claim_pull_tasks(
+            UUID(provider_call_id),
+            request_id=request_id,
+            capacity=capacity,
+        )
 
     @modal.method()
     def complete_task(
@@ -290,13 +303,13 @@ class ExecutionCoordinator:
             self._require_ledger()
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
-            runtime.refresh_publications(workload_run_key=plan.workload_run_key)
-            return runtime.complete_pull_task(
-                UUID(provider_call_id),
-                task_key,
-                request_id=request_id,
-                result=result,
-            )
+        runtime.refresh_publications(workload_run_key=plan.workload_run_key)
+        return runtime.complete_pull_task(
+            UUID(provider_call_id),
+            task_key,
+            request_id=request_id,
+            result=result,
+        )
 
     @modal.method()
     def prepare_restart(
@@ -440,7 +453,13 @@ class ExecutionCoordinator:
             with self._lock():
                 self._require_ledger()
                 plan = self._load_plan()
-                runtime = self._open_runtime(plan, resolve_external_checker=True)
+            external_checker = self._resolve_external_checker(plan)
+            with self._lock():
+                runtime = self._open_runtime(
+                    plan,
+                    resolve_external_checker=True,
+                    external_checker=external_checker,
+                )
             try:
                 return runtime.run(
                     workload_run_key=plan.workload_run_key,
@@ -481,7 +500,6 @@ class ExecutionCoordinator:
                     )
                 return plan
             store.write_workflow_plan(pickle.dumps(candidate))
-            OUT_VOLUME.commit()
             return candidate
         finally:
             store.close()
@@ -498,27 +516,16 @@ class ExecutionCoordinator:
         plan: WorkflowCoordinatorPlan,
         *,
         resolve_external_checker: bool,
+        external_checker: Any | None = None,
     ) -> WorkflowRuntime:
         runtime = getattr(self, "_runtime", None)
         if runtime is not None:
             return runtime
         execution_run_id, deployment = self._identity()
         driver = self._modal_driver()
-        external_checker = None
         if resolve_external_checker and plan.strict_external_artifact_checks:
-            function_name = plan.external_artifact_checker_function_name
-            if function_name is None:
-                raise RuntimeError("Persisted workflow plan has no artifact checker")
-            checker = driver.resolve(
-                ProviderBinding(
-                    environment=deployment.environment,
-                    app_name=deployment.deployment_name,
-                    app_version=deployment.deployment_version,
-                    function_name=function_name,
-                    uses_gpu=False,
-                )
-            )
-            external_checker = checker.remote
+            if external_checker is None:
+                raise RuntimeError("External artifact checker was not preflighted")
         runtime = WorkflowRuntime(
             workflow=plan.workflow,
             execution_run_id=execution_run_id,
@@ -537,9 +544,32 @@ class ExecutionCoordinator:
             ),
             external_artifact_checker=external_checker,
             pull_worker_coordinator=self._worker_coordinator_handle(),
+            store=self._run_store(),
         )
         self._runtime = runtime
         return runtime
+
+    def _resolve_external_checker(
+        self,
+        plan: WorkflowCoordinatorPlan,
+    ) -> Any | None:
+        """Resolve an optional remote checker without holding the SQLite writer."""
+        if not plan.strict_external_artifact_checks:
+            return None
+        function_name = plan.external_artifact_checker_function_name
+        if function_name is None:
+            raise RuntimeError("Persisted workflow plan has no artifact checker")
+        _, deployment = self._identity()
+        checker = self._modal_driver().resolve(
+            ProviderBinding(
+                environment=deployment.environment,
+                app_name=deployment.deployment_name,
+                app_version=deployment.deployment_version,
+                function_name=function_name,
+                uses_gpu=False,
+            )
+        )
+        return checker.remote
 
     def _load_successor_source(
         self,
@@ -744,6 +774,7 @@ class ExecutionCoordinator:
         return WorkflowRunStore(
             Path(CONF.output_volume_mountpoint),
             execution_run_id,
+            lock=self._lock(),
         )
 
     def _require_ledger(self) -> None:

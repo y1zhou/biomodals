@@ -28,6 +28,7 @@ from biomodals.execution import (
     NodeStatus,
     ProviderBinding,
     ProviderCallStatus,
+    ProviderCallSubmission,
     TaskPlan,
     ready_node_keys,
     required_node_keys,
@@ -79,13 +80,12 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             self.store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=self.store.commit,
             transaction=self.store.transaction,
+            synchronize=self.store.synchronize,
         )
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._provider.repository = self.store.execution
         # BoltzGen completes Tasks from validated Volume publications.
         self._provider.advance_once(
             self.execution_run_id,
@@ -98,7 +98,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._reload_output()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -111,10 +110,12 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _recover_publications(self) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            nodes = repository.list_nodes(self.execution_run_id)
         observations: dict[str, AvailabilityStatus | None] = {}
-        for node in repository.list_nodes(self.execution_run_id):
+        for node in nodes:
             if node.status == NodeStatus.SUCCEEDED:
                 observations[node.node_key] = AvailabilityStatus.AVAILABLE
             elif node.status.is_terminal:
@@ -127,7 +128,13 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 (node_key, self._node_observation(node_key)) for node_key in frontier
             ]
             with self.store.transaction():
+                repository = self.store.execution
                 for node_key, observation in observed:
+                    if repository.get_node(
+                        self.execution_run_id,
+                        node_key,
+                    ).status.is_terminal:
+                        continue
                     repository.record_node_result_observation(
                         self.execution_run_id,
                         node_key,
@@ -152,37 +159,54 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         if required is None:
             return
 
-        task_observations = []
-        for node in repository.list_nodes(self.execution_run_id):
-            if (
-                node.node_key in required
-                and node.status == NodeStatus.RUNNING
-                and node.discovery_complete
-            ):
-                planned = {
-                    item.plan.task_key: item
-                    for item in self._planned_tasks(node.node_key)
-                }
+        with self.store.synchronize():
+            repository = self.store.execution
+            nodes = repository.list_nodes(self.execution_run_id)
+            pending_tasks = tuple(
+                (node, task)
+                for node in nodes
+                if (
+                    node.node_key in required
+                    and node.status == NodeStatus.RUNNING
+                    and node.discovery_complete
+                )
                 for task in repository.list_tasks(
                     self.execution_run_id,
                     node.node_key,
-                ):
-                    if task.status.is_terminal:
-                        continue
-                    task_observations.append((
-                        node.node_key,
-                        task.task_key,
-                        self._task_observation(
-                            node.node_key,
-                            planned[task.task_key],
-                            task.fingerprint,
-                        ),
-                    ))
+                )
+                if not task.status.is_terminal
+            )
+        task_observations = []
+        for node, task in pending_tasks:
+            planned = {
+                item.plan.task_key: item for item in self._planned_tasks(node.node_key)
+            }
+            task_observations.append((
+                node.node_key,
+                task.task_key,
+                self._task_observation(
+                    node.node_key,
+                    planned[task.task_key],
+                    task.fingerprint,
+                ),
+            ))
         if not task_observations:
             return
         with self.store.transaction():
+            repository = self.store.execution
             for node_key, task_key, observation in task_observations:
-                call = self._task_call(node_key, task_key)
+                current_task = repository.get_task(
+                    self.execution_run_id,
+                    node_key,
+                    task_key,
+                )
+                if current_task.status.is_terminal:
+                    continue
+                call = (
+                    None
+                    if current_task.provider_call_id is None
+                    else repository.get_provider_call(current_task.provider_call_id)
+                )
                 if (
                     observation == AvailabilityStatus.MISSING
                     and call is not None
@@ -252,7 +276,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._node_observation(node_key)
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
@@ -260,24 +283,30 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
         if any(
-            not original.status.is_terminal and updated.status.is_terminal
+            not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
             for original, updated in reconciled
         ):
             self._reload_output()
 
     def _start_ready_nodes(self) -> None:
-        repository = self.store.execution
-        statuses = {
-            node.node_key: node.status
-            for node in repository.list_nodes(self.execution_run_id)
-        }
-        ready = ready_node_keys(
-            repository.get_run(self.execution_run_id).plan,
-            statuses,
-        )
+        with self.store.synchronize():
+            repository = self.store.execution
+            statuses = {
+                node.node_key: node.status
+                for node in repository.list_nodes(self.execution_run_id)
+            }
+            plan = repository.get_run(self.execution_run_id).plan
+        ready = ready_node_keys(plan, statuses)
         for node_key in ready:
             planned = self._planned_tasks(node_key)
             with self.store.transaction():
+                repository = self.store.execution
+                if repository.get_node(
+                    self.execution_run_id,
+                    node_key,
+                ).status.is_terminal:
+                    continue
                 repository.start_node(
                     self.execution_run_id,
                     node_key,
@@ -294,11 +323,18 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 for item, record in zip(planned, records, strict=True)
             )
             with self.store.transaction():
+                repository = self.store.execution
                 for record, observation in zip(
                     records,
                     observations,
                     strict=True,
                 ):
+                    if repository.get_task(
+                        self.execution_run_id,
+                        node_key,
+                        record.task_key,
+                    ).status.is_terminal:
+                        continue
                     repository.record_task_result_observation(
                         self.execution_run_id,
                         node_key,
@@ -336,8 +372,10 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         raise ValueError(f"Unknown BoltzGen Node {node_key!r}")
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
         bindings: dict[str, ProviderBinding] = {}
 
         def describe_task(node, task, rank):
@@ -357,8 +395,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 unblocking_span=rank.unblocking_span,
             )
 
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -373,31 +409,34 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        for candidate in selected:
-            kwargs = self._invocation_kwargs(
-                candidate.node_key,
-                candidate.task_keys[0],
-            )
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                kwargs=kwargs,
-                provider_call_id_kwarg=(
-                    "claim_owner" if candidate.node_key == DESIGN_RUNS_NODE else None
-                ),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=self._invocation_kwargs(
+                        candidate.node_key,
+                        candidate.task_keys[0],
+                    ),
+                    provider_call_id_kwarg=(
+                        "claim_owner"
+                        if candidate.node_key == DESIGN_RUNS_NODE
+                        else None
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
-        run = self.store.execution.get_run(self.execution_run_id)
         return ProviderBinding(
-            environment=run.deployment.environment,
-            app_name=run.deployment.deployment_name,
-            app_version=run.deployment.deployment_version,
+            environment=self.deployment.environment,
+            app_name=self.deployment.deployment_name,
+            app_version=self.deployment.deployment_version,
             function_name=(
                 "run_boltzgen_task"
                 if node_key == DESIGN_RUNS_NODE
@@ -416,11 +455,12 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
     ) -> dict[str, object]:
         if node_key == DESIGN_RUNS_NODE:
             replace_claim_owner = dict(self.request.replace_claim_owners).get(task_key)
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                node_key,
-                task_key,
-            )
+            with self.store.synchronize():
+                task = self.store.execution.get_task(
+                    self.execution_run_id,
+                    node_key,
+                    task_key,
+                )
             return {
                 "out_dir": str(
                     boltzgen_run_root(
@@ -440,10 +480,11 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 "task_fingerprint": task.fingerprint,
             }
         if node_key == COLLECT_RESULTS_NODE:
-            design_tasks = self.store.execution.list_tasks(
-                self.execution_run_id,
-                DESIGN_RUNS_NODE,
-            )
+            with self.store.synchronize():
+                design_tasks = self.store.execution.list_tasks(
+                    self.execution_run_id,
+                    DESIGN_RUNS_NODE,
+                )
             task_fingerprints = {
                 task.task_key: task.fingerprint for task in design_tasks
             }
@@ -465,16 +506,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 ),
             }
         raise ValueError(f"Unknown BoltzGen Node {node_key!r}")
-
-    def _task_call(self, node_key: str, task_key: str):
-        task = self.store.execution.get_task(
-            self.execution_run_id,
-            node_key,
-            task_key,
-        )
-        if task.provider_call_id is None:
-            return None
-        return self.store.execution.get_provider_call(task.provider_call_id)
 
 
 def _result_envelope(result: object) -> dict[str, object]:

@@ -13,17 +13,21 @@ from uuid import UUID
 import pytest
 
 from biomodals.execution import (
+    AvailabilityStatus,
     DeploymentIdentity,
     ExecutionPlan,
     ExecutionRuntime,
     NodePlan,
     RunStatus,
+    TaskPlan,
+    drive_execution_run,
 )
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
+    ExecutionVolumeSync,
     load_execution_launch,
     persist_execution_launch,
     stage_execution_launch,
@@ -111,6 +115,17 @@ def test_app_execution_store_closes_sqlite_during_volume_sync(
             _ = store.connection
 
     assert store.connection is not original
+    store.close()
+
+
+def test_checkpoint_without_a_volume_keeps_sqlite_open(tmp_path: Path) -> None:
+    """Local-only durability is a commit, not a synthetic Volume sync."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    original = store.connection
+
+    ExecutionVolumeSync(volume=None, store=store).commit()
+
+    assert store.connection is original
     store.close()
 
 
@@ -256,6 +271,90 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
     assert errors == []
     assert runtime.max_active_drivers == 1
     assert not runtime.closed_while_driving
+
+
+def test_app_coordinator_status_is_available_during_provider_io(
+    tmp_path: Path,
+) -> None:
+    """A slow scheduling effect does not occupy the SQLite writer lock."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    with store.transaction():
+        store.execution.create_run(
+            execution_run_id=RUN_ID,
+            plan=plan,
+            deployment=DeploymentIdentity("main", "Example", 3),
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=0,
+            now=10,
+        )
+    effect_started = Event()
+    release_effect = Event()
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.store = store
+
+        def run(self, *, synchronize):
+            def advance_once() -> None:
+                effect_started.set()
+                assert release_effect.wait(timeout=1)
+                with store.transaction():
+                    store.execution.start_node(RUN_ID, "run", now=11)
+                    store.execution.discover_tasks(
+                        RUN_ID,
+                        "run",
+                        (TaskPlan("task", {}),),
+                        now=11,
+                    )
+                    store.execution.record_task_result_observation(
+                        RUN_ID,
+                        "run",
+                        "task",
+                        AvailabilityStatus.AVAILABLE,
+                        now=12,
+                    )
+                    store.execution.reconcile_node_tasks(RUN_ID, "run", now=13)
+                    store.execution.finalize_run_from_results(RUN_ID, now=14)
+
+            return drive_execution_run(
+                store.execution,
+                RUN_ID,
+                advance_once=advance_once,
+                checkpoint=lambda: store.execution,
+                current_repository=lambda: store.execution,
+                poll_interval_seconds=0,
+                synchronize=synchronize,
+            )
+
+        def close(self) -> None:
+            pass
+
+    runtime = Runtime()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        def _open_current_runtime(self, *, recover: bool):
+            del recover
+            self._runtime = runtime
+            return runtime
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=DeploymentIdentity("main", "Example", 3),
+        volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
+    )
+    run_thread = Thread(target=coordinator.run)
+    run_thread.start()
+    assert effect_started.wait(timeout=1)
+
+    snapshot = coordinator.status()
+
+    assert snapshot.run.status == RunStatus.PENDING
+    release_effect.set()
+    run_thread.join(timeout=1)
+    assert not run_thread.is_alive()
+    store.close()
 
 
 def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:

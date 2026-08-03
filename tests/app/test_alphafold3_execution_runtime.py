@@ -240,7 +240,7 @@ def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) ->
 
     assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.PENDING
     output = cast(FakeVolume, runtime.output_volume)
-    assert output.reloads == 1
+    assert output.reloads == 0
     assert output.commits == 0
     runtime.close()
 

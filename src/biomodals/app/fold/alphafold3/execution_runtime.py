@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import PurePosixPath
@@ -95,6 +95,7 @@ from biomodals.execution import (
     ProviderBinding,
     ProviderCallRecord,
     ProviderCallStatus,
+    ProviderCallSubmission,
     RunStatus,
     TaskPlan,
     ready_node_keys,
@@ -186,8 +187,8 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             self.store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=self.store.commit,
             transaction=self.store.transaction,
+            synchronize=self.store.synchronize,
         )
         self._msa_inventory_cache: (
             tuple[
@@ -207,16 +208,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def advance_once(self) -> None:
         """Apply one AlphaFold3-specific scheduling and publication cycle."""
-        repository = self.store.execution
-        self._provider.repository = repository
-
         self._recover_publications()
         required = self._required_nodes()
         if required is None:
             return
         calls_to_cancel = self._prune_unrequired(required)
         for provider_call_id in calls_to_cancel:
-            self._provider.repository = self.store.execution
             self._provider.request_provider_call_cancellation(
                 provider_call_id,
                 now=self._now(),
@@ -226,7 +223,8 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         self._publish_request_receipt()
         self._recover_task_publications()
         self._reconcile_nodes_and_run()
-        run = self.store.execution.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            run = self.store.execution.get_run(self.execution_run_id)
         if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
             return
 
@@ -240,7 +238,6 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         self._reconcile_nodes_and_run()
 
     def _initialize(self):
-        self._reload_output()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -254,10 +251,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def _recover_publications(self) -> None:
         """Probe result Nodes backward until reusable work closes each branch."""
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            nodes = repository.list_nodes(self.execution_run_id)
         observations: dict[str, AvailabilityStatus | None] = {}
-        for node in repository.list_nodes(self.execution_run_id):
+        for node in nodes:
             if node.status == NodeStatus.SUCCEEDED:
                 observations[node.node_key] = AvailabilityStatus.AVAILABLE
             elif node.status.is_terminal:
@@ -270,7 +269,13 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 (node_key, self._node_observation(node_key)) for node_key in frontier
             ]
             with self.store.transaction():
+                repository = self.store.execution
                 for node_key, observation in observed:
+                    if repository.get_node(
+                        self.execution_run_id,
+                        node_key,
+                    ).status.is_terminal:
+                        continue
                     repository.record_node_result_observation(
                         self.execution_run_id,
                         node_key,
@@ -328,49 +333,56 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _required_nodes(self) -> tuple[str, ...] | None:
-        self._provider.repository = self.store.execution
         return self._provider.required_node_keys(self.execution_run_id)
 
     def _prune_unrequired(self, required: tuple[str, ...]) -> tuple[UUID, ...]:
-        with self.store.transaction():
-            calls = self.store.execution.prune_unrequired_nodes(
-                self.execution_run_id,
-                required_node_keys=set(required),
-                now=self._now(),
-            )
-        if calls:
-            self._checkpoint()
+        with self.store.synchronize():
+            with self.store.transaction():
+                calls = self.store.execution.prune_unrequired_nodes(
+                    self.execution_run_id,
+                    required_node_keys=set(required),
+                    now=self._now(),
+                )
+            if calls:
+                self._checkpoint()
         return calls
 
     def _reconcile_provider_calls(self, required: tuple[str, ...]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
             encode_result=_result_envelope,
             now=self._now(),
         )
-        if any(
-            not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
+        succeeded_nodes = {
+            updated.node_key
             for original, updated in reconciled
-        ):
-            self._reload_output()
+            if not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
+        }
+        if succeeded_nodes:
+            super()._reload_output()
+            self._invalidate_planning_cache(succeeded_nodes)
 
     def _start_ready_nodes(self) -> None:
-        repository = self.store.execution
-        statuses = {
-            node.node_key: node.status
-            for node in repository.list_nodes(self.execution_run_id)
-        }
-        for node_key in ready_node_keys(
-            repository.get_run(self.execution_run_id).plan,
-            statuses,
-        ):
+        with self.store.synchronize():
+            repository = self.store.execution
+            statuses = {
+                node.node_key: node.status
+                for node in repository.list_nodes(self.execution_run_id)
+            }
+            plan = repository.get_run(self.execution_run_id).plan
+        for node_key in ready_node_keys(plan, statuses):
             try:
                 planned = self._planned_tasks(node_key)
             except Exception:
                 with self.store.transaction():
+                    repository = self.store.execution
+                    if repository.get_node(
+                        self.execution_run_id,
+                        node_key,
+                    ).status.is_terminal:
+                        return
                     repository.record_node_result_observation(
                         self.execution_run_id,
                         node_key,
@@ -385,6 +397,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 except Exception:
                     observations.append(AvailabilityStatus.UNKNOWN)
             with self.store.transaction():
+                repository = self.store.execution
+                if repository.get_node(
+                    self.execution_run_id,
+                    node_key,
+                ).status.is_terminal:
+                    continue
                 repository.start_node(
                     self.execution_run_id,
                     node_key,
@@ -412,14 +430,25 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 self._publish_empty_node(node_key)
 
     def _recover_task_publications(self) -> None:
-        repository = self.store.execution
-        for node in repository.list_nodes(self.execution_run_id):
+        with self.store.synchronize():
+            repository = self.store.execution
+            nodes = repository.list_nodes(self.execution_run_id)
+            fingerprint = repository.get_run(
+                self.execution_run_id
+            ).plan.workload_plan_fingerprint
+        for node in nodes:
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
                 continue
             try:
                 planned = self._planned_tasks(node.node_key)
             except Exception:
                 with self.store.transaction():
+                    repository = self.store.execution
+                    if repository.get_node(
+                        self.execution_run_id,
+                        node.node_key,
+                    ).status.is_terminal:
+                        return
                     repository.record_node_result_observation(
                         self.execution_run_id,
                         node.node_key,
@@ -427,80 +456,97 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                         now=self._now(),
                     )
                 return
-            records = repository.list_tasks(self.execution_run_id, node.node_key)
+            with self.store.synchronize():
+                records = self.store.execution.list_tasks(
+                    self.execution_run_id,
+                    node.node_key,
+                )
             if len(records) != len(planned):
                 raise RuntimeError("Persisted AlphaFold3 Task count changed")
+            updates = []
+            for record, item in zip(records, planned, strict=True):
+                expected = item.plan.fingerprint(
+                    workload_plan_fingerprint=fingerprint,
+                    node_key=node.node_key,
+                )
+                if (
+                    record.task_key != item.plan.task_key
+                    or record.fingerprint != expected
+                ):
+                    raise RuntimeError("Persisted AlphaFold3 Task identity changed")
+                if record.status.is_terminal:
+                    continue
+                try:
+                    observation = self._task_observation(node.node_key, item)
+                except _ConclusivePublicationError as error:
+                    updates.append((record.task_key, None, str(error)))
+                    continue
+                except Exception:
+                    observation = AvailabilityStatus.UNKNOWN
+                if observation != AvailabilityStatus.MISSING:
+                    updates.append((record.task_key, observation, None))
+            if not updates:
+                continue
             with self.store.transaction():
-                for record, item in zip(records, planned, strict=True):
-                    expected = item.plan.fingerprint(
-                        workload_plan_fingerprint=(
-                            repository.get_run(
-                                self.execution_run_id
-                            ).plan.workload_plan_fingerprint
-                        ),
-                        node_key=node.node_key,
-                    )
-                    if (
-                        record.task_key != item.plan.task_key
-                        or record.fingerprint != expected
-                    ):
-                        raise RuntimeError("Persisted AlphaFold3 Task identity changed")
-                    if record.status.is_terminal:
+                repository = self.store.execution
+                for task_key, observation, message in updates:
+                    if repository.get_task(
+                        self.execution_run_id,
+                        node.node_key,
+                        task_key,
+                    ).status.is_terminal:
                         continue
-                    try:
-                        observation = self._task_observation(node.node_key, item)
-                    except _ConclusivePublicationError as error:
+                    if message is not None:
                         repository.fail_task(
                             self.execution_run_id,
                             node.node_key,
-                            record.task_key,
-                            message=str(error),
+                            task_key,
+                            message=message,
                             now=self._now(),
                         )
                         continue
-                    except Exception:
-                        observation = AvailabilityStatus.UNKNOWN
-                    if observation == AvailabilityStatus.MISSING:
+                    if observation is None:
                         continue
                     repository.record_task_result_observation(
                         self.execution_run_id,
                         node.node_key,
-                        record.task_key,
+                        task_key,
                         observation,
                         now=self._now(),
                     )
 
     def _run_local_tasks(self) -> None:
-        repository = self.store.execution
-        node = repository.get_node(self.execution_run_id, _STAGE_INFERENCE)
-        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
-            return
-        task = repository.get_task(
-            self.execution_run_id,
-            _STAGE_INFERENCE,
-            "staged-input",
-        )
+        with self.store.synchronize():
+            repository = self.store.execution
+            node = repository.get_node(self.execution_run_id, _STAGE_INFERENCE)
+            if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+                return
+            task = repository.get_task(
+                self.execution_run_id,
+                _STAGE_INFERENCE,
+                "staged-input",
+            )
         if (
             task.status.is_terminal
             or task.result_observation != AvailabilityStatus.MISSING
         ):
             return
-        with self.store.transaction():
-            acquired = repository.acquire_local_task(
-                self.execution_run_id,
-                _STAGE_INFERENCE,
-                task.task_key,
-                now=self._now(),
-            )
+        with self.store.synchronize():
+            with self.store.transaction():
+                acquired = self.store.execution.acquire_local_task(
+                    self.execution_run_id,
+                    _STAGE_INFERENCE,
+                    task.task_key,
+                    now=self._now(),
+                )
+            if acquired:
+                self._checkpoint()
         if not acquired:
             return
-        self._checkpoint()
         prepared = self._prepared_inference()
         try:
-            with self.store.closed_for_volume_sync():
-                stage_inference_run(self.output_volume, prepared)
-                self.output_volume.reload()
-            self._provider.repository = self.store.execution
+            stage_inference_run(self.output_volume, prepared)
+            super()._reload_output()
             loaded = load_staged_inference_input(
                 self.inference_runtime.output_root,
                 run_id=prepared.run_id,
@@ -511,7 +557,14 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 raise RuntimeError("Staged AlphaFold3 input changed")
         except Exception as error:
             with self.store.transaction():
-                self.store.execution.fail_task(
+                repository = self.store.execution
+                if repository.get_task(
+                    self.execution_run_id,
+                    _STAGE_INFERENCE,
+                    task.task_key,
+                ).status.is_terminal:
+                    return
+                repository.fail_task(
                     self.execution_run_id,
                     _STAGE_INFERENCE,
                     task.task_key,
@@ -520,7 +573,14 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 )
             return
         with self.store.transaction():
-            self.store.execution.record_task_result_observation(
+            repository = self.store.execution
+            if repository.get_task(
+                self.execution_run_id,
+                _STAGE_INFERENCE,
+                task.task_key,
+            ).status.is_terminal:
+                return
+            repository.record_task_result_observation(
                 self.execution_run_id,
                 _STAGE_INFERENCE,
                 task.task_key,
@@ -529,18 +589,19 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             )
 
     def _publish_request_receipt(self) -> None:
-        repository = self.store.execution
-        node = repository.get_node(self.execution_run_id, _REQUEST_PUBLICATION)
-        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
-            return
-        task = repository.get_task(
-            self.execution_run_id,
-            _REQUEST_PUBLICATION,
-            "request-view",
-        )
-        if task.status.is_terminal or task.provider_call_id is None:
-            return
-        call = repository.get_provider_call(task.provider_call_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            node = repository.get_node(self.execution_run_id, _REQUEST_PUBLICATION)
+            if node.status != NodeStatus.RUNNING or not node.discovery_complete:
+                return
+            task = repository.get_task(
+                self.execution_run_id,
+                _REQUEST_PUBLICATION,
+                "request-view",
+            )
+            if task.status.is_terminal or task.provider_call_id is None:
+                return
+            call = repository.get_provider_call(task.provider_call_id)
         if call.status != ProviderCallStatus.SUCCEEDED:
             return
         prepared = self._prepared_inference()
@@ -552,20 +613,25 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 raise _ConclusivePublicationError(
                     "Request finalizer returned without its exact manifest"
                 )
-            with self.store.closed_for_volume_sync():
-                publish_invocation_receipt(
-                    self.output_volume,
-                    build_invocation_receipt(
-                        self.request.invocation,
-                        prepared,
-                        manifest,
-                    ),
-                )
-                self.output_volume.reload()
-            self._provider.repository = self.store.execution
+            publish_invocation_receipt(
+                self.output_volume,
+                build_invocation_receipt(
+                    self.request.invocation,
+                    prepared,
+                    manifest,
+                ),
+            )
+            super()._reload_output()
         except _ConclusivePublicationError as error:
             with self.store.transaction():
-                self.store.execution.fail_task(
+                repository = self.store.execution
+                if repository.get_task(
+                    self.execution_run_id,
+                    _REQUEST_PUBLICATION,
+                    task.task_key,
+                ).status.is_terminal:
+                    return
+                repository.fail_task(
                     self.execution_run_id,
                     _REQUEST_PUBLICATION,
                     task.task_key,
@@ -574,17 +640,28 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 )
 
     def _reconcile_nodes_and_run(self) -> None:
-        repository = self.store.execution
-        for node in repository.list_nodes(self.execution_run_id):
+        with self.store.synchronize():
+            nodes = self.store.execution.list_nodes(self.execution_run_id)
+        for node in nodes:
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
                 continue
-            tasks = repository.list_tasks(self.execution_run_id, node.node_key)
+            with self.store.synchronize():
+                tasks = self.store.execution.list_tasks(
+                    self.execution_run_id,
+                    node.node_key,
+                )
             if not tasks:
                 observation = self._empty_node_observation(node.node_key)
                 if observation == AvailabilityStatus.MISSING:
                     self._publish_empty_node(node.node_key)
                     return
                 with self.store.transaction():
+                    repository = self.store.execution
+                    if repository.get_node(
+                        self.execution_run_id,
+                        node.node_key,
+                    ).status.is_terminal:
+                        continue
                     repository.record_node_result_observation(
                         self.execution_run_id,
                         node.node_key,
@@ -593,12 +670,14 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                     )
                 continue
             with self.store.transaction():
+                repository = self.store.execution
                 repository.reconcile_node_tasks(
                     self.execution_run_id,
                     node.node_key,
                     now=self._now(),
                 )
         with self.store.transaction():
+            repository = self.store.execution
             repository.skip_unreachable_nodes(
                 self.execution_run_id,
                 now=self._now(),
@@ -609,8 +688,10 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             )
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
         planned_by_node: dict[str, dict[str, _PlannedTask]] = {}
         dispatch_by_node: dict[str, tuple[ProviderBinding, int]] = {}
 
@@ -637,8 +718,6 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 unblocking_span=rank.unblocking_span,
             )
 
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -654,17 +733,22 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
         if any(candidate.node_key == _SEED_PREDICTIONS for candidate in selected):
-            self._reload_output()
+            super()._reload_output()
+            self._seed_prediction_cache = None
+        resolved_functions: dict[ProviderBinding, Any] = {}
+        submissions = []
         for candidate in selected:
             planned = planned_by_node[candidate.node_key]
-            self._provider.repository = self.store.execution
-            binding_function = self._provider.resolve_provider_binding(
-                self.execution_run_id,
-                candidate.binding,
-                now=self._now(),
-            )
+            binding_function = resolved_functions.get(candidate.binding)
             if binding_function is None:
-                return
+                binding_function = self._provider.resolve_provider_binding(
+                    self.execution_run_id,
+                    candidate.binding,
+                    now=self._now(),
+                )
+                if binding_function is None:
+                    return
+                resolved_functions[candidate.binding] = binding_function
             selected_candidate, claimed = self._claim_seed_candidate(
                 candidate,
                 planned,
@@ -676,24 +760,28 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 planned,
                 claimed,
             )
-            self._provider.repository = self.store.execution
-            try:
-                submitted = self._provider.submit_resolved_fixed_batch(
-                    self.execution_run_id,
-                    selected_candidate,
+            submissions.append(
+                ProviderCallSubmission(
+                    candidate=selected_candidate,
                     function=binding_function,
                     submission_token=selected_candidate.candidate_key,
                     args=args,
                     kwargs=kwargs,
-                    now=self._now(),
                 )
-                if submitted is None:
-                    return
-            except (
-                ModalDefiniteSubmissionError,
-                ModalSubmissionOutcomeUnknownError,
-            ):
+            )
+        try:
+            submitted = self._provider.submit_provider_calls(
+                self.execution_run_id,
+                tuple(submissions),
+                now=self._now(),
+            )
+            if any(call is None for call in submitted):
                 return
+        except (
+            ModalDefiniteSubmissionError,
+            ModalSubmissionOutcomeUnknownError,
+        ):
+            return
 
     def _claim_seed_candidate(
         self,
@@ -704,13 +792,14 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             return candidate, {}
         prepared = self._prepared_inference()
         seeds = tuple(cast(int, planned[key].value) for key in candidate.task_keys)
-        task_records = {
-            task.task_key: task
-            for task in self.store.execution.list_tasks(
-                self.execution_run_id,
-                _SEED_PREDICTIONS,
-            )
-        }
+        with self.store.synchronize():
+            task_records = {
+                task.task_key: task
+                for task in self.store.execution.list_tasks(
+                    self.execution_run_id,
+                    _SEED_PREDICTIONS,
+                )
+            }
         generations = {
             seed: self._generation_id(task_records[f"seed:{seed}"]) for seed in seeds
         }
@@ -724,11 +813,19 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         )
         if plan.reused_seeds:
             with self.store.transaction():
+                repository = self.store.execution
                 for seed in plan.reused_seeds:
-                    self.store.execution.record_task_result_observation(
+                    task_key = f"seed:{seed}"
+                    if repository.get_task(
                         self.execution_run_id,
                         _SEED_PREDICTIONS,
-                        f"seed:{seed}",
+                        task_key,
+                    ).status.is_terminal:
+                        continue
+                    repository.record_task_result_observation(
+                        self.execution_run_id,
+                        _SEED_PREDICTIONS,
+                        task_key,
                         AvailabilityStatus.AVAILABLE,
                         now=self._now(),
                     )
@@ -736,11 +833,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         task_keys = tuple(key for key in candidate.task_keys if key in owned)
         if not task_keys:
             return None, {}
-        first = self.store.execution.get_task(
-            self.execution_run_id,
-            _SEED_PREDICTIONS,
-            task_keys[0],
-        )
+        with self.store.synchronize():
+            first = self.store.execution.get_task(
+                self.execution_run_id,
+                _SEED_PREDICTIONS,
+                task_keys[0],
+            )
         return (
             replace(
                 candidate,
@@ -764,11 +862,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         values = [planned[key].value for key in candidate.task_keys]
         if candidate.node_key == _RAW_SEARCHES:
             task = cast(RawSearchTask, values[0])
-            record = self.store.execution.get_task(
-                self.execution_run_id,
-                candidate.node_key,
-                candidate.task_keys[0],
-            )
+            with self.store.synchronize():
+                record = self.store.execution.get_task(
+                    self.execution_run_id,
+                    candidate.node_key,
+                    candidate.task_keys[0],
+                )
             return (), {
                 "database_id": task.database_id,
                 "sequence": task.sequence,
@@ -777,11 +876,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             }
         if candidate.node_key == _MSA_ASSEMBLIES:
             task = cast(MsaAssemblyTask, values[0])
-            record = self.store.execution.get_task(
-                self.execution_run_id,
-                candidate.node_key,
-                candidate.task_keys[0],
-            )
+            with self.store.synchronize():
+                record = self.store.execution.get_task(
+                    self.execution_run_id,
+                    candidate.node_key,
+                    candidate.task_keys[0],
+                )
             return (), {
                 "polymer": task.polymer,
                 "sequence": task.sequence,
@@ -792,11 +892,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             }
         if candidate.node_key == _TEMPLATE_SEARCHES:
             task = cast(TemplateTask, values[0])
-            record = self.store.execution.get_task(
-                self.execution_run_id,
-                candidate.node_key,
-                candidate.task_keys[0],
-            )
+            with self.store.synchronize():
+                record = self.store.execution.get_task(
+                    self.execution_run_id,
+                    candidate.node_key,
+                    candidate.task_keys[0],
+                )
             return (), {
                 "sequence": task.sequence,
                 "unpaired_msa": task.unpaired_msa,
@@ -1113,17 +1214,19 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         node_key: str,
         task_key: str,
     ) -> ProviderCallRecord | None:
-        try:
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                node_key,
-                task_key,
-            )
-        except LookupError:
-            return None
-        if task.provider_call_id is None:
-            return None
-        return self.store.execution.get_provider_call(task.provider_call_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            try:
+                task = repository.get_task(
+                    self.execution_run_id,
+                    node_key,
+                    task_key,
+                )
+            except LookupError:
+                return None
+            if task.provider_call_id is None:
+                return None
+            return repository.get_provider_call(task.provider_call_id)
 
     def _load_call_result(self, call: ProviderCallRecord) -> dict[str, object]:
         envelope = call.result_envelope
@@ -1342,7 +1445,13 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             },
         )
         with self.store.transaction():
-            self.store.execution.record_node_result_observation(
+            repository = self.store.execution
+            if repository.get_node(
+                self.execution_run_id,
+                node_key,
+            ).status.is_terminal:
+                return
+            repository.record_node_result_observation(
                 self.execution_run_id,
                 node_key,
                 AvailabilityStatus.AVAILABLE,
@@ -1398,14 +1507,15 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         node_key: str,
         task_keys: tuple[str, ...],
     ) -> PurePosixPath:
-        tasks = [
-            self.store.execution.get_task(
-                self.execution_run_id,
-                node_key,
-                key,
-            )
-            for key in task_keys
-        ]
+        with self.store.synchronize():
+            tasks = [
+                self.store.execution.get_task(
+                    self.execution_run_id,
+                    node_key,
+                    key,
+                )
+                for key in task_keys
+            ]
         digest = sha256(
             orjson.dumps(
                 [task.fingerprint for task in tasks],
@@ -1451,13 +1561,30 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         super()._reload_output()
         self._invalidate_planning_cache()
 
-    def _invalidate_planning_cache(self) -> None:
+    def _invalidate_planning_cache(
+        self,
+        changed_nodes: Collection[str] | None = None,
+    ) -> None:
         """Discard cache observations after cross-container publications change."""
-        self._msa_inventory_cache = None
-        self._combined_msa_cache.clear()
-        self._prepared_inference_cache = None
-        self._prepared_inference_error = None
-        self._seed_prediction_cache = None
+        changed = (
+            {_RAW_SEARCHES, _MSA_ASSEMBLIES, _TEMPLATE_SEARCHES, _SEED_PREDICTIONS}
+            if changed_nodes is None
+            else set(changed_nodes)
+        )
+        if _RAW_SEARCHES in changed:
+            self._msa_inventory_cache = None
+        if changed & {_RAW_SEARCHES, _MSA_ASSEMBLIES}:
+            self._combined_msa_cache.clear()
+        if changed & {_RAW_SEARCHES, _MSA_ASSEMBLIES, _TEMPLATE_SEARCHES}:
+            self._prepared_inference_cache = None
+            self._prepared_inference_error = None
+        if changed & {
+            _RAW_SEARCHES,
+            _MSA_ASSEMBLIES,
+            _TEMPLATE_SEARCHES,
+            _SEED_PREDICTIONS,
+        }:
+            self._seed_prediction_cache = None
 
 
 def _result_envelope(result: object) -> dict[str, object]:

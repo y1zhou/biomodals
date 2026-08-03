@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from biomodals.helper.app_execution import ExecutionRunStore
@@ -32,9 +33,15 @@ class UnsupportedWorkflowRunStoreError(RuntimeError):
 class WorkflowRunStore(ExecutionRunStore):
     """Own one workflow Run's paths, connection, and transaction boundary."""
 
-    def __init__(self, volume_root: str | Path, execution_run_id: UUID) -> None:
+    def __init__(
+        self,
+        volume_root: str | Path,
+        execution_run_id: UUID,
+        *,
+        lock: Any | None = None,
+    ) -> None:
         """Select paths using only the opaque Execution Run identity."""
-        super().__init__(volume_root, execution_run_id)
+        super().__init__(volume_root, execution_run_id, lock=lock)
         self._artifacts: WorkflowArtifactStore | None = None
 
     @property

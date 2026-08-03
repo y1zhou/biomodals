@@ -155,13 +155,13 @@ def _publish_run(
     )
 
 
-def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) -> None:
+def test_initialization_reuses_the_host_volume_view(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
 
     runtime._initialize()
 
     output = cast(FakeVolume, runtime.output_volume)
-    assert output.reloads == 1
+    assert output.reloads == 0
     assert output.commits == 0
     runtime.close()
 
@@ -347,12 +347,13 @@ def test_unknown_run_prunes_calls_after_terminal_publication_appears(
     runtime._initialize()
     runtime.advance_once()
     calls = runtime.store.execution.list_provider_calls(RUN_ID)
-    for call in calls:
-        runtime.store.execution.mark_provider_call_state_unknown(
-            call.provider_call_id,
-            message="Modal state lookup was inconclusive",
-            now=11,
-        )
+    with runtime.store.transaction():
+        for call in calls:
+            runtime.store.execution.mark_provider_call_state_unknown(
+                call.provider_call_id,
+                message="Modal state lookup was inconclusive",
+                now=11,
+            )
     driver.state_unknown = True
     write_collection_publication(
         tmp_path,

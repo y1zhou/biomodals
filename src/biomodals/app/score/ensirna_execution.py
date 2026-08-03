@@ -23,6 +23,7 @@ from biomodals.execution import (
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
+    ProviderCallSubmission,
     TaskPlan,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
@@ -252,8 +253,8 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
             store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=store.commit,
             transaction=store.transaction,
+            synchronize=store.synchronize,
         )
 
     @property
@@ -272,7 +273,6 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._provider.repository = self.store.execution
         self._provider.advance_once(
             self.execution_run_id,
             recover_publications=self._recover_publications,
@@ -284,7 +284,6 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._reload_output()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -297,7 +296,6 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _recover_publications(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.recover_publications(
             self.execution_run_id,
             observe_node=self._node_observation,
@@ -349,21 +347,22 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._node_observation(node_key)
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
             encode_result=_result_envelope,
             now=self._now(),
         )
-        if any(
-            not original.status.is_terminal and updated.status.is_terminal
+        succeeded_nodes = {
+            updated.node_key
             for original, updated in reconciled
-        ):
+            if not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
+        }
+        if succeeded_nodes - {DOWNLOAD_MODELS_NODE}:
             self._reload_output()
 
     def _decode_completed_calls(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.decode_completed_calls(
             self.execution_run_id,
             observe_task=self._completed_task_observation,
@@ -397,7 +396,6 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._task_observation(node_key, task)
 
     def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         self._provider.start_ready_nodes(
             self.execution_run_id,
             required_node_keys=required,
@@ -450,8 +448,9 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
             return None
 
     def _plan_from_node(self, node_key: str) -> EnsirnaPreparationPlan:
-        repository = self.store.execution
-        for call in repository.list_provider_calls(self.execution_run_id):
+        with self.store.synchronize():
+            calls = self.store.execution.list_provider_calls(self.execution_run_id)
+        for call in calls:
             if (
                 call.node_key == node_key
                 and call.status == ProviderCallStatus.SUCCEEDED
@@ -530,10 +529,10 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
         return plan
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -554,19 +553,23 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
         )
         for candidate in selected:
             self._ensure_publication_claim(candidate.node_key)
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                kwargs=self._invocation_kwargs(
-                    candidate.node_key,
-                    candidate.task_keys[0],
-                ),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=self._invocation_kwargs(
+                        candidate.node_key,
+                        candidate.task_keys[0],
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {
@@ -601,11 +604,12 @@ class EnsirnaExecutionRuntime(ExecutionRuntimeLifecycle):
                 "force_generation": self.request.force_generation,
             }
         if node_key == CHUNKS_NODE:
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                CHUNKS_NODE,
-                task_key,
-            )
+            with self.store.synchronize():
+                task = self.store.execution.get_task(
+                    self.execution_run_id,
+                    CHUNKS_NODE,
+                    task_key,
+                )
             return {
                 "chunk": EnsirnaPdbChunkSpec(**task.execution_payload["chunk"]),
                 "pdb_cores": self.request.pdb_cores,

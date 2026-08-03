@@ -31,6 +31,8 @@ from biomodals.execution import (
     ExecutionRuntime,
     ExecutionSnapshot,
     NodeStatus,
+    ProviderCallStatus,
+    ProviderCallSubmission,
     TaskStatus,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
@@ -218,13 +220,12 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
-            commit_local=store.commit,
             transaction=store.transaction,
+            synchronize=store.synchronize,
         )
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
-        self._provider.repository = self.store.execution
         self._provider.advance_once(
             self.execution_run_id,
             recover_publications=self._recover_publications,
@@ -237,7 +238,6 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._reload_output()
         self._provider.create_or_verify_run(
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=self.predecessor_execution_run_id,
@@ -250,7 +250,6 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _recover_publications(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.recover_publications(
             self.execution_run_id,
             observe_node=self._node_observation,
@@ -428,7 +427,6 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         raise ValueError(f"Unknown GROMACS Node {node_key!r}")
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
@@ -436,13 +434,13 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
         if any(
-            not original.status.is_terminal and updated.status.is_terminal
+            not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
             for original, updated in reconciled
         ):
             self._reload_output()
 
     def _decode_completed_calls(self) -> None:
-        self._provider.repository = self.store.execution
         self._provider.decode_completed_calls(
             self.execution_run_id,
             observe_task=self._completed_task_observation,
@@ -467,7 +465,6 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._node_observation(node_key) if valid else AvailabilityStatus.MISSING
 
     def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         self._provider.start_ready_nodes(
             self.execution_run_id,
             required_node_keys=required,
@@ -477,31 +474,40 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _complete_local_result(self) -> None:
-        repository = self.store.execution
-        node = repository.get_node(self.execution_run_id, PREPARE_RESULT)
-        if node.status != NodeStatus.RUNNING:
-            return
-        task = repository.get_task(
-            self.execution_run_id,
-            PREPARE_RESULT,
-            "operation",
-        )
-        if task.status != TaskStatus.PENDING:
-            return
-        with self.store.transaction():
-            acquired = repository.acquire_local_task(
+        with self.store.synchronize():
+            repository = self.store.execution
+            node = repository.get_node(self.execution_run_id, PREPARE_RESULT)
+            if node.status != NodeStatus.RUNNING:
+                return
+            task = repository.get_task(
                 self.execution_run_id,
                 PREPARE_RESULT,
                 "operation",
-                now=self._now(),
             )
+        if task.status != TaskStatus.PENDING:
+            return
+        with self.store.synchronize():
+            with self.store.transaction():
+                acquired = self.store.execution.acquire_local_task(
+                    self.execution_run_id,
+                    PREPARE_RESULT,
+                    "operation",
+                    now=self._now(),
+                )
+            if acquired:
+                self._checkpoint()
         if not acquired:
             return
-        self._checkpoint()
-        repository = self.store.execution
         self._write_node_publication(PREPARE_RESULT)
         observation = self._node_observation(PREPARE_RESULT)
         with self.store.transaction():
+            repository = self.store.execution
+            if repository.get_task(
+                self.execution_run_id,
+                PREPARE_RESULT,
+                "operation",
+            ).status.is_terminal:
+                return
             if observation == AvailabilityStatus.MISSING:
                 repository.fail_task(
                     self.execution_run_id,
@@ -520,10 +526,10 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 )
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        self._provider.repository = repository
-        counts = repository.active_provider_call_counts(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
@@ -557,17 +563,20 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             ),
             now=self._now(),
         )
-        for candidate in selected:
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                kwargs=self._invocation_kwargs(candidate.node_key),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=self._invocation_kwargs(candidate.node_key),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _invocation_kwargs(self, node_key: str) -> dict[str, object]:
         request = self.request

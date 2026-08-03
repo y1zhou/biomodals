@@ -38,7 +38,7 @@ def drive_execution_run(
     poll_interval_seconds: float = 1.0,
     synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
 ) -> ExecutionSnapshot:
-    """Advance one Run, releasing its optional host lock between cycles."""
+    """Advance one Run without holding its writer across workload or provider I/O."""
     if poll_interval_seconds < 0:
         raise ValueError("poll_interval_seconds cannot be negative")
     clock = now or (lambda: int(time.time()))
@@ -71,11 +71,12 @@ def drive_execution_run(
                     snapshot.active_provider_calls.gpu,
                 )
                 return snapshot
-            try:
-                advance_once()
+        try:
+            advance_once()
+        except Exception as exc:
+            with synchronize():
                 if current_repository is not None:
                     repository = current_repository()
-            except Exception as exc:
                 _suspend_after_application_error(
                     repository,
                     execution_run_id,
@@ -83,7 +84,10 @@ def drive_execution_run(
                     checkpoint=checkpoint,
                     now=clock(),
                 )
-                raise
+            raise
+        with synchronize():
+            if current_repository is not None:
+                repository = current_repository()
             keep_driving = (
                 repository.get_run(execution_run_id).status in _DRIVABLE_STATUSES
             )
@@ -102,21 +106,33 @@ def resume_execution_run(
     reconcile_once: Callable[[], None],
     checkpoint: Callable[[], SqliteExecutionRepository | None],
     now: int,
+    current_repository: Callable[[], SqliteExecutionRepository] | None = None,
+    synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
 ) -> ExecutionRunRecord:
-    """Resume suspension or explicitly reconcile uncertain provider ownership."""
-    run = repository.get_run(execution_run_id)
-    if run.status == RunStatus.SUSPENDED:
-        repository.resume_run(execution_run_id, now=now)
-    elif run.status == RunStatus.STATE_UNKNOWN:
-        reconcile_once()
-    else:
-        raise ValueError(
-            "only a suspended or state_unknown Run can be explicitly resumed"
-        )
-    replacement = checkpoint()
-    if replacement is not None:
-        repository = replacement
-    return repository.get_run(execution_run_id)
+    """Resume one Run without holding its writer during provider reconciliation."""
+    with synchronize():
+        if current_repository is not None:
+            repository = current_repository()
+        run = repository.get_run(execution_run_id)
+        if run.status == RunStatus.SUSPENDED:
+            repository.resume_run(execution_run_id, now=now)
+            replacement = checkpoint()
+            if replacement is not None:
+                repository = replacement
+            return repository.get_run(execution_run_id)
+        if run.status != RunStatus.STATE_UNKNOWN:
+            raise ValueError(
+                "only a suspended or state_unknown Run can be explicitly resumed"
+            )
+
+    reconcile_once()
+    with synchronize():
+        if current_repository is not None:
+            repository = current_repository()
+        replacement = checkpoint()
+        if replacement is not None:
+            repository = replacement
+        return repository.get_run(execution_run_id)
 
 
 def _suspend_after_application_error(

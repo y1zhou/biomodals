@@ -24,12 +24,13 @@ from biomodals.execution.modal import (
     ModalDeploymentUnavailableError,
     ModalSubmissionOutcomeUnknownError,
 )
-from biomodals.execution.runtime import ExecutionRuntime
+from biomodals.execution.runtime import ExecutionRuntime, ProviderCallSubmission
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
+from biomodals.helper.app_execution import ExecutionRunStore, ExecutionVolumeSync
 
 from .provider_call_helpers import (
     GPU_BINDING,
@@ -67,7 +68,7 @@ class FakeModalDriver:
         self.spawn_kwargs.append(dict(kwargs))
         if self.spawn_error is not None:
             raise self.spawn_error
-        return f"fc-{function.name}"
+        return f"fc-{function.name}-{self.spawn_count}"
 
     def observe(self, provider_call_handle_id):
         self.observe_count += 1
@@ -184,7 +185,6 @@ def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
         repository,
         modal_driver=FakeModalDriver(),
         checkpoint=connection.commit,
-        commit_local=connection.commit,
         transaction=_transaction(connection),
     )
 
@@ -249,6 +249,199 @@ def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> N
     assert duplicate == first
     assert checkpoints == [0, 1]
     assert driver.spawn_count == 1
+
+
+def test_admission_set_batches_resolution_and_volume_checkpoints() -> None:
+    repository = create_repository(
+        task_count=2,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    checkpoints: list[int] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: checkpoints.append(driver.spawn_count),
+    )
+
+    calls = runtime.submit_provider_calls(
+        RUN_ID,
+        tuple(
+            ProviderCallSubmission(
+                candidate=_candidate(index),
+                submission_token=f"batch-{index}",
+                kwargs={"seed": index},
+            )
+            for index in range(2)
+        ),
+        now=110,
+    )
+
+    assert all(call is not None for call in calls)
+    assert driver.resolve_count == 1
+    assert driver.spawn_count == 2
+    assert checkpoints == [0, 2]
+
+
+def test_modal_operations_never_hold_the_repository_writer() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    writer_active = False
+    operations: list[str] = []
+
+    @contextmanager
+    def synchronize():
+        nonlocal writer_active
+        assert not writer_active
+        writer_active = True
+        try:
+            yield
+        finally:
+            writer_active = False
+
+    class LockCheckingDriver(FakeModalDriver):
+        def resolve(self, binding):
+            assert not writer_active
+            operations.append("resolve")
+            return super().resolve(binding)
+
+        def spawn(self, function, *, args, kwargs):
+            assert not writer_active
+            operations.append("spawn")
+            return super().spawn(function, args=args, kwargs=kwargs)
+
+        def observe(self, provider_call_handle_id):
+            assert not writer_active
+            operations.append("observe")
+            return super().observe(provider_call_handle_id)
+
+        def cancel(self, provider_call_handle_id):
+            assert not writer_active
+            operations.append("cancel")
+            return super().cancel(provider_call_handle_id)
+
+    driver = LockCheckingDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: (
+            pytest.fail("checkpoint escaped the writer") if not writer_active else None
+        ),
+        synchronize=synchronize,
+    )
+    runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(),
+        submission_token="batch",
+        now=110,
+    )
+    runtime.cancel_run(RUN_ID, now=111)
+    runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
+        encode_result=lambda result: result,
+        now=112,
+    )
+
+    assert operations == ["resolve", "spawn", "cancel", "observe"]
+
+
+def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    runtime: ExecutionRuntime
+
+    class CancellingDriver(FakeModalDriver):
+        def spawn(self, function, *, args, kwargs):
+            handle_id = super().spawn(function, args=args, kwargs=kwargs)
+            runtime.cancel_run(RUN_ID, now=111)
+            return handle_id
+
+    driver = CancellingDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+
+    call = runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(),
+        submission_token="batch",
+        now=110,
+    )
+
+    assert call is not None
+    assert call.status == ProviderCallStatus.ATTACHED
+    assert repository.get_run(RUN_ID).status.value == "cancel_requested"
+    assert driver.cancelled == [call.provider_call_handle_id]
+
+
+def test_terminal_call_set_uses_one_volume_checkpoint() -> None:
+    repository = create_repository(
+        task_count=2,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    checkpoints: list[str] = []
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: checkpoints.append("checkpoint"),
+    )
+    runtime.submit_provider_calls(
+        RUN_ID,
+        tuple(
+            ProviderCallSubmission(
+                candidate=_candidate(index),
+                submission_token=f"batch-{index}",
+            )
+            for index in range(2)
+        ),
+        now=110,
+    )
+    checkpoints.clear()
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.SUCCEEDED,
+        result={"path": "/outputs/result"},
+    )
+
+    reconciled = runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
+        encode_result=lambda result: result,
+        now=120,
+    )
+
+    assert all(
+        updated.status == ProviderCallStatus.SUCCEEDED for _, updated in reconciled
+    )
+    assert driver.observe_count == 2
+    assert checkpoints == ["checkpoint"]
 
 
 def test_checkpoint_may_replace_a_volume_backed_repository(tmp_path) -> None:
@@ -321,6 +514,50 @@ def test_resolution_failure_happens_before_durable_preclaim() -> None:
         )
 
     assert repository.list_provider_calls(RUN_ID) == ()
+
+
+def test_publication_recovery_reopens_repository_after_concurrent_checkpoint(
+    tmp_path,
+) -> None:
+    """A Volume barrier during observation must not leave a stale SQLite handle."""
+
+    class Volume:
+        def commit(self) -> None:
+            pass
+
+        def reload(self) -> None:
+            pass
+
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    create_repository(connection=store.connection, task_count=1)
+    volume_sync = ExecutionVolumeSync(volume=Volume(), store=store)
+
+    def checkpoint():
+        volume_sync.commit()
+        return store.execution
+
+    runtime = ExecutionRuntime(
+        store.execution,
+        modal_driver=FakeModalDriver(),
+        checkpoint=checkpoint,
+        transaction=store.transaction,
+        synchronize=store.synchronize,
+    )
+
+    def observe_node(_node_key):
+        runtime.checkpoint()
+        return AvailabilityStatus.AVAILABLE
+
+    required = runtime.recover_publications(
+        RUN_ID,
+        observe_node=observe_node,
+        observe_task=lambda _node_key, _task: None,
+        now=110,
+    )
+
+    assert required == ()
+    assert store.execution.get_node(RUN_ID, "inference").status == NodeStatus.SUCCEEDED
+    store.close()
 
 
 def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
@@ -468,6 +705,10 @@ def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -
             ModalSubmissionOutcomeUnknownError("response lost"),
             ProviderCallStatus.OUTCOME_UNKNOWN,
         ),
+        (
+            RuntimeError("unexpected transport failure"),
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+        ),
     ],
 )
 def test_spawn_failure_is_durably_classified_without_reauthorization(
@@ -546,7 +787,7 @@ def test_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
 
     call = repository.list_provider_calls(RUN_ID)[0]
     assert call.status == ProviderCallStatus.OUTCOME_UNKNOWN
-    assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}"]
+    assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}-1"]
     assert checkpoints == [
         ProviderCallStatus.SUBMITTING,
         ProviderCallStatus.OUTCOME_UNKNOWN,
@@ -596,7 +837,7 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
     assert driver.observe_count == 1
 
 
-def test_running_poll_commits_sqlite_without_crossing_host_checkpoint() -> None:
+def test_running_poll_does_not_cross_host_checkpoint() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(
         repository,
@@ -606,12 +847,10 @@ def test_running_poll_commits_sqlite_without_crossing_host_checkpoint() -> None:
     )
     driver = FakeModalDriver()
     checkpoints: list[str] = []
-    commits: list[str] = []
     runtime = ExecutionRuntime(
         repository,
         modal_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
-        commit_local=lambda: commits.append("commit"),
     )
     call = runtime.submit_fixed_batch(
         RUN_ID,
@@ -629,7 +868,6 @@ def test_running_poll_commits_sqlite_without_crossing_host_checkpoint() -> None:
     )
 
     assert running.status == ProviderCallStatus.RUNNING
-    assert commits == ["commit"]
     assert checkpoints == []
 
 

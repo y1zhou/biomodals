@@ -72,12 +72,12 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 request,
                 predecessor_execution_run_id=self._existing_predecessor(),
             )
-            runtime.attach()
-            return runtime.claim_pull_tasks(
-                provider_call_id,
-                request_id=request_id,
-                capacity=capacity,
-            )
+        runtime.attach()
+        return runtime.claim_pull_tasks(
+            provider_call_id,
+            request_id=request_id,
+            capacity=capacity,
+        )
 
     def complete_task(
         self,
@@ -97,13 +97,13 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 request,
                 predecessor_execution_run_id=self._existing_predecessor(),
             )
-            runtime.refresh_publications()
-            return runtime.complete_pull_task(
-                provider_call_id,
-                task_key,
-                request_id=request_id,
-                result=result,
-            )
+        runtime.refresh_publications()
+        return runtime.complete_pull_task(
+            provider_call_id,
+            task_key,
+            request_id=request_id,
+            result=result,
+        )
 
     def restart(
         self,

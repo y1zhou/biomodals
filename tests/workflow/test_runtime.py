@@ -461,7 +461,7 @@ def _runtime(
     )
 
 
-def test_initialization_does_not_checkpoint_the_workflow_volume(
+def test_initialization_reuses_the_host_volume_view(
     tmp_path: Path,
 ) -> None:
     workflow = Workflow("remote")
@@ -474,13 +474,13 @@ def test_initialization_does_not_checkpoint_the_workflow_volume(
 
     runtime._initialize("friendly-name")
 
-    assert volume.reloads == 1
+    assert volume.reloads == 0
     assert volume.commits == 0
     runtime.attach(workload_run_key="friendly-name")
     runtime.attach(workload_run_key="friendly-name")
-    assert volume.reloads == 1
+    assert volume.reloads == 0
     runtime.refresh_publications(workload_run_key="friendly-name")
-    assert volume.reloads == 2
+    assert volume.reloads == 1
     runtime.close()
 
 
@@ -623,8 +623,8 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
     assert result.status == AppRunStatus.SUCCEEDED
     assert driver.events[:4] == [
         "resolve:main/DemoWorkflow/7/run_gpu",
-        "spawn:run_gpu",
         "resolve:main/DemoWorkflow/7/run_cpu",
+        "spawn:run_gpu",
         "spawn:run_cpu",
     ]
     assert driver.events[4:] == [
@@ -774,10 +774,9 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
     result = runtime.run(workload_run_key="fanout")
 
     assert result.status == AppRunStatus.SUCCEEDED
-    assert driver.events[:4] == [
+    assert driver.events[:3] == [
         "resolve:main/DemoWorkflow/7/run_candidate",
         "spawn:candidate-0",
-        "resolve:main/DemoWorkflow/7/run_candidate",
         "spawn:candidate-1",
     ]
     tasks = runtime.store.execution.list_tasks(RUN_ID, "fanout")

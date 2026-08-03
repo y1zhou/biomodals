@@ -24,6 +24,7 @@ from biomodals.execution import (
     ProviderBinding,
     ProviderCallRecord,
     ProviderCallStatus,
+    ProviderCallSubmission,
     PullTaskClaim,
     RunStatus,
     RunStatusReason,
@@ -106,6 +107,7 @@ class WorkflowRuntime:
         external_artifact_checker: ExternalArtifactChecker | None = None,
         external_volume_roots: Mapping[str, str | Path] | None = None,
         pull_worker_coordinator: Any | None = None,
+        store: WorkflowRunStore | None = None,
         now: Callable[[], int] | None = None,
         poll_interval_seconds: float = 1.0,
     ) -> None:
@@ -139,7 +141,7 @@ class WorkflowRuntime:
         self.pull_worker_coordinator = pull_worker_coordinator
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
-        self.store = WorkflowRunStore(self.volume_root, execution_run_id)
+        self.store = store or WorkflowRunStore(self.volume_root, execution_run_id)
         self._volume_sync = ExecutionVolumeSync(
             volume=workflow_volume,
             store=self.store,
@@ -148,7 +150,8 @@ class WorkflowRuntime:
             self.store.execution,
             modal_driver=modal_driver or ModalCallDriver(),
             checkpoint=self._checkpoint,
-            commit_local=self.store.commit,
+            transaction=self.store.transaction,
+            synchronize=self.store.synchronize,
         )
         self._definition: WorkflowDefinition | None = None
         self._workload_run_key: str | None = None
@@ -183,13 +186,15 @@ class WorkflowRuntime:
         """Explicitly resume this persisted Run, then drive it."""
         with synchronize():
             repository = self._initialize(workload_run_key)
-            resume_execution_run(
-                repository,
-                self.execution_run_id,
-                reconcile_once=self.advance_once,
-                checkpoint=self._checkpoint,
-                now=self._now(),
-            )
+        resume_execution_run(
+            repository,
+            self.execution_run_id,
+            reconcile_once=self.advance_once,
+            checkpoint=self._checkpoint,
+            current_repository=lambda: self.store.execution,
+            synchronize=synchronize,
+            now=self._now(),
+        )
         snapshot = drive_execution_run(
             self.store.execution,
             self.execution_run_id,
@@ -205,11 +210,11 @@ class WorkflowRuntime:
     def advance_once(self) -> None:
         """Apply one caller-driven workflow scheduling cycle."""
         definition = self._require_definition()
-        self._provider.repository = self.store.execution
         self._recover_publications()
         self._reconcile_nodes_and_run()
 
-        run = self.store.execution.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            run = self.store.execution.get_run(self.execution_run_id)
         if run.status == RunStatus.CANCEL_REQUESTED:
             self._reconcile_provider_calls(set(run.plan.node_keys))
             self._recover_publications()
@@ -222,7 +227,6 @@ class WorkflowRuntime:
             else:
                 required_nodes = required
                 for provider_call_id in self._prune_unrequired(required):
-                    self._provider.repository = self.store.execution
                     self._provider.request_provider_call_cancellation(
                         provider_call_id,
                         now=self._now(),
@@ -239,7 +243,6 @@ class WorkflowRuntime:
 
         calls_to_cancel = self._prune_unrequired(required)
         for provider_call_id in calls_to_cancel:
-            self._provider.repository = self.store.execution
             self._provider.request_provider_call_cancellation(
                 provider_call_id,
                 now=self._now(),
@@ -247,10 +250,14 @@ class WorkflowRuntime:
 
         self._reconcile_provider_calls(required)
         self._reconcile_nodes_and_run()
-        if self.store.execution.get_run(self.execution_run_id).status not in {
-            RunStatus.PENDING,
-            RunStatus.RUNNING,
-        }:
+        with self.store.synchronize():
+            can_continue = self.store.execution.get_run(
+                self.execution_run_id
+            ).status in {
+                RunStatus.PENDING,
+                RunStatus.RUNNING,
+            }
+        if not can_continue:
             return
 
         self._start_ready_nodes(definition)
@@ -262,7 +269,6 @@ class WorkflowRuntime:
 
     def cancel(self) -> None:
         """Request cancellation through the shared provider lifecycle."""
-        self._provider.repository = self.store.execution
         self._provider.cancel_run(self.execution_run_id, now=self._now())
 
     def attach(self, *, workload_run_key: str) -> None:
@@ -281,7 +287,6 @@ class WorkflowRuntime:
         capacity: int,
     ) -> PullTaskClaim:
         """Checkpoint one idempotent worker claim before returning its payloads."""
-        self._provider.repository = self.store.execution
         return self._provider.claim_pull_tasks(
             provider_call_id,
             request_id=request_id,
@@ -299,26 +304,28 @@ class WorkflowRuntime:
     ) -> ExecutionTaskRecord:
         """Publish one worker result and checkpoint its idempotent completion."""
         result = AppRunResult.model_validate(result)
-        call = self.store.execution.get_provider_call(provider_call_id)
+        with self.store.synchronize():
+            call = self.store.execution.get_provider_call(provider_call_id)
+            task = self.store.execution.get_task(
+                self.execution_run_id,
+                call.node_key,
+                task_key,
+            )
         node = self._require_definition().nodes[call.node_key].node
         if not isinstance(node, RemotePullTaskWorkflowNode):
             raise ValueError("Provider Call does not belong to a pull-worker Node")
-        task = self.store.execution.get_task(
-            self.execution_run_id,
-            call.node_key,
-            task_key,
-        )
         if result.status != AppRunStatus.SUCCEEDED:
-            with self.store.transaction():
-                completed = self.store.execution.record_pull_task_completion(
-                    provider_call_id,
-                    task_key,
-                    request_id=request_id,
-                    observation=AvailabilityStatus.MISSING,
-                    message=_node_error_message(result),
-                    now=self._now(),
-                )
-            self._checkpoint()
+            with self.store.synchronize():
+                with self.store.transaction():
+                    completed = self.store.execution.record_pull_task_completion(
+                        provider_call_id,
+                        task_key,
+                        request_id=request_id,
+                        observation=AvailabilityStatus.MISSING,
+                        message=_node_error_message(result),
+                        now=self._now(),
+                    )
+                self._checkpoint()
             return completed
 
         context = self._node_context(
@@ -348,28 +355,29 @@ class WorkflowRuntime:
             materialized.result,
             artifacts,
         )
-        with self.store.transaction():
-            self.store.artifacts.record_task_publication(
-                call.node_key,
-                task_key,
-                task_fingerprint=task.fingerprint,
-                result=materialized.result,
-                artifacts=artifacts,
-                now=self._now(),
-            )
-            completed = self.store.execution.record_pull_task_completion(
-                provider_call_id,
-                task_key,
-                request_id=request_id,
-                observation=observation,
-                message=(
-                    "Published workflow Task result is unavailable"
-                    if observation == AvailabilityStatus.MISSING
-                    else None
-                ),
-                now=self._now(),
-            )
-        self._checkpoint()
+        with self.store.synchronize():
+            with self.store.transaction():
+                self.store.artifacts.record_task_publication(
+                    call.node_key,
+                    task_key,
+                    task_fingerprint=task.fingerprint,
+                    result=materialized.result,
+                    artifacts=artifacts,
+                    now=self._now(),
+                )
+                completed = self.store.execution.record_pull_task_completion(
+                    provider_call_id,
+                    task_key,
+                    request_id=request_id,
+                    observation=observation,
+                    message=(
+                        "Published workflow Task result is unavailable"
+                        if observation == AvailabilityStatus.MISSING
+                        else None
+                    ),
+                    now=self._now(),
+                )
+            self._checkpoint()
         return completed
 
     def close(self) -> None:
@@ -380,14 +388,14 @@ class WorkflowRuntime:
         self,
         workload_run_key: str,
         *,
-        reload_volume: bool = True,
+        reload_volume: bool = False,
     ) -> SqliteExecutionRepository:
         """Load the workflow definition and create or verify its Run."""
         definition = self.workflow.validate()
         self._definition = definition
         self._workload_run_key = workload_run_key
         if reload_volume:
-            self._volume_sync.reload()
+            self._reload_volume()
         return self._ensure_run(definition, workload_run_key)
 
     def _ensure_run(
@@ -395,39 +403,44 @@ class WorkflowRuntime:
         definition: WorkflowDefinition,
         workload_run_key: str,
     ) -> SqliteExecutionRepository:
-        plan = execution_plan(
-            definition,
-            workload_run_key=workload_run_key,
-        )
-        repository = self.store.execution
-        try:
-            existing = repository.get_run(self.execution_run_id)
-        except LookupError:
-            with self.store.transaction():
-                self.store.execution.create_run(
-                    execution_run_id=self.execution_run_id,
-                    plan=plan,
-                    deployment=self.deployment,
-                    max_active_provider_calls=self.max_active_provider_calls,
-                    max_active_gpu_provider_calls=self.max_active_gpu_provider_calls,
-                    now=self._now(),
+        plan = execution_plan(definition, workload_run_key=workload_run_key)
+        with self.store.synchronize():
+            repository = self.store.execution
+            try:
+                existing = repository.get_run(self.execution_run_id)
+            except LookupError:
+                with self.store.transaction():
+                    self.store.execution.create_run(
+                        execution_run_id=self.execution_run_id,
+                        plan=plan,
+                        deployment=self.deployment,
+                        max_active_provider_calls=self.max_active_provider_calls,
+                        max_active_gpu_provider_calls=self.max_active_gpu_provider_calls,
+                        now=self._now(),
+                    )
+                return self.store.execution
+
+            if (
+                existing.plan.workload_plan_fingerprint
+                != plan.workload_plan_fingerprint
+            ):
+                raise ValueError(
+                    "Workflow Plan Fingerprint does not match Execution Run"
                 )
+            if existing.plan.workload_run_key != workload_run_key:
+                raise ValueError("Workload Run Key does not match Execution Run")
+            if existing.deployment != self.deployment:
+                raise ValueError("Deployment Identity does not match Execution Run")
             return repository
 
-        if existing.plan.workload_plan_fingerprint != plan.workload_plan_fingerprint:
-            raise ValueError("Workflow Plan Fingerprint does not match Execution Run")
-        if existing.plan.workload_run_key != workload_run_key:
-            raise ValueError("Workload Run Key does not match Execution Run")
-        if existing.deployment != self.deployment:
-            raise ValueError("Deployment Identity does not match Execution Run")
-        return repository
-
     def _recover_publications(self) -> None:
-        repository = self.store.execution
         definition = self._require_definition()
-        run = repository.get_run(self.execution_run_id)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            nodes = repository.list_nodes(self.execution_run_id)
         observations: dict[str, AvailabilityStatus | None] = {}
-        for node in repository.list_nodes(self.execution_run_id):
+        for node in nodes:
             if node.status == NodeStatus.SUCCEEDED:
                 observations[node.node_key] = AvailabilityStatus.AVAILABLE
             elif node.status.is_terminal:
@@ -442,6 +455,11 @@ class WorkflowRuntime:
             ]
             with self.store.transaction():
                 for node_id, observation in observed:
+                    if self.store.execution.get_node(
+                        self.execution_run_id,
+                        node_id,
+                    ).status.is_terminal:
+                        continue
                     if observation == AvailabilityStatus.MISSING:
                         self.store.artifacts.discard_node_publication(node_id)
                     self.store.execution.record_node_result_observation(
@@ -469,7 +487,22 @@ class WorkflowRuntime:
             return
 
         task_observations: list[tuple[str, str, AvailabilityStatus]] = []
-        for node in repository.list_nodes(self.execution_run_id):
+        with self.store.synchronize():
+            repository = self.store.execution
+            nodes = repository.list_nodes(self.execution_run_id)
+            tasks_by_node = {
+                node.node_key: repository.list_tasks(
+                    self.execution_run_id,
+                    node.node_key,
+                )
+                for node in nodes
+                if (
+                    node.node_key in required
+                    and node.status == NodeStatus.RUNNING
+                    and node.discovery_complete
+                )
+            }
+        for node in nodes:
             if (
                 node.node_key in required
                 and node.status == NodeStatus.RUNNING
@@ -477,10 +510,7 @@ class WorkflowRuntime:
             ):
                 implementation = definition.nodes[node.node_key].node
                 if isinstance(implementation, RemoteTaskWorkflowNode):
-                    for task in repository.list_tasks(
-                        self.execution_run_id,
-                        node.node_key,
-                    ):
+                    for task in tasks_by_node[node.node_key]:
                         if task.status.is_terminal:
                             continue
                         context = self._node_context(
@@ -505,10 +535,10 @@ class WorkflowRuntime:
                             ),
                         ))
                 else:
-                    task = repository.get_task(
-                        self.execution_run_id,
-                        node.node_key,
-                        _TASK_KEY,
+                    task = next(
+                        task
+                        for task in tasks_by_node[node.node_key]
+                        if task.task_key == _TASK_KEY
                     )
                     if not task.status.is_terminal:
                         observation = observations[node.node_key]
@@ -526,6 +556,12 @@ class WorkflowRuntime:
             return
         with self.store.transaction():
             for node_id, task_key, observation in task_observations:
+                if self.store.execution.get_task(
+                    self.execution_run_id,
+                    node_id,
+                    task_key,
+                ).status.is_terminal:
+                    continue
                 if observation == AvailabilityStatus.MISSING:
                     self.store.artifacts.discard_task_publication(
                         node_id,
@@ -540,23 +576,22 @@ class WorkflowRuntime:
                 )
 
     def _required_nodes(self) -> set[str] | None:
-        self._provider.repository = self.store.execution
         required = self._provider.required_node_keys(self.execution_run_id)
         return None if required is None else set(required)
 
     def _prune_unrequired(self, required: set[str]) -> tuple[UUID, ...]:
-        with self.store.transaction():
-            calls = self.store.execution.prune_unrequired_nodes(
-                self.execution_run_id,
-                required_node_keys=required,
-                now=self._now(),
-            )
-        if calls:
-            self._checkpoint()
+        with self.store.synchronize():
+            with self.store.transaction():
+                calls = self.store.execution.prune_unrequired_nodes(
+                    self.execution_run_id,
+                    required_node_keys=required,
+                    now=self._now(),
+                )
+            if calls:
+                self._checkpoint()
         return calls
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.repository = self.store.execution
         reconciled = self._provider.reconcile_provider_calls(
             self.execution_run_id,
             required_node_keys=required,
@@ -564,11 +599,12 @@ class WorkflowRuntime:
             now=self._now(),
         )
         if any(
-            not original.status.is_terminal and updated.status.is_terminal
+            not original.status.is_terminal
+            and updated.status == ProviderCallStatus.SUCCEEDED
+            and updated.dispatch_mode != DispatchMode.PULL_WORKER
             for original, updated in reconciled
         ):
-            self._volume_sync.reload()
-            self._provider.repository = self.store.execution
+            self._reload_volume()
         for _, call in reconciled:
             if (
                 call.status != ProviderCallStatus.SUCCEEDED
@@ -594,11 +630,12 @@ class WorkflowRuntime:
                 node,
             )
             return
-        task = self.store.execution.get_task(
-            self.execution_run_id,
-            node_id,
-            _TASK_KEY,
-        )
+        with self.store.synchronize():
+            task = self.store.execution.get_task(
+                self.execution_run_id,
+                node_id,
+                _TASK_KEY,
+            )
         if task.status.is_terminal:
             return
         if not isinstance(node, RemoteWorkflowNode):
@@ -622,14 +659,15 @@ class WorkflowRuntime:
         envelope: object,
         node: RemoteTaskWorkflowNode,
     ) -> None:
-        tasks = tuple(
-            self.store.execution.get_task(
-                self.execution_run_id,
-                node_id,
-                task_key,
+        with self.store.synchronize():
+            tasks = tuple(
+                self.store.execution.get_task(
+                    self.execution_run_id,
+                    node_id,
+                    task_key,
+                )
+                for task_key in task_keys
             )
-            for task_key in task_keys
-        )
         unfinished = tuple(task for task in tasks if not task.status.is_terminal)
         if not unfinished:
             return
@@ -679,13 +717,12 @@ class WorkflowRuntime:
             )
 
     def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
-        repository = self.store.execution
-        node_records = repository.list_nodes(self.execution_run_id)
-        statuses = {node.node_key: node.status for node in node_records}
-        ready = ready_node_keys(
-            repository.get_run(self.execution_run_id).plan,
-            statuses,
-        )
+        with self.store.synchronize():
+            repository = self.store.execution
+            node_records = repository.list_nodes(self.execution_run_id)
+            statuses = {node.node_key: node.status for node in node_records}
+            plan = repository.get_run(self.execution_run_id).plan
+        ready = ready_node_keys(plan, statuses)
         available_slots = self.max_parallel_nodes - sum(
             node.status == NodeStatus.RUNNING for node in node_records
         )
@@ -698,6 +735,11 @@ class WorkflowRuntime:
         ]
         with self.store.transaction():
             for item in prepared:
+                if self.store.execution.get_node(
+                    self.execution_run_id,
+                    item.node_id,
+                ).status.is_terminal:
+                    continue
                 self.store.execution.start_node(
                     self.execution_run_id,
                     item.node_id,
@@ -745,9 +787,10 @@ class WorkflowRuntime:
         try:
             if isinstance(node, RemoteTaskWorkflowNode):
                 discovered = node.discover_remote_tasks(context)
-                workload_plan_fingerprint = self.store.execution.get_run(
-                    self.execution_run_id
-                ).plan.workload_plan_fingerprint
+                with self.store.synchronize():
+                    workload_plan_fingerprint = self.store.execution.get_run(
+                        self.execution_run_id
+                    ).plan.workload_plan_fingerprint
                 tasks: list[_PreparedTask] = []
                 for task in discovered:
                     plan = TaskPlan(
@@ -791,7 +834,9 @@ class WorkflowRuntime:
             return _PreparedNode(node_id, context, (), error)
 
     def _run_local_tasks(self, definition: WorkflowDefinition) -> None:
-        for node_record in self.store.execution.list_nodes(self.execution_run_id):
+        with self.store.synchronize():
+            node_records = self.store.execution.list_nodes(self.execution_run_id)
+        for node_record in node_records:
             if (
                 node_record.status != NodeStatus.RUNNING
                 or not node_record.discovery_complete
@@ -800,23 +845,26 @@ class WorkflowRuntime:
             node = definition.nodes[node_record.node_key].node
             if isinstance(node, RemoteWorkflowNode | RemoteTaskWorkflowNode):
                 continue
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                node_record.node_key,
-                _TASK_KEY,
-            )
-            if task.status.is_terminal:
-                continue
-            with self.store.transaction():
-                acquired = self.store.execution.acquire_local_task(
+            with self.store.synchronize():
+                task = self.store.execution.get_task(
                     self.execution_run_id,
                     node_record.node_key,
                     _TASK_KEY,
-                    now=self._now(),
                 )
+            if task.status.is_terminal:
+                continue
+            with self.store.synchronize():
+                with self.store.transaction():
+                    acquired = self.store.execution.acquire_local_task(
+                        self.execution_run_id,
+                        node_record.node_key,
+                        _TASK_KEY,
+                        now=self._now(),
+                    )
+                if acquired:
+                    self._checkpoint()
             if not acquired:
                 continue
-            self._checkpoint()
             context = self._node_context(definition, node_record.node_key)
             try:
                 result = AppRunResult.model_validate(node.run(context))
@@ -833,11 +881,18 @@ class WorkflowRuntime:
         definition: WorkflowDefinition,
         required: set[str],
     ) -> None:
-        repository = self.store.execution
-        run = repository.get_run(self.execution_run_id)
-        nodes = {
-            node.node_key: node for node in repository.list_nodes(run.execution_run_id)
-        }
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            nodes = {
+                node.node_key: node
+                for node in repository.list_nodes(run.execution_run_id)
+            }
+            calls = repository.list_provider_calls(self.execution_run_id)
+            tasks_by_node = {
+                node_id: repository.list_tasks(self.execution_run_id, node_id)
+                for node_id in nodes
+            }
         unfinished = {
             node.node_key for node in nodes.values() if not node.status.is_terminal
         }
@@ -850,7 +905,6 @@ class WorkflowRuntime:
         descriptors: list[TaskDispatchDescriptor] = []
         pull_invocations: dict[str, RemotePullWorkerCall] = {}
         pull_descriptors: list[PullWorkerDispatchDescriptor] = []
-        calls = repository.list_provider_calls(self.execution_run_id)
         for node_id, node_record in nodes.items():
             if (
                 node_id not in required
@@ -889,10 +943,7 @@ class WorkflowRuntime:
                 ]
                 unfinished_task_count = sum(
                     task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
-                    for task in repository.list_tasks(
-                        self.execution_run_id,
-                        node_id,
-                    )
+                    for task in tasks_by_node[node_id]
                 )
                 pull_invocations[node_id] = invocation
                 pull_descriptors.append(
@@ -914,7 +965,7 @@ class WorkflowRuntime:
                     )
                 )
                 continue
-            for task in repository.list_tasks(self.execution_run_id, node_id):
+            for task in tasks_by_node[node_id]:
                 if (
                     task.status != TaskStatus.PENDING
                     or task.result_observation != AvailabilityStatus.MISSING
@@ -977,7 +1028,6 @@ class WorkflowRuntime:
                     )
                 )
 
-        self._provider.repository = repository
         descriptors = list(
             self._provider.persist_fixed_dispatch_policy(
                 self.execution_run_id,
@@ -993,8 +1043,10 @@ class WorkflowRuntime:
             )
             for descriptor in pull_descriptors
         ]
-        repository = self.store.execution
-        counts = repository.active_provider_call_counts(self.execution_run_id)
+        with self.store.synchronize():
+            counts = self.store.execution.active_provider_call_counts(
+                self.execution_run_id
+            )
         selected = select_admissible_candidates(
             (
                 *form_fixed_batches(tuple(descriptors)),
@@ -1009,6 +1061,7 @@ class WorkflowRuntime:
                 run.max_active_gpu_provider_calls - counts.gpu,
             ),
         )
+        submissions = []
         for candidate in selected:
             node = definition.nodes[candidate.node_key].node
             if isinstance(node, RemotePullTaskWorkflowNode):
@@ -1025,20 +1078,16 @@ class WorkflowRuntime:
                         "Pull-worker coordinator argument is runtime-owned"
                     )
                 kwargs["coordinator"] = self.pull_worker_coordinator
-                self._provider.repository = self.store.execution
-                submitted = self._provider.submit_pull_worker(
-                    self.execution_run_id,
-                    node_key=candidate.node_key,
-                    submission_token=candidate.candidate_key,
-                    binding=candidate.binding,
-                    compatibility_key=candidate.compatibility_key,
-                    claim_capacity=invocation.claim_capacity,
-                    args=invocation.args,
-                    kwargs=kwargs,
-                    now=self._now(),
+                submissions.append(
+                    ProviderCallSubmission(
+                        candidate=candidate,
+                        claim_capacity=invocation.claim_capacity,
+                        provider_call_id_kwarg="provider_call_id",
+                        submission_token=candidate.candidate_key,
+                        args=invocation.args,
+                        kwargs=kwargs,
+                    )
                 )
-                if submitted is None:
-                    return
                 continue
             if len(candidate.task_keys) == 1:
                 invocation = invocations[(candidate.node_key, candidate.task_keys[0])]
@@ -1051,10 +1100,10 @@ class WorkflowRuntime:
                     )
                     for task_key in candidate.task_keys
                     for task in (
-                        repository.get_task(
-                            self.execution_run_id,
-                            candidate.node_key,
-                            task_key,
+                        next(
+                            task
+                            for task in tasks_by_node[candidate.node_key]
+                            if task.task_key == task_key
                         ),
                     )
                 )
@@ -1089,17 +1138,21 @@ class WorkflowRuntime:
                     continue
             else:  # pragma: no cover - scheduler never batches ordinary Nodes
                 raise RuntimeError("Only remote Task Nodes may own batched calls")
-            self._provider.repository = self.store.execution
-            submitted = self._provider.submit_fixed_batch(
-                self.execution_run_id,
-                candidate,
-                submission_token=candidate.candidate_key,
-                args=invocation.args,
-                kwargs=invocation.kwargs,
-                now=self._now(),
+            submissions.append(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    args=invocation.args,
+                    kwargs=invocation.kwargs,
+                )
             )
-            if submitted is None:
-                return
+        submitted = self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(submissions),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _publish_result(self, node_id: str, result: AppRunResult) -> None:
         if result.status != AppRunStatus.SUCCEEDED:
@@ -1116,6 +1169,12 @@ class WorkflowRuntime:
         )
         observation = self._artifact_observation(tuple(materialized.artifacts))
         with self.store.transaction():
+            if self.store.execution.get_task(
+                self.execution_run_id,
+                node_id,
+                _TASK_KEY,
+            ).status.is_terminal:
+                return
             self.store.artifacts.record_node_publication(
                 node_id,
                 result=materialized.result,
@@ -1151,11 +1210,12 @@ class WorkflowRuntime:
         task_key: str,
         result: AppRunResult,
     ) -> None:
-        task = self.store.execution.get_task(
-            self.execution_run_id,
-            node_id,
-            task_key,
-        )
+        with self.store.synchronize():
+            task = self.store.execution.get_task(
+                self.execution_run_id,
+                node_id,
+                task_key,
+            )
         if result.status != AppRunStatus.SUCCEEDED:
             self._fail_discovered_task(
                 node_id,
@@ -1179,6 +1239,12 @@ class WorkflowRuntime:
         )
         observation = self._artifact_observation(tuple(materialized.artifacts))
         with self.store.transaction():
+            if self.store.execution.get_task(
+                self.execution_run_id,
+                node_id,
+                task_key,
+            ).status.is_terminal:
+                return
             self.store.artifacts.record_task_publication(
                 node_id,
                 task_key,
@@ -1245,7 +1311,9 @@ class WorkflowRuntime:
 
     def _reconcile_nodes_and_run(self) -> None:
         definition = self._require_definition()
-        for node in self.store.execution.list_nodes(self.execution_run_id):
+        with self.store.synchronize():
+            nodes = self.store.execution.list_nodes(self.execution_run_id)
+        for node in nodes:
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
                 continue
             implementation = definition.nodes[node.node_key].node
@@ -1286,7 +1354,8 @@ class WorkflowRuntime:
                 node_id,
                 now=self._now(),
             )
-        tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
+        with self.store.synchronize():
+            tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
         empty_result = not tasks
         outcome = (
             NodeStatus.SUCCEEDED
@@ -1307,11 +1376,13 @@ class WorkflowRuntime:
                 )
             return
 
-        existing = self.store.artifacts.load_node_result(node_id)
-        if existing is not None:
-            observation = self._artifact_observation(
-                self.store.artifacts.load_node_output_artifacts(node_id)
+        with self.store.synchronize():
+            existing = self.store.artifacts.load_node_result(node_id)
+            existing_artifacts = self.store.artifacts.load_node_output_artifacts(
+                node_id
             )
+        if existing is not None:
+            observation = self._artifact_observation(existing_artifacts)
             if observation == AvailabilityStatus.MISSING:
                 with self.store.transaction():
                     self.store.artifacts.discard_node_publication(node_id)
@@ -1352,12 +1423,21 @@ class WorkflowRuntime:
         results: dict[str, AppRunResult] = {}
         errors: dict[str, str] = {}
         task_artifacts: list[WorkflowArtifact] = []
+        with self.store.synchronize():
+            publications = {
+                task.task_key: (
+                    self.store.artifacts.load_task_result(node_id, task.task_key),
+                    self.store.artifacts.load_task_output_artifacts(
+                        node_id,
+                        task.task_key,
+                    ),
+                )
+                for task in tasks
+                if task.status == TaskStatus.SUCCEEDED
+            }
         for task in tasks:
             if task.status == TaskStatus.SUCCEEDED:
-                result = self.store.artifacts.load_task_result(
-                    node_id,
-                    task.task_key,
-                )
+                result, artifacts = publications[task.task_key]
                 if result is None:
                     self._fail_node_publication(
                         node_id,
@@ -1365,12 +1445,7 @@ class WorkflowRuntime:
                     )
                     return
                 results[task.task_key] = result
-                task_artifacts.extend(
-                    self.store.artifacts.load_task_output_artifacts(
-                        node_id,
-                        task.task_key,
-                    )
-                )
+                task_artifacts.extend(artifacts)
             else:
                 errors[task.task_key] = (
                     task.error_message or f"Task ended as {task.status.value}"
@@ -1476,10 +1551,11 @@ class WorkflowRuntime:
             )
 
     def _publication_observation(self, node_id: str) -> AvailabilityStatus:
-        result = self.store.artifacts.load_node_result(node_id)
+        with self.store.synchronize():
+            result = self.store.artifacts.load_node_result(node_id)
+            artifacts = self.store.artifacts.load_node_output_artifacts(node_id)
         if result is None or result.status != AppRunStatus.SUCCEEDED:
             return AvailabilityStatus.MISSING
-        artifacts = self.store.artifacts.load_node_output_artifacts(node_id)
         return self._artifact_observation(artifacts)
 
     def _remote_task_publication_observation(
@@ -1491,21 +1567,22 @@ class WorkflowRuntime:
         expected_fingerprint: str,
     ) -> AvailabilityStatus:
         """Validate a stored Task result and its workload-owned publication."""
-        result = self.store.artifacts.load_task_result(node_id, task.task_key)
-        if (
-            result is None
-            or result.status != AppRunStatus.SUCCEEDED
-            or self.store.artifacts.load_task_fingerprint(
+        with self.store.synchronize():
+            result = self.store.artifacts.load_task_result(node_id, task.task_key)
+            fingerprint = self.store.artifacts.load_task_fingerprint(
                 node_id,
                 task.task_key,
             )
-            != expected_fingerprint
+            artifacts = self.store.artifacts.load_task_output_artifacts(
+                node_id,
+                task.task_key,
+            )
+        if (
+            result is None
+            or result.status != AppRunStatus.SUCCEEDED
+            or fingerprint != expected_fingerprint
         ):
             return AvailabilityStatus.MISSING
-        artifacts = self.store.artifacts.load_task_output_artifacts(
-            node_id,
-            task.task_key,
-        )
         return self._observe_remote_task_publication(
             implementation,
             context,
@@ -1564,10 +1641,11 @@ class WorkflowRuntime:
         task_key: str = _TASK_KEY,
     ) -> NodeRunContext:
         spec = definition.nodes[node_id]
-        inputs = {
-            input_name: list(self.store.artifacts.select_artifacts(selector))
-            for input_name, selector in spec.inputs.items()
-        }
+        with self.store.synchronize():
+            inputs = {
+                input_name: list(self.store.artifacts.select_artifacts(selector))
+                for input_name, selector in spec.inputs.items()
+            }
         node_root = self.store.output_root / "nodes" / node_id
         if task_key == _TASK_KEY:
             work_dir = node_root / "result"
@@ -1591,8 +1669,21 @@ class WorkflowRuntime:
         )
 
     def _checkpoint(self) -> SqliteExecutionRepository:
-        self._volume_sync.commit()
-        return self.store.execution
+        with self.store.synchronize():
+            try:
+                self._volume_sync.commit()
+            finally:
+                repository = self.store.execution
+                self._provider.repository = repository
+        return repository
+
+    def _reload_volume(self) -> None:
+        """Refresh cross-container publications and reopen the shared ledger."""
+        with self.store.synchronize():
+            try:
+                self._volume_sync.reload()
+            finally:
+                self._provider.repository = self.store.execution
 
     def _require_definition(self) -> WorkflowDefinition:
         if self._definition is None:

@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 from biomodals.execution import (
+    EXECUTION_SCHEMA_VERSION,
     DeploymentIdentity,
     ExecutionPlan,
     NodeDependency,
@@ -157,3 +158,48 @@ def test_repository_rejects_pre_file_envelope_schema() -> None:
         match="Unsupported execution schema version 2",
     ):
         SqliteExecutionRepository(connection).initialize_schema()
+
+
+def test_replace_schema_discards_only_known_execution_state() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute("CREATE TABLE service_settings (key TEXT PRIMARY KEY)")
+    repository = SqliteExecutionRepository(connection)
+    repository.initialize_schema()
+    repository.create_run(
+        execution_run_id=UUID("d4e4744e-aacf-4478-92d6-a58681805162"),
+        plan=_plan(),
+        deployment=DeploymentIdentity("production", "biomodals-af3", 23),
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=1,
+        now=100,
+    )
+
+    repository.replace_schema()
+
+    assert connection.execute("SELECT COUNT(*) FROM execution_runs").fetchone()[0] == 0
+    assert (
+        connection.execute("SELECT COUNT(*) FROM service_settings").fetchone()[0] == 0
+    )
+    assert (
+        connection.execute(
+            "SELECT version FROM execution_schema WHERE singleton = 1"
+        ).fetchone()[0]
+        == EXECUTION_SCHEMA_VERSION
+    )
+
+
+def test_replace_schema_rejects_unknown_execution_tables_before_deleting() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SqliteExecutionRepository(connection)
+    repository.initialize_schema()
+    connection.execute("CREATE TABLE execution_extension (value TEXT)")
+
+    with pytest.raises(RuntimeError, match="schema is unexpected"):
+        repository.replace_schema()
+
+    assert (
+        connection.execute(
+            "SELECT version FROM execution_schema WHERE singleton = 1"
+        ).fetchone()[0]
+        == EXECUTION_SCHEMA_VERSION
+    )

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import orjson
 
 from biomodals.execution import (
+    EXECUTION_SCHEMA_VERSION,
     AsyncExecutionRuntime,
     DeploymentIdentity,
     ExecutionPlan,
@@ -117,14 +118,14 @@ class JobOperationExecutor(StrEnum):
 
 
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 4
+_SERVICE_SCHEMA_VERSION = 5
 _ACTIVE_RUN_STATUSES = tuple(status for status in RunStatus if not status.is_terminal)
 _RECONCILABLE_RUN_STATUSES = (
     RunStatus.PENDING,
     RunStatus.RUNNING,
     RunStatus.CANCEL_REQUESTED,
 )
-_LEGACY_SERVICE_SCHEMA_VERSION = 3
+_LEGACY_SERVICE_SCHEMA_VERSIONS = frozenset({3, 4})
 _JOB_TABLES_SQL = """
 CREATE TABLE jobs (
     job_id TEXT PRIMARY KEY,
@@ -171,6 +172,13 @@ CREATE TABLE job_inputs (
     content BLOB NOT NULL
 );
 """
+
+
+def _create_job_tables(connection: sqlite3.Connection) -> None:
+    """Create the fixed service Job schema inside the caller's transaction."""
+    for statement in _JOB_TABLES_SQL.split(";"):
+        if statement.strip():
+            connection.execute(statement)
 
 
 class UserStatus(StrEnum):
@@ -481,6 +489,8 @@ class ServiceStore:
                     f"{version} at {self.path}; stop the service and run "
                     "'biomodals api transition-execution-state --yes'"
                 )
+            else:
+                SqliteExecutionRepository(conn).initialize_schema()
             conn.execute("PRAGMA journal_mode = WAL")
         self.path.chmod(0o600)
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
@@ -491,21 +501,20 @@ class ServiceStore:
         """Replace legacy service Job execution state while preserving accounts."""
         if not self.path.is_file() or self.path.is_symlink():
             raise RuntimeError("Service database is unavailable")
-        required_tables = {
+        preserved_tables = {
             "users",
             "password_tokens",
             "sessions",
-            "jobs",
-            "job_operations",
             "service_settings",
             "workload_settings",
         }
         with self._connection() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version != _LEGACY_SERVICE_SCHEMA_VERSION:
+            if version not in _LEGACY_SERVICE_SCHEMA_VERSIONS:
                 raise RuntimeError(
                     "Expected pre-release service database version "
-                    f"{_LEGACY_SERVICE_SCHEMA_VERSION}, found {version}"
+                    "3 or 4, "
+                    f"found {version}"
                 )
             tables = {
                 str(row["name"])
@@ -513,21 +522,33 @@ class ServiceStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall()
             }
-            if tables != required_tables:
+            service_tables = {
+                table for table in tables if not table.startswith("execution_")
+            }
+            execution_tables = tables - service_tables
+            expected_service_tables = preserved_tables | (
+                {"jobs", "job_operations"} if version == 3 else {"jobs", "job_inputs"}
+            )
+            if service_tables != expected_service_tables or (
+                version == 3 and execution_tables
+            ):
                 raise RuntimeError("Legacy service database schema is unexpected")
             discarded_jobs = int(
                 conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
             )
             try:
-                conn.executescript(
-                    f"""
-                    BEGIN IMMEDIATE;
-                    DROP TABLE job_operations;
-                    DROP TABLE jobs;
-                    {_JOB_TABLES_SQL}
-                    """
-                )
-                SqliteExecutionRepository(conn).initialize_schema()
+                conn.execute("BEGIN IMMEDIATE")
+                if version == 3:
+                    conn.execute("DROP TABLE job_operations")
+                    conn.execute("DROP TABLE jobs")
+                    execution = SqliteExecutionRepository(conn)
+                    execution.initialize_schema()
+                else:
+                    conn.execute("DROP TABLE job_inputs")
+                    conn.execute("DROP TABLE jobs")
+                    execution = SqliteExecutionRepository(conn)
+                    execution.replace_schema()
+                _create_job_tables(conn)
                 conn.execute(f"PRAGMA user_version = {_SERVICE_SCHEMA_VERSION}")
             except BaseException:
                 conn.rollback()
@@ -557,9 +578,14 @@ class ServiceStore:
             ):
                 raise RuntimeError("SQLite schema is unavailable")
             conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
-            conn.execute(
+            execution_row = conn.execute(
                 "SELECT version FROM execution_schema WHERE singleton = 1"
             ).fetchone()
+            if (
+                execution_row is None
+                or int(execution_row[0]) != EXECUTION_SCHEMA_VERSION
+            ):
+                raise RuntimeError("SQLite execution schema is unavailable")
         except sqlite3.Error as exc:
             raise RuntimeError("SQLite readiness check failed") from exc
         finally:

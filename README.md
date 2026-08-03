@@ -251,7 +251,7 @@ disabled or demoted.
 ### Pre-release database transition
 
 The execution kernel intentionally does not migrate pre-release Job history.
-If startup reports service database version 3, stop the API and run:
+If startup reports service database version 3 or 4, stop the API and run:
 
 ```bash
 uv run biomodals api transition-execution-state --yes

@@ -180,6 +180,19 @@ def test_readiness_checks_existing_schema_without_creating_state(
     store.check_ready()
 
 
+def test_service_rejects_a_stale_embedded_execution_schema(tmp_path: Path) -> None:
+    store, _alice, _bob = make_store(tmp_path)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE execution_schema SET version = 3 WHERE singleton = 1"
+        )
+
+    with pytest.raises(RuntimeError, match="execution schema version 3"):
+        store.initialize()
+    with pytest.raises(RuntimeError, match="execution schema is unavailable"):
+        store.check_ready()
+
+
 def test_admission_atomically_links_job_run_and_staged_input(tmp_path: Path) -> None:
     store, alice, _bob = make_store(tmp_path)
     job_id = UUID("11111111-1111-4111-8111-111111111111")

@@ -77,7 +77,7 @@ record.
 
 ### Pre-release service schema
 
-If startup reports service database version 3, stop the API process and run
+If startup reports service database version 3 or 4, stop the API process and run
 the explicit offline transition with the same configuration:
 
 ```console
@@ -88,7 +88,7 @@ The transition preserves Users, Password Links, Sessions, and service and
 workload settings. It removes legacy Jobs and their local execution history,
 then installs the current execution schema. It does not change Modal Volumes.
 
-The command accepts only the known version 3 schema. Do not delete a database
+The command accepts only the known version 3 or 4 schemas. Do not delete a database
 merely because startup rejects an unknown version; first confirm the selected
 configuration and exact database path.
 

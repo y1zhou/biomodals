@@ -107,6 +107,29 @@ def _legacy_service_database(path: Path) -> None:
         )
 
 
+def _previous_service_database(path: Path) -> None:
+    ServiceStore(path).initialize()
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            INSERT INTO users VALUES (
+                '11111111-1111-4111-8111-111111111111',
+                'admin@example.com',
+                'Admin',
+                'hash',
+                'enabled',
+                1,
+                7,
+                1,
+                2
+            );
+            INSERT INTO service_settings VALUES ('modal_environment', 'research');
+            UPDATE execution_schema SET version = 3 WHERE singleton = 1;
+            PRAGMA user_version = 4;
+            """
+        )
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_host", "expected_port"),
     [
@@ -202,7 +225,7 @@ def test_execution_state_transition_preserves_accounts_and_configuration(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
         assert (
             connection.execute("SELECT COUNT(*) FROM password_tokens").fetchone()[0]
@@ -237,6 +260,37 @@ def test_execution_state_transition_rejects_unknown_legacy_tables(
         assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
 
+def test_execution_state_transition_replaces_previous_embedded_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The prior service schema keeps accounts while resetting kernel state."""
+    state_dir = tmp_path / "state"
+    database_path = state_dir / "service.sqlite3"
+    _previous_service_database(database_path)
+    monkeypatch.setenv("BIOMODALS_STATE_DIR", str(state_dir))
+
+    result = runner.invoke(
+        app,
+        ["api", "transition-execution-state", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    store = ServiceStore(database_path)
+    store.initialize()
+    [user] = store.list_users()
+    assert (user.email, user.is_admin) == ("admin@example.com", True)
+    assert store.get_service_setting("modal_environment") == "research"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            connection.execute(
+                "SELECT version FROM execution_schema WHERE singleton = 1"
+            ).fetchone()[0]
+            == 4
+        )
+
+
 def test_execution_state_transition_rejects_an_unexpected_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -253,4 +307,6 @@ def test_execution_state_transition_rejects_an_unexpected_source(
     )
 
     assert result.exit_code == 1
-    assert "Expected pre-release service database version 3, found 4" in result.output
+    assert (
+        "Expected pre-release service database version 3 or 4, found 5" in result.output
+    )

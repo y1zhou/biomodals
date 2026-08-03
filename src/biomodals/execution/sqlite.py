@@ -381,6 +381,19 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+_SCHEMA_DROP_ORDER = (
+    "execution_task_completion_requests",
+    "execution_worker_assignments",
+    "execution_task_claim_requests",
+    "execution_tasks",
+    "execution_provider_calls",
+    "execution_dispatch_batches",
+    "execution_node_dependencies",
+    "execution_nodes",
+    "execution_runs",
+    "execution_schema",
+)
+
 
 class SqliteExecutionRepository:
     """Persist execution state on a host-owned SQLite connection."""
@@ -417,6 +430,24 @@ class SqliteExecutionRepository:
             "INSERT INTO execution_schema (singleton, version) VALUES (1, ?)",
             (EXECUTION_SCHEMA_VERSION,),
         )
+
+    def replace_schema(self) -> None:
+        """Explicitly discard a known execution schema and create the current one."""
+        tables = {
+            str(row["name"])
+            for row in self._connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name GLOB 'execution_*'
+                """
+            ).fetchall()
+        }
+        expected = set(_SCHEMA_DROP_ORDER)
+        if tables != expected:
+            raise RuntimeError("Execution database schema is unexpected")
+        for table in _SCHEMA_DROP_ORDER:
+            self._connection.execute(f"DROP TABLE {table}")  # noqa: S608
+        self.initialize_schema()
 
     def create_run(
         self,

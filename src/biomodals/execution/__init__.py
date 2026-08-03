@@ -48,6 +48,7 @@ from biomodals.execution.scheduler import (
     terminal_run_outcome,
 )
 from biomodals.execution.sqlite import (
+    EXECUTION_SCHEMA_VERSION,
     ExecutionRunNotFoundError,
     SqliteExecutionRepository,
     UnsupportedExecutionSchemaVersionError,
@@ -63,6 +64,7 @@ __all__ = [
     "ExecutionNodeRecord",
     "ExecutionPlan",
     "ExecutionRunNotFoundError",
+    "EXECUTION_SCHEMA_VERSION",
     "ExecutionRunRecord",
     "ExecutionRuntime",
     "ExecutionSnapshot",

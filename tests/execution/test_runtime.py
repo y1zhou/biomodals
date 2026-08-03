@@ -177,6 +177,28 @@ def test_runtime_owns_result_frontier_recovery() -> None:
     assert repository.get_node(RUN_ID, "inference").status == NodeStatus.SUCCEEDED
 
 
+def test_publication_recovery_does_not_reprobe_persisted_unowned_misses() -> None:
+    repository = create_repository(task_count=3)
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: None,
+    )
+    observed_tasks: list[str] = []
+
+    required = runtime.recover_publications(
+        RUN_ID,
+        observe_node=lambda _node_key: AvailabilityStatus.MISSING,
+        observe_task=lambda _node_key, task: (
+            observed_tasks.append(task.task_key) or AvailabilityStatus.MISSING
+        ),
+        now=110,
+    )
+
+    assert required == ("inference",)
+    assert observed_tasks == []
+
+
 def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(

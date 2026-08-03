@@ -384,7 +384,13 @@ class ExecutionRuntime:
                     and node.discovery_complete
                 )
                 for task in repository.list_tasks(execution_run_id, node.node_key)
-                if not task.status.is_terminal
+                if (
+                    not task.status.is_terminal
+                    and not (
+                        task.status == TaskStatus.PENDING
+                        and task.result_observation == AvailabilityStatus.MISSING
+                    )
+                )
             )
         task_observations = []
         for node_key, task in pending_tasks:
@@ -1456,7 +1462,7 @@ class AsyncExecutionRuntime:
         )
         if observation.kind != ModalCallObservationKind.RUNNING:
             self._checkpoint_state()
-        else:
+        elif updated != call:
             self._commit_local_state()
         return updated
 

@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103, S106
 
+import sqlite3
+
 import pytest
 
 from biomodals.execution import ProviderCallStatus, RunStatus, RunStatusReason
@@ -136,3 +138,48 @@ def test_call_lifecycle_rejects_missing_attachment_identity_and_illegal_rewrites
             message="cancel requested before attachment",
             now=113,
         )
+
+
+def test_listing_provider_calls_bulk_loads_owned_task_keys() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(
+        connection=connection,
+        task_count=3,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=3,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1", "seed-2"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    for index in range(3):
+        claim = repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            (f"seed-{index}",),
+            submission_token=f"batch-{index}",
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            now=110 + index,
+        )
+        assert claim is not None
+
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    calls = repository.list_provider_calls(RUN_ID)
+    connection.set_trace_callback(None)
+
+    task_selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+        and "FROM execution_tasks" in statement
+    ]
+    assert [call.task_keys for call in calls] == [
+        ("seed-0",),
+        ("seed-1",),
+        ("seed-2",),
+    ]
+    assert len(task_selects) == 1

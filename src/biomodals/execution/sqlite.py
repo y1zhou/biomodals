@@ -269,6 +269,16 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE INDEX execution_tasks_provider_call_idx
+    ON execution_tasks(provider_call_id)
+    WHERE provider_call_id IS NOT NULL
+    """,
+    """
+    CREATE INDEX execution_tasks_worker_call_idx
+    ON execution_tasks(worker_provider_call_id)
+    WHERE worker_provider_call_id IS NOT NULL
+    """,
+    """
     CREATE TABLE execution_task_claim_requests (
         request_id TEXT PRIMARY KEY,
         provider_call_id TEXT NOT NULL
@@ -2348,7 +2358,30 @@ class SqliteExecutionRepository:
             """,
             (str(execution_run_id),),
         ).fetchall()
-        return tuple(self._provider_call_from_row(row) for row in rows)
+        task_rows = self._connection.execute(
+            """
+            SELECT task_key, provider_call_id, worker_provider_call_id
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND (
+                    provider_call_id IS NOT NULL
+                    OR worker_provider_call_id IS NOT NULL
+                )
+            ORDER BY node_key, ordinal
+            """,
+            (str(execution_run_id),),
+        ).fetchall()
+        task_keys_by_call: dict[str, list[str]] = {}
+        for task in task_rows:
+            owner = task["provider_call_id"] or task["worker_provider_call_id"]
+            task_keys_by_call.setdefault(owner, []).append(task["task_key"])
+        return tuple(
+            self._provider_call_from_row(
+                row,
+                task_keys=tuple(task_keys_by_call.get(row["provider_call_id"], ())),
+            )
+            for row in rows
+        )
 
     def get_provider_call(self, provider_call_id: UUID) -> ProviderCallRecord:
         """Load one durable Provider Call."""
@@ -2804,16 +2837,23 @@ class SqliteExecutionRepository:
             explicit_resume=False,
         )
 
-    def _provider_call_from_row(self, row: sqlite3.Row) -> ProviderCallRecord:
-        task_rows = self._connection.execute(
-            """
-            SELECT task_key
-            FROM execution_tasks
-            WHERE provider_call_id = ? OR worker_provider_call_id = ?
-            ORDER BY ordinal
-            """,
-            (row["provider_call_id"], row["provider_call_id"]),
-        ).fetchall()
+    def _provider_call_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        task_keys: tuple[str, ...] | None = None,
+    ) -> ProviderCallRecord:
+        if task_keys is None:
+            task_rows = self._connection.execute(
+                """
+                SELECT task_key
+                FROM execution_tasks
+                WHERE provider_call_id = ? OR worker_provider_call_id = ?
+                ORDER BY ordinal
+                """,
+                (row["provider_call_id"], row["provider_call_id"]),
+            ).fetchall()
+            task_keys = tuple(task["task_key"] for task in task_rows)
         return ProviderCallRecord(
             provider_call_id=UUID(row["provider_call_id"]),
             execution_run_id=UUID(row["execution_run_id"]),
@@ -2837,7 +2877,7 @@ class SqliteExecutionRepository:
                 else orjson.loads(row["result_envelope_json"])
             ),
             error_message=row["error_message"],
-            task_keys=tuple(task["task_key"] for task in task_rows),
+            task_keys=task_keys,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             attached_at=row["attached_at"],

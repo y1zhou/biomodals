@@ -119,6 +119,51 @@ def test_async_runtime_preserves_preclaim_and_result_envelope_boundaries() -> No
     asyncio.run(scenario())
 
 
+def test_async_running_poll_commits_only_the_first_state_transition() -> None:
+    async def scenario() -> None:
+        repository = create_repository(task_count=1)
+        persist_fixed_policy(
+            repository,
+            ("seed-0",),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
+        driver = AsyncFakeModalDriver()
+        local_commits: list[ProviderCallStatus] = []
+        runtime = AsyncExecutionRuntime(
+            repository,
+            modal_driver=driver,
+            checkpoint=lambda: None,
+            commit_local=lambda: local_commits.append(
+                repository.list_provider_calls(RUN_ID)[0].status
+            ),
+        )
+        call = await runtime.submit_fixed_batch(
+            RUN_ID,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+        assert call is not None
+
+        first = await runtime.reconcile_provider_call(
+            call.provider_call_id,
+            encode_result=lambda result: result,
+            now=120,
+        )
+        second = await runtime.reconcile_provider_call(
+            call.provider_call_id,
+            encode_result=lambda result: result,
+            now=121,
+        )
+
+        assert first.status == ProviderCallStatus.RUNNING
+        assert second == first
+        assert local_commits == [ProviderCallStatus.RUNNING]
+
+    asyncio.run(scenario())
+
+
 def test_async_runtime_requests_cancellation_without_inventing_completion() -> None:
     async def scenario() -> None:
         repository = create_repository(task_count=1)

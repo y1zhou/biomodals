@@ -16,7 +16,6 @@ from dataclasses import asdict
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from threading import Lock
 from uuid import UUID, uuid4
 
 import modal
@@ -117,11 +116,6 @@ def run_rosetta_worker(
         Path(CONF.output_volume_mountpoint) / f"{run_name}-{run_id}"
     )
     call_id = UUID(provider_call_id)
-    publication_lock = Lock()
-
-    def checkpoint_outputs() -> None:
-        with publication_lock:
-            CONF.output_volume.commit()
 
     def claim(request_id: str, capacity: int):
         return coordinator.claim_tasks.remote(
@@ -138,7 +132,6 @@ def run_rosetta_worker(
                 task=task,
                 task_fingerprint=assignment.task_fingerprint,
                 run_command=run_command,
-                checkpoint_outputs=checkpoint_outputs,
             )
         except Exception as error:  # noqa: BLE001
             return {

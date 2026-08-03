@@ -162,34 +162,35 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         with self.store.synchronize():
             repository = self.store.execution
             nodes = repository.list_nodes(self.execution_run_id)
-            pending_tasks = tuple(
-                (node, task)
+            tasks_by_node = {
+                node.node_key: repository.list_tasks_requiring_publication_recovery(
+                    self.execution_run_id,
+                    node.node_key,
+                )
                 for node in nodes
                 if (
                     node.node_key in required
                     and node.status == NodeStatus.RUNNING
                     and node.discovery_complete
                 )
-                for task in repository.list_tasks(
-                    self.execution_run_id,
-                    node.node_key,
-                )
-                if not task.status.is_terminal
-            )
-        task_observations = []
-        for node, task in pending_tasks:
-            planned = {
-                item.plan.task_key: item for item in self._planned_tasks(node.node_key)
             }
-            task_observations.append((
-                node.node_key,
-                task.task_key,
-                self._task_observation(
-                    node.node_key,
-                    planned[task.task_key],
-                    task.fingerprint,
-                ),
-            ))
+        task_observations = []
+        for node_key, tasks in tasks_by_node.items():
+            if not tasks:
+                continue
+            planned = {
+                item.plan.task_key: item for item in self._planned_tasks(node_key)
+            }
+            for task in tasks:
+                task_observations.append((
+                    node_key,
+                    task.task_key,
+                    self._task_observation(
+                        node_key,
+                        planned[task.task_key],
+                        task.fingerprint,
+                    ),
+                ))
         if not task_observations:
             return
         with self.store.transaction():

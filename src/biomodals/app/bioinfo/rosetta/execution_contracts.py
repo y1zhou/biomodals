@@ -105,7 +105,6 @@ def execute_rosetta_task(
     task: RosettaTaskSpec,
     task_fingerprint: str,
     run_command: Callable[..., object],
-    checkpoint_outputs: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Run or reuse one command and publish its fingerprint-bound completion."""
     root = Path(run_root)
@@ -145,8 +144,6 @@ def execute_rosetta_task(
             "Rosetta returned without required output: " + ", ".join(missing)
         )
     artifacts = _collect_output_artifacts(root, task)
-    if checkpoint_outputs is not None:
-        checkpoint_outputs()
     _write_task_publication(root, task, task_fingerprint, artifacts)
     return _execution_result(task)
 

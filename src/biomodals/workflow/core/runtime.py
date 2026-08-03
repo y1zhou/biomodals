@@ -523,8 +523,6 @@ class WorkflowRuntime:
                 implementation = definition.nodes[node.node_key].node
                 if isinstance(implementation, RemoteTaskWorkflowNode):
                     for task in tasks_by_node[node.node_key]:
-                        if task.status.is_terminal:
-                            continue
                         context = self._node_context(
                             definition,
                             node.node_key,
@@ -547,20 +545,15 @@ class WorkflowRuntime:
                             ),
                         ))
                 else:
-                    task = repository.get_task(
-                        self.execution_run_id,
-                        node.node_key,
-                        _TASK_KEY,
-                    )
-                    if not task.status.is_terminal:
-                        observation = observations[node.node_key]
-                        if observation is None:
-                            raise RuntimeError(
-                                f"Workflow Node {node.node_key!r} was not probed"
-                            )
+                    observation = observations[node.node_key]
+                    if observation is None:
+                        raise RuntimeError(
+                            f"Workflow Node {node.node_key!r} was not probed"
+                        )
+                    for task in tasks_by_node[node.node_key]:
                         task_observations.append((
                             node.node_key,
-                            _TASK_KEY,
+                            task.task_key,
                             observation,
                         ))
 

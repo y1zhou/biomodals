@@ -10,7 +10,6 @@ import pytest
 from biomodals.app.bioinfo.rosetta.execution_contracts import (
     RosettaTaskSpec,
     execute_rosetta_task,
-    task_publication_path,
     validate_task_publication,
     validate_task_publication_from_volume,
 )
@@ -39,7 +38,6 @@ def test_execute_preserves_command_and_reuses_valid_publication(
 ) -> None:
     task = _task(expected_files=("outputs/1/score.sc",))
     calls = []
-    checkpoints: list[str] = []
 
     def run_command(command, *, output_mode, log_file):
         calls.append((command, output_mode, log_file))
@@ -47,11 +45,6 @@ def test_execute_preserves_command_and_reuses_valid_publication(
         score = tmp_path / "outputs" / "1" / "score.sc"
         score.parent.mkdir(parents=True, exist_ok=True)
         score.write_text("score\n", encoding="utf-8")
-
-    def checkpoint_outputs() -> None:
-        assert (tmp_path / "outputs" / "1" / "score.sc").is_file()
-        assert not task_publication_path(tmp_path, task.task_key).exists()
-        checkpoints.append("outputs")
 
     expected_command = [
         "/usr/bin/relax",
@@ -69,7 +62,6 @@ def test_execute_preserves_command_and_reuses_valid_publication(
         task=task,
         task_fingerprint="fingerprint",
         run_command=run_command,
-        checkpoint_outputs=checkpoint_outputs,
     )
     second = execute_rosetta_task(
         run_root=tmp_path,
@@ -80,7 +72,6 @@ def test_execute_preserves_command_and_reuses_valid_publication(
 
     assert first == second
     assert calls == [(expected_command, "log", tmp_path / "logs" / "1.log")]
-    assert checkpoints == ["outputs"]
     assert validate_task_publication(tmp_path, task, "fingerprint")
     assert not validate_task_publication(tmp_path, task, "other-fingerprint")
 

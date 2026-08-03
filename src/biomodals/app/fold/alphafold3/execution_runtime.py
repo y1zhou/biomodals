@@ -439,8 +439,20 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         for node in nodes:
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
                 continue
+            with self.store.synchronize():
+                records = (
+                    self.store.execution.list_tasks_requiring_publication_recovery(
+                        self.execution_run_id,
+                        node.node_key,
+                    )
+                )
+            if not records:
+                continue
             try:
-                planned = self._planned_tasks(node.node_key)
+                planned = {
+                    item.plan.task_key: item
+                    for item in self._planned_tasks(node.node_key)
+                }
             except Exception:
                 with self.store.transaction():
                     repository = self.store.execution
@@ -456,23 +468,19 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                         now=self._now(),
                     )
                 return
-            with self.store.synchronize():
-                records = self.store.execution.list_tasks(
-                    self.execution_run_id,
-                    node.node_key,
-                )
-            if len(records) != len(planned):
-                raise RuntimeError("Persisted AlphaFold3 Task count changed")
             updates = []
-            for record, item in zip(records, planned, strict=True):
+            for record in records:
+                try:
+                    item = planned[record.task_key]
+                except KeyError as error:
+                    raise RuntimeError(
+                        "Persisted AlphaFold3 Task identity changed"
+                    ) from error
                 expected = item.plan.fingerprint(
                     workload_plan_fingerprint=fingerprint,
                     node_key=node.node_key,
                 )
-                if (
-                    record.task_key != item.plan.task_key
-                    or record.fingerprint != expected
-                ):
+                if record.fingerprint != expected:
                     raise RuntimeError("Persisted AlphaFold3 Task identity changed")
                 if record.status.is_terminal:
                     continue
@@ -646,11 +654,11 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
                 continue
             with self.store.synchronize():
-                tasks = self.store.execution.list_tasks(
+                has_tasks = self.store.execution.node_has_tasks(
                     self.execution_run_id,
                     node.node_key,
                 )
-            if not tasks:
+            if not has_tasks:
                 observation = self._empty_node_observation(node.node_key)
                 if observation == AvailabilityStatus.MISSING:
                     self._publish_empty_node(node.node_key)

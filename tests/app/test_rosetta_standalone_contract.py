@@ -242,7 +242,7 @@ def test_rosetta_worker_uses_app_run_layout(
     )
     assert completions[0][3]["status"] == "succeeded"
     assert summary == {"claimed_tasks": 1, "claim_requests": 2}
-    assert output_volume.commit_count == 2
+    assert output_volume.commit_count == 1
 
 
 def test_rosetta_worker_rejects_path_escaping_run_identity(

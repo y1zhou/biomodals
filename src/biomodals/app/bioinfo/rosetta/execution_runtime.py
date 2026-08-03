@@ -222,8 +222,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             )
         observations = []
         for task in tasks:
-            if task.status.is_terminal:
-                continue
             try:
                 observation = (
                     AvailabilityStatus.AVAILABLE

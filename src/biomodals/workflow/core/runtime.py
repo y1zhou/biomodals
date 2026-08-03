@@ -903,9 +903,6 @@ class WorkflowRuntime:
                 for node in repository.list_nodes(run.execution_run_id)
             }
             counts = repository.active_provider_call_counts(self.execution_run_id)
-            provider_counts_by_node = repository.provider_call_counts_by_node(
-                self.execution_run_id
-            )
         available_total_slots = max(
             0,
             run.max_active_provider_calls - counts.total,
@@ -927,6 +924,24 @@ class WorkflowRuntime:
         fixed_node_keys: set[str] = set()
         pull_invocations: dict[str, RemotePullWorkerCall] = {}
         pull_descriptors: list[PullWorkerDispatchDescriptor] = []
+        pull_node_keys = tuple(
+            node_id
+            for node_id, node_record in nodes.items()
+            if (
+                node_id in required
+                and node_record.status == NodeStatus.RUNNING
+                and node_record.discovery_complete
+                and isinstance(
+                    definition.nodes[node_id].node,
+                    RemotePullTaskWorkflowNode,
+                )
+            )
+        )
+        with self.store.synchronize():
+            provider_counts_by_node = repository.provider_call_counts_by_node(
+                self.execution_run_id,
+                pull_node_keys,
+            )
         for node_id, node_record in nodes.items():
             if (
                 node_id not in required

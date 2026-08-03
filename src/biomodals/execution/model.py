@@ -487,11 +487,11 @@ class ExecutionSnapshot:
 
 @dataclass(frozen=True)
 class ExecutionOverview:
-    """Bounded Run, Node, and latest-call state for lifecycle projections."""
+    """Bounded Run, Node, and representative-call lifecycle projection."""
 
     run: ExecutionRunRecord
     nodes: tuple[ExecutionNodeRecord, ...]
-    latest_provider_calls: tuple[ProviderCallOverview, ...]
+    representative_provider_calls: tuple[ProviderCallOverview, ...]
     active_provider_calls: ActiveProviderCallCounts
 
 

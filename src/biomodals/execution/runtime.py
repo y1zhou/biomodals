@@ -931,7 +931,8 @@ class ExecutionRuntime:
                     with self._transaction():
                         for preclaim in authorized:
                             call = self.repository.get_provider_call(
-                                preclaim.call.provider_call_id
+                                preclaim.call.provider_call_id,
+                                include_task_keys=False,
                             )
                             if call.status == ProviderCallStatus.SUBMITTING:
                                 self.repository.mark_submission_outcome_unknown(
@@ -1061,7 +1062,8 @@ class ExecutionRuntime:
                         provider_call_id = original.provider_call_id
                         if provider_call_id in abandoned_submissions:
                             current = self.repository.get_provider_call(
-                                provider_call_id
+                                provider_call_id,
+                                include_task_keys=False,
                             )
                             updated = (
                                 self.repository.mark_submission_outcome_unknown(
@@ -1168,7 +1170,10 @@ class ExecutionRuntime:
     ) -> ProviderCallRecord:
         """Request cancellation without inventing a conclusive provider outcome."""
         with self._synchronize():
-            call = self.repository.get_provider_call(provider_call_id)
+            call = self.repository.get_provider_call(
+                provider_call_id,
+                include_task_keys=False,
+            )
         if call.status.is_terminal:
             return call
         if call.provider_call_handle_id is None:
@@ -1194,7 +1199,10 @@ class ExecutionRuntime:
                 self._checkpoint_state()
             return updated
         with self._synchronize():
-            return self.repository.get_provider_call(provider_call_id)
+            return self.repository.get_provider_call(
+                provider_call_id,
+                include_task_keys=False,
+            )
 
     def cancel_run(
         self,
@@ -1379,7 +1387,10 @@ class AsyncExecutionRuntime:
             try:
                 await self._modal.cancel(handle_id)
             finally:
-                call = self.repository.get_provider_call(preclaim.call.provider_call_id)
+                call = self.repository.get_provider_call(
+                    preclaim.call.provider_call_id,
+                    include_task_keys=False,
+                )
                 if call.status == ProviderCallStatus.SUBMITTING:
                     self.repository.mark_submission_outcome_unknown(
                         call.provider_call_id,
@@ -1439,7 +1450,7 @@ class AsyncExecutionRuntime:
         )
         if observation.kind != ModalCallObservationKind.RUNNING:
             self._checkpoint_state()
-        elif updated != call:
+        elif updated.status != call.status:
             self._commit_local_state()
         return updated
 
@@ -1476,7 +1487,10 @@ class AsyncExecutionRuntime:
         now: int,
     ) -> ProviderCallRecord:
         """Request cancellation without inventing a conclusive provider outcome."""
-        call = self.repository.get_provider_call(provider_call_id)
+        call = self.repository.get_provider_call(
+            provider_call_id,
+            include_task_keys=False,
+        )
         if call.status.is_terminal:
             return call
         if call.provider_call_handle_id is None:
@@ -1497,7 +1511,10 @@ class AsyncExecutionRuntime:
             )
             self._checkpoint_state()
             return updated
-        return self.repository.get_provider_call(provider_call_id)
+        return self.repository.get_provider_call(
+            provider_call_id,
+            include_task_keys=False,
+        )
 
     async def cancel_run(
         self,

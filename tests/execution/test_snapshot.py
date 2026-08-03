@@ -1,6 +1,6 @@
 """Read-only execution snapshot and overview tests."""
 
-# ruff: noqa: D103, S106
+# ruff: noqa: D103, S105, S106
 
 import sqlite3
 
@@ -77,12 +77,26 @@ def test_overview_preserves_lifecycle_state_without_reading_tasks() -> None:
     connection.set_trace_callback(None)
     assert overview.run == repository.get_run(RUN_ID)
     assert overview.nodes == repository.list_nodes(RUN_ID)
-    assert [call.submission_token for call in overview.latest_provider_calls] == [
-        "call-1"
-    ]
-    assert overview.latest_provider_calls[0].status == ProviderCallStatus.SUCCEEDED
-    assert overview.latest_provider_calls[0].result_envelope == {
-        "path": "/outputs/seed-0"
-    }
+    assert [
+        call.submission_token for call in overview.representative_provider_calls
+    ] == ["call-0"]
+    assert overview.representative_provider_calls[0].status == (
+        ProviderCallStatus.ATTACHED
+    )
+    assert overview.representative_provider_calls[0].provider_call_handle_id == (
+        "fc-active"
+    )
+    assert overview.representative_provider_calls[0].result_envelope is None
     assert overview.active_provider_calls == ActiveProviderCallCounts(total=1, gpu=1)
     assert all("execution_tasks" not in statement for statement in statements)
+
+    repository.cancel_provider_call(
+        active.call.provider_call_id,
+        message="test cleanup",
+        now=115,
+    )
+
+    [representative] = repository.overview(RUN_ID).representative_provider_calls
+    assert representative.submission_token == "call-1"
+    assert representative.status == ProviderCallStatus.SUCCEEDED
+    assert representative.result_envelope == {"path": "/outputs/seed-0"}

@@ -222,7 +222,88 @@ def test_fail_fast_pull_claim_stops_unowned_siblings() -> None:
     assert repository.get_task(RUN_ID, "inference", "seed-1").status == (
         TaskStatus.SKIPPED
     )
-    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.FAILED
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.RUNNING
+    assert (
+        repository.reconcile_node_tasks(
+            RUN_ID,
+            "inference",
+            now=143,
+        ).status
+        == NodeStatus.FAILED
+    )
+
+
+def test_fail_fast_provider_failure_stops_other_workers() -> None:
+    repository = create_repository(
+        task_count=3,
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    first, second = _admit_workers(repository, 2)
+    repository.claim_pull_tasks(
+        first.call.provider_call_id,
+        request_id="first",
+        capacity=1,
+        now=140,
+    )
+
+    repository.fail_provider_call(
+        first.call.provider_call_id,
+        message="worker failed",
+        now=141,
+    )
+
+    assert (
+        repository.claim_pull_tasks(
+            second.call.provider_call_id,
+            request_id="after-failure",
+            capacity=2,
+            now=142,
+        ).assignments
+        == ()
+    )
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.RUNNING
+    assert (
+        repository.reconcile_node_tasks(
+            RUN_ID,
+            "inference",
+            now=143,
+        ).status
+        == NodeStatus.FAILED
+    )
+
+
+def test_fail_fast_worker_return_stops_unowned_siblings() -> None:
+    repository = create_repository(
+        task_count=2,
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="first",
+        capacity=1,
+        now=140,
+    )
+
+    repository.record_provider_call_result(
+        worker.call.provider_call_id,
+        result_envelope={"claimed_tasks": 1},
+        now=141,
+    )
+
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.RUNNING
+    assert [task.status for task in repository.list_tasks(RUN_ID, "inference")] == [
+        TaskStatus.FAILED,
+        TaskStatus.SKIPPED,
+    ]
+    assert (
+        repository.reconcile_node_tasks(
+            RUN_ID,
+            "inference",
+            now=142,
+        ).status
+        == NodeStatus.FAILED
+    )
 
 
 def test_claim_request_conflicts_and_failed_owner_never_reassigns_tasks() -> None:
@@ -243,7 +324,7 @@ def test_claim_request_conflicts_and_failed_owner_never_reassigns_tasks() -> Non
             now=141,
         )
 
-    repository.fail_provider_call(
+    failed_call = repository.fail_provider_call(
         first.call.provider_call_id,
         message="worker failed",
         now=150,
@@ -256,6 +337,7 @@ def test_claim_request_conflicts_and_failed_owner_never_reassigns_tasks() -> Non
     )
 
     assert [assignment.task_key for assignment in remaining.assignments] == ["seed-2"]
+    assert failed_call.task_keys == ()
     assert {
         task.task_key: task.status
         for task in repository.list_tasks(RUN_ID, "inference")
@@ -348,12 +430,13 @@ def test_successful_worker_fails_any_unreported_assignment() -> None:
         now=145,
     )
 
-    repository.record_provider_call_result(
+    completed_call = repository.record_provider_call_result(
         worker.call.provider_call_id,
         result_envelope={"claimed_tasks": 2},
         now=150,
     )
 
+    assert completed_call.task_keys == ()
     assert {
         task.task_key: task.status
         for task in repository.list_tasks(RUN_ID, "inference")

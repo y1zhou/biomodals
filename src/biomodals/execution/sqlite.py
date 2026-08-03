@@ -629,6 +629,10 @@ class SqliteExecutionRepository:
         active = tuple(
             status.value for status in ProviderCallStatus if not status.is_terminal
         )
+        terminal = tuple(
+            status.value for status in ProviderCallStatus if status.is_terminal
+        )
+        terminal_placeholders = ", ".join("?" for _ in terminal)
         active_placeholders = ", ".join("?" for _ in active)
         for offset in range(0, len(run_ids), 400):
             chunk = tuple(str(run_id) for run_id in run_ids[offset : offset + 400])
@@ -668,15 +672,23 @@ class SqliteExecutionRepository:
                     SELECT call.*, call.rowid AS provider_call_rowid
                     FROM execution_provider_calls AS call
                     JOIN (
-                        SELECT execution_run_id, node_key, MAX(rowid) AS latest_rowid
+                        SELECT execution_run_id, node_key,
+                               COALESCE(
+                                   MAX(
+                                       CASE WHEN status NOT IN ({terminal_placeholders})
+                                            THEN rowid END
+                                   ),
+                                   MAX(rowid)
+                               ) AS representative_rowid
                         FROM execution_provider_calls
                         WHERE execution_run_id IN ({placeholders})
                         GROUP BY execution_run_id, node_key
-                    ) AS latest ON latest.latest_rowid = call.rowid
+                    ) AS representative
+                        ON representative.representative_rowid = call.rowid
                     ORDER BY call.execution_run_id, call.created_at,
                              provider_call_rowid
                     """,  # noqa: S608 - generated placeholders
-                    chunk,
+                    (*terminal, *chunk),
                 ).fetchall()
             )
             active_rows.extend(
@@ -726,7 +738,9 @@ class SqliteExecutionRepository:
             UUID(row["execution_run_id"]): ExecutionOverview(
                 run=_run_from_row(row),
                 nodes=tuple(nodes.get(row["execution_run_id"], ())),
-                latest_provider_calls=tuple(calls.get(row["execution_run_id"], ())),
+                representative_provider_calls=tuple(
+                    calls.get(row["execution_run_id"], ())
+                ),
                 active_provider_calls=active_counts.get(
                     row["execution_run_id"],
                     ActiveProviderCallCounts(0, 0),
@@ -1793,15 +1807,6 @@ class SqliteExecutionRepository:
             }
         ):
             return self._load_pull_task_claim(request_id)
-        self.reconcile_node_tasks(
-            call.execution_run_id,
-            call.node_key,
-            now=now,
-        )
-        if self.get_node(call.execution_run_id, call.node_key).status != (
-            NodeStatus.RUNNING
-        ):
-            return self._load_pull_task_claim(request_id)
         rows = self._connection.execute(
             """
             SELECT task_key
@@ -1942,13 +1947,19 @@ class SqliteExecutionRepository:
             ),
         )
         if observation == AvailabilityStatus.MISSING:
-            return self.fail_task(
+            failed = self.fail_task(
                 call.execution_run_id,
                 call.node_key,
                 task_key,
                 message=message or "Worker publication was missing",
                 now=now,
             )
+            self._apply_fail_fast_policy_after_failure(
+                call.execution_run_id,
+                call.node_key,
+                now=now,
+            )
+            return failed
         return self.record_task_result_observation(
             call.execution_run_id,
             call.node_key,
@@ -2369,7 +2380,7 @@ class SqliteExecutionRepository:
             call.node_key,
             now=now,
         )
-        return self.get_provider_call(provider_call_id)
+        return call
 
     def finalize_run_from_results(
         self,
@@ -2566,14 +2577,14 @@ class SqliteExecutionRepository:
                     now=now,
                 )
         elif call.status.is_terminal:
-            return call
+            return self._get_provider_call_for_return(call)
         self._project_run_unknown(
             call.execution_run_id,
             reason=RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN,
             message=message,
             now=now,
         )
-        return self.get_provider_call(provider_call_id, include_task_keys=False)
+        return self._get_provider_call_for_return(call)
 
     def active_provider_call_counts(
         self,
@@ -2755,12 +2766,12 @@ class SqliteExecutionRepository:
         """Durably attach the provider's concrete call identity."""
         if not provider_call_handle_id:
             raise ValueError("provider call handle ID cannot be empty")
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if (
             call.status == ProviderCallStatus.ATTACHED
             and call.provider_call_handle_id == provider_call_handle_id
         ):
-            return call
+            return self._get_provider_call_for_return(call)
         if call.status not in {
             ProviderCallStatus.SUBMITTING,
             ProviderCallStatus.OUTCOME_UNKNOWN,
@@ -2784,7 +2795,7 @@ class SqliteExecutionRepository:
             ),
         )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
-        return self.get_provider_call(provider_call_id)
+        return self._get_provider_call_for_return(call)
 
     def mark_provider_call_running(
         self,
@@ -2795,7 +2806,7 @@ class SqliteExecutionRepository:
         """Record a conclusive active provider observation."""
         call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.RUNNING:
-            return call
+            return self._get_provider_call_for_return(call)
         if call.status not in {
             ProviderCallStatus.ATTACHED,
             ProviderCallStatus.STATE_UNKNOWN,
@@ -2817,7 +2828,7 @@ class SqliteExecutionRepository:
             ),
         )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
-        return self.get_provider_call(provider_call_id, include_task_keys=False)
+        return self._get_provider_call_for_return(call)
 
     def mark_submission_outcome_unknown(
         self,
@@ -2827,9 +2838,9 @@ class SqliteExecutionRepository:
         now: int,
     ) -> ProviderCallRecord:
         """Preserve ownership when spawn may have occurred without attachment."""
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.OUTCOME_UNKNOWN:
-            return call
+            return self._get_provider_call_for_return(call)
         if call.status != ProviderCallStatus.SUBMITTING:
             raise ValueError(
                 f"cannot mark {call.status.value} submission outcome unknown"
@@ -2846,7 +2857,7 @@ class SqliteExecutionRepository:
             message=message,
             now=now,
         )
-        return self.get_provider_call(provider_call_id)
+        return self._get_provider_call_for_return(call)
 
     def mark_provider_call_state_unknown(
         self,
@@ -2856,9 +2867,9 @@ class SqliteExecutionRepository:
         now: int,
     ) -> ProviderCallRecord:
         """Preserve attached ownership after an inconclusive provider lookup."""
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.STATE_UNKNOWN:
-            return call
+            return self._get_provider_call_for_return(call)
         if call.status not in {
             ProviderCallStatus.ATTACHED,
             ProviderCallStatus.RUNNING,
@@ -2878,7 +2889,7 @@ class SqliteExecutionRepository:
             message=message,
             now=now,
         )
-        return self.get_provider_call(provider_call_id)
+        return self._get_provider_call_for_return(call)
 
     def record_provider_call_result(
         self,
@@ -2891,11 +2902,11 @@ class SqliteExecutionRepository:
         if result_envelope is None:
             raise ValueError("Provider Call success requires a Result Envelope")
         envelope_json = _dump_json(result_envelope)
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.SUCCEEDED:
             if call.result_envelope != result_envelope:
                 raise ValueError("Provider Call Result Envelope cannot be replaced")
-            return call
+            return self._get_provider_call_for_return(call)
         if call.status not in {
             ProviderCallStatus.ATTACHED,
             ProviderCallStatus.RUNNING,
@@ -2946,7 +2957,7 @@ class SqliteExecutionRepository:
                 ),
             )
         elif call.dispatch_mode == DispatchMode.PULL_WORKER:
-            self._connection.execute(
+            failed_tasks = self._connection.execute(
                 """
                 UPDATE execution_tasks
                 SET status = ?,
@@ -2970,11 +2981,14 @@ class SqliteExecutionRepository:
                     TaskStatus.RUNNING.value,
                 ),
             )
+            if failed_tasks.rowcount:
+                self._apply_fail_fast_policy_after_failure(
+                    call.execution_run_id,
+                    call.node_key,
+                    now=now,
+                )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
-        return self.get_provider_call(
-            provider_call_id,
-            include_task_keys=call.dispatch_mode != DispatchMode.PULL_WORKER,
-        )
+        return self._get_provider_call_for_return(call)
 
     def fail_provider_call(
         self,
@@ -3000,7 +3014,7 @@ class SqliteExecutionRepository:
         now: int,
     ) -> ProviderCallRecord:
         """Record conclusive cancellation and cancel unfinished owned Tasks."""
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.SUBMITTING:
             raise ValueError("cannot cancel submitting Provider Call")
         return self._finish_provider_call(
@@ -3019,9 +3033,9 @@ class SqliteExecutionRepository:
         now: int,
     ) -> ProviderCallRecord:
         """Cancel a preclaim whose spawn-owning process has not invoked spawn."""
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.CANCELLED:
-            return call
+            return self._get_provider_call_for_return(call)
         if call.status not in {
             ProviderCallStatus.SUBMITTING,
             ProviderCallStatus.OUTCOME_UNKNOWN,
@@ -3080,24 +3094,60 @@ class SqliteExecutionRepository:
     def provider_call_counts_by_node(
         self,
         execution_run_id: UUID,
+        node_keys: Collection[str],
     ) -> dict[str, tuple[int, int]]:
-        """Return total and nonterminal Provider Call counts grouped by Node."""
+        """Return total and nonterminal call counts for selected Nodes."""
+        ordered_keys = tuple(dict.fromkeys(node_keys))
+        if not ordered_keys:
+            return {}
         terminal = tuple(
             status.value for status in ProviderCallStatus if status.is_terminal
         )
+        terminal_placeholders = ", ".join("?" for _ in terminal)
+        rows: list[sqlite3.Row] = []
+        for offset in range(0, len(ordered_keys), 400):
+            chunk = ordered_keys[offset : offset + 400]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT
+                        node_key,
+                        COUNT(*) AS total,
+                        COALESCE(
+                            SUM(status NOT IN ({terminal_placeholders})),
+                            0
+                        ) AS nonterminal
+                    FROM execution_provider_calls
+                    WHERE execution_run_id = ?
+                        AND node_key IN ({placeholders})
+                    GROUP BY node_key
+                    """,  # noqa: S608 - generated placeholders
+                    (*terminal, str(execution_run_id), *chunk),
+                ).fetchall()
+            )
+        return {row["node_key"]: (row["total"], row["nonterminal"]) for row in rows}
+
+    def active_provider_call_counts_by_node(
+        self,
+        execution_run_id: UUID,
+    ) -> dict[str, int]:
+        """Return nonterminal Provider Call counts grouped by Node."""
+        active = tuple(
+            status.value for status in ProviderCallStatus if not status.is_terminal
+        )
+        active_placeholders = ", ".join("?" for _ in active)
         rows = self._connection.execute(
-            """
-            SELECT
-                node_key,
-                COUNT(*) AS total,
-                COALESCE(SUM(status NOT IN (?, ?, ?)), 0) AS nonterminal
+            f"""
+            SELECT node_key, COUNT(*) AS active
             FROM execution_provider_calls
             WHERE execution_run_id = ?
+                AND status IN ({active_placeholders})
             GROUP BY node_key
-            """,
-            (*terminal, str(execution_run_id)),
+            """,  # noqa: S608 - generated placeholders
+            (str(execution_run_id), *active),
         ).fetchall()
-        return {row["node_key"]: (row["total"], row["nonterminal"]) for row in rows}
+        return {row["node_key"]: row["active"] for row in rows}
 
     def list_unplanned_ready_tasks(
         self,
@@ -3152,41 +3202,32 @@ class SqliteExecutionRepository:
         if not ordered_keys:
             return ()
         rows: list[sqlite3.Row] = []
-        for offset in range(0, len(ordered_keys), 400):
-            chunk = ordered_keys[offset : offset + 400]
-            placeholders = ", ".join("?" for _ in chunk)
+        for node_key in ordered_keys:
             rows.extend(
                 self._connection.execute(
-                    f"""
-                    WITH ranked AS (
-                        SELECT task.*, node.ordinal AS node_ordinal,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY task.node_key
-                                   ORDER BY task.ordinal
-                               ) AS task_rank
-                        FROM execution_tasks AS task
-                        JOIN execution_nodes AS node
-                            ON node.execution_run_id = task.execution_run_id
-                            AND node.node_key = task.node_key
-                        WHERE task.execution_run_id = ?
-                            AND task.node_key IN ({placeholders})
-                            AND node.status = ?
-                            AND node.discovery_complete = 1
-                            AND task.status = ?
-                            AND task.result_observation = ?
-                            AND task.dispatch_policy_json IS NOT NULL
-                            AND json_extract(
-                                task.dispatch_policy_json,
-                                '$.binding.uses_gpu'
-                            ) = ?
-                    )
-                    SELECT * FROM ranked
-                    WHERE task_rank <= ?
-                    ORDER BY node_ordinal, ordinal
-                    """,  # noqa: S608 - generated placeholders
+                    """
+                    SELECT task.*, node.ordinal AS node_ordinal
+                    FROM execution_tasks AS task
+                    JOIN execution_nodes AS node
+                        ON node.execution_run_id = task.execution_run_id
+                        AND node.node_key = task.node_key
+                    WHERE task.execution_run_id = ?
+                        AND task.node_key = ?
+                        AND node.status = ?
+                        AND node.discovery_complete = 1
+                        AND task.status = ?
+                        AND task.result_observation = ?
+                        AND task.dispatch_policy_json IS NOT NULL
+                        AND json_extract(
+                            task.dispatch_policy_json,
+                            '$.binding.uses_gpu'
+                        ) = ?
+                    ORDER BY task.ordinal
+                    LIMIT ?
+                    """,
                     (
                         str(execution_run_id),
-                        *chunk,
+                        node_key,
                         NodeStatus.RUNNING.value,
                         TaskStatus.PENDING.value,
                         AvailabilityStatus.MISSING.value,
@@ -3195,6 +3236,7 @@ class SqliteExecutionRepository:
                     ),
                 ).fetchall()
             )
+        rows.sort(key=lambda row: (row["node_ordinal"], row["ordinal"]))
         return tuple(
             _task_dispatch_descriptor_from_row(
                 row,
@@ -3597,13 +3639,13 @@ class SqliteExecutionRepository:
         message: str,
         now: int,
     ) -> ProviderCallRecord:
-        call = self.get_provider_call(provider_call_id)
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status.is_terminal:
             if call.status != call_status:
                 raise ValueError(
                     f"cannot rewrite terminal Provider Call {call.status.value}"
                 )
-            return call
+            return self._get_provider_call_for_return(call)
         self._set_provider_call_status(
             provider_call_id,
             call_status,
@@ -3659,8 +3701,39 @@ class SqliteExecutionRepository:
                 TaskStatus.RUNNING.value,
             ),
         )
+        if effective_task_status == TaskStatus.FAILED:
+            self._apply_fail_fast_policy_after_failure(
+                call.execution_run_id,
+                call.node_key,
+                now=now,
+            )
         self._reconcile_run_unknown(call.execution_run_id, now=now)
-        return self.get_provider_call(provider_call_id)
+        return self._get_provider_call_for_return(call)
+
+    def _get_provider_call_for_return(
+        self,
+        call: ProviderCallRecord,
+    ) -> ProviderCallRecord:
+        """Preserve fixed-call ownership while bounding pull-worker responses."""
+        return self.get_provider_call(
+            call.provider_call_id,
+            include_task_keys=call.dispatch_mode != DispatchMode.PULL_WORKER,
+        )
+
+    def _apply_fail_fast_policy_after_failure(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        now: int,
+    ) -> None:
+        node = self.get_node(execution_run_id, node_key)
+        if (
+            node.status == NodeStatus.RUNNING
+            and node.discovery_complete
+            and node.aggregation_policy == NodeAggregationPolicy.FAIL_FAST
+        ):
+            self.apply_task_failure_policy(execution_run_id, node_key, now=now)
 
     def _project_run_unknown(
         self,

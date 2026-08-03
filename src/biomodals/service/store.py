@@ -2199,7 +2199,7 @@ def _job_from_row(
                 if node.started_at is not None
                 and not any(
                     call.node_key == node.node_key
-                    for call in overview.latest_provider_calls
+                    for call in overview.representative_provider_calls
                 )
             ),
             default=None,
@@ -2228,7 +2228,9 @@ def _job_state_from_execution(overview: ExecutionOverview) -> JobState:
             for node in overview.nodes
             if node.status == NodeStatus.RUNNING
         }
-        calls_by_node = {call.node_key for call in overview.latest_provider_calls}
+        calls_by_node = {
+            call.node_key for call in overview.representative_provider_calls
+        }
         if running_nodes and running_nodes.isdisjoint(calls_by_node):
             return JobState.FINALIZING
         return JobState.RUNNING
@@ -2248,7 +2250,9 @@ def _operations_from_execution_overview(
     job_id: UUID,
 ) -> tuple[JobOperationRecord, ...]:
     """Project Node and Provider Call state into the existing Stage/log DTO."""
-    calls_by_node = {call.node_key: call for call in overview.latest_provider_calls}
+    calls_by_node = {
+        call.node_key: call for call in overview.representative_provider_calls
+    }
     operations: list[JobOperationRecord] = []
     for node in overview.nodes:
         if node.started_at is None:

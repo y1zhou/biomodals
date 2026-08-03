@@ -684,7 +684,7 @@ def _result_envelope(result: object) -> dict[str, object]:
 
 def run_config_from_overview(overview: ExecutionOverview) -> ABCFold2RunConfig:
     """Return the validated preparation result from a completed overview."""
-    for call in overview.latest_provider_calls:
+    for call in overview.representative_provider_calls:
         if (
             call.node_key == PREPARE_NODE
             and call.status == ProviderCallStatus.SUCCEEDED

@@ -17,7 +17,7 @@ import string
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from hashlib import sha256
+from hashlib import file_digest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
@@ -139,11 +139,8 @@ def _metrics_publication_path(run_root: str | Path) -> Path:
 
 
 def _file_sha256(path: Path) -> str:
-    digest = sha256()
     with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return file_digest(stream, "sha256").hexdigest()
 
 
 def _input_output_dir(output_dir: str | Path, input_id: str) -> Path:
@@ -904,7 +901,7 @@ def submit_af3score_task(
         postprocess_call = next(
             (
                 provider_call
-                for provider_call in overview.latest_provider_calls
+                for provider_call in overview.representative_provider_calls
                 if provider_call.node_key == "postprocess"
             ),
             None,

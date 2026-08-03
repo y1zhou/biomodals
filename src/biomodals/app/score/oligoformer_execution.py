@@ -725,17 +725,18 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if available_total == 0:
             return
         with self.store.synchronize():
-            provider_counts = self.store.execution.provider_call_counts_by_node(
-                self.execution_run_id
+            active_counts_by_node = (
+                self.store.execution.active_provider_call_counts_by_node(
+                    self.execution_run_id
+                )
             )
         candidate_node_keys = {
             node_key
             for node_key in required
-            if provider_counts.get(node_key, (0, 0))[1]
-            < self._node_call_limit(node_key)
+            if active_counts_by_node.get(node_key, 0) < self._node_call_limit(node_key)
         }
         active_by_node = {
-            node_key: provider_counts.get(node_key, (0, 0))[1] for node_key in required
+            node_key: active_counts_by_node.get(node_key, 0) for node_key in required
         }
         window_size = available_total
         while True:

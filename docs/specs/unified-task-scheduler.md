@@ -1543,6 +1543,12 @@ obtain, reconstruct, or make any envelope durable, it must not invent call
 success: the call remains or becomes `state_unknown`, retains its slots, and
 requires explicit reconciliation.
 
+Pull workers report one completed microbatch at a time. The worker commits the
+microbatch's publications once, the coordinator reloads the Volume once,
+records every Task's stable idempotency request ID in one transaction, and
+checkpoints once. Per-Task outcome semantics are unchanged; the batch boundary
+only removes redundant cross-container Volume synchronization.
+
 The recovery path follows the last durable boundary:
 
 1. before envelope durability, resolve and collect the same attached provider

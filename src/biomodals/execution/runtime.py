@@ -870,6 +870,16 @@ class ExecutionRuntime:
         ):
             if preclaim is None or not preclaim.spawn_authorized:
                 continue
+            with self._synchronize():
+                run = self.repository.get_run(execution_run_id)
+                if _cancellation_is_durable(run):
+                    with self._transaction():
+                        self.repository.cancel_unsubmitted_provider_call(
+                            preclaim.call.provider_call_id,
+                            message="Run cancellation stopped submission",
+                            now=now,
+                        )
+                    continue
             invocation_kwargs = dict(submission.kwargs)
             identity_kwarg = submission.provider_call_id_kwarg
             if identity_kwarg is not None:
@@ -900,6 +910,11 @@ class ExecutionRuntime:
                     with self._transaction():
                         for preclaim in authorized:
                             provider_call_id = preclaim.call.provider_call_id
+                            current = self.repository.get_provider_call(
+                                provider_call_id
+                            )
+                            if current.status.is_terminal:
+                                continue
                             error = errors.get(provider_call_id)
                             if isinstance(error, ModalDefiniteSubmissionError):
                                 self.repository.fail_provider_call(
@@ -931,14 +946,7 @@ class ExecutionRuntime:
                                     now=now,
                                 )
                         run = self.repository.get_run(execution_run_id)
-                        cancellation_requested = (
-                            run.status == RunStatus.CANCEL_REQUESTED
-                            or (
-                                run.status == RunStatus.STATE_UNKNOWN
-                                and run.status_reason
-                                == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
-                            )
-                        )
+                        cancellation_requested = _cancellation_is_durable(run)
                     self._checkpoint_state()
             except Exception:
                 for handle_id in spawned.values():
@@ -969,8 +977,6 @@ class ExecutionRuntime:
             for provider_call_id in spawned:
                 self.request_provider_call_cancellation(provider_call_id, now=now)
 
-        if errors:
-            raise next(iter(errors.values()))
         with self._synchronize():
             return tuple(
                 None
@@ -1571,4 +1577,12 @@ def _fixed_descriptors_for_candidate(
                 task_key,
             ),
         )
+    )
+
+
+def _cancellation_is_durable(run: ExecutionRunRecord) -> bool:
+    """Return whether this Run must admit no further provider side effects."""
+    return run.status == RunStatus.CANCEL_REQUESTED or (
+        run.status == RunStatus.STATE_UNKNOWN
+        and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
     )

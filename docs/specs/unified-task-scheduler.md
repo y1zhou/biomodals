@@ -614,7 +614,10 @@ An interruption after step 2 cannot authorize the same paid call again.
 Unattached `submitting` records become `outcome_unknown` during recovery.
 If cancellation becomes durable during step 3, every newly attached handle is
 cancelled immediately after step 4 without placing the Modal RPC under the
-writer.
+writer. Before each later spawn in the admission set, the spawn-owning process
+rechecks cancellation under the writer and conclusively cancels any preclaim
+whose provider side effect has not begun. This prevents a cancellation that
+arrives during one slow spawn from launching the rest of the selected set.
 Ordinary planning, cache observation, policy persistence, and unchanged or
 running provider polls use only their local SQLite transactions. They do not
 issue a remote Volume commit.
@@ -1168,6 +1171,13 @@ returns payloads. The worker may repeat the same request after a lost response
 and may claim another microbatch after reporting completion. No Task moves to
 a different call after assignment in the same Execution Run.
 
+An existing request ID always replays its durable assignments. A new request
+receives work only while its Run and Node are both `running` and its Provider
+Call is `submitting`, `attached`, or `running`. Suspended, unknown, cancelling,
+pruned, or terminal work returns an empty claim. Before selecting Tasks, the
+repository applies the Node aggregation policy so the first `fail_fast`
+failure skips unowned siblings without waiting for another coordinator poll.
+
 The workload declares one positive `claim_capacity`, the maximum Tasks a
 worker can own concurrently. Pool size is derived rather than separately
 configured:
@@ -1418,6 +1428,12 @@ attached. `state_unknown` means an attached call exists but its current or
 terminal provider state, returned result recovery, or cancellation outcome
 cannot be established. Both preserve Task ownership and prohibit replacement
 work until explicit reconciliation establishes one of the listed transitions.
+
+Explicit cancellation intent takes precedence over every later provider
+uncertainty. While a cancelling Run is represented as `state_unknown`, it keeps
+`status_reason=cancellation_outcome_unknown`; another call cannot overwrite
+that reason. When the final unknown owner becomes conclusive, reconciliation
+returns to `cancel_requested`, never `running`, so no new work is admitted.
 
 There is no `planned` Provider Call: unsubmitted intent remains on the Task or
 Dispatch Batch, and the durable preclaim creates a call directly in

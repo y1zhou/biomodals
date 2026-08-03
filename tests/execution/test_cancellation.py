@@ -152,6 +152,60 @@ def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
     assert repository.active_provider_call_counts(RUN_ID).total == 1
 
 
+def test_mixed_unknown_calls_preserve_durable_cancellation_intent() -> None:
+    repository = create_repository(task_count=2)
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claims = []
+    for index in range(2):
+        claim = repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            (f"seed-{index}",),
+            submission_token=f"batch-{index}",
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            now=110 + index,
+        )
+        assert claim is not None
+        repository.attach_provider_call(
+            claim.call.provider_call_id,
+            provider_call_handle_id=f"fc-{index}",
+            now=115 + index,
+        )
+        claims.append(claim)
+
+    repository.request_run_cancellation(RUN_ID, now=120)
+    repository.mark_provider_cancellation_unknown(
+        claims[0].call.provider_call_id,
+        message="cancellation response was lost",
+        now=121,
+    )
+    repository.mark_provider_call_state_unknown(
+        claims[1].call.provider_call_id,
+        message="provider state was unavailable",
+        now=122,
+    )
+    repository.cancel_provider_call(
+        claims[0].call.provider_call_id,
+        message="cancelled",
+        now=123,
+    )
+    repository.cancel_provider_call(
+        claims[1].call.provider_call_id,
+        message="cancelled",
+        now=124,
+    )
+
+    run = repository.get_run(RUN_ID)
+    assert run.status == RunStatus.CANCEL_REQUESTED
+    assert run.status_reason is None
+
+
 def test_result_pruning_waits_for_conclusive_provider_cancellation() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

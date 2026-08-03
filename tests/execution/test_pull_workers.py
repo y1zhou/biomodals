@@ -7,7 +7,10 @@ import pytest
 from biomodals.execution import (
     AvailabilityStatus,
     DispatchMode,
+    NodeAggregationPolicy,
+    NodeStatus,
     ResultProvenance,
+    RunStatus,
     TaskStatus,
 )
 
@@ -160,6 +163,66 @@ def test_worker_can_claim_after_spawn_before_call_attachment() -> None:
     )
 
     assert [assignment.task_key for assignment in claim.assignments] == ["seed-0"]
+
+
+def test_suspended_run_returns_no_new_pull_assignments() -> None:
+    repository = create_repository(task_count=2)
+    (worker,) = _admit_workers(repository, 1)
+    repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-0",
+        AvailabilityStatus.UNKNOWN,
+        now=140,
+    )
+
+    claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="while-suspended",
+        capacity=2,
+        now=141,
+    )
+
+    assert repository.get_run(RUN_ID).status == RunStatus.SUSPENDED
+    assert claim.assignments == ()
+    assert repository.get_task(RUN_ID, "inference", "seed-1").status == (
+        TaskStatus.PENDING
+    )
+
+
+def test_fail_fast_pull_claim_stops_unowned_siblings() -> None:
+    repository = create_repository(
+        task_count=2,
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    (worker,) = _admit_workers(repository, 1)
+    first = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="first",
+        capacity=1,
+        now=140,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        first.assignments[0].task_key,
+        request_id="failed-first",
+        observation=AvailabilityStatus.MISSING,
+        message="scientific output was missing",
+        now=141,
+    )
+
+    next_claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="after-failure",
+        capacity=1,
+        now=142,
+    )
+
+    assert next_claim.assignments == ()
+    assert repository.get_task(RUN_ID, "inference", "seed-1").status == (
+        TaskStatus.SKIPPED
+    )
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.FAILED
 
 
 def test_claim_request_conflicts_and_failed_owner_never_reassigns_tasks() -> None:

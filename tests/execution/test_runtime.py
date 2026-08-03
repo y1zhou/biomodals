@@ -5,6 +5,7 @@
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
+from threading import Event, RLock, Thread
 
 import pytest
 
@@ -15,8 +16,10 @@ from biomodals.execution import (
     NodePlan,
     NodeStatus,
     ProviderCallStatus,
+    RunStatus,
     SqliteExecutionRepository,
 )
+from biomodals.execution.coordinator import drive_execution_run
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -730,16 +733,16 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
         checkpoint=lambda: None,
     )
 
-    with pytest.raises(type(error)):
-        runtime.submit_fixed_batch(
-            RUN_ID,
-            _candidate(),
-            submission_token="batch",
-            kwargs={"seed": 0},
-            now=110,
-        )
+    submitted = runtime.submit_fixed_batch(
+        RUN_ID,
+        _candidate(),
+        submission_token="batch",
+        kwargs={"seed": 0},
+        now=110,
+    )
 
     call = repository.list_provider_calls(RUN_ID)[0]
+    assert submitted == call
     assert call.status == expected_status
     replay = runtime.submit_fixed_batch(
         RUN_ID,
@@ -750,6 +753,115 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
     )
     assert replay == call
     assert driver.spawn_count == 1
+
+
+def test_definite_submission_rejection_finishes_run_without_suspension() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    driver.spawn_error = ModalDefiniteSubmissionError("rejected")
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+
+    def advance_once() -> None:
+        runtime.submit_provider_calls(
+            RUN_ID,
+            (
+                ProviderCallSubmission(
+                    candidate=_candidate(),
+                    submission_token="batch",
+                ),
+            ),
+            now=110,
+        )
+        repository.reconcile_node_tasks(RUN_ID, "inference", now=111)
+        repository.finalize_run_from_results(RUN_ID, now=112)
+
+    snapshot = drive_execution_run(
+        repository,
+        RUN_ID,
+        advance_once=advance_once,
+        checkpoint=lambda: None,
+        sleep=lambda _: None,
+        poll_interval_seconds=0,
+    )
+
+    assert snapshot.run.status == RunStatus.FAILED
+
+
+def test_cancellation_stops_the_rest_of_a_multi_call_admission_set() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    repository = create_repository(
+        connection=connection,
+        task_count=3,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=3,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1", "seed-2"),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    first_spawn_started = Event()
+    release_first_spawn = Event()
+    writer = RLock()
+
+    class BlockingDriver(FakeModalDriver):
+        def spawn(self, function, *, args, kwargs):
+            handle_id = super().spawn(function, args=args, kwargs=kwargs)
+            if self.spawn_count == 1:
+                first_spawn_started.set()
+                assert release_first_spawn.wait(timeout=5)
+            return handle_id
+
+    driver = BlockingDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=connection.commit,
+        transaction=_transaction(connection),
+        synchronize=lambda: writer,
+    )
+    submissions = tuple(
+        ProviderCallSubmission(
+            candidate=_candidate(index),
+            submission_token=f"batch-{index}",
+        )
+        for index in range(3)
+    )
+    failure: list[BaseException] = []
+
+    def submit() -> None:
+        try:
+            runtime.submit_provider_calls(RUN_ID, submissions, now=110)
+        except BaseException as error:  # pragma: no cover - assertion aid
+            failure.append(error)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert first_spawn_started.wait(timeout=5)
+    runtime.cancel_run(RUN_ID, now=120)
+    release_first_spawn.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failure == []
+    assert driver.spawn_count == 1
+    assert driver.cancelled == [f"fc-{GPU_BINDING.function_name}-1"]
+    assert [call.status for call in repository.list_provider_calls(RUN_ID)] == [
+        ProviderCallStatus.ATTACHED,
+        ProviderCallStatus.CANCELLED,
+        ProviderCallStatus.CANCELLED,
+    ]
 
 
 def test_unattached_returned_call_is_cancelled_and_checkpointed_unknown(

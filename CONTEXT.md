@@ -82,6 +82,9 @@ _Avoid_: failed Task, provider state unknown, Modal preemption
 A nonterminal Execution Run whose provider submission, call state, or
 cancellation outcome cannot be established. It preserves ownership and forbids
 replacement work until explicit reconciliation or administrative resolution.
+Cancellation intent is sticky: later provider uncertainty cannot erase it, and
+conclusive reconciliation returns such a Run to `cancel_requested` rather than
+admitting new work.
 _Avoid_: suspended Run, missing publication, failed Run
 
 **Execution Node**:

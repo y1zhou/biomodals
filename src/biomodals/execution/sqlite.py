@@ -1552,6 +1552,28 @@ class SqliteExecutionRepository:
             """,
             (request_id, str(provider_call_id), capacity, now),
         )
+        run = self.get_run(call.execution_run_id)
+        node = self.get_node(call.execution_run_id, call.node_key)
+        if (
+            run.status != RunStatus.RUNNING
+            or node.status != NodeStatus.RUNNING
+            or call.status
+            not in {
+                ProviderCallStatus.SUBMITTING,
+                ProviderCallStatus.ATTACHED,
+                ProviderCallStatus.RUNNING,
+            }
+        ):
+            return self._load_pull_task_claim(request_id)
+        self.reconcile_node_tasks(
+            call.execution_run_id,
+            call.node_key,
+            now=now,
+        )
+        if self.get_node(call.execution_run_id, call.node_key).status != (
+            NodeStatus.RUNNING
+        ):
+            return self._load_pull_task_claim(request_id)
         rows = self._connection.execute(
             """
             SELECT task_key
@@ -2561,6 +2583,32 @@ class SqliteExecutionRepository:
             now=now,
         )
 
+    def cancel_unsubmitted_provider_call(
+        self,
+        provider_call_id: UUID,
+        *,
+        message: str,
+        now: int,
+    ) -> ProviderCallRecord:
+        """Cancel a preclaim whose spawn-owning process has not invoked spawn."""
+        call = self.get_provider_call(provider_call_id)
+        if call.status == ProviderCallStatus.CANCELLED:
+            return call
+        if call.status not in {
+            ProviderCallStatus.SUBMITTING,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+        }:
+            raise ValueError(
+                f"cannot cancel {call.status.value} as an unsubmitted Provider Call"
+            )
+        return self._finish_provider_call(
+            provider_call_id,
+            call_status=ProviderCallStatus.CANCELLED,
+            task_status=TaskStatus.CANCELLED,
+            message=message,
+            now=now,
+        )
+
     def list_tasks(
         self,
         execution_run_id: UUID,
@@ -3029,6 +3077,13 @@ class SqliteExecutionRepository:
         now: int,
     ) -> None:
         run = self.get_run(execution_run_id)
+        if run.status == RunStatus.CANCEL_REQUESTED:
+            reason = RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+        elif (
+            run.status == RunStatus.STATE_UNKNOWN
+            and run.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
+        ):
+            reason = RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
         if run.status == RunStatus.STATE_UNKNOWN:
             if run.status_reason != reason or run.status_message != message:
                 self._connection.execute(

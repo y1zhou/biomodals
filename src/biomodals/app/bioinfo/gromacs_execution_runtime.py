@@ -6,7 +6,7 @@ import time
 from base64 import b64decode, b64encode
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from typing import Any
@@ -54,6 +54,8 @@ _REQUEST_FILE = ExecutionRequestFile(
     "GROMACS execution request",
 )
 _PUBLICATION_SCHEMA_VERSION = 1
+_RUN_IDENTITY_SCHEMA_VERSION = 1
+_RUN_IDENTITY_FILE = "run.json"
 
 
 @dataclass(frozen=True)
@@ -205,6 +207,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         self.predecessor_execution_run_id = predecessor_execution_run_id
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
+        self._run_identity_verified = False
         self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
         self._provider = ExecutionRuntime(
             store.execution,
@@ -240,12 +243,70 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         return self.store.execution
 
     def _recover_publications(self) -> None:
+        if not self._run_identity_verified:
+            if self._ensure_run_identity():
+                self._checkpoint()
+            self._run_identity_verified = True
         self._provider.recover_publications(
             self.execution_run_id,
             observe_node=self._node_observation,
             observe_task=lambda node_key, _task: self._node_observation(node_key),
             now=self._now(),
         )
+
+    def _run_identity_path(self) -> Path:
+        return (
+            self.request.run_root(self.output_root)
+            / ".biomodals"
+            / "gromacs"
+            / _RUN_IDENTITY_FILE
+        )
+
+    def _ensure_run_identity(self) -> bool:
+        """Bind the app-owned directory to exactly one scientific plan."""
+        root = self.request.run_root(self.output_root)
+        marker = self._run_identity_path()
+        expected = {
+            "schema_version": _RUN_IDENTITY_SCHEMA_VERSION,
+            "workload_plan_fingerprint": (
+                self.request.execution_plan.workload_plan_fingerprint
+            ),
+        }
+        if root.is_symlink():
+            raise ValueError(f"GROMACS run directory cannot be a symlink: {root}")
+        if marker.exists():
+            if marker.is_symlink() or not marker.is_file():
+                raise ValueError(
+                    f"GROMACS run identity is not a regular file: {marker}"
+                )
+            try:
+                recorded = orjson.loads(marker.read_bytes())
+            except orjson.JSONDecodeError as error:
+                raise ValueError(
+                    f"GROMACS run identity is invalid: {marker}"
+                ) from error
+            if recorded != expected:
+                raise ValueError(
+                    f"GROMACS run name {self.request.run_name!r} is already bound "
+                    "to different scientific inputs; choose a new run name"
+                )
+            return False
+        if root.exists():
+            if not root.is_dir():
+                raise ValueError(f"GROMACS run path is not a directory: {root}")
+            if any(root.iterdir()):
+                raise ValueError(
+                    f"GROMACS run name {self.request.run_name!r} has unclaimed "
+                    "existing outputs; choose a new run name"
+                )
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
+        try:
+            temporary.write_bytes(orjson.dumps(expected, option=orjson.OPT_SORT_KEYS))
+            temporary.replace(marker)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         try:
@@ -376,16 +437,18 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
-        digest = sha256()
         with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
+            return file_digest(stream, "sha256").hexdigest()
 
     def _node_paths(self, node_key: str) -> tuple[Path, ...]:
         root = self.request.run_root(self.output_root)
         name = self.request.run_name
         prepare = (
+            root / f"{name}.pdb",
+            root / f"nvt_{name}.tpr",
+            root / f"nvt_{name}.xtc",
+            root / f"npt_{name}.tpr",
+            root / f"npt_{name}.xtc",
             root / f"production_{name}.tpr",
             root / "production.mdp",
         )

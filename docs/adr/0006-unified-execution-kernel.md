@@ -423,6 +423,14 @@ contract without further app changes in this service-focused refactor. New
 workloads must expose independently scheduled or resource-accounted remote
 work to the kernel instead of copying this pattern.
 
+The direct GROMACS adapter also binds its app-owned run directory to one
+Workload Plan Fingerprint before submitting any Provider Call. The binding is
+immutable: the same human run name may reuse validated publications for the
+same scientific plan, while changed inputs or simulation settings must use a
+new run name. The preparation publication covers the input PDB plus all NVT,
+NPT, and production inputs consumed by downstream Nodes, rather than relying
+only on the deployed app's legacy production-TPR skip condition.
+
 The Provider Call status policy was accepted on 2026-07-29. Calls have exactly
 eight statuses: `submitting`, `attached`, `running`, `outcome_unknown`,
 `state_unknown`, `succeeded`, `failed`, and `cancelled`. The first five are

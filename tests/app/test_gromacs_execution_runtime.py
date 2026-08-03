@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pytest
+
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
     GromacsExecutionRequest,
     GromacsExecutionRuntime,
@@ -20,6 +22,7 @@ from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SECOND_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+THIRD_RUN_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 DEPLOYMENT = DeploymentIdentity("main", "Gromacs", 7)
 
 
@@ -62,6 +65,11 @@ class CompletingDriver:
     def _publish(self, function_name: str, kwargs: dict[str, object]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         if function_name.startswith("prepare_tpr_"):
+            (self.root / f"{self.run_name}.pdb").write_bytes(b"pdb")
+            (self.root / f"nvt_{self.run_name}.tpr").write_bytes(b"tpr")
+            (self.root / f"nvt_{self.run_name}.xtc").write_bytes(b"xtc")
+            (self.root / f"npt_{self.run_name}.tpr").write_bytes(b"tpr")
+            (self.root / f"npt_{self.run_name}.xtc").write_bytes(b"xtc")
             (self.root / f"production_{self.run_name}.tpr").write_bytes(b"tpr")
             (self.root / "production.mdp").write_bytes(b"mdp")
             return
@@ -76,6 +84,16 @@ class CompletingDriver:
                 )
         if kwargs.get("save_processed_traj"):
             (self.root / f"{prefix}{self.run_name}_nopbc.xtc").write_bytes(b"xtc")
+
+
+class IncompletePreparationDriver(CompletingDriver):
+    def _publish(self, function_name: str, kwargs: dict[str, object]) -> None:
+        if function_name.startswith("prepare_tpr_"):
+            self.root.mkdir(parents=True, exist_ok=True)
+            (self.root / f"production_{self.run_name}.tpr").write_bytes(b"tpr")
+            (self.root / "production.mdp").write_bytes(b"mdp")
+            return
+        super()._publish(function_name, kwargs)
 
 
 def _request() -> GromacsExecutionRequest:
@@ -158,7 +176,7 @@ def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None
     runtime.close()
 
 
-def test_same_run_name_does_not_reuse_outputs_from_changed_science(
+def test_same_run_name_rejects_outputs_from_changed_science(
     tmp_path: Path,
 ) -> None:
     first_request = _request()
@@ -191,12 +209,66 @@ def test_same_run_name_does_not_reuse_outputs_from_changed_science(
         now=lambda: 20,
     )
 
-    assert changed.run().run.status == RunStatus.SUCCEEDED
-    assert [name for name, _kwargs in changed_driver.spawns] == [
-        "prepare_tpr_gpu",
-        "production_run_gpu",
-        "collect_traj_stats",
-        "collect_traj_stats",
-        "collect_traj_stats",
-    ]
-    changed.close()
+    try:
+        with pytest.raises(ValueError, match="different scientific inputs"):
+            changed.run()
+        assert changed_driver.spawns == []
+    finally:
+        changed.close()
+
+
+def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
+    request = _request()
+    first = GromacsExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=CompletingDriver(tmp_path, request.run_name),
+        output_volume=FakeVolume(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+    assert first.run().run.status == RunStatus.SUCCEEDED
+    first.close()
+    driver = CompletingDriver(tmp_path, request.run_name)
+    resumed = GromacsExecutionRuntime(
+        request=request,
+        execution_run_id=THIRD_RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, THIRD_RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 20,
+    )
+
+    try:
+        assert resumed.run().run.status == RunStatus.SUCCEEDED
+        assert driver.spawns == []
+    finally:
+        resumed.close()
+
+
+def test_prepare_publication_requires_downstream_inputs(tmp_path: Path) -> None:
+    request = _request()
+    driver = IncompletePreparationDriver(tmp_path, request.run_name)
+    runtime = GromacsExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    try:
+        assert runtime.run().run.status == RunStatus.FAILED
+        assert [name for name, _kwargs in driver.spawns] == ["prepare_tpr_gpu"]
+    finally:
+        runtime.close()

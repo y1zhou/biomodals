@@ -141,6 +141,11 @@ These existing decisions remain binding during the refactor:
   current identities and Volume layouts.
 - GROMACS continues to call the deployed app's established functions. The
   service does not rewrite the app or replace its CLI entrypoint.
+- A GROMACS run directory has an immutable plan-identity marker. Reusing the
+  human run name is allowed only for the same Workload Plan Fingerprint; a
+  changed input or simulation setting requires another run name. Preparation
+  is reusable only when the input PDB and every NVT, NPT, and production file
+  required by downstream Nodes validates against its publication marker.
 - The GROMACS coordinator records only the top-level deployed Function as the
   Task-owning Provider Call. Existing private nested calls to
   `find_traj_last_time_ns` and `postprocess_traj` remain an explicit legacy
@@ -1109,8 +1114,10 @@ facts. Workload presentation code maps stable Node and Task keys to labels and
 timeline rows without writing those labels into execution tables.
 
 Routine lifecycle and service reads use a bounded Execution Overview: the Run,
-its Nodes, the latest Provider Call for each Node, and aggregate active-call
-counts. It deliberately excludes Task payloads and historical call ownership.
+its Nodes, one representative Provider Call per Node, and aggregate active-call
+counts. The representative is the newest active call when one exists, otherwise
+the latest terminal call. The view deliberately excludes Task payloads and
+historical call ownership.
 The complete Execution Snapshot remains available for explicit diagnostics and
 tests, but is not a list- or status-endpoint projection.
 

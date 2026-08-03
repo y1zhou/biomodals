@@ -1214,21 +1214,13 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 )
                 self.output_volume.commit()
 
-    def _open_runtime(
+    def _create_runtime(
         self,
         request: OligoformerExecutionRequest,
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> OligoformerExecutionRuntime:
-        runtime = self._runtime
-        if runtime is not None:
-            if (
-                runtime.request != request
-                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
-            ):
-                raise ValueError("Active OligoFormer runtime does not match request")
-            return runtime
-        runtime = OligoformerExecutionRuntime(
+        return OligoformerExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             deployment=self.deployment,
@@ -1240,5 +1232,3 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
             predecessor_execution_run_id=predecessor_execution_run_id,
             poll_interval_seconds=self.poll_interval_seconds,
         )
-        self._runtime = runtime
-        return runtime

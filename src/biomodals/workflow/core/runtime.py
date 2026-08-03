@@ -7,7 +7,6 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -172,10 +171,9 @@ class WorkflowRuntime:
         self,
         *,
         workload_run_key: str,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> AppRunResult:
         """Create or recover this Run and drive it until it cannot advance."""
-        with synchronize():
+        with self.store.synchronize():
             repository = self._initialize(workload_run_key)
         snapshot = drive_execution_run(
             repository,
@@ -185,7 +183,7 @@ class WorkflowRuntime:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
+            synchronize=self.store.synchronize,
         )
         return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
 
@@ -193,10 +191,9 @@ class WorkflowRuntime:
         self,
         *,
         workload_run_key: str,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> AppRunResult:
         """Explicitly resume this persisted Run, then drive it."""
-        with synchronize():
+        with self.store.synchronize():
             repository = self._initialize(workload_run_key)
         resume_execution_run(
             repository,
@@ -204,7 +201,7 @@ class WorkflowRuntime:
             reconcile_once=self.advance_once,
             checkpoint=self._checkpoint,
             current_repository=lambda: self.store.execution,
-            synchronize=synchronize,
+            synchronize=self.store.synchronize,
             now=self._now(),
         )
         snapshot = drive_execution_run(
@@ -215,7 +212,7 @@ class WorkflowRuntime:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
+            synchronize=self.store.synchronize,
         )
         return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
 

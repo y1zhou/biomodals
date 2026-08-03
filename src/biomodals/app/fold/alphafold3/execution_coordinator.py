@@ -113,23 +113,13 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 )
                 self.output_volume.commit()
 
-    def _open_runtime(
+    def _create_runtime(
         self,
         request: AlphaFold3ExecutionRequest,
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> AlphaFold3ExecutionRuntime:
-        runtime = self._runtime
-        if runtime is not None:
-            if (
-                runtime.request != request
-                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
-            ):
-                raise ValueError(
-                    "Active AlphaFold3 runtime does not match coordinator request"
-                )
-            return runtime
-        runtime = AlphaFold3ExecutionRuntime(
+        return AlphaFold3ExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=predecessor_execution_run_id,
@@ -142,8 +132,6 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
             inference_runtime=self.inference_runtime,
             poll_interval_seconds=self.poll_interval_seconds,
         )
-        self._runtime = runtime
-        return runtime
 
 
 def _restart_request(

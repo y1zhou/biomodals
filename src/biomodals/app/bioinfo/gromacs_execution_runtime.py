@@ -694,21 +694,13 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 )
                 self.output_volume.commit()
 
-    def _open_runtime(
+    def _create_runtime(
         self,
         request: GromacsExecutionRequest,
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> GromacsExecutionRuntime:
-        runtime = self._runtime
-        if runtime is not None:
-            if (
-                runtime.request != request
-                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
-            ):
-                raise ValueError("Active GROMACS runtime does not match request")
-            return runtime
-        runtime = GromacsExecutionRuntime(
+        return GromacsExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=predecessor_execution_run_id,
@@ -719,5 +711,3 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
             output_root=self.volume_root,
             poll_interval_seconds=self.poll_interval_seconds,
         )
-        self._runtime = runtime
-        return runtime

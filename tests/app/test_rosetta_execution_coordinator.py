@@ -54,12 +54,10 @@ class FakeRuntime:
         self.store = cast(ExecutionRunStore, kwargs["store"])
         self.created.append(kwargs)
 
-    def run(self, *, synchronize):
-        del synchronize
+    def run(self):
         return self._snapshot()
 
-    def resume(self, *, synchronize):
-        del synchronize
+    def resume(self):
         return self._snapshot()
 
     def cancel(self):

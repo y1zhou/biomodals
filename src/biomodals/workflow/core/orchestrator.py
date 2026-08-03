@@ -207,7 +207,6 @@ class ExecutionCoordinator:
             try:
                 return runtime.run(
                     workload_run_key=plan.workload_run_key,
-                    synchronize=self._lock,
                 )
             finally:
                 with self._lock():
@@ -240,7 +239,6 @@ class ExecutionCoordinator:
             try:
                 runtime.run(
                     workload_run_key=plan.workload_run_key,
-                    synchronize=self._lock,
                 )
                 with self._lock():
                     return self._verified_snapshot()
@@ -265,7 +263,6 @@ class ExecutionCoordinator:
             try:
                 return runtime.resume(
                     workload_run_key=plan.workload_run_key,
-                    synchronize=self._lock,
                 )
             finally:
                 with self._lock():
@@ -463,7 +460,6 @@ class ExecutionCoordinator:
             try:
                 return runtime.run(
                     workload_run_key=plan.workload_run_key,
-                    synchronize=self._lock,
                 )
             finally:
                 with self._lock():

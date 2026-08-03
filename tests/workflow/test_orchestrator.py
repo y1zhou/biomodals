@@ -233,9 +233,8 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
             calls["init"] = kwargs
             self.store = WorkflowRunStore(tmp_path, RUN_ID)
 
-        def run(self, *, workload_run_key: str, synchronize: object) -> AppRunResult:
+        def run(self, *, workload_run_key: str) -> AppRunResult:
             calls["workload_run_key"] = workload_run_key
-            calls["synchronize"] = synchronize
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
         def close(self) -> None:
@@ -879,10 +878,8 @@ def test_resume_reloads_the_persisted_plan(
             self,
             *,
             workload_run_key: str,
-            synchronize: object,
         ) -> AppRunResult:
             calls["workload_run_key"] = workload_run_key
-            calls["synchronize"] = synchronize
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
         def close(self) -> None:

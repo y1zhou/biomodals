@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -368,13 +368,9 @@ class ExecutionRuntimeLifecycle:
     _provider: ExecutionRuntime
     _volume_sync: ExecutionVolumeSync
 
-    def run(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
+    def run(self) -> ExecutionSnapshot:
         """Create or recover the Run and drive it until it stops."""
-        with synchronize():
+        with self.store.synchronize():
             repository = self._initialize()
         return drive_execution_run(
             repository,
@@ -384,16 +380,12 @@ class ExecutionRuntimeLifecycle:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
+            synchronize=self.store.synchronize,
         )
 
-    def resume(
-        self,
-        *,
-        synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-    ) -> ExecutionSnapshot:
+    def resume(self) -> ExecutionSnapshot:
         """Resume this Run without retrying conclusive failures."""
-        with synchronize():
+        with self.store.synchronize():
             repository = self._initialize()
         resume_execution_run(
             repository,
@@ -401,7 +393,7 @@ class ExecutionRuntimeLifecycle:
             reconcile_once=self.advance_once,
             checkpoint=self._checkpoint,
             current_repository=lambda: self.store.execution,
-            synchronize=synchronize,
+            synchronize=self.store.synchronize,
             now=self._now(),
         )
         return drive_execution_run(
@@ -412,7 +404,7 @@ class ExecutionRuntimeLifecycle:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=synchronize,
+            synchronize=self.store.synchronize,
         )
 
     def cancel(self) -> ExecutionSnapshot:
@@ -574,17 +566,9 @@ class ExecutionCoordinatorLifecycle:
             with self._writer_lock:
                 self._close_runtime()
 
-    def synchronize(self) -> AbstractContextManager[object]:
-        """Return the single-writer boundary used between drive cycles."""
-        return self._writer_lock
-
     def _drive(self, runtime: Any, *, resume: bool) -> ExecutionSnapshot:
         try:
-            snapshot = (
-                runtime.resume(synchronize=self.synchronize)
-                if resume
-                else runtime.run(synchronize=self.synchronize)
-            )
+            snapshot = runtime.resume() if resume else runtime.run()
             self._verify_snapshot(snapshot)
             return snapshot
         finally:
@@ -679,6 +663,27 @@ class ExecutionCoordinatorLifecycle:
         )
 
     def _open_runtime(
+        self,
+        request: Any,
+        *,
+        predecessor_execution_run_id: UUID | None = None,
+    ) -> Any:
+        runtime = self._runtime
+        if runtime is not None:
+            if (
+                runtime.request != request
+                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
+            ):
+                raise ValueError("Active execution runtime does not match request")
+            return runtime
+        runtime = self._create_runtime(
+            request,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+        )
+        self._runtime = runtime
+        return runtime
+
+    def _create_runtime(
         self,
         request: Any,
         *,

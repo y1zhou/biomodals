@@ -211,7 +211,7 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
                 )
             )
 
-        def run(self, *, synchronize):
+        def run(self):
             with self._lock:
                 self.active_drivers += 1
                 self.max_active_drivers = max(
@@ -221,7 +221,7 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
             self.started.set()
             assert self.cancel_requested.wait(timeout=1)
             sleep(0.05)
-            with synchronize():
+            with self._lock:
                 self.status = RunStatus.CANCELLED
             with self._lock:
                 self.active_drivers -= 1
@@ -295,7 +295,7 @@ def test_app_coordinator_status_is_available_during_provider_io(
         def __init__(self) -> None:
             self.store = store
 
-        def run(self, *, synchronize):
+        def run(self):
             def advance_once() -> None:
                 effect_started.set()
                 assert release_effect.wait(timeout=1)
@@ -324,7 +324,7 @@ def test_app_coordinator_status_is_available_during_provider_io(
                 checkpoint=lambda: store.execution,
                 current_repository=lambda: store.execution,
                 poll_interval_seconds=0,
-                synchronize=synchronize,
+                synchronize=store.synchronize,
             )
 
         def close(self) -> None:
@@ -431,6 +431,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
 
     class Runtime:
         def __init__(self, predecessor: UUID | None) -> None:
+            self.request = request
             self.predecessor_execution_run_id = predecessor
             self.store = ExecutionRunStore(tmp_path, RUN_ID)
 
@@ -438,8 +439,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
             self.store.execution.request_run_cancellation(RUN_ID, now=11)
             return self.store.execution.snapshot(RUN_ID)
 
-        def run(self, *, synchronize):
-            del synchronize
+        def run(self):
             return self.store.execution.snapshot(RUN_ID)
 
         def close(self) -> None:
@@ -448,7 +448,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
     class Coordinator(ExecutionCoordinatorLifecycle):
         _request_loader = staticmethod(lambda _root, _run_id: request)
 
-        def _open_runtime(
+        def _create_runtime(
             self,
             request,
             *,
@@ -456,9 +456,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
         ):
             assert request.execution_plan == plan
             opened_with.append(predecessor_execution_run_id)
-            if self._runtime is None:
-                self._runtime = Runtime(predecessor_execution_run_id)
-            return self._runtime
+            return Runtime(predecessor_execution_run_id)
 
     coordinator = Coordinator(
         execution_run_id=RUN_ID,
@@ -470,7 +468,7 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
     snapshot = coordinator.cancel()
 
     assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
-    assert opened_with == [predecessor_id, predecessor_id]
+    assert opened_with == [predecessor_id]
 
 
 def test_app_coordinator_cancels_successor_before_restart_initializes(
@@ -489,6 +487,7 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
 
     class Runtime:
         def __init__(self, predecessor: UUID | None) -> None:
+            self.request = request
             self.predecessor_execution_run_id = predecessor
             self.store = ExecutionRunStore(tmp_path, RUN_ID)
 
@@ -506,8 +505,7 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
                 self.store.execution.request_run_cancellation(RUN_ID, now=11)
             return self.store.execution.snapshot(RUN_ID)
 
-        def run(self, *, synchronize):
-            del synchronize
+        def run(self):
             return self.store.execution.snapshot(RUN_ID)
 
         def close(self) -> None:
@@ -516,16 +514,14 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
     class Coordinator(ExecutionCoordinatorLifecycle):
         _request_loader = staticmethod(lambda _root, _run_id: request)
 
-        def _open_runtime(
+        def _create_runtime(
             self,
             request,
             *,
             predecessor_execution_run_id: UUID | None = None,
         ):
             assert request.execution_plan == plan
-            if self._runtime is None:
-                self._runtime = Runtime(predecessor_execution_run_id)
-            return self._runtime
+            return Runtime(predecessor_execution_run_id)
 
     snapshot = Coordinator(
         execution_run_id=RUN_ID,

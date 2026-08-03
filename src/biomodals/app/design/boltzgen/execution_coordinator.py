@@ -111,21 +111,13 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 )
                 self.output_volume.commit()
 
-    def _open_runtime(
+    def _create_runtime(
         self,
         request: BoltzGenExecutionRequest,
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> BoltzGenExecutionRuntime:
-        runtime = self._runtime
-        if runtime is not None:
-            if (
-                runtime.request != request
-                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
-            ):
-                raise ValueError("Active BoltzGen runtime does not match request")
-            return runtime
-        runtime = BoltzGenExecutionRuntime(
+        return BoltzGenExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=predecessor_execution_run_id,
@@ -136,8 +128,6 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
             output_root=self.volume_root,
             poll_interval_seconds=self.poll_interval_seconds,
         )
-        self._runtime = runtime
-        return runtime
 
 
 def _replaceable_claim_owners(

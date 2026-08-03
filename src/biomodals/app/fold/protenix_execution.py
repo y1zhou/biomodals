@@ -792,21 +792,13 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 )
                 self.output_volume.commit()
 
-    def _open_runtime(
+    def _create_runtime(
         self,
         request: ProtenixExecutionRequest,
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> ProtenixExecutionRuntime:
-        runtime = self._runtime
-        if runtime is not None:
-            if (
-                runtime.request != request
-                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
-            ):
-                raise ValueError("Active Protenix runtime does not match request")
-            return runtime
-        runtime = ProtenixExecutionRuntime(
+        return ProtenixExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=predecessor_execution_run_id,
@@ -818,5 +810,3 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
             output_claims=self.output_claims,
             poll_interval_seconds=self.poll_interval_seconds,
         )
-        self._runtime = runtime
-        return runtime

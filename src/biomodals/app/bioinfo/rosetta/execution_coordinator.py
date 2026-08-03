@@ -156,21 +156,13 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 )
                 self.output_volume.commit()
 
-    def _open_runtime(
+    def _create_runtime(
         self,
         request: RosettaExecutionRequest,
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> RosettaExecutionRuntime:
-        runtime = self._runtime
-        if runtime is not None:
-            if (
-                runtime.request != request
-                or runtime.predecessor_execution_run_id != predecessor_execution_run_id
-            ):
-                raise ValueError("Active Rosetta runtime does not match request")
-            return runtime
-        runtime = RosettaExecutionRuntime(
+        return RosettaExecutionRuntime(
             request=request,
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=predecessor_execution_run_id,
@@ -182,5 +174,3 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             pull_worker_coordinator=self.pull_worker_coordinator,
             poll_interval_seconds=self.poll_interval_seconds,
         )
-        self._runtime = runtime
-        return runtime

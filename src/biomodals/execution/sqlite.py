@@ -45,7 +45,7 @@ from biomodals.execution.scheduler import (
     terminal_run_outcome,
 )
 
-EXECUTION_SCHEMA_VERSION = 3
+EXECUTION_SCHEMA_VERSION = 4
 
 
 def _cancellation_is_durable(run: ExecutionRunRecord) -> bool:
@@ -233,6 +233,10 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE INDEX execution_provider_calls_status_created_idx
+    ON execution_provider_calls(execution_run_id, status, created_at)
+    """,
+    """
     CREATE TABLE execution_tasks (
         execution_run_id TEXT NOT NULL,
         node_key TEXT NOT NULL,
@@ -284,6 +288,16 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE INDEX execution_tasks_worker_call_idx
     ON execution_tasks(worker_provider_call_id)
+    WHERE worker_provider_call_id IS NOT NULL
+    """,
+    """
+    CREATE INDEX execution_tasks_running_provider_call_idx
+    ON execution_tasks(execution_run_id, status, provider_call_id)
+    WHERE provider_call_id IS NOT NULL
+    """,
+    """
+    CREATE INDEX execution_tasks_running_worker_call_idx
+    ON execution_tasks(execution_run_id, status, worker_provider_call_id)
     WHERE worker_provider_call_id IS NOT NULL
     """,
     """
@@ -2378,8 +2392,8 @@ class SqliteExecutionRepository:
         execution_run_id: UUID,
     ) -> ActiveProviderCallCounts:
         """Derive occupied total and GPU slots from nonterminal calls."""
-        terminal = tuple(
-            status.value for status in ProviderCallStatus if status.is_terminal
+        active = tuple(
+            status.value for status in ProviderCallStatus if not status.is_terminal
         )
         row = self._connection.execute(
             """
@@ -2388,9 +2402,9 @@ class SqliteExecutionRepository:
                 COALESCE(SUM(uses_gpu), 0) AS gpu
             FROM execution_provider_calls
             WHERE execution_run_id = ?
-                AND status NOT IN (?, ?, ?)
+                AND status IN (?, ?, ?, ?, ?)
             """,
-            (str(execution_run_id), *terminal),
+            (str(execution_run_id), *active),
         ).fetchone()
         return ActiveProviderCallCounts(total=row["total"], gpu=row["gpu"])
 
@@ -2415,40 +2429,44 @@ class SqliteExecutionRepository:
         execution_run_id: UUID,
     ) -> tuple[ProviderCallRecord, ...]:
         """Load observable calls plus successful calls awaiting publication."""
-        terminal = tuple(
-            status.value for status in ProviderCallStatus if status.is_terminal
+        active = tuple(
+            status.value for status in ProviderCallStatus if not status.is_terminal
         )
-        rows = self._connection.execute(
-            """
-            SELECT call.*
-            FROM execution_provider_calls AS call
-            WHERE call.execution_run_id = ?
-                AND (
-                    call.status NOT IN (?, ?, ?)
-                    OR (
-                        call.status = ?
-                        AND EXISTS (
-                            SELECT 1
-                            FROM execution_tasks AS task
-                            WHERE task.execution_run_id = call.execution_run_id
-                                AND task.status = ?
-                                AND (
-                                    task.provider_call_id = call.provider_call_id
-                                    OR task.worker_provider_call_id =
-                                        call.provider_call_id
-                                )
-                        )
-                    )
-                )
-            ORDER BY call.created_at, call.rowid
-            """,
-            (
-                str(execution_run_id),
-                *terminal,
-                ProviderCallStatus.SUCCEEDED.value,
-                TaskStatus.RUNNING.value,
-            ),
-        ).fetchall()
+        rows = list(
+            self._connection.execute(
+                """
+                SELECT call.*, call.rowid AS provider_call_rowid
+                FROM execution_provider_calls AS call
+                WHERE call.execution_run_id = ?
+                    AND call.status IN (?, ?, ?, ?, ?)
+                """,
+                (str(execution_run_id), *active),
+            ).fetchall()
+        )
+        selected = {row["provider_call_id"] for row in rows}
+        for ownership_column in ("provider_call_id", "worker_provider_call_id"):
+            succeeded_rows = self._connection.execute(
+                f"""
+                SELECT DISTINCT call.*, call.rowid AS provider_call_rowid
+                FROM execution_tasks AS task
+                JOIN execution_provider_calls AS call
+                    ON call.provider_call_id = task.{ownership_column}
+                WHERE task.execution_run_id = ?
+                    AND task.status = ?
+                    AND task.{ownership_column} IS NOT NULL
+                    AND call.status = ?
+                """,  # noqa: S608 - column comes from a closed internal tuple
+                (
+                    str(execution_run_id),
+                    TaskStatus.RUNNING.value,
+                    ProviderCallStatus.SUCCEEDED.value,
+                ),
+            ).fetchall()
+            rows.extend(
+                row for row in succeeded_rows if row["provider_call_id"] not in selected
+            )
+            selected.update(row["provider_call_id"] for row in succeeded_rows)
+        rows.sort(key=lambda row: (row["created_at"], row["provider_call_rowid"]))
         return self._provider_calls_from_rows(rows)
 
     def _provider_calls_from_rows(
@@ -2464,18 +2482,22 @@ class SqliteExecutionRepository:
         for offset in range(0, len(call_ids), 400):
             chunk = call_ids[offset : offset + 400]
             placeholders = ", ".join("?" for _ in chunk)
-            task_rows.extend(
-                self._connection.execute(
-                    f"""
-                    SELECT task_key, provider_call_id, worker_provider_call_id
-                    FROM execution_tasks
-                    WHERE provider_call_id IN ({placeholders})
-                        OR worker_provider_call_id IN ({placeholders})
-                    ORDER BY node_key, ordinal
-                    """,  # noqa: S608 - generated parameter placeholders
-                    (*chunk, *chunk),
-                ).fetchall()
-            )
+            for ownership_column in (
+                "provider_call_id",
+                "worker_provider_call_id",
+            ):
+                task_rows.extend(
+                    self._connection.execute(
+                        f"""
+                        SELECT task_key, node_key, ordinal,
+                               provider_call_id, worker_provider_call_id
+                        FROM execution_tasks
+                        WHERE {ownership_column} IN ({placeholders})
+                        """,  # noqa: S608 - generated placeholders, closed column
+                        chunk,
+                    ).fetchall()
+                )
+        task_rows.sort(key=lambda row: (row["node_key"], row["ordinal"]))
         task_keys_by_call: dict[str, list[str]] = {}
         for task in task_rows:
             owner = task["provider_call_id"] or task["worker_provider_call_id"]

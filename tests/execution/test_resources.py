@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103, S106
 
+import sqlite3
+
 from biomodals.execution import ActiveProviderCallCounts
 
 from .provider_call_helpers import (
@@ -11,6 +13,34 @@ from .provider_call_helpers import (
     create_repository,
     persist_fixed_policy,
 )
+
+
+def test_active_call_count_uses_the_status_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection)
+
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT COUNT(*), COALESCE(SUM(uses_gpu), 0)
+        FROM execution_provider_calls
+        WHERE execution_run_id = ?
+            AND status IN (?, ?, ?, ?, ?)
+        """,
+        (
+            str(RUN_ID),
+            "submitting",
+            "attached",
+            "running",
+            "outcome_unknown",
+            "state_unknown",
+        ),
+    ).fetchall()
+
+    assert any(
+        "execution_provider_calls_status_created_idx" in str(row[3])
+        for row in query_plan
+    )
 
 
 def test_preclaim_atomically_enforces_total_and_gpu_subset_limits() -> None:

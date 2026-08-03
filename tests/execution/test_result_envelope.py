@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103, S106
 
+import sqlite3
+
 import pytest
 
 from biomodals.execution import AvailabilityStatus, ProviderCallStatus, TaskStatus
@@ -12,6 +14,30 @@ from .provider_call_helpers import (
     create_repository,
     persist_fixed_policy,
 )
+
+
+def test_running_task_ownership_uses_the_reconciliation_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection)
+
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT DISTINCT call.*
+        FROM execution_tasks AS task
+        JOIN execution_provider_calls AS call
+            ON call.provider_call_id = task.provider_call_id
+        WHERE task.execution_run_id = ?
+            AND task.status = ?
+            AND task.provider_call_id IS NOT NULL
+            AND call.status = ?
+        """,
+        (str(RUN_ID), "running", "succeeded"),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_running_provider_call_idx" in str(row[3]) for row in query_plan
+    )
 
 
 def test_call_success_and_task_scientific_completion_are_separate() -> None:

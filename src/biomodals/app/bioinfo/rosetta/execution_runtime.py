@@ -389,6 +389,7 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             binding=binding,
             compatibility_key="rosetta-worker",
             claim_capacity=self.request.claim_capacity,
+            max_worker_calls=self.request.max_active_provider_calls,
             unfinished_task_count=unfinished,
             nonterminal_worker_count=nonterminal_workers,
             next_worker_ordinal=total_workers,

@@ -208,6 +208,7 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
 @dataclass
 class PullFanoutNode(RemotePullTaskWorkflowNode):
     texts: tuple[str, ...]
+    max_worker_calls: int = 2
     publication_observation: AvailabilityStatus | None = field(
         default=None,
         repr=False,
@@ -245,6 +246,7 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
             function_name="run_pull_worker",
             uses_gpu=False,
             claim_capacity=2,
+            max_worker_calls=self.max_worker_calls,
             kwargs={"node_id": context.node_id},
             runtime_image_key="pull-cpu",
         )
@@ -944,6 +946,31 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
     assert node.finalized_results == [
         (("candidate-0", "candidate-1", "candidate-2"), ()),
     ]
+
+
+def test_pull_task_node_limits_its_concurrent_worker_calls(tmp_path: Path) -> None:
+    workflow = Workflow("bounded-pull-fanout")
+    workflow.add_node(
+        PullFanoutNode(tuple(str(index) for index in range(100)), max_worker_calls=1),
+        id="fanout",
+    )
+    driver = PullModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_calls=4,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "bounded-pull-fanout"
+    runtime._ensure_run(definition, "bounded-pull-fanout")
+
+    runtime.advance_once()
+
+    assert len(runtime.store.execution.list_provider_calls(RUN_ID)) == 1
 
 
 def test_pull_task_node_uses_workload_publication_probe(tmp_path: Path) -> None:

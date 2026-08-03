@@ -1203,39 +1203,43 @@ repository applies the Node aggregation policy so the first `fail_fast`
 failure skips unowned siblings without waiting for another coordinator poll.
 
 The workload declares one positive `claim_capacity`, the maximum Tasks a
-worker can own concurrently. Pool size is derived rather than separately
-configured:
+worker can own concurrently, and one positive `max_worker_calls`, the Node's
+concurrent worker limit. Pool size is bounded and derived:
 
 ```text
 desired_workers =
-    ceil(nonterminal_tasks_in_node / claim_capacity)
+    min(
+        max_worker_calls,
+        ceil(nonterminal_tasks_in_node / claim_capacity),
+    )
 
 new_worker_candidates =
     max(0, desired_workers - nonterminal_worker_calls_in_node)
 ```
 
-The scheduler then applies DAG priority and the remaining total and GPU call
-slots. Pending Tasks and assigned-but-unfinished Tasks count toward the
-numerator. Cache-satisfied, succeeded, failed, cancelled, and skipped Tasks do
-not. `submitting`, `attached`, `running`, `outcome_unknown`, and
-`state_unknown` worker calls count against the desired pool and the Run's call
-limits.
+The scheduler then applies DAG priority and the remaining Run-wide total and
+GPU call slots. The serialized SQLite preclaim enforces both the Node worker
+limit and the Run limits. Pending Tasks and assigned-but-unfinished Tasks count
+toward the numerator. Cache-satisfied, succeeded, failed, cancelled, and
+skipped Tasks do not. `submitting`, `attached`, `running`, `outcome_unknown`,
+and `state_unknown` worker calls count against the desired pool and the Run's
+call limits.
 
 A worker may claim repeatedly, which provides work stealing when Task
 durations differ. The coordinator does not cancel already-admitted workers
 when the desired count falls. They finish owned work and exit once no unowned
 Task remains. Because claims are serialized, a worker can lose a race, receive
-no Tasks, and return successfully. The kernel adds no separate
-`max_worker_calls`, utilization feedback loop, lease, or idle timeout; Modal
-decorator limits still govern actual provider containers.
+no Tasks, and return successfully. The kernel adds no utilization feedback
+loop, lease, or idle timeout; Modal decorator limits still govern actual
+provider containers.
 
 #### Policy persistence and scientific identity
 
 One Run persists its dispatch mode, compatibility descriptors, provider
 bindings, GPU declarations, Runtime Image Keys, and maximum batch or claim
-sizes as operational policy. Resume reloads that policy. A Successor Execution
-Run may choose different operational batching or worker counts while reusing
-validated scientific publications.
+sizes and pull-worker counts as operational policy. Resume reloads that policy.
+A Successor Execution Run may choose different operational batching or worker
+counts while reusing validated scientific publications.
 
 These values are excluded from Workload Plan and Task Fingerprints unless they
 change scientific meaning. Any result-affecting ordering or batching parameter

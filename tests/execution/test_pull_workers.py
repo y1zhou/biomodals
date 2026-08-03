@@ -24,12 +24,13 @@ from .provider_call_helpers import (
 )
 
 
-def _admit_workers(repository, count: int):
+def _admit_workers(repository, count: int, *, max_worker_calls: int = 100):
     persist_pull_policy(
         repository,
         binding=GPU_BINDING,
         compatibility_key="af3-seeds",
         claim_capacity=2,
+        max_worker_calls=max_worker_calls,
     )
     claims = []
     for index in range(count):
@@ -77,6 +78,27 @@ def test_pull_worker_count_is_derived_from_unfinished_tasks_and_claim_capacity()
     )
 
     assert all(claim.call.dispatch_mode == DispatchMode.PULL_WORKER for claim in claims)
+    assert excess is None
+
+
+def test_pull_worker_preclaim_enforces_the_node_worker_cap() -> None:
+    repository = create_repository(
+        task_count=100,
+        max_active_provider_calls=5,
+        max_active_gpu_provider_calls=5,
+    )
+
+    _admit_workers(repository, 1, max_worker_calls=1)
+    excess = repository.preclaim_pull_worker(
+        RUN_ID,
+        "inference",
+        submission_token="worker-1",
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=2,
+        now=140,
+    )
+
     assert excess is None
 
 

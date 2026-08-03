@@ -317,6 +317,7 @@ def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:
         binding=GPU,
         compatibility_key="af3-seeds",
         claim_capacity=2,
+        max_worker_calls=2,
         unfinished_task_count=3,
         nonterminal_worker_count=0,
         next_worker_ordinal=0,
@@ -342,6 +343,7 @@ def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:
     ).fetchone()
     assert mode == "pull_worker"
     assert orjson.loads(policy_json)["claim_capacity"] == 2
+    assert orjson.loads(policy_json)["max_worker_calls"] == 2
 
     with pytest.raises(
         ValueError,
@@ -362,6 +364,7 @@ def test_pull_worker_candidates_fill_the_derived_pool_gap() -> None:
             binding=CPU,
             compatibility_key="rosetta-cpu",
             claim_capacity=2,
+            max_worker_calls=4,
             unfinished_task_count=7,
             nonterminal_worker_count=1,
             next_worker_ordinal=4,
@@ -387,6 +390,7 @@ def test_pull_worker_candidates_reject_invalid_capacity() -> None:
                 binding=CPU,
                 compatibility_key="rosetta-cpu",
                 claim_capacity=0,
+                max_worker_calls=1,
                 unfinished_task_count=1,
                 nonterminal_worker_count=0,
                 next_worker_ordinal=0,
@@ -394,3 +398,23 @@ def test_pull_worker_candidates_reject_invalid_capacity() -> None:
                 unblocking_span=0,
             ),
         ))
+
+
+def test_pull_worker_candidates_honor_the_node_worker_cap() -> None:
+    candidates = form_pull_worker_candidates((
+        PullWorkerDispatchDescriptor(
+            node_key="rosetta",
+            node_ordinal=0,
+            binding=CPU,
+            compatibility_key="rosetta-cpu",
+            claim_capacity=30,
+            max_worker_calls=1,
+            unfinished_task_count=100,
+            nonterminal_worker_count=0,
+            next_worker_ordinal=0,
+            depth=0,
+            unblocking_span=0,
+        ),
+    ))
+
+    assert len(candidates) == 1

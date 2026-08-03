@@ -944,6 +944,7 @@ class WorkflowRuntime:
                             invocation.compatibility_key or invocation.function_name
                         ),
                         claim_capacity=invocation.claim_capacity,
+                        max_worker_calls=invocation.max_worker_calls,
                         unfinished_task_count=unfinished_task_count,
                         nonterminal_worker_count=nonterminal_workers,
                         next_worker_ordinal=total_workers,

@@ -1263,6 +1263,8 @@ class SqliteExecutionRepository:
         """Persist one pull Node's immutable operational worker policy."""
         if descriptor.claim_capacity <= 0:
             raise ValueError("claim_capacity must be positive")
+        if descriptor.max_worker_calls <= 0:
+            raise ValueError("max_worker_calls must be positive")
         run = self.get_run(execution_run_id)
         node = self._connection.execute(
             """
@@ -1540,10 +1542,37 @@ class SqliteExecutionRepository:
             raise ValueError("submission token cannot be empty")
         if claim_capacity <= 0:
             raise ValueError("claim_capacity must be positive")
+        node_policy = self._connection.execute(
+            """
+            SELECT dispatch_mode, dispatch_policy_json
+            FROM execution_nodes
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchone()
+        if (
+            node_policy is None
+            or node_policy["dispatch_mode"] != DispatchMode.PULL_WORKER.value
+            or node_policy["dispatch_policy_json"] is None
+        ):
+            raise ValueError("pull-worker dispatch policy cannot change within a Run")
+        node_policy_value = orjson.loads(node_policy["dispatch_policy_json"])
+        max_worker_calls = node_policy_value.get("max_worker_calls")
+        if not isinstance(max_worker_calls, int) or max_worker_calls < 1:
+            raise RuntimeError("stored pull-worker dispatch policy is invalid")
+        expected_node_policy_json = _pull_worker_dispatch_policy_json_from_parts(
+            binding=binding,
+            compatibility_key=compatibility_key,
+            claim_capacity=claim_capacity,
+            max_worker_calls=max_worker_calls,
+        )
+        if node_policy["dispatch_policy_json"] != expected_node_policy_json:
+            raise ValueError("pull-worker dispatch policy cannot change within a Run")
         policy_json = _dump_json({
             "binding": _binding_json_value(binding),
             "claim_capacity": claim_capacity,
             "compatibility_key": compatibility_key,
+            "max_worker_calls": max_worker_calls,
             "node_key": node_key,
         })
         preclaim_json = _dump_json({
@@ -1573,25 +1602,6 @@ class SqliteExecutionRepository:
         node = self.get_node(execution_run_id, node_key)
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             raise ValueError("Pull-worker Node is not ready for admission")
-        node_policy = self._connection.execute(
-            """
-            SELECT dispatch_mode, dispatch_policy_json
-            FROM execution_nodes
-            WHERE execution_run_id = ? AND node_key = ?
-            """,
-            (str(execution_run_id), node_key),
-        ).fetchone()
-        expected_node_policy_json = _pull_worker_dispatch_policy_json_from_parts(
-            binding=binding,
-            compatibility_key=compatibility_key,
-            claim_capacity=claim_capacity,
-        )
-        if (
-            node_policy is None
-            or node_policy["dispatch_mode"] != DispatchMode.PULL_WORKER.value
-            or node_policy["dispatch_policy_json"] != expected_node_policy_json
-        ):
-            raise ValueError("pull-worker dispatch policy cannot change within a Run")
         batch = self._connection.execute(
             """
             SELECT *
@@ -1614,7 +1624,10 @@ class SqliteExecutionRepository:
             )
         elif unfinished_task_count < 0:
             raise ValueError("unfinished_task_count cannot be negative")
-        desired_workers = (unfinished_task_count + claim_capacity - 1) // claim_capacity
+        desired_workers = min(
+            max_worker_calls,
+            (unfinished_task_count + claim_capacity - 1) // claim_capacity,
+        )
         existing_workers = (
             0
             if batch is None
@@ -4161,6 +4174,7 @@ def _pull_worker_dispatch_policy_json(
         binding=descriptor.binding,
         compatibility_key=descriptor.compatibility_key,
         claim_capacity=descriptor.claim_capacity,
+        max_worker_calls=descriptor.max_worker_calls,
     )
 
 
@@ -4169,11 +4183,13 @@ def _pull_worker_dispatch_policy_json_from_parts(
     binding: ProviderBinding,
     compatibility_key: str,
     claim_capacity: int,
+    max_worker_calls: int,
 ) -> str:
     return _dump_json({
         "binding": _binding_json_value(binding),
         "claim_capacity": claim_capacity,
         "compatibility_key": compatibility_key,
+        "max_worker_calls": max_worker_calls,
         "mode": DispatchMode.PULL_WORKER.value,
     })
 
@@ -4191,6 +4207,7 @@ def _pull_worker_descriptor_from_policy(
         binding=_binding_from_json_value(value["binding"]),
         compatibility_key=value["compatibility_key"],
         claim_capacity=value["claim_capacity"],
+        max_worker_calls=value["max_worker_calls"],
         unfinished_task_count=descriptor.unfinished_task_count,
         nonterminal_worker_count=descriptor.nonterminal_worker_count,
         next_worker_ordinal=descriptor.next_worker_ordinal,

@@ -1148,6 +1148,7 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
     worker_call = worker_node.prepare_pull_worker(worker_context)
     assert worker_call.function_name == "run_ppiflow_rosetta_worker"
     assert worker_call.claim_capacity == 1
+    assert worker_call.max_worker_calls == 1
     assert worker_call.kwargs["max_parallel"] == 1
 
     finalizer = ppiflow_workflow.RosettaRelaxNode(

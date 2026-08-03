@@ -134,6 +134,7 @@ def persist_pull_policy(
     binding: ProviderBinding,
     compatibility_key: str,
     claim_capacity: int,
+    max_worker_calls: int = 100,
     now: int = 109,
 ) -> None:
     """Bind the fixture Node to one pull-worker dispatch policy."""
@@ -147,6 +148,7 @@ def persist_pull_policy(
             binding=binding,
             compatibility_key=compatibility_key,
             claim_capacity=claim_capacity,
+            max_worker_calls=max_worker_calls,
             unfinished_task_count=sum(not task.status.is_terminal for task in tasks),
             nonterminal_worker_count=0,
             next_worker_ordinal=0,

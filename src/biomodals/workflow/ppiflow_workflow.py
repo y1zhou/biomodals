@@ -2605,6 +2605,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
             function_name="run_ppiflow_rosetta_worker",
             uses_gpu=False,
             claim_capacity=_config_int(plan, "claim_capacity", 0),
+            max_worker_calls=_config_int(plan, "worker_count", 0),
             kwargs={
                 "run_name": str(plan["run_name"]),
                 "run_id": str(plan["run_id"]),

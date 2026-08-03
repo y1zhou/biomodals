@@ -73,6 +73,7 @@ class RemotePullWorkerCall:
     function_name: str
     uses_gpu: bool
     claim_capacity: int
+    max_worker_calls: int
     args: tuple[Any, ...] = ()
     kwargs: dict[str, Any] = field(default_factory=dict)
     runtime_image_key: str | None = None
@@ -84,6 +85,8 @@ class RemotePullWorkerCall:
             raise ValueError("Remote pull-worker function name cannot be empty")
         if self.claim_capacity < 1:
             raise ValueError("claim_capacity must be positive")
+        if self.max_worker_calls < 1:
+            raise ValueError("max_worker_calls must be positive")
 
 
 class WorkflowNode(Protocol):

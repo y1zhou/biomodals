@@ -47,6 +47,7 @@ class PullWorkerDispatchDescriptor:
     binding: ProviderBinding
     compatibility_key: str
     claim_capacity: int
+    max_worker_calls: int
     unfinished_task_count: int
     nonterminal_worker_count: int
     next_worker_ordinal: int
@@ -179,15 +180,19 @@ def form_pull_worker_candidates(
     for descriptor in descriptors:
         if descriptor.claim_capacity <= 0:
             raise ValueError("claim_capacity must be positive")
+        if descriptor.max_worker_calls <= 0:
+            raise ValueError("max_worker_calls must be positive")
         if descriptor.unfinished_task_count < 0:
             raise ValueError("unfinished_task_count cannot be negative")
         if descriptor.nonterminal_worker_count < 0:
             raise ValueError("nonterminal_worker_count cannot be negative")
         if descriptor.next_worker_ordinal < 0:
             raise ValueError("next_worker_ordinal cannot be negative")
-        desired_workers = (
-            descriptor.unfinished_task_count + descriptor.claim_capacity - 1
-        ) // descriptor.claim_capacity
+        desired_workers = min(
+            descriptor.max_worker_calls,
+            (descriptor.unfinished_task_count + descriptor.claim_capacity - 1)
+            // descriptor.claim_capacity,
+        )
         candidate_count = max(
             0,
             desired_workers - descriptor.nonterminal_worker_count,

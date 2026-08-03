@@ -2,11 +2,14 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from uuid import UUID
 
+import orjson
 import pytest
 
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
@@ -32,6 +35,23 @@ class FakeVolume:
 
     def reload(self) -> None:
         pass
+
+
+class FakeClaims:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.lock = Lock()
+
+    def get(self, key: str, default=None):
+        with self.lock:
+            return self.values.get(key, default)
+
+    def put(self, key: str, value: str, *, skip_if_exists: bool = False) -> bool:
+        with self.lock:
+            if skip_if_exists and key in self.values:
+                return False
+            self.values[key] = value
+            return True
 
 
 class CompletingDriver:
@@ -171,6 +191,7 @@ def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None
         store=ExecutionRunStore(tmp_path, RUN_ID),
         modal_driver=driver,
         output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
         output_root=tmp_path,
         poll_interval_seconds=0,
         now=lambda: 10,
@@ -198,6 +219,7 @@ def test_same_run_name_rejects_outputs_from_changed_science(
     tmp_path: Path,
 ) -> None:
     first_request = _request()
+    claims = FakeClaims()
     first_driver = CompletingDriver(tmp_path, first_request.run_name)
     first = GromacsExecutionRuntime(
         request=first_request,
@@ -206,6 +228,7 @@ def test_same_run_name_rejects_outputs_from_changed_science(
         store=ExecutionRunStore(tmp_path, RUN_ID),
         modal_driver=first_driver,
         output_volume=FakeVolume(),
+        output_claims=claims,
         output_root=tmp_path,
         poll_interval_seconds=0,
         now=lambda: 10,
@@ -222,6 +245,7 @@ def test_same_run_name_rejects_outputs_from_changed_science(
         store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
         modal_driver=changed_driver,
         output_volume=FakeVolume(),
+        output_claims=claims,
         output_root=tmp_path,
         poll_interval_seconds=0,
         now=lambda: 20,
@@ -237,6 +261,7 @@ def test_same_run_name_rejects_outputs_from_changed_science(
 
 def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
     request = _request()
+    claims = FakeClaims()
     first = GromacsExecutionRuntime(
         request=request,
         execution_run_id=RUN_ID,
@@ -244,6 +269,7 @@ def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
         store=ExecutionRunStore(tmp_path, RUN_ID),
         modal_driver=CompletingDriver(tmp_path, request.run_name),
         output_volume=FakeVolume(),
+        output_claims=claims,
         output_root=tmp_path,
         poll_interval_seconds=0,
         now=lambda: 10,
@@ -258,6 +284,7 @@ def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
         store=ExecutionRunStore(tmp_path, THIRD_RUN_ID),
         modal_driver=driver,
         output_volume=FakeVolume(),
+        output_claims=claims,
         output_root=tmp_path,
         poll_interval_seconds=0,
         now=lambda: 20,
@@ -280,6 +307,7 @@ def test_prepare_publication_requires_downstream_inputs(tmp_path: Path) -> None:
         store=ExecutionRunStore(tmp_path, RUN_ID),
         modal_driver=driver,
         output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
         output_root=tmp_path,
         poll_interval_seconds=0,
         now=lambda: 10,
@@ -290,3 +318,78 @@ def test_prepare_publication_requires_downstream_inputs(tmp_path: Path) -> None:
         assert [name for name, _kwargs in driver.spawns] == ["prepare_tpr_gpu"]
     finally:
         runtime.close()
+
+
+def test_concurrent_same_name_roots_elect_one_output_owner(tmp_path: Path) -> None:
+    request = _request()
+    claims = FakeClaims()
+    runtimes = tuple(
+        GromacsExecutionRuntime(
+            request=request,
+            execution_run_id=execution_run_id,
+            deployment=DEPLOYMENT,
+            store=ExecutionRunStore(tmp_path, execution_run_id),
+            modal_driver=CompletingDriver(tmp_path, request.run_name),
+            output_volume=FakeVolume(),
+            output_claims=claims,
+            output_root=tmp_path,
+            poll_interval_seconds=0,
+            now=lambda: 10,
+        )
+        for execution_run_id in (RUN_ID, SECOND_RUN_ID)
+    )
+
+    def ensure(runtime: GromacsExecutionRuntime) -> bool | str:
+        try:
+            return runtime._ensure_run_identity()
+        except (RuntimeError, ValueError) as error:
+            return str(error)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(executor.map(ensure, runtimes))
+        assert outcomes.count(True) == 1
+        assert (
+            sum(
+                "already claimed" in str(outcome)
+                or "unclaimed existing outputs" in str(outcome)
+                for outcome in outcomes
+            )
+            == 1
+        )
+    finally:
+        for runtime in runtimes:
+            runtime.close()
+
+
+def test_successors_transfer_incomplete_output_ownership(tmp_path: Path) -> None:
+    request = _request()
+    claims = FakeClaims()
+
+    def runtime(execution_run_id: UUID, predecessor: UUID | None):
+        return GromacsExecutionRuntime(
+            request=request,
+            execution_run_id=execution_run_id,
+            predecessor_execution_run_id=predecessor,
+            deployment=DEPLOYMENT,
+            store=ExecutionRunStore(tmp_path, execution_run_id),
+            modal_driver=CompletingDriver(tmp_path, request.run_name),
+            output_volume=FakeVolume(),
+            output_claims=claims,
+            output_root=tmp_path,
+            poll_interval_seconds=0,
+            now=lambda: 10,
+        )
+
+    generations = (
+        runtime(RUN_ID, None),
+        runtime(SECOND_RUN_ID, RUN_ID),
+        runtime(THIRD_RUN_ID, SECOND_RUN_ID),
+    )
+    try:
+        assert [item._ensure_run_identity() for item in generations] == [True] * 3
+        marker = orjson.loads(generations[-1]._run_identity_path().read_bytes())
+        assert marker["owner_execution_run_id"] == str(THIRD_RUN_ID)
+    finally:
+        for item in generations:
+            item.close()

@@ -431,6 +431,13 @@ new run name. The preparation publication covers the input PDB plus all NVT,
 NPT, and production inputs consumed by downstream Nodes, rather than relying
 only on the deployed app's legacy production-TPR skip condition.
 
+An incomplete GROMACS directory also has one atomically elected writer in a
+workload-scoped Modal Dict. The Volume marker records that owner but is only
+publication evidence, not a distributed lock. A matching complete terminal
+publication remains reusable without taking ownership. Resume retains the
+same owner, and an explicit Successor Run may transfer ownership before
+repairing incomplete output; an independent root may not race or replace it.
+
 The Provider Call status policy was accepted on 2026-07-29. Calls have exactly
 eight statuses: `submitting`, `attached`, `running`, `outcome_unknown`,
 `state_unknown`, `succeeded`, `failed`, and `cancelled`. The first five are

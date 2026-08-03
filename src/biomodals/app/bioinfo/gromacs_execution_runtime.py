@@ -45,6 +45,10 @@ from biomodals.helper.app_execution import (
     ExecutionVolumeSync,
     persist_execution_launch,
 )
+from biomodals.helper.output_claim import (
+    acquire_output_claim,
+    register_output_claim_successor,
+)
 from biomodals.helper.shell import sanitize_filename
 
 REQUEST_SCHEMA_VERSION = 2
@@ -55,8 +59,9 @@ _REQUEST_FILE = ExecutionRequestFile(
     "GROMACS execution request",
 )
 _PUBLICATION_SCHEMA_VERSION = 1
-_RUN_IDENTITY_SCHEMA_VERSION = 1
+_RUN_IDENTITY_SCHEMA_VERSION = 2
 _RUN_IDENTITY_FILE = "run.json"
+_OUTPUT_CLAIMS_NAME = "Gromacs-output-claims"
 
 
 @dataclass(frozen=True)
@@ -201,6 +206,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         store: ExecutionRunStore,
         modal_driver: Any,
         output_volume: Any,
+        output_claims: Any,
         output_root: str | Path,
         predecessor_execution_run_id: UUID | None = None,
         poll_interval_seconds: float = 1.0,
@@ -212,6 +218,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         self.deployment = deployment
         self.store = store
         self.output_volume = output_volume
+        self.output_claims = output_claims
         self.output_root = Path(output_root)
         self.predecessor_execution_run_id = predecessor_execution_run_id
         self.poll_interval_seconds = poll_interval_seconds
@@ -275,12 +282,13 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         """Bind the app-owned directory to exactly one scientific plan."""
         root = self.request.run_root(self.output_root)
         marker = self._run_identity_path()
-        expected = {
+        scientific_identity = {
             "schema_version": _RUN_IDENTITY_SCHEMA_VERSION,
             "workload_plan_fingerprint": (
                 self.request.execution_plan.workload_plan_fingerprint
             ),
         }
+        recorded: object = None
         if root.is_symlink():
             raise ValueError(f"GROMACS run directory cannot be a symlink: {root}")
         if marker.exists():
@@ -294,20 +302,56 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 raise ValueError(
                     f"GROMACS run identity is invalid: {marker}"
                 ) from error
-            if recorded != expected:
+            if not isinstance(recorded, dict) or any(
+                recorded.get(key) != value for key, value in scientific_identity.items()
+            ):
                 raise ValueError(
                     f"GROMACS run name {self.request.run_name!r} is already bound "
                     "to different scientific inputs; choose a new run name"
                 )
-            return False
+            marker_owner = recorded.get("owner_execution_run_id")
+            try:
+                if str(UUID(str(marker_owner))) != marker_owner:
+                    raise ValueError
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"GROMACS run identity has an invalid owner: {marker}"
+                ) from error
+            if all(
+                self._node_publication_ready(node_key)
+                for node_key in self.request.execution_plan.terminal_node_keys
+            ):
+                return False
         if root.exists():
             if not root.is_dir():
                 raise ValueError(f"GROMACS run path is not a directory: {root}")
-            if any(root.iterdir()):
+            if recorded is None and any(root.iterdir()):
                 raise ValueError(
                     f"GROMACS run name {self.request.run_name!r} has unclaimed "
                     "existing outputs; choose a new run name"
                 )
+        owner = str(self.execution_run_id)
+        replace_owner = None
+        if self.predecessor_execution_run_id is not None:
+            replace_owner = (
+                str(recorded["owner_execution_run_id"])
+                if isinstance(recorded, dict)
+                else str(self.predecessor_execution_run_id)
+            )
+            register_output_claim_successor(
+                self.output_claims,
+                owner=owner,
+                predecessor=replace_owner,
+            )
+        acquire_output_claim(
+            self.output_claims,
+            claim_key=f"gromacs-run:{self.request.run_name}",
+            owner=owner,
+            replace_owner=replace_owner,
+        )
+        expected = scientific_identity | {"owner_execution_run_id": owner}
+        if recorded == expected:
+            return False
         marker.parent.mkdir(parents=True, exist_ok=True)
         temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
         try:
@@ -684,6 +728,7 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
         volume_root: str | Path,
         output_volume: Any,
         modal_driver: Any,
+        output_claims: Any | None = None,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only the deployment resources used by this adapter."""
@@ -698,6 +743,14 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
         )
         self.output_volume = output_volume
         self.modal_driver = modal_driver
+        if output_claims is None:
+            import modal
+
+            output_claims = modal.Dict.from_name(
+                _OUTPUT_CLAIMS_NAME,
+                create_if_missing=True,
+            )
+        self.output_claims = output_claims
         self.poll_interval_seconds = poll_interval_seconds
 
     def restart(
@@ -779,6 +832,7 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
             store=self._run_store(),
             modal_driver=self.modal_driver,
             output_volume=self.output_volume,
+            output_claims=self.output_claims,
             output_root=self.volume_root,
             poll_interval_seconds=self.poll_interval_seconds,
         )

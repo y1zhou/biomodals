@@ -71,14 +71,14 @@ class FakeRuntime:
                 self.execution_run_id,
                 now=20,
             )
-        return self.store.execution.snapshot(self.execution_run_id)
+        return self.store.execution.overview(self.execution_run_id)
 
     def close(self) -> None:
         self.store.close()
 
     def _snapshot(self):
         try:
-            return self.store.execution.snapshot(self.execution_run_id)
+            return self.store.execution.overview(self.execution_run_id)
         except LookupError:
             with self.store.transaction():
                 self.store.execution.create_run(
@@ -92,7 +92,7 @@ class FakeRuntime:
                     ),
                     now=10,
                 )
-            return self.store.execution.snapshot(self.execution_run_id)
+            return self.store.execution.overview(self.execution_run_id)
 
 
 def _request() -> BoltzGenExecutionRequest:

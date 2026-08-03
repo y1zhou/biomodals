@@ -238,7 +238,7 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
                         status_message=None,
                         status_reason=None,
                     ),
-                    provider_calls=(),
+                    latest_provider_calls=(),
                 ),
             )
 

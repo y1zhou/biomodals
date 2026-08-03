@@ -199,7 +199,7 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
             self.closed_while_driving = False
             self._lock = Lock()
             self.store = SimpleNamespace(
-                execution=SimpleNamespace(snapshot=lambda _run_id: self.snapshot())
+                execution=SimpleNamespace(overview=lambda _run_id: self.snapshot())
             )
 
         def snapshot(self):
@@ -437,10 +437,10 @@ def test_app_coordinator_recovers_successor_identity_for_cancellation(
 
         def cancel(self):
             self.store.execution.request_run_cancellation(RUN_ID, now=11)
-            return self.store.execution.snapshot(RUN_ID)
+            return self.store.execution.overview(RUN_ID)
 
         def run(self):
-            return self.store.execution.snapshot(RUN_ID)
+            return self.store.execution.overview(RUN_ID)
 
         def close(self) -> None:
             self.store.close()
@@ -503,10 +503,10 @@ def test_app_coordinator_cancels_successor_before_restart_initializes(
                     now=10,
                 )
                 self.store.execution.request_run_cancellation(RUN_ID, now=11)
-            return self.store.execution.snapshot(RUN_ID)
+            return self.store.execution.overview(RUN_ID)
 
         def run(self):
-            return self.store.execution.snapshot(RUN_ID)
+            return self.store.execution.overview(RUN_ID)
 
         def close(self) -> None:
             self.store.close()

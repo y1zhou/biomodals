@@ -655,7 +655,7 @@ are refreshed only for successful Nodes whose functions write those Volumes.
 | Batching | Stable grouping by compatibility and encounter order, immutable call mapping, and outcome distribution | Positive maximum Tasks per call and whether batching changes scientific identity |
 | Resources | Run-scoped total and GPU Provider Call admission counts | Service admission, Modal decorators, deployment limits, cross-coordinator policy |
 | Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
-| Presentation | Stable snapshots/events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
+| Presentation | Bounded lifecycle overviews, full diagnostic snapshots, and stable events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
 
 The kernel is a caller-driven library rather than an inversion-of-control
 framework. Workload code constructs plans and Tasks, records cache
@@ -1107,6 +1107,12 @@ compute status. The service retains `JobState` as an HTTP/OpenAPI enum only and
 derives it at read time from the Execution Run plus service result-delivery
 facts. Workload presentation code maps stable Node and Task keys to labels and
 timeline rows without writing those labels into execution tables.
+
+Routine lifecycle and service reads use a bounded Execution Overview: the Run,
+its Nodes, the latest Provider Call for each Node, and aggregate active-call
+counts. It deliberately excludes Task payloads and historical call ownership.
+The complete Execution Snapshot remains available for explicit diagnostics and
+tests, but is not a list- or status-endpoint projection.
 
 The same projection is used for:
 

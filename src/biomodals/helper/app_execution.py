@@ -14,10 +14,10 @@ from uuid import UUID
 
 from biomodals.execution import (
     DeploymentIdentity,
+    ExecutionOverview,
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
     ExecutionRuntime,
-    ExecutionSnapshot,
     SqliteExecutionRepository,
     drive_execution_run,
     resume_execution_run,
@@ -368,7 +368,7 @@ class ExecutionRuntimeLifecycle:
     _provider: ExecutionRuntime
     _volume_sync: ExecutionVolumeSync
 
-    def run(self) -> ExecutionSnapshot:
+    def run(self) -> ExecutionOverview:
         """Create or recover the Run and drive it until it stops."""
         with self.store.synchronize():
             repository = self._initialize()
@@ -383,7 +383,7 @@ class ExecutionRuntimeLifecycle:
             synchronize=self.store.synchronize,
         )
 
-    def resume(self) -> ExecutionSnapshot:
+    def resume(self) -> ExecutionOverview:
         """Resume this Run without retrying conclusive failures."""
         with self.store.synchronize():
             repository = self._initialize()
@@ -407,7 +407,7 @@ class ExecutionRuntimeLifecycle:
             synchronize=self.store.synchronize,
         )
 
-    def cancel(self) -> ExecutionSnapshot:
+    def cancel(self) -> ExecutionOverview:
         """Request cancellation while retaining uncertain call ownership."""
         with self.store.synchronize():
             repository = self.store.execution
@@ -417,7 +417,7 @@ class ExecutionRuntimeLifecycle:
                 repository = self._initialize()
         self._provider.cancel_run(self.execution_run_id, now=self._now())
         with self.store.synchronize():
-            return self.store.execution.snapshot(self.execution_run_id)
+            return self.store.execution.overview(self.execution_run_id)
 
     def close(self) -> None:
         """Close SQLite without cancelling attached Provider Calls."""
@@ -505,60 +505,60 @@ class ExecutionCoordinatorLifecycle:
         self._drive_lock = Lock()
         self._runtime: Any | None = None
 
-    def run(self) -> ExecutionSnapshot:
+    def run(self) -> ExecutionOverview:
         """Load the staged request and drive one root Run."""
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=False)
             return self._drive(runtime, resume=False)
 
-    def drive_prepared(self) -> ExecutionSnapshot:
+    def drive_prepared(self) -> ExecutionOverview:
         """Drive a prepared root or Successor Run from immutable launch state."""
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
             return self._drive(runtime, resume=False)
 
-    def cancel(self) -> ExecutionSnapshot:
+    def cancel(self) -> ExecutionOverview:
         """Request cancellation and reconcile it to a terminal result."""
         with self._writer_lock:
             runtime = self._open_current_runtime(recover=True)
         cancelled = runtime.cancel()
         with self._writer_lock:
-            self._verify_snapshot(cancelled)
+            self._verify_overview(cancelled)
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
-                snapshot = runtime.store.execution.snapshot(self.execution_run_id)
-                self._verify_snapshot(snapshot)
-                if snapshot.run.status.is_terminal:
+                overview = runtime.store.execution.overview(self.execution_run_id)
+                self._verify_overview(overview)
+                if overview.run.status.is_terminal:
                     self._close_runtime()
-                    return snapshot
+                    return overview
             return self._drive(runtime, resume=False)
 
-    def resume(self) -> ExecutionSnapshot:
+    def resume(self) -> ExecutionOverview:
         """Resume this Run without retrying conclusive failures."""
         with self._drive_lock:
             with self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
             return self._drive(runtime, resume=True)
 
-    def status(self) -> ExecutionSnapshot:
-        """Read one verified snapshot without advancing work."""
+    def status(self) -> ExecutionOverview:
+        """Read one verified overview without advancing work."""
         with self._writer_lock:
             runtime = self._runtime
             if runtime is not None:
-                snapshot = runtime.store.execution.snapshot(self.execution_run_id)
+                overview = runtime.store.execution.overview(self.execution_run_id)
             else:
                 store = self._run_store()
                 if not store.ledger_path.is_file():
                     raise ExecutionRunNotFoundError(str(self.execution_run_id))
                 try:
-                    snapshot = store.execution.snapshot(self.execution_run_id)
+                    overview = store.execution.overview(self.execution_run_id)
                 finally:
                     store.close()
-            self._verify_snapshot(snapshot)
-            return snapshot
+            self._verify_overview(overview)
+            return overview
 
     def close(self) -> None:
         """Close coordinator-local state without cancelling Provider Calls."""
@@ -566,11 +566,11 @@ class ExecutionCoordinatorLifecycle:
             with self._writer_lock:
                 self._close_runtime()
 
-    def _drive(self, runtime: Any, *, resume: bool) -> ExecutionSnapshot:
+    def _drive(self, runtime: Any, *, resume: bool) -> ExecutionOverview:
         try:
-            snapshot = runtime.resume() if resume else runtime.run()
-            self._verify_snapshot(snapshot)
-            return snapshot
+            overview = runtime.resume() if resume else runtime.run()
+            self._verify_overview(overview)
+            return overview
         finally:
             with self._writer_lock:
                 self._close_runtime()
@@ -709,10 +709,10 @@ class ExecutionCoordinatorLifecycle:
         finally:
             store.close()
 
-    def _verify_snapshot(self, snapshot: ExecutionSnapshot) -> None:
-        if snapshot.run.execution_run_id != self.execution_run_id:
+    def _verify_overview(self, overview: ExecutionOverview) -> None:
+        if overview.run.execution_run_id != self.execution_run_id:
             raise ValueError("Execution Run ID does not match coordinator")
-        if snapshot.run.deployment != self.deployment:
+        if overview.run.deployment != self.deployment:
             raise ValueError("Deployment Identity does not match Execution Run")
 
     def _close_runtime(self) -> None:

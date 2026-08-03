@@ -28,8 +28,8 @@ from biomodals.app.bioinfo.gromacs_execution import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionOverview,
     ExecutionRuntime,
-    ExecutionSnapshot,
     NodeStatus,
     ProviderCallStatus,
     ProviderCallSubmission,
@@ -637,7 +637,7 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
         expected_workload_plan_fingerprint: str | None = None,
-    ) -> ExecutionSnapshot:
+    ) -> ExecutionOverview:
         """Create and drive a compatible Successor from conclusive state."""
         self.prepare_restart(
             predecessor_execution_run_id=predecessor_execution_run_id,

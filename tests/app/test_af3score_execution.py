@@ -463,9 +463,10 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
         now=lambda: 10,
     )
 
-    snapshot = runtime.run()
+    overview = runtime.run()
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
 
-    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert overview.run.status == RunStatus.SUCCEEDED
     assert [name for name, _kwargs in driver.spawns] == [
         "af3score_prepare",
         "af3score_run",

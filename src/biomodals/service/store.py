@@ -18,8 +18,8 @@ from biomodals.execution import (
     EXECUTION_SCHEMA_VERSION,
     AsyncExecutionRuntime,
     DeploymentIdentity,
+    ExecutionOverview,
     ExecutionPlan,
-    ExecutionSnapshot,
     NodeStatus,
     ProviderCallStatus,
     RunStatus,
@@ -628,7 +628,7 @@ class ServiceStore:
 
     def list_state_unknown_jobs(self) -> list[JobRecord]:
         """List Jobs that require explicit Administrator review."""
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             rows = conn.execute(
                 """
                 SELECT jobs.* FROM jobs
@@ -1507,7 +1507,7 @@ class ServiceStore:
 
     def get_job(self, owner_user_id: UUID, job_id: UUID) -> JobRecord | None:
         """Load a job only when it belongs to the requesting owner."""
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             row = conn.execute(
                 """
                 SELECT * FROM jobs WHERE job_id = ? AND owner_user_id = ?
@@ -1518,7 +1518,7 @@ class ServiceStore:
 
     def get_job_by_id(self, job_id: UUID) -> JobRecord | None:
         """Load one Job for an internal or already-authorized operation."""
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
@@ -1527,7 +1527,7 @@ class ServiceStore:
 
     def list_jobs(self, owner_user_id: UUID) -> list[JobRecord]:
         """List only one owner's jobs, newest first."""
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs WHERE owner_user_id = ?
@@ -1547,7 +1547,7 @@ class ServiceStore:
         """List a stable bounded page after an optional owner-scoped cursor."""
         if type(limit) is not int or limit < 1:
             raise ValueError("Job page limit must be positive")
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             parameters: tuple[object, ...] = (str(owner_user_id),)
             cursor_clause = ""
             if cursor is not None:
@@ -1645,7 +1645,7 @@ class ServiceStore:
             RunStatus.PARTIAL.value,
             *((workload,) if workload is not None else ()),
         )
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             rows = conn.execute(
                 f"""
                 SELECT jobs.* FROM jobs
@@ -1670,7 +1670,7 @@ class ServiceStore:
         completed_before: int,
     ) -> list[JobRecord]:
         """List terminal runs whose non-final files have passed retention."""
-        with self._connection() as conn:
+        with self._read_transaction() as conn:
             rows = conn.execute(
                 """
                 SELECT jobs.* FROM jobs
@@ -1787,11 +1787,11 @@ class ServiceStore:
             repository = SqliteExecutionRepository(conn)
             run = repository.get_run(UUID(row["execution_run_id"]))
             if run.status == RunStatus.CANCEL_REQUESTED:
-                snapshot = repository.snapshot(run.execution_run_id)
+                overview = repository.overview(run.execution_run_id)
                 return _job_from_row(
                     row,
-                    _operations_from_execution_snapshot(snapshot, job_id),
-                    snapshot=snapshot,
+                    _operations_from_execution_overview(overview, job_id),
+                    overview=overview,
                 )
             if run.status.is_terminal:
                 raise JobNotCancellableError(f"Job is already {run.status.value}")
@@ -1808,11 +1808,11 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-            snapshot = repository.snapshot(run.execution_run_id)
+            overview = repository.overview(run.execution_run_id)
             return _job_from_row(
                 updated,
-                _operations_from_execution_snapshot(snapshot, job_id),
-                snapshot=snapshot,
+                _operations_from_execution_overview(overview, job_id),
+                overview=overview,
             )
 
     def resolve_state_unknown(self, job_id: UUID, *, now: int) -> JobRecord:
@@ -1867,11 +1867,11 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
-            snapshot = repository.snapshot(execution_run_id)
+            overview = repository.overview(execution_run_id)
             return _job_from_row(
                 updated,
-                _operations_from_execution_snapshot(snapshot, job_id),
-                snapshot=snapshot,
+                _operations_from_execution_overview(overview, job_id),
+                overview=overview,
             )
 
     def block_job(
@@ -1894,16 +1894,16 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             repository = SqliteExecutionRepository(conn)
-            snapshot = repository.snapshot(UUID(row["execution_run_id"]))
-            current_state = _job_state_from_execution(snapshot)
+            overview = repository.overview(UUID(row["execution_run_id"]))
+            current_state = _job_state_from_execution(overview)
             result_state = row["result_state"]
             if result_state == JobState.PARTIAL.value:
                 current_state = JobState.PARTIAL
             if current_state not in {JobState.SUCCEEDED, JobState.PARTIAL}:
                 return _job_from_row(
                     row,
-                    _operations_from_execution_snapshot(snapshot, job_id),
-                    snapshot=snapshot,
+                    _operations_from_execution_overview(overview, job_id),
+                    overview=overview,
                 )
             if previous_state != current_state:
                 raise ValueError(
@@ -1933,8 +1933,8 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             return _job_from_row(
                 row,
-                _operations_from_execution_snapshot(snapshot, job_id),
-                snapshot=snapshot,
+                _operations_from_execution_overview(overview, job_id),
+                overview=overview,
             )
 
     def complete_job(
@@ -2046,6 +2046,16 @@ class ServiceStore:
             conn.close()
 
     @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Hold one coherent SQLite read snapshot across a service projection."""
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                conn.rollback()
+
+    @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2079,15 +2089,18 @@ def _jobs_from_rows(
     if not rows:
         return []
     repository = SqliteExecutionRepository(conn)
+    overviews = repository.overviews(
+        tuple(UUID(row["execution_run_id"]) for row in rows)
+    )
     jobs: list[JobRecord] = []
     for row in rows:
-        snapshot = repository.snapshot(UUID(row["execution_run_id"]))
+        overview = overviews[UUID(row["execution_run_id"])]
         job_id = UUID(row["job_id"])
         jobs.append(
             _job_from_row(
                 row,
-                _operations_from_execution_snapshot(snapshot, job_id),
-                snapshot=snapshot,
+                _operations_from_execution_overview(overview, job_id),
+                overview=overview,
             )
         )
     return jobs
@@ -2104,19 +2117,19 @@ def _job_from_row(
     row: sqlite3.Row,
     operations: tuple[JobOperationRecord, ...],
     *,
-    snapshot: ExecutionSnapshot,
+    overview: ExecutionOverview,
 ) -> JobRecord:
-    state = _job_state_from_execution(snapshot)
+    state = _job_state_from_execution(overview)
     if state in {JobState.SUCCEEDED, JobState.PARTIAL} and row["result_state"] is None:
         state = JobState.FINALIZING
     elif row["result_blocked_at"] is not None:
         state = JobState.BLOCKED
     elif state == JobState.SUCCEEDED and row["result_state"] == "partial":
         state = JobState.PARTIAL
-    updated_at = max(int(row["updated_at"]), snapshot.run.updated_at)
+    updated_at = max(int(row["updated_at"]), overview.run.updated_at)
     completed_at = (
-        snapshot.run.completed_at
-        if snapshot.run.status.is_terminal and row["result_state"] is not None
+        overview.run.completed_at
+        if overview.run.status.is_terminal and row["result_state"] is not None
         else None
     )
     cancel_requested_at = row["cancel_requested_at"]
@@ -2126,12 +2139,12 @@ def _job_from_row(
     error_code = row["error_code"]
     error_message = row["error_message"]
     if (
-        snapshot.run.status == RunStatus.CANCEL_REQUESTED
+        overview.run.status == RunStatus.CANCEL_REQUESTED
         and cancel_requested_at is None
     ):
-        cancel_requested_at = snapshot.run.updated_at
-    elif snapshot.run.status == RunStatus.STATE_UNKNOWN:
-        state_unknown_at = snapshot.run.updated_at
+        cancel_requested_at = overview.run.updated_at
+    elif overview.run.status == RunStatus.STATE_UNKNOWN:
+        state_unknown_at = overview.run.updated_at
         state_unknown_reason = {
             RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN: (
                 JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
@@ -2142,10 +2155,10 @@ def _job_from_row(
             RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN: (
                 JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN
             ),
-        }.get(snapshot.run.status_reason)
-    elif snapshot.run.status == RunStatus.SUSPENDED and blocked_at is None:
-        blocked_at = snapshot.run.updated_at
-    elif snapshot.run.status == RunStatus.FAILED and error_code is None:
+        }.get(overview.run.status_reason)
+    elif overview.run.status == RunStatus.SUSPENDED and blocked_at is None:
+        blocked_at = overview.run.updated_at
+    elif overview.run.status == RunStatus.FAILED and error_code is None:
         error_code = "compute_failed"
         error_message = "The remote computation did not complete successfully."
     return JobRecord(
@@ -2159,10 +2172,10 @@ def _job_from_row(
         parameters_json=str(row["parameters_json"]),
         artifact_request_sha256=row["artifact_request_sha256"],
         state=state,
-        modal_environment=snapshot.run.deployment.environment,
-        modal_app_name=snapshot.run.deployment.deployment_name,
-        modal_app_version=snapshot.run.deployment.deployment_version,
-        run_name=snapshot.run.plan.workload_run_key,
+        modal_environment=overview.run.deployment.environment,
+        modal_app_name=overview.run.deployment.deployment_name,
+        modal_app_version=overview.run.deployment.deployment_version,
+        run_name=overview.run.plan.workload_run_key,
         operations=operations,
         result_volume_name=row["result_volume_name"],
         result_volume_path=row["result_volume_path"],
@@ -2182,10 +2195,11 @@ def _job_from_row(
         finalization_started_at=max(
             (
                 node.started_at
-                for node in snapshot.nodes
+                for node in overview.nodes
                 if node.started_at is not None
                 and not any(
-                    call.node_key == node.node_key for call in snapshot.provider_calls
+                    call.node_key == node.node_key
+                    for call in overview.latest_provider_calls
                 )
             ),
             default=None,
@@ -2203,18 +2217,18 @@ def _job_from_row(
     )
 
 
-def _job_state_from_execution(snapshot: ExecutionSnapshot) -> JobState:
+def _job_state_from_execution(overview: ExecutionOverview) -> JobState:
     """Project kernel lifecycle into the stable browser-facing Job vocabulary."""
-    status = snapshot.run.status
+    status = overview.run.status
     if status == RunStatus.PENDING:
         return JobState.QUEUED
     if status == RunStatus.RUNNING:
         running_nodes = {
             node.node_key
-            for node in snapshot.nodes
+            for node in overview.nodes
             if node.status == NodeStatus.RUNNING
         }
-        calls_by_node = {call.node_key for call in snapshot.provider_calls}
+        calls_by_node = {call.node_key for call in overview.latest_provider_calls}
         if running_nodes and running_nodes.isdisjoint(calls_by_node):
             return JobState.FINALIZING
         return JobState.RUNNING
@@ -2229,20 +2243,17 @@ def _job_state_from_execution(snapshot: ExecutionSnapshot) -> JobState:
     }[status]
 
 
-def _operations_from_execution_snapshot(
-    snapshot: ExecutionSnapshot,
+def _operations_from_execution_overview(
+    overview: ExecutionOverview,
     job_id: UUID,
 ) -> tuple[JobOperationRecord, ...]:
     """Project Node and Provider Call state into the existing Stage/log DTO."""
-    calls_by_node: dict[str, list[Any]] = {}
-    for call in snapshot.provider_calls:
-        calls_by_node.setdefault(call.node_key, []).append(call)
+    calls_by_node = {call.node_key: call for call in overview.latest_provider_calls}
     operations: list[JobOperationRecord] = []
-    for node in snapshot.nodes:
+    for node in overview.nodes:
         if node.started_at is None:
             continue
-        calls = calls_by_node.get(node.node_key, [])
-        call = calls[-1] if calls else None
+        call = calls_by_node.get(node.node_key)
         if node.status == NodeStatus.SUCCEEDED:
             state = JobOperationState.COMPLETED
         elif node.status == NodeStatus.FAILED:

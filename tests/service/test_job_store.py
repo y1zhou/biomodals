@@ -17,6 +17,7 @@ from biomodals.execution import (
     RunStatus,
     RunStatusReason,
 )
+from biomodals.execution.sqlite import SqliteExecutionRepository
 from biomodals.service.auth import AuthService
 from biomodals.service.runtime_config import (
     DatabaseOverridableSetting,
@@ -303,6 +304,35 @@ def test_job_queries_and_cursor_never_cross_owner_boundaries(tmp_path: Path) -> 
     assert page.next_cursor is not None
     with pytest.raises(JobCursorError):
         store.list_jobs_page(alice, limit=1, cursor=hidden.job.job_id)
+
+
+def test_job_list_loads_execution_overviews_in_one_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, alice, _bob = make_store(tmp_path)
+    admit(store, alice, key="one")
+    admit(store, alice, key="two")
+    original = SqliteExecutionRepository.overviews
+    calls: list[tuple[UUID, ...]] = []
+
+    def record_overviews(self, execution_run_ids):
+        run_ids = tuple(execution_run_ids)
+        calls.append(run_ids)
+        return original(self, run_ids)
+
+    monkeypatch.setattr(SqliteExecutionRepository, "overviews", record_overviews)
+    monkeypatch.setattr(
+        SqliteExecutionRepository,
+        "snapshot",
+        lambda *_args, **_kwargs: pytest.fail("job lists must not load full snapshots"),
+    )
+
+    jobs = store.list_jobs(alice)
+
+    assert len(jobs) == 2
+    assert len(calls) == 1
+    assert len(calls[0]) == 2
 
 
 def test_cancellation_audit_does_not_mirror_execution_state(tmp_path: Path) -> None:

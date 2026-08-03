@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from base64 import b64decode, b64encode
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
@@ -726,17 +725,17 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if available_total == 0:
             return
         with self.store.synchronize():
-            active_by_node = Counter({
-                node_key: self.store.execution.provider_call_counts_for_node(
-                    self.execution_run_id,
-                    node_key,
-                )[1]
-                for node_key in required
-            })
+            provider_counts = self.store.execution.provider_call_counts_by_node(
+                self.execution_run_id
+            )
         candidate_node_keys = {
             node_key
             for node_key in required
-            if active_by_node[node_key] < self._node_call_limit(node_key)
+            if provider_counts.get(node_key, (0, 0))[1]
+            < self._node_call_limit(node_key)
+        }
+        active_by_node = {
+            node_key: provider_counts.get(node_key, (0, 0))[1] for node_key in required
         }
         window_size = available_total
         while True:

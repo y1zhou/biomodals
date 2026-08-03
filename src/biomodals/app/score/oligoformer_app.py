@@ -118,7 +118,7 @@ from biomodals.app.score.oligoformer_execution import (
 from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
-    ExecutionSnapshot,
+    ExecutionOverview,
     RunStatus,
 )
 from biomodals.execution.modal import (
@@ -5677,22 +5677,22 @@ class ExecutionCoordinator:
         MODEL_VOLUME.reload()
 
     @modal.method()
-    def run(self, development: bool = False) -> ExecutionSnapshot:
+    def run(self, development: bool = False) -> ExecutionOverview:
         """Drive one staged root App Run."""
         return self._adapter(development=development).run()
 
     @modal.method()
-    def status(self) -> ExecutionSnapshot:
-        """Read this Run's durable snapshot."""
+    def status(self) -> ExecutionOverview:
+        """Read this Run's durable overview."""
         return self._adapter().status()
 
     @modal.method()
-    def cancel(self) -> ExecutionSnapshot:
+    def cancel(self) -> ExecutionOverview:
         """Request cancellation for this Run."""
         return self._adapter().cancel()
 
     @modal.method()
-    def resume(self) -> ExecutionSnapshot:
+    def resume(self) -> ExecutionOverview:
         """Resume without retrying failed Tasks."""
         return self._adapter().resume()
 
@@ -5719,7 +5719,7 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def drive_prepared(self) -> ExecutionSnapshot:
+    def drive_prepared(self) -> ExecutionOverview:
         """Drive one previously prepared root or Successor Run."""
         return self._adapter().drive_prepared()
 
@@ -5727,7 +5727,7 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
-    ) -> ExecutionSnapshot:
+    ) -> ExecutionOverview:
         """Create a compatible Successor while inferring deployment identity."""
         adapter = self._adapter()
         adapter.prepare_restart(
@@ -6025,16 +6025,16 @@ def submit_oligoformer_task(
         )
     print(f"Execution Run ID: {execution_run_id}")
     print(f"Coordinator FunctionCall ID: {call.object_id}")
-    snapshot = call.get()
-    if snapshot.run.status != RunStatus.SUCCEEDED:
-        diagnostic = snapshot.run.status_message or (
-            snapshot.run.status_reason.value
-            if snapshot.run.status_reason is not None
-            else snapshot.run.status.value
+    overview = call.get()
+    if overview.run.status != RunStatus.SUCCEEDED:
+        diagnostic = overview.run.status_message or (
+            overview.run.status_reason.value
+            if overview.run.status_reason is not None
+            else overview.run.status.value
         )
         raise RuntimeError(
             f"OligoFormer Execution Run ended as "
-            f"{snapshot.run.status.value}: {diagnostic}"
+            f"{overview.run.status.value}: {diagnostic}"
         )
     publication = _oligoformer_result_publication_from_volume(
         CONF.output_volume,

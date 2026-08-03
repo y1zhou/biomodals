@@ -10,8 +10,8 @@ from contextlib import AbstractContextManager, nullcontext
 from uuid import UUID
 
 from biomodals.execution.model import (
+    ExecutionOverview,
     ExecutionRunRecord,
-    ExecutionSnapshot,
     RunStatus,
     RunStatusReason,
 )
@@ -37,7 +37,7 @@ def drive_execution_run(
     sleep: Callable[[float], None] = time.sleep,
     poll_interval_seconds: float = 1.0,
     synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
-) -> ExecutionSnapshot:
+) -> ExecutionOverview:
     """Advance one Run without holding its writer across workload or provider I/O."""
     if poll_interval_seconds < 0:
         raise ValueError("poll_interval_seconds cannot be negative")
@@ -49,7 +49,7 @@ def drive_execution_run(
                 repository = current_repository()
             run = repository.get_run(execution_run_id)
             if run.status not in _DRIVABLE_STATUSES:
-                snapshot = repository.snapshot(execution_run_id)
+                overview = repository.overview(execution_run_id)
                 reason = (
                     run.status_reason.value if run.status_reason is not None else None
                 )
@@ -67,10 +67,10 @@ def drive_execution_run(
                     run.status.value,
                     reason,
                     run.status_message,
-                    snapshot.active_provider_calls.total,
-                    snapshot.active_provider_calls.gpu,
+                    overview.active_provider_calls.total,
+                    overview.active_provider_calls.gpu,
                 )
-                return snapshot
+                return overview
         try:
             advance_once()
         except Exception as exc:

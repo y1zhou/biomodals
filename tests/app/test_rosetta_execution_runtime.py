@@ -310,9 +310,10 @@ def test_unknown_run_prunes_workers_after_task_publications_appear(
             )
     driver.state_unknown = True
 
-    snapshot = runtime.resume()
+    overview = runtime.resume()
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
 
-    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert overview.run.status == RunStatus.SUCCEEDED
     assert driver.cancelled == {str(spawn["handle"]) for spawn in driver.spawns}
     assert {call.status for call in snapshot.provider_calls} == {
         ProviderCallStatus.CANCELLED

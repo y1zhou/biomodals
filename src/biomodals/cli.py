@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from biomodals.execution import DeploymentIdentity, ExecutionSnapshot, RunStatus
+from biomodals.execution import DeploymentIdentity, ExecutionOverview, RunStatus
 from biomodals.execution.modal import deployed_execution_coordinator
 from biomodals.helper.catalog import (
     WORKFLOW_HOME,
@@ -748,9 +748,9 @@ def _run_coordinator(
     )
 
 
-def _print_execution_snapshot(snapshot: ExecutionSnapshot) -> None:
-    """Render the common durable execution view."""
-    run = snapshot.run
+def _print_execution_overview(overview: ExecutionOverview) -> None:
+    """Render the bounded durable execution view."""
+    run = overview.run
     console.print(f"Execution Run ID: [green]{run.execution_run_id}[/green]")
     console.print(
         "Deployment Identity: "
@@ -765,10 +765,10 @@ def _print_execution_snapshot(snapshot: ExecutionSnapshot) -> None:
         console.print(f"Message: {run.status_message}")
     console.print(
         "Occupied Provider Call Slots: "
-        f"{snapshot.active_provider_calls.total} total, "
-        f"{snapshot.active_provider_calls.gpu} GPU"
+        f"{overview.active_provider_calls.total} total, "
+        f"{overview.active_provider_calls.gpu} GPU"
     )
-    if snapshot.active_provider_calls.total:
+    if overview.active_provider_calls.total:
         console.print(
             "[dim]These are durable ownership records, not confirmed live Modal "
             "containers.[/dim]"
@@ -825,7 +825,7 @@ def status_execution_run(
 ) -> None:
     """Read one persisted Execution Run without advancing it."""
     try:
-        snapshot = _run_coordinator(
+        overview = _run_coordinator(
             environment=environment,
             deployment_name=deployment_name,
             deployment_version=deployment_version,
@@ -834,7 +834,7 @@ def status_execution_run(
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Error[/bold red] Could not read run status: {exc}")
         raise typer.Exit(code=1) from exc
-    _print_execution_snapshot(snapshot)
+    _print_execution_overview(overview)
 
 
 @run_commands.command(name="cancel")
@@ -862,7 +862,7 @@ def cancel_execution_run(
 ) -> None:
     """Request idempotent cancellation of one Execution Run."""
     try:
-        snapshot = _run_coordinator(
+        overview = _run_coordinator(
             environment=environment,
             deployment_name=deployment_name,
             deployment_version=deployment_version,
@@ -871,7 +871,7 @@ def cancel_execution_run(
     except Exception as exc:  # noqa: BLE001
         console.print(f"[bold red]Error[/bold red] Could not cancel run: {exc}")
         raise typer.Exit(code=1) from exc
-    _print_execution_snapshot(snapshot)
+    _print_execution_overview(overview)
 
 
 @run_commands.command(name="resume")

@@ -658,7 +658,7 @@ class ExecutionRuntime:
                         uses_gpu=uses_gpu,
                         depth=depth,
                         unblocking_span=unblocking_span,
-                        limit=lookahead,
+                        limit_per_node=lookahead,
                     )
                 if not window:
                     continue
@@ -673,7 +673,7 @@ class ExecutionRuntime:
                             uses_gpu=uses_gpu,
                             depth=depth,
                             unblocking_span=unblocking_span,
-                            limit=task_capacity,
+                            limit_per_node=task_capacity,
                         )
                 admitted = select_admissible_candidates(
                     form_fixed_batches(window),

@@ -238,7 +238,7 @@ def test_ready_dispatch_query_uses_the_resource_class_index() -> None:
     assert all("USE TEMP B-TREE" not in str(row[3]) for row in query_plan)
 
 
-def test_ready_dispatch_window_stops_after_its_node_limit() -> None:
+def test_ready_dispatch_window_bounds_each_eligible_node() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SqliteExecutionRepository(connection)
     repository.initialize_schema()
@@ -293,20 +293,17 @@ def test_ready_dispatch_window_stops_after_its_node_limit() -> None:
         uses_gpu=True,
         depth=1,
         unblocking_span=1,
-        limit=2,
+        limit_per_node=2,
     )
 
     connection.set_trace_callback(None)
     window_queries = [
-        statement
-        for statement in statements
-        if "SELECT task.*, node.ordinal AS node_ordinal" in statement
+        statement for statement in statements if "WITH ranked AS" in statement
     ]
     assert [(item.node_key, item.task_key) for item in window] == [
-        ("node-0", "task"),
-        ("node-1", "task"),
+        (node_key, "task") for node_key in node_keys
     ]
-    assert len(window_queries) == 2
+    assert len(window_queries) == 1
 
 
 def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:

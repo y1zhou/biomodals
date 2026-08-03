@@ -35,7 +35,7 @@ from biomodals.app.design.boltzgen.execution_request import (
 from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
-    ExecutionSnapshot,
+    ExecutionOverview,
     RunStatus,
 )
 from biomodals.execution.modal import (
@@ -700,22 +700,22 @@ class ExecutionCoordinator:
         CONF.output_volume.reload()
 
     @modal.method()
-    def run(self, development: bool = False) -> ExecutionSnapshot:
+    def run(self, development: bool = False) -> ExecutionOverview:
         """Drive one staged root App Run until it stops."""
         return self._adapter(development=development).run()
 
     @modal.method()
-    def status(self) -> ExecutionSnapshot:
-        """Read this Run's durable kernel snapshot."""
+    def status(self) -> ExecutionOverview:
+        """Read this Run's durable kernel overview."""
         return self._adapter().status()
 
     @modal.method()
-    def cancel(self) -> ExecutionSnapshot:
+    def cancel(self) -> ExecutionOverview:
         """Request idempotent cancellation for this Run."""
         return self._adapter().cancel()
 
     @modal.method()
-    def resume(self) -> ExecutionSnapshot:
+    def resume(self) -> ExecutionOverview:
         """Resume this Run without retrying conclusive failures."""
         return self._adapter().resume()
 
@@ -742,7 +742,7 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def drive_prepared(self) -> ExecutionSnapshot:
+    def drive_prepared(self) -> ExecutionOverview:
         """Drive one previously prepared root or Successor Run."""
         return self._adapter().drive_prepared()
 
@@ -753,7 +753,7 @@ class ExecutionCoordinator:
         workload_plan_fingerprint: str,
         max_active_provider_calls: int,
         max_active_gpu_provider_calls: int,
-    ) -> ExecutionSnapshot:
+    ) -> ExecutionOverview:
         """Create a compatible Successor while inferring predecessor identity."""
         adapter = self._adapter()
         adapter.prepare_restart(
@@ -1021,16 +1021,16 @@ def submit_boltzgen_task(
         f"v{deployment.deployment_version}"
     )
     print(f"Coordinator FunctionCall ID: {call.object_id}")
-    snapshot = call.get()
-    if snapshot.run.status != RunStatus.SUCCEEDED:
-        diagnostic = snapshot.run.status_message or (
-            snapshot.run.status_reason.value
-            if snapshot.run.status_reason is not None
-            else snapshot.run.status.value
+    overview = call.get()
+    if overview.run.status != RunStatus.SUCCEEDED:
+        diagnostic = overview.run.status_message or (
+            overview.run.status_reason.value
+            if overview.run.status_reason is not None
+            else overview.run.status.value
         )
         raise RuntimeError(
             f"{CONF.name} Execution Run ended as "
-            f"{snapshot.run.status.value}: {diagnostic}"
+            f"{overview.run.status.value}: {diagnostic}"
         )
     completed_request = load_execution_request_from_volume(
         CONF.output_volume,

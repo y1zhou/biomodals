@@ -16,9 +16,9 @@ from biomodals.app.config import AppConfig
 from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
+    ExecutionOverview,
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
-    ExecutionSnapshot,
     NodeStatus,
     ProviderBinding,
     TaskStatus,
@@ -213,13 +213,13 @@ class ExecutionCoordinator:
                     self._close_runtime()
 
     @modal.method()
-    def status(self) -> ExecutionSnapshot:
-        """Read the current kernel snapshot without advancing the Run."""
+    def status(self) -> ExecutionOverview:
+        """Read the current kernel overview without advancing the Run."""
         with self._lock():
-            return self._verified_snapshot()
+            return self._verified_overview()
 
     @modal.method()
-    def cancel(self) -> ExecutionSnapshot:
+    def cancel(self) -> ExecutionOverview:
         """Idempotently request cancellation of this Execution Run."""
         with self._lock():
             self._require_ledger()
@@ -227,13 +227,13 @@ class ExecutionCoordinator:
             runtime = self._open_runtime(plan, resolve_external_checker=False)
         runtime.cancel()
         with self._lock():
-            self._verified_snapshot()
+            self._verified_overview()
         with self._drive_lock:
             with self._lock():
-                snapshot = self._verified_snapshot()
-                if snapshot.run.status.is_terminal:
+                overview = self._verified_overview()
+                if overview.run.status.is_terminal:
                     self._close_runtime()
-                    return snapshot
+                    return overview
                 plan = self._load_plan()
                 runtime = self._open_runtime(plan, resolve_external_checker=False)
             try:
@@ -241,7 +241,7 @@ class ExecutionCoordinator:
                     workload_run_key=plan.workload_run_key,
                 )
                 with self._lock():
-                    return self._verified_snapshot()
+                    return self._verified_overview()
             finally:
                 with self._lock():
                     self._close_runtime()
@@ -749,21 +749,21 @@ class ExecutionCoordinator:
             deployment_version=deployment.deployment_version,
         )
 
-    def _verified_snapshot(self) -> ExecutionSnapshot:
+    def _verified_overview(self) -> ExecutionOverview:
         execution_run_id, deployment = self._identity()
         runtime = getattr(self, "_runtime", None)
         if runtime is not None:
-            snapshot = runtime.store.execution.snapshot(execution_run_id)
+            overview = runtime.store.execution.overview(execution_run_id)
         else:
             self._require_ledger()
             store = self._run_store()
             try:
-                snapshot = store.execution.snapshot(execution_run_id)
+                overview = store.execution.overview(execution_run_id)
             finally:
                 store.close()
-        if snapshot.run.deployment != deployment:
+        if overview.run.deployment != deployment:
             raise ValueError("Deployment Identity does not match Execution Run")
-        return snapshot
+        return overview
 
     def _run_store(self) -> WorkflowRunStore:
         execution_run_id, _ = self._identity()

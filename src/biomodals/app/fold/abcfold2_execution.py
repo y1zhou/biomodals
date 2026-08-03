@@ -16,9 +16,9 @@ import orjson
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionOverview,
     ExecutionPlan,
     ExecutionRuntime,
-    ExecutionSnapshot,
     NodeDependency,
     NodePlan,
     ProviderBinding,
@@ -682,9 +682,9 @@ def _result_envelope(result: object) -> dict[str, object]:
     return {"kind": "invalid"}
 
 
-def run_config_from_snapshot(snapshot: ExecutionSnapshot) -> ABCFold2RunConfig:
-    """Return the validated preparation result from a completed snapshot."""
-    for call in snapshot.provider_calls:
+def run_config_from_overview(overview: ExecutionOverview) -> ABCFold2RunConfig:
+    """Return the validated preparation result from a completed overview."""
+    for call in overview.latest_provider_calls:
         if (
             call.node_key == PREPARE_NODE
             and call.status == ProviderCallStatus.SUCCEEDED

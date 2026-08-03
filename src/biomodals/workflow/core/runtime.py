@@ -903,6 +903,9 @@ class WorkflowRuntime:
                 for node in repository.list_nodes(run.execution_run_id)
             }
             counts = repository.active_provider_call_counts(self.execution_run_id)
+            provider_counts_by_node = repository.provider_call_counts_by_node(
+                self.execution_run_id
+            )
         available_total_slots = max(
             0,
             run.max_active_provider_calls - counts.total,
@@ -959,11 +962,9 @@ class WorkflowRuntime:
                         self.execution_run_id,
                         node_id,
                     )
-                    total_workers, nonterminal_workers = (
-                        self.store.execution.provider_call_counts_for_node(
-                            self.execution_run_id,
-                            node_id,
-                        )
+                    total_workers, nonterminal_workers = provider_counts_by_node.get(
+                        node_id,
+                        (0, 0),
                     )
                 pull_invocations[node_id] = invocation
                 pull_descriptors.append(

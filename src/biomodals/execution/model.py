@@ -416,6 +416,25 @@ class ProviderCallRecord:
 
 
 @dataclass(frozen=True)
+class ProviderCallOverview:
+    """Bounded Provider Call state without Task ownership or binding details."""
+
+    provider_call_id: UUID
+    execution_run_id: UUID
+    node_key: str
+    submission_token: str
+    status: ProviderCallStatus
+    provider_call_handle_id: str | None
+    result_envelope: Any
+    error_message: str | None
+    created_at: int
+    updated_at: int
+    attached_at: int | None
+    started_at: int | None
+    completed_at: int | None
+
+
+@dataclass(frozen=True)
 class ProviderCallPreclaim:
     """A durable call plus one-time in-process permission to spawn it."""
 
@@ -463,6 +482,16 @@ class ExecutionSnapshot:
     nodes: tuple[ExecutionNodeRecord, ...]
     tasks: tuple[ExecutionTaskRecord, ...]
     provider_calls: tuple[ProviderCallRecord, ...]
+    active_provider_calls: ActiveProviderCallCounts
+
+
+@dataclass(frozen=True)
+class ExecutionOverview:
+    """Bounded Run, Node, and latest-call state for lifecycle projections."""
+
+    run: ExecutionRunRecord
+    nodes: tuple[ExecutionNodeRecord, ...]
+    latest_provider_calls: tuple[ProviderCallOverview, ...]
     active_provider_calls: ActiveProviderCallCounts
 
 

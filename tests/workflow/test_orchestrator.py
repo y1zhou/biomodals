@@ -980,7 +980,7 @@ def test_workflow_cancel_does_not_start_a_second_driver(
     instance._load_plan = lambda: plan
     instance._open_runtime = open_runtime
     instance._require_ledger = lambda: None
-    instance._verified_snapshot = snapshot
+    instance._verified_overview = snapshot
     errors: list[BaseException] = []
 
     def call(operation, *args: object, **kwargs: object) -> None:

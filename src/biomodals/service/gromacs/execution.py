@@ -180,8 +180,8 @@ class GromacsExecutionCoordinator:
                 required = self._required_nodes(runtime, execution_run_id)
                 if required is None:
                     runtime.checkpoint()
-                    snapshot = runtime.repository.snapshot(execution_run_id)
-                    self._project_terminal_or_running_job(job, snapshot.run.status)
+                    overview = runtime.repository.overview(execution_run_id)
+                    self._project_terminal_or_running_job(job, overview.run.status)
                     return
 
                 calls_to_cancel = runtime.repository.prune_unrequired_nodes(
@@ -253,11 +253,11 @@ class GromacsExecutionCoordinator:
                     now=self._now(),
                 )
                 runtime.checkpoint()
-                snapshot = runtime.repository.snapshot(execution_run_id)
+                overview = runtime.repository.overview(execution_run_id)
                 prepare = next(
                     (
                         node
-                        for node in snapshot.nodes
+                        for node in overview.nodes
                         if node.node_key.startswith("prepare_tpr_")
                     ),
                     None,
@@ -271,13 +271,13 @@ class GromacsExecutionCoordinator:
             if (
                 archive is None
                 and job.result_filename is None
-                and snapshot.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}
+                and overview.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}
             ):
                 archive = await self.adapter.recover_archive(job)
             if archive is not None:
                 self._complete_job(job, archive)
             else:
-                self._project_terminal_or_running_job(job, snapshot.run.status)
+                self._project_terminal_or_running_job(job, overview.run.status)
 
     def _suspend_after_coordinator_error(
         self,

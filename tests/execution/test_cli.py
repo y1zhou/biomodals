@@ -95,13 +95,13 @@ def _patch_coordinator(
     return coordinator, calls
 
 
-def test_run_status_uses_explicit_location_and_prints_snapshot(
+def test_run_status_uses_explicit_location_and_prints_overview(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator, calls = _patch_coordinator(monkeypatch)
     printed: list[object] = []
     monkeypatch.setattr(
-        "biomodals.cli._print_execution_snapshot",
+        "biomodals.cli._print_execution_overview",
         printed.append,
     )
 
@@ -152,8 +152,8 @@ def test_run_cancel_calls_the_same_coordinator_surface(
 ) -> None:
     coordinator, _ = _patch_coordinator(monkeypatch)
     monkeypatch.setattr(
-        "biomodals.cli._print_execution_snapshot",
-        lambda _snapshot: None,
+        "biomodals.cli._print_execution_overview",
+        lambda _overview: None,
     )
 
     result = runner.invoke(app, ["run", "cancel", *LOCATION_FLAGS])

@@ -15,6 +15,7 @@ from biomodals.execution.model import (
     DeploymentIdentity,
     DispatchMode,
     ExecutionNodeRecord,
+    ExecutionOverview,
     ExecutionPlan,
     ExecutionRunRecord,
     ExecutionSnapshot,
@@ -24,6 +25,7 @@ from biomodals.execution.model import (
     NodePlan,
     NodeStatus,
     ProviderBinding,
+    ProviderCallOverview,
     ProviderCallPreclaim,
     ProviderCallRecord,
     ProviderCallStatus,
@@ -603,6 +605,135 @@ class SqliteExecutionRepository:
             provider_calls=self.list_provider_calls(execution_run_id),
             active_provider_calls=self.active_provider_call_counts(execution_run_id),
         )
+
+    def overview(self, execution_run_id: UUID) -> ExecutionOverview:
+        """Return bounded lifecycle state without Task payloads or ownership."""
+        try:
+            return self.overviews((execution_run_id,))[execution_run_id]
+        except KeyError as error:
+            raise ExecutionRunNotFoundError(str(execution_run_id)) from error
+
+    def overviews(
+        self,
+        execution_run_ids: Collection[UUID],
+    ) -> dict[UUID, ExecutionOverview]:
+        """Load bounded lifecycle views in a constant query count per chunk."""
+        run_ids = tuple(dict.fromkeys(execution_run_ids))
+        if not run_ids:
+            return {}
+        run_rows: list[sqlite3.Row] = []
+        node_rows: list[sqlite3.Row] = []
+        dependency_rows: list[sqlite3.Row] = []
+        call_rows: list[sqlite3.Row] = []
+        active_rows: list[sqlite3.Row] = []
+        active = tuple(
+            status.value for status in ProviderCallStatus if not status.is_terminal
+        )
+        active_placeholders = ", ".join("?" for _ in active)
+        for offset in range(0, len(run_ids), 400):
+            chunk = tuple(str(run_id) for run_id in run_ids[offset : offset + 400])
+            placeholders = ", ".join("?" for _ in chunk)
+            run_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT * FROM execution_runs
+                    WHERE execution_run_id IN ({placeholders})
+                    """,  # noqa: S608 - generated placeholders
+                    chunk,
+                ).fetchall()
+            )
+            node_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT * FROM execution_nodes
+                    WHERE execution_run_id IN ({placeholders})
+                    ORDER BY execution_run_id, ordinal
+                    """,  # noqa: S608 - generated placeholders
+                    chunk,
+                ).fetchall()
+            )
+            dependency_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT * FROM execution_node_dependencies
+                    WHERE execution_run_id IN ({placeholders})
+                    ORDER BY execution_run_id, node_key, ordinal
+                    """,  # noqa: S608 - generated placeholders
+                    chunk,
+                ).fetchall()
+            )
+            call_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT call.*, call.rowid AS provider_call_rowid
+                    FROM execution_provider_calls AS call
+                    JOIN (
+                        SELECT execution_run_id, node_key, MAX(rowid) AS latest_rowid
+                        FROM execution_provider_calls
+                        WHERE execution_run_id IN ({placeholders})
+                        GROUP BY execution_run_id, node_key
+                    ) AS latest ON latest.latest_rowid = call.rowid
+                    ORDER BY call.execution_run_id, call.created_at,
+                             provider_call_rowid
+                    """,  # noqa: S608 - generated placeholders
+                    chunk,
+                ).fetchall()
+            )
+            active_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT execution_run_id, COUNT(*) AS total,
+                           COALESCE(SUM(uses_gpu), 0) AS gpu
+                    FROM execution_provider_calls
+                    WHERE execution_run_id IN ({placeholders})
+                        AND status IN ({active_placeholders})
+                    GROUP BY execution_run_id
+                    """,  # noqa: S608 - generated placeholders
+                    (*chunk, *active),
+                ).fetchall()
+            )
+
+        dependencies: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in dependency_rows:
+            dependencies.setdefault(
+                (row["execution_run_id"], row["node_key"]),
+                [],
+            ).append(row)
+        nodes: dict[str, list[ExecutionNodeRecord]] = {}
+        for row in node_rows:
+            nodes.setdefault(row["execution_run_id"], []).append(
+                self._node_from_row_with_dependencies(
+                    row,
+                    dependencies.get(
+                        (row["execution_run_id"], row["node_key"]),
+                        (),
+                    ),
+                )
+            )
+        calls: dict[str, list[ProviderCallOverview]] = {}
+        active_counts = {
+            row["execution_run_id"]: ActiveProviderCallCounts(
+                total=row["total"],
+                gpu=row["gpu"],
+            )
+            for row in active_rows
+        }
+        for row in call_rows:
+            run_id = row["execution_run_id"]
+            calls.setdefault(run_id, []).append(_provider_call_overview_from_row(row))
+
+        return {
+            UUID(row["execution_run_id"]): ExecutionOverview(
+                run=_run_from_row(row),
+                nodes=tuple(nodes.get(row["execution_run_id"], ())),
+                latest_provider_calls=tuple(calls.get(row["execution_run_id"], ())),
+                active_provider_calls=active_counts.get(
+                    row["execution_run_id"],
+                    ActiveProviderCallCounts(0, 0),
+                ),
+            )
+            for row in run_rows
+        }
 
     def list_nodes(self, execution_run_id: UUID) -> tuple[ExecutionNodeRecord, ...]:
         """Load planned Nodes in their persisted encounter order."""
@@ -2946,26 +3077,27 @@ class SqliteExecutionRepository:
         ).fetchone()
         return row["count"]
 
-    def provider_call_counts_for_node(
+    def provider_call_counts_by_node(
         self,
         execution_run_id: UUID,
-        node_key: str,
-    ) -> tuple[int, int]:
-        """Return total and nonterminal Provider Call counts for one Node."""
+    ) -> dict[str, tuple[int, int]]:
+        """Return total and nonterminal Provider Call counts grouped by Node."""
         terminal = tuple(
             status.value for status in ProviderCallStatus if status.is_terminal
         )
-        row = self._connection.execute(
+        rows = self._connection.execute(
             """
             SELECT
+                node_key,
                 COUNT(*) AS total,
                 COALESCE(SUM(status NOT IN (?, ?, ?)), 0) AS nonterminal
             FROM execution_provider_calls
-            WHERE execution_run_id = ? AND node_key = ?
+            WHERE execution_run_id = ?
+            GROUP BY node_key
             """,
-            (*terminal, str(execution_run_id), node_key),
-        ).fetchone()
-        return row["total"], row["nonterminal"]
+            (*terminal, str(execution_run_id)),
+        ).fetchall()
+        return {row["node_key"]: (row["total"], row["nonterminal"]) for row in rows}
 
     def list_unplanned_ready_tasks(
         self,
@@ -3011,49 +3143,55 @@ class SqliteExecutionRepository:
         uses_gpu: bool,
         depth: int,
         unblocking_span: int,
-        limit: int,
+        limit_per_node: int,
     ) -> tuple[TaskDispatchDescriptor, ...]:
-        """Load a bounded window in the caller's stable Node order."""
-        if limit < 1:
+        """Load bounded per-Node windows for global stable cohort selection."""
+        if limit_per_node < 1:
             raise ValueError("dispatch descriptor limit must be positive")
         ordered_keys = tuple(dict.fromkeys(node_keys))
         if not ordered_keys:
             return ()
         rows: list[sqlite3.Row] = []
-        for node_key in ordered_keys:
-            remaining = limit - len(rows)
-            if remaining == 0:
-                break
+        for offset in range(0, len(ordered_keys), 400):
+            chunk = ordered_keys[offset : offset + 400]
+            placeholders = ", ".join("?" for _ in chunk)
             rows.extend(
                 self._connection.execute(
-                    """
-                    SELECT task.*, node.ordinal AS node_ordinal
-                    FROM execution_tasks AS task
-                    JOIN execution_nodes AS node
-                        ON node.execution_run_id = task.execution_run_id
-                        AND node.node_key = task.node_key
-                    WHERE task.execution_run_id = ?
-                        AND task.node_key = ?
-                        AND node.status = ?
-                        AND node.discovery_complete = 1
-                        AND task.status = ?
-                        AND task.result_observation = ?
-                        AND task.dispatch_policy_json IS NOT NULL
-                        AND json_extract(
-                            task.dispatch_policy_json,
-                            '$.binding.uses_gpu'
-                        ) = ?
-                    ORDER BY task.ordinal
-                    LIMIT ?
-                    """,
+                    f"""
+                    WITH ranked AS (
+                        SELECT task.*, node.ordinal AS node_ordinal,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY task.node_key
+                                   ORDER BY task.ordinal
+                               ) AS task_rank
+                        FROM execution_tasks AS task
+                        JOIN execution_nodes AS node
+                            ON node.execution_run_id = task.execution_run_id
+                            AND node.node_key = task.node_key
+                        WHERE task.execution_run_id = ?
+                            AND task.node_key IN ({placeholders})
+                            AND node.status = ?
+                            AND node.discovery_complete = 1
+                            AND task.status = ?
+                            AND task.result_observation = ?
+                            AND task.dispatch_policy_json IS NOT NULL
+                            AND json_extract(
+                                task.dispatch_policy_json,
+                                '$.binding.uses_gpu'
+                            ) = ?
+                    )
+                    SELECT * FROM ranked
+                    WHERE task_rank <= ?
+                    ORDER BY node_ordinal, ordinal
+                    """,  # noqa: S608 - generated placeholders
                     (
                         str(execution_run_id),
-                        node_key,
+                        *chunk,
                         NodeStatus.RUNNING.value,
                         TaskStatus.PENDING.value,
                         AvailabilityStatus.MISSING.value,
                         int(uses_gpu),
-                        remaining,
+                        limit_per_node,
                     ),
                 ).fetchall()
             )
@@ -3610,6 +3748,13 @@ class SqliteExecutionRepository:
             """,
             (row["execution_run_id"], row["node_key"]),
         ).fetchall()
+        return self._node_from_row_with_dependencies(row, dependencies)
+
+    @staticmethod
+    def _node_from_row_with_dependencies(
+        row: sqlite3.Row,
+        dependencies: Collection[sqlite3.Row],
+    ) -> ExecutionNodeRecord:
         return ExecutionNodeRecord(
             execution_run_id=UUID(row["execution_run_id"]),
             node_key=row["node_key"],
@@ -3800,6 +3945,28 @@ def _run_from_row(row: sqlite3.Row) -> ExecutionRunRecord:
         max_active_gpu_provider_calls=row["max_active_gpu_provider_calls"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _provider_call_overview_from_row(row: sqlite3.Row) -> ProviderCallOverview:
+    return ProviderCallOverview(
+        provider_call_id=UUID(row["provider_call_id"]),
+        execution_run_id=UUID(row["execution_run_id"]),
+        node_key=row["node_key"],
+        submission_token=row["submission_token"],
+        status=ProviderCallStatus(row["status"]),
+        provider_call_handle_id=row["provider_call_handle_id"],
+        result_envelope=(
+            None
+            if row["result_envelope_json"] is None
+            else orjson.loads(row["result_envelope_json"])
+        ),
+        error_message=row["error_message"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        attached_at=row["attached_at"],
         started_at=row["started_at"],
         completed_at=row["completed_at"],
     )

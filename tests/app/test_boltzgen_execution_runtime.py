@@ -365,9 +365,10 @@ def test_unknown_run_prunes_calls_after_terminal_publication_appears(
         },
     )
 
-    snapshot = runtime.resume()
+    overview = runtime.resume()
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
 
-    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert overview.run.status == RunStatus.SUCCEEDED
     assert driver.cancelled == {str(spawn["handle"]) for spawn in driver.spawns}
     assert len(driver.spawns) == len(calls)
     assert {call.status for call in snapshot.provider_calls} == {

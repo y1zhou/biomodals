@@ -576,32 +576,41 @@ class ExecutionRuntime:
         execution_run_id: UUID,
         *,
         required_node_keys: set[str],
+        candidate_node_keys: set[str] | None = None,
         describe_task: Callable[
             [ExecutionNodeRecord, ExecutionTaskRecord, NodeAdmissionRank],
             TaskDispatchDescriptor | None,
         ],
-        available_total_slots: int | None,
+        available_total_slots: int,
         available_gpu_slots: int,
         now: int,
     ) -> tuple[ProviderCallCandidate, ...]:
-        """Persist workload dispatch descriptions and select admissible calls."""
+        """Describe unplanned Tasks once, then admit a bounded ready window."""
+        if available_total_slots < 0 or available_gpu_slots < 0:
+            raise ValueError("available Provider Call slots cannot be negative")
+        if available_total_slots == 0:
+            return ()
+        eligible_node_keys = (
+            required_node_keys
+            if candidate_node_keys is None
+            else required_node_keys & candidate_node_keys
+        )
         with self._synchronize():
             repository = self.repository
             run = repository.get_run(execution_run_id)
             nodes = repository.list_nodes(execution_run_id)
-            pending_tasks = tuple(
-                (node, task)
+            ready_nodes = {
+                node.node_key: node
                 for node in nodes
                 if (
-                    node.node_key in required_node_keys
+                    node.node_key in eligible_node_keys
                     and node.status == NodeStatus.RUNNING
                     and node.discovery_complete
                 )
-                for task in repository.list_tasks(execution_run_id, node.node_key)
-                if (
-                    task.status == TaskStatus.PENDING
-                    and task.result_observation == AvailabilityStatus.MISSING
-                )
+            }
+            unplanned_tasks = repository.list_unplanned_ready_tasks(
+                execution_run_id,
+                ready_nodes,
             )
         ranks = required_node_ranks(
             run.plan,
@@ -611,25 +620,74 @@ class ExecutionRuntime:
             },
         )
         descriptors = []
-        for node, task in pending_tasks:
+        for task in unplanned_tasks:
+            node = ready_nodes[task.node_key]
             descriptor = describe_task(node, task, ranks[node.node_key])
             if descriptor is not None:
                 descriptors.append(descriptor)
-        persisted = self.persist_fixed_dispatch_policy(
+        self.persist_fixed_dispatch_policy(
             execution_run_id,
             tuple(descriptors),
             now=now,
         )
-        candidates = form_fixed_batches(persisted)
-        return select_admissible_candidates(
-            candidates,
-            available_total_slots=(
-                len(candidates)
-                if available_total_slots is None
-                else available_total_slots
-            ),
-            available_gpu_slots=available_gpu_slots,
-        )
+
+        node_keys_by_rank: dict[tuple[int, int], list[str]] = {}
+        for node in ready_nodes.values():
+            rank = ranks[node.node_key]
+            node_keys_by_rank.setdefault(
+                (rank.depth, rank.unblocking_span),
+                [],
+            ).append(node.node_key)
+
+        selected: list[ProviderCallCandidate] = []
+        remaining_gpu_slots = available_gpu_slots
+        for depth, unblocking_span in sorted(node_keys_by_rank, reverse=True):
+            node_keys = node_keys_by_rank[(depth, unblocking_span)]
+            for uses_gpu in (True, False):
+                remaining_total_slots = available_total_slots - len(selected)
+                resource_slots = (
+                    min(remaining_total_slots, remaining_gpu_slots)
+                    if uses_gpu
+                    else remaining_total_slots
+                )
+                if resource_slots <= 0:
+                    continue
+                lookahead = max(1, resource_slots * 4)
+                with self._synchronize():
+                    window = self.repository.list_ready_fixed_dispatch_descriptors(
+                        execution_run_id,
+                        node_keys,
+                        uses_gpu=uses_gpu,
+                        depth=depth,
+                        unblocking_span=unblocking_span,
+                        limit=lookahead,
+                    )
+                if not window:
+                    continue
+                task_capacity = resource_slots * max(
+                    descriptor.max_tasks_per_call for descriptor in window
+                )
+                if task_capacity > lookahead:
+                    with self._synchronize():
+                        window = self.repository.list_ready_fixed_dispatch_descriptors(
+                            execution_run_id,
+                            node_keys,
+                            uses_gpu=uses_gpu,
+                            depth=depth,
+                            unblocking_span=unblocking_span,
+                            limit=task_capacity,
+                        )
+                admitted = select_admissible_candidates(
+                    form_fixed_batches(window),
+                    available_total_slots=resource_slots,
+                    available_gpu_slots=(resource_slots if uses_gpu else 0),
+                )
+                selected.extend(admitted)
+                if uses_gpu:
+                    remaining_gpu_slots -= len(admitted)
+                if len(selected) == available_total_slots:
+                    return tuple(selected)
+        return tuple(selected)
 
     def persist_fixed_dispatch_policy(
         self,

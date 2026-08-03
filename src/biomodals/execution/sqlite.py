@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -277,6 +277,28 @@ _SCHEMA_STATEMENTS = (
     CREATE INDEX execution_tasks_worker_call_idx
     ON execution_tasks(worker_provider_call_id)
     WHERE worker_provider_call_id IS NOT NULL
+    """,
+    """
+    CREATE INDEX execution_tasks_ready_dispatch_idx
+    ON execution_tasks(
+        execution_run_id,
+        node_key,
+        status,
+        result_observation,
+        ordinal
+    )
+    WHERE dispatch_policy_json IS NOT NULL
+    """,
+    """
+    CREATE INDEX execution_tasks_unplanned_dispatch_idx
+    ON execution_tasks(
+        execution_run_id,
+        node_key,
+        status,
+        result_observation,
+        ordinal
+    )
+    WHERE dispatch_policy_json IS NULL
     """,
     """
     CREATE TABLE execution_task_claim_requests (
@@ -873,7 +895,7 @@ class SqliteExecutionRepository:
             tuple[TaskDispatchDescriptor, str, sqlite3.Row, sqlite3.Row]
         ] = []
         seen: set[tuple[str, str]] = set()
-        node_keys: set[str] = set()
+        node_keys: list[str] = []
         fixed_node_policy_json = _dump_json({"mode": DispatchMode.FIXED_BATCH.value})
         for descriptor in descriptors:
             identity = (descriptor.node_key, descriptor.task_key)
@@ -884,16 +906,50 @@ class SqliteExecutionRepository:
             seen.add(identity)
             if descriptor.max_tasks_per_call <= 0:
                 raise ValueError("max_tasks_per_call must be positive")
+            if descriptor.node_key not in node_keys:
+                node_keys.append(descriptor.node_key)
 
-            node = self._connection.execute(
-                """
-                SELECT ordinal, status, discovery_complete,
-                       dispatch_mode, dispatch_policy_json
-                FROM execution_nodes
-                WHERE execution_run_id = ? AND node_key = ?
-                """,
-                (str(execution_run_id), descriptor.node_key),
-            ).fetchone()
+        node_placeholders = ", ".join("?" for _ in node_keys)
+        node_rows = self._connection.execute(
+            f"""
+            SELECT node_key, ordinal, status, discovery_complete,
+                   dispatch_mode, dispatch_policy_json
+            FROM execution_nodes
+            WHERE execution_run_id = ? AND node_key IN ({node_placeholders})
+            """,  # noqa: S608 - placeholders are generated, not user input
+            (str(execution_run_id), *node_keys),
+        ).fetchall()
+        nodes_by_key = {row["node_key"]: row for row in node_rows}
+
+        tasks_by_key: dict[tuple[str, str], sqlite3.Row] = {}
+        identities = tuple(
+            (descriptor.node_key, descriptor.task_key) for descriptor in descriptors
+        )
+        for offset in range(0, len(identities), 400):
+            chunk = identities[offset : offset + 400]
+            requested = ", ".join("(?, ?)" for _ in chunk)
+            task_rows = self._connection.execute(
+                f"""
+                WITH requested(node_key, task_key) AS (VALUES {requested})
+                SELECT task.node_key, task.task_key, task.ordinal, task.status,
+                       task.result_observation, task.dispatch_policy_json
+                FROM execution_tasks AS task
+                JOIN requested
+                    ON requested.node_key = task.node_key
+                    AND requested.task_key = task.task_key
+                WHERE task.execution_run_id = ?
+                """,  # noqa: S608 - placeholders are generated, not user input
+                (
+                    *(value for identity in chunk for value in identity),
+                    str(execution_run_id),
+                ),
+            ).fetchall()
+            tasks_by_key.update({
+                (row["node_key"], row["task_key"]): row for row in task_rows
+            })
+
+        for descriptor in descriptors:
+            node = nodes_by_key.get(descriptor.node_key)
             if node is None:
                 raise LookupError(f"Execution Node not found: {descriptor.node_key}")
             if node["ordinal"] != descriptor.node_ordinal:
@@ -909,20 +965,7 @@ class SqliteExecutionRepository:
             ):
                 raise RuntimeError("stored fixed-batch dispatch policy is invalid")
 
-            task = self._connection.execute(
-                """
-                SELECT ordinal, status, result_observation, dispatch_policy_json
-                FROM execution_tasks
-                WHERE execution_run_id = ?
-                    AND node_key = ?
-                    AND task_key = ?
-                """,
-                (
-                    str(execution_run_id),
-                    descriptor.node_key,
-                    descriptor.task_key,
-                ),
-            ).fetchone()
+            task = tasks_by_key.get((descriptor.node_key, descriptor.task_key))
             if task is None:
                 raise LookupError(
                     "Execution Task not found: "
@@ -954,7 +997,6 @@ class SqliteExecutionRepository:
                     raise ValueError(
                         f"Task {descriptor.task_key!r} is not ready for dispatch"
                     )
-            node_keys.add(descriptor.node_key)
             prepared.append((descriptor, policy_json, node, task))
 
         changed = False
@@ -2707,6 +2749,143 @@ class SqliteExecutionRepository:
         ).fetchall()
         return tuple(_task_from_row(row) for row in rows)
 
+    def unfinished_task_count(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+    ) -> int:
+        """Count pending and running Tasks without materializing their payloads."""
+        row = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND status IN (?, ?)
+            """,
+            (
+                str(execution_run_id),
+                node_key,
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        return row["count"]
+
+    def provider_call_counts_for_node(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+    ) -> tuple[int, int]:
+        """Return total and nonterminal Provider Call counts for one Node."""
+        terminal = tuple(
+            status.value for status in ProviderCallStatus if status.is_terminal
+        )
+        row = self._connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(status NOT IN (?, ?, ?)), 0) AS nonterminal
+            FROM execution_provider_calls
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (*terminal, str(execution_run_id), node_key),
+        ).fetchone()
+        return row["total"], row["nonterminal"]
+
+    def list_unplanned_ready_tasks(
+        self,
+        execution_run_id: UUID,
+        node_keys: Collection[str],
+    ) -> tuple[ExecutionTaskRecord, ...]:
+        """Load ready Tasks whose fixed dispatch policy is not yet durable."""
+        ordered_keys = tuple(dict.fromkeys(node_keys))
+        if not ordered_keys:
+            return ()
+        placeholders = ", ".join("?" for _ in ordered_keys)
+        rows = self._connection.execute(
+            f"""
+            SELECT task.*
+            FROM execution_tasks AS task
+            JOIN execution_nodes AS node
+                ON node.execution_run_id = task.execution_run_id
+                AND node.node_key = task.node_key
+            WHERE task.execution_run_id = ?
+                AND task.node_key IN ({placeholders})
+                AND node.status = ?
+                AND node.discovery_complete = 1
+                AND task.status = ?
+                AND task.result_observation = ?
+                AND task.dispatch_policy_json IS NULL
+            ORDER BY node.ordinal, task.ordinal
+            """,  # noqa: S608 - placeholders are generated, not user input
+            (
+                str(execution_run_id),
+                *ordered_keys,
+                NodeStatus.RUNNING.value,
+                TaskStatus.PENDING.value,
+                AvailabilityStatus.MISSING.value,
+            ),
+        ).fetchall()
+        return tuple(_task_from_row(row) for row in rows)
+
+    def list_ready_fixed_dispatch_descriptors(
+        self,
+        execution_run_id: UUID,
+        node_keys: Collection[str],
+        *,
+        uses_gpu: bool,
+        depth: int,
+        unblocking_span: int,
+        limit: int,
+    ) -> tuple[TaskDispatchDescriptor, ...]:
+        """Load one bounded graph/resource window from durable Task policy."""
+        if limit < 1:
+            raise ValueError("dispatch descriptor limit must be positive")
+        ordered_keys = tuple(dict.fromkeys(node_keys))
+        if not ordered_keys:
+            return ()
+        placeholders = ", ".join("?" for _ in ordered_keys)
+        rows = self._connection.execute(
+            f"""
+            SELECT task.*, node.ordinal AS node_ordinal
+            FROM execution_tasks AS task
+            JOIN execution_nodes AS node
+                ON node.execution_run_id = task.execution_run_id
+                AND node.node_key = task.node_key
+            WHERE task.execution_run_id = ?
+                AND task.node_key IN ({placeholders})
+                AND node.status = ?
+                AND node.discovery_complete = 1
+                AND task.status = ?
+                AND task.result_observation = ?
+                AND task.dispatch_policy_json IS NOT NULL
+                AND json_extract(
+                    task.dispatch_policy_json,
+                    '$.binding.uses_gpu'
+                ) = ?
+            ORDER BY node.ordinal, task.ordinal
+            LIMIT ?
+            """,  # noqa: S608 - placeholders are generated, not user input
+            (
+                str(execution_run_id),
+                *ordered_keys,
+                NodeStatus.RUNNING.value,
+                TaskStatus.PENDING.value,
+                AvailabilityStatus.MISSING.value,
+                int(uses_gpu),
+                limit,
+            ),
+        ).fetchall()
+        return tuple(
+            _task_dispatch_descriptor_from_row(
+                row,
+                depth=depth,
+                unblocking_span=unblocking_span,
+            )
+            for row in rows
+        )
+
     def get_task(
         self,
         execution_run_id: UUID,
@@ -3500,6 +3679,31 @@ def _task_dispatch_descriptor_from_policy(
         max_tasks_per_call=value["max_tasks_per_call"],
         depth=descriptor.depth,
         unblocking_span=descriptor.unblocking_span,
+    )
+
+
+def _task_dispatch_descriptor_from_row(
+    row: sqlite3.Row,
+    *,
+    depth: int,
+    unblocking_span: int,
+) -> TaskDispatchDescriptor:
+    policy_json = row["dispatch_policy_json"]
+    if policy_json is None:
+        raise RuntimeError("ready fixed Task has no dispatch policy")
+    value = orjson.loads(policy_json)
+    if value.get("mode") != DispatchMode.FIXED_BATCH.value:
+        raise RuntimeError("stored fixed-batch dispatch policy is invalid")
+    return TaskDispatchDescriptor(
+        node_key=row["node_key"],
+        node_ordinal=row["node_ordinal"],
+        task_key=row["task_key"],
+        task_ordinal=row["ordinal"],
+        binding=_binding_from_json_value(value["binding"]),
+        compatibility_key=value["compatibility_key"],
+        max_tasks_per_call=value["max_tasks_per_call"],
+        depth=depth,
+        unblocking_span=unblocking_span,
     )
 
 

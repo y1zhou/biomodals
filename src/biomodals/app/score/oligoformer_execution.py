@@ -745,42 +745,60 @@ class OligoformerExecutionRuntime(ExecutionRuntimeLifecycle):
             repository = self.store.execution
             run = repository.get_run(self.execution_run_id)
             counts = repository.active_provider_call_counts(self.execution_run_id)
-            calls = repository.list_provider_calls(self.execution_run_id)
-        ordered = self._provider.fixed_call_candidates(
-            self.execution_run_id,
-            required_node_keys=required,
-            describe_task=lambda node, task, rank: TaskDispatchDescriptor(
-                node_key=node.node_key,
-                node_ordinal=node.ordinal,
-                task_key=task.task_key,
-                task_ordinal=task.ordinal,
-                binding=self._binding(node.node_key),
-                compatibility_key=self._binding(node.node_key).function_name,
-                max_tasks_per_call=1,
-                depth=rank.depth,
-                unblocking_span=rank.unblocking_span,
-            ),
-            available_total_slots=None,
-            available_gpu_slots=max(
-                0,
-                run.max_active_gpu_provider_calls - counts.gpu,
-            ),
-            now=self._now(),
-        )
         available_total = max(0, run.max_active_provider_calls - counts.total)
-        active_by_node = Counter(
-            call.node_key for call in calls if not call.status.is_terminal
-        )
-        selected = []
-        for candidate in ordered:
-            if len(selected) >= available_total:
+        if available_total == 0:
+            return
+        with self.store.synchronize():
+            active_by_node = Counter({
+                node_key: self.store.execution.provider_call_counts_for_node(
+                    self.execution_run_id,
+                    node_key,
+                )[1]
+                for node_key in required
+            })
+        candidate_node_keys = {
+            node_key
+            for node_key in required
+            if active_by_node[node_key] < self._node_call_limit(node_key)
+        }
+        window_size = available_total
+        while True:
+            ordered = self._provider.fixed_call_candidates(
+                self.execution_run_id,
+                required_node_keys=required,
+                candidate_node_keys=candidate_node_keys,
+                describe_task=lambda node, task, rank: TaskDispatchDescriptor(
+                    node_key=node.node_key,
+                    node_ordinal=node.ordinal,
+                    task_key=task.task_key,
+                    task_ordinal=task.ordinal,
+                    binding=self._binding(node.node_key),
+                    compatibility_key=self._binding(node.node_key).function_name,
+                    max_tasks_per_call=1,
+                    depth=rank.depth,
+                    unblocking_span=rank.unblocking_span,
+                ),
+                available_total_slots=window_size,
+                available_gpu_slots=max(
+                    0,
+                    run.max_active_gpu_provider_calls - counts.gpu,
+                ),
+                now=self._now(),
+            )
+            admitted_by_node = active_by_node.copy()
+            selected = []
+            for candidate in ordered:
+                if len(selected) >= available_total:
+                    break
+                if admitted_by_node[candidate.node_key] >= self._node_call_limit(
+                    candidate.node_key
+                ):
+                    continue
+                selected.append(candidate)
+                admitted_by_node[candidate.node_key] += 1
+            if len(selected) == available_total or len(ordered) < window_size:
                 break
-            if active_by_node[candidate.node_key] >= self._node_call_limit(
-                candidate.node_key
-            ):
-                continue
-            selected.append(candidate)
-            active_by_node[candidate.node_key] += 1
+            window_size *= 2
         for candidate in selected:
             self._ensure_publication_claim(
                 candidate.node_key,

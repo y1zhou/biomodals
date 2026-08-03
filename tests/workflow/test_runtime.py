@@ -81,6 +81,11 @@ class RemoteTextNode(RemoteWorkflowNode):
 @dataclass
 class RemoteFanoutNode(RemoteTaskWorkflowNode):
     texts: tuple[str, ...]
+    prepare_calls: list[str] = field(
+        default_factory=list,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
     finalized_results: list[tuple[tuple[str, ...], tuple[str, ...]]] = field(
         default_factory=list,
         repr=False,
@@ -105,6 +110,7 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
         context: NodeRunContext,
         task: RemoteWorkflowTask,
     ) -> RemoteNodeCall:
+        self.prepare_calls.append(task.task_key)
         payload = dict(task.execution_payload)
         return RemoteNodeCall(
             function_name="run_candidate",
@@ -800,6 +806,37 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
     assert {
         artifact.artifact_id for artifact in downstream.seen[0].inputs["candidates"]
     }.issuperset(task_artifact_ids)
+
+
+def test_remote_task_admission_reuses_persisted_dispatch_policy(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("bounded-fanout")
+    node = RemoteFanoutNode(tuple(f"value-{index}" for index in range(20)))
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=FanoutModalDriver(),
+        max_calls=2,
+        max_gpu_calls=0,
+    )
+    runtime._initialize("bounded-fanout")
+
+    runtime.advance_once()
+
+    assert len(node.prepare_calls) == 22
+    node.prepare_calls.clear()
+
+    runtime.advance_once()
+
+    assert node.prepare_calls == [
+        "candidate-0",
+        "candidate-1",
+        "candidate-2",
+        "candidate-3",
+    ]
+    runtime.close()
 
 
 def test_remote_task_node_batches_compatible_tasks_into_one_call(

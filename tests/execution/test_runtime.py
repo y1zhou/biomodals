@@ -239,6 +239,75 @@ def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
     assert [candidate.task_keys for candidate in candidates] == [("seed-0",)]
 
 
+def test_fixed_candidate_policy_is_prepared_once_then_admitted_in_windows() -> None:
+    repository = create_repository(
+        task_count=100,
+        max_active_provider_calls=100,
+        max_active_gpu_provider_calls=100,
+    )
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: None,
+    )
+    described: list[str] = []
+
+    def descriptor(node, task, rank: NodeAdmissionRank):
+        described.append(task.task_key)
+        return TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+            max_tasks_per_call=1,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
+        )
+
+    first = runtime.fixed_call_candidates(
+        RUN_ID,
+        required_node_keys={"inference"},
+        describe_task=descriptor,
+        available_total_slots=2,
+        available_gpu_slots=2,
+        now=110,
+    )
+    for candidate in first:
+        preclaim = repository.preclaim_fixed_batch(
+            RUN_ID,
+            candidate.node_key,
+            candidate.task_keys,
+            submission_token=candidate.candidate_key,
+            binding=candidate.binding,
+            compatibility_key=candidate.compatibility_key,
+            max_tasks_per_call=candidate.max_tasks_per_call,
+            now=111,
+        )
+        assert preclaim is not None
+
+    described.clear()
+    second = runtime.fixed_call_candidates(
+        RUN_ID,
+        required_node_keys={"inference"},
+        describe_task=descriptor,
+        available_total_slots=2,
+        available_gpu_slots=2,
+        now=120,
+    )
+
+    assert [candidate.task_keys for candidate in first] == [
+        ("seed-0",),
+        ("seed-1",),
+    ]
+    assert [candidate.task_keys for candidate in second] == [
+        ("seed-2",),
+        ("seed-3",),
+    ]
+    assert described == []
+
+
 def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

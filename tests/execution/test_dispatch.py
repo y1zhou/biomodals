@@ -165,6 +165,31 @@ def test_fixed_batch_policy_is_durable_and_immutable_within_a_run() -> None:
         )
 
 
+def test_fixed_batch_policy_validates_tasks_with_bulk_queries() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=100)
+    descriptors = tuple(
+        replace(_task(f"seed-{index}", index), node_ordinal=0) for index in range(100)
+    )
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    repository.persist_fixed_dispatch_policy(RUN_ID, descriptors, now=110)
+    connection.set_trace_callback(None)
+
+    node_selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+        and "FROM execution_nodes" in statement
+    ]
+    task_selects = [
+        statement for statement in statements if "FROM execution_tasks" in statement
+    ]
+    assert len(node_selects) == 1
+    assert len(task_selects) == 1
+
+
 def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(connection=connection, task_count=3)

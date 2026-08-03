@@ -17,6 +17,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     DispatchMode,
+    ExecutionNodeRecord,
     ExecutionRuntime,
     ExecutionTaskRecord,
     NodeAggregationPolicy,
@@ -41,9 +42,9 @@ from biomodals.execution import (
 from biomodals.execution.modal import ModalCallDriver
 from biomodals.execution.runtime import ModalDriver
 from biomodals.execution.scheduler import (
+    NodeAdmissionRank,
     PullWorkerDispatchDescriptor,
     TaskDispatchDescriptor,
-    form_fixed_batches,
     form_pull_worker_candidates,
     required_node_ranks,
     select_admissible_candidates,
@@ -888,11 +889,17 @@ class WorkflowRuntime:
                 node.node_key: node
                 for node in repository.list_nodes(run.execution_run_id)
             }
-            calls = repository.list_provider_calls(self.execution_run_id)
-            tasks_by_node = {
-                node_id: repository.list_tasks(self.execution_run_id, node_id)
-                for node_id in nodes
-            }
+            counts = repository.active_provider_call_counts(self.execution_run_id)
+        available_total_slots = max(
+            0,
+            run.max_active_provider_calls - counts.total,
+        )
+        available_gpu_slots = max(
+            0,
+            run.max_active_gpu_provider_calls - counts.gpu,
+        )
+        if available_total_slots == 0:
+            return
         unfinished = {
             node.node_key for node in nodes.values() if not node.status.is_terminal
         }
@@ -901,8 +908,7 @@ class WorkflowRuntime:
             required_node_keys=required,
             unfinished_node_keys=unfinished,
         )
-        invocations: dict[tuple[str, str], RemoteNodeCall] = {}
-        descriptors: list[TaskDispatchDescriptor] = []
+        fixed_node_keys: set[str] = set()
         pull_invocations: dict[str, RemotePullWorkerCall] = {}
         pull_descriptors: list[PullWorkerDispatchDescriptor] = []
         for node_id, node_record in nodes.items():
@@ -935,16 +941,17 @@ class WorkflowRuntime:
                     uses_gpu=invocation.uses_gpu,
                     runtime_image_key=invocation.runtime_image_key,
                 )
-                node_calls = [
-                    call
-                    for call in calls
-                    if call.node_key == node_id
-                    and call.dispatch_mode == DispatchMode.PULL_WORKER
-                ]
-                unfinished_task_count = sum(
-                    task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
-                    for task in tasks_by_node[node_id]
-                )
+                with self.store.synchronize():
+                    unfinished_task_count = self.store.execution.unfinished_task_count(
+                        self.execution_run_id,
+                        node_id,
+                    )
+                    total_workers, nonterminal_workers = (
+                        self.store.execution.provider_call_counts_for_node(
+                            self.execution_run_id,
+                            node_id,
+                        )
+                    )
                 pull_invocations[node_id] = invocation
                 pull_descriptors.append(
                     PullWorkerDispatchDescriptor(
@@ -956,85 +963,86 @@ class WorkflowRuntime:
                         ),
                         claim_capacity=invocation.claim_capacity,
                         unfinished_task_count=unfinished_task_count,
-                        nonterminal_worker_count=sum(
-                            not call.status.is_terminal for call in node_calls
-                        ),
-                        next_worker_ordinal=len(node_calls),
+                        nonterminal_worker_count=nonterminal_workers,
+                        next_worker_ordinal=total_workers,
                         depth=rank.depth,
                         unblocking_span=rank.unblocking_span,
                     )
                 )
                 continue
-            for task in tasks_by_node[node_id]:
-                if (
-                    task.status != TaskStatus.PENDING
-                    or task.result_observation != AvailabilityStatus.MISSING
-                ):
-                    continue
-                try:
-                    if isinstance(node, RemoteTaskWorkflowNode):
-                        invocation = node.prepare_remote_task(
-                            self._node_context(
-                                definition,
-                                node_id,
-                                task_key=task.task_key,
-                            ),
-                            RemoteWorkflowTask(
-                                task_key=task.task_key,
-                                scientific_payload=task.scientific_payload,
-                                execution_payload=task.execution_payload,
-                            ),
-                        )
-                        _json_value(_execution_payload(invocation))
-                    else:
-                        invocation = node.prepare_remote(
-                            self._node_context(definition, node_id)
-                        )
-                        payload = _json_value(_execution_payload(invocation))
-                        if payload != task.execution_payload:
-                            raise ValueError(
-                                "Remote Node preparation changed after Task discovery"
-                            )
-                except Exception as error:
-                    self._fail_discovered_task(
-                        node_id,
-                        task.task_key,
-                        f"Could not prepare provider call: {error}",
-                    )
-                    continue
-                rank = ranks[node_id]
-                binding = ProviderBinding(
-                    environment=run.deployment.environment,
-                    app_name=run.deployment.deployment_name,
-                    app_version=run.deployment.deployment_version,
-                    function_name=invocation.function_name,
-                    uses_gpu=invocation.uses_gpu,
-                    runtime_image_key=invocation.runtime_image_key,
-                )
-                invocations[(node_id, task.task_key)] = invocation
-                descriptors.append(
-                    TaskDispatchDescriptor(
-                        node_key=node_id,
-                        node_ordinal=node_record.ordinal,
-                        task_key=task.task_key,
-                        task_ordinal=task.ordinal,
-                        binding=binding,
-                        compatibility_key=(
-                            invocation.compatibility_key or invocation.function_name
-                        ),
-                        max_tasks_per_call=invocation.max_tasks_per_call,
-                        depth=rank.depth,
-                        unblocking_span=rank.unblocking_span,
-                    )
-                )
+            fixed_node_keys.add(node_id)
 
-        descriptors = list(
-            self._provider.persist_fixed_dispatch_policy(
-                self.execution_run_id,
-                tuple(descriptors),
-                now=self._now(),
+        def describe_task(
+            node_record: ExecutionNodeRecord,
+            task: ExecutionTaskRecord,
+            rank: NodeAdmissionRank,
+        ) -> TaskDispatchDescriptor | None:
+            node = definition.nodes[node_record.node_key].node
+            try:
+                if isinstance(node, RemoteTaskWorkflowNode):
+                    invocation = node.prepare_remote_task(
+                        self._node_context(
+                            definition,
+                            node_record.node_key,
+                            task_key=task.task_key,
+                        ),
+                        RemoteWorkflowTask(
+                            task_key=task.task_key,
+                            scientific_payload=task.scientific_payload,
+                            execution_payload=task.execution_payload,
+                        ),
+                    )
+                    _json_value(_execution_payload(invocation))
+                elif isinstance(node, RemoteWorkflowNode):
+                    invocation = node.prepare_remote(
+                        self._node_context(definition, node_record.node_key)
+                    )
+                    payload = _json_value(_execution_payload(invocation))
+                    if payload != task.execution_payload:
+                        raise ValueError(
+                            "Remote Node preparation changed after Task discovery"
+                        )
+                else:  # pragma: no cover - filtered by fixed_node_keys
+                    raise TypeError("Fixed dispatch requires a remote workflow Node")
+            except Exception as error:
+                self._fail_discovered_task(
+                    node_record.node_key,
+                    task.task_key,
+                    f"Could not prepare provider call: {error}",
+                )
+                return None
+            binding = ProviderBinding(
+                environment=run.deployment.environment,
+                app_name=run.deployment.deployment_name,
+                app_version=run.deployment.deployment_version,
+                function_name=invocation.function_name,
+                uses_gpu=invocation.uses_gpu,
+                runtime_image_key=invocation.runtime_image_key,
             )
+            return TaskDispatchDescriptor(
+                node_key=node_record.node_key,
+                node_ordinal=node_record.ordinal,
+                task_key=task.task_key,
+                task_ordinal=task.ordinal,
+                binding=binding,
+                compatibility_key=(
+                    invocation.compatibility_key or invocation.function_name
+                ),
+                max_tasks_per_call=invocation.max_tasks_per_call,
+                depth=rank.depth,
+                unblocking_span=rank.unblocking_span,
+            )
+
+        fixed_candidates = self._provider.fixed_call_candidates(
+            self.execution_run_id,
+            required_node_keys=required,
+            candidate_node_keys=fixed_node_keys,
+            describe_task=describe_task,
+            available_total_slots=available_total_slots,
+            available_gpu_slots=available_gpu_slots,
+            now=self._now(),
         )
+
         pull_descriptors = [
             self._provider.persist_pull_worker_dispatch_policy(
                 self.execution_run_id,
@@ -1043,23 +1051,13 @@ class WorkflowRuntime:
             )
             for descriptor in pull_descriptors
         ]
-        with self.store.synchronize():
-            counts = self.store.execution.active_provider_call_counts(
-                self.execution_run_id
-            )
         selected = select_admissible_candidates(
             (
-                *form_fixed_batches(tuple(descriptors)),
+                *fixed_candidates,
                 *form_pull_worker_candidates(tuple(pull_descriptors)),
             ),
-            available_total_slots=max(
-                0,
-                run.max_active_provider_calls - counts.total,
-            ),
-            available_gpu_slots=max(
-                0,
-                run.max_active_gpu_provider_calls - counts.gpu,
-            ),
+            available_total_slots=available_total_slots,
+            available_gpu_slots=available_gpu_slots,
         )
         submissions = []
         for candidate in selected:
@@ -1089,32 +1087,62 @@ class WorkflowRuntime:
                     )
                 )
                 continue
-            if len(candidate.task_keys) == 1:
-                invocation = invocations[(candidate.node_key, candidate.task_keys[0])]
-            elif isinstance(node, RemoteTaskWorkflowNode):
-                task_definitions = tuple(
-                    RemoteWorkflowTask(
-                        task_key=task.task_key,
-                        scientific_payload=task.scientific_payload,
-                        execution_payload=task.execution_payload,
+
+            with self.store.synchronize():
+                tasks = tuple(
+                    self.store.execution.get_task(
+                        self.execution_run_id,
+                        candidate.node_key,
+                        task_key,
                     )
                     for task_key in candidate.task_keys
-                    for task in (
-                        next(
-                            task
-                            for task in tasks_by_node[candidate.node_key]
-                            if task.task_key == task_key
-                        ),
+                )
+            try:
+                if isinstance(node, RemoteTaskWorkflowNode):
+                    task_definitions = tuple(
+                        RemoteWorkflowTask(
+                            task_key=task.task_key,
+                            scientific_payload=task.scientific_payload,
+                            execution_payload=task.execution_payload,
+                        )
+                        for task in tasks
                     )
-                )
-                invocation = node.prepare_remote_task_batch(
-                    self._node_context(
-                        definition,
-                        candidate.node_key,
-                        task_key=candidate.task_keys[0],
-                    ),
-                    task_definitions,
-                )
+                    if len(task_definitions) == 1:
+                        invocation = node.prepare_remote_task(
+                            self._node_context(
+                                definition,
+                                candidate.node_key,
+                                task_key=task_definitions[0].task_key,
+                            ),
+                            task_definitions[0],
+                        )
+                    else:
+                        invocation = node.prepare_remote_task_batch(
+                            self._node_context(
+                                definition,
+                                candidate.node_key,
+                                task_key=task_definitions[0].task_key,
+                            ),
+                            task_definitions,
+                        )
+                elif isinstance(node, RemoteWorkflowNode):
+                    if len(tasks) != 1:  # pragma: no cover - scheduler contract
+                        raise RuntimeError(
+                            "Only remote Task Nodes may own batched calls"
+                        )
+                    invocation = node.prepare_remote(
+                        self._node_context(definition, candidate.node_key)
+                    )
+                    if (
+                        _json_value(_execution_payload(invocation))
+                        != tasks[0].execution_payload
+                    ):
+                        raise ValueError(
+                            "Remote Node preparation changed after Task discovery"
+                        )
+                else:  # pragma: no cover - scheduler contract
+                    raise TypeError("Fixed dispatch requires a remote workflow Node")
+
                 invocation_binding = ProviderBinding(
                     environment=run.deployment.environment,
                     app_name=run.deployment.deployment_name,
@@ -1129,15 +1157,18 @@ class WorkflowRuntime:
                     != candidate.compatibility_key
                     or invocation.max_tasks_per_call < len(candidate.task_keys)
                 ):
-                    for task_key in candidate.task_keys:
-                        self._fail_discovered_task(
-                            candidate.node_key,
-                            task_key,
-                            "Batched provider preparation changed its dispatch contract",
-                        )
-                    continue
-            else:  # pragma: no cover - scheduler never batches ordinary Nodes
-                raise RuntimeError("Only remote Task Nodes may own batched calls")
+                    raise ValueError(
+                        "Provider preparation changed its dispatch contract"
+                    )
+            except Exception as error:
+                for task_key in candidate.task_keys:
+                    self._fail_discovered_task(
+                        candidate.node_key,
+                        task_key,
+                        f"Could not prepare provider call: {error}",
+                    )
+                continue
+
             submissions.append(
                 ProviderCallSubmission(
                     candidate=candidate,

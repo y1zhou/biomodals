@@ -1076,9 +1076,6 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
                 / "rosetta_job_manifest.csv"
             ),
             "num_jobs": 1,
-            "worker_count": 1,
-            "claim_capacity": 1,
-            "max_parallel_per_worker": 1,
             "tasks": [task.to_dict()],
         }).decode(),
         encoding="utf-8",
@@ -1170,6 +1167,80 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
     assert finalizer_call.kwargs["outcome_artifacts"] == [outcome_artifact]
 
 
+def test_rosetta_worker_policy_uses_current_config_for_reused_plan(
+    tmp_path: Path,
+) -> None:
+    tasks = [
+        ppiflow_workflow.RosettaTaskSpec(
+            task_key=f"candidate-{index}",
+            index=index,
+            binary="relax",
+            pdb=f"inputs/{index}/candidate.pdb",
+            rosetta_script=None,
+            flags_file=None,
+            output_dir=f"outputs/{index}",
+            worker_log=f"logs/{index}.log",
+            expected_files=(f"outputs/{index}/score.sc",),
+            input_sha256=f"{index:064x}",
+            candidate_id=f"candidate-{index}",
+        )
+        for index in range(1, 101)
+    ]
+    plan_path = tmp_path / "rosetta-plan.json"
+    plan_path.write_bytes(
+        orjson.dumps({
+            "schema_version": 1,
+            "run_name": "rosetta-run",
+            "run_id": "rosetta-id",
+            "run_root": "/rosetta/rosetta-run-rosetta-id",
+            "job_manifest": "/rosetta/rosetta-run-rosetta-id/jobs.csv",
+            "num_jobs": len(tasks),
+            "tasks": [task.to_dict() for task in tasks],
+        })
+    )
+    plan_artifact = WorkflowArtifact(
+        artifact_id="rosetta-plan",
+        producing_node_id="prepare",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=plan_path.name,
+            media_type="application/json",
+        ),
+    )
+    context = NodeRunContext(
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
+        node_id="workers",
+        task_key="node",
+        work_dir=tmp_path / "result",
+        cache_dir=tmp_path / "cache",
+        inputs={"rosetta_plan": [plan_artifact]},
+        volume_root=tmp_path,
+        workflow_volume_name="workflow-volume",
+    )
+
+    predecessor = ppiflow_workflow.RosettaWorkerNode(
+        "RosettaRelaxStep",
+        {"max_num_pods": 4},
+    ).prepare_pull_worker(context)
+    successor = ppiflow_workflow.RosettaWorkerNode(
+        "RosettaRelaxStep",
+        {"max_num_pods": 1},
+    ).prepare_pull_worker(context)
+
+    assert (
+        predecessor.max_worker_calls,
+        predecessor.claim_capacity,
+        predecessor.kwargs["max_parallel"],
+    ) == (4, 25, 25)
+    assert (
+        successor.max_worker_calls,
+        successor.claim_capacity,
+        successor.kwargs["max_parallel"],
+    ) == (1, 30, 30)
+
+
 def test_rosetta_prepare_publishes_deterministic_task_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1215,8 +1286,8 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     assert isinstance(output.storage, InlineBytes)
     plan = orjson.loads(output.storage.data)
     assert plan["num_jobs"] == 2
-    assert plan["worker_count"] == 1
-    assert plan["claim_capacity"] == 2
+    assert "worker_count" not in plan
+    assert "claim_capacity" not in plan
     assert [task["candidate_id"] for task in plan["tasks"]] == ["a", "b"]
     assert [task["index"] for task in plan["tasks"]] == [1, 2]
     assert [task["input_sha256"] for task in plan["tasks"]] == [
@@ -1382,9 +1453,6 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
             "run_root": str(run_root),
             "num_jobs": 2,
             "job_manifest": str(job_manifest),
-            "worker_count": 1,
-            "claim_capacity": 2,
-            "max_parallel_per_worker": 2,
             "tasks": [task.to_dict() for task in tasks],
         }).decode(),
         encoding="utf-8",

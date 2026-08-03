@@ -1073,14 +1073,6 @@ def _load_rosetta_plan(path: Path) -> dict[str, object]:
     specs = tuple(RosettaTaskSpec.from_dict(task) for task in tasks)
     if len(specs) != value.get("num_jobs"):
         raise ValueError("PPIFlow Rosetta Task count does not match its plan")
-    for field_name in (
-        "worker_count",
-        "claim_capacity",
-        "max_parallel_per_worker",
-    ):
-        field_value = value.get(field_name)
-        if not isinstance(field_value, int) or field_value < 1:
-            raise ValueError(f"PPIFlow Rosetta {field_name} must be positive")
     return cast(dict[str, object], value)
 
 
@@ -1230,10 +1222,6 @@ def prepare_ppiflow_rosetta_stage(
         rosetta_rows,
         layout.run_root / "rosetta_job_manifest.csv",
     )
-    worker_count, claim_capacity, max_parallel = _rosetta_worker_policy(
-        len(task_specs),
-        config,
-    )
     plan: dict[str, object] = {
         "schema_version": _ROSETTA_PLAN_SCHEMA_VERSION,
         "run_name": safe_run_name,
@@ -1241,9 +1229,6 @@ def prepare_ppiflow_rosetta_stage(
         "run_root": str(layout.run_root),
         "job_manifest": str(job_manifest),
         "num_jobs": len(task_specs),
-        "worker_count": worker_count,
-        "claim_capacity": claim_capacity,
-        "max_parallel_per_worker": max_parallel,
         "tasks": [task.to_dict() for task in task_specs],
     }
     ROSETTA_OUTPUT_VOLUME.commit()
@@ -1252,7 +1237,6 @@ def prepare_ppiflow_rosetta_stage(
         outputs=[_rosetta_plan_artifact(plan)],
         metrics={
             "staged_candidates": len(task_specs),
-            "worker_count": worker_count,
         },
     )
 
@@ -1993,6 +1977,10 @@ def finalize_ppiflow_rosetta_stage(
     task_specs = tuple(
         RosettaTaskSpec.from_dict(task) for task in cast(list[object], plan["tasks"])
     )
+    worker_count, _claim_capacity, _max_parallel = _rosetta_worker_policy(
+        len(task_specs),
+        config,
+    )
     expected_task_keys = {task.task_key for task in task_specs}
     if succeeded_tasks | task_errors.keys() != expected_task_keys:
         raise ValueError("Rosetta Task outcomes do not match the staged plan")
@@ -2052,7 +2040,7 @@ def finalize_ppiflow_rosetta_stage(
                 ],
                 summary={
                     "index": row["index"],
-                    "num_pods": _config_int(plan, "worker_count", 0),
+                    "num_pods": worker_count,
                 },
             )
         )
@@ -2079,7 +2067,7 @@ def finalize_ppiflow_rosetta_stage(
                     "run_name": str(plan["run_name"]),
                     "run_id": str(plan["run_id"]),
                     "num_jobs": _config_int(plan, "num_jobs", 0),
-                    "num_pods": _config_int(plan, "worker_count", 0),
+                    "num_pods": worker_count,
                     "structure_patterns": APP_RUN_OUTPUT_STRUCTURE_PATTERNS,
                 },
             ),
@@ -2601,20 +2589,20 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
     ) -> RemotePullWorkerCall:
         """Bind the derived worker pool to the workflow's Rosetta function."""
         plan = self._plan(context)
+        worker_count, claim_capacity, max_parallel = _rosetta_worker_policy(
+            len(cast(list[object], plan["tasks"])),
+            self.config,
+        )
         return RemotePullWorkerCall(
             function_name="run_ppiflow_rosetta_worker",
             uses_gpu=False,
-            claim_capacity=_config_int(plan, "claim_capacity", 0),
-            max_worker_calls=_config_int(plan, "worker_count", 0),
+            claim_capacity=claim_capacity,
+            max_worker_calls=worker_count,
             kwargs={
                 "run_name": str(plan["run_name"]),
                 "run_id": str(plan["run_id"]),
-                "claim_capacity": _config_int(plan, "claim_capacity", 0),
-                "max_parallel": _config_int(
-                    plan,
-                    "max_parallel_per_worker",
-                    0,
-                ),
+                "claim_capacity": claim_capacity,
+                "max_parallel": max_parallel,
             },
             runtime_image_key="rosetta-cpu",
             compatibility_key=f"{plan['run_name']}:{plan['run_id']}",

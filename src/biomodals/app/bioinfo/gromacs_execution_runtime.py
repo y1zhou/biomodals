@@ -178,16 +178,6 @@ def load_execution_request(
     )
 
 
-def load_execution_request_from_volume(
-    output_volume: Any,
-    execution_run_id: UUID,
-) -> GromacsExecutionRequest:
-    """Load one request through Modal's Volume API."""
-    return GromacsExecutionRequest.from_bytes(
-        _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
-    )
-
-
 class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
     """Drive one direct GROMACS request through fixed one-Task calls."""
 

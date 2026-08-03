@@ -680,8 +680,10 @@ def test_coordinator_launch_restart_forwards_candidate_bytes() -> None:
     captured: dict[str, object] = {}
 
     class Adapter:
-        def restart(self, **kwargs):
+        def prepare_restart(self, **kwargs):
             captured.update(kwargs)
+
+        def drive_prepared(self):
             return "snapshot"
 
     raw_cls = alphafold3_app.ExecutionCoordinator._get_user_cls()

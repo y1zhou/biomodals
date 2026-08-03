@@ -17,7 +17,6 @@ from biomodals.app.bioinfo.rosetta.execution_runtime import (
 )
 from biomodals.execution import (
     DeploymentIdentity,
-    ExecutionSnapshot,
     PullTaskClaim,
 )
 from biomodals.helper.app_execution import (
@@ -104,27 +103,6 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             request_id=request_id,
             result=result,
         )
-
-    def restart(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        max_active_provider_calls: int | None = None,
-        claim_capacity: int | None = None,
-        max_parallel_per_worker: int | None = None,
-        expected_workload_plan_fingerprint: str | None = None,
-    ) -> ExecutionSnapshot:
-        """Create a compatible Successor from conclusive predecessor state."""
-        self.prepare_restart(
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            predecessor_deployment=predecessor_deployment,
-            max_active_provider_calls=max_active_provider_calls,
-            claim_capacity=claim_capacity,
-            max_parallel_per_worker=max_parallel_per_worker,
-            expected_workload_plan_fingerprint=expected_workload_plan_fingerprint,
-        )
-        return self.drive_prepared()
 
     def prepare_restart(
         self,

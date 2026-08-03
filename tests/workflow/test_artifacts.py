@@ -18,6 +18,7 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow.core.artifact_availability import (
+    ArtifactAvailability,
     check_artifact_availability,
     mounted_volume_checker,
 )
@@ -251,7 +252,7 @@ def test_typed_artifact_availability_reports_unknown_when_checker_fails(
         ),
     )
 
-    def broken_checker(_artifact: WorkflowArtifact) -> list[str]:
+    def broken_checker(_artifact: WorkflowArtifact) -> ArtifactAvailability:
         raise RuntimeError("volume unavailable")
 
     availability = check_artifact_availability(

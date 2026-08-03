@@ -263,12 +263,13 @@ def test_restart_links_a_new_ledger_and_only_changes_operational_limits(
         deployment=SUCCESSOR_DEPLOYMENT,
     )
 
-    snapshot = coordinator.restart(
+    coordinator.prepare_restart(
         predecessor_execution_run_id=PREDECESSOR_ID,
         predecessor_deployment=DEPLOYMENT,
         max_active_provider_calls=3,
         max_active_gpu_provider_calls=2,
     )
+    snapshot = coordinator.drive_prepared()
 
     assert snapshot.run.predecessor_execution_run_id == PREDECESSOR_ID
     assert snapshot.run.plan == request.execution_plan
@@ -307,11 +308,12 @@ def test_launch_restart_uses_candidate_operational_limits(
         deployment=SUCCESSOR_DEPLOYMENT,
     )
 
-    snapshot = coordinator.restart(
+    coordinator.prepare_restart(
         predecessor_execution_run_id=PREDECESSOR_ID,
         predecessor_deployment=None,
         candidate_request=candidate_request,
     )
+    snapshot = coordinator.drive_prepared()
 
     assert snapshot.run.plan == predecessor_request.execution_plan
     assert snapshot.run.max_active_provider_calls == 4
@@ -343,7 +345,7 @@ def test_launch_restart_rejects_changed_science_before_creating_state(
     )
 
     with pytest.raises(ValueError, match="Workload Plan Fingerprint"):
-        coordinator.restart(
+        coordinator.prepare_restart(
             predecessor_execution_run_id=PREDECESSOR_ID,
             predecessor_deployment=None,
             candidate_request=candidate_request,

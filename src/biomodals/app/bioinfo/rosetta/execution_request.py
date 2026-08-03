@@ -119,11 +119,6 @@ class RosettaExecutionRequest:
         )
 
 
-def request_relative_path(execution_run_id: UUID) -> PurePosixPath:
-    """Return this App Run's reserved immutable request path."""
-    return _REQUEST_FILE.path(execution_run_id)
-
-
 def stage_execution_request(
     output_volume: Any,
     execution_run_id: UUID,

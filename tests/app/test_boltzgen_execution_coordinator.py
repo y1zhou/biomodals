@@ -277,7 +277,7 @@ def test_restart_links_successor_and_preserves_scientific_plan(
         deployment=SUCCESSOR_DEPLOYMENT,
     )
 
-    snapshot = coordinator.restart(
+    coordinator.prepare_restart(
         predecessor_execution_run_id=PREDECESSOR_ID,
         predecessor_deployment=DEPLOYMENT,
         max_active_provider_calls=2,
@@ -286,6 +286,7 @@ def test_restart_links_successor_and_preserves_scientific_plan(
             request.execution_plan.workload_plan_fingerprint
         ),
     )
+    snapshot = coordinator.drive_prepared()
 
     assert snapshot.run.predecessor_execution_run_id == PREDECESSOR_ID
     assert snapshot.run.plan == request.execution_plan
@@ -311,7 +312,7 @@ def test_launch_time_restart_rejects_changed_science(
     )
 
     with pytest.raises(ValueError, match="changed the Workload Plan Fingerprint"):
-        coordinator.restart(
+        coordinator.prepare_restart(
             predecessor_execution_run_id=PREDECESSOR_ID,
             predecessor_deployment=DEPLOYMENT,
             expected_workload_plan_fingerprint="different",

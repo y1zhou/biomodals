@@ -18,7 +18,6 @@ from biomodals.execution import (
     DeploymentIdentity,
     ExecutionPlan,
     ExecutionRuntime,
-    ExecutionSnapshot,
     NodeDependency,
     NodePlan,
     ProviderBinding,
@@ -207,16 +206,6 @@ def load_execution_request(
     """Load one request inside the mounted coordinator."""
     return EnsirnaExecutionRequest.from_bytes(
         _REQUEST_FILE.load(volume_root, execution_run_id)
-    )
-
-
-def load_execution_request_from_volume(
-    output_volume: Any,
-    execution_run_id: UUID,
-) -> EnsirnaExecutionRequest:
-    """Load one request through Modal's Volume API."""
-    return EnsirnaExecutionRequest.from_bytes(
-        _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
     )
 
 
@@ -695,27 +684,6 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.output_claims = output_claims
         self.modal_driver = modal_driver
         self.poll_interval_seconds = poll_interval_seconds
-
-    def restart(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-        expected_workload_plan_fingerprint: str | None = None,
-        candidate_request: EnsirnaExecutionRequest | None = None,
-    ) -> ExecutionSnapshot:
-        """Create and drive a compatible Successor from conclusive state."""
-        self.prepare_restart(
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            predecessor_deployment=predecessor_deployment,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-            expected_workload_plan_fingerprint=expected_workload_plan_fingerprint,
-            candidate_request=candidate_request,
-        )
-        return self.drive_prepared()
 
     def prepare_restart(
         self,

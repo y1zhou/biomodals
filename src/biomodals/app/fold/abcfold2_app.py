@@ -810,34 +810,13 @@ class ExecutionCoordinator:
         return self._adapter().drive_prepared()
 
     @modal.method()
-    def restart(
-        self,
-        predecessor_execution_run_id: str,
-        predecessor_deployment_environment: str,
-        predecessor_deployment_name: str,
-        predecessor_deployment_version: int,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-    ) -> ExecutionSnapshot:
-        """Create and drive one compatible Successor Run."""
-        return self._adapter().restart(
-            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
-            predecessor_deployment=DeploymentIdentity(
-                predecessor_deployment_environment,
-                predecessor_deployment_name,
-                predecessor_deployment_version,
-            ),
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-        )
-
-    @modal.method()
     def restart_from(
         self,
         predecessor_execution_run_id: str,
     ) -> ExecutionSnapshot:
         """Create a compatible Successor while inferring predecessor identity."""
-        return self._adapter().restart(
+        adapter = self._adapter()
+        adapter.prepare_restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
             candidate_request=load_execution_request(
@@ -845,6 +824,7 @@ class ExecutionCoordinator:
                 UUID(self.execution_run_id),
             ),
         )
+        return adapter.drive_prepared()
 
     @modal.exit()
     def exit(self) -> None:

@@ -4,7 +4,6 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     ExternalArtifactChecker,
     check_artifact_availability,
-    check_external_artifact_availability,
     check_external_artifact_status,
     mounted_volume_checker,
 )
@@ -46,7 +45,6 @@ __all__ = [
     "WorkflowNode",
     "WorkflowNodeSpec",
     "check_artifact_availability",
-    "check_external_artifact_availability",
     "check_external_artifact_status",
     "mounted_volume_checker",
     "print_workflow_dag",

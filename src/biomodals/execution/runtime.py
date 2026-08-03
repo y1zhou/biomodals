@@ -761,34 +761,6 @@ class ExecutionRuntime:
         """Preflight one exact binding before workload writer coordination."""
         return self._resolve_provider(execution_run_id, binding, now=now)
 
-    def submit_resolved_fixed_batch(
-        self,
-        execution_run_id: UUID,
-        candidate: ProviderCallCandidate,
-        *,
-        function: Any,
-        submission_token: str,
-        args: tuple[Any, ...] = (),
-        kwargs: Mapping[str, Any] | None = None,
-        provider_call_id_kwarg: str | None = None,
-        now: int,
-    ) -> ProviderCallRecord | None:
-        """Preclaim and spawn once using an already hydrated exact binding."""
-        return self.submit_provider_calls(
-            execution_run_id,
-            (
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=submission_token,
-                    args=args,
-                    kwargs={} if kwargs is None else kwargs,
-                    provider_call_id_kwarg=provider_call_id_kwarg,
-                    function=function,
-                ),
-            ),
-            now=now,
-        )[0]
-
     def submit_pull_worker(
         self,
         execution_run_id: UUID,

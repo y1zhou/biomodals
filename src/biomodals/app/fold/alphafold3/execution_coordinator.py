@@ -21,7 +21,6 @@ from biomodals.app.fold.alphafold3.seed_predictions import InferenceRuntime
 from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
 from biomodals.execution import (
     DeploymentIdentity,
-    ExecutionSnapshot,
 )
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
@@ -63,25 +62,6 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.template_runtime = template_runtime
         self.inference_runtime = inference_runtime
         self.poll_interval_seconds = poll_interval_seconds
-
-    def restart(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        candidate_request: AlphaFold3ExecutionRequest | None = None,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-    ) -> ExecutionSnapshot:
-        """Create and drive a compatible Successor Run from conclusive state."""
-        self.prepare_restart(
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            predecessor_deployment=predecessor_deployment,
-            candidate_request=candidate_request,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-        )
-        return self.drive_prepared()
 
     def prepare_restart(
         self,

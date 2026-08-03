@@ -226,3 +226,22 @@ def test_node_call_counts_separate_active_from_selected_history() -> None:
 
     connection.set_trace_callback(None)
     assert len(statements) == statement_count
+
+
+def test_selected_node_call_counts_use_the_node_status_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection)
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT node_key, COUNT(*)
+        FROM execution_provider_calls
+        WHERE execution_run_id = ? AND node_key IN (?, ?)
+        GROUP BY node_key
+        """,
+        (str(RUN_ID), "inference", "other"),
+    ).fetchall()
+
+    assert any(
+        "execution_provider_calls_node_status_idx" in str(row[3]) for row in query_plan
+    )

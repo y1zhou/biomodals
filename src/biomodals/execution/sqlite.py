@@ -47,7 +47,7 @@ from biomodals.execution.scheduler import (
     terminal_run_outcome,
 )
 
-EXECUTION_SCHEMA_VERSION = 4
+EXECUTION_SCHEMA_VERSION = 5
 
 
 class UnsupportedExecutionSchemaVersionError(RuntimeError):
@@ -231,6 +231,10 @@ _SCHEMA_STATEMENTS = (
     ON execution_provider_calls(execution_run_id, status, created_at)
     """,
     """
+    CREATE INDEX execution_provider_calls_node_status_idx
+    ON execution_provider_calls(execution_run_id, node_key, status)
+    """,
+    """
     CREATE TABLE execution_tasks (
         execution_run_id TEXT NOT NULL,
         node_key TEXT NOT NULL,
@@ -316,6 +320,12 @@ _SCHEMA_STATEMENTS = (
         ordinal
     )
     WHERE dispatch_policy_json IS NULL
+    """,
+    """
+    CREATE INDEX execution_tasks_publication_recovery_idx
+    ON execution_tasks(execution_run_id, node_key, ordinal)
+    WHERE status = 'running'
+        OR (status = 'pending' AND result_observation IS NOT 'missing')
     """,
     """
     CREATE TABLE execution_task_claim_requests (
@@ -1818,6 +1828,7 @@ class SqliteExecutionRepository:
                 AND provider_call_id IS NULL
                 AND worker_provider_call_id IS NULL
                 AND local_owned = 0
+                AND dispatch_policy_json IS NULL
             ORDER BY ordinal
             LIMIT ?
             """,
@@ -3068,12 +3079,37 @@ class SqliteExecutionRepository:
         ).fetchall()
         return tuple(_task_from_row(row) for row in rows)
 
-    def unfinished_task_count(
+    def list_tasks_requiring_publication_recovery(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+    ) -> tuple[ExecutionTaskRecord, ...]:
+        """Load nonterminal Tasks whose publications may have changed."""
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND (
+                    status = 'running'
+                    OR (
+                        status = 'pending'
+                        AND result_observation IS NOT 'missing'
+                    )
+                )
+            ORDER BY ordinal
+            """,
+            (str(execution_run_id), node_key),
+        ).fetchall()
+        return tuple(_task_from_row(row) for row in rows)
+
+    def unfinished_pull_task_count(
         self,
         execution_run_id: UUID,
         node_key: str,
     ) -> int:
-        """Count pending and running Tasks without materializing their payloads."""
+        """Count pending and running pull Tasks without decoding payloads."""
         row = self._connection.execute(
             """
             SELECT COUNT(*) AS count
@@ -3081,6 +3117,7 @@ class SqliteExecutionRepository:
             WHERE execution_run_id = ?
                 AND node_key = ?
                 AND status IN (?, ?)
+                AND dispatch_policy_json IS NULL
             """,
             (
                 str(execution_run_id),

@@ -503,7 +503,7 @@ class WorkflowRuntime:
             repository = self.store.execution
             nodes = repository.list_nodes(self.execution_run_id)
             tasks_by_node = {
-                node.node_key: repository.list_tasks(
+                node.node_key: repository.list_tasks_requiring_publication_recovery(
                     self.execution_run_id,
                     node.node_key,
                 )
@@ -547,10 +547,10 @@ class WorkflowRuntime:
                             ),
                         ))
                 else:
-                    task = next(
-                        task
-                        for task in tasks_by_node[node.node_key]
-                        if task.task_key == _TASK_KEY
+                    task = repository.get_task(
+                        self.execution_run_id,
+                        node.node_key,
+                        _TASK_KEY,
                     )
                     if not task.status.is_terminal:
                         observation = observations[node.node_key]
@@ -973,9 +973,11 @@ class WorkflowRuntime:
                     runtime_image_key=invocation.runtime_image_key,
                 )
                 with self.store.synchronize():
-                    unfinished_task_count = self.store.execution.unfinished_task_count(
-                        self.execution_run_id,
-                        node_id,
+                    unfinished_task_count = (
+                        self.store.execution.unfinished_pull_task_count(
+                            self.execution_run_id,
+                            node_id,
+                        )
                     )
                     total_workers, nonterminal_workers = provider_counts_by_node.get(
                         node_id,

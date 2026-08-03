@@ -379,13 +379,9 @@ class ExecutionRuntime:
                     and node.status == NodeStatus.RUNNING
                     and node.discovery_complete
                 )
-                for task in repository.list_tasks(execution_run_id, node.node_key)
-                if (
-                    not task.status.is_terminal
-                    and not (
-                        task.status == TaskStatus.PENDING
-                        and task.result_observation == AvailabilityStatus.MISSING
-                    )
+                for task in repository.list_tasks_requiring_publication_recovery(
+                    execution_run_id,
+                    node.node_key,
                 )
             )
         task_observations = []

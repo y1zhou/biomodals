@@ -27,7 +27,6 @@ from biomodals.execution import (
     ProviderCallSubmission,
     PullTaskClaim,
     TaskPlan,
-    TaskStatus,
     form_pull_worker_candidates,
     ready_node_keys,
 )
@@ -217,7 +216,7 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             return
         specs = self._task_specs()
         with self.store.synchronize():
-            tasks = self.store.execution.list_tasks(
+            tasks = self.store.execution.list_tasks_requiring_publication_recovery(
                 self.execution_run_id,
                 ROSETTA_TASKS_NODE,
             )
@@ -355,14 +354,15 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             repository = self.store.execution
             node = repository.get_node(self.execution_run_id, ROSETTA_TASKS_NODE)
             run = repository.get_run(self.execution_run_id)
-            calls = tuple(
-                call
-                for call in repository.list_provider_calls(self.execution_run_id)
-                if call.node_key == ROSETTA_TASKS_NODE
-            )
-            tasks = repository.list_tasks(
+            unfinished = repository.unfinished_pull_task_count(
                 self.execution_run_id,
                 ROSETTA_TASKS_NODE,
+            )
+            total_workers, nonterminal_workers = (
+                repository.provider_call_counts_by_node(
+                    self.execution_run_id,
+                    (ROSETTA_TASKS_NODE,),
+                ).get(ROSETTA_TASKS_NODE, (0, 0))
             )
         if node.status != NodeStatus.RUNNING or not node.discovery_complete:
             return
@@ -379,9 +379,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             uses_gpu=False,
             runtime_image_key="rosetta-cpu",
         )
-        unfinished = sum(
-            task.status in {TaskStatus.PENDING, TaskStatus.RUNNING} for task in tasks
-        )
         descriptor = PullWorkerDispatchDescriptor(
             node_key=ROSETTA_TASKS_NODE,
             node_ordinal=node.ordinal,
@@ -389,8 +386,8 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             compatibility_key="rosetta-worker",
             claim_capacity=self.request.claim_capacity,
             unfinished_task_count=unfinished,
-            nonterminal_worker_count=sum(not call.status.is_terminal for call in calls),
-            next_worker_ordinal=len(calls),
+            nonterminal_worker_count=nonterminal_workers,
+            next_worker_ordinal=total_workers,
             depth=rank.depth,
             unblocking_span=rank.unblocking_span,
         )

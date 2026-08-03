@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from biomodals.cli import app
+from biomodals.execution import EXECUTION_SCHEMA_VERSION
 from biomodals.service.store import ServiceStore
 
 runner = CliRunner()
@@ -287,7 +288,7 @@ def test_execution_state_transition_replaces_previous_embedded_kernel(
             connection.execute(
                 "SELECT version FROM execution_schema WHERE singleton = 1"
             ).fetchone()[0]
-            == 4
+            == EXECUTION_SCHEMA_VERSION
         )
 
 

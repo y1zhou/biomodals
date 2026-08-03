@@ -2,6 +2,8 @@
 
 # ruff: noqa: D103, S106
 
+import sqlite3
+
 import pytest
 
 from biomodals.execution import (
@@ -134,6 +136,106 @@ def test_claim_response_is_checkpointed_idempotent_and_ordered() -> None:
     assert tasks[0].worker_provider_call_id == first.call.provider_call_id
     assert tasks[2].worker_provider_call_id == second.call.provider_call_id
     assert tasks[4].worker_provider_call_id == third.call.provider_call_id
+
+
+def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection, task_count=100)
+
+    claim_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT task_key
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND status = ?
+            AND result_observation = ?
+            AND provider_call_id IS NULL
+            AND worker_provider_call_id IS NULL
+            AND local_owned = 0
+            AND dispatch_policy_json IS NULL
+        ORDER BY ordinal
+        LIMIT ?
+        """,
+        (str(RUN_ID), "inference", "pending", "missing", 8),
+    ).fetchall()
+    count_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT COUNT(*)
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND status IN (?, ?)
+            AND dispatch_policy_json IS NULL
+        """,
+        (str(RUN_ID), "inference", "pending", "running"),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_unplanned_dispatch_idx" in str(row[3]) for row in claim_plan
+    )
+    assert any(
+        "execution_tasks_unplanned_dispatch_idx" in str(row[3])
+        or "execution_tasks_publication_recovery_idx" in str(row[3])
+        for row in count_plan
+    )
+
+
+def test_publication_recovery_omits_known_missing_pending_tasks() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=4)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="running",
+        capacity=2,
+        now=140,
+    )
+    connection.execute(
+        """
+        UPDATE execution_tasks
+        SET result_observation = NULL
+        WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+        """,
+        (str(RUN_ID), "inference", "seed-2"),
+    )
+
+    tasks = repository.list_tasks_requiring_publication_recovery(
+        RUN_ID,
+        "inference",
+    )
+
+    assert [task.task_key for task in tasks] == ["seed-0", "seed-1", "seed-2"]
+
+
+def test_publication_recovery_uses_its_status_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection)
+
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND (
+                status = 'running'
+                OR (
+                    status = 'pending'
+                    AND result_observation IS NOT 'missing'
+                )
+            )
+        ORDER BY ordinal
+        """,
+        (str(RUN_ID), "inference"),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_publication_recovery_idx" in str(row[3]) for row in query_plan
+    )
 
 
 def test_worker_can_claim_after_spawn_before_call_attachment() -> None:

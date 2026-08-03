@@ -31,7 +31,7 @@ import os
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from pathlib import Path
 from stat import S_ISREG
 from uuid import UUID, uuid4
@@ -296,11 +296,8 @@ def _publication_file_matches(
         return False
     if not S_ISREG(stat.st_mode) or stat.st_size != expected_size:
         return False
-    digest = sha256()
     with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest() == expected_digest
+        return file_digest(stream, "sha256").hexdigest() == expected_digest
 
 
 def _publish_result(

@@ -18,7 +18,7 @@
 
 import os
 from dataclasses import dataclass
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from uuid import UUID, uuid4
@@ -468,11 +468,8 @@ def _publication_file_matches(
 
 
 def _sha256_file(path: Path) -> str:
-    digest = sha256()
     with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return file_digest(stream, "sha256").hexdigest()
 
 
 def _directory_artifacts(directory: Path) -> list[dict[str, str | int]]:

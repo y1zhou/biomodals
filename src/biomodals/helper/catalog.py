@@ -2,7 +2,7 @@
 
 import importlib
 import inspect
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -127,6 +127,26 @@ class AppFunction:
     func_type: Literal["modal", "local_entrypoint"]
     docstring: str | None
     args_table: list[str]
+    parameter_names: tuple[str, ...] = ()
+
+    def visible_args_table(
+        self,
+        *,
+        hidden_parameters: Collection[str] = (),
+    ) -> list[str]:
+        """Return CLI argument rows without caller-owned parameters."""
+        if not self.args_table or not hidden_parameters:
+            return self.args_table
+        visible_rows = [
+            row
+            for name, row in zip(
+                self.parameter_names,
+                self.args_table[2:],
+                strict=True,
+            )
+            if name not in hidden_parameters
+        ]
+        return [*self.args_table[:2], *visible_rows] if visible_rows else []
 
 
 class BiomodalsApp:
@@ -246,6 +266,7 @@ class BiomodalsApp:
                     func_type=func_type,
                     docstring=raw_f.__doc__ or None,
                     args_table=_docstring_to_markdown_table(raw_f),
+                    parameter_names=tuple(inspect.signature(raw_f).parameters),
                 )
             )
 

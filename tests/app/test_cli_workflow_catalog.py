@@ -47,6 +47,63 @@ def test_app_list_command_is_namespaced() -> None:
     assert "rosetta" in result.output
 
 
+@pytest.mark.parametrize(
+    ("command", "public_flag"),
+    [
+        (["workflow", "help", "rfd_ligandmpnn"], "--input-pdb"),
+        (
+            [
+                "workflow",
+                "help",
+                "rfd_ligandmpnn::submit_rfd_ligandmpnn_workflow",
+            ],
+            "--input-pdb",
+        ),
+        (["app", "help", "alphafold3"], "--input-json"),
+        (
+            ["app", "help", "alphafold3::submit_alphafold3_task"],
+            "--input-json",
+        ),
+    ],
+)
+def test_entry_help_separates_cli_owned_and_workload_flags(
+    command: list[str],
+    public_flag: str,
+) -> None:
+    result = runner.invoke(app, command)
+    output = strip_ansi(result.output)
+
+    assert result.exit_code == 0
+    assert public_flag in output
+    assert "options below belong after --" in output
+    for internal_name in (
+        "use_deployed_coordinator",
+        "deployment_environment",
+        "deployment_name",
+        "deployment_version",
+        "restart_from",
+    ):
+        assert internal_name not in output
+        assert f"--{internal_name.replace('_', '-')}" not in output
+    if command[0] == "workflow":
+        assert "dry_run" not in output
+        assert "--dry-run" not in output
+
+
+@pytest.mark.parametrize("namespace", ["app", "workflow"])
+def test_run_help_owns_public_deployment_flags(namespace: str) -> None:
+    result = runner.invoke(app, [namespace, "run", "--help"])
+    output = strip_ansi(result.output)
+
+    assert result.exit_code == 0
+    assert "--environment" in output
+    assert "--deployment-name" in output
+    assert "--version" in output
+    assert "--restart-from" in output
+    assert "--deployment-environment" not in output
+    assert "--deployment-version" not in output
+
+
 @pytest.mark.parametrize("command", ["list", "ls", "l", "help", "h", "deploy", "d"])
 def test_top_level_app_compatibility_aliases_are_removed(command: str) -> None:
     result = runner.invoke(app, [command])

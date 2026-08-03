@@ -1,6 +1,7 @@
 """Helper script for constructing actual modal run commands."""
 
 import importlib
+import inspect
 import shlex
 import subprocess
 from pathlib import Path
@@ -44,6 +45,15 @@ workflow_commands = typer.Typer(no_args_is_help=True)
 run_commands = typer.Typer(no_args_is_help=True)
 api_commands = typer.Typer(no_args_is_help=True)
 console = Console()
+
+_COORDINATOR_CLI_PARAMETERS = frozenset({
+    "use_deployed_coordinator",
+    "deployment_environment",
+    "deployment_name",
+    "deployment_version",
+    "restart_from",
+})
+_WORKFLOW_CLI_PARAMETERS = _COORDINATOR_CLI_PARAMETERS | {"dry_run"}
 
 
 @app.callback(invoke_without_command=True, no_args_is_help=True)
@@ -336,6 +346,48 @@ def list_available_workflows(
     )
 
 
+def _entrypoint_help_parameters(
+    list_type: CatalogType,
+    catalog_entry: BiomodalsApp,
+    function_name: str,
+) -> frozenset[str]:
+    """Return entrypoint parameters owned by the outer Biomodals CLI."""
+    if list_type == "workflow":
+        return _WORKFLOW_CLI_PARAMETERS
+    if function_name in _execution_coordinator_entrypoints(catalog_entry):
+        return _COORDINATOR_CLI_PARAMETERS
+    return frozenset()
+
+
+def _docstring_without_args(docstring: str | None) -> str:
+    """Remove the Google-style Args section already represented by the table."""
+    if not docstring:
+        return "No documentation available."
+    lines = inspect.cleandoc(docstring).splitlines()
+    try:
+        args_start = next(i for i, line in enumerate(lines) if line == "Args:")
+    except StopIteration:
+        return "\n".join(lines)
+    args_end = next(
+        (
+            i
+            for i in range(args_start + 1, len(lines))
+            if lines[i] and not lines[i][0].isspace() and lines[i].endswith(":")
+        ),
+        len(lines),
+    )
+    return "\n".join([*lines[:args_start], *lines[args_end:]]).strip()
+
+
+def _print_entrypoint_options_note(list_type: CatalogType) -> None:
+    """Explain the boundary between outer and entrypoint CLI options."""
+    console.print(
+        "[dim]Entrypoint options below belong after --. Run "
+        f"'biomodals {list_type} run --help' for deployment and execution options."
+        "[/dim]\n"
+    )
+
+
 def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) -> None:
     """Show help for a specific biomodals app or workflow."""
     catalog_entry = _load_entry(list_type, entry_name)
@@ -344,13 +396,24 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
         f = catalog_entry[catalog_entry._entrypoint]
         console.print(
             f"[bold]Help for {f.func_type} function"
-            f"'[green]{f.name}[/green]'"
+            f" '[green]{f.name}[/green]'"
             f" in {list_type} '[green]{catalog_entry.name}[/green]'"
             f" ({catalog_entry.category}):[/bold]\n"
         )
-        console.print(f.docstring or "No documentation available.")
-        if table_rows := f.args_table:
+        hidden_parameters = _entrypoint_help_parameters(
+            list_type,
+            catalog_entry,
+            f.name,
+        )
+        table_rows = f.visible_args_table(hidden_parameters=hidden_parameters)
+        console.print(
+            _docstring_without_args(f.docstring)
+            if f.args_table
+            else f.docstring or "No documentation available."
+        )
+        if table_rows:
             _print_title("Entrypoint CLI flags")
+            _print_entrypoint_options_note(list_type)
             console.print(Markdown("\n".join(table_rows)))
         return
 
@@ -379,12 +442,25 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
 
     if f_indices := catalog_entry._local_entrypoint_idx:
         _print_title(f"Local entrypoint(s) in this {list_type}")
+        _print_entrypoint_options_note(list_type)
         for f_idx in f_indices:
             f = catalog_entry[f_idx]
+            table_rows = f.visible_args_table(
+                hidden_parameters=_entrypoint_help_parameters(
+                    list_type,
+                    catalog_entry,
+                    f.name,
+                )
+            )
 
-            if f.args_table:
+            if table_rows:
                 console.print(f"[bold green]{f.name}[/bold green] CLI flags:\n")
-                console.print(Markdown("\n".join(f.args_table)))
+                console.print(Markdown("\n".join(table_rows)))
+            elif f.args_table:
+                console.print(
+                    f"[bold green]{f.name}[/bold green] has no "
+                    "entrypoint-specific CLI flags.\n"
+                )
             elif f.docstring:
                 console.print(f"[bold green]{f.name}[/bold green] documentation:\n")
                 console.print(Markdown(f.docstring))
@@ -631,13 +707,9 @@ def run_modal_app(
         _show_entry_help("app", str(app.path), verbose=False)
 
 
-def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
-    """Return the selected entrypoint only when its module opts into the kernel."""
-    entrypoint = app._entrypoint
-    module_name = getattr(app, "module", None)
-    if entrypoint is None or not isinstance(module_name, str):
-        return None
-    module = importlib.import_module(module_name)
+def _execution_coordinator_entrypoints(app: BiomodalsApp) -> frozenset[str]:
+    """Return the app entrypoints declared as execution-kernel clients."""
+    module = importlib.import_module(app.module)
     declared = getattr(module, "EXECUTION_COORDINATOR_ENTRYPOINTS", ())
     if not isinstance(declared, frozenset | set | tuple | list) or not all(
         isinstance(value, str) and value for value in declared
@@ -645,7 +717,15 @@ def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
         raise ValueError(
             f"App '{app.name}' has an invalid coordinator entrypoint declaration"
         )
-    return entrypoint if entrypoint in declared else None
+    return frozenset(declared)
+
+
+def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
+    """Return the selected entrypoint only when its module opts into the kernel."""
+    entrypoint = app._entrypoint
+    if entrypoint is None or not isinstance(getattr(app, "module", None), str):
+        return None
+    return entrypoint if entrypoint in _execution_coordinator_entrypoints(app) else None
 
 
 def _deployment_name(entry: BiomodalsApp) -> str:

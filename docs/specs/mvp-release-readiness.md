@@ -211,41 +211,36 @@ retrying; it must not suggest blind resubmission of paid work.
 
 ### Recoverable finalization failures
 
-The public Job Status vocabulary adds `blocked`. A Job becomes blocked when
-scientific compute is preserved but finalization cannot continue until an
-Administrator repairs a permanent service configuration, credential, or
-permission problem.
+`blocked` remains a service-facing projection rather than an Execution Run
+status. While an Execution Run is incomplete, the service projects kernel
+`suspended` as blocked. The Run carries either `coordinator_error` or
+`result_validation_unknown`, stops new admission, and retains every attached
+Provider Call under its existing ownership.
 
-Transient publication failures remain `finalizing` and retry with bounded
-backoff. A blocked Job does not consume User, Tool, or Global Active Job Limits.
-After repair, resuming it returns the same Job to `finalizing` and reuses its
-existing outputs; scientific compute must never be submitted again as part of
-that recovery.
+ADR 0006 supersedes the earlier automatic finalization-retry design. The
+coordinator does not poll or retry an unknown validator or an uncaught
+application exception. Restarting the API process is not an explicit resume.
+After an Administrator repairs the cause, an explicit same-Run resume repeats
+publication validation, reconciles existing calls, and may admit only Tasks
+that have never been submitted. It never reruns failed Tasks or scientific
+compute whose ownership is active or unknown.
 
-Recovery is automatic and uses a persisted exponential retry schedule capped at
-approximately 15 minutes. It retains the Job's original Modal Configuration
-Snapshot and retries only finalization. Restarting the API resumes
-reconciliation. Administrators may see blocked counts and safe blocking
-categories, but do not gain access to another User's Input, Result, or private
-Job detail. The MVP has no per-Job rerun or unblock action.
+A missing, corrupt, or scientifically invalid required publication remains a
+conclusive Task failure and produces terminal `failed`; it is not recoverable
+blocked state. Post-terminal Result delivery and local cache restoration remain
+service-owned metadata. Their recovery may rebuild a user archive from a
+validated remote publication, but must not reopen the Execution Run or
+authorize Modal compute.
 
-Authentication, permission, invalid service configuration, and missing
-configured Modal resources block immediately. Connection, internal-service,
-resource-exhaustion, and upload-timeout failures remain `finalizing` for a
-persisted 30-minute retry window before becoming blocked. Local cache or
-staging filesystem errors follow the same window and then use safe category
-`local_storage`; they never redefine valid remote scientific output as an
-invalid Result. Missing, corrupt, or
-scientifically invalid required output instead produces terminal
-`failed/result_invalid`. A blocked Job may remain blocked indefinitely while
-low-frequency automatic finalization retries continue.
-
-Owner-visible Job detail supplies generic blocked copy, `blocked_at`, and
-`next_retry_at`. Existing terminal `error_code` and `error_message` fields
-remain exclusive to failed Jobs. The Admin Modal page exposes only aggregate
-blocked counts grouped by safe Blocking Category and the oldest blocked age;
-it exposes no owner identity, Job identifier, Input, Result, raw provider
-detail, or storage path.
+Owner-visible Job detail supplies generic blocked copy and `blocked_at`.
+`next_retry_at` is nullable and must not imply an automatic kernel retry when
+absent. Existing terminal `error_code` and `error_message` fields remain
+exclusive to failed Jobs. The Admin Modal page exposes only aggregate blocked
+counts grouped by safe Blocking Category and the oldest blocked age; it exposes
+no owner identity, Job identifier, Input, Result, raw provider detail, or
+storage path. A service-facing explicit resume control is outside the unified
+kernel refactor; until a host supplies one, recovery is an operator action
+rather than an automatic loop.
 
 ### Unknown remote execution state
 
@@ -255,19 +250,22 @@ track it safely. This is distinct from `blocked`: a blocked Job has known
 scientific output and retries only recoverable finalization, while a
 state-unknown Job may still be consuming paid remote compute.
 
-A Job enters `state_unknown` when either:
+A Job enters `state_unknown` when any of these kernel-owned provider
+uncertainties occurs:
 
 - a direct Modal `.spawn()` may have been accepted but its Function Call ID
   could not be durably recorded; or
-- Cancellation cannot be confirmed because the known call status expired, and
+- an attached call's state or terminal result cannot be established; or
+- Cancellation cannot be confirmed for an attached call, and
   a verified final Result cannot be recovered.
 
-An explicit ambiguous submission outcome enters the state immediately. If the
-API process stops after acquiring a submission lease, the restarted reconciler
-waits for that short lease to expire before entering the state. Neither path
-automatically submits another Function. The Job is excluded from automatic
-reconciliation but continues consuming User, Tool, and Global Active Job Limits
-until it is resolved.
+An ambiguous submission outcome enters the state immediately. If the API
+process stops after durably creating a `submitting` Provider Call but before
+attaching its Function Call ID, the restarted coordinator marks that call
+`outcome_unknown` without a timeout or lease-stealing interval. No uncertainty
+automatically authorizes another Function. The Job is excluded from automatic
+service reconciliation but continues consuming User, Tool, and Global Active
+Job Limits until it is resolved.
 
 Owner-visible Job detail labels the state `Status unknown`, explains that an
 Administrator must review Modal, exposes `state_unknown_at`, and provides no
@@ -278,14 +276,15 @@ visible without a spinner or invented outcome.
 
 The Admin Modal page exposes a dedicated list containing only Job ID, workload,
 display name, safe run name, `state_unknown_at`, and one of the fixed reasons
-`submission_outcome_unknown` or `cancellation_outcome_unknown`. It does not
-expose owner identity, Input, Result, Function Call ID, raw provider exception,
-or storage path. The Administrator must inspect Modal and stop remote work there
-first when necessary. The only MVP resolution is a confirmed destructive
-`Mark failed` action. It records terminal `failed/compute_failed`, closes any
-still-open Stage as failed, preserves the unknown-state timestamp and reason for
-audit, and releases admission capacity. The action does not contact Modal and
-cannot be undone in the Admin panel.
+`submission_outcome_unknown`, `provider_outcome_unknown`, or
+`cancellation_outcome_unknown`. It does not expose owner identity, Input,
+Result, Function Call ID, raw provider exception, or storage path. The
+Administrator must inspect Modal and stop remote work there first when
+necessary. The only MVP resolution is a confirmed destructive `Mark failed`
+action. It records terminal `failed/compute_failed`, closes any still-open
+Stage as failed, preserves the unknown-state timestamp and reason for audit,
+and releases admission capacity. The action does not contact Modal and cannot
+be undone in the Admin panel.
 
 ### Modal configuration preflight
 
@@ -303,11 +302,12 @@ Within one API process, provider-identity mutations serialize their effective
 setting read, preflight, and database commit. A concurrent Environment and Tool
 edit therefore cannot commit a combined identity that was never preflighted.
 
-Job admission snapshots the Modal Environment, App name, exact deployment
-version, expected artifact-request digest, and initial Modal-operation lease in
-one transaction. Every direct deployed-Function lookup for that Job passes the
-snapshot as Modal's `version` argument, so an App redeployment cannot mix
-Function implementations within an in-flight workflow. Administrators use
+Job admission persists the Service Job, immutable Execution Plan, Execution
+Run ID, Modal Environment, App name, exact deployment version, expected
+artifact-request digest, and Provider Call limits in one transaction. Every
+direct deployed-Function lookup for that Run passes its persisted `version`
+argument, so an App redeployment cannot mix Function implementations within an
+in-flight workflow. Administrators use
 `modal app history <app> --env <environment> --json` to discover deployment
 version integers; the Admin Tool form configures and restores the value with
 the same field-specific source behavior as App name and limits. Result
@@ -374,11 +374,13 @@ prepare_simulation
 
 The three branches after preparation run concurrently. Production analysis may
 start while NVT or NPT analysis is still running. Result preparation starts only
-after all three analysis stages complete. A definite branch failure stops new
-dependencies, requests cancellation of active siblings, and reaches `failed`
-only after every known remote call is inactive. If the service cannot confirm a
-sibling's state while stopping it, the Job becomes `state_unknown` and keeps its
-admission capacity until an Administrator resolves it.
+after all three analysis stages complete. A definite branch failure stops
+dependent admission. Independent required branches that already own Provider
+Calls retain those owners and are reconciled to conclusive outcomes; workload
+failure alone does not authorize cancellation. The Run reaches `failed` only
+after every known remote owner is conclusive. If an owner's state cannot be
+established, the Job becomes `state_unknown` and keeps its admission capacity
+until an Administrator resolves it.
 
 ### Tool-configured Job logs
 
@@ -467,9 +469,10 @@ to Administrator-only access. Runtime configuration,
 Admin Tool rows, routing registration, and Job views consume that descriptor
 instead of carrying separate GROMACS name and stage tables. The descriptor does
 not make scientific orchestration generic: GROMACS keeps its own adapter,
-request schema, sequencing, archive builder, and tests. All executable workload
-routes do share the operation-scoped Modal submission state machine so
-idempotency and ambiguous paid-call outcomes cannot drift between Tools.
+request schema, sequencing, archive builder, and tests. All executable
+workload routes use the shared `biomodals.execution` preclaim, detached spawn,
+attachment, Result Envelope, cancellation, and unknown-state transitions so
+cost-sensitive behavior cannot drift between Tools.
 
 The frontend Catalog separately includes an AlphaFold3 placeholder marked
 `WIP`. Its card is visibly muted, is not an interactive navigation target, and
@@ -482,10 +485,11 @@ that workflow is designed and deployed.
 Accepting Cancellation persists `cancel_requested_at` and moves the Job to
 `cancel_requested` before contacting Modal. The reconciler must not start
 another stage after that transition. For every known active direct call it
-requests termination with `terminate_containers=False`, retries transient
-provider failures, and resumes the same work after an API restart. This mode
-cancels inputs without forcibly terminating workers that may contain unrelated
-inputs.
+requests termination with `terminate_containers=False` and resumes
+reconciliation of the same owners after an API restart. An inconclusive
+provider response moves the Run to `state_unknown`; it is not retried or
+treated as cancellation success. This mode cancels inputs without forcibly
+terminating workers that may contain unrelated inputs.
 
 The Job becomes `cancelled` only after Modal confirms every active call is
 inactive. Calls that finish first retain their completed outcome, but the

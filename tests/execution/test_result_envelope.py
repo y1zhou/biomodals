@@ -1,0 +1,174 @@
+"""Provider Result Envelope durability tests."""
+
+# ruff: noqa: D103, S106
+
+import sqlite3
+
+import pytest
+
+from biomodals.execution import AvailabilityStatus, ProviderCallStatus, TaskStatus
+
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_fixed_policy,
+)
+
+
+def test_running_task_ownership_uses_the_reconciliation_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection)
+
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT DISTINCT call.*
+        FROM execution_tasks AS task
+        JOIN execution_provider_calls AS call
+            ON call.provider_call_id = task.provider_call_id
+        WHERE task.execution_run_id = ?
+            AND task.status = ?
+            AND task.provider_call_id IS NOT NULL
+            AND call.status = ?
+        """,
+        (str(RUN_ID), "running", "succeeded"),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_running_provider_call_idx" in str(row[3]) for row in query_plan
+    )
+
+
+def test_call_success_and_task_scientific_completion_are_separate() -> None:
+    repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+
+    call = repository.record_provider_call_result(
+        claim.call.provider_call_id,
+        result_envelope={"tasks": {"seed-0": {"path": "/outputs/seed-0"}}},
+        now=120,
+    )
+
+    assert call.status == ProviderCallStatus.SUCCEEDED
+    assert (
+        repository.get_task(
+            RUN_ID,
+            "inference",
+            "seed-0",
+        ).status
+        == TaskStatus.RUNNING
+    )
+    assert repository.list_provider_calls_requiring_reconciliation(RUN_ID) == (call,)
+
+    repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=121,
+    )
+
+    assert repository.list_provider_calls_requiring_reconciliation(RUN_ID) == ()
+
+
+def test_non_json_result_does_not_change_call_or_release_slot() -> None:
+    repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+
+    with pytest.raises(TypeError):
+        repository.record_provider_call_result(
+            claim.call.provider_call_id,
+            result_envelope={"bad": object()},
+            now=120,
+        )
+
+    assert (
+        repository.get_provider_call(claim.call.provider_call_id).status
+        == ProviderCallStatus.ATTACHED
+    )
+
+
+def test_conclusive_call_failure_fails_only_unfinished_owned_tasks() -> None:
+    repository = create_repository(task_count=2)
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        max_tasks_per_call=2,
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0", "seed-1"),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        max_tasks_per_call=2,
+        now=110,
+    )
+    assert claim is not None
+    repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-0",
+        # An early worker completion report already validated this publication.
+        observation=AvailabilityStatus.AVAILABLE,
+        now=111,
+    )
+
+    repository.fail_provider_call(
+        claim.call.provider_call_id,
+        message="provider input failed",
+        now=120,
+    )
+
+    tasks = {
+        task.task_key: task.status
+        for task in repository.list_tasks(RUN_ID, "inference")
+    }
+    assert tasks == {
+        "seed-0": TaskStatus.SUCCEEDED,
+        "seed-1": TaskStatus.FAILED,
+    }

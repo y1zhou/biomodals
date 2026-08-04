@@ -90,28 +90,49 @@ candidates from `<stem>_ranked.txt`.
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
 
-from __future__ import annotations
-
 import hashlib
 import os
-import queue as queue_lib
 import re
 import shlex
 import shutil
 from collections.abc import Iterable
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import count, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeVar, cast
-from uuid import uuid4
+from typing import cast
+from uuid import UUID, uuid4
 
 import modal
+import orjson
 import polars as pl
 
 from biomodals.app.config import AppConfig
+from biomodals.app.score.oligoformer_execution import (
+    OligoformerExecutionCoordinator,
+    OligoformerExecutionRequest,
+    load_execution_request,
+    stage_execution_request,
+)
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionOverview,
+    RunStatus,
+)
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    development_modal_call_driver,
+    execution_coordinator_adapter,
+    execution_coordinator_identity,
+    initialize_execution_coordinator_host,
+)
+from biomodals.execution.modal import (
+    execution_coordinator_handle as _execution_coordinator_handle,
+)
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.io import (
@@ -125,7 +146,7 @@ from biomodals.helper.shell import (
     sanitize_filename,
     warmup_directory,
 )
-from biomodals.helper.task_budget import batches_for_total_concurrency, bounded_map
+from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
 TARGETSCAN_RNAPLFOLD_MAX_NODES = 32
@@ -133,7 +154,6 @@ TARGETSCAN_RNAPLFOLD_MAX_WORKERS = 32
 TARGETSCAN_RNAPLFOLD_MANIFEST_VERSION = 1
 TARGETSCAN_RNAPLFOLD_CACHE_MARKER_VERSION = 2
 
-T = TypeVar("T")
 TARGETSCAN_COLUMNS = ("refseq", "siRNA", "targetscan_score")
 TARGETSCAN_HEADER = "\t".join(TARGETSCAN_COLUMNS)
 
@@ -222,12 +242,6 @@ class AppInfo:
     default_targetscan_context_workers: int = 32
     default_targetscan_context_shard_size: int = 500
     default_targetscan_context_attempts: int = 3
-    targetscan_context_queue_put_batch_size: int = 256
-    targetscan_context_queue_initial_batches: int = 4
-    targetscan_context_queue_idle_timeout: float = 45.0
-    targetscan_context_queue_sentinel: str = (
-        "__biomodals_oligoformer_targetscan_context_stop__"
-    )
     default_targetscan_merge_nodes: int = 16
     cache_lock_dict_name: str = f"{CONF.package_name}-cache-locks"
     cache_lock_poll_seconds: float = 5.0
@@ -637,6 +651,30 @@ class PreparedOffTargetShard:
     row_shards: tuple[PitaRowShardSpec, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class OligoformerReferencePlan:
+    """Finite RNAplfold reference-shard publication plan."""
+
+    record_count: int
+    shard_specs: tuple[TargetscanRnaPlfoldShardSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OligoformerEvidenceStemPlan:
+    """Deterministic PITA and TargetScan Tasks for one efficacy output."""
+
+    stem: str
+    pita_specs: tuple[OffTargetShardSpec, ...]
+    targetscan_specs: tuple[TargetscanBatchSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OligoformerEvidencePlan:
+    """Finite off-target Task plan discovered after efficacy prediction."""
+
+    stems: tuple[OligoformerEvidenceStemPlan, ...]
+
+
 def _hash_bytes(data: bytes | None) -> str:
     """Return a stable hash for optional bytes."""
     if data is None:
@@ -904,7 +942,13 @@ def _paths_ready(
         actual_tables = [
             _tabular_output_metadata(path, root=paths[0].parent) for path in paths
         ]
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (
+        FileNotFoundError,
+        IsADirectoryError,
+        NotADirectoryError,
+        UnicodeDecodeError,
+        ValueError,
+    ):
         return False
     if tables != actual_tables:
         return False
@@ -1042,17 +1086,17 @@ def _build_plan(
     )
 
 
-def _rnafm_model_identity() -> dict[str, object]:
-    """Return the persisted content identity for RNA-FM weights."""
+def _load_rnafm_identity(path: Path) -> dict[str, object]:
+    """Load and validate one persisted RNA-FM content identity."""
     import orjson
 
-    if not APP_INFO.rnafm_identity_path.is_file():
+    try:
+        identity = orjson.loads(path.read_bytes())
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
         raise FileNotFoundError(
             "OligoFormer RNA-FM identity is missing. Run "
             "download_oligoformer_models first."
-        )
-    try:
-        identity = orjson.loads(APP_INFO.rnafm_identity_path.read_bytes())
+        ) from exc
     except orjson.JSONDecodeError as exc:
         raise FileNotFoundError(
             "OligoFormer RNA-FM identity is invalid. Run "
@@ -1073,12 +1117,29 @@ def _rnafm_model_identity() -> dict[str, object]:
     return identity
 
 
+def _rnafm_model_identity() -> dict[str, object]:
+    """Return the output-volume content identity for RNA-FM weights."""
+    return _load_rnafm_identity(APP_INFO.rnafm_identity_path)
+
+
 def _rnafm_model_identity_digest() -> str:
     """Return the canonical RNA-FM identity digest for efficacy cache keys."""
     import orjson
 
     return _hash_bytes(
         orjson.dumps(_rnafm_model_identity(), option=orjson.OPT_SORT_KEYS)
+    )
+
+
+def _oligoformer_model_volume_identity_digest() -> str:
+    """Return the exact RNA-FM identity currently on the model volume."""
+    import orjson
+
+    return _hash_bytes(
+        orjson.dumps(
+            _load_rnafm_identity(APP_INFO.model_rnafm_identity_path),
+            option=orjson.OPT_SORT_KEYS,
+        )
     )
 
 
@@ -1122,18 +1183,17 @@ def _targetscan_human_refs_ready() -> bool:
     )
 
 
-def _targetscan_ref_identity() -> dict[str, object]:
-    """Return the persisted content identity for full-human references."""
+def _load_targetscan_ref_identity(path: Path) -> dict[str, object]:
+    """Load and validate one persisted full-human reference identity."""
     import orjson
 
-    path = APP_INFO.targetscan_ref_identity_path
-    if not path.is_file():
+    try:
+        identity = orjson.loads(path.read_bytes())
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError) as exc:
         raise FileNotFoundError(
             "OligoFormer full-human reference identity is missing. Run "
             "download_oligoformer_models first."
-        )
-    try:
-        identity = orjson.loads(path.read_bytes())
+        ) from exc
     except orjson.JSONDecodeError as exc:
         raise FileNotFoundError(
             "OligoFormer full-human reference identity is invalid. Run "
@@ -1160,12 +1220,29 @@ def _targetscan_ref_identity() -> dict[str, object]:
     return identity
 
 
+def _targetscan_ref_identity() -> dict[str, object]:
+    """Return the output-volume content identity for full-human references."""
+    return _load_targetscan_ref_identity(APP_INFO.targetscan_ref_identity_path)
+
+
 def _targetscan_ref_identity_digest() -> str:
     """Return the canonical digest pinned by full-human evidence plans."""
     import orjson
 
     return _hash_bytes(
         orjson.dumps(_targetscan_ref_identity(), option=orjson.OPT_SORT_KEYS)
+    )
+
+
+def _oligoformer_reference_volume_identity_digest() -> str:
+    """Return the exact TargetScan identity currently on the model volume."""
+    import orjson
+
+    return _hash_bytes(
+        orjson.dumps(
+            _load_targetscan_ref_identity(APP_INFO.targetscan_ref_marker_path),
+            option=orjson.OPT_SORT_KEYS,
+        )
     )
 
 
@@ -1379,7 +1456,7 @@ def _targetscan_rnaplfold_shard_state(
                 continue
             if verify_output_hashes and _hash_path(output_path) != metadata["sha256"]:
                 continue
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
         valid_outputs.add(output_name)
     return len(valid_outputs) == len(output_names), valid_outputs, len(output_names)
@@ -1525,7 +1602,7 @@ def _targetscan_rnaplfold_cache_ready() -> bool:
                 "name": shard_marker_path.name,
                 **_targetscan_rnaplfold_file_metadata(shard_marker_path),
             }
-        except (FileNotFoundError, OSError, ValueError):
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError, ValueError):
             return False
         if recorded_marker != actual_marker:
             return False
@@ -1605,6 +1682,12 @@ runtime_image = (
     )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+OLIGOFORMER_OUTPUT_CLAIMS = modal.Dict.from_name(
+    f"{CONF.name}-output-claims",
+    create_if_missing=True,
+)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_oligoformer_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 
 ##########################################
@@ -1772,6 +1855,15 @@ def download_oligoformer_models(force: bool = False) -> None:
         _download_oligoformer_models_locked(force)
 
 
+def _oligoformer_models_ready() -> bool:
+    """Return whether model and converted-reference identities are available."""
+    return (
+        APP_INFO.model_rnafm_redevelop_dir.is_dir()
+        and _rnafm_model_identity_matches_model()
+        and _targetscan_ref_identity_matches_model()
+    )
+
+
 def _run_rnaplfold_for_record(
     *,
     name: str,
@@ -1875,19 +1967,16 @@ def run_oligoformer_targetscan_rnaplfold_shard(
     return created
 
 
-def _build_targetscan_rnaplfold_cache(
+def _plan_targetscan_rnaplfold_cache(
     force: bool,
     execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> None:
-    """Build the TargetScan RNAplfold cache while holding its build lock."""
+) -> OligoformerReferencePlan:
+    """Persist deterministic RNAplfold shard inputs for kernel dispatch."""
     import shutil
 
     CONF.output_volume.reload()
     MODEL_VOLUME.reload()
     _ensure_human_refs()
-    if _targetscan_rnaplfold_cache_ready() and not force:
-        print("💊 OligoFormer TargetScan RNAplfold cache already available")
-        return
 
     cache_dir = APP_INFO.targetscan_rnaplfold_cache_dir
     shard_dir = APP_INFO.targetscan_rnaplfold_shard_dir
@@ -1923,86 +2012,62 @@ def _build_targetscan_rnaplfold_cache(
         shard_specs.append(spec)
 
     CONF.output_volume.commit()
-    pending_specs = [
+    return OligoformerReferencePlan(
+        record_count=len(records),
+        shard_specs=tuple(shard_specs),
+    )
+
+
+def _publish_targetscan_rnaplfold_cache(
+    plan: OligoformerReferencePlan,
+) -> None:
+    """Validate every RNAplfold shard before publishing the top marker."""
+    missing = [
         spec
-        for spec in shard_specs
+        for spec in plan.shard_specs
         if not _targetscan_rnaplfold_shard_state(
             spec,
             verify_output_hashes=False,
         )[0]
     ]
-    node_count = _targetscan_rnaplfold_node_count(
-        len(pending_specs), execution.targetscan_rnaplfold_nodes
-    )
-    local_workers = _targetscan_rnaplfold_worker_count(
-        execution.targetscan_rnaplfold_workers
-    )
-    print(
-        "💊 Preparing OligoFormer TargetScan RNAplfold cache for "
-        f"{len(records)} UTRs; rebuilding {len(pending_specs)}/"
-        f"{len(shard_specs)} shards on up to "
-        f"{node_count} CPU nodes with {local_workers} workers each"
-    )
-    bounded_map(
-        pending_specs,
-        lambda spec: run_oligoformer_targetscan_rnaplfold_shard.remote(
-            spec, local_workers=local_workers
-        ),
-        max_parallel=node_count,
-    )
-
-    CONF.output_volume.reload()
+    if missing:
+        raise FileNotFoundError(
+            "OligoFormer RNAplfold reference cache is missing "
+            f"{len(missing)} shards; first missing shard: {missing[0].shard_index}"
+        )
     _publish_targetscan_rnaplfold_cache_marker(
-        shard_specs,
-        record_count=len(records),
+        list(plan.shard_specs),
+        record_count=plan.record_count,
     )
     CONF.output_volume.commit()
-    print(f"💊 OligoFormer TargetScan RNAplfold cache committed: {len(records)} UTRs")
 
 
 @app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
     timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
-def prepare_oligoformer_targetscan_rnaplfold_cache(
+def plan_oligoformer_targetscan_rnaplfold_cache(
     force: bool = False,
     execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
+) -> OligoformerReferencePlan:
+    """Publish finite RNAplfold shard inputs for the execution kernel."""
+    return _plan_targetscan_rnaplfold_cache(force, execution)
+
+
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True),
+)
+def finalize_oligoformer_targetscan_rnaplfold_cache(
+    plan: OligoformerReferencePlan,
 ) -> None:
-    """Build or reuse cached TargetScan RNAplfold outputs for all-human refs."""
+    """Publish the validated top-level RNAplfold cache marker."""
     CONF.output_volume.reload()
-    MODEL_VOLUME.reload()
-    _ensure_human_refs()
-    if not _targetscan_ref_identity_matches_model():
-        raise FileNotFoundError(
-            "OligoFormer human reference identity does not match the model volume. "
-            "Run download_oligoformer_models first."
-        )
-    if _targetscan_rnaplfold_cache_ready() and not force:
-        print("💊 OligoFormer TargetScan RNAplfold cache already available")
-        return
-    with _cache_build_lock(
-        "targetscan-reference-state",
-        "global",
-        rebuild=True,
-    ) as owns_cache_build:
-        CONF.output_volume.reload()
-        MODEL_VOLUME.reload()
-        _ensure_human_refs()
-        if not _targetscan_ref_identity_matches_model():
-            raise FileNotFoundError(
-                "OligoFormer human reference identity changed during RNAplfold "
-                "setup. Run download_oligoformer_models first."
-            )
-        if _targetscan_rnaplfold_cache_ready() and (not force or not owns_cache_build):
-            print("💊 OligoFormer TargetScan RNAplfold cache already available")
-            return
-        if not owns_cache_build:
-            raise RuntimeError(
-                "OligoFormer RNAplfold cache was marked complete without outputs"
-            )
-        _build_targetscan_rnaplfold_cache(force, execution)
+    _publish_targetscan_rnaplfold_cache(plan)
 
 
 ##########################################
@@ -2213,15 +2278,6 @@ def _targetscan_ref_shard_size(
     return max(1, (utr_count + prepare_nodes - 1) // prepare_nodes)
 
 
-def _bounded_node_count(task_count: int, configured_nodes: int) -> int:
-    """Return a per-run Modal node count capped to the task count."""
-    if configured_nodes < 1:
-        raise ValueError("configured_nodes must be a positive integer")
-    if task_count < 1:
-        return 1
-    return max(1, min(configured_nodes, task_count))
-
-
 def _validated_worker_count(
     value: int,
     *,
@@ -2241,16 +2297,6 @@ def _targetscan_rnaplfold_worker_count(configured_workers: int) -> int:
         name="targetscan_rnaplfold_workers",
         maximum=TARGETSCAN_RNAPLFOLD_MAX_WORKERS,
     )
-
-
-def _targetscan_rnaplfold_node_count(task_count: int, configured_nodes: int) -> int:
-    """Return validated RNAplfold fanout within the deployment limit."""
-    if not 1 <= configured_nodes <= TARGETSCAN_RNAPLFOLD_MAX_NODES:
-        raise ValueError(
-            "targetscan_rnaplfold_nodes must be between 1 and "
-            f"{TARGETSCAN_RNAPLFOLD_MAX_NODES}"
-        )
-    return _bounded_node_count(task_count, configured_nodes)
 
 
 def _unique_tmp_path(path: Path) -> Path:
@@ -2307,7 +2353,7 @@ def _artifact_marker_ready(
         actual = {
             name: _artifact_file_metadata(path) for name, path in artifacts.items()
         }
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     return marker["artifacts"] == actual
 
@@ -2426,10 +2472,7 @@ def _targetscan_reference_shards(
     rnaplfold_cache_dir = ""
     if _is_model_human_ref_pair(utr_path, orf_path):
         if not _targetscan_rnaplfold_cache_ready():
-            raise FileNotFoundError(
-                "OligoFormer TargetScan RNAplfold cache is missing. Run "
-                "prepare_oligoformer_targetscan_rnaplfold_cache first."
-            )
+            raise FileNotFoundError("OligoFormer TargetScan RNAplfold cache is missing")
         rnaplfold_cache_dir = str(APP_INFO.targetscan_rnaplfold_cache_dir)
 
     shards = []
@@ -2629,58 +2672,6 @@ def _targetscan_batch_logs_dir(spec: TargetscanBatchSpec) -> Path:
     )
 
 
-def _batch_items_for_local_workers(  # noqa: UP047 - runtime image uses Python 3.10.
-    items: list[T],
-    *,
-    max_nodes: int,
-    local_workers: int,
-) -> list[list[T]]:
-    """Split work so each Modal node can keep local workers busy."""
-    if not items:
-        return []
-    if max_nodes < 1:
-        raise ValueError("max_nodes must be at least 1")
-    if local_workers < 1:
-        raise ValueError("local_workers must be at least 1")
-
-    worker_sized_node_count = (len(items) + local_workers - 1) // local_workers
-    if worker_sized_node_count <= max_nodes:
-        batch_size = local_workers
-    else:
-        batch_size = (len(items) + max_nodes - 1) // max_nodes
-    return [
-        items[index : index + batch_size] for index in range(0, len(items), batch_size)
-    ]
-
-
-def _bounded_worker_topology(
-    *,
-    task_count: int,
-    configured_nodes: int,
-    configured_workers: int,
-    max_process_slots: int | None,
-) -> tuple[int, int]:
-    """Cap Modal nodes times local workers to one branch-wide slot budget."""
-    if task_count < 1:
-        return 0, 1
-    if configured_nodes < 1 or configured_workers < 1:
-        raise ValueError("Configured nodes and workers must be positive")
-    slot_count = (
-        configured_nodes * configured_workers
-        if max_process_slots is None
-        else max_process_slots
-    )
-    if slot_count < 1:
-        raise ValueError("max_process_slots must be a positive integer")
-    local_workers = min(configured_workers, task_count, slot_count)
-    node_count = min(
-        configured_nodes,
-        (task_count + local_workers - 1) // local_workers,
-        max(1, slot_count // local_workers),
-    )
-    return node_count, local_workers
-
-
 def _write_pita_stage0_script(
     script_path: Path,
     utr_stab_path: Path,
@@ -2872,130 +2863,6 @@ def _pita_prepare_utr_shard_ready(spec: PitaPrepareUtrShardSpec) -> bool:
         kind="pita-target-discovery",
         artifacts={"potential_targets": output_path},
     )
-
-
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def run_oligoformer_pita_prepare_utr_shard_batch(
-    specs: list[PitaPrepareUtrShardSpec],
-    local_workers: int,
-    attempts: int = APP_INFO.default_pita_row_attempts,
-) -> int:
-    """Run cached PITA UTR target-discovery shards on one CPU node."""
-    local_workers = _validated_worker_count(local_workers)
-    if attempts < 1:
-        raise ValueError("attempts must be a positive integer")
-    CONF.output_volume.reload()
-    _warmup_file_parents(
-        (path for spec in specs for path in (spec.input_path, spec.mir_stab_path)),
-        file_pattern=r"\.(utr|mir)\.stab$",
-    )
-    print(
-        "💊 Running OligoFormer PITA target-discovery batch with "
-        f"{len(specs)} shards using {local_workers} workers; logs under "
-        f"{Path(specs[0].log_path).parent if specs else 'n/a'}"
-    )
-    outputs = bounded_map(
-        specs,
-        lambda spec: _run_pita_prepare_utr_shard(spec, attempts),
-        max_parallel=local_workers,
-    )
-    CONF.output_volume.commit()
-    return len(outputs)
-
-
-def _run_pita_prepare_utr_shard_batches(
-    specs: list[PitaPrepareUtrShardSpec],
-    *,
-    max_process_slots: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> None:
-    """Run PITA target-discovery shard batches with bounded global fanout."""
-    if not specs:
-        return
-
-    configured_workers = execution.pita_prepare_workers
-    configured_nodes = _bounded_node_count(
-        len(specs),
-        execution.pita_prepare_nodes,
-    )
-    node_count, local_workers = _bounded_worker_topology(
-        task_count=len(specs),
-        configured_nodes=configured_nodes,
-        configured_workers=configured_workers,
-        max_process_slots=max_process_slots,
-    )
-    batches = _batch_items_for_local_workers(
-        specs,
-        max_nodes=node_count,
-        local_workers=local_workers,
-    )
-    print(
-        "💊 Running OligoFormer PITA target discovery for "
-        f"{len(specs)} UTR shards on {len(batches)} CPU nodes with "
-        f"{local_workers} workers each"
-    )
-    completed_shards = 0
-    progress_interval = max(1, len(batches) // 10)
-    for completed_batches, output_count in enumerate(
-        run_oligoformer_pita_prepare_utr_shard_batch.starmap(
-            (list(batch), local_workers, execution.pita_row_attempts)
-            for batch in batches
-        ),
-        start=1,
-    ):
-        completed_shards += output_count
-        if completed_batches % progress_interval == 0 or completed_batches == len(
-            batches
-        ):
-            print(
-                "💊 Completed OligoFormer PITA target discovery for "
-                f"{completed_shards}/{len(specs)} UTR shards "
-                f"({completed_batches}/{len(batches)} batches)"
-            )
-    if completed_shards != len(specs):
-        raise RuntimeError(
-            "OligoFormer PITA target discovery reported "
-            f"{completed_shards} completed shards; expected {len(specs)}"
-        )
-
-    CONF.output_volume.reload()
-    missing_specs = [spec for spec in specs if not _pita_prepare_utr_shard_ready(spec)]
-    if missing_specs:
-        retry_batches = _batch_items_for_local_workers(
-            missing_specs,
-            max_nodes=min(len(batches), len(missing_specs)),
-            local_workers=local_workers,
-        )
-        print(
-            "💊 Retrying OligoFormer PITA target discovery for "
-            f"{len(missing_specs)} missing UTR shards"
-        )
-        retried_shards = sum(
-            run_oligoformer_pita_prepare_utr_shard_batch.starmap(
-                (list(batch), local_workers, execution.pita_row_attempts)
-                for batch in retry_batches
-            )
-        )
-        if retried_shards != len(missing_specs):
-            raise RuntimeError(
-                "OligoFormer PITA target-discovery retry reported "
-                f"{retried_shards} completed shards; expected {len(missing_specs)}"
-            )
-        CONF.output_volume.reload()
-        missing_specs = [
-            spec for spec in missing_specs if not _pita_prepare_utr_shard_ready(spec)
-        ]
-    if missing_specs:
-        raise FileNotFoundError(
-            "OligoFormer PITA target discovery did not produce "
-            f"{len(missing_specs)} expected outputs; first missing output: "
-            f"{missing_specs[0].output_path}"
-        )
 
 
 def _pita_row_shard_specs(
@@ -3511,83 +3378,6 @@ def _finalize_pita_target_discovery_plan(
     return _pita_prepared_shard_from_plan(plan, row_count=row_count)
 
 
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def run_oligoformer_pita_consolidate_batch(
-    plans: list[PitaPreparePlan],
-    local_workers: int,
-) -> list[PreparedOffTargetShard]:
-    """Consolidate PITA discovery outputs and create row inputs."""
-    local_workers = _validated_worker_count(local_workers)
-    CONF.output_volume.reload()
-    print(
-        "💊 Consolidating OligoFormer PITA discovery outputs for "
-        f"{len(plans)} siRNAs using {local_workers} workers"
-    )
-    prepared_shards = bounded_map(
-        plans,
-        _finalize_pita_target_discovery_plan,
-        max_parallel=local_workers,
-    )
-    CONF.output_volume.commit()
-    return prepared_shards
-
-
-def _run_pita_consolidate_batches(
-    plans: list[PitaPreparePlan],
-    *,
-    max_process_slots: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> list[PreparedOffTargetShard]:
-    """Consolidate per-siRNA PITA plans with Modal-native fanout."""
-    if not plans:
-        return []
-
-    configured_workers = execution.pita_prepare_workers
-    configured_nodes = _bounded_node_count(
-        len(plans),
-        execution.pita_prepare_nodes,
-    )
-    node_count, local_workers = _bounded_worker_topology(
-        task_count=len(plans),
-        configured_nodes=configured_nodes,
-        configured_workers=configured_workers,
-        max_process_slots=max_process_slots,
-    )
-    batches = _batch_items_for_local_workers(
-        plans,
-        max_nodes=node_count,
-        local_workers=local_workers,
-    )
-    print(
-        "💊 Consolidating OligoFormer PITA discovery outputs for "
-        f"{len(plans)} siRNAs on {len(batches)} CPU nodes with "
-        f"{local_workers} workers each"
-    )
-    prepared_shards = []
-    progress_interval = max(1, len(batches) // 10)
-    for completed_batches, batch_results in enumerate(
-        run_oligoformer_pita_consolidate_batch.starmap(
-            (list(batch), local_workers) for batch in batches
-        ),
-        start=1,
-    ):
-        prepared_shards.extend(batch_results)
-        if completed_batches % progress_interval == 0 or completed_batches == len(
-            batches
-        ):
-            print(
-                "💊 Consolidated OligoFormer PITA discovery outputs for "
-                f"{len(prepared_shards)}/{len(plans)} siRNAs "
-                f"({completed_batches}/{len(batches)} batches)"
-            )
-    return prepared_shards
-
-
 def _pita_row_shard_spec(
     *,
     spec: OffTargetShardSpec,
@@ -3754,46 +3544,14 @@ def _targetscan_context_shard_ready(spec: TargetscanContextShardSpec) -> bool:
     )
 
 
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def run_oligoformer_targetscan_context_queue_worker(
-    queue_name: str,
-    local_workers: int,
-    attempts: int = APP_INFO.default_targetscan_context_attempts,
-) -> int:
-    """Drain queued TargetScan context-score shards on one CPU node."""
-    local_workers = _validated_worker_count(local_workers)
-    if attempts < 1:
-        raise ValueError("attempts must be a positive integer")
-    CONF.output_volume.reload()
-
-    queue = modal.Queue.from_name(queue_name)
-    idle_timeout = APP_INFO.targetscan_context_queue_idle_timeout
-
-    def _worker(_worker_index: int) -> int:
-        output_count = 0
-        while True:
-            try:
-                spec = queue.get(timeout=idle_timeout)
-            except queue_lib.Empty:
-                return output_count
-            if spec == APP_INFO.targetscan_context_queue_sentinel:
-                return output_count
-            _run_targetscan_context_shard(
-                cast(TargetscanContextShardSpec, spec), attempts
-            )
-            output_count += 1
-
-    try:
-        return sum(
-            bounded_map(range(local_workers), _worker, max_parallel=local_workers)
-        )
-    finally:
-        CONF.output_volume.commit()
+def _targetscan_tile_ready(spec: TargetscanBatchSpec) -> bool:
+    """Return whether one complete TargetScan tile publication is valid."""
+    targetscan_path = _targetscan_batch_cache_dir(spec) / "targetscan.tab"
+    return _artifact_marker_ready(
+        targetscan_path.parent / "targetscan.done",
+        kind="targetscan-candidate-reference-tile",
+        artifacts={"targetscan": targetscan_path},
+    )
 
 
 def _merge_targetscan_context_outputs(
@@ -3867,141 +3625,6 @@ def _merge_targetscan_context_outputs(
         f"output_rows\t{merged.height}\n",
         encoding="utf-8",
     )
-
-
-def _run_targetscan_context_batches(
-    context_shards: list[TargetscanContextShardSpec],
-    *,
-    max_process_slots: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> list[str]:
-    """Run TargetScan context-score shards with queue-based work stealing."""
-    if not context_shards:
-        return []
-
-    from uuid import uuid4
-
-    context_workers = execution.targetscan_context_workers
-    expected_outputs = [shard.output_path for shard in context_shards]
-    queue_key = hash_string("\n".join(expected_outputs))
-    put_batch_size = APP_INFO.targetscan_context_queue_put_batch_size
-    max_attempts = execution.targetscan_context_attempts
-    last_error: Exception | None = None
-
-    for attempt in range(1, max_attempts + 1):
-        CONF.output_volume.reload()
-        pending_shards = [
-            shard
-            for shard in context_shards
-            if not _targetscan_context_shard_ready(shard)
-        ]
-        if not pending_shards:
-            return expected_outputs
-
-        configured_nodes = _bounded_node_count(
-            len(pending_shards),
-            execution.targetscan_context_nodes,
-        )
-        context_node_count, local_workers = _bounded_worker_topology(
-            task_count=len(pending_shards),
-            configured_nodes=configured_nodes,
-            configured_workers=context_workers,
-            max_process_slots=max_process_slots,
-        )
-        queue_sized_node_count = (
-            len(pending_shards) + local_workers - 1
-        ) // local_workers
-        context_node_count = min(context_node_count, queue_sized_node_count)
-        queue_name = (
-            f"{CONF.package_name}-targetscan-context-{queue_key[:16]}-"
-            f"{attempt}-{uuid4().hex[:12]}"
-        )
-        queue = modal.Queue.from_name(queue_name, create_if_missing=True)
-        print(
-            "💊 Running OligoFormer TargetScan context scoring for "
-            f"{len(pending_shards)} pending of {len(context_shards)} shards via "
-            f"{context_node_count} queue workers with {local_workers} local workers "
-            f"each (attempt {attempt}/{max_attempts})"
-        )
-        worker_calls = []
-        print(
-            "💊 Queueing OligoFormer TargetScan context scoring for "
-            f"{len(pending_shards)} pending of {len(context_shards)} shards"
-        )
-        try:
-            initial_count = min(
-                len(pending_shards),
-                put_batch_size * APP_INFO.targetscan_context_queue_initial_batches,
-            )
-            for start in range(0, initial_count, put_batch_size):
-                queue.put_many(pending_shards[start : start + put_batch_size])
-            worker_calls = bounded_map(
-                range(context_node_count),
-                lambda _index, q=queue_name, w=local_workers: (
-                    run_oligoformer_targetscan_context_queue_worker.spawn(
-                        q,
-                        local_workers=w,
-                        attempts=execution.targetscan_context_attempts,
-                    )
-                ),
-                max_parallel=context_node_count,
-            )
-            for start in range(initial_count, len(pending_shards), put_batch_size):
-                queue.put_many(pending_shards[start : start + put_batch_size])
-            stop_tokens = [APP_INFO.targetscan_context_queue_sentinel] * (
-                context_node_count * local_workers
-            )
-            for start in range(0, len(stop_tokens), put_batch_size):
-                queue.put_many(stop_tokens[start : start + put_batch_size])
-            for call in worker_calls:
-                call.get()
-        except Exception as exc:
-            last_error = exc
-            for call in worker_calls:
-                with suppress(Exception):
-                    call.cancel(terminate_containers=True)
-        except BaseException:
-            for call in worker_calls:
-                with suppress(Exception):
-                    call.cancel(terminate_containers=True)
-            raise
-        finally:
-            with suppress(Exception):
-                modal.Queue.objects.delete(queue_name)
-
-        CONF.output_volume.reload()
-        missing_outputs = [
-            shard.output_path
-            for shard in context_shards
-            if not _targetscan_context_shard_ready(shard)
-        ]
-        if not missing_outputs:
-            return expected_outputs
-        if attempt < max_attempts:
-            reason = f" after {type(last_error).__name__}" if last_error else ""
-            print(
-                "💊 Retrying OligoFormer TargetScan context scoring for "
-                f"{len(missing_outputs)} missing shards{reason}"
-            )
-
-    CONF.output_volume.reload()
-    missing_outputs = [
-        shard.output_path
-        for shard in context_shards
-        if not _targetscan_context_shard_ready(shard)
-    ]
-    if missing_outputs:
-        preview = ", ".join(missing_outputs[:5])
-        if len(missing_outputs) > 5:
-            preview += f", ... ({len(missing_outputs)} total)"
-        error = RuntimeError(
-            "OligoFormer TargetScan context scoring did not produce all outputs: "
-            f"{preview}"
-        )
-        if last_error is not None:
-            raise error from last_error
-        raise error
-    return expected_outputs
 
 
 TARGETSCAN_REFERENCE_INPUT_NAMES = (
@@ -4370,93 +3993,6 @@ def _finalize_targetscan_batch_context_plan(
     return plan.targetscan_path
 
 
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def finalize_oligoformer_targetscan_batch_context_plan(
-    plan: PreparedTargetscanBatch,
-    context_outputs: list[str],
-) -> str:
-    """Finalize one TargetScan reference batch from context-score outputs."""
-    CONF.output_volume.reload()
-    targetscan_path = _finalize_targetscan_batch_context_plan(plan, context_outputs)
-    CONF.output_volume.commit()
-    return targetscan_path
-
-
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True, model_volume=True),
-)
-def prepare_oligoformer_targetscan_batch_shard(
-    spec: TargetscanBatchSpec,
-) -> PreparedTargetscanBatch:
-    """Prepare one TargetScan candidate-batch/reference-shard tile."""
-    import shutil
-
-    CONF.output_volume.reload()
-    MODEL_VOLUME.reload()
-    with TemporaryDirectory(
-        prefix=f"oligoformer_targetscan_{spec.stem}_{spec.shard_index}_"
-    ) as tmpdir:
-        batch_root = Path(tmpdir)
-        off_target_root = batch_root / "off-target"
-        off_target_root.mkdir(parents=True)
-        shutil.copytree(
-            CONF.git_clone_dir / "off-target/targetscan",
-            off_target_root / "targetscan",
-        )
-        plan = _prepare_targetscan_batch_context_plan(
-            spec=spec,
-            batch_root=batch_root,
-        )
-    CONF.output_volume.commit()
-    print(f"💊 Committed OligoFormer TargetScan batch {spec.stem}:{spec.shard_index}")
-    return plan
-
-
-def _run_targetscan_prepare_batches(
-    specs: list[TargetscanBatchSpec],
-    *,
-    max_process_slots: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> list[PreparedTargetscanBatch]:
-    """Prepare TargetScan reference shards with bounded remote fanout."""
-    if not specs:
-        return []
-
-    node_count = _bounded_node_count(
-        len(specs),
-        execution.targetscan_prepare_nodes,
-    )
-    if max_process_slots is not None:
-        if max_process_slots < 1:
-            raise ValueError("max_process_slots must be a positive integer")
-        node_count = min(node_count, max_process_slots)
-    print(
-        "💊 Preparing OligoFormer TargetScan for "
-        f"{len(specs)} reference shards of up to {specs[0].ref_shard_size} UTRs "
-        f"on up to {node_count} CPU nodes"
-    )
-    plans = []
-    for start in range(0, len(specs), node_count):
-        plans.extend(
-            prepare_oligoformer_targetscan_batch_shard.map(
-                specs[start : start + node_count]
-            )
-        )
-    print(
-        "💊 Prepared all OligoFormer TargetScan reference shards: "
-        f"{len(plans)}/{len(specs)}"
-    )
-    return plans
-
-
 def _merge_targetscan_batch_outputs(
     *,
     targetscan_paths: list[str],
@@ -4760,31 +4296,6 @@ def _cleanup_off_target_transients(raw_off_target_dir: Path) -> None:
             child.unlink(missing_ok=True)
 
 
-def _discard_invalid_off_target_evidence(
-    raw_off_target_dir: Path,
-    *,
-    expected_identity: str,
-) -> bool:
-    """Discard one invalid published evidence set after acquiring rebuild ownership."""
-    marker_path = raw_off_target_dir / "off_target.done"
-    if _raw_off_target_ready(
-        raw_off_target_dir,
-        expected_identity=expected_identity,
-    ):
-        return False
-    evidence_paths = (
-        marker_path,
-        raw_off_target_dir / "pita.tab",
-        raw_off_target_dir / "targetscan.tab",
-    )
-    had_artifacts = any(path.exists() for path in evidence_paths)
-    # Invalidate publication first; tables without the manifest are never reusable.
-    marker_path.unlink(missing_ok=True)
-    raw_off_target_dir.joinpath("pita.tab").unlink(missing_ok=True)
-    raw_off_target_dir.joinpath("targetscan.tab").unlink(missing_ok=True)
-    return had_artifacts
-
-
 def _run_pita_row_shard(
     spec: PitaRowShardSpec,
     attempts: int = APP_INFO.default_pita_row_attempts,
@@ -4870,39 +4381,6 @@ def _run_pita_row_shard(
         artifacts={"scored_rows": output_path},
     )
     return str(output_path)
-
-
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def run_oligoformer_pita_row_shard_batch(
-    row_shards: list[PitaRowShardSpec],
-    local_workers: int,
-    attempts: int = APP_INFO.default_pita_row_attempts,
-) -> int:
-    """Run cached PITA row-shard scoring on one CPU node."""
-    local_workers = _validated_worker_count(local_workers)
-    if attempts < 1:
-        raise ValueError("attempts must be a positive integer")
-    CONF.output_volume.reload()
-    _warmup_file_parents(
-        (row.input_path for row in row_shards),
-        file_pattern=r"\.potential\.tsv$",
-    )
-    _warmup_file_parents(
-        (row.ext_utr_path for row in row_shards),
-        file_pattern=r"_ext_utr\.stab$",
-    )
-    outputs = bounded_map(
-        row_shards,
-        lambda spec: _run_pita_row_shard(spec, attempts),
-        max_parallel=local_workers,
-    )
-    CONF.output_volume.commit()
-    return len(outputs)
 
 
 def _write_pita_targets_from_scored_rows(
@@ -5008,38 +4486,14 @@ def _finalize_oligoformer_pita_shard(
     )
 
 
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def finalize_oligoformer_pita_shard_batch(
-    prepared_shards: list[PreparedOffTargetShard],
-    local_workers: int,
-) -> list[OffTargetShardResult]:
-    """Finalize cached per-siRNA PITA tables on one CPU node."""
-    local_workers = _validated_worker_count(local_workers)
-    CONF.output_volume.reload()
-    print(
-        "💊 Running OligoFormer PITA finalize batch with "
-        f"{len(prepared_shards)} siRNAs using {local_workers} workers"
+def _pita_candidate_ready(spec: OffTargetShardSpec) -> bool:
+    """Return whether one complete PITA candidate publication is valid."""
+    cache_dir = _off_target_shard_cache_dir(spec)
+    return _artifact_marker_ready(
+        cache_dir / "pita_finalize.done",
+        kind="pita-candidate-final",
+        artifacts={"pita": cache_dir / "pita.tab"},
     )
-    _warmup_file_parents(
-        (
-            row.output_path
-            for prepared in prepared_shards
-            for row in prepared.row_shards
-        ),
-        file_pattern=r"\.scored\.tsv$",
-    )
-    results = bounded_map(
-        prepared_shards,
-        _finalize_oligoformer_pita_shard,
-        max_parallel=local_workers,
-    )
-    CONF.output_volume.commit()
-    return results
 
 
 def _merge_pita_shards(shard_results: list[OffTargetShardResult], output_path: Path):
@@ -5097,76 +4551,41 @@ def _prepare_pita_target_discovery_plan_for_spec(
         shutil.rmtree(shard_root, ignore_errors=True)
 
 
-@app.function(
-    cpu=(0.125, 32.125),
-    memory=(1024, 32768),
-    timeout=MAX_TIMEOUT,
-    volumes=CONF.mounts(output_volume=True),
-)
-def run_oligoformer_targetscan_branch(
-    targetscan_specs: list[TargetscanBatchSpec],
-    max_process_slots: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> list[str]:
-    """Run TargetScan off-target scoring for all selected siRNAs."""
-    if not targetscan_specs:
-        return []
+def _off_target_branch_slots(
+    execution: OligoformerExecutionConfig,
+) -> tuple[int, int]:
+    """Split the existing run-wide process budget between both CPU branches."""
+    targetscan_slots = max(1, execution.off_target_process_slots // 2)
+    return targetscan_slots, execution.off_target_process_slots - targetscan_slots
 
-    CONF.output_volume.reload()
-    targetscan_plans = _run_targetscan_prepare_batches(
-        targetscan_specs,
-        max_process_slots=max_process_slots,
-        execution=execution,
-    )
-    context_shards = [
-        shard
-        for plan in targetscan_plans
-        for shard in sorted(plan.context_shards, key=lambda item: item.shard_index)
-    ]
-    context_outputs = _run_targetscan_context_batches(
-        context_shards,
-        max_process_slots=max_process_slots,
-        execution=execution,
-    )
-    CONF.output_volume.reload()
-    context_outputs_by_path = {
-        shard.output_path: output
-        for shard, output in zip(context_shards, context_outputs, strict=True)
-    }
-    merge_inputs = [
-        (
-            plan,
-            [
-                context_outputs_by_path[shard.output_path]
-                for shard in sorted(
-                    plan.context_shards, key=lambda item: item.shard_index
-                )
-            ],
-        )
-        for plan in targetscan_plans
-    ]
-    merge_node_count = _bounded_node_count(
-        len(merge_inputs),
-        execution.targetscan_merge_nodes,
-    )
-    if max_process_slots is not None:
-        if max_process_slots < 1:
-            raise ValueError("max_process_slots must be a positive integer")
-        merge_node_count = min(merge_node_count, max_process_slots)
-    print(
-        "💊 Merging OligoFormer TargetScan context outputs for "
-        f"{len(merge_inputs)} reference batches on up to {merge_node_count} CPU nodes"
-    )
-    targetscan_paths = bounded_map(
-        merge_inputs,
-        lambda item: finalize_oligoformer_targetscan_batch_context_plan.remote(
-            item[0],
-            item[1],
+
+def _pita_local_workers(execution: OligoformerExecutionConfig) -> tuple[int, int]:
+    """Derive per-container PITA worker counts from its process-slot share."""
+    _, slots = _off_target_branch_slots(execution)
+    nodes = min(execution.off_target_nodes, slots)
+    workers = max(1, slots // nodes)
+    return (
+        min(
+            workers,
+            execution.off_target_prep_workers,
+            execution.pita_prepare_workers,
         ),
-        max_parallel=merge_node_count,
+        min(workers, execution.off_target_workers),
     )
-    CONF.output_volume.commit()
-    return targetscan_paths
+
+
+def _targetscan_local_workers(execution: OligoformerExecutionConfig) -> int:
+    """Derive per-container TargetScan workers from its process-slot share."""
+    slots, _ = _off_target_branch_slots(execution)
+    nodes = min(
+        execution.targetscan_prepare_nodes,
+        execution.targetscan_context_nodes,
+        slots,
+    )
+    return min(
+        execution.targetscan_context_workers,
+        max(1, slots // nodes),
+    )
 
 
 @app.function(
@@ -5175,276 +4594,221 @@ def run_oligoformer_targetscan_branch(
     timeout=MAX_TIMEOUT,
     volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
-def run_oligoformer_pita_branch(
-    shard_specs: list[OffTargetShardSpec],
-    node_count: int,
-    local_workers: int,
-    max_process_slots: int | None = None,
+def prepare_oligoformer_pita_reference(
+    spec: OffTargetShardSpec,
     execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> list[OffTargetShardResult]:
-    """Run PITA off-target scoring for all selected siRNAs."""
-    if not shard_specs:
-        return []
-    if node_count < 1:
-        raise ValueError("node_count must be a positive integer")
-    local_workers = _validated_worker_count(local_workers)
-
+) -> PitaReferencePlan:
+    """Publish reusable PITA reference STAB shards for one evidence stem."""
     CONF.output_volume.reload()
-    prep_workers = min(
-        execution.off_target_prep_workers,
-        len(shard_specs),
-        max_process_slots or len(shard_specs),
-    )
-    print(
-        "💊 Preparing OligoFormer PITA inputs for "
-        f"{len(shard_specs)} siRNAs with {prep_workers} local workers"
-    )
-    candidate_wave_size = prep_workers * 4
-    shard_results: list[OffTargetShardResult] = []
-    with TemporaryDirectory(
-        prefix=f"oligoformer_{shard_specs[0].stem}_off_target_prepare_"
-    ) as tmpdir:
-        prepare_root = Path(tmpdir)
-        reference = _prepare_pita_reference_plan(
-            shard_specs[0], prepare_root, execution
+    with TemporaryDirectory(prefix=f"oligoformer_{spec.stem}_pita_reference_") as tmp:
+        plan = _prepare_pita_reference_plan(spec, Path(tmp), execution)
+    CONF.output_volume.commit()
+    return plan
+
+
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 32768),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True),
+)
+def run_oligoformer_pita_candidate(
+    spec: OffTargetShardSpec,
+    reference: PitaReferencePlan,
+    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
+) -> OffTargetShardResult:
+    """Run one complete deterministic PITA candidate Task."""
+    CONF.output_volume.reload()
+    prepare_workers, row_workers = _pita_local_workers(execution)
+    with TemporaryDirectory(prefix=f"oligoformer_{spec.stem}_pita_candidate_") as tmp:
+        plan = _prepare_pita_target_discovery_plan_for_spec(
+            spec=spec,
+            prepare_root=Path(tmp),
+            reference=reference,
+            execution=execution,
         )
-        CONF.output_volume.commit()
-        for start in range(0, len(shard_specs), candidate_wave_size):
-            wave_specs = shard_specs[start : start + candidate_wave_size]
-            print(
-                "💊 Running OligoFormer PITA candidate wave "
-                f"{start // candidate_wave_size + 1} with {len(wave_specs)} siRNAs"
-            )
-            pita_plans = bounded_map(
-                wave_specs,
-                lambda spec: _prepare_pita_target_discovery_plan_for_spec(
-                    spec=spec,
-                    prepare_root=prepare_root,
-                    reference=reference,
-                    execution=execution,
-                ),
-                max_parallel=prep_workers,
-            )
-            CONF.output_volume.commit()
-
-            pita_utr_shards = [
-                shard
-                for plan in pita_plans
-                for shard in sorted(
-                    plan.utr_shards,
-                    key=lambda item: item.shard_index,
-                )
-            ]
-            _run_pita_prepare_utr_shard_batches(
-                pita_utr_shards,
-                max_process_slots=max_process_slots,
-                execution=execution,
-            )
-            prepared_shards = _run_pita_consolidate_batches(
-                pita_plans,
-                max_process_slots=max_process_slots,
-                execution=execution,
-            )
-
-            row_shards = [
-                row for prepared in prepared_shards for row in prepared.row_shards
-            ]
-            configured_row_nodes = min(
-                node_count,
-                _bounded_node_count(
-                    len(row_shards),
-                    execution.off_target_nodes,
-                ),
-            )
-            row_node_count, row_local_workers = _bounded_worker_topology(
-                task_count=len(row_shards),
-                configured_nodes=max(1, configured_row_nodes),
-                configured_workers=local_workers,
-                max_process_slots=max_process_slots,
-            )
-            row_batches = _batch_items_for_local_workers(
-                row_shards,
-                max_nodes=max(1, row_node_count),
-                local_workers=row_local_workers,
-            )
-            if row_batches:
-                print(
-                    "💊 Running OligoFormer PITA scoring for "
-                    f"{len(row_shards)} row shards on up to "
-                    f"{len(row_batches)} CPU nodes with "
-                    f"{row_local_workers} workers each"
-                )
-                completed_rows = sum(
-                    run_oligoformer_pita_row_shard_batch.starmap(
-                        (
-                            list(batch),
-                            row_local_workers,
-                            execution.pita_row_attempts,
-                        )
-                        for batch in row_batches
-                    )
-                )
-                if completed_rows != len(row_shards):
-                    raise RuntimeError(
-                        "OligoFormer PITA scoring reported "
-                        f"{completed_rows} completed row shards; expected "
-                        f"{len(row_shards)}"
-                    )
-
-            finalize_batches, finalize_workers = batches_for_total_concurrency(
-                prepared_shards,
-                max_batches=node_count,
-                max_workers_per_batch=row_local_workers,
-                total_concurrency=max_process_slots or node_count * local_workers,
-            )
-            print(
-                "💊 Finalizing OligoFormer PITA tables for "
-                f"{len(prepared_shards)} siRNAs in {len(finalize_batches)} "
-                f"batches with {finalize_workers} workers each"
-            )
-            result_batches = finalize_oligoformer_pita_shard_batch.starmap(
-                (list(batch), finalize_workers) for batch in finalize_batches
-            )
-            shard_results.extend(result for batch in result_batches for result in batch)
-            del (
-                finalize_batches,
-                pita_plans,
-                pita_utr_shards,
-                prepared_shards,
-                result_batches,
-                row_batches,
-                row_shards,
-                wave_specs,
-            )
-    return shard_results
+    bounded_map(
+        plan.utr_shards,
+        lambda shard: _run_pita_prepare_utr_shard(
+            shard,
+            execution.pita_row_attempts,
+        ),
+        max_parallel=prepare_workers,
+    )
+    prepared = _finalize_pita_target_discovery_plan(plan)
+    bounded_map(
+        prepared.row_shards,
+        lambda row: _run_pita_row_shard(row, execution.pita_row_attempts),
+        max_parallel=row_workers,
+    )
+    result = _finalize_oligoformer_pita_shard(prepared)
+    CONF.output_volume.commit()
+    return result
 
 
-def _run_off_target_shards(
-    *,
-    run_root: str,
-    records: list[OffTargetSirnaRecord],
-    stem: str,
-    utr_path: str,
-    orf_path: str,
-    infer_dir: Path,
-    output_dir: Path,
-    logs_dir: Path,
+@app.function(
+    cpu=(0.125, 32.125),
+    memory=(1024, 32768),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def run_oligoformer_targetscan_tile(
+    spec: TargetscanBatchSpec,
+    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
+) -> str:
+    """Run one candidate/reference TargetScan tile without nested calls."""
+    CONF.output_volume.reload()
+    MODEL_VOLUME.reload()
+    with TemporaryDirectory(
+        prefix=f"oligoformer_targetscan_{spec.stem}_{spec.shard_index}_"
+    ) as tmp:
+        batch_root = Path(tmp)
+        off_target_root = batch_root / "off-target"
+        off_target_root.mkdir(parents=True)
+        shutil.copytree(
+            CONF.git_clone_dir / "off-target/targetscan",
+            off_target_root / "targetscan",
+        )
+        plan = _prepare_targetscan_batch_context_plan(
+            spec=spec,
+            batch_root=batch_root,
+        )
+    context_outputs = bounded_map(
+        plan.context_shards,
+        lambda shard: _run_targetscan_context_shard(
+            shard,
+            execution.targetscan_context_attempts,
+        ),
+        max_parallel=_targetscan_local_workers(execution),
+    )
+    targetscan_path = _finalize_targetscan_batch_context_plan(
+        plan,
+        list(context_outputs),
+    )
+    CONF.output_volume.commit()
+    return targetscan_path
+
+
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+def plan_oligoformer_off_target_evidence(
+    plan: OligoformerRunPlan,
     targetscan_ref_shard_size: int | None = None,
     execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
-) -> None:
-    """Run per-siRNA off-target shards and merge their raw outputs."""
-    if not records:
-        raise RuntimeError("No siRNA records available for off-target prediction")
-
-    raw_off_target_dir = (
-        AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
+) -> OligoformerEvidencePlan:
+    """Discover finite PITA candidates and TargetScan tiles after efficacy."""
+    if not plan.config.off_target:
+        return OligoformerEvidencePlan(())
+    CONF.output_volume.reload()
+    MODEL_VOLUME.reload()
+    refreshed = _build_plan(
+        plan.cache_key,
+        plan.efficacy_key,
+        plan.output_stems,
+        plan.run_root,
+        config=plan.config,
+        postprocess_key=plan.postprocess_key,
+        reference_identity=plan.reference_identity,
+        model_identity=plan.model_identity,
     )
-    evidence_identity = _off_target_evidence_identity(run_root, stem)
-    merged_pita_path = raw_off_target_dir / "pita.tab"
-    merged_targetscan_path = raw_off_target_dir / "targetscan.tab"
-    if _raw_off_target_ready(
-        raw_off_target_dir,
-        expected_identity=evidence_identity,
-    ):
-        _copy_merged_off_target_evidence(raw_off_target_dir, infer_dir)
-        print(
-            f"💊 Reusing cached OligoFormer off-target evidence: {raw_off_target_dir}"
+    if not refreshed.efficacy_ready:
+        raise FileNotFoundError("OligoFormer efficacy outputs are incomplete")
+    layout = AppRunLayout.from_run_root(refreshed.run_root)
+    if refreshed.config.all_human:
+        _ensure_human_refs()
+        if not _targetscan_rnaplfold_cache_ready():
+            raise FileNotFoundError("OligoFormer RNAplfold reference cache is missing")
+        utr_path = str(APP_INFO.model_ref_dir / "human_UTR.txt")
+        orf_path = str(APP_INFO.model_ref_dir / "human_ORF.txt")
+    else:
+        utr_path = str(layout.inputs_dir / "utr.txt")
+        orf_path = str(layout.inputs_dir / "orf.txt")
+
+    stem_plans = []
+    for stem in refreshed.output_stems:
+        records = _off_target_sirna_records(
+            _read_efficacy_output(Path(refreshed.efficacy_dir) / f"{stem}.txt"),
+            refreshed.config.top_n,
         )
-        return
-
-    row_shard_size = execution.pita_row_shard_size
-    total_process_slots = execution.off_target_process_slots
-    targetscan_process_slots = max(1, total_process_slots // 2)
-    pita_process_slots = total_process_slots - targetscan_process_slots
-    shard_specs = [
-        _off_target_shard_spec(
-            run_root=run_root,
-            output_dir=output_dir,
-            stem=stem,
-            item=item,
-            utr_path=utr_path,
-            orf_path=orf_path,
-            row_shard_size=row_shard_size,
-        )
-        for item in enumerate(records)
-    ]
-    targetscan_waves = _targetscan_batch_spec_waves(
-        run_root=run_root,
-        output_dir=output_dir,
-        stem=stem,
-        records=records,
-        utr_path=utr_path,
-        orf_path=orf_path,
-        ref_shard_size=targetscan_ref_shard_size,
-        max_tiles_per_wave=targetscan_process_slots,
-        execution=execution,
-    )
-    print(
-        "💊 Preparing OligoFormer off-target inputs for "
-        f"{len(records)} siRNAs in the postprocess node"
-    )
-    print(f"💊 Saving OligoFormer off-target logs under {logs_dir}")
-
-    CONF.output_volume.commit()
-    pita_call = run_oligoformer_pita_branch.spawn(
-        shard_specs,
-        node_count=execution.off_target_nodes,
-        local_workers=execution.off_target_workers,
-        max_process_slots=pita_process_slots,
-        execution=execution,
-    )
-    print(
-        "💊 Running OligoFormer TargetScan and PITA concurrently within "
-        f"{total_process_slots} process slots "
-        f"({targetscan_process_slots} TargetScan, {pita_process_slots} PITA)"
-    )
-    targetscan_wave_paths = []
-    targetscan_call = None
-    try:
-        for wave_index, targetscan_specs in enumerate(targetscan_waves):
-            CONF.output_volume.commit()
-            print(
-                "💊 Running OligoFormer TargetScan candidate/reference wave "
-                f"{wave_index + 1} with {len(targetscan_specs)} tiles"
+        if not records:
+            raise RuntimeError(
+                f"No siRNA records are available for off-target prediction: {stem}"
             )
-            targetscan_call = run_oligoformer_targetscan_branch.spawn(
-                targetscan_specs,
-                max_process_slots=targetscan_process_slots,
+        pita_specs = tuple(
+            _off_target_shard_spec(
+                run_root=refreshed.run_root,
+                output_dir=Path(refreshed.output_dir),
+                stem=stem,
+                item=item,
+                utr_path=utr_path,
+                orf_path=orf_path,
+                row_shard_size=execution.pita_row_shard_size,
+            )
+            for item in enumerate(records)
+        )
+        targetscan_specs = tuple(
+            _targetscan_batch_specs(
+                run_root=refreshed.run_root,
+                output_dir=Path(refreshed.output_dir),
+                stem=stem,
+                records=records,
+                utr_path=utr_path,
+                orf_path=orf_path,
+                ref_shard_size=targetscan_ref_shard_size,
                 execution=execution,
             )
-            targetscan_paths = targetscan_call.get()
-            targetscan_call = None
-            CONF.output_volume.reload()
-            wave_path = (
-                raw_off_target_dir / "targetscan_waves" / f"{wave_index:05d}.tab"
+        )
+        stem_plans.append(
+            OligoformerEvidenceStemPlan(
+                stem=stem,
+                pita_specs=pita_specs,
+                targetscan_specs=targetscan_specs,
             )
-            _merge_targetscan_batch_outputs(
-                targetscan_paths=targetscan_paths,
-                output_path=wave_path,
-            )
-            targetscan_wave_paths.append(str(wave_path))
-            CONF.output_volume.commit()
-        shard_results = pita_call.get()
-    except BaseException:
-        for call in (targetscan_call, pita_call):
-            if call is None:
-                continue
-            with suppress(Exception):
-                call.cancel()
-        raise
-
-    CONF.output_volume.reload()
-    _merge_pita_shards(shard_results, merged_pita_path)
-    _merge_targetscan_batch_outputs(
-        targetscan_paths=targetscan_wave_paths,
-        output_path=merged_targetscan_path,
-    )
-    _publish_off_target_manifest(
-        raw_off_target_dir,
-        identity=evidence_identity,
-    )
+        )
     CONF.output_volume.commit()
-    _copy_merged_off_target_evidence(raw_off_target_dir, infer_dir)
+    return OligoformerEvidencePlan(tuple(stem_plans))
+
+
+@app.function(
+    cpu=(0.125, 16.125),
+    memory=(1024, 32768),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True),
+)
+def publish_oligoformer_off_target_evidence(
+    run_root: str,
+    stem_plan: OligoformerEvidenceStemPlan,
+) -> None:
+    """Merge complete scientific tiles and publish one evidence manifest."""
+    CONF.output_volume.reload()
+    evidence_dir = (
+        AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem_plan.stem
+    )
+    identity = _off_target_evidence_identity(run_root, stem_plan.stem)
+    if _raw_off_target_ready(evidence_dir, expected_identity=identity):
+        return
+    pita_results = [
+        OffTargetShardResult(
+            index=spec.index,
+            pita_path=str(_off_target_shard_cache_dir(spec) / "pita.tab"),
+        )
+        for spec in stem_plan.pita_specs
+    ]
+    targetscan_paths = [
+        str(_targetscan_batch_cache_dir(spec) / "targetscan.tab")
+        for spec in stem_plan.targetscan_specs
+    ]
+    _merge_pita_shards(pita_results, evidence_dir / "pita.tab")
+    _merge_targetscan_batch_outputs(
+        targetscan_paths=targetscan_paths,
+        output_path=evidence_dir / "targetscan.tab",
+    )
+    _publish_off_target_manifest(evidence_dir, identity=identity)
+    CONF.output_volume.commit()
 
 
 def _apply_off_target_filters(
@@ -5452,16 +4816,11 @@ def _apply_off_target_filters(
     result,
     run_root: str,
     stem: str,
-    utr_path: str,
-    orf_path: str,
-    output_dir: Path,
     top_n: int,
     pita_threshold: float,
     targetscan_threshold: float,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ):
-    """Apply upstream-equivalent PITA and TargetScan post-processing."""
+    """Apply filters from already-published PITA and TargetScan evidence."""
     import shutil
 
     infer_dir = CONF.git_clone_dir / "data/infer" / stem
@@ -5475,19 +4834,15 @@ def _apply_off_target_filters(
         sirna_file = infer_dir / "top_n_siRNA.fa"
     records = _off_target_sirna_records(result, top_n)
     _write_sirna_records(records, sirna_file)
-    off_target_logs_dir = output_dir / "logs" / "off_target" / stem
-    _run_off_target_shards(
-        run_root=run_root,
-        records=records,
-        stem=stem,
-        utr_path=utr_path,
-        orf_path=orf_path,
-        infer_dir=infer_dir,
-        output_dir=output_dir,
-        logs_dir=off_target_logs_dir,
-        targetscan_ref_shard_size=targetscan_ref_shard_size,
-        execution=execution,
-    )
+    evidence_dir = AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
+    if not _raw_off_target_ready(
+        evidence_dir,
+        expected_identity=_off_target_evidence_identity(run_root, stem),
+    ):
+        raise FileNotFoundError(
+            f"OligoFormer off-target evidence is incomplete for {stem}"
+        )
+    _copy_merged_off_target_evidence(evidence_dir, infer_dir)
 
     original_columns = list(result.columns)
     result = result.with_columns(
@@ -5891,8 +5246,6 @@ def _run_oligoformer_postprocess_locked(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ) -> bytes:
     """Build final tables while holding their cache-generation lock."""
     CONF.output_volume.reload()
@@ -5922,134 +5275,42 @@ def _run_oligoformer_postprocess_locked(
     if not off_target and not toxicity:
         _copy_outputs(efficacy_dir, output_dir, refreshed_plan.output_stems)
     else:
-        needs_reference_guard = (
-            off_target and all_human and not refreshed_plan.evidence_ready
-        )
         if off_target and all_human:
-            if needs_reference_guard:
-                _ensure_human_refs()
-                if not _targetscan_rnaplfold_cache_ready():
-                    prepare_oligoformer_targetscan_rnaplfold_cache.remote(
-                        force=False,
-                        execution=execution,
-                    )
-                    CONF.output_volume.reload()
-            utr_path = str(APP_INFO.model_ref_dir / "human_UTR.txt")
-            orf_path = str(APP_INFO.model_ref_dir / "human_ORF.txt")
-        else:
-            utr_path = str(layout.inputs_dir / "utr.txt")
-            orf_path = str(layout.inputs_dir / "orf.txt")
-
-        reference_guard = (
-            _cache_build_lock(
-                "targetscan-reference-state",
-                "global",
-                rebuild=True,
-                coalesce_rebuild=False,
-            )
-            if needs_reference_guard
-            else nullcontext(False)
-        )
-        with reference_guard as owns_reference_state:
-            if needs_reference_guard:
-                if not owns_reference_state:
-                    raise RuntimeError(
-                        "OligoFormer reference-state access was not serialized"
-                    )
-                CONF.output_volume.reload()
-                MODEL_VOLUME.reload()
-                if (
-                    refreshed_plan.reference_identity is None
-                    or _targetscan_ref_identity_digest()
-                    != refreshed_plan.reference_identity
-                    or not _targetscan_ref_identity_matches_model()
-                ):
-                    raise FileNotFoundError(
-                        "OligoFormer human references changed after run preparation. "
-                        "Prepare and submit the run again."
-                    )
-                if not _targetscan_rnaplfold_cache_ready():
-                    raise FileNotFoundError(
-                        "OligoFormer RNAplfold references changed after preparation. "
-                        "Prepare and submit the run again."
-                    )
-
-            for stem in refreshed_plan.output_stems:
-                result = _read_efficacy_output(efficacy_dir / f"{stem}.txt")
-                if off_target:
-                    evidence_dir = layout.prep_dir / "off_target" / stem
-                    evidence_identity = _off_target_evidence_identity(
-                        refreshed_plan.run_root,
-                        stem,
-                    )
-                    needs_lock = not _raw_off_target_ready(
-                        evidence_dir,
-                        expected_identity=evidence_identity,
-                    )
-                    evidence_paths = tuple(
-                        evidence_dir / name
-                        for name in ("off_target.done", "pita.tab", "targetscan.tab")
-                    )
-                    published_evidence_artifacts = any(
-                        path.exists() for path in evidence_paths
-                    )
-                    lock = (
-                        _cache_build_lock(
-                            "off-target-evidence",
-                            f"{refreshed_plan.run_root}\n{stem}",
-                            rebuild=True,
-                        )
-                        if needs_lock
-                        else nullcontext()
-                    )
-                    with lock as owns_cache_build:
-                        if needs_lock:
-                            CONF.output_volume.reload()
-                            evidence_ready = _raw_off_target_ready(
-                                evidence_dir,
-                                expected_identity=evidence_identity,
-                            )
-                            if (
-                                owns_cache_build
-                                and published_evidence_artifacts
-                                and not evidence_ready
-                            ):
-                                _discard_invalid_off_target_evidence(
-                                    evidence_dir,
-                                    expected_identity=evidence_identity,
-                                )
-                            elif not owns_cache_build and not evidence_ready:
-                                raise RuntimeError(
-                                    "OligoFormer off-target evidence cache was marked "
-                                    "complete without outputs"
-                                )
-                        result = _apply_off_target_filters(
-                            result=result,
-                            run_root=refreshed_plan.run_root,
-                            stem=stem,
-                            utr_path=utr_path,
-                            orf_path=orf_path,
-                            output_dir=output_dir,
-                            top_n=top_n,
-                            pita_threshold=pita_threshold,
-                            targetscan_threshold=targetscan_threshold,
-                            targetscan_ref_shard_size=targetscan_ref_shard_size,
-                            execution=execution,
-                        )
-                        if owns_cache_build:
-                            CONF.output_volume.commit()
-                if toxicity:
-                    result = _apply_toxicity_filters(
-                        result=result,
-                        toxicity_threshold=toxicity_threshold,
-                    )
-                result = _apply_final_filter(
-                    result=result,
-                    off_target=off_target,
-                    toxicity=toxicity,
-                    functionality_filter=functionality_filter,
+            _ensure_human_refs()
+            if (
+                refreshed_plan.reference_identity is None
+                or _targetscan_ref_identity_digest()
+                != refreshed_plan.reference_identity
+                or not _targetscan_ref_identity_matches_model()
+                or not _targetscan_rnaplfold_cache_ready()
+            ):
+                raise FileNotFoundError(
+                    "OligoFormer human references changed after run preparation"
                 )
-                _write_final_outputs(result, output_dir, stem)
+
+        for stem in refreshed_plan.output_stems:
+            result = _read_efficacy_output(efficacy_dir / f"{stem}.txt")
+            if off_target:
+                result = _apply_off_target_filters(
+                    result=result,
+                    run_root=refreshed_plan.run_root,
+                    stem=stem,
+                    top_n=top_n,
+                    pita_threshold=pita_threshold,
+                    targetscan_threshold=targetscan_threshold,
+                )
+            if toxicity:
+                result = _apply_toxicity_filters(
+                    result=result,
+                    toxicity_threshold=toxicity_threshold,
+                )
+            result = _apply_final_filter(
+                result=result,
+                off_target=off_target,
+                toxicity=toxicity,
+                functionality_filter=functionality_filter,
+            )
+            _write_final_outputs(result, output_dir, stem)
 
     _write_cache_marker(
         layout,
@@ -6081,12 +5342,8 @@ def run_oligoformer_postprocess(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    targetscan_ref_shard_size: int | None = None,
-    execution: OligoformerExecutionConfig = DEFAULT_EXECUTION_CONFIG,
 ) -> bytes:
     """Run CPU post-processing and return packaged OligoFormer outputs."""
-    if targetscan_ref_shard_size is not None and targetscan_ref_shard_size < 1:
-        raise ValueError("targetscan_ref_shard_size must be a positive integer")
     requested_config = OligoformerRunConfig(
         off_target=off_target,
         toxicity=toxicity,
@@ -6155,21 +5412,31 @@ def run_oligoformer_postprocess(
             pita_threshold=pita_threshold,
             targetscan_threshold=targetscan_threshold,
             toxicity_threshold=toxicity_threshold,
-            targetscan_ref_shard_size=targetscan_ref_shard_size,
-            execution=execution,
         )
 
 
 @app.function(
     cpu=(0.125, 32.125),
     memory=(1024, 32768),
-    timeout=CONF.timeout,
-    volumes=CONF.mounts(output_volume=True),
+    timeout=MAX_TIMEOUT,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
 )
-def package_oligoformer_outputs(plan: OligoformerRunPlan) -> bytes:
-    """Return cached OligoFormer outputs as standalone tarball bytes."""
-    CONF.output_volume.reload()
-    refreshed_plan = _build_plan(
+def build_oligoformer_final_tables(
+    plan: OligoformerRunPlan,
+) -> OligoformerRunPlan:
+    """Build final tables and return only their refreshed publication plan."""
+    run_oligoformer_postprocess.get_raw_f()(
+        plan=plan,
+        off_target=plan.config.off_target,
+        toxicity=plan.config.toxicity,
+        all_human=plan.config.all_human,
+        top_n=plan.config.top_n,
+        functionality_filter=plan.config.functionality_filter,
+        pita_threshold=plan.config.pita_threshold,
+        targetscan_threshold=plan.config.targetscan_threshold,
+        toxicity_threshold=plan.config.toxicity_threshold,
+    )
+    return _build_plan(
         plan.cache_key,
         plan.efficacy_key,
         plan.output_stems,
@@ -6179,13 +5446,386 @@ def package_oligoformer_outputs(plan: OligoformerRunPlan) -> bytes:
         reference_identity=plan.reference_identity,
         model_identity=plan.model_identity,
     )
-    if not refreshed_plan.final_ready:
-        raise FileNotFoundError(
-            f"OligoFormer final outputs are incomplete for {refreshed_plan.cache_key}"
-        )
-    return _package_output_tables(
-        Path(refreshed_plan.output_dir), refreshed_plan.output_stems
+
+
+def _oligoformer_result_archive_path(plan: OligoformerRunPlan) -> Path:
+    """Return the reconstructable result archive published for direct clients."""
+    return Path(plan.output_dir) / "oligoformer.tar.zst"
+
+
+def _oligoformer_result_record_path(
+    output_root: str | Path,
+    publication_key: str,
+) -> Path:
+    if len(publication_key) != 64 or any(
+        character not in "0123456789abcdef" for character in publication_key
+    ):
+        raise ValueError("OligoFormer result publication key must be SHA-256")
+    return (
+        Path(output_root)
+        / ".biomodals"
+        / "oligoformer"
+        / "results"
+        / f"{publication_key}.json"
     )
+
+
+def _parse_oligoformer_result_publication(
+    content: bytes,
+    publication_key: str,
+) -> dict[str, object] | None:
+    import orjson
+
+    try:
+        value = orjson.loads(content)
+    except orjson.JSONDecodeError:
+        return None
+    if not (
+        isinstance(value, dict)
+        and value.get("version") == 2
+        and value.get("publication_key") == publication_key
+        and isinstance(value.get("result_path"), str)
+        and isinstance(value.get("size_bytes"), int)
+        and not isinstance(value.get("size_bytes"), bool)
+        and value["size_bytes"] > 0
+        and isinstance(value.get("sha256"), str)
+        and len(value["sha256"]) == 64
+        and isinstance(value.get("model_identity"), str)
+        and bool(value["model_identity"])
+        and (
+            value.get("reference_identity") is None
+            or isinstance(value.get("reference_identity"), str)
+        )
+    ):
+        return None
+    relative = Path(cast(str, value["result_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    return cast(dict[str, object], value)
+
+
+def _publish_oligoformer_result_record(
+    output_root: str | Path,
+    publication_key: str,
+    archive_path: Path,
+    *,
+    model_identity: str,
+    reference_identity: str | None,
+) -> None:
+    """Atomically bind one reconstructable archive to its scientific plan."""
+    import orjson
+
+    root = Path(output_root).resolve()
+    relative = archive_path.resolve().relative_to(root)
+    size = archive_path.stat().st_size
+    if archive_path.is_symlink() or size < 1:
+        raise RuntimeError("OligoFormer result archive is not a regular artifact")
+    marker = _oligoformer_result_record_path(root, publication_key)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = _unique_tmp_path(marker)
+    try:
+        tmp_path.write_bytes(
+            orjson.dumps({
+                "version": 2,
+                "publication_key": publication_key,
+                "model_identity": model_identity,
+                "reference_identity": reference_identity,
+                "result_path": relative.as_posix(),
+                "size_bytes": size,
+                "sha256": _hash_path(archive_path),
+            })
+        )
+        tmp_path.replace(marker)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _oligoformer_result_publication(
+    output_root: str | Path,
+    publication_key: str,
+    *,
+    expected_identities: tuple[str, str | None] | None = None,
+) -> dict[str, object] | None:
+    """Return one validated local archive publication, if complete."""
+    marker = _oligoformer_result_record_path(output_root, publication_key)
+    try:
+        publication = _parse_oligoformer_result_publication(
+            marker.read_bytes(),
+            publication_key,
+        )
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return None
+    if publication is None:
+        return None
+    if (
+        expected_identities is not None
+        and (
+            publication["model_identity"],
+            publication["reference_identity"],
+        )
+        != expected_identities
+    ):
+        return None
+    archive = Path(output_root).joinpath(
+        *Path(cast(str, publication["result_path"])).parts
+    )
+    try:
+        if archive.is_symlink() or archive.stat().st_size != publication["size_bytes"]:
+            return None
+        if _hash_path(archive) != publication["sha256"]:
+            return None
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return publication
+
+
+def _oligoformer_result_publication_from_volume(
+    volume,
+    publication_key: str,
+) -> dict[str, object] | None:
+    """Read the bounded result record through the client-side Volume API."""
+    relative = (
+        Path(".biomodals") / "oligoformer" / "results" / f"{publication_key}.json"
+    )
+    content = bytearray()
+    try:
+        for chunk in volume.read_file(relative.as_posix()):
+            if not isinstance(chunk, bytes):
+                raise TypeError("OligoFormer result publication must be bytes")
+            if len(content) + len(chunk) > 64 * 1024:
+                raise ValueError("OligoFormer result publication is too large")
+            content.extend(chunk)
+    except FileNotFoundError:
+        return None
+    return _parse_oligoformer_result_publication(bytes(content), publication_key)
+
+
+@app.function(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def publish_oligoformer_outputs(
+    plan: OligoformerRunPlan,
+    publication_key: str,
+) -> dict[str, object]:
+    """Publish the final standalone archive for Volume API download."""
+    CONF.output_volume.reload()
+    refreshed = _build_plan(
+        plan.cache_key,
+        plan.efficacy_key,
+        plan.output_stems,
+        plan.run_root,
+        config=plan.config,
+        postprocess_key=plan.postprocess_key,
+        reference_identity=plan.reference_identity,
+        model_identity=plan.model_identity,
+    )
+    if not refreshed.final_ready:
+        raise FileNotFoundError("OligoFormer final outputs are incomplete")
+    if refreshed.model_identity is None:
+        raise FileNotFoundError("OligoFormer model identity is unavailable")
+    archive_path = _oligoformer_result_archive_path(refreshed)
+    archive_bytes = _package_output_tables(
+        Path(refreshed.output_dir),
+        refreshed.output_stems,
+    )
+    tmp_path = _unique_tmp_path(archive_path)
+    try:
+        tmp_path.write_bytes(archive_bytes)
+        tmp_path.replace(archive_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    _publish_oligoformer_result_record(
+        CONF.output_volume_mountpoint,
+        publication_key,
+        archive_path,
+        model_identity=refreshed.model_identity,
+        reference_identity=refreshed.reference_identity,
+    )
+    CONF.output_volume.commit()
+    return {"result_path": str(archive_path), "size_bytes": len(archive_bytes)}
+
+
+##########################################
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    volumes=CONF.mounts(output_volume=True, model_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with OligoFormer functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh mounted state before accepting lifecycle calls."""
+        initialize_execution_coordinator_host(self)
+        self._identity()
+        CONF.output_volume.reload()
+        MODEL_VOLUME.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionOverview:
+        """Drive one staged root App Run."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionOverview:
+        """Read this Run's durable overview."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionOverview:
+        """Request cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionOverview:
+        """Resume without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Persist a validated Successor request without driving it."""
+        self._adapter().prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> ExecutionOverview:
+        """Drive one previously prepared root or Successor Run."""
+        return self._adapter().drive_prepared()
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+    ) -> ExecutionOverview:
+        """Create a compatible Successor while inferring deployment identity."""
+        adapter = self._adapter()
+        adapter.prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            candidate_request=load_execution_request(
+                CONF.output_volume_mountpoint,
+                UUID(self.execution_run_id),
+            ),
+        )
+        return adapter.drive_prepared()
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return execution_coordinator_identity(self)
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> OligoformerExecutionCoordinator:
+        execution_run_id, deployment = self._identity()
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: OligoformerExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                model_volume=MODEL_VOLUME,
+                output_claims=OLIGOFORMER_OUTPUT_CLAIMS,
+                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+                model_version=_hash_bytes(
+                    orjson.dumps(
+                        APP_INFO.rnafm_identity_metadata,
+                        option=orjson.OPT_SORT_KEYS,
+                    )
+                ),
+                reference_version=_hash_bytes(
+                    orjson.dumps(
+                        APP_INFO.targetscan_ref_metadata,
+                        option=orjson.OPT_SORT_KEYS,
+                    )
+                ),
+            ),
+        )
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "download_oligoformer_models": download_oligoformer_models,
+            "prepare_oligoformer_run": prepare_oligoformer_run,
+            "plan_oligoformer_targetscan_rnaplfold_cache": (
+                plan_oligoformer_targetscan_rnaplfold_cache
+            ),
+            "run_oligoformer_targetscan_rnaplfold_shard": (
+                run_oligoformer_targetscan_rnaplfold_shard
+            ),
+            "finalize_oligoformer_targetscan_rnaplfold_cache": (
+                finalize_oligoformer_targetscan_rnaplfold_cache
+            ),
+            "run_oligoformer_efficacy": run_oligoformer_efficacy,
+            "plan_oligoformer_off_target_evidence": (
+                plan_oligoformer_off_target_evidence
+            ),
+            "prepare_oligoformer_pita_reference": prepare_oligoformer_pita_reference,
+            "run_oligoformer_pita_candidate": run_oligoformer_pita_candidate,
+            "run_oligoformer_targetscan_tile": run_oligoformer_targetscan_tile,
+            "publish_oligoformer_off_target_evidence": (
+                publish_oligoformer_off_target_evidence
+            ),
+            "build_oligoformer_final_tables": build_oligoformer_final_tables,
+            "publish_oligoformer_outputs": publish_oligoformer_outputs,
+        },
+        workload_name="OligoFormer",
+    )
+
+
+def _optional_local_bytes(path: str | None, label: str) -> bytes | None:
+    """Read one optional local CLI input."""
+    if path is None:
+        return None
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} not found: {resolved}")
+    return resolved.read_bytes()
 
 
 ##########################################
@@ -6234,6 +5874,11 @@ def submit_oligoformer_task(
     targetscan_context_attempts: int = APP_INFO.default_targetscan_context_attempts,
     targetscan_merge_nodes: int = APP_INFO.default_targetscan_merge_nodes,
     force: bool = False,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run OligoFormer siRNA efficacy prediction.
 
@@ -6280,26 +5925,32 @@ def submit_oligoformer_task(
         targetscan_context_attempts: Attempts for TargetScan context scoring.
         targetscan_merge_nodes: Maximum TargetScan merge containers.
         force: Rebuild cached intermediates and outputs.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            Biomodals CLI supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
     input_path = Path(mrna_fasta).expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f"mRNA FASTA not found: {input_path}")
     run_name = run_name or input_path.stem
-    out_file = build_local_output_path(
-        resolve_local_output_dir(out_dir),
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    request = OligoformerExecutionRequest(
         run_name=run_name,
-        suffix="oligoformer",
-        overwrite=force,
-    )
-
-    if off_target and not all_human and (utr_file is None or orf_file is None):
-        raise ValueError(
-            "Set --utr-file and --orf-file for off-target prediction, or pass "
-            "--all-human."
-        )
-    if targetscan_ref_shard_size is not None and targetscan_ref_shard_size < 1:
-        raise ValueError("targetscan_ref_shard_size must be a positive integer")
-    execution = OligoformerExecutionConfig(
+        mrna_fasta_bytes=input_path.read_bytes(),
+        sirna_fasta_bytes=_optional_local_bytes(sirna_fasta, "siRNA FASTA"),
+        off_target=off_target,
+        toxicity=toxicity,
+        all_human=all_human,
+        utr_bytes=_optional_local_bytes(utr_file, "UTR reference"),
+        orf_bytes=_optional_local_bytes(orf_file, "ORF reference"),
+        top_n=top_n,
+        functionality_filter=functionality_filter,
+        pita_threshold=pita_threshold,
+        targetscan_threshold=targetscan_threshold,
+        toxicity_threshold=toxicity_threshold,
         off_target_nodes=off_target_nodes,
         off_target_workers=off_target_workers,
         off_target_process_slots=off_target_process_slots,
@@ -6313,134 +5964,93 @@ def submit_oligoformer_task(
         targetscan_rnaplfold_workers=targetscan_rnaplfold_workers,
         targetscan_rnaplfold_shard_size=targetscan_rnaplfold_shard_size,
         targetscan_prepare_nodes=targetscan_prepare_nodes,
+        targetscan_ref_shard_size=targetscan_ref_shard_size,
         targetscan_candidate_shard_size=targetscan_candidate_shard_size,
         targetscan_context_nodes=targetscan_context_nodes,
         targetscan_context_workers=targetscan_context_workers,
         targetscan_context_shard_size=targetscan_context_shard_size,
         targetscan_context_attempts=targetscan_context_attempts,
         targetscan_merge_nodes=targetscan_merge_nodes,
+        force=force,
+        force_generation=uuid4().hex if force else None,
+        app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+        model_version=_hash_bytes(
+            orjson.dumps(
+                APP_INFO.rnafm_identity_metadata,
+                option=orjson.OPT_SORT_KEYS,
+            )
+        ),
+        reference_version=(
+            _hash_bytes(
+                orjson.dumps(
+                    APP_INFO.targetscan_ref_metadata,
+                    option=orjson.OPT_SORT_KEYS,
+                )
+            )
+            if off_target and all_human
+            else None
+        ),
     )
 
-    sirna_fasta_bytes = None
-    if sirna_fasta is not None:
-        sirna_path = Path(sirna_fasta).expanduser().resolve()
-        if not sirna_path.is_file():
-            raise FileNotFoundError(f"siRNA FASTA not found: {sirna_path}")
-        sirna_fasta_bytes = sirna_path.read_bytes()
+    out_file = build_local_output_path(
+        resolve_local_output_dir(out_dir),
+        run_name=request.run_name,
+        suffix="oligoformer",
+        overwrite=force,
+    )
 
-    utr_bytes = None
-    if utr_file is not None:
-        utr_path = Path(utr_file).expanduser().resolve()
-        if not utr_path.is_file():
-            raise FileNotFoundError(f"UTR reference not found: {utr_path}")
-        utr_bytes = utr_path.read_bytes()
-
-    orf_bytes = None
-    if orf_file is not None:
-        orf_path = Path(orf_file).expanduser().resolve()
-        if not orf_path.is_file():
-            raise FileNotFoundError(f"ORF reference not found: {orf_path}")
-        orf_bytes = orf_path.read_bytes()
-
-    print(f"🧬 Submitting OligoFormer run '{run_name}'")
-    force_generation = None
-    if force:
-        from uuid import uuid4
-
-        force_generation = uuid4().hex
-    prepare_kwargs = {
-        "mrna_fasta_bytes": input_path.read_bytes(),
-        "sirna_fasta_bytes": sirna_fasta_bytes,
-        "off_target": off_target,
-        "toxicity": toxicity,
-        "all_human": all_human,
-        "utr_bytes": utr_bytes,
-        "orf_bytes": orf_bytes,
-        "top_n": top_n,
-        "functionality_filter": functionality_filter,
-        "pita_threshold": pita_threshold,
-        "targetscan_threshold": targetscan_threshold,
-        "toxicity_threshold": toxicity_threshold,
-        "force": force,
-        "force_generation": force_generation,
-    }
-    model_assets_ready = False
-    try:
-        plan = prepare_oligoformer_run.remote(**prepare_kwargs)
-    except FileNotFoundError:
-        if not (off_target and all_human):
-            raise
-        download_oligoformer_models.remote(force=False)
-        model_assets_ready = True
-        plan = prepare_oligoformer_run.remote(**prepare_kwargs)
-
-    needs_human_reference_cache = off_target and all_human and not plan.evidence_ready
-    if (
-        not plan.final_ready
-        and (not plan.efficacy_ready or needs_human_reference_cache)
-        and not model_assets_ready
-    ):
-        download_oligoformer_models.remote(force=False)
-        model_assets_ready = True
-        plan = prepare_oligoformer_run.remote(**prepare_kwargs)
-
-    if plan.final_ready:
-        print(f"🧬 Reusing cached OligoFormer outputs: {plan.run_root}")
-        tarball_bytes = package_oligoformer_outputs.remote(plan)
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
+    )
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_launch(
+        CONF.output_volume,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(development=not use_deployed_coordinator)
     else:
-        needs_human_reference_cache = (
-            off_target and all_human and not plan.evidence_ready
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
         )
-
-        reference_call = None
-        if needs_human_reference_cache:
-            print("🧬 Preparing reusable TargetScan RNAplfold references")
-            reference_call = prepare_oligoformer_targetscan_rnaplfold_cache.spawn(
-                force=False,
-                execution=execution,
-            )
-
-        efficacy_call = None
-        if plan.efficacy_ready:
-            print(f"🧬 Reusing cached OligoFormer efficacy: {plan.run_root}")
-            efficacy_plan = plan
-        else:
-            print("🧬 Running OligoFormer efficacy on GPU")
-            efficacy_call = run_oligoformer_efficacy.spawn(
-                plan=plan,
-                functionality_filter=functionality_filter,
-            )
-
-        if efficacy_call is not None and reference_call is not None:
-            try:
-                efficacy_plan_raw, _ = modal.FunctionCall.gather(
-                    efficacy_call,
-                    reference_call,
-                )
-            except BaseException:
-                for call in (efficacy_call, reference_call):
-                    with suppress(Exception):
-                        call.cancel()
-                raise
-            efficacy_plan = cast(OligoformerRunPlan, efficacy_plan_raw)
-        elif efficacy_call is not None:
-            efficacy_plan = efficacy_call.get()
-        elif reference_call is not None:
-            reference_call.get()
-
-        print("🧬 Running OligoFormer CPU post-processing")
-        tarball_bytes = run_oligoformer_postprocess.remote(
-            plan=efficacy_plan,
-            off_target=off_target,
-            toxicity=toxicity,
-            all_human=all_human,
-            top_n=top_n,
-            functionality_filter=functionality_filter,
-            pita_threshold=pita_threshold,
-            targetscan_threshold=targetscan_threshold,
-            toxicity_threshold=toxicity_threshold,
-            targetscan_ref_shard_size=targetscan_ref_shard_size,
-            execution=execution,
+    print(f"Execution Run ID: {execution_run_id}")
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    overview = call.get()
+    if overview.run.status != RunStatus.SUCCEEDED:
+        diagnostic = overview.run.status_message or (
+            overview.run.status_reason.value
+            if overview.run.status_reason is not None
+            else overview.run.status.value
         )
+        raise RuntimeError(
+            f"OligoFormer Execution Run ended as "
+            f"{overview.run.status.value}: {diagnostic}"
+        )
+    publication = _oligoformer_result_publication_from_volume(
+        CONF.output_volume,
+        request.execution_plan.workload_plan_fingerprint,
+    )
+    if not isinstance(publication, dict) or not isinstance(
+        publication.get("result_path"),
+        str,
+    ):
+        raise RuntimeError("OligoFormer result publication is missing")
+    result_path = cast(str, publication["result_path"])
+    tarball_bytes = b"".join(CONF.output_volume.read_file(result_path))
+    if (
+        len(tarball_bytes) != publication["size_bytes"]
+        or hashlib.sha256(tarball_bytes).hexdigest() != publication["sha256"]
+    ):
+        raise RuntimeError("OligoFormer result archive failed integrity validation")
     write_local_tarball(out_file, tarball_bytes, overwrite=force)
     print(f"🧬 OligoFormer run complete! Results saved to {out_file}")

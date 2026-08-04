@@ -12,18 +12,51 @@ See <https://docs.rosettacommons.org/docs/latest/Home> for documentation.
 
 import os
 from collections.abc import Iterable
+from dataclasses import asdict
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import modal
 import polars as pl
 
+from biomodals.app.bioinfo.rosetta.execution_contracts import (
+    RosettaTaskSpec,
+    execute_rosetta_task,
+)
+from biomodals.app.bioinfo.rosetta.execution_coordinator import (
+    RosettaExecutionCoordinator,
+)
+from biomodals.app.bioinfo.rosetta.execution_request import (
+    RosettaExecutionRequest,
+    load_execution_request_from_volume,
+    stage_execution_request,
+)
 from biomodals.app.config import AppConfig
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionOverview,
+    RunStatus,
+    WorkerAssignmentRecord,
+)
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    development_modal_call_driver,
+    execution_coordinator_adapter,
+    execution_coordinator_identity,
+    initialize_execution_coordinator_host,
+)
+from biomodals.execution.modal import (
+    execution_coordinator_handle as _execution_coordinator_handle,
+)
+from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
 from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
-from biomodals.helper.shell import package_outputs, warmup_directory
-from biomodals.helper.task_budget import bounded_map
+from biomodals.helper.constant import MAX_TIMEOUT
+from biomodals.helper.shell import package_outputs, sanitize_filename, warmup_directory
 
 ##########################################
 # Modal configs
@@ -48,8 +81,11 @@ runtime_image = (
     .from_registry("rosettacommons/rosetta:serial-420", add_python=CONF.python_version)
     .env(CONF.default_env)
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.bioinfo.rosetta")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_rosetta_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 32
 
 
 ##########################################
@@ -61,59 +97,73 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
     timeout=CONF.timeout,
     volumes=CONF.mounts(output_volume=True),
 )
-def run_rosetta(run_name: str, run_id: str, num_cpu_per_pod: int):
-    """Run Rosetta scripts."""
+def run_rosetta_worker(
+    coordinator,
+    provider_call_id: str,
+    run_name: str,
+    run_id: str,
+    claim_capacity: int,
+    max_parallel: int,
+) -> dict[str, int]:
+    """Claim, execute, and report Rosetta Tasks until the durable pool is empty."""
     from biomodals.helper.shell import run_command
 
+    if sanitize_filename(run_name) != run_name:
+        raise ValueError("run_name must be a safe filename component")
+    if sanitize_filename(run_id) != run_id:
+        raise ValueError("run_id must be a safe filename component")
     layout = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / f"{run_name}-{run_id}"
     )
-    queue = modal.Queue.from_name(f"{CONF.name}-queue-{run_id}")
+    call_id = UUID(provider_call_id)
 
-    def _worker(worker_idx: int) -> None:
-        while True:
-            job_spec = queue.get(block=False)
-            if job_spec is None:
-                print(f"💊 No more jobs in queue for worker {worker_idx}")
-                return
+    def claim(request_id: str, capacity: int):
+        return coordinator.claim_tasks.remote(
+            provider_call_id,
+            request_id,
+            capacity,
+        )
 
-            task_idx = str(job_spec["index"])
-            binary = job_spec["binary"]
-            pdb_path = job_spec["pdb"]
-            if binary is None or pdb_path is None:
-                raise ValueError(f"Rosetta job is missing required values: {job_spec}")
-
-            out_dir = layout.outputs_dir / task_idx
-            out_dir.mkdir(parents=True, exist_ok=True)
-            layout.logs_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [str(binary)]
-            if job_spec.get("rosetta_script") is not None:
-                cmd.extend([
-                    "-parser:protocol",
-                    str(layout.run_root / str(job_spec["rosetta_script"])),
-                ])
-            if job_spec.get("flags_file") is not None:
-                cmd.append(f"@{layout.run_root / str(job_spec['flags_file'])}")
-            cmd.extend([
-                "-s",
-                str(layout.run_root / str(pdb_path)),
-                "-out:path:all",
-                str(out_dir),
-            ])
-            run_command(
-                cmd,
-                output_mode="capture",
-                log_file=layout.logs_dir / f"{task_idx}.log",
+    def execute(assignment: WorkerAssignmentRecord) -> dict[str, object]:
+        task = RosettaTaskSpec.from_dict(assignment.execution_payload)
+        try:
+            return execute_rosetta_task(
+                run_root=layout.run_root,
+                task=task,
+                task_fingerprint=assignment.task_fingerprint,
+                run_command=run_command,
             )
-            CONF.output_volume.commit()
+        except Exception as error:  # noqa: BLE001
+            return {
+                "status": "failed",
+                "task_key": task.task_key,
+                "error": str(error) or type(error).__name__,
+            }
 
-    # Run workers in parallel within the pod
-    from concurrent.futures import ThreadPoolExecutor
+    def complete_batch(
+        completions: tuple[
+            tuple[WorkerAssignmentRecord, str, dict[str, object]],
+            ...,
+        ],
+    ) -> None:
+        coordinator.complete_tasks.remote(
+            provider_call_id,
+            tuple(
+                (assignment.task_key, request_id, result)
+                for assignment, request_id, result in completions
+            ),
+        )
 
-    with ThreadPoolExecutor(max_workers=num_cpu_per_pod) as executor:
-        futures = [executor.submit(_worker, i) for i in range(num_cpu_per_pod)]
-        for future in futures:
-            future.result()  # wait for all workers to finish
+    summary = drive_pull_worker(
+        provider_call_id=call_id,
+        claim_capacity=claim_capacity,
+        claim=claim,
+        execute=execute,
+        complete_batch=complete_batch,
+        checkpoint_batch=CONF.output_volume.commit,
+        max_parallel=max_parallel,
+    )
+    return asdict(summary)
 
 
 @app.function(
@@ -135,6 +185,181 @@ def package_outputs_helper(
         paths_to_bundle=paths_to_bundle,
         tar_args=tar_args,
         num_threads=num_threads,
+    )
+
+
+##########################################
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    volumes=CONF.mounts(output_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with Rosetta's pull workers."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh the output Volume before accepting lifecycle calls."""
+        initialize_execution_coordinator_host(self)
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionOverview:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionOverview:
+        """Read this Run's durable kernel overview."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionOverview:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionOverview:
+        """Resume this Run without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Persist a validated Successor request without driving it."""
+        if max_active_gpu_provider_calls not in {None, 0}:
+            raise ValueError("Rosetta does not admit GPU Provider Calls")
+        self._adapter().prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> ExecutionOverview:
+        """Drive one previously prepared root or Successor Run."""
+        return self._adapter().drive_prepared()
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        max_active_provider_calls: int,
+        claim_capacity: int,
+        max_parallel_per_worker: int,
+    ) -> ExecutionOverview:
+        """Create a launch-time compatible Successor Run."""
+        adapter = self._adapter()
+        adapter.prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=max_active_provider_calls,
+            claim_capacity=claim_capacity,
+            max_parallel_per_worker=max_parallel_per_worker,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+        return adapter.drive_prepared()
+
+    @modal.method()
+    def claim_tasks(
+        self,
+        provider_call_id: str,
+        request_id: str,
+        capacity: int,
+    ):
+        """Return one checkpointed pull Task microbatch."""
+        return self._adapter().claim_tasks(
+            UUID(provider_call_id),
+            request_id=request_id,
+            capacity=capacity,
+        )
+
+    @modal.method()
+    def complete_tasks(
+        self,
+        provider_call_id: str,
+        completions: tuple[
+            tuple[str, str, dict[str, object]],
+            ...,
+        ],
+    ):
+        """Validate and checkpoint one pull Task result microbatch."""
+        return self._adapter().complete_tasks(
+            UUID(provider_call_id),
+            completions,
+        )
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached workers."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return execution_coordinator_identity(self)
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> RosettaExecutionCoordinator:
+        execution_run_id, deployment = self._identity()
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: RosettaExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                pull_worker_coordinator=self._worker_coordinator_handle(),
+                app_version=CONF.version or "",
+            ),
+        )
+
+    def _worker_coordinator_handle(self):
+        execution_run_id, deployment = self._identity()
+        return ExecutionCoordinator(
+            execution_run_id=str(execution_run_id),
+            deployment_environment=deployment.environment,
+            deployment_name=deployment.deployment_name,
+            deployment_version=deployment.deployment_version,
+        )
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source development handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {"run_rosetta_worker": run_rosetta_worker},
+        workload_name="Rosetta",
     )
 
 
@@ -285,6 +510,11 @@ def submit_rosetta_task(
     out_dir: str | None = None,
     max_num_pods: int = 1,
     rosetta_search_path: str = str(ROSETTA_DIR),
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run Rosetta scripts on Modal and fetch results to `out_dir`.
 
@@ -325,9 +555,22 @@ def submit_rosetta_task(
             more threads for a single job will not speed up the runtime.
         rosetta_search_path: The additional search path for Rosetta to find
             Rosetta scripts and flags files.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            `biomodals app run` client supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
-    # Validate and read input
-    run_id = uuid4().hex
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    predecessor_request = (
+        None
+        if predecessor_execution_run_id is None
+        else load_execution_request_from_volume(
+            CONF.output_volume,
+            predecessor_execution_run_id,
+        )
+    )
     if input_csv is not None:
         run_name = Path(input_csv).stem
     elif input_pdb is not None:
@@ -346,65 +589,141 @@ def submit_rosetta_task(
     if tasks_df.height == 0:
         raise ValueError("No valid tasks found in the input CSV")
 
-    print(f"🧬 Preparing queue for {run_name} tasks...")
-    queue = modal.Queue.from_name(f"{CONF.name}-queue-{run_id}", create_if_missing=True)
+    if predecessor_request is None:
+        run_id = uuid4().hex
+    else:
+        run_name = predecessor_request.run_name
+        run_id = predecessor_request.run_id
     mount_root = Path(CONF.output_volume_mountpoint)
     layout = AppRunLayout.from_run_root(mount_root / f"{run_name}-{run_id}")
     remote_run_root = layout.run_root.relative_to(mount_root)
     remote_input_root = layout.inputs_dir.relative_to(mount_root)
-    uploaded_files = set()
-    with CONF.output_volume.batch_upload() as batch:
-        for r in tasks_df.iter_rows(named=True):
-            # Structure file should always be present
-            local_pdb = Path(r["pdb"]).expanduser().resolve()
-            remote_pdb = f"inputs/{r['index']}/{local_pdb.name}"
-            batch.put_file(local_pdb, f"/{remote_run_root}/{remote_pdb}")
+    uploaded_files: set[str] = set()
+    task_uploads: list[tuple[Path, str]] = []
+    task_specs = []
+    for row in tasks_df.iter_rows(named=True):
+        local_pdb = Path(row["pdb"]).expanduser().resolve()
+        remote_pdb = f"inputs/{row['index']}/{local_pdb.name}"
+        task_uploads.append((local_pdb, remote_pdb))
 
-            # Other files may or may not be present, depending on the input CSV
-            remote_script, remote_flags = None, None
-            if r["rosetta_script"] is not None:
-                local_script = Path(r["rosetta_script"]).expanduser().resolve()
-                r_script_hash = r["script_hash"]
-                remote_script = f"inputs/_script/{r_script_hash}.xml"
-                if remote_script not in uploaded_files:
-                    batch.put_file(local_script, f"/{remote_run_root}/{remote_script}")
-                    uploaded_files.add(remote_script)
-            if r["flags_file"] is not None:
-                local_flags = Path(r["flags_file"]).expanduser().resolve()
-                r_flags_hash = r["flags_hash"]
-                remote_flags = f"inputs/_flags/{r_flags_hash}.flags"
-                if remote_flags not in uploaded_files:
-                    batch.put_file(local_flags, f"/{remote_run_root}/{remote_flags}")
-                    uploaded_files.add(remote_flags)
+        remote_script, remote_flags = None, None
+        script_hash = row["script_hash"]
+        if row["rosetta_script"] is not None:
+            local_script = Path(row["rosetta_script"]).expanduser().resolve()
+            remote_script = f"inputs/_script/{script_hash}.xml"
+            if remote_script not in uploaded_files:
+                task_uploads.append((local_script, remote_script))
+                uploaded_files.add(remote_script)
+        flags_hash = row["flags_hash"]
+        if row["flags_file"] is not None:
+            local_flags = Path(row["flags_file"]).expanduser().resolve()
+            remote_flags = f"inputs/_flags/{flags_hash}.flags"
+            if remote_flags not in uploaded_files:
+                task_uploads.append((local_flags, remote_flags))
+                uploaded_files.add(remote_flags)
 
-            queue.put({
-                "index": r["index"],
-                "binary": r["binary"],
-                "pdb": remote_pdb,
-                "rosetta_script": remote_script,
-                "flags_file": remote_flags,
-            })
-        buffer = BytesIO()
-        tasks_df.write_parquet(buffer)
-        batch.put_file(buffer, f"/{remote_input_root}/tasks.parquet")
+        index = int(row["index"])
+        task_specs.append(
+            RosettaTaskSpec(
+                task_key=str(index),
+                index=index,
+                binary=str(row["binary"]),
+                pdb=remote_pdb,
+                rosetta_script=remote_script,
+                flags_file=remote_flags,
+                output_dir=f"outputs/{index}",
+                worker_log=f"logs/{index}.log",
+                expected_files=(),
+                input_sha256=sha256(local_pdb.read_bytes()).hexdigest(),
+                script_sha256=None if script_hash is None else str(script_hash),
+                flags_sha256=None if flags_hash is None else str(flags_hash),
+            )
+        )
 
-    # Tune numbers based on total number of tasks
-    num_cpu_per_pod = min(30, max(1, tasks_df.height))
-    max_num_pods = min(
-        max_num_pods, (tasks_df.height + num_cpu_per_pod - 1) // num_cpu_per_pod
+    if predecessor_request is None:
+        print(f"🧬 Staging {len(task_specs)} Rosetta Tasks for {run_name}...")
+        with CONF.output_volume.batch_upload() as batch:
+            for local_path, remote_path in task_uploads:
+                batch.put_file(
+                    local_path,
+                    f"/{remote_run_root}/{remote_path}",
+                )
+            buffer = BytesIO()
+            tasks_df.write_parquet(buffer)
+            batch.put_file(buffer, f"/{remote_input_root}/tasks.parquet")
+
+    worker_count, claim_capacity = size_pull_worker_pool(
+        tasks_df.height,
+        max_worker_calls=max(1, max_num_pods),
+        max_parallel_per_worker=30,
     )
-    max_num_pods = max(1, max_num_pods)  # ensure at least 1 pod
-
+    app_version = CONF.version
+    if app_version is None:
+        raise RuntimeError("Rosetta scientific version metadata is incomplete")
+    request = RosettaExecutionRequest(
+        run_name=run_name,
+        run_id=run_id,
+        tasks=tuple(task_specs),
+        app_version=app_version,
+        max_active_provider_calls=worker_count,
+        claim_capacity=claim_capacity,
+        max_parallel_per_worker=claim_capacity,
+    )
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
+    )
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    stage_execution_launch(
+        CONF.output_volume,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
+    coordinator = _execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(
+            development=not use_deployed_coordinator,
+        )
+    else:
+        call = coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor_execution_run_id),
+            workload_plan_fingerprint=(
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            max_active_provider_calls=request.max_active_provider_calls,
+            claim_capacity=request.claim_capacity,
+            max_parallel_per_worker=request.max_parallel_per_worker,
+        )
+    print(f"Execution Run ID: {execution_run_id}")
     print(
-        f"🧬 Running task {run_name}-{run_id} in {max_num_pods} {num_cpu_per_pod}-CPU pods..."
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
     )
-    bounded_map(
-        range(max_num_pods),
-        lambda _: run_rosetta.remote(run_name, run_id, num_cpu_per_pod),
-        max_parallel=max_num_pods,
+    print(f"Coordinator FunctionCall ID: {call.object_id}")
+    overview = call.get()
+    if overview.run.status != RunStatus.SUCCEEDED:
+        diagnostic = overview.run.status_message or (
+            overview.run.status_reason.value
+            if overview.run.status_reason is not None
+            else overview.run.status.value
+        )
+        raise RuntimeError(
+            f"{CONF.name} Execution Run ended as "
+            f"{overview.run.status.value}: {diagnostic}"
+        )
+    completed_request = load_execution_request_from_volume(
+        CONF.output_volume,
+        execution_run_id,
     )
-
-    modal.Queue.objects.delete(f"{CONF.name}-queue-{run_id}")
+    layout = AppRunLayout.from_run_root(mount_root / completed_request.workload_run_key)
 
     # Save results locally
     out_vol = volume_path_from_mount_path(
@@ -418,7 +737,7 @@ def submit_rosetta_task(
 
     local_out_dir = Path(out_dir).expanduser().resolve()
     local_out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = local_out_dir / f"{run_name}-{run_id}.tar.zst"
+    out_file = local_out_dir / f"{completed_request.workload_run_key}.tar.zst"
     tarball_bytes = package_outputs_helper.remote(
         root=str(layout.run_root),
     )

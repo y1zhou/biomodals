@@ -27,28 +27,11 @@ from biomodals.service.gromacs.archive import (
     write_gromacs_archive,
 )
 from biomodals.service.gromacs.contracts import is_gromacs_run_name
-from biomodals.service.gromacs.provider import (
-    DEFINITE_SUBMISSION_ERRORS,
-    MODAL_SERVICE_ERRORS,
-)
 from biomodals.service.jobs import job_stage_history
 from biomodals.service.store import JobRecord, JobState
 from biomodals.service.workloads import GROMACS_WORKLOAD
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-MODAL_PUBLICATION_ERRORS = MODAL_SERVICE_ERRORS + (
-    modal.exception.ExecutionError,
-    modal.exception.VolumeUploadTimeoutError,
-)
-PERMANENT_FINALIZATION_ERRORS = DEFINITE_SUBMISSION_ERRORS
-TRANSIENT_FINALIZATION_ERRORS = (
-    modal.exception.ConnectionError,
-    modal.exception.ExecutionError,
-    modal.exception.InternalError,
-    modal.exception.ResourceExhaustedError,
-    modal.exception.ServiceError,
-    modal.exception.VolumeUploadTimeoutError,
-)
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,9 +1,8 @@
-"""Schemas for workflow artifacts, selectors, and durable run status."""
+"""Schemas for workflow artifacts and selectors."""
 
 from __future__ import annotations
 
 import sys
-from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -12,13 +11,9 @@ from biomodals.schema.storage import VolumePath
 
 # < Python 3.11 guards
 if sys.version_info >= (3, 11):  # noqa: UP036
-    from datetime import UTC
     from enum import StrEnum
 else:
-    from datetime import timezone  # noqa: I001
-    from backports.strenum import StrEnum  # noqa: UP035,I001
-
-    UTC = timezone.utc  # noqa: UP017
+    from backports.strenum import StrEnum  # noqa: UP035
 
 
 class ArtifactKind(StrEnum):
@@ -31,39 +26,6 @@ class ArtifactKind(StrEnum):
     DIRECTORY = "directory"
     TABLE = "table"
     LOGS = "logs"
-
-
-class NodeExecutionPolicy(StrEnum):
-    """Restart behavior for an incomplete workflow node."""
-
-    RERUN = "rerun"
-    RESUME = "resume"
-
-
-class NodePlacement(StrEnum):
-    """Execution location for a workflow node."""
-
-    ORCHESTRATOR = "orchestrator"
-    REMOTE = "remote"
-
-
-class NodeStatus(StrEnum):
-    """Durable lifecycle states for one workflow node."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-
-
-class RunStatus(StrEnum):
-    """Durable lifecycle states for one workflow run."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
 
 
 class ArtifactFile(BaseModel):
@@ -96,37 +58,3 @@ class ArtifactSelector(BaseModel):
     pattern: str | None = None
     role: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class WorkflowRun(BaseModel):
-    """Durable status record for one workflow run."""
-
-    workflow_name: str
-    run_id: str
-    status: RunStatus = RunStatus.PENDING
-    dag_hash: str | None = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class AttemptRecord(BaseModel):
-    """Durable record for one node execution attempt."""
-
-    node_id: str
-    attempt_id: str
-    status: NodeStatus = NodeStatus.RUNNING
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class NodeStatusRecord(BaseModel):
-    """Durable status record for one workflow node."""
-
-    node_id: str
-    status: NodeStatus
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RERUN
-    placement: NodePlacement = NodePlacement.ORCHESTRATOR
-    input_artifact_ids: list[str] = Field(default_factory=list)
-    output_artifact_ids: list[str] = Field(default_factory=list)
-    attempts: list[str] = Field(default_factory=list)
-    error: str | None = None

@@ -2,8 +2,9 @@
 
 import importlib
 import inspect
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +14,11 @@ BIOMODALS_HOME = Path(__file__).parent.parent.resolve()
 APP_HOME = BIOMODALS_HOME / "app"
 WORKFLOW_HOME = BIOMODALS_HOME / "workflow"
 CatalogType = Literal["app", "workflow"]
+_EXECUTION_COORDINATOR_TAG = "ExecutionCoordinator"
+_ARGS_TABLE_HEADER = (
+    "| Flag | Default | Description |",
+    "|-----:|:--------|:------------|",
+)
 
 
 class AppNotFoundError(ValueError):
@@ -72,7 +78,7 @@ def get_catalog(
 
 
 def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> modal.App:
-    """Include catalog app definitions into an existing Modal app."""
+    """Include child-call functions without importing a nested coordinator."""
     all_apps = get_catalog("app", use_absolute_paths=True)
     for dependency in dependencies:
         dependency_metadata = BiomodalsApp(dependency, all_apps=all_apps)
@@ -83,12 +89,20 @@ def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> moda
                 f"Dependency app '{dependency}' does not expose a modal.App named app"
             )
 
+        dependency_functions = {
+            tag: function
+            for tag, function in dependency_app._local_state.functions.items()
+            if not _is_execution_coordinator_tag(tag)
+        }
+        dependency_classes = {
+            tag: cls
+            for tag, cls in dependency_app._local_state.classes.items()
+            if not _is_execution_coordinator_tag(tag)
+        }
         function_collisions = set(app._local_state.functions) & set(
-            dependency_app._local_state.functions
+            dependency_functions
         )
-        class_collisions = set(app._local_state.classes) & set(
-            dependency_app._local_state.classes
-        )
+        class_collisions = set(app._local_state.classes) & set(dependency_classes)
         duplicate_tags = sorted(function_collisions | class_collisions)
         if duplicate_tags:
             duplicate_list = ", ".join(duplicate_tags)
@@ -96,8 +110,18 @@ def include_dependency_apps(app: modal.App, dependencies: Iterable[str]) -> moda
                 f"Dependency app '{dependency}' has Modal tag collisions: "
                 f"{duplicate_list}"
             )
-        app.include(dependency_app, inherit_tags=False)
+        for function in dependency_functions.values():
+            app._add_function(function, False)
+        for tag, cls in dependency_classes.items():
+            app._add_class(tag, cls)
     return app
+
+
+def _is_execution_coordinator_tag(tag: str) -> bool:
+    """Return whether one Modal tag belongs to the child app's coordinator."""
+    return tag == _EXECUTION_COORDINATOR_TAG or tag.startswith(
+        f"{_EXECUTION_COORDINATOR_TAG}."
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +131,23 @@ class AppFunction:
     name: str
     func_type: Literal["modal", "local_entrypoint"]
     docstring: str | None
-    args_table: list[str]
+    argument_rows: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def args_table(self) -> list[str]:
+        """Return the complete rendered CLI argument table."""
+        return self.visible_args_table()
+
+    def visible_args_table(
+        self,
+        *,
+        hidden_parameters: Collection[str] = (),
+    ) -> list[str]:
+        """Return CLI argument rows without caller-owned parameters."""
+        visible_rows = [
+            row for name, row in self.argument_rows if name not in hidden_parameters
+        ]
+        return [*_ARGS_TABLE_HEADER, *visible_rows] if visible_rows else []
 
 
 class BiomodalsApp:
@@ -171,6 +211,19 @@ class BiomodalsApp:
             return self.functions[self._func_idx[name]]
         return self.functions[name]
 
+    @cached_property
+    def execution_coordinator_entrypoints(self) -> frozenset[str]:
+        """Return entrypoints declared as execution-kernel clients."""
+        module = importlib.import_module(self.module)
+        declared = getattr(module, "EXECUTION_COORDINATOR_ENTRYPOINTS", ())
+        if not isinstance(declared, frozenset | set | tuple | list) or not all(
+            isinstance(value, str) and value for value in declared
+        ):
+            raise ValueError(
+                f"App '{self.name}' has an invalid coordinator entrypoint declaration"
+            )
+        return frozenset(declared)
+
     def resolve_app_path(self, app_name_or_path: str) -> tuple[str, Path]:
         """Resolve an app name or filesystem path to its name and absolute path."""
         if app_name_or_path in self._all_apps:
@@ -226,7 +279,7 @@ class BiomodalsApp:
                     name=obj,
                     func_type=func_type,
                     docstring=raw_f.__doc__ or None,
-                    args_table=_docstring_to_markdown_table(raw_f),
+                    argument_rows=_docstring_to_argument_rows(raw_f),
                 )
             )
 
@@ -266,17 +319,16 @@ def _arg_descriptions_from_google_docstring(doc: str) -> dict[str, str]:
     return arg_descriptions
 
 
-def _docstring_to_markdown_table(f: Callable) -> list[str]:
-    """Convert a function docstring with Args into Markdown table rows."""
+def _docstring_to_argument_rows(
+    f: Callable,
+) -> tuple[tuple[str, str], ...]:
+    """Convert a function docstring with Args into named Markdown rows."""
     sig = inspect.signature(f)
     arg_descriptions = _arg_descriptions_from_google_docstring(inspect.getdoc(f) or "")
     if not arg_descriptions:
-        return []
+        return ()
 
-    table_rows = [
-        "| Flag | Default | Description |",
-        "|-----:|:--------|:------------|",
-    ]
+    argument_rows: list[tuple[str, str]] = []
     for name, p in sig.parameters.items():
         flag_base = name.replace("_", "-")
         default = (
@@ -290,6 +342,6 @@ def _docstring_to_markdown_table(f: Callable) -> list[str]:
             else f"`--{flag_base}`/`--no-{flag_base}`"
         )
         description = arg_descriptions.get(name, "")
-        table_rows.append(f"| {flag} | {default} | {description} |")
+        argument_rows.append((name, f"| {flag} | {default} | {description} |"))
 
-    return table_rows
+    return tuple(argument_rows)

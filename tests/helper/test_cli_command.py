@@ -6,10 +6,12 @@ import sys
 
 from biomodals.helper.cli_command import (
     build_app_run_command,
+    build_modal_app_history_command,
     build_modal_deploy_command,
     build_workflow_run_command,
     modal_env_overrides,
     resolve_workflow_entrypoint,
+    select_modal_deployment_version,
 )
 
 
@@ -68,6 +70,50 @@ def test_build_workflow_run_command_does_not_duplicate_dry_run() -> None:
     )[-2:] == ("--dry-run", "/inputs")
 
 
+def test_build_modal_app_history_command_uses_explicit_environment() -> None:
+    assert build_modal_app_history_command(
+        deployment_name="ShortMDWorkflow",
+        environment="production",
+        python_executable="python",
+    ) == (
+        "python",
+        "-m",
+        "modal",
+        "app",
+        "history",
+        "ShortMDWorkflow",
+        "--env",
+        "production",
+        "--json",
+    )
+
+
+def test_select_modal_deployment_version_defaults_to_latest_or_validates_pin() -> None:
+    history = (
+        '[{"version":"v7","time_deployed":"now"},'
+        '{"version":"v4","time_deployed":"earlier"}]'
+    )
+
+    assert select_modal_deployment_version(history) == 7
+    assert select_modal_deployment_version(history, requested_version=4) == 4
+    try:
+        select_modal_deployment_version(history, requested_version=5)
+    except ValueError as error:
+        assert "version 5 is not available" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("Expected an unavailable deployment version to fail")
+
+
+def test_select_modal_deployment_version_rejects_invalid_history() -> None:
+    for history in ("not json", "[]", '[{"version":"latest"}]'):
+        try:
+            select_modal_deployment_version(history)
+        except ValueError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(f"Expected invalid history to fail: {history}")
+
+
 def test_resolve_workflow_entrypoint_uses_explicit_or_single_entrypoint() -> None:
     assert (
         resolve_workflow_entrypoint(
@@ -114,7 +160,7 @@ def test_modal_env_overrides_only_contains_requested_values() -> None:
 
 def test_build_modal_deploy_command() -> None:
     assert build_modal_deploy_command(
-        app_path="src/biomodals/app/fold/demo_app.py",
+        app_ref="src/biomodals/app/fold/demo_app.py",
         name="demo-prod",
         tag="v1",
         env="production",

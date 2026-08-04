@@ -2,18 +2,35 @@
 
 # ruff: noqa: D101,D102,D103
 
-from dataclasses import fields
+from dataclasses import dataclass, field, fields
 
 import pytest
 
 import biomodals.workflow as workflow_api
+from biomodals.execution import NodeAggregationPolicy
 from biomodals.schema import ArtifactKind
 from biomodals.workflow import Workflow
 from biomodals.workflow.core.builder import NodeHandle
-from biomodals.workflow.core.nodes import WorkflowNativeNode
+from biomodals.workflow.core.display import print_workflow_dag
+from biomodals.workflow.core.execution import (
+    execution_plan,
+    node_task_plan,
+)
+from biomodals.workflow.core.nodes import (
+    RemoteTaskWorkflowNode,
+    WorkflowNativeNode,
+)
 
 
 class DummyNode(WorkflowNativeNode):
+    def run(self, context):  # pragma: no cover - builder tests do not execute nodes
+        raise NotImplementedError
+
+
+@dataclass
+class ConfiguredDummyNode(WorkflowNativeNode):
+    config: dict[str, object] = field(metadata={"dag_hash_exclude_keys": ("workers",)})
+
     def run(self, context):  # pragma: no cover - builder tests do not execute nodes
         raise NotImplementedError
 
@@ -77,3 +94,86 @@ def test_cycles_raise_value_error() -> None:
 
     with pytest.raises(ValueError, match="cycle"):
         workflow.validate()
+
+
+def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None:
+    workflow = Workflow("demo", scientific_versions={"model": "v1"})
+    first = workflow.add_node(DummyNode(), id="first")
+    workflow.add_node(
+        DummyNode(),
+        id="second",
+        depends_on=[first],
+        accept_partial_from=[first],
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+        allow_empty_result=True,
+    )
+    definition = workflow.validate()
+
+    plan = execution_plan(definition, workload_run_key="run-1")
+
+    assert plan.workload_name == "workflow:demo"
+    assert plan.workload_run_key == "run-1"
+    assert plan.node_keys == ("first", "second")
+    assert [dependency.node_key for dependency in plan.nodes[1].dependencies] == [
+        "first"
+    ]
+    assert plan.nodes[1].dependencies[0].accept_partial is True
+    assert plan.nodes[1].aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
+    assert plan.nodes[1].allow_empty_result is True
+    assert plan.scientific_payload["dag_hash"]
+    assert plan.scientific_versions == {
+        "biomodals.workflow.execution_plan": "1",
+        "model": "v1",
+    }
+
+
+def test_workflow_hash_can_exclude_declared_operational_config_keys() -> None:
+    def fingerprint(*, workers: int, threshold: float) -> str:
+        workflow = Workflow("demo")
+        workflow.add_node(
+            ConfiguredDummyNode({
+                "workers": workers,
+                "threshold": threshold,
+                "nested": {"workers": 99},
+            }),
+            id="configured",
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint(workers=1, threshold=0.5)
+
+    assert fingerprint(workers=8, threshold=0.5) == baseline
+    assert fingerprint(workers=1, threshold=0.8) != baseline
+
+
+def test_partial_acceptance_must_name_an_actual_dependency() -> None:
+    workflow = Workflow("demo")
+    first = workflow.add_node(DummyNode(), id="first")
+    workflow.add_node(
+        DummyNode(),
+        id="second",
+        accept_partial_from=[first],
+    )
+
+    with pytest.raises(ValueError, match="must name a Node dependency"):
+        workflow.validate()
+
+
+def test_workflow_node_is_one_scientifically_identified_task() -> None:
+    task = node_task_plan("score")
+
+    assert task.task_key == "node"
+    assert task.scientific_payload == {"workflow_node_id": "score"}
+    assert task.execution_payload is None
+
+
+def test_dag_display_marks_runtime_task_nodes_as_provider_work(capsys) -> None:
+    workflow = Workflow("display")
+    workflow.add_node(RemoteTaskWorkflowNode(), id="fanout")
+
+    print_workflow_dag(workflow.validate())
+
+    assert "[provider; RemoteTaskWorkflowNode]" in capsys.readouterr().out

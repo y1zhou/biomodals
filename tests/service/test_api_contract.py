@@ -7,11 +7,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
@@ -19,29 +18,39 @@ import httpx
 import pytest
 from fastapi import APIRouter, FastAPI
 
+from biomodals.execution import (
+    AvailabilityStatus,
+    ExecutionPlan,
+    NodePlan,
+    ProviderBinding,
+    RunStatus,
+    TaskPlan,
+)
+from biomodals.execution.modal import (
+    ModalCallObservation,
+    ModalCallObservationKind,
+    ModalDefiniteSubmissionError,
+    ModalSubmissionOutcomeUnknownError,
+)
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease
 from biomodals.service.auth import AuthService, IssuedPasswordLink
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import GromacsJobOptions, create_registration
-from biomodals.service.gromacs.modal import GromacsReconciler
+from biomodals.service.gromacs.execution import GromacsExecutionCoordinator
+from biomodals.service.gromacs.results import ArchiveNotReadyError, FinalArchive
 from biomodals.service.jobs import (
     JobLifecycleLocks,
     OperationLogRequest,
     WorkloadRegistration,
 )
 from biomodals.service.jobs_api import _download_filename
-from biomodals.service.runtime_config import (
-    ModalConfigurationSnapshot,
-    RuntimeConfiguration,
-)
+from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
-    InitialModalOperation,
-    JobOperationState,
     JobState,
     ServiceStore,
 )
-from biomodals.service.submission import SubmissionOutcomeUnknownError
 from biomodals.service.workloads import (
     GROMACS_WORKLOAD,
     WorkloadDefinition,
@@ -58,13 +67,6 @@ VALID_PDB = (
 )
 
 
-@dataclass(frozen=True)
-class SubmittedCall:
-    modal_call_id: str
-    run_name: str
-    operation: str
-
-
 class FakeGromacsAdapter:
     """Small fake for the Modal boundary; no Modal object reaches HTTP tests."""
 
@@ -73,6 +75,7 @@ class FakeGromacsAdapter:
         self.submission_configurations: list[tuple[str, str, int]] = []
         self.cancellations: list[str] = []
         self.recovery_attempts: list[UUID] = []
+        self.published_archives: set[UUID] = set()
         self.downloads = 0
         self.artifact_content = b"PK\x03\x04verified archive"
         self.failures_remaining = 0
@@ -81,6 +84,7 @@ class FakeGromacsAdapter:
         self.preflight_failures_remaining = 0
         self.preflight_started: asyncio.Event | None = None
         self.preflight_release: asyncio.Event | None = None
+        self.call_observations: dict[str, ModalCallObservation] = {}
         self.log_requests: list[
             tuple[
                 UUID,
@@ -91,6 +95,7 @@ class FakeGromacsAdapter:
                 datetime | None,
             ]
         ] = []
+        self._execution_calls: dict[str, object] = {}
 
     async def preflight(
         self,
@@ -107,38 +112,91 @@ class FakeGromacsAdapter:
             self.preflight_failures_remaining -= 1
             raise RuntimeError("configured resource is unavailable")
 
-    async def submit(
-        self,
-        pdb_content: bytes,
-        options: GromacsJobOptions,
-        *,
-        run_name: str,
-        modal_configuration: ModalConfigurationSnapshot,
-    ) -> SubmittedCall:
-        self.submissions.append((pdb_content, run_name, options))
+    async def resolve(self, binding):
         self.submission_configurations.append((
-            modal_configuration.app_name,
-            modal_configuration.environment,
-            modal_configuration.app_version,
+            binding.app_name,
+            binding.environment,
+            binding.app_version,
+        ))
+        return binding
+
+    async def spawn(self, function, *, args, kwargs):
+        options = GromacsJobOptions(
+            simulation_time_ns=int(kwargs.get("simulation_time_ns", 5)),
+            run_pdbfixer=bool(kwargs.get("run_pdbfixer", False)),
+            cpu_only=function.function_name.endswith("_cpu"),
+        )
+        self.submissions.append((
+            bytes(kwargs.get("pdb_content", b"")),
+            str(kwargs["run_name"]),
+            options,
         ))
         if self.unknown_failures_remaining:
             self.unknown_failures_remaining -= 1
-            raise SubmissionOutcomeUnknownError("provider outcome unknown")
+            raise ModalSubmissionOutcomeUnknownError("provider outcome unknown")
         if self.failures_remaining:
             self.failures_remaining -= 1
-            raise RuntimeError("temporary Modal failure")
-        return SubmittedCall(
-            modal_call_id=f"fc-{len(self.submissions)}",
-            run_name=run_name,
-            operation=("prepare_tpr_cpu" if options.cpu_only else "prepare_tpr_gpu"),
+            raise ModalDefiniteSubmissionError("provider rejected submission")
+        call_id = f"fc-{len(self.submissions)}"
+        self._execution_calls[call_id] = function
+        return call_id
+
+    async def observe(self, provider_call_handle_id):
+        return self.call_observations.get(
+            provider_call_handle_id,
+            ModalCallObservation(ModalCallObservationKind.RUNNING),
         )
 
-    async def cancel(self, modal_call_id: str) -> None:
-        self.cancellations.append(modal_call_id)
+    def complete_calls(self, *provider_call_handle_ids: str) -> None:
+        """Make subsequent observations return one valid GROMACS result."""
+        for handle_id in provider_call_handle_ids:
+            self.call_observations[handle_id] = ModalCallObservation(
+                ModalCallObservationKind.SUCCEEDED,
+                result=f"/outputs/{handle_id}",
+            )
 
-    async def recover_archive(self, job) -> None:
+    def fail_calls(self, *provider_call_handle_ids: str) -> None:
+        """Make subsequent observations return a conclusive failure."""
+        for handle_id in provider_call_handle_ids:
+            self.call_observations[handle_id] = ModalCallObservation(
+                ModalCallObservationKind.FAILED,
+                message="test provider failure",
+            )
+
+    def cancel_calls(self, *provider_call_handle_ids: str) -> None:
+        """Make subsequent observations return conclusive cancellation."""
+        for handle_id in provider_call_handle_ids:
+            self.call_observations[handle_id] = ModalCallObservation(
+                ModalCallObservationKind.CANCELLED,
+                message="test provider cancellation",
+            )
+
+    async def cancel(self, provider_call_handle_id: str) -> None:
+        self.cancellations.append(provider_call_handle_id)
+
+    async def recover_archive(self, job) -> FinalArchive:
         self.recovery_attempts.append(job.job_id)
-        raise AssertionError("an unsubmitted cancellation must not touch Modal")
+        if job.job_id not in self.published_archives:
+            raise ArchiveNotReadyError("published archive is missing")
+        return self._archive(job)
+
+    async def publish_archive(self, job, *, completed_at):
+        self.published_archives.add(job.job_id)
+        return self._archive(job)
+
+    def _archive(self, job) -> FinalArchive:
+        return FinalArchive(
+            state=JobState.SUCCEEDED,
+            volume_name="Gromacs-outputs",
+            path=f"api-results/{job.run_name}/result.zip",
+            filename=f"{job.run_name}.zip",
+            size_bytes=len(self.artifact_content),
+            sha256=hashlib.sha256(self.artifact_content).hexdigest(),
+            warnings_json="[]",
+        )
+
+    async def cleanup_intermediates(self, job) -> None:
+        return None
 
     async def read_artifact(self, _job):
         self.downloads += 1
@@ -304,6 +362,84 @@ def _response_codes(schema: dict, path: str, status_code: int) -> list[str]:
         "code"
     ]
     return code["enum"] if "enum" in code else [code["const"]]
+
+
+def _advance_gromacs(
+    store: ServiceStore,
+    adapter: FakeGromacsAdapter,
+    job_id: UUID,
+    *,
+    completed: tuple[str, ...] = (),
+    failed: tuple[str, ...] = (),
+    cancelled: tuple[str, ...] = (),
+    now: int = 1_800_000_001,
+) -> None:
+    """Advance one Job through its real kernel coordinator in API tests."""
+    adapter.complete_calls(*completed)
+    adapter.fail_calls(*failed)
+    adapter.cancel_calls(*cancelled)
+    asyncio.run(
+        GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=lambda: now,
+        ).advance(job_id)
+    )
+
+
+def _finish_gromacs(
+    store: ServiceStore,
+    adapter: FakeGromacsAdapter,
+    job_id: UUID,
+) -> None:
+    """Conclude every current wave until the result archive is published."""
+    for offset in range(6):
+        job = store.get_job_by_id(job_id)
+        assert job is not None
+        if job.result_filename is not None:
+            return
+        active_handles = tuple(
+            operation.modal_call_id
+            for operation in job.operations
+            if operation.modal_call_id is not None and operation.completed_at is None
+        )
+        adapter.complete_calls(*active_handles)
+        _advance_gromacs(
+            store,
+            adapter,
+            job_id,
+            now=1_800_000_001 + offset,
+        )
+    raise AssertionError("GROMACS test Job did not finish")
+
+
+def _fail_execution_run(
+    store: ServiceStore,
+    job_id: UUID,
+    *,
+    now: int = 1_800_000_001,
+) -> None:
+    """Conclude one test Run without coupling service tests to a workload DAG."""
+    job = store.get_job_by_id(job_id)
+    assert job is not None and job.execution_run_id is not None
+    with store.execution_repository() as repository:
+        for call in repository.list_provider_calls(job.execution_run_id):
+            if not call.status.is_terminal:
+                repository.fail_provider_call(
+                    call.provider_call_id,
+                    message="test execution failure",
+                    now=now,
+                )
+        for node in repository.list_nodes(job.execution_run_id):
+            if node.status.value == "running" and node.discovery_complete:
+                repository.reconcile_node_tasks(
+                    job.execution_run_id,
+                    node.node_key,
+                    now=now,
+                )
+        repository.skip_unreachable_nodes(job.execution_run_id, now=now)
+        run = repository.finalize_run_from_results(job.execution_run_id, now=now)
+        assert run.status == RunStatus.FAILED
 
 
 def test_result_filename_falls_back_without_exposing_job_identity() -> None:
@@ -579,7 +715,6 @@ def test_modal_admin_configuration_is_live_and_job_configuration_is_pinned(
     first = _submit(client, csrf_token, idempotency_key=str(uuid4()))
     assert first.status_code == 202
     first_job_id = UUID(first.json()["job_id"])
-    store.set_job_state(first_job_id, JobState.RUNNING, now=1_800_000_001)
     assert adapter.submission_configurations == [("GromacsA", "department-a", 17)]
 
     client.patch(
@@ -814,35 +949,12 @@ def test_job_owner_and_admin_can_select_and_stream_owner_visible_logs(
     assert "fc-1" not in streamed.text
     assert adapter.log_requests == [(job_id, "fc-1", "running", "live", None, None)]
 
-    store.record_operation_outcome(
+    _advance_gromacs(
+        store,
+        adapter,
         job_id,
-        operation="prepare_tpr_cpu",
-        expected_modal_call_id="fc-1",
-        outcome=JobOperationState.COMPLETED,
-        now=1_800_000_001,
+        completed=("fc-1",),
     )
-    for operation, modal_call_id in (
-        ("collect_traj_stats:nvt_", "fc-nvt"),
-        ("collect_traj_stats:npt_", "fc-npt"),
-        ("production_run_cpu", "fc-production"),
-    ):
-        token = uuid4().hex
-        assert (
-            store.claim_modal_operation(
-                job_id,
-                operation=operation,
-                submission_token=token,
-                now=1_800_000_001,
-            )
-            is not None
-        )
-        store.attach_modal_call(
-            job_id,
-            operation=operation,
-            modal_call_id=modal_call_id,
-            submission_token=token,
-            now=1_800_000_001,
-        )
 
     parallel = client.get(f"/api/v1/jobs/{job_id}/log-targets")
 
@@ -944,12 +1056,11 @@ def test_admin_can_fetch_completed_stage_logs_without_following(tmp_path: Path) 
     csrf_token = _login(client, "alice@example.com")
     submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
     job_id = UUID(submitted.json()["job_id"])
-    store.record_operation_outcome(
+    _advance_gromacs(
+        store,
+        adapter,
         job_id,
-        operation="prepare_tpr_cpu",
-        expected_modal_call_id="fc-1",
-        outcome=JobOperationState.COMPLETED,
-        now=1_800_000_001,
+        completed=("fc-1",),
     )
     client.cookies.clear()
     _login(client, "admin@example.com")
@@ -958,17 +1069,16 @@ def test_admin_can_fetch_completed_stage_logs_without_following(tmp_path: Path) 
     streamed = client.get(f"/api/v1/jobs/{job_id}/logs?stage=prepare_simulation")
 
     assert targets.status_code == 200
-    assert targets.json()["targets"] == [
-        {
-            "stage_code": "prepare_simulation",
-            "function_name": "prepare_tpr_cpu",
-            "state": "completed",
-            "mode": "historical",
-            "started_at": targets.json()["targets"][0]["started_at"],
-            "ended_at": targets.json()["targets"][0]["ended_at"],
-        }
-    ]
-    assert targets.json()["targets"][0]["ended_at"] is not None
+    [prepare_target, *_parallel_targets] = targets.json()["targets"]
+    assert prepare_target == {
+        "stage_code": "prepare_simulation",
+        "function_name": "prepare_tpr_cpu",
+        "state": "completed",
+        "mode": "historical",
+        "started_at": prepare_target["started_at"],
+        "ended_at": prepare_target["ended_at"],
+    }
+    assert prepare_target["ended_at"] is not None
     assert streamed.status_code == 200
     assert adapter.log_requests == [
         (job_id, "fc-1", "completed", "historical", None, None)
@@ -1202,6 +1312,7 @@ def test_storage_metrics_and_explicit_cleanup_report_actual_reclamation(
     submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
     job_id = UUID(submitted.json()["job_id"])
     content = adapter.artifact_content
+    _finish_gromacs(store, adapter, job_id)
     store.complete_job(
         job_id,
         state=JobState.SUCCEEDED,
@@ -1466,6 +1577,7 @@ def test_registered_workload_drives_runtime_admin_and_job_views(
             secure_cookies=True,
         )
     submission_key = uuid4().hex
+    execution_run_id = UUID("33333333-3333-4333-8333-333333333333")
     admitted = store.admit_job(
         owner_user_id=owner.user_id,
         display_name="Example prediction",
@@ -1476,19 +1588,77 @@ def test_registered_workload_drives_runtime_admin_and_job_views(
         configuration=configuration.admission_configuration(definition.name),
         now=1_800_000_000,
         new_job_id=UUID("22222222-2222-4222-8222-222222222222"),
-        initial_operation=InitialModalOperation(
-            operation="predict_structure",
-            run_name="example-prediction",
-            submission_token=submission_key,
+        execution_plan=ExecutionPlan(
+            workload_name=definition.name,
+            workload_run_key="example-prediction",
+            nodes=(NodePlan(node_key="predict_structure"),),
+            scientific_payload={"input": "example"},
+            scientific_versions={"test": "1"},
         ),
+        execution_run_id=execution_run_id,
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
     )
-    job = store.attach_modal_call(
-        admitted.job.job_id,
-        operation="predict_structure",
-        modal_call_id="fc-predict",
-        submission_token=submission_key,
-        now=1_800_000_001,
-    )
+    with store.execution_repository() as repository:
+        repository.start_node(
+            execution_run_id,
+            "predict_structure",
+            now=1_800_000_001,
+        )
+        repository.discover_tasks(
+            execution_run_id,
+            "predict_structure",
+            (TaskPlan(task_key="prediction", scientific_payload={}),),
+            now=1_800_000_001,
+        )
+        repository.record_task_result_observation(
+            execution_run_id,
+            "predict_structure",
+            "prediction",
+            AvailabilityStatus.MISSING,
+            now=1_800_000_001,
+        )
+        binding = ProviderBinding(
+            environment="production",
+            app_name="ConfiguredStructureApp",
+            app_version=9,
+            function_name="predict_structure",
+            uses_gpu=False,
+        )
+        repository.persist_fixed_dispatch_policy(
+            execution_run_id,
+            (
+                TaskDispatchDescriptor(
+                    node_key="predict_structure",
+                    node_ordinal=0,
+                    task_key="prediction",
+                    task_ordinal=0,
+                    binding=binding,
+                    compatibility_key="predict_structure",
+                    max_tasks_per_call=1,
+                    depth=0,
+                    unblocking_span=0,
+                ),
+            ),
+            now=1_800_000_001,
+        )
+        preclaim = repository.preclaim_fixed_batch(
+            execution_run_id,
+            "predict_structure",
+            ("prediction",),
+            submission_token=submission_key,
+            binding=binding,
+            compatibility_key="predict_structure",
+            now=1_800_000_001,
+        )
+        assert preclaim is not None
+        repository.attach_provider_call(
+            preclaim.call.provider_call_id,
+            provider_call_handle_id="fc-predict",
+            now=1_800_000_001,
+        )
+    job = store.get_job_by_id(admitted.job.job_id)
+    assert job is not None
 
     client = APIClient(app)
     _login(client, owner.email)
@@ -1784,8 +1954,11 @@ def test_openapi_documents_frontend_handled_error_statuses(tmp_path: Path) -> No
     }
 
     for (path, method), statuses in expected.items():
-        documented = set(schema["paths"][path][method]["responses"])
+        responses = schema["paths"][path][method]["responses"]
+        documented = set(responses)
         assert statuses <= documented, (path, statuses - documented)
+        if "413" in documented:
+            assert responses["413"]["description"] == "Request Entity Too Large"
 
 
 def test_unsafe_cookie_requests_require_exact_origin_and_session_csrf(
@@ -1911,7 +2084,7 @@ def test_gromacs_submission_is_idempotent_for_one_owner_and_payload(
     assert replay.json()["job_id"] == first.json()["job_id"]
     assert first.json()["workload"] == "gromacs"
     assert first.json()["display_name"] == "First simulation"
-    assert first.json()["state"] == "queued"
+    assert first.json()["state"] == "running"
     assert first.json()["stage"]["code"] == "prepare_simulation"
     assert first.json()["stage"]["function_name"] == "prepare_tpr_cpu"
     assert first.json()["stage"]["started_at"]
@@ -1961,7 +2134,7 @@ def test_filename_derived_display_name_is_part_of_submission_identity(
 def test_job_stage_contract_supports_parallel_deployed_functions(
     tmp_path: Path,
 ) -> None:
-    client, auth, store, _adapter = _service(tmp_path)
+    client, auth, store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
     csrf_token = _login(client, "alice@example.com")
     submitted = _submit(
@@ -1970,48 +2143,24 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         idempotency_key=str(uuid4()),
     )
     job_id = UUID(submitted.json()["job_id"])
-    store.record_operation_outcome(
+    _advance_gromacs(
+        store,
+        adapter,
         job_id,
-        operation="prepare_tpr_cpu",
-        expected_modal_call_id="fc-1",
-        outcome=JobOperationState.COMPLETED,
-        now=1_800_000_001,
+        completed=("fc-1",),
     )
-    operations = (
-        ("collect_traj_stats:nvt_", "fc-nvt"),
-        ("collect_traj_stats:npt_", "fc-npt"),
-        ("production_run_cpu", "fc-production"),
-    )
-    for operation, modal_call_id in operations:
-        token = uuid4().hex
-        claimed = store.claim_modal_operation(
-            job_id,
-            operation=operation,
-            submission_token=token,
-            now=1_800_000_001,
-        )
-        assert claimed is not None
-        store.attach_modal_call(
-            job_id,
-            operation=operation,
-            modal_call_id=modal_call_id,
-            submission_token=token,
-            now=1_800_000_001,
-        )
     analyzing = client.get(f"/api/v1/jobs/{job_id}")
 
-    assert analyzing.json()["stage"] == {
-        "code": "run_production",
-        "function_name": "production_run_cpu",
-        "started_at": "2027-01-15T08:00:01Z",
-    }
+    assert analyzing.json()["stage"]["code"] == "run_production"
+    assert analyzing.json()["stage"]["function_name"] == "production_run_cpu"
+    assert analyzing.json()["stage"]["started_at"]
     preparation, nvt_analysis, npt_analysis, production = analyzing.json()[
         "stage_history"
     ]
     assert preparation["code"] == "prepare_simulation"
     assert preparation["function_name"] == "prepare_tpr_cpu"
     assert preparation["started_at"]
-    assert preparation["ended_at"] == "2027-01-15T08:00:01Z"
+    assert preparation["ended_at"]
     assert preparation["outcome"] == "completed"
     assert [stage["code"] for stage in analyzing.json()["active_stages"]] == [
         "analyze_nvt",
@@ -2024,22 +2173,20 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
     assert "modal_call_id" not in analyzing.json()
     assert "operation" not in analyzing.json()
 
-    store.fail_job(
+    _advance_gromacs(
+        store,
+        adapter,
         job_id,
-        error_code="compute_failed",
-        error_message="The simulation failed.",
+        failed=("fc-2", "fc-3", "fc-4"),
         now=1_800_000_002,
     )
     unavailable = client.get(f"/api/v1/jobs/{job_id}")
 
     assert unavailable.json()["active_stages"] == []
-    assert unavailable.json()["stage"] == {
-        "code": "run_production",
-        "function_name": "production_run_cpu",
-        "started_at": "2027-01-15T08:00:01Z",
-        "ended_at": "2027-01-15T08:00:02Z",
-        "outcome": "failed",
-    }
+    assert unavailable.json()["stage"]["code"] == "run_production"
+    assert unavailable.json()["stage"]["function_name"] == "production_run_cpu"
+    assert unavailable.json()["stage"]["ended_at"]
+    assert unavailable.json()["stage"]["outcome"] == "failed"
 
     submitted_packaging = _submit(
         client,
@@ -2047,18 +2194,57 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         idempotency_key=str(uuid4()),
     )
     packaging_job_id = UUID(submitted_packaging.json()["job_id"])
-    store.record_operation_outcome(
-        packaging_job_id,
-        operation="prepare_tpr_cpu",
-        expected_modal_call_id="fc-2",
-        outcome=JobOperationState.COMPLETED,
-        now=1_800_000_003,
-    )
-    store.set_job_state(
-        packaging_job_id,
-        JobState.FINALIZING,
-        now=1_800_000_003,
-    )
+    packaging_job = store.get_job_by_id(packaging_job_id)
+    assert packaging_job is not None and packaging_job.execution_run_id is not None
+    with store.execution_repository() as repository:
+        execution_run_id = packaging_job.execution_run_id
+        [call] = repository.list_provider_calls(execution_run_id)
+        repository.record_provider_call_result(
+            call.provider_call_id,
+            result_envelope={
+                "schema_version": 1,
+                "remote_workdir": "/outputs/packaging",
+            },
+            now=1_800_000_003,
+        )
+        repository.record_task_result_observation(
+            execution_run_id,
+            call.node_key,
+            "operation",
+            AvailabilityStatus.AVAILABLE,
+            now=1_800_000_003,
+        )
+        repository.reconcile_node_tasks(
+            execution_run_id,
+            call.node_key,
+            now=1_800_000_003,
+        )
+        for node in repository.list_nodes(execution_run_id):
+            if node.node_key != "prepare_result" and not node.status.is_terminal:
+                repository.record_node_result_observation(
+                    execution_run_id,
+                    node.node_key,
+                    AvailabilityStatus.AVAILABLE,
+                    now=1_800_000_003,
+                )
+        repository.start_node(
+            execution_run_id,
+            "prepare_result",
+            now=1_800_000_003,
+        )
+        repository.discover_tasks(
+            execution_run_id,
+            "prepare_result",
+            (TaskPlan(task_key="operation", scientific_payload={}),),
+            now=1_800_000_003,
+        )
+        repository.record_task_result_observation(
+            execution_run_id,
+            "prepare_result",
+            "operation",
+            AvailabilityStatus.MISSING,
+            now=1_800_000_003,
+        )
     packaging = client.get(f"/api/v1/jobs/{packaging_job_id}")
 
     assert packaging.json()["stage"] == {
@@ -2069,19 +2255,6 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
     assert packaging.json()["stage_history"][-2]["ended_at"] == ("2027-01-15T08:00:03Z")
     assert packaging.json()["stage_history"][-2]["outcome"] == "completed"
     assert packaging.json()["stage_history"][-1] == packaging.json()["stage"]
-
-    store.block_job(
-        packaging_job_id,
-        category="modal_unavailable",
-        now=1_800_000_004,
-        next_retry_at=1_800_000_904,
-    )
-    blocked = client.get(f"/api/v1/jobs/{packaging_job_id}")
-    assert blocked.json()["state"] == "blocked"
-    assert blocked.json()["stage"] == {
-        "code": "prepare_result",
-        "started_at": "2027-01-15T08:00:03Z",
-    }
 
     schema = client.get("/openapi.json").json()
     stage_schema = schema["components"]["schemas"]["JobStageView"]
@@ -2145,7 +2318,7 @@ def test_gromacs_simulation_time_accepts_200_ns_and_rejects_201(
     assert adapter.submissions[0][2].simulation_time_ns == 200
 
 
-def test_failed_spawn_can_retry_the_same_stable_run(
+def test_failed_spawn_is_terminal_in_the_same_execution_run(
     tmp_path: Path,
 ) -> None:
     client, auth, _store, adapter = _service(tmp_path)
@@ -2160,9 +2333,9 @@ def test_failed_spawn_can_retry_the_same_stable_run(
     assert failed.status_code == 503
     assert failed.json()["code"] == "compute_unavailable"
     assert retried.status_code == 202
-    assert retried.json()["state"] == "queued"
-    assert len(adapter.submissions) == 2
-    assert adapter.submissions[0][1] == adapter.submissions[1][1]
+    assert retried.json()["state"] == "failed"
+    assert retried.json()["job_id"]
+    assert len(adapter.submissions) == 1
     assert adapter.submissions[0][1] == (
         f"first-simulation-{UUID(retried.json()['job_id']).hex}"
     )
@@ -2190,7 +2363,6 @@ def test_unknown_spawn_outcome_is_not_retried(
     job = store.get_job(owner_id, UUID(replayed.json()["job_id"]))
     assert job is not None
     assert job.state == JobState.STATE_UNKNOWN
-    assert job.operations[0].submission_lease_until is None
 
 
 def test_admin_can_resolve_state_unknown_after_manual_provider_review(
@@ -2240,10 +2412,10 @@ def test_admin_can_resolve_state_unknown_after_manual_provider_review(
     assert repeated.json()["code"] == "job_state_changed"
 
 
-def test_cancel_after_failed_spawn_finishes_without_modal_access(
+def test_failed_spawn_cannot_be_cancelled_or_resubmitted(
     tmp_path: Path,
 ) -> None:
-    client, auth, store, adapter = _service(tmp_path)
+    client, auth, _store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
     csrf_token = _login(client, "alice@example.com")
     adapter.failures_remaining = 1
@@ -2253,27 +2425,15 @@ def test_cancel_after_failed_spawn_finishes_without_modal_access(
 
     [job] = _jobs(client.get("/api/v1/jobs"))
     job_id = UUID(str(job["job_id"]))
-    cancelling = client.post(
+    rejected = client.post(
         f"/api/v1/jobs/{job_id}/cancel",
         headers=_unsafe_headers(csrf_token),
     )
-    assert cancelling.status_code == 202
-    assert cancelling.json()["state"] == "cancel_requested"
-
-    asyncio.run(
-        GromacsReconciler(
-            store,
-            cast(Any, adapter),
-            now=lambda: 1_800_000_001,
-        ).reconcile()
-    )
-
-    cancelled = client.get(f"/api/v1/jobs/{job_id}")
-    assert cancelled.status_code == 200
-    assert cancelled.json()["state"] == "cancelled"
-    assert cancelled.json()["completed_at"] == "2027-01-15T08:00:01Z"
+    assert rejected.status_code == 409
+    assert rejected.json()["code"] == "job_not_cancellable"
+    terminal = client.get(f"/api/v1/jobs/{job_id}")
+    assert terminal.json()["state"] == "failed"
     assert adapter.cancellations == []
-    assert adapter.recovery_attempts == []
 
 
 def test_my_jobs_and_job_lookup_are_private_to_the_cookie_owner(
@@ -2332,6 +2492,11 @@ def test_job_history_uses_an_owner_scoped_cursor(tmp_path: Path) -> None:
             display_name=f"Simulation {index}",
         )
         assert submitted.status_code == 202
+        _fail_execution_run(
+            store,
+            UUID(submitted.json()["job_id"]),
+            now=1_800_000_001 + index,
+        )
         store.fail_job(
             UUID(submitted.json()["job_id"]),
             error_code="compute_failed",
@@ -2375,6 +2540,11 @@ def test_job_history_resolves_log_visibility_once_per_workload(
             display_name=f"Simulation {index}",
         )
         assert submitted.status_code == 202
+        _fail_execution_run(
+            store,
+            UUID(submitted.json()["job_id"]),
+            now=1_800_000_001 + index,
+        )
         store.fail_job(
             UUID(submitted.json()["job_id"]),
             error_code="compute_failed",
@@ -2410,6 +2580,7 @@ def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:
     assert "error_code" not in submitted.json()
     assert "error_message" not in submitted.json()
 
+    _fail_execution_run(store, job_id, now=1_800_000_001)
     store.fail_job(
         job_id,
         error_code="compute_failed",
@@ -2444,32 +2615,13 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     )
     job_id = submitted.json()["job_id"]
     parsed_job_id = UUID(job_id)
-    store.record_operation_outcome(
+    _advance_gromacs(
+        store,
+        adapter,
         parsed_job_id,
-        operation="prepare_tpr_cpu",
-        expected_modal_call_id="fc-1",
-        outcome=JobOperationState.COMPLETED,
+        completed=("fc-1",),
         now=1_799_999_999,
     )
-    for operation, modal_call_id in (
-        ("collect_traj_stats:nvt_", "fc-nvt"),
-        ("collect_traj_stats:npt_", "fc-npt"),
-        ("production_run_cpu", "fc-production"),
-    ):
-        token = uuid4().hex
-        store.claim_modal_operation(
-            parsed_job_id,
-            operation=operation,
-            submission_token=token,
-            now=1_799_999_999,
-        )
-        store.attach_modal_call(
-            parsed_job_id,
-            operation=operation,
-            modal_call_id=modal_call_id,
-            submission_token=token,
-            now=1_799_999_999,
-        )
 
     first = client.post(
         f"/api/v1/jobs/{job_id}/cancel",
@@ -2488,17 +2640,16 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     assert first.json()["state"] == "cancel_requested"
     assert replay.status_code == 202
     assert replay.json()["state"] == "cancel_requested"
-    assert adapter.cancellations == [
-        "fc-nvt",
-        "fc-npt",
-        "fc-production",
-        "fc-nvt",
-        "fc-npt",
-        "fc-production",
-    ]
+    assert adapter.cancellations == ["fc-2", "fc-3", "fc-4"]
     assert old_delete_route.status_code == 405
 
-    store.set_job_state(UUID(job_id), JobState.CANCELLED, now=1_800_000_000)
+    _advance_gromacs(
+        store,
+        adapter,
+        parsed_job_id,
+        cancelled=("fc-2", "fc-3", "fc-4"),
+        now=1_800_000_000,
+    )
     terminal = client.post(
         f"/api/v1/jobs/{job_id}/cancel",
         headers=_unsafe_headers(csrf_token),
@@ -2506,21 +2657,8 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     assert terminal.status_code == 409
     assert terminal.json()["code"] == "job_not_cancellable"
 
-    second = _submit(
-        client,
-        csrf_token,
-        idempotency_key=str(uuid4()),
-    )
-    second_id = UUID(second.json()["job_id"])
-    store.set_job_state(second_id, JobState.FINALIZING, now=1_800_000_001)
-    finalizing = client.post(
-        f"/api/v1/jobs/{second_id}/cancel",
-        headers=_unsafe_headers(csrf_token),
-    )
     schema = client.get("/openapi.json").json()
 
-    assert finalizing.status_code == 409
-    assert finalizing.json()["code"] == "job_not_cancellable"
     assert _response_codes(schema, "/api/v1/jobs/{job_id}/cancel", 409) == [
         "job_not_cancellable"
     ]
@@ -2534,6 +2672,7 @@ def test_completed_archive_download_is_private_and_cached(tmp_path: Path) -> Non
     submitted = _submit(alice, alice_csrf, idempotency_key=str(uuid4()))
     job_id = UUID(submitted.json()["job_id"])
     content = adapter.artifact_content
+    _finish_gromacs(store, adapter, job_id)
     store.complete_job(
         job_id,
         state=JobState.SUCCEEDED,
@@ -2605,6 +2744,7 @@ def test_cached_result_reads_do_not_block_core_requests(
     submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
     job_id = UUID(submitted.json()["job_id"])
     content = adapter.artifact_content
+    _finish_gromacs(store, adapter, job_id)
     store.complete_job(
         job_id,
         state=JobState.SUCCEEDED,
@@ -2687,6 +2827,7 @@ def test_local_result_storage_failures_are_503_and_preserve_the_job(
     submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
     job_id = UUID(submitted.json()["job_id"])
     content = adapter.artifact_content
+    _finish_gromacs(store, adapter, job_id)
     store.complete_job(
         job_id,
         state=JobState.SUCCEEDED,
@@ -2753,6 +2894,7 @@ def test_large_result_validation_keeps_core_requests_and_cache_hits_responsive(
     )
     cached_job_id = UUID(cached_submission.json()["job_id"])
     cached_archive = adapter.artifact_content
+    _finish_gromacs(store, adapter, cached_job_id)
     store.complete_job(
         cached_job_id,
         state=JobState.SUCCEEDED,
@@ -2779,6 +2921,7 @@ def test_large_result_validation_keeps_core_requests_and_cache_hits_responsive(
     completed_job_id = UUID(completed_submission.json()["job_id"])
     large_archive = b"PK" + b"x" * (32 * 1024 * 1024)
     adapter.artifact_content = large_archive
+    _finish_gromacs(store, adapter, completed_job_id)
     store.complete_job(
         completed_job_id,
         state=JobState.SUCCEEDED,

@@ -2,10 +2,12 @@
 
 # ruff: noqa: D103
 
+import hashlib
 import tarfile
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import polars as pl
 import pytest
@@ -118,7 +120,8 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
         roots,
     )
     assert [record.artifact_file_path for record in records] == ["nested/design.pdb"]
-    assert records[0].size_bytes == archive_path.stat().st_size
+    assert records[0].size_bytes == len(b"ATOM\n")
+    assert records[0].content_sha256 == hashlib.sha256(b"ATOM\n").hexdigest()
 
 
 def test_stage2_input_manifest_rows_scan_structure_directory(
@@ -325,10 +328,11 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         app_steps=("PPIFlowStep",),
     )
 
+    digest = hashlib.sha256(input_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["input_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/input_pdb/{digest}.pdb"
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
     assert upload_forces == [True]
 
     uploaded.clear()
@@ -338,7 +342,7 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         run_id="run-1",
         app_steps=("PPIFlowStep",),
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
     assert upload_forces == [True]
 
 
@@ -406,11 +410,12 @@ def test_ppiflow_staging_uses_active_stage_steps(
         app_steps=_active_ppiflow_app_steps(task_doc, stage=1),
     )
 
+    digest = hashlib.sha256(input_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["input_pdb"].endswith(
-        "/PPIFlowStep/input_pdb/input.pdb"
+        f"/PPIFlowStep/input_pdb/{digest}.pdb"
     )
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
 
     staged = _stage_ppiflow_app_inputs(
         steps_doc=steps_doc,
@@ -419,7 +424,7 @@ def test_ppiflow_staging_uses_active_stage_steps(
     )
 
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
 
 
 def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
@@ -477,15 +482,23 @@ def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
         app_steps=("PPIFlowStep",),
     )
 
+    antigen_digest = hashlib.sha256(antigen_pdb.read_bytes()).hexdigest()
+    framework_digest = hashlib.sha256(framework_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["antigen_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/{antigen_digest}.pdb"
     )
     assert staged["PPIFlowStep"]["args"]["framework_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/{framework_digest}.pdb"
     )
     assert uploaded == [
-        (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
-        (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
+        (
+            antigen_pdb,
+            f"/run-1/PPIFlowStep/antigen_pdb/{antigen_digest}.pdb",
+        ),
+        (
+            framework_pdb,
+            f"/run-1/PPIFlowStep/framework_pdb/{framework_digest}.pdb",
+        ),
     ]
 
 
@@ -528,9 +541,11 @@ def test_report_node_reads_rank_artifact_from_configured_volume_root(
 
     result = ppiflow_workflow.ReportNode("ReportStep").run(
         ppiflow_workflow.NodeRunContext(
-            run_id="run-1",
+            execution_run_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            workload_run_key="run-1",
             node_id="report",
-            attempt_id="attempt-1",
+            task_key="node",
+            work_dir=tmp_path / "result",
             cache_dir=tmp_path,
             inputs={"rank": [artifact]},
         )

@@ -80,4 +80,4 @@ Do not run `systemctl enable` on the generated service.
 For all three options, wait for
 `http://127.0.0.1:4100/api/v1/ready` before exposing a release. The
 [deployment runbook](../docs/deployment/mvp-runbook.md) covers the frontend
-proxy, pre-release isolation, verification, and rollback.
+proxy, pre-release schema transition, isolation, verification, and rollback.

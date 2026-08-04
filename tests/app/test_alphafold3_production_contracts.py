@@ -981,26 +981,6 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
         resolve_msa_and_templates(config, cast(Any, NeverCalledExecutor()))
 
 
-def test_remote_cache_inspectors_repeat_task_bounds() -> None:
-    with pytest.raises(ValueError, match="512 remote search tasks"):
-        alphafold3_app.inspect_msa_search_cache.get_raw_f()(
-            [("small_bfd", "ACDE")] * 513,
-            [],
-        )
-    with pytest.raises(ValueError, match="512 remote search tasks"):
-        alphafold3_app.inspect_protein_template_cache.get_raw_f()(
-            [("ACDE", "a" * 64, "2021-09-30")] * 513,
-        )
-
-
-def test_remote_msa_inspector_validates_assembly_shape_before_volume_access() -> None:
-    inspect = alphafold3_app.inspect_msa_search_cache.get_raw_f()
-    with pytest.raises(TypeError, match="include_unpaired must be a boolean"):
-        inspect([], [("protein", "ACDE", 1, True)])  # type: ignore[list-item]
-    with pytest.raises(ValueError, match="complete canonical MSAs"):
-        inspect([], [("protein", "ACDE", True, False)])
-
-
 def test_remote_search_repeats_query_length_bound() -> None:
     with pytest.raises(ValueError, match="between 1 and 5,120"):
         alphafold3_app.search_database_msa.get_raw_f()(
@@ -1914,6 +1894,83 @@ def test_generation_claims_fence_active_and_terminal_writers() -> None:
         "finished_at": "second-abandoned",
         "cleanup_recovery": True,
     }
+
+
+def test_generation_claim_replays_the_same_live_owner() -> None:
+    """Provider redelivery may recover one stable generation without takeover."""
+    store = FakeClaimStore()
+    first = acquire_generation_claim(
+        store,
+        scope_key="raw:Protein:sequence:small_bfd",
+        generation_id="execution-task",
+        identity={"search": "one"},
+        container_id="container-a",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_000,
+        now_text="first-start",
+    )
+
+    replay = acquire_generation_claim(
+        store,
+        scope_key=first.scope_key,
+        generation_id=first.generation_id,
+        identity={"search": "one"},
+        container_id="replacement-container",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_001,
+        now_text="replay-start",
+    )
+
+    assert replay == first
+    with pytest.raises(ValueError, match="different identity"):
+        acquire_generation_claim(
+            store,
+            scope_key=first.scope_key,
+            generation_id=first.generation_id,
+            identity={"search": "changed"},
+            container_id="replacement-container",
+            maximum_age_seconds=100,
+            now_epoch_seconds=1_002,
+            now_text="replay-start",
+        )
+
+
+def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
+    """Coordinator-owned seed Tasks reacquire their live writer claims."""
+    runtime = InferenceRuntime(
+        output_root=tmp_path,
+        volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        summary_maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+    )
+    generations = {1: "execution-seed-1", 2: "execution-seed-2"}
+
+    first = claim_seed_predictions(
+        runtime,
+        "a" * 64,
+        (1, 2),
+        sample_count=1,
+        generation_ids=generations,
+    )
+    replay = claim_seed_predictions(
+        runtime,
+        "a" * 64,
+        (1, 2),
+        sample_count=1,
+        generation_ids=generations,
+    )
+
+    assert tuple(item.claim.generation_id for item in first.owned) == (
+        "execution-seed-1",
+        "execution-seed-2",
+    )
+    assert replay == first
 
 
 def test_generation_claims_adapt_legacy_owners() -> None:

@@ -14,7 +14,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,6 +335,7 @@ def inspect_seed_predictions(
     seeds: tuple[int, ...],
     *,
     sample_count: int,
+    reload_volume: bool = True,
 ) -> list[dict[str, object]]:
     """Inspect requested seed markers without walking output artifacts."""
     selected_run = validate_run_id(run_id)
@@ -343,7 +344,8 @@ def inspect_seed_predictions(
     validate_inference_workload(list(selected_seeds), selected_samples)
     if len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("seed inspection inputs must be unique")
-    runtime.volume.reload()
+    if reload_volume:
+        runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
     statuses: list[dict[str, object]] = []
     for seed in selected_seeds:
@@ -383,6 +385,8 @@ def claim_seed_predictions(
     seeds: tuple[int, ...],
     *,
     sample_count: int,
+    generation_ids: Mapping[int, str] | None = None,
+    reload_volume: bool = True,
 ) -> SeedClaimPlan:
     """Reuse marked seeds and atomically claim every currently missing seed."""
     selected_run = validate_run_id(run_id)
@@ -391,7 +395,13 @@ def claim_seed_predictions(
     validate_inference_workload(list(selected_seeds), selected_samples)
     if not selected_seeds or len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("claim inputs must be a non-empty unique seed set")
-    runtime.volume.reload()
+    selected_generations: dict[int, str] = {}
+    if generation_ids is not None:
+        if set(generation_ids) != set(selected_seeds):
+            raise ValueError("generation_ids must contain exactly the requested seeds")
+        selected_generations = {seed: generation_ids[seed] for seed in selected_seeds}
+    if reload_volume:
+        runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
     reused: list[int] = []
     claimed: list[ClaimedSeed] = []
@@ -412,7 +422,7 @@ def claim_seed_predictions(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_seed_claim_scope(selected_run, seed),
-                generation_id=uuid.uuid4().hex,
+                generation_id=selected_generations.get(seed, uuid.uuid4().hex),
                 identity=_seed_claim_identity(selected_run, seed),
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
@@ -429,7 +439,7 @@ def claim_seed_predictions(
         claimed.append(ClaimedSeed(seed=seed, claim=claim))
 
     owned: list[ClaimedSeed] = []
-    if claimed:
+    if claimed and reload_volume:
         runtime.volume.reload()
     for item in claimed:
         raced_marker = load_seed_marker(

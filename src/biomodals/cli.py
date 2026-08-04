@@ -1,14 +1,20 @@
 """Helper script for constructing actual modal run commands."""
 
+import importlib
+import inspect
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
+from uuid import UUID, uuid4
 
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from biomodals.execution import DeploymentIdentity, ExecutionOverview, RunStatus
+from biomodals.execution.modal import deployed_execution_coordinator
 from biomodals.helper.catalog import (
     WORKFLOW_HOME,
     AppNotFoundError,
@@ -18,37 +24,62 @@ from biomodals.helper.catalog import (
 )
 from biomodals.helper.cli_command import (
     build_app_run_command,
+    build_modal_app_history_command,
     build_modal_deploy_command,
     build_workflow_run_command,
     modal_env_overrides,
     resolve_workflow_entrypoint,
+    select_modal_deployment_version,
 )
+from biomodals.helper.cli_entrypoint import invoke_local_entrypoint
 from biomodals.helper.shell import run_command
 from biomodals.service.admin import app as admin_commands
+from biomodals.service.config import AdminSettings
+from biomodals.service.store import ServiceStore
 
 # ruff: noqa: S603
 
 app = typer.Typer()
 app_commands = typer.Typer(no_args_is_help=True)
 workflow_commands = typer.Typer(no_args_is_help=True)
+run_commands = typer.Typer(no_args_is_help=True)
 api_commands = typer.Typer(no_args_is_help=True)
 console = Console()
+
+_COORDINATOR_CLI_PARAMETERS = frozenset({
+    "use_deployed_coordinator",
+    "deployment_environment",
+    "deployment_name",
+    "deployment_version",
+    "restart_from",
+})
+_WORKFLOW_CLI_PARAMETERS = _COORDINATOR_CLI_PARAMETERS | {"dry_run"}
 
 
 @app.callback(invoke_without_command=True, no_args_is_help=True)
 def callback():
-    """Biomodals CLI - List and get help for biomodals applications.
+    """Discover, deploy, run, and administer BioModals compute.
 
-    This CLI helps users discover available biomodals applications and view their help documentation.
+    Use the command groups to run Modal compute, control durable runs, or
+    operate the optional API service.
     """
     ...
 
 
-app.add_typer(app_commands, name="app", help="Discover and run Biomodals apps.")
 app.add_typer(
-    workflow_commands, name="workflow", help="Discover Biomodals workflow entrypoints."
+    app_commands, name="app", help="Discover, deploy, and run BioModals apps."
 )
-app.add_typer(api_commands, name="api", help="Run and administer the Biomodals API.")
+app.add_typer(
+    workflow_commands,
+    name="workflow",
+    help="Discover, deploy, and run BioModals workflows.",
+)
+app.add_typer(
+    run_commands,
+    name="run",
+    help="Inspect and control a durable BioModals Execution Run.",
+)
+app.add_typer(api_commands, name="api", help="Run and administer the BioModals API.")
 api_commands.add_typer(
     admin_commands,
     name="admin",
@@ -83,6 +114,38 @@ def serve_api(
         host=host,
         port=port,
         workers=1,
+    )
+
+
+@api_commands.command(
+    name="transition-execution-state",
+    help="Replace pre-release Job execution state with the current schema.",
+)
+def transition_execution_state(
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Confirm deletion of legacy Job history and local execution state.",
+        ),
+    ] = False,
+) -> None:
+    """Preserve accounts and settings while discarding legacy Job history."""
+    if not yes:
+        console.print(
+            "[bold red]Error[/bold red] This discards legacy Job history. "
+            "Re-run with '[green]--yes[/green]' after stopping the API service."
+        )
+        raise typer.Exit(code=1)
+    store = ServiceStore(AdminSettings.from_environment().database_path)
+    try:
+        discarded_jobs = store.transition_execution_state()
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[bold red]Error[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        "Transitioned service execution state; "
+        f"discarded {discarded_jobs} legacy Job(s)."
     )
 
 
@@ -201,11 +264,6 @@ def _list_available_entries(
 )
 @app_commands.command(name="ls", hidden=True)
 @app_commands.command(name="l", hidden=True)
-@app.command(
-    name="list", help="Deprecated alias for 'biomodals app list'.", deprecated=True
-)
-@app.command(name="ls", hidden=True, deprecated=True)
-@app.command(name="l", hidden=True, deprecated=True)
 def list_available_apps(
     use_absolute_paths: Annotated[
         bool,
@@ -288,6 +346,48 @@ def list_available_workflows(
     )
 
 
+def _entrypoint_help_parameters(
+    list_type: CatalogType,
+    catalog_entry: BiomodalsApp,
+    function_name: str,
+) -> frozenset[str]:
+    """Return entrypoint parameters owned by the outer Biomodals CLI."""
+    if list_type == "workflow":
+        return _WORKFLOW_CLI_PARAMETERS
+    if function_name in catalog_entry.execution_coordinator_entrypoints:
+        return _COORDINATOR_CLI_PARAMETERS
+    return frozenset()
+
+
+def _docstring_without_args(docstring: str | None) -> str:
+    """Remove the Google-style Args section already represented by the table."""
+    if not docstring:
+        return "No documentation available."
+    lines = inspect.cleandoc(docstring).splitlines()
+    try:
+        args_start = next(i for i, line in enumerate(lines) if line == "Args:")
+    except StopIteration:
+        return "\n".join(lines)
+    args_end = next(
+        (
+            i
+            for i in range(args_start + 1, len(lines))
+            if lines[i] and not lines[i][0].isspace() and lines[i].endswith(":")
+        ),
+        len(lines),
+    )
+    return "\n".join([*lines[:args_start], *lines[args_end:]]).strip()
+
+
+def _print_entrypoint_options_note(list_type: CatalogType) -> None:
+    """Explain the boundary between outer and entrypoint CLI options."""
+    console.print(
+        "[dim]Entrypoint options below belong after --. Run "
+        f"'biomodals {list_type} run --help' for deployment and execution options."
+        "[/dim]\n"
+    )
+
+
 def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) -> None:
     """Show help for a specific biomodals app or workflow."""
     catalog_entry = _load_entry(list_type, entry_name)
@@ -296,13 +396,24 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
         f = catalog_entry[catalog_entry._entrypoint]
         console.print(
             f"[bold]Help for {f.func_type} function"
-            f"'[green]{f.name}[/green]'"
+            f" '[green]{f.name}[/green]'"
             f" in {list_type} '[green]{catalog_entry.name}[/green]'"
             f" ({catalog_entry.category}):[/bold]\n"
         )
-        console.print(f.docstring or "No documentation available.")
-        if table_rows := f.args_table:
+        hidden_parameters = _entrypoint_help_parameters(
+            list_type,
+            catalog_entry,
+            f.name,
+        )
+        table_rows = f.visible_args_table(hidden_parameters=hidden_parameters)
+        console.print(
+            _docstring_without_args(f.docstring)
+            if f.args_table
+            else f.docstring or "No documentation available."
+        )
+        if table_rows:
             _print_title("Entrypoint CLI flags")
+            _print_entrypoint_options_note(list_type)
             console.print(Markdown("\n".join(table_rows)))
         return
 
@@ -331,12 +442,29 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
 
     if f_indices := catalog_entry._local_entrypoint_idx:
         _print_title(f"Local entrypoint(s) in this {list_type}")
+        _print_entrypoint_options_note(list_type)
         for f_idx in f_indices:
             f = catalog_entry[f_idx]
+            table_rows = f.visible_args_table(
+                hidden_parameters=_entrypoint_help_parameters(
+                    list_type,
+                    catalog_entry,
+                    f.name,
+                )
+            )
 
-            if f.args_table:
-                console.print(f"[bold green]{f.name}[/bold green] CLI flags:\n")
-                console.print(Markdown("\n".join(f.args_table)))
+            if table_rows:
+                console.print(
+                    f"[bold green]{f.name}[/bold green] CLI flags:",
+                    end="",
+                )
+                console.print(Markdown("\n".join(table_rows)))
+                console.print()
+            elif f.args_table:
+                console.print(
+                    f"[bold green]{f.name}[/bold green] has no "
+                    "entrypoint-specific CLI flags.\n"
+                )
             elif f.docstring:
                 console.print(f"[bold green]{f.name}[/bold green] documentation:\n")
                 console.print(Markdown(f.docstring))
@@ -348,13 +476,6 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
     help="Show help for a specific biomodals application (alias: h).",
 )
 @app_commands.command(name="h", no_args_is_help=True, hidden=True)
-@app.command(
-    name="help",
-    no_args_is_help=True,
-    help="Deprecated alias for 'biomodals app help'.",
-    deprecated=True,
-)
-@app.command(name="h", no_args_is_help=True, hidden=True, deprecated=True)
 def show_app_help(
     app_name: Annotated[
         str, typer.Argument(help="Name or path of the app to show help for.")
@@ -398,13 +519,6 @@ def show_workflow_help(
     help="Run a biomodals application on Modal (alias: r).",
 )
 @app_commands.command(name="r", no_args_is_help=True, hidden=True)
-@app.command(
-    name="run",
-    no_args_is_help=True,
-    help="Deprecated alias for 'biomodals app run'.",
-    deprecated=True,
-)
-@app.command(name="r", no_args_is_help=True, hidden=True, deprecated=True)
 def run_modal_app(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to run.")
@@ -415,17 +529,61 @@ def run_modal_app(
     ] = "run",
     detach: Annotated[
         bool,
-        typer.Option("--detach", "-d", help="Run the modal command in detached mode."),
+        typer.Option(
+            "--detach",
+            "-d",
+            help="Detach the source-backed development Modal command.",
+        ),
     ] = False,
     gpu: Annotated[
         str | None,
-        typer.Option("--gpu", help="GPU type to use for the modal run (e.g. 'L40S'). "),
+        typer.Option(
+            "--gpu",
+            help="GPU type for a source-backed development run (e.g. 'L40S').",
+        ),
     ] = None,
     timeout: Annotated[
         int | None,
         typer.Option(
             "--timeout",
-            help="Timeout in seconds for the modal run. If not specified, use the app default.",
+            help="Timeout in seconds for a source-backed development run.",
+        ),
+    ] = None,
+    development: Annotated[
+        bool,
+        typer.Option(
+            "--development",
+            help=("Run an app from current source without cross-command recovery."),
+        ),
+    ] = False,
+    environment: Annotated[
+        str,
+        typer.Option(
+            "--environment",
+            "-e",
+            help="Modal Environment containing a deployed app coordinator.",
+        ),
+    ] = "main",
+    deployment_name: Annotated[
+        str | None,
+        typer.Option(
+            "--deployment-name",
+            help="Modal app name. Defaults to the app's declared name.",
+        ),
+    ] = None,
+    version: Annotated[
+        int | None,
+        typer.Option(
+            "--version",
+            min=1,
+            help="Exact Modal deployment version. Defaults to the latest deployment.",
+        ),
+    ] = None,
+    restart_from: Annotated[
+        UUID | None,
+        typer.Option(
+            "--restart-from",
+            help="Create a Successor Run from this Execution Run UUID.",
         ),
     ] = None,
     flags: Annotated[
@@ -435,14 +593,101 @@ def run_modal_app(
 ):
     """Run a biomodals application on Modal.
 
-    Use with: `biomodals run <app-name> [OPTIONS] -- [app-options]`, where `[app-options]` are
-    additional flags to pass to the `modal run <app-name>` command.
+    Use with: `biomodals app run <app-name> [OPTIONS] -- [app-options]`.
     """
-    # TODO(workflows): add workflow run semantics separately from Modal app runs
-    # so workflow-* names can stage workflow inputs before invoking orchestrators.
     import os
 
     app = _load_entry("app", app_name_or_path)
+    coordinated_entrypoint = _coordinated_app_entrypoint(app)
+    if (
+        modal_mode != "shell"
+        and app._entrypoint is not None
+        and coordinated_entrypoint is None
+        and not development
+    ):
+        console.print(
+            "[bold red]Error[/bold red] This app entrypoint does not expose a "
+            "deployment coordinator. Rerun with --development for explicit "
+            "source-backed execution."
+        )
+        raise typer.Exit(code=1)
+    if development and (version is not None or deployment_name is not None):
+        console.print(
+            "[bold red]Error[/bold red] --version and --deployment-name are "
+            "unavailable in source-backed development mode"
+        )
+        raise typer.Exit(code=1)
+    if (
+        modal_mode != "shell"
+        and not development
+        and (detach or gpu is not None or timeout is not None)
+    ):
+        console.print(
+            "[bold red]Error[/bold red] --detach, --gpu, and --timeout are "
+            "available only in source-backed development mode"
+        )
+        raise typer.Exit(code=1)
+    if modal_mode != "shell" and coordinated_entrypoint is not None and not development:
+        try:
+            resolved_deployment_name = deployment_name or _deployment_name(app)
+            resolved_version = _resolve_deployment_version(
+                deployment_name=resolved_deployment_name,
+                environment=environment,
+                requested_version=version,
+            )
+        except (ImportError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+            console.print(
+                "[bold red]Error[/bold red] Could not resolve exact app "
+                f"deployment: {exc}"
+            )
+            raise typer.Exit(code=1) from exc
+    elif restart_from is not None:
+        if development:
+            message = "--restart-from is unavailable in source-backed development mode"
+        else:
+            message = "--restart-from requires a coordinator-aware app entrypoint"
+        console.print(f"[bold red]Error[/bold red] {message}")
+        raise typer.Exit(code=1)
+    elif coordinated_entrypoint is None and (
+        version is not None or deployment_name is not None
+    ):
+        console.print(
+            "[bold red]Error[/bold red] Deployment coordinator options require "
+            "a coordinator-aware app entrypoint"
+        )
+        raise typer.Exit(code=1)
+
+    if modal_mode == "shell":
+        cmd = build_app_run_command(
+            app_path=app.path,
+            entrypoint=app._entrypoint,
+            modal_mode=modal_mode,
+            detach=detach,
+            flags=flags,
+        )
+        console.print(
+            "To start an interactive shell for the app, run:\n"
+            f"[bold green]{shlex.join(cmd)}[/bold green]"
+        )
+        return
+
+    if coordinated_entrypoint is not None and not development:
+        invoke_local_entrypoint(
+            module_name=app.module,
+            entrypoint_name=coordinated_entrypoint,
+            flags=flags or (),
+            overrides={
+                "use_deployed_coordinator": True,
+                "deployment_environment": environment,
+                "deployment_name": resolved_deployment_name,
+                "deployment_version": resolved_version,
+                "restart_from": None if restart_from is None else str(restart_from),
+            },
+            program_name=(f"biomodals app run {app.name}::{coordinated_entrypoint} --"),
+            environment_name=environment,
+        )
+        return
+
     cmd = build_app_run_command(
         app_path=app.path,
         entrypoint=app._entrypoint,
@@ -450,13 +695,6 @@ def run_modal_app(
         detach=detach,
         flags=flags,
     )
-
-    if modal_mode == "shell":
-        console.print(
-            "To start an interactive shell for the app, run:\n"
-            f"[bold green]{shlex.join(cmd)}[/bold green]"
-        )
-        return
 
     # TODO: figure out a way to tag run names into the app.
     # Previously we used the MODAL_APP environment variable for ephemeral
@@ -471,6 +709,322 @@ def run_modal_app(
         run_command(list(cmd), env=env, output_mode="inherit")
     else:
         _show_entry_help("app", str(app.path), verbose=False)
+
+
+def _coordinated_app_entrypoint(app: BiomodalsApp) -> str | None:
+    """Return the selected entrypoint only when its module opts into the kernel."""
+    entrypoint = app._entrypoint
+    if entrypoint is None or not isinstance(getattr(app, "module", None), str):
+        return None
+    return entrypoint if entrypoint in app.execution_coordinator_entrypoints else None
+
+
+def _deployment_name(entry: BiomodalsApp) -> str:
+    """Return one app or workflow module's Modal deployment name."""
+    module = importlib.import_module(entry.module)
+    config = getattr(module, "CONF", None)
+    deployment_name = getattr(config, "name", None)
+    if not isinstance(deployment_name, str) or not deployment_name:
+        raise ValueError(f"'{entry.name}' does not declare a deployment name")
+    return deployment_name
+
+
+def _run_coordinator(
+    *,
+    environment: str,
+    deployment_name: str,
+    deployment_version: int,
+    execution_run_id: UUID,
+):
+    """Resolve the standard coordinator for one explicit run location."""
+    deployment = DeploymentIdentity(
+        environment=environment,
+        deployment_name=deployment_name,
+        deployment_version=deployment_version,
+    )
+    return deployed_execution_coordinator(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+    )
+
+
+def _print_execution_overview(overview: ExecutionOverview) -> None:
+    """Render the bounded durable execution view."""
+    run = overview.run
+    console.print(f"Execution Run ID: [green]{run.execution_run_id}[/green]")
+    console.print(
+        "Deployment Identity: "
+        f"[green]{run.deployment.environment}/"
+        f"{run.deployment.deployment_name}/"
+        f"v{run.deployment.deployment_version}[/green]"
+    )
+    console.print(f"Status: [green]{run.status.value}[/green]")
+    if run.status_reason is not None:
+        console.print(f"Reason: {run.status_reason.value}")
+    if run.status_message:
+        console.print(f"Message: {run.status_message}")
+    console.print(
+        "Occupied Provider Call Slots: "
+        f"{overview.active_provider_calls.total} total, "
+        f"{overview.active_provider_calls.gpu} GPU"
+    )
+    if overview.active_provider_calls.total:
+        console.print(
+            "[dim]These are durable ownership records, not confirmed live Modal "
+            "containers.[/dim]"
+        )
+    if run.status in {RunStatus.SUSPENDED, RunStatus.STATE_UNKNOWN}:
+        console.print(
+            "[yellow]Automatic scheduling is stopped. Use 'biomodals run resume' "
+            "to reconcile this Run.[/yellow]"
+        )
+
+
+def _print_spawned_execution_run(
+    *,
+    execution_run_id: UUID,
+    environment: str,
+    deployment_name: str,
+    deployment_version: int,
+    call: object,
+) -> None:
+    """Print the explicit location of one detached coordinator call."""
+    console.print(f"Execution Run ID: [green]{execution_run_id}[/green]")
+    console.print(
+        "Deployment Identity: "
+        f"[green]{environment}/{deployment_name}/v{deployment_version}[/green]"
+    )
+    console.print(
+        "Coordinator FunctionCall ID: "
+        f"[green]{getattr(call, 'object_id', call)}[/green]"
+    )
+
+
+@run_commands.command(name="status")
+def status_execution_run(
+    environment: Annotated[
+        str,
+        typer.Option("--environment", help="Modal Environment containing the run."),
+    ],
+    deployment_name: Annotated[
+        str,
+        typer.Option("--deployment-name", help="Modal app deployment name."),
+    ],
+    deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--deployment-version",
+            min=1,
+            help="Exact numeric Modal deployment version.",
+        ),
+    ],
+    execution_run_id: Annotated[
+        UUID,
+        typer.Option("--execution-run-id", help="Opaque Execution Run UUID."),
+    ],
+) -> None:
+    """Read one persisted Execution Run without advancing it."""
+    try:
+        overview = _run_coordinator(
+            environment=environment,
+            deployment_name=deployment_name,
+            deployment_version=deployment_version,
+            execution_run_id=execution_run_id,
+        ).status.remote()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Error[/bold red] Could not read run status: {exc}")
+        raise typer.Exit(code=1) from exc
+    _print_execution_overview(overview)
+
+
+@run_commands.command(name="cancel")
+def cancel_execution_run(
+    environment: Annotated[
+        str,
+        typer.Option("--environment", help="Modal Environment containing the run."),
+    ],
+    deployment_name: Annotated[
+        str,
+        typer.Option("--deployment-name", help="Modal app deployment name."),
+    ],
+    deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--deployment-version",
+            min=1,
+            help="Exact numeric Modal deployment version.",
+        ),
+    ],
+    execution_run_id: Annotated[
+        UUID,
+        typer.Option("--execution-run-id", help="Opaque Execution Run UUID."),
+    ],
+) -> None:
+    """Request idempotent cancellation of one Execution Run."""
+    try:
+        overview = _run_coordinator(
+            environment=environment,
+            deployment_name=deployment_name,
+            deployment_version=deployment_version,
+            execution_run_id=execution_run_id,
+        ).cancel.remote()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Error[/bold red] Could not cancel run: {exc}")
+        raise typer.Exit(code=1) from exc
+    _print_execution_overview(overview)
+
+
+@run_commands.command(name="resume")
+def resume_execution_run_command(
+    environment: Annotated[
+        str,
+        typer.Option("--environment", help="Modal Environment containing the run."),
+    ],
+    deployment_name: Annotated[
+        str,
+        typer.Option("--deployment-name", help="Modal app deployment name."),
+    ],
+    deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--deployment-version",
+            min=1,
+            help="Exact numeric Modal deployment version.",
+        ),
+    ],
+    execution_run_id: Annotated[
+        UUID,
+        typer.Option("--execution-run-id", help="Opaque Execution Run UUID."),
+    ],
+) -> None:
+    """Resume a suspended or state-unknown Run without retrying failed Tasks."""
+    try:
+        call = _run_coordinator(
+            environment=environment,
+            deployment_name=deployment_name,
+            deployment_version=deployment_version,
+            execution_run_id=execution_run_id,
+        ).resume.spawn()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Error[/bold red] Could not resume run: {exc}")
+        raise typer.Exit(code=1) from exc
+    _print_spawned_execution_run(
+        execution_run_id=execution_run_id,
+        environment=environment,
+        deployment_name=deployment_name,
+        deployment_version=deployment_version,
+        call=call,
+    )
+
+
+@run_commands.command(name="restart")
+def restart_execution_run(
+    environment: Annotated[
+        str,
+        typer.Option(
+            "--environment",
+            help="Modal Environment containing the predecessor Run.",
+        ),
+    ],
+    deployment_name: Annotated[
+        str,
+        typer.Option(
+            "--deployment-name",
+            help="Predecessor Modal app deployment name.",
+        ),
+    ],
+    deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--deployment-version",
+            min=1,
+            help="Exact predecessor Modal deployment version.",
+        ),
+    ],
+    execution_run_id: Annotated[
+        UUID,
+        typer.Option(
+            "--execution-run-id",
+            help="Opaque predecessor Execution Run UUID.",
+        ),
+    ],
+    target_environment: Annotated[
+        str,
+        typer.Option(
+            "--target-environment",
+            help="Modal Environment for the Successor Run.",
+        ),
+    ],
+    target_deployment_name: Annotated[
+        str,
+        typer.Option(
+            "--target-deployment-name",
+            help="Modal app deployment name for the Successor Run.",
+        ),
+    ],
+    target_deployment_version: Annotated[
+        int,
+        typer.Option(
+            "--target-deployment-version",
+            min=1,
+            help="Exact Modal deployment version for the Successor Run.",
+        ),
+    ],
+    max_active_provider_calls: Annotated[
+        int | None,
+        typer.Option(
+            "--max-active-provider-calls",
+            min=1,
+            help="Override the predecessor's total active-call limit.",
+        ),
+    ] = None,
+    max_active_gpu_provider_calls: Annotated[
+        int | None,
+        typer.Option(
+            "--max-active-gpu-provider-calls",
+            min=0,
+            help="Override the predecessor's active GPU-call limit.",
+        ),
+    ] = None,
+) -> None:
+    """Create a new Successor Run without mutating the predecessor."""
+    successor_execution_run_id = uuid4()
+    try:
+        coordinator = _run_coordinator(
+            environment=target_environment,
+            deployment_name=target_deployment_name,
+            deployment_version=target_deployment_version,
+            execution_run_id=successor_execution_run_id,
+        )
+        coordinator.prepare_restart.remote(
+            predecessor_execution_run_id=str(execution_run_id),
+            predecessor_deployment_environment=environment,
+            predecessor_deployment_name=deployment_name,
+            predecessor_deployment_version=deployment_version,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+        call = coordinator.drive_prepared.spawn()
+    except KeyboardInterrupt:
+        console.print(f"Successor Execution Run ID: {successor_execution_run_id}")
+        console.print(
+            "Restart submission outcome is unknown; inspect this Run before retrying."
+        )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[bold red]Error[/bold red] Could not restart run: {exc}")
+        console.print(f"Successor Execution Run ID: {successor_execution_run_id}")
+        console.print(
+            "Restart submission outcome is unknown; inspect this Run before retrying."
+        )
+        raise typer.Exit(code=1) from exc
+    _print_spawned_execution_run(
+        execution_run_id=successor_execution_run_id,
+        environment=target_environment,
+        deployment_name=target_deployment_name,
+        deployment_version=target_deployment_version,
+        call=call,
+    )
 
 
 def _resolve_workflow_entrypoint(workflow: BiomodalsApp) -> str:
@@ -490,6 +1044,28 @@ def _resolve_workflow_entrypoint(workflow: BiomodalsApp) -> str:
         raise typer.Exit(code=1) from exc
 
 
+def _resolve_deployment_version(
+    *,
+    deployment_name: str,
+    environment: str,
+    requested_version: int | None,
+) -> int:
+    """Preflight one exact deployment through Modal history."""
+    command = build_modal_app_history_command(
+        deployment_name=deployment_name,
+        environment=environment,
+    )
+    lines = run_command(
+        list(command),
+        output_mode="capture",
+        show_command=False,
+    )
+    return select_modal_deployment_version(
+        "\n".join(lines),
+        requested_version=requested_version,
+    )
+
+
 @workflow_commands.command(
     name="run",
     no_args_is_help=True,
@@ -506,17 +1082,24 @@ def run_workflow(
     ] = "run",
     detach: Annotated[
         bool,
-        typer.Option("--detach", "-d", help="Run the modal command in detached mode."),
+        typer.Option(
+            "--detach",
+            "-d",
+            help="Detach the source-backed development Modal command.",
+        ),
     ] = False,
     gpu: Annotated[
         str | None,
-        typer.Option("--gpu", help="GPU type to use for the modal run (e.g. 'L40S'). "),
+        typer.Option(
+            "--gpu",
+            help="GPU type for a source-backed development run (e.g. 'L40S').",
+        ),
     ] = None,
     timeout: Annotated[
         int | None,
         typer.Option(
             "--timeout",
-            help="Timeout in seconds for the modal run. If not specified, use the workflow default.",
+            help="Timeout in seconds for a source-backed development run.",
         ),
     ] = None,
     dry_run: Annotated[
@@ -526,6 +1109,46 @@ def run_workflow(
             help="Build the workflow and print its DAG graph without submitting it.",
         ),
     ] = False,
+    development: Annotated[
+        bool,
+        typer.Option(
+            "--development",
+            help=(
+                "Run against current source without durable cross-command "
+                "coordinator lookup."
+            ),
+        ),
+    ] = False,
+    environment: Annotated[
+        str,
+        typer.Option(
+            "--environment",
+            "-e",
+            help="Modal Environment containing the deployed workflow.",
+        ),
+    ] = "main",
+    deployment_name: Annotated[
+        str | None,
+        typer.Option(
+            "--deployment-name",
+            help="Modal app name. Defaults to the workflow's declared name.",
+        ),
+    ] = None,
+    version: Annotated[
+        int | None,
+        typer.Option(
+            "--version",
+            min=1,
+            help="Exact Modal deployment version. Defaults to the latest deployment.",
+        ),
+    ] = None,
+    restart_from: Annotated[
+        UUID | None,
+        typer.Option(
+            "--restart-from",
+            help="Create a Successor Run from this Execution Run UUID.",
+        ),
+    ] = None,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the workflow entrypoint."),
@@ -540,6 +1163,77 @@ def run_workflow(
 
     workflow = _load_entry("workflow", workflow_name_or_path)
     entrypoint = _resolve_workflow_entrypoint(workflow)
+    if (
+        modal_mode != "shell"
+        and not development
+        and (detach or gpu is not None or timeout is not None)
+    ):
+        console.print(
+            "[bold red]Error[/bold red] --detach, --gpu, and --timeout are "
+            "available only in source-backed development mode"
+        )
+        raise typer.Exit(code=1)
+    if restart_from is not None:
+        if development:
+            message = "--restart-from is unavailable in source-backed development mode"
+        elif dry_run:
+            message = "--restart-from is unavailable for a local dry run"
+        elif modal_mode == "shell":
+            message = "--restart-from is unavailable for an interactive shell"
+        else:
+            message = None
+        if message is not None:
+            console.print(f"[bold red]Error[/bold red] {message}")
+            raise typer.Exit(code=1)
+    if modal_mode != "shell" and not dry_run and not development:
+        try:
+            resolved_deployment_name = deployment_name or _deployment_name(workflow)
+            resolved_version = _resolve_deployment_version(
+                deployment_name=resolved_deployment_name,
+                environment=environment,
+                requested_version=version,
+            )
+        except (ImportError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+            console.print(
+                "[bold red]Error[/bold red] Could not resolve exact workflow "
+                f"deployment: {exc}"
+            )
+            raise typer.Exit(code=1) from exc
+
+    if modal_mode == "shell":
+        cmd = build_workflow_run_command(
+            workflow_module=workflow.module,
+            entrypoint=entrypoint,
+            modal_mode=modal_mode,
+            detach=detach,
+            dry_run=dry_run,
+            flags=flags,
+        )
+        console.print(
+            "To start an interactive shell for the workflow, run:\n"
+            f"[bold green]{shlex.join(cmd)}[/bold green]"
+        )
+        return
+
+    if not development:
+        deployed = not dry_run
+        invoke_local_entrypoint(
+            module_name=workflow.module,
+            entrypoint_name=entrypoint,
+            flags=flags or (),
+            overrides={
+                "dry_run": dry_run,
+                "use_deployed_coordinator": deployed,
+                "deployment_environment": environment if deployed else "development",
+                "deployment_name": resolved_deployment_name if deployed else None,
+                "deployment_version": resolved_version if deployed else 1,
+                "restart_from": None if restart_from is None else str(restart_from),
+            },
+            program_name=f"biomodals workflow run {workflow.name}::{entrypoint} --",
+            environment_name=environment if deployed else None,
+        )
+        return
+
     cmd = build_workflow_run_command(
         workflow_module=workflow.module,
         entrypoint=entrypoint,
@@ -548,13 +1242,6 @@ def run_workflow(
         dry_run=dry_run,
         flags=flags,
     )
-
-    if modal_mode == "shell":
-        console.print(
-            "To start an interactive shell for the workflow, run:\n"
-            f"[bold green]{shlex.join(cmd)}[/bold green]"
-        )
-        return
 
     env = os.environ.copy()
     env.update(modal_env_overrides(gpu=gpu, timeout=timeout))
@@ -568,13 +1255,6 @@ def run_workflow(
     help="Deploy a biomodals application to Modal (alias: d).",
 )
 @app_commands.command(name="d", no_args_is_help=True, hidden=True)
-@app.command(
-    name="deploy",
-    no_args_is_help=True,
-    help="Deprecated alias for 'biomodals app deploy'.",
-    deprecated=True,
-)
-@app.command(name="d", no_args_is_help=True, hidden=True, deprecated=True)
 def deploy_app(
     app_name_or_path: Annotated[
         str, typer.Argument(help="Name or path of the app to deploy.")
@@ -598,11 +1278,50 @@ def deploy_app(
     """Deploy a biomodals application to Modal."""
     app = _load_entry("app", app_name_or_path)
     cmd = build_modal_deploy_command(
-        app_path=app.path,
+        app_ref=app.path,
         name=name,
         tag=tag,
         env=env,
         strategy=strategy,
+    )
+    run_command(list(cmd), output_mode="inherit")
+
+
+@workflow_commands.command(
+    name="deploy",
+    no_args_is_help=True,
+    help="Deploy a BioModals workflow to Modal (alias: d).",
+)
+@workflow_commands.command(name="d", no_args_is_help=True, hidden=True)
+def deploy_workflow(
+    workflow_name_or_path: Annotated[
+        str, typer.Argument(help="Name or path of the workflow to deploy.")
+    ],
+    name: Annotated[
+        str | None, typer.Option("--name", "-n", help="Name of the deployment.")
+    ] = None,
+    tag: Annotated[
+        str | None,
+        typer.Option("--tag", "-t", help="Tag the deployment with a version."),
+    ] = None,
+    env: Annotated[
+        str | None,
+        typer.Option("--env", "-e", help="Modal Environment to deploy into."),
+    ] = None,
+    strategy: Annotated[
+        Literal["rolling", "recreate"] | None,
+        typer.Option("--strategy", help="Deployment strategy."),
+    ] = None,
+) -> None:
+    """Deploy a BioModals workflow as an importable Modal module."""
+    workflow = _load_entry("workflow", workflow_name_or_path)
+    cmd = build_modal_deploy_command(
+        app_ref=workflow.module,
+        name=name,
+        tag=tag,
+        env=env,
+        strategy=strategy,
+        module_mode=True,
     )
     run_command(list(cmd), output_mode="inherit")
 

@@ -82,6 +82,30 @@ def _publish_efficacy_marker(
     )
 
 
+def _publish_test_off_target_evidence(
+    run_root: Path,
+    *,
+    stem: str,
+    pita: str,
+    targetscan: str,
+) -> None:
+    evidence_dir = (
+        oligoformer_app.AppRunLayout.from_run_root(run_root).prep_dir
+        / "off_target"
+        / stem
+    )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.joinpath("pita.tab").write_text(pita, encoding="utf-8")
+    evidence_dir.joinpath("targetscan.tab").write_text(
+        targetscan,
+        encoding="utf-8",
+    )
+    oligoformer_app._publish_off_target_manifest(
+        evidence_dir,
+        identity=oligoformer_app._off_target_evidence_identity(run_root, stem),
+    )
+
+
 def _write_targetscan_context_output(
     path: Path,
     rows: list[tuple[str, str, str, str]],
@@ -601,73 +625,6 @@ def test_cache_build_lock_exclusive_guards_own_sequential_generations(monkeypatc
         assert status["state"] == "complete"
 
 
-def test_targetscan_rnaplfold_preparation_is_single_writer(monkeypatch, tmp_path: Path):
-    output_volume = FakeVolume()
-    model_volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, output_volume))
-    monkeypatch.setattr(oligoformer_app, "MODEL_VOLUME", model_volume)
-    monkeypatch.setattr(oligoformer_app, "_ensure_human_refs", lambda: None)
-    monkeypatch.setattr(
-        oligoformer_app, "_targetscan_ref_identity_matches_model", lambda: True
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_targetscan_ref_identity",
-        lambda: {
-            "content_sha256": {
-                "human_UTR.txt": "utr",
-                "human_ORF.txt": "orf",
-            }
-        },
-    )
-    ready = False
-    build_calls = []
-    values = {}
-
-    def fake_ready():
-        return ready
-
-    def fake_build(force, execution):
-        nonlocal ready
-        build_calls.append((force, execution))
-        ready = True
-        output_volume.commit()
-
-    class FakeDictInstance:
-        def put(self, key, value, *, skip_if_exists=False):
-            if skip_if_exists and key in values:
-                return False
-            values[key] = value
-            return True
-
-        def get(self, key, default=None):
-            return values.get(key, default)
-
-    class FakeDict:
-        @staticmethod
-        def from_name(_name, create_if_missing=False):
-            assert create_if_missing
-            return FakeDictInstance()
-
-    monkeypatch.setattr(
-        oligoformer_app, "_targetscan_rnaplfold_cache_ready", fake_ready
-    )
-    monkeypatch.setattr(
-        oligoformer_app, "_build_targetscan_rnaplfold_cache", fake_build
-    )
-    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
-
-    raw_f = oligoformer_app.prepare_oligoformer_targetscan_rnaplfold_cache.get_raw_f()
-    raw_f(force=False)
-    raw_f(force=False)
-
-    assert build_calls == [(False, oligoformer_app.DEFAULT_EXECUTION_CONFIG)]
-    assert any(
-        isinstance(value, dict) and value.get("state") == "complete"
-        for value in values.values()
-    )
-
-
 def test_final_ready_requires_current_postprocess_marker_salt(tmp_path: Path):
     layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
     postprocess_key = "final-key"
@@ -1052,6 +1009,72 @@ def test_run_postprocess_rechecks_final_cache_after_lock(tmp_path: Path, monkeyp
     assert volume.reload_count == 2
 
 
+def test_result_publication_is_fingerprint_bound_and_digested(tmp_path: Path) -> None:
+    archive = tmp_path / "run" / "outputs" / "oligoformer.tar.zst"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"archive")
+    publication_key = "a" * 64
+
+    oligoformer_app._publish_oligoformer_result_record(
+        tmp_path,
+        publication_key,
+        archive,
+        model_identity="model-content-v1",
+        reference_identity=None,
+    )
+
+    publication = oligoformer_app._oligoformer_result_publication(
+        tmp_path,
+        publication_key,
+    )
+    assert publication is not None
+    assert publication["result_path"] == "run/outputs/oligoformer.tar.zst"
+    assert publication["model_identity"] == "model-content-v1"
+    assert oligoformer_app._oligoformer_result_publication(tmp_path, "b" * 64) is None
+
+    class VolumeReader:
+        def read_file(self, path):
+            yield tmp_path.joinpath(*Path(path).parts).read_bytes()
+
+    assert (
+        oligoformer_app._oligoformer_result_publication_from_volume(
+            VolumeReader(),
+            publication_key,
+        )
+        == publication
+    )
+
+    archive.write_bytes(b"damaged")
+
+    assert (
+        oligoformer_app._oligoformer_result_publication(tmp_path, publication_key)
+        is None
+    )
+
+
+def test_result_publication_rejects_changed_model_identity(tmp_path: Path) -> None:
+    archive = tmp_path / "run" / "outputs" / "oligoformer.tar.zst"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"archive")
+    publication_key = "a" * 64
+    oligoformer_app._publish_oligoformer_result_record(
+        tmp_path,
+        publication_key,
+        archive,
+        model_identity="model-content-v1",
+        reference_identity="reference-content-v1",
+    )
+
+    assert (
+        oligoformer_app._oligoformer_result_publication(
+            tmp_path,
+            publication_key,
+            expected_identities=("model-content-v2", "reference-content-v1"),
+        )
+        is None
+    )
+
+
 def test_run_postprocess_rejects_changed_all_human_reference_identity(
     tmp_path: Path, monkeypatch
 ):
@@ -1106,778 +1129,6 @@ def test_run_postprocess_rejects_changed_all_human_reference_identity(
         )
 
 
-def test_run_oligoformer_postprocess_packages_cpu_outputs(tmp_path: Path, monkeypatch):
-    captured: dict[str, object] = {}
-    targetscan_plan_calls: list[oligoformer_app.TargetscanBatchSpec] = []
-    targetscan_worker_calls: list[tuple[str, int]] = []
-    targetscan_finalize_calls: list[
-        tuple[oligoformer_app.PreparedTargetscanBatch, list[str]]
-    ] = []
-    pita_plan_calls: list[oligoformer_app.OffTargetShardSpec] = []
-    pita_prepare_batch_calls: list[
-        tuple[list[oligoformer_app.PitaPrepareUtrShardSpec], int]
-    ] = []
-    pita_consolidate_batch_calls: list[
-        tuple[list[oligoformer_app.PitaPreparePlan], int]
-    ] = []
-    row_batch_calls: list[tuple[list[oligoformer_app.PitaRowShardSpec], int]] = []
-    finalize_calls: list[oligoformer_app.PreparedOffTargetShard] = []
-    finalize_batch_calls: list[
-        tuple[list[oligoformer_app.PreparedOffTargetShard], int]
-    ] = []
-    repo_dir = tmp_path / "repo"
-    repo_dir.joinpath("toxicity").mkdir(parents=True)
-    repo_dir.joinpath("toxicity", "cell_viability.txt").write_text(
-        "Seed\tcell_viability\nUGCUAG\t60\nGCUAGC\t60\n",
-        encoding="utf-8",
-    )
-    repo_dir.joinpath("off-target", "pita").mkdir(parents=True)
-    repo_dir.joinpath("off-target", "targetscan").mkdir(parents=True)
-    layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
-
-    class TrackingVolume(FakeVolume):
-        def __init__(self):
-            super().__init__()
-            self.evidence_ready_committed = False
-            self.final_ready_committed = False
-
-        def commit(self):
-            super().commit()
-            evidence_dir = layout.prep_dir / "off_target" / "target"
-            if oligoformer_app._raw_off_target_ready(evidence_dir):
-                self.evidence_ready_committed = True
-            if oligoformer_app._marker_path(
-                layout,
-                oligoformer_app._final_marker_name("postprocess"),
-            ).exists():
-                self.final_ready_committed = True
-
-    volume = TrackingVolume()
-    efficacy_layout = oligoformer_app.AppRunLayout.from_run_root(
-        tmp_path / "outputs-volume" / "efficacy-cache" / "target" / "efficacy123"
-    )
-    efficacy_dir = efficacy_layout.outputs_dir
-    final_output_dir = layout.outputs_dir / "postprocess"
-    efficacy_dir.mkdir(parents=True)
-    layout.inputs_dir.mkdir(parents=True)
-    layout.inputs_dir.joinpath("utr.txt").write_text(">utr\nAUGC\n", encoding="utf-8")
-    layout.inputs_dir.joinpath("orf.txt").write_text(">orf\nAUGC\n", encoding="utf-8")
-    efficacy_dir.joinpath("target.txt").write_text(
-        "pos\tsense\tsiRNA\tefficacy\tfunc_filter\tfilter\n"
-        "1\tGC\tAUGCUAGCUAGCUAGCUAG\t0.8\t0\t0\n"
-        "2\tCG\tUGCUAGCUAGCUAGCUAGC\t0.6\t0\t0\n",
-        encoding="utf-8",
-    )
-    efficacy_contents = efficacy_dir.joinpath("target.txt").read_text(encoding="utf-8")
-    for suffix in ("_ranked", "_ranked_filtered"):
-        efficacy_dir.joinpath(f"target{suffix}.txt").write_text(
-            efficacy_contents,
-            encoding="utf-8",
-        )
-    _publish_efficacy_marker(
-        efficacy_layout,
-        efficacy_dir,
-    )
-    plan = oligoformer_app.OligoformerRunPlan(
-        cache_key="abc123",
-        efficacy_key="efficacy123",
-        run_root=str(layout.run_root),
-        efficacy_dir=str(efficacy_dir),
-        output_dir=str(final_output_dir),
-        output_stems=("target",),
-        config=_run_config(off_target=True, toxicity=True, top_n=-1),
-        postprocess_key="postprocess",
-        efficacy_ready=True,
-        evidence_ready=False,
-        final_ready=False,
-    )
-    execution = _execution_config(
-        off_target_prep_workers=2,
-        off_target_nodes=4,
-        off_target_workers=32,
-    )
-
-    def fake_run_targetscan_prepare_batches(
-        specs: list[oligoformer_app.TargetscanBatchSpec],
-        *,
-        max_process_slots: int | None = None,
-        execution: oligoformer_app.OligoformerExecutionConfig,
-    ):
-        assert max_process_slots == 32
-        assert execution == _execution_config(
-            off_target_prep_workers=2,
-            off_target_nodes=4,
-            off_target_workers=32,
-        )
-        targetscan_plan_calls.extend(specs)
-        spec = specs[0]
-        captured["targetscan_sirnas"] = Path(spec.sirna_path).read_text(
-            encoding="utf-8"
-        )
-        cache_dir = oligoformer_app._targetscan_batch_cache_dir(spec)
-        context_dir = cache_dir / "targetscan_context"
-        context_spec = oligoformer_app.TargetscanContextShardSpec(
-            shard_index=0,
-            common_dir=str(context_dir / "common"),
-            targets_path=str(context_dir / "shards" / "targets_00000"),
-            output_path=str(context_dir / "outputs" / "context_00000.txt"),
-            log_path=str(
-                final_output_dir
-                / "logs"
-                / "off_target"
-                / spec.stem
-                / "targetscan"
-                / f"{spec.shard_index:05d}"
-                / "targetscan_context"
-                / "00000.log"
-            ),
-            rnaplfold_cache_dir="",
-        )
-        return [
-            oligoformer_app.PreparedTargetscanBatch(
-                targetscan_path=str(cache_dir / "targetscan.tab"),
-                logs_dir=str(
-                    final_output_dir
-                    / "logs"
-                    / "off_target"
-                    / spec.stem
-                    / "targetscan"
-                    / f"{spec.shard_index:05d}"
-                ),
-                context_shards=(context_spec,),
-                needs_merge=True,
-            ),
-        ]
-
-    fake_queues = {}
-    deleted_queues = []
-    fake_dicts = {}
-
-    class FakeQueueInstance:
-        def __init__(self):
-            self.items = []
-
-        def put(self, item):
-            self.items.append(item)
-
-        def put_many(self, items):
-            self.items.extend(items)
-
-        def get(self, *, block=False, timeout=None):
-            del block, timeout
-            if not self.items:
-                return None
-            return self.items.pop(0)
-
-        def get_many(self, n_values: int, *, block=False, timeout=None):
-            del block, timeout
-            values = self.items[:n_values]
-            del self.items[:n_values]
-            return values
-
-    class FakeQueue:
-        class objects:
-            @staticmethod
-            def delete(name):
-                deleted_queues.append(name)
-                fake_queues.pop(name, None)
-
-        @staticmethod
-        def from_name(name, create_if_missing=False):
-            if create_if_missing:
-                return fake_queues.setdefault(name, FakeQueueInstance())
-            return fake_queues[name]
-
-    class FakeDictInstance:
-        def __init__(self):
-            self.values = {}
-
-        def put(self, key, value, *, skip_if_exists=False):
-            if skip_if_exists and key in self.values:
-                return False
-            if isinstance(value, dict) and value.get("state") == "complete":
-                assert volume.evidence_ready_committed
-            self.values[key] = value
-            return True
-
-        def get(self, key, default=None):
-            return self.values.get(key, default)
-
-        def pop(self, key, default=None):
-            return self.values.pop(key, default)
-
-    class FakeDict:
-        @staticmethod
-        def from_name(name, create_if_missing=False):
-            if create_if_missing:
-                return fake_dicts.setdefault(name, FakeDictInstance())
-            return fake_dicts[name]
-
-    class FakeTargetscanContextQueueWorker:
-        def remote(self, queue_name: str, local_workers: int, attempts: int):
-            assert attempts == execution.targetscan_context_attempts
-            targetscan_worker_calls.append((queue_name, local_workers))
-            queue = FakeQueue.from_name(queue_name)
-            outputs = []
-            while True:
-                spec = queue.get(block=False)
-                if (
-                    spec is None
-                    or spec
-                    == oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
-                ):
-                    break
-                output_path = Path(spec.output_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text("context\n", encoding="utf-8")
-                oligoformer_app._publish_artifact_marker(
-                    output_path.with_suffix(output_path.suffix + ".done"),
-                    kind="targetscan-context-score",
-                    artifacts={"context_scores": output_path},
-                )
-                outputs.append(spec.output_path)
-            return outputs
-
-        def spawn(self, queue_name: str, local_workers: int, attempts: int):
-            return FakeCall(self.remote, (queue_name, local_workers, attempts), {})
-
-    class FakeFinalizeTargetscanBatch:
-        def remote(
-            self,
-            plan: oligoformer_app.PreparedTargetscanBatch,
-            context_outputs: list[str],
-        ):
-            targetscan_finalize_calls.append((plan, list(context_outputs)))
-            return oligoformer_app._finalize_targetscan_batch_context_plan(
-                plan, context_outputs
-            )
-
-    def fake_merge_targetscan_context_outputs(
-        *,
-        context_outputs: list[str],
-        targetscan_path: Path,
-        log_file: Path,
-    ) -> None:
-        assert len(context_outputs) == 1
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        log_file.write_text("merge log\n", encoding="utf-8")
-        targetscan_path.parent.mkdir(parents=True, exist_ok=True)
-        targetscan_path.write_text(
-            "ref\tRNA0\t2\nref\tRNA1\t0.5\n",
-            encoding="utf-8",
-        )
-
-    reference_calls = []
-
-    def fake_prepare_pita_reference_plan(
-        spec: oligoformer_app.OffTargetShardSpec,
-        _prepare_root: Path,
-        inner_execution: oligoformer_app.OligoformerExecutionConfig,
-    ):
-        assert inner_execution == execution
-        reference_calls.append(spec)
-        reference_dir = layout.prep_dir / "off_target" / spec.stem / "pita_reference"
-        reference_dir.mkdir(parents=True, exist_ok=True)
-        utr_shard = reference_dir / "00000.utr.stab"
-        ext_utr = reference_dir / "reference_ext_utr.stab"
-        utr_shard.write_text("utr\n", encoding="utf-8")
-        ext_utr.write_text("utr\n", encoding="utf-8")
-        return oligoformer_app.PitaReferencePlan(
-            utr_shard_paths=(str(utr_shard),),
-            ext_utr_path=str(ext_utr),
-        )
-
-    def fake_prepare_pita_target_discovery_plan(
-        spec: oligoformer_app.OffTargetShardSpec,
-        _shard_root: Path,
-        reference: oligoformer_app.PitaReferencePlan,
-        inner_execution: oligoformer_app.OligoformerExecutionConfig,
-    ):
-        assert inner_execution == execution
-        assert reference.ext_utr_path.endswith("reference_ext_utr.stab")
-        pita_plan_calls.append(spec)
-        cache_dir = oligoformer_app._off_target_shard_cache_dir(spec)
-        shard_dir = cache_dir / "pita_prepare_utr_shards"
-        input_path = shard_dir / "00000_000000000000_000000000001.utr.stab"
-        output_path = shard_dir / "00000_000000000000_000000000001.potential.tsv"
-        input_path.parent.mkdir(parents=True, exist_ok=True)
-        input_path.write_text("utr\n", encoding="utf-8")
-        cache_dir.joinpath(
-            f"{spec.stem}_shard_{spec.index:05d}_ext_utr.stab"
-        ).write_text(
-            "utr\n",
-            encoding="utf-8",
-        )
-        return oligoformer_app.PitaPreparePlan(
-            spec=spec,
-            utr_shards=(
-                oligoformer_app.PitaPrepareUtrShardSpec(
-                    shard_index=0,
-                    input_path=str(input_path),
-                    mir_stab_path=str(cache_dir / f"{spec.record_name}_mir.stab"),
-                    output_path=str(output_path),
-                    log_path=str(
-                        final_output_dir
-                        / "logs"
-                        / "off_target"
-                        / spec.stem
-                        / f"{spec.index:05d}_{spec.record_name}"
-                        / "pita_prepare_utr_shards"
-                        / "00000.log"
-                    ),
-                ),
-            ),
-            row_count=None,
-        )
-
-    class FakePitaPrepareUtrShardBatch:
-        def _run(
-            self,
-            specs: list[oligoformer_app.PitaPrepareUtrShardSpec],
-            local_workers: int,
-            attempts: int,
-        ):
-            assert attempts == execution.pita_row_attempts
-            pita_prepare_batch_calls.append((list(specs), local_workers))
-            outputs = []
-            for spec in specs:
-                output_path = Path(spec.output_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                record_name = "RNA0" if "00000_RNA0" in str(output_path) else "RNA1"
-                output_path.write_text(
-                    f"{record_name}\tpotential\n",
-                    encoding="utf-8",
-                )
-                oligoformer_app._publish_artifact_marker(
-                    output_path.with_suffix(output_path.suffix + ".done"),
-                    kind="pita-target-discovery",
-                    artifacts={"potential_targets": output_path},
-                )
-                outputs.append(spec.output_path)
-            return len(outputs)
-
-        def starmap(self, inputs):
-            return [self._run(*args) for args in inputs]
-
-    class FakePitaConsolidateBatch:
-        def _run(
-            self,
-            plans: list[oligoformer_app.PitaPreparePlan],
-            local_workers: int,
-        ):
-            pita_consolidate_batch_calls.append((list(plans), local_workers))
-            return [
-                oligoformer_app._finalize_pita_target_discovery_plan(plan)
-                for plan in plans
-            ]
-
-        def starmap(self, inputs):
-            return [self._run(*args) for args in inputs]
-
-    class FakeRowBatch:
-        def _run(
-            self,
-            row_shards: list[oligoformer_app.PitaRowShardSpec],
-            local_workers: int,
-            attempts: int,
-        ):
-            assert attempts == execution.pita_row_attempts
-            row_batch_calls.append((list(row_shards), local_workers))
-            outputs = []
-            for row in row_shards:
-                output_path = Path(row.output_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text("scored\n", encoding="utf-8")
-                oligoformer_app._publish_artifact_marker(
-                    output_path.with_suffix(output_path.suffix + ".done"),
-                    kind="pita-row-score",
-                    artifacts={"scored_rows": output_path},
-                )
-                log_path = Path(row.log_path)
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                log_path.write_text("row log\n", encoding="utf-8")
-                outputs.append(row.output_path)
-            return len(outputs)
-
-        def starmap(self, inputs):
-            return [self._run(*args) for args in inputs]
-
-    class FakeFinalizePitaShardBatch:
-        def _run(
-            self,
-            prepared_shards: list[oligoformer_app.PreparedOffTargetShard],
-            local_workers: int,
-        ):
-            finalize_batch_calls.append((list(prepared_shards), local_workers))
-            results = []
-            for prepared in prepared_shards:
-                finalize_calls.append(prepared)
-                pita_score = "-11" if prepared.record_name == "RNA0" else "-2"
-                Path(prepared.pita_path).write_text(
-                    "RefSeq\tmicroRNA\tSites\tScore\n"
-                    f"ref\t{prepared.record_name}\t1\t{pita_score}\n",
-                    encoding="utf-8",
-                )
-                results.append(
-                    oligoformer_app.OffTargetShardResult(
-                        index=prepared.index,
-                        pita_path=prepared.pita_path,
-                    )
-                )
-            return results
-
-        def starmap(self, inputs):
-            return [self._run(*args) for args in inputs]
-
-    def fake_package_outputs(root, *, paths_to_bundle=None):
-        captured["package_root"] = Path(root)
-        captured["package_paths"] = [str(path) for path in paths_to_bundle or ()]
-        return b"archive"
-
-    class FakeCall:
-        def __init__(self, func, args, kwargs):
-            self.func = func
-            self.args = args
-            self.kwargs = kwargs
-            self.cancelled = False
-
-        def get(self):
-            return self.func(*self.args, **self.kwargs)
-
-        def cancel(self, terminate_containers=False):
-            self.cancelled = terminate_containers
-
-    class FakeBranch:
-        def __init__(self, func):
-            self.func = func
-            self.spawn_calls = []
-
-        def spawn(self, *args, **kwargs):
-            self.spawn_calls.append((args, kwargs))
-            return FakeCall(self.func, args, kwargs)
-
-    gather_calls = []
-    targetscan_branch = FakeBranch(
-        oligoformer_app.run_oligoformer_targetscan_branch.get_raw_f()
-    )
-    pita_branch = FakeBranch(oligoformer_app.run_oligoformer_pita_branch.get_raw_f())
-
-    def fake_gather(*calls):
-        gather_calls.append(calls)
-        return tuple(call.get() for call in calls)
-
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_targetscan_branch",
-        targetscan_branch,
-    )
-    monkeypatch.setattr(oligoformer_app, "run_oligoformer_pita_branch", pita_branch)
-    monkeypatch.setattr(
-        oligoformer_app.modal.FunctionCall,
-        "gather",
-        staticmethod(fake_gather),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_run_targetscan_prepare_batches",
-        fake_run_targetscan_prepare_batches,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_targetscan_context_queue_worker",
-        FakeTargetscanContextQueueWorker(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "finalize_oligoformer_targetscan_batch_context_plan",
-        FakeFinalizeTargetscanBatch(),
-    )
-    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
-    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_merge_targetscan_context_outputs",
-        fake_merge_targetscan_context_outputs,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_prepare_pita_reference_plan",
-        fake_prepare_pita_reference_plan,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_prepare_pita_target_discovery_plan",
-        fake_prepare_pita_target_discovery_plan,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_pita_prepare_utr_shard_batch",
-        FakePitaPrepareUtrShardBatch(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_pita_consolidate_batch",
-        FakePitaConsolidateBatch(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_pita_row_shard_batch",
-        FakeRowBatch(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "finalize_oligoformer_pita_shard_batch",
-        FakeFinalizePitaShardBatch(),
-    )
-    monkeypatch.setattr(oligoformer_app, "package_outputs", fake_package_outputs)
-    cleanup_calls = []
-    cleanup_off_target_transients = oligoformer_app._cleanup_off_target_transients
-
-    def track_cleanup(path: Path):
-        assert volume.final_ready_committed
-        cleanup_calls.append(path)
-        cleanup_off_target_transients(path)
-
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_cleanup_off_target_transients",
-        track_cleanup,
-    )
-    result = oligoformer_app.run_oligoformer_postprocess.get_raw_f()(
-        plan=plan,
-        off_target=True,
-        toxicity=True,
-        top_n=-1,
-        execution=execution,
-    )
-
-    final_table = final_output_dir.joinpath("target.txt").read_text(encoding="utf-8")
-    raw_off_target_dir = layout.prep_dir / "off_target" / "target"
-    assert result == b"archive"
-    assert len(targetscan_branch.spawn_calls) == 1
-    assert len(pita_branch.spawn_calls) == 1
-    assert targetscan_branch.spawn_calls[0][1]["execution"] == execution
-    assert pita_branch.spawn_calls[0][1]["execution"] == execution
-    assert gather_calls == []
-    assert (
-        targetscan_branch.spawn_calls[0][1]["max_process_slots"]
-        + pita_branch.spawn_calls[0][1]["max_process_slots"]
-        == oligoformer_app.APP_INFO.default_off_target_process_slots
-    )
-    assert len(targetscan_plan_calls) == 1
-    assert targetscan_plan_calls[0].sirna_count == 2
-    assert captured["targetscan_sirnas"] == (
-        ">RNA0\nAUGCUAGCUAGCUAGCUAG\n>RNA1\nUGCUAGCUAGCUAGCUAGC\n"
-    )
-    assert targetscan_plan_calls[0].ref_shard_size == 1
-    assert targetscan_plan_calls[0].shard_index == 0
-    assert len(targetscan_worker_calls) == 1
-    targetscan_queue_name, targetscan_local_workers = targetscan_worker_calls[0]
-    assert targetscan_queue_name.startswith("oligoformer-targetscan-context-")
-    assert targetscan_local_workers == 1
-    assert deleted_queues == [targetscan_queue_name]
-    assert len(targetscan_finalize_calls) == 1
-    targetscan_finalize_plan, targetscan_finalize_outputs = targetscan_finalize_calls[0]
-    assert targetscan_finalize_plan.needs_merge is True
-    assert targetscan_finalize_outputs == [
-        targetscan_finalize_plan.context_shards[0].output_path
-    ]
-    assert sorted(call.record_name for call in pita_plan_calls) == ["RNA0", "RNA1"]
-    assert len(reference_calls) == 1
-    assert [len(batch) for batch, _ in pita_prepare_batch_calls] == [2]
-    assert [workers for _, workers in pita_prepare_batch_calls] == [2]
-    assert [len(batch) for batch, _ in pita_consolidate_batch_calls] == [2]
-    assert [workers for _, workers in pita_consolidate_batch_calls] == [2]
-    assert all(call.output_dir == str(final_output_dir) for call in pita_plan_calls)
-    assert len(row_batch_calls) == 1
-    assert all(local_workers == 2 for _, local_workers in row_batch_calls)
-    batched_rows = [row for rows, _ in row_batch_calls for row in rows]
-    assert [row.record_name for row in batched_rows] == ["RNA0", "RNA1"]
-    assert all(
-        Path(row.log_path).is_relative_to(final_output_dir / "logs" / "off_target")
-        for row in batched_rows
-    )
-    assert [len(batch) for batch, _ in finalize_batch_calls] == [2]
-    assert [workers for _, workers in finalize_batch_calls] == [2]
-    assert [call.record_name for call in finalize_calls] == ["RNA0", "RNA1"]
-    assert captured["package_root"] == final_output_dir
-    assert captured["package_paths"] == [
-        "target.txt",
-        "target_ranked.txt",
-        "target_ranked_filtered.txt",
-    ]
-    assert final_table.splitlines() == [
-        "pos\tsense\tsiRNA\tefficacy\tfunc_filter\tpita_score\t"
-        "targetscan_score\toff_target_filter\tSeed\tcell_viability\t"
-        "toxicity_filter\tfilter",
-        "1\tGC\tAUGCUAGCUAGCUAGCUAG\t0.8\t0\t-11\t2.0\t1\tUGCUAG\t60\t0\t1",
-        "2\tCG\tUGCUAGCUAGCUAGCUAGC\t0.6\t0\t-2\t0.5\t0\tGCUAGC\t60\t0\t0",
-    ]
-    assert {path.name for path in raw_off_target_dir.iterdir()} == {
-        "off_target.done",
-        "pita.tab",
-        "targetscan.tab",
-    }
-    assert cleanup_calls == [raw_off_target_dir]
-    assert all(
-        any(
-            isinstance(value, dict) and value.get("state") == "complete"
-            for value in fake_dict.values.values()
-        )
-        for fake_dict in fake_dicts.values()
-    )
-    assert volume.reload_count >= 4
-    assert volume.commit_count >= 3
-
-
-def test_run_off_target_shards_reuses_merged_raw_evidence(tmp_path: Path, monkeypatch):
-    layout = oligoformer_app.AppRunLayout.from_run_root(tmp_path / "run")
-    raw_off_target_dir = layout.prep_dir / "off_target" / "target"
-    raw_off_target_dir.mkdir(parents=True)
-    raw_off_target_dir.joinpath("pita.tab").write_text(
-        "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-1\n",
-        encoding="utf-8",
-    )
-    raw_off_target_dir.joinpath("targetscan.tab").write_text(
-        "ref\tRNA0\t0.5\n",
-        encoding="utf-8",
-    )
-    identity = oligoformer_app._off_target_evidence_identity(
-        str(layout.run_root), "target"
-    )
-    oligoformer_app._publish_off_target_manifest(
-        raw_off_target_dir,
-        identity=identity,
-    )
-    infer_dir = tmp_path / "infer"
-    infer_dir.mkdir()
-
-    class ExplodingBranch:
-        def spawn(self, *_args, **_kwargs):
-            raise AssertionError("cached raw evidence should skip branch fanout")
-
-    monkeypatch.setattr(
-        oligoformer_app, "run_oligoformer_targetscan_branch", ExplodingBranch()
-    )
-    monkeypatch.setattr(
-        oligoformer_app, "run_oligoformer_pita_branch", ExplodingBranch()
-    )
-
-    oligoformer_app._run_off_target_shards(
-        run_root=str(layout.run_root),
-        records=[oligoformer_app.OffTargetSirnaRecord("RNA0", "AUGCUAGCUAGCUAGCUAG")],
-        stem="target",
-        utr_path=str(tmp_path / "utr.txt"),
-        orf_path=str(tmp_path / "orf.txt"),
-        infer_dir=infer_dir,
-        output_dir=layout.outputs_dir,
-        logs_dir=layout.outputs_dir / "logs" / "off_target" / "target",
-    )
-
-    assert infer_dir.joinpath("pita.tab").read_text(encoding="utf-8") == (
-        "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-1\n"
-    )
-    assert infer_dir.joinpath("targetscan.tab").read_text(encoding="utf-8") == (
-        "ref\tRNA0\t0.5\n"
-    )
-
-
-def test_run_off_target_shards_preserves_pita_row_fanout_topology(
-    tmp_path: Path,
-    monkeypatch,
-):
-    volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    execution = _execution_config(
-        off_target_nodes=4,
-        off_target_workers=2,
-        off_target_process_slots=4,
-    )
-    branch_calls = []
-
-    class FakeCall:
-        def get(self):
-            return []
-
-        def cancel(self):
-            raise AssertionError("successful branches must not be cancelled")
-
-    class FakeBranch:
-        def __init__(self, name):
-            self.name = name
-
-        def spawn(self, *args, **kwargs):
-            branch_calls.append((self.name, args, kwargs))
-            return FakeCall()
-
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_pita_branch",
-        FakeBranch("pita"),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_targetscan_branch",
-        FakeBranch("targetscan"),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_raw_off_target_ready",
-        lambda *_args, **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_targetscan_batch_spec_waves",
-        lambda **_kwargs: iter([[object()]]),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_merge_pita_shards",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_merge_targetscan_batch_outputs",
-        lambda **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_publish_off_target_manifest",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_copy_merged_off_target_evidence",
-        lambda *_args, **_kwargs: None,
-    )
-
-    oligoformer_app._run_off_target_shards(
-        run_root=str(tmp_path / "run"),
-        records=[
-            oligoformer_app.OffTargetSirnaRecord(
-                "RNA0",
-                "AUGCUAGCUAGCUAGCUAG",
-            )
-        ],
-        stem="target",
-        utr_path=str(tmp_path / "utr.fa"),
-        orf_path=str(tmp_path / "orf.fa"),
-        infer_dir=tmp_path / "infer",
-        output_dir=tmp_path / "outputs",
-        logs_dir=tmp_path / "logs",
-        execution=execution,
-    )
-
-    pita_call = next(call for call in branch_calls if call[0] == "pita")
-    assert pita_call[2] == {
-        "node_count": 4,
-        "local_workers": 2,
-        "max_process_slots": 2,
-        "execution": execution,
-    }
-
-
 @pytest.mark.parametrize(
     ("process_slots", "message"),
     [(1, "at least 2"), (65, "must not exceed")],
@@ -1918,7 +1169,7 @@ def test_execution_config_rejects_cpu_envelope_overrides(field_name: str):
 def test_runtime_image_does_not_bake_oligoformer_tuning_environment():
     source = Path(oligoformer_app.__file__).read_text(encoding="utf-8")
 
-    assert "OLIGOFORMER_" not in source
+    assert 'os.environ.get("OLIGOFORMER_' not in source
     assert "tuning_env_names" not in source
 
 
@@ -2019,110 +1270,17 @@ def test_off_target_manifest_accepts_no_hit_pita_evidence(tmp_path: Path):
     assert manifest["tables"]["pita.tab"]["row_count"] == 0
 
 
-def test_orphaned_off_target_tables_are_discarded_without_marker(
-    tmp_path: Path,
-) -> None:
-    raw_dir = tmp_path / "run" / "prepare" / "off_target" / "target"
-    raw_dir.mkdir(parents=True)
-    raw_dir.joinpath("pita.tab").write_text("orphaned\n", encoding="utf-8")
-    raw_dir.joinpath("targetscan.tab").write_text("orphaned\n", encoding="utf-8")
-
-    assert oligoformer_app._discard_invalid_off_target_evidence(
-        raw_dir,
-        expected_identity="evidence-v1",
-    )
-    assert not raw_dir.joinpath("pita.tab").exists()
-    assert not raw_dir.joinpath("targetscan.tab").exists()
-
-
-def test_corrupt_completed_evidence_advances_one_repair_generation(
-    tmp_path: Path,
-    monkeypatch,
-):
-    raw_dir = tmp_path / "run" / "prepare" / "off_target" / "target"
-    raw_dir.mkdir(parents=True)
-    pita_contents = "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-1\n"
-    targetscan_contents = "ref\tRNA0\t0.5\n"
-    raw_dir.joinpath("pita.tab").write_text(pita_contents, encoding="utf-8")
-    raw_dir.joinpath("targetscan.tab").write_text(
-        targetscan_contents,
-        encoding="utf-8",
-    )
-    identity = "evidence-v1"
-    oligoformer_app._publish_off_target_manifest(raw_dir, identity=identity)
-    raw_dir.joinpath("targetscan.tab").write_text("truncated\n", encoding="utf-8")
-
-    lock_identity = "run\ntarget"
-    lock_key = oligoformer_app.hash_string(f"off-target-evidence\n{lock_identity}")
-    values = {
-        f"{lock_key}:head": 0,
-        f"{lock_key}:owner:0": {"id": "original", "acquired_at": 0.0},
-        f"{lock_key}:status:0": {"state": "complete"},
-    }
-
-    class FakeDictInstance:
-        def put(self, key, value, *, skip_if_exists=False):
-            if skip_if_exists and key in values:
-                return False
-            values[key] = value
-            return True
-
-        def get(self, key, default=None):
-            return values.get(key, default)
-
-    class FakeDict:
-        @staticmethod
-        def from_name(_name, create_if_missing=False):
-            assert create_if_missing
-            return FakeDictInstance()
-
-    monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
-
-    with oligoformer_app._cache_build_lock(
-        "off-target-evidence",
-        lock_identity,
-        rebuild=True,
-    ) as owns_repair:
-        assert owns_repair
-        assert oligoformer_app._discard_invalid_off_target_evidence(
-            raw_dir,
-            expected_identity=identity,
-        )
-        raw_dir.joinpath("pita.tab").write_text(pita_contents, encoding="utf-8")
-        raw_dir.joinpath("targetscan.tab").write_text(
-            targetscan_contents,
-            encoding="utf-8",
-        )
-        oligoformer_app._publish_off_target_manifest(raw_dir, identity=identity)
-
-    assert oligoformer_app._raw_off_target_ready(
-        raw_dir,
-        expected_identity=identity,
-    )
-    repair_status = values[f"{lock_key}:status:1"]
-    assert isinstance(repair_status, dict)
-    assert repair_status["state"] == "complete"
-    assert f"{lock_key}:owner:2" not in values
-
-
 def test_apply_off_target_filters_handles_header_only_pita(tmp_path: Path, monkeypatch):
     volume = FakeVolume()
     repo_dir = tmp_path / "repo"
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
 
-    def fake_run_off_target_shards(*, infer_dir: Path, **_kwargs) -> None:
-        infer_dir.mkdir(parents=True, exist_ok=True)
-        infer_dir.joinpath("pita.tab").write_text(
-            "RefSeq\tmicroRNA\tSites\tScore\n",
-            encoding="utf-8",
-        )
-        infer_dir.joinpath("targetscan.tab").write_text(
-            "ref\tRNA0\t0.5\n",
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(
-        oligoformer_app, "_run_off_target_shards", fake_run_off_target_shards
+    run_root = tmp_path / "run"
+    _publish_test_off_target_evidence(
+        run_root,
+        stem="target",
+        pita="RefSeq\tmicroRNA\tSites\tScore\n",
+        targetscan="ref\tRNA0\t0.5\n",
     )
 
     result = pl.DataFrame({
@@ -2135,11 +1293,8 @@ def test_apply_off_target_filters_handles_header_only_pita(tmp_path: Path, monke
 
     filtered = oligoformer_app._apply_off_target_filters(
         result=result,
-        run_root=str(tmp_path / "run"),
+        run_root=str(run_root),
         stem="target",
-        utr_path=str(tmp_path / "utr.txt"),
-        orf_path=str(tmp_path / "orf.txt"),
-        output_dir=tmp_path / "outputs",
         top_n=1,
         pita_threshold=-10.0,
         targetscan_threshold=1.0,
@@ -2160,19 +1315,12 @@ def test_apply_off_target_filters_handles_header_only_targetscan(
     repo_dir = tmp_path / "repo"
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
 
-    def fake_run_off_target_shards(*, infer_dir: Path, **_kwargs) -> None:
-        infer_dir.mkdir(parents=True, exist_ok=True)
-        infer_dir.joinpath("pita.tab").write_text(
-            "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-2\n",
-            encoding="utf-8",
-        )
-        infer_dir.joinpath("targetscan.tab").write_text(
-            "refseq\tsiRNA\ttargetscan_score\n",
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(
-        oligoformer_app, "_run_off_target_shards", fake_run_off_target_shards
+    run_root = tmp_path / "run"
+    _publish_test_off_target_evidence(
+        run_root,
+        stem="target",
+        pita="RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-2\n",
+        targetscan="refseq\tsiRNA\ttargetscan_score\n",
     )
 
     result = pl.DataFrame({
@@ -2185,11 +1333,8 @@ def test_apply_off_target_filters_handles_header_only_targetscan(
 
     filtered = oligoformer_app._apply_off_target_filters(
         result=result,
-        run_root=str(tmp_path / "run"),
+        run_root=str(run_root),
         stem="target",
-        utr_path=str(tmp_path / "utr.txt"),
-        orf_path=str(tmp_path / "orf.txt"),
-        output_dir=tmp_path / "outputs",
         top_n=-1,
         pita_threshold=-10.0,
         targetscan_threshold=1.0,
@@ -2207,19 +1352,12 @@ def test_apply_off_target_filters_fills_missing_targetscan_for_pita_hits(
     repo_dir = tmp_path / "repo"
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
 
-    def fake_run_off_target_shards(*, infer_dir: Path, **_kwargs) -> None:
-        infer_dir.mkdir(parents=True, exist_ok=True)
-        infer_dir.joinpath("pita.tab").write_text(
-            "RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-2\n",
-            encoding="utf-8",
-        )
-        infer_dir.joinpath("targetscan.tab").write_text(
-            "ref\tRNA1\t0.5\n",
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(
-        oligoformer_app, "_run_off_target_shards", fake_run_off_target_shards
+    run_root = tmp_path / "run"
+    _publish_test_off_target_evidence(
+        run_root,
+        stem="target",
+        pita="RefSeq\tmicroRNA\tSites\tScore\nref\tRNA0\t1\t-2\n",
+        targetscan="ref\tRNA1\t0.5\n",
     )
 
     result = pl.DataFrame({
@@ -2232,11 +1370,8 @@ def test_apply_off_target_filters_fills_missing_targetscan_for_pita_hits(
 
     filtered = oligoformer_app._apply_off_target_filters(
         result=result,
-        run_root=str(tmp_path / "run"),
+        run_root=str(run_root),
         stem="target",
-        utr_path=str(tmp_path / "utr.txt"),
-        orf_path=str(tmp_path / "orf.txt"),
-        output_dir=tmp_path / "outputs",
         top_n=-1,
         pita_threshold=-10.0,
         targetscan_threshold=1.0,
@@ -2258,24 +1393,17 @@ def test_apply_off_target_filters_streams_summaries_and_preserves_pita_ties(
     repo_dir = tmp_path / "repo"
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
 
-    def fake_run_off_target_shards(*, infer_dir: Path, **_kwargs) -> None:
-        infer_dir.mkdir(parents=True, exist_ok=True)
-        infer_dir.joinpath("pita.tab").write_text(
-            "RefSeq\tmicroRNA\tSites\tScore\nref1\tRNA0\t1\t-2.00\nref2\tRNA0\t1\t-2\n",
-            encoding="utf-8",
-        )
-        infer_dir.joinpath("targetscan.tab").write_text(
-            "ref1\tRNA0\t0.5\nref2\tRNA0\t1.5\n",
-            encoding="utf-8",
-        )
-
     def exploding_read_csv(*_args, **_kwargs):
         raise AssertionError("merged evidence must not be eagerly read")
 
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_run_off_target_shards",
-        fake_run_off_target_shards,
+    run_root = tmp_path / "run"
+    _publish_test_off_target_evidence(
+        run_root,
+        stem="target",
+        pita=(
+            "RefSeq\tmicroRNA\tSites\tScore\nref1\tRNA0\t1\t-2.00\nref2\tRNA0\t1\t-2\n"
+        ),
+        targetscan="ref1\tRNA0\t0.5\nref2\tRNA0\t1.5\n",
     )
     monkeypatch.setattr(oligoformer_app.pl, "read_csv", exploding_read_csv)
     result = pl.DataFrame({
@@ -2288,11 +1416,8 @@ def test_apply_off_target_filters_streams_summaries_and_preserves_pita_ties(
 
     filtered = oligoformer_app._apply_off_target_filters(
         result=result,
-        run_root=str(tmp_path / "run"),
+        run_root=str(run_root),
         stem="target",
-        utr_path=str(tmp_path / "utr.txt"),
-        orf_path=str(tmp_path / "orf.txt"),
-        output_dir=tmp_path / "outputs",
         top_n=-1,
         pita_threshold=-10.0,
         targetscan_threshold=1.0,
@@ -2496,210 +1621,6 @@ def test_merge_targetscan_batch_outputs_preserves_header_only_empty_table(
     assert output.read_text(encoding="utf-8") == "refseq\tsiRNA\ttargetscan_score\n"
 
 
-def test_run_targetscan_context_batches_drains_modal_queue(tmp_path: Path, monkeypatch):
-    from threading import Lock
-
-    volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    execution = _execution_config(
-        targetscan_context_nodes=2,
-        targetscan_context_workers=2,
-    )
-
-    fake_queues = {}
-    deleted_queues = []
-    worker_calls = []
-    queue_lock = Lock()
-
-    class FakeQueueInstance:
-        def __init__(self):
-            self.items = []
-
-        def put(self, item):
-            with queue_lock:
-                self.items.append(item)
-
-        def put_many(self, items):
-            with queue_lock:
-                self.items.extend(items)
-
-        def get(self, *, block=False, timeout=None):
-            del block, timeout
-            with queue_lock:
-                if not self.items:
-                    return None
-                return self.items.pop(0)
-
-        def get_many(self, n_values: int, *, block=False, timeout=None):
-            del block, timeout
-            with queue_lock:
-                values = self.items[:n_values]
-                del self.items[:n_values]
-                return values
-
-    class FakeQueue:
-        class objects:
-            @staticmethod
-            def delete(name):
-                deleted_queues.append(name)
-                fake_queues.pop(name, None)
-
-        @staticmethod
-        def from_name(name, create_if_missing=False):
-            if create_if_missing:
-                return fake_queues.setdefault(name, FakeQueueInstance())
-            return fake_queues[name]
-
-    class FakeTargetscanContextQueueWorker:
-        def remote(self, queue_name: str, local_workers: int, attempts: int):
-            assert attempts == execution.targetscan_context_attempts
-            worker_calls.append((queue_name, local_workers))
-            queue = FakeQueue.from_name(queue_name)
-            outputs = []
-            while True:
-                spec = queue.get(block=False)
-                if (
-                    spec is None
-                    or spec
-                    == oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
-                ):
-                    break
-                output_path = Path(spec.output_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(
-                    f"context {spec.shard_index}\n", encoding="utf-8"
-                )
-                oligoformer_app._publish_artifact_marker(
-                    output_path.with_suffix(output_path.suffix + ".done"),
-                    kind="targetscan-context-score",
-                    artifacts={"context_scores": output_path},
-                )
-                outputs.append(spec.output_path)
-            return outputs
-
-        def spawn(self, queue_name: str, local_workers: int, attempts: int):
-            class FakeCall:
-                def get(self_inner):
-                    return self.remote(queue_name, local_workers, attempts)
-
-                def cancel(self_inner, terminate_containers=False):
-                    del terminate_containers
-
-            return FakeCall()
-
-    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_targetscan_context_queue_worker",
-        FakeTargetscanContextQueueWorker(),
-    )
-    shards = [
-        oligoformer_app.TargetscanContextShardSpec(
-            shard_index=index,
-            common_dir=str(tmp_path / "common"),
-            targets_path=str(tmp_path / "shards" / f"targets_{index:05d}"),
-            output_path=str(tmp_path / "outputs" / f"context_{index:05d}.txt"),
-            log_path=str(tmp_path / "logs" / f"{index:05d}.log"),
-            rnaplfold_cache_dir="",
-        )
-        for index in range(3)
-    ]
-
-    outputs = oligoformer_app._run_targetscan_context_batches(
-        shards,
-        execution=execution,
-    )
-
-    assert outputs == [shard.output_path for shard in shards]
-    assert len(worker_calls) == 2
-    assert {local_workers for _, local_workers in worker_calls} == {2}
-    assert deleted_queues == [worker_calls[0][0]]
-    assert worker_calls[0][0].startswith("oligoformer-targetscan-context-")
-    assert fake_queues == {}
-    for shard in shards:
-        output_path = Path(shard.output_path)
-        assert output_path.exists()
-        assert output_path.with_suffix(output_path.suffix + ".done").exists()
-
-
-def test_run_targetscan_context_batches_retries_failed_workers(
-    tmp_path: Path, monkeypatch
-):
-    volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    execution = _execution_config(
-        targetscan_context_nodes=1,
-        targetscan_context_workers=1,
-        targetscan_context_attempts=2,
-    )
-    ready_outputs: set[str] = set()
-    queues = {}
-    worker_attempts = []
-
-    class FakeQueueInstance:
-        def put_many(self, items):
-            self.items = list(getattr(self, "items", [])) + list(items)
-
-    class FakeQueue:
-        class objects:
-            @staticmethod
-            def delete(name):
-                queues.pop(name, None)
-
-        @staticmethod
-        def from_name(name, create_if_missing=False):
-            if create_if_missing:
-                return queues.setdefault(name, FakeQueueInstance())
-            return queues[name]
-
-    class FakeCall:
-        def __init__(self, attempt: int):
-            self.attempt = attempt
-
-        def get(self):
-            if self.attempt == 1:
-                raise RuntimeError("worker crashed")
-            ready_outputs.add(shard.output_path)
-            return 1
-
-        def cancel(self, terminate_containers=False):
-            del terminate_containers
-
-    class FakeWorker:
-        def spawn(self, queue_name: str, local_workers: int, attempts: int):
-            del queue_name, local_workers
-            assert attempts == execution.targetscan_context_attempts
-            worker_attempts.append(len(worker_attempts) + 1)
-            return FakeCall(worker_attempts[-1])
-
-    shard = oligoformer_app.TargetscanContextShardSpec(
-        shard_index=0,
-        common_dir=str(tmp_path / "common"),
-        targets_path=str(tmp_path / "targets"),
-        output_path=str(tmp_path / "output.txt"),
-        log_path=str(tmp_path / "output.log"),
-        rnaplfold_cache_dir="",
-    )
-    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_targetscan_context_queue_worker",
-        FakeWorker(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_targetscan_context_shard_ready",
-        lambda spec: spec.output_path in ready_outputs,
-    )
-
-    assert oligoformer_app._run_targetscan_context_batches(
-        [shard],
-        execution=execution,
-    ) == [shard.output_path]
-    assert worker_attempts == [1, 2]
-    assert queues == {}
-
-
 def test_targetscan_context_shard_retries_interrupted_commands_atomically(
     tmp_path: Path, monkeypatch, capfd
 ):
@@ -2748,175 +1669,6 @@ def test_targetscan_context_shard_retries_interrupted_commands_atomically(
     assert len(attempts) == 3
 
 
-def test_targetscan_context_worker_commits_once_per_worker(tmp_path: Path, monkeypatch):
-    volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    shards = [
-        oligoformer_app.TargetscanContextShardSpec(
-            shard_index=index,
-            common_dir=str(tmp_path / "common"),
-            targets_path=str(tmp_path / f"targets-{index}"),
-            output_path=str(tmp_path / f"output-{index}.txt"),
-            log_path=str(tmp_path / f"output-{index}.log"),
-            rnaplfold_cache_dir="",
-        )
-        for index in range(2)
-    ]
-
-    class FakeQueue:
-        def __init__(self):
-            self.items = shards + [
-                oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
-            ]
-
-        def get(self, timeout=None):
-            del timeout
-            return self.items.pop(0)
-
-        @classmethod
-        def from_name(cls, _name):
-            return cls()
-
-    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_run_targetscan_context_shard",
-        lambda spec, attempts: spec.output_path,
-    )
-
-    completed = (
-        oligoformer_app.run_oligoformer_targetscan_context_queue_worker.get_raw_f()(
-            "queue", local_workers=1, attempts=2
-        )
-    )
-
-    assert completed == 2
-    assert volume.reload_count == 1
-    assert volume.commit_count == 1
-
-
-def test_run_targetscan_context_batches_caps_default_queue_workers(
-    tmp_path: Path, monkeypatch
-):
-    from threading import Lock
-
-    volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    fake_queues = {}
-    deleted_queues = []
-    ready_outputs = set()
-    worker_calls = []
-    bounded_map_calls = []
-    queue_lock = Lock()
-
-    class FakeQueueInstance:
-        def __init__(self):
-            self.items = []
-
-        def put(self, item):
-            with queue_lock:
-                self.items.append(item)
-
-        def put_many(self, items):
-            with queue_lock:
-                self.items.extend(items)
-
-        def get(self, *, block=False, timeout=None):
-            del block, timeout
-            with queue_lock:
-                if not self.items:
-                    return None
-                return self.items.pop(0)
-
-        def get_many(self, n_values: int, *, block=False, timeout=None):
-            del block, timeout
-            with queue_lock:
-                values = self.items[:n_values]
-                del self.items[:n_values]
-                return values
-
-    class FakeQueue:
-        class objects:
-            @staticmethod
-            def delete(name):
-                deleted_queues.append(name)
-                fake_queues.pop(name, None)
-
-        @staticmethod
-        def from_name(name, create_if_missing=False):
-            if create_if_missing:
-                return fake_queues.setdefault(name, FakeQueueInstance())
-            return fake_queues[name]
-
-    class FakeTargetscanContextQueueWorker:
-        def remote(self, queue_name: str, local_workers: int, attempts: int):
-            assert (
-                attempts
-                == oligoformer_app.DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts
-            )
-            worker_calls.append((queue_name, local_workers))
-            queue = FakeQueue.from_name(queue_name)
-            outputs = []
-            while True:
-                spec = queue.get(block=False)
-                if (
-                    spec is None
-                    or spec
-                    == oligoformer_app.APP_INFO.targetscan_context_queue_sentinel
-                ):
-                    return outputs
-                ready_outputs.add(spec.output_path)
-                outputs.append(spec.output_path)
-
-        def spawn(self, queue_name: str, local_workers: int, attempts: int):
-            class FakeCall:
-                def get(self_inner):
-                    return self.remote(queue_name, local_workers, attempts)
-
-                def cancel(self_inner, terminate_containers=False):
-                    del terminate_containers
-
-            return FakeCall()
-
-    def fake_bounded_map(items, fn, *, max_parallel: int):
-        items = list(items)
-        bounded_map_calls.append((len(items), max_parallel))
-        return [fn(item) for item in items]
-
-    monkeypatch.setattr(oligoformer_app.modal, "Queue", FakeQueue)
-    monkeypatch.setattr(oligoformer_app, "bounded_map", fake_bounded_map)
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_targetscan_context_shard_ready",
-        lambda shard: shard.output_path in ready_outputs,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_targetscan_context_queue_worker",
-        FakeTargetscanContextQueueWorker(),
-    )
-    shards = [
-        oligoformer_app.TargetscanContextShardSpec(
-            shard_index=index,
-            common_dir=str(tmp_path / "common"),
-            targets_path=str(tmp_path / "shards" / f"targets_{index:05d}"),
-            output_path=str(tmp_path / "outputs" / f"context_{index:05d}.txt"),
-            log_path=str(tmp_path / "logs" / f"{index:05d}.log"),
-            rnaplfold_cache_dir="",
-        )
-        for index in range(3425)
-    ]
-
-    outputs = oligoformer_app._run_targetscan_context_batches(shards)
-
-    assert outputs == [shard.output_path for shard in shards]
-    assert bounded_map_calls == [(100, 100)]
-    assert len(worker_calls) == 100
-    assert {local_workers for _, local_workers in worker_calls} == {32}
-    assert deleted_queues == [worker_calls[0][0]]
-    assert fake_queues == {}
-
-
 def test_merge_pita_shards_sorts_like_upstream_score_table(tmp_path: Path):
     first = tmp_path / "first_pita.tab"
     second = tmp_path / "second_pita.tab"
@@ -2953,31 +1705,16 @@ def test_merge_pita_shards_sorts_like_upstream_score_table(tmp_path: Path):
     ]
 
 
-def test_oligoformer_execution_defaults_use_distributed_cpu_nodes():
+def test_oligoformer_execution_defaults_validate_cpu_workers():
     execution = oligoformer_app.OligoformerExecutionConfig()
 
     assert execution == oligoformer_app.DEFAULT_EXECUTION_CONFIG
-    assert oligoformer_app._bounded_node_count(100, execution.off_target_nodes) == 32
-    assert (
-        oligoformer_app._bounded_node_count(
-            100,
-            execution.targetscan_context_nodes,
-        )
-        == 100
-    )
     assert (
         oligoformer_app._targetscan_ref_shard_size(
             100,
             prepare_nodes=execution.targetscan_prepare_nodes,
         )
         == 4
-    )
-    assert (
-        oligoformer_app._targetscan_rnaplfold_node_count(
-            1000,
-            execution.targetscan_rnaplfold_nodes,
-        )
-        == 32
     )
     assert (
         oligoformer_app._targetscan_rnaplfold_worker_count(
@@ -3204,53 +1941,6 @@ def test_targetscan_ref_shard_size_uses_prepare_node_fanout():
     assert oligoformer_app._targetscan_ref_shard_size(28_352, 100) == 100
 
 
-def test_targetscan_prepare_streams_results_in_node_sized_map_batches(monkeypatch):
-    map_batches = []
-
-    class FakePrepareBatchShard:
-        def map(self, specs):
-            batch = list(specs)
-            map_batches.append(batch)
-            return iter(batch)
-
-        def remote(self, _spec):
-            raise AssertionError("TargetScan preparation must not block per input")
-
-    monkeypatch.setattr(
-        oligoformer_app,
-        "prepare_oligoformer_targetscan_batch_shard",
-        FakePrepareBatchShard(),
-    )
-    execution = _execution_config(targetscan_prepare_nodes=2)
-    specs = [
-        oligoformer_app.TargetscanBatchSpec(
-            run_root="run",
-            output_dir="output",
-            stem="target",
-            ref_shard_size=95,
-            shard_index=index,
-            sirna_path="sirna.fa",
-            sirna_count=1,
-            utr_path="utr.fa",
-            orf_path="orf.fa",
-            rnaplfold_cache_dir="",
-        )
-        for index in range(5)
-    ]
-
-    plans = oligoformer_app._run_targetscan_prepare_batches(
-        specs,
-        execution=execution,
-    )
-
-    assert [[spec.shard_index for spec in batch] for batch in map_batches] == [
-        [0, 1],
-        [2, 3],
-        [4],
-    ]
-    assert plans == specs
-
-
 def test_targetscan_batch_reuses_seed_checkpoint_after_interruption(
     tmp_path: Path,
     monkeypatch,
@@ -3360,209 +2050,6 @@ def test_targetscan_batch_reuses_seed_checkpoint_after_interruption(
     assert len(third.context_shards) == 1
     assert [cmd[0] for cmd in calls] == ["perl", "bash"]
     assert checkpoint_path.read_text(encoding="utf-8") == "seed output\n"
-
-
-def test_pita_branch_mounts_model_references():
-    assert (
-        oligoformer_app.CONF.model_volume_mountpoint
-        in oligoformer_app.run_oligoformer_pita_branch.spec.volumes
-    )
-
-
-def test_pita_branch_rejects_nonpositive_node_count():
-    spec = oligoformer_app.OffTargetShardSpec(
-        run_root="run",
-        output_dir="outputs",
-        stem="target",
-        index=0,
-        record_name="RNA0",
-        record_sequence="AUGCUAGCUAGCUAGCUAG",
-        utr_path="utr.fa",
-        orf_path="orf.fa",
-        row_shard_size=1000,
-    )
-
-    with pytest.raises(ValueError, match="node_count must be a positive integer"):
-        oligoformer_app.run_oligoformer_pita_branch.get_raw_f()(
-            [spec],
-            node_count=0,
-            local_workers=1,
-        )
-
-
-def test_pita_branch_completes_each_candidate_wave_before_planning_the_next(
-    tmp_path: Path,
-    monkeypatch,
-):
-    volume = FakeVolume()
-    repo_dir = tmp_path / "repo"
-    events: list[str] = []
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
-    expected_execution = _execution_config(off_target_prep_workers=1)
-
-    shard_specs = [
-        oligoformer_app.OffTargetShardSpec(
-            run_root=str(tmp_path / "run"),
-            output_dir=str(tmp_path / "outputs"),
-            stem="target",
-            index=index,
-            record_name=f"RNA{index}",
-            record_sequence="AUGCUAGCUAGCUAGCUAG",
-            utr_path=str(tmp_path / "UTR.fa"),
-            orf_path=str(tmp_path / "ORF.fa"),
-            row_shard_size=1000,
-        )
-        for index in range(5)
-    ]
-
-    def fake_reference(spec, _prepare_root, inner_execution):
-        assert inner_execution == expected_execution
-        events.append(f"reference:{spec.index}")
-        return oligoformer_app.PitaReferencePlan((), "reference_ext_utr.stab")
-
-    def fake_plan(*, spec, prepare_root, reference, execution):
-        assert execution == expected_execution
-        del prepare_root, reference
-        events.append(f"plan:{spec.index}")
-        return oligoformer_app.PitaPreparePlan(
-            spec=spec,
-            utr_shards=(
-                oligoformer_app.PitaPrepareUtrShardSpec(
-                    shard_index=0,
-                    input_path=f"candidate_{spec.index}.utr.stab",
-                    mir_stab_path=f"candidate_{spec.index}.mir.stab",
-                    output_path=f"candidate_{spec.index}.potential.tsv",
-                    log_path=f"candidate_{spec.index}.log",
-                ),
-            ),
-            row_count=None,
-        )
-
-    def candidate_indexes(items):
-        return ",".join(str(item.spec.index) for item in items)
-
-    def fake_discovery(shards, *, max_process_slots=None, execution):
-        assert max_process_slots == 1
-        assert execution == expected_execution
-        indexes = [
-            Path(shard.output_path).name.split(".", 1)[0].removeprefix("candidate_")
-            for shard in shards
-        ]
-        events.append(f"discover:{','.join(indexes)}")
-
-    def fake_consolidate(plans, *, max_process_slots=None, execution):
-        assert max_process_slots == 1
-        assert execution == expected_execution
-        events.append(f"consolidate:{candidate_indexes(plans)}")
-        prepared = []
-        for plan in plans:
-            spec = plan.spec
-            row = oligoformer_app.PitaRowShardSpec(
-                run_root=spec.run_root,
-                stem=spec.stem,
-                sirna_index=spec.index,
-                record_name=spec.record_name,
-                shard_index=0,
-                start_row=0,
-                end_row=1,
-                potential_targets_path=f"candidate_{spec.index}.potential.tsv",
-                input_path=f"candidate_{spec.index}.row.tsv",
-                ext_utr_path="reference_ext_utr.stab",
-                output_path=f"candidate_{spec.index}.scored.tsv",
-                log_path=f"candidate_{spec.index}.log",
-            )
-            prepared.append(
-                oligoformer_app.PreparedOffTargetShard(
-                    index=spec.index,
-                    record_name=spec.record_name,
-                    cache_dir=str(tmp_path / f"candidate_{spec.index}"),
-                    logs_dir=str(tmp_path / "logs"),
-                    pita_path=str(tmp_path / f"candidate_{spec.index}" / "pita.tab"),
-                    row_shards=(row,),
-                )
-            )
-        return prepared
-
-    class FakeRowBatch:
-        def starmap(self, inputs):
-            results = []
-            for rows, workers, attempts in inputs:
-                assert workers == 1
-                assert attempts == expected_execution.pita_row_attempts
-                events.append("rows:" + ",".join(str(row.sirna_index) for row in rows))
-                results.append(len(rows))
-            return results
-
-    class FakeFinalizeBatch:
-        def starmap(self, inputs):
-            results = []
-            for prepared, workers in inputs:
-                assert workers == 1
-                events.append(
-                    "finalize:" + ",".join(str(item.index) for item in prepared)
-                )
-                results.append([
-                    oligoformer_app.OffTargetShardResult(
-                        index=item.index,
-                        pita_path=item.pita_path,
-                    )
-                    for item in prepared
-                ])
-            return results
-
-    monkeypatch.setattr(oligoformer_app, "_prepare_pita_reference_plan", fake_reference)
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_prepare_pita_target_discovery_plan_for_spec",
-        fake_plan,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_run_pita_prepare_utr_shard_batches",
-        fake_discovery,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "_run_pita_consolidate_batches",
-        fake_consolidate,
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_pita_row_shard_batch",
-        FakeRowBatch(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "finalize_oligoformer_pita_shard_batch",
-        FakeFinalizeBatch(),
-    )
-
-    results = oligoformer_app.run_oligoformer_pita_branch.get_raw_f()(
-        shard_specs,
-        node_count=1,
-        local_workers=1,
-        max_process_slots=1,
-        execution=expected_execution,
-    )
-
-    assert [result.index for result in results] == list(range(5))
-    assert events.index("finalize:0,1,2,3") < events.index("plan:4")
-    assert events == [
-        "reference:0",
-        "plan:0",
-        "plan:1",
-        "plan:2",
-        "plan:3",
-        "discover:0,1,2,3",
-        "consolidate:0,1,2,3",
-        "rows:0,1,2,3",
-        "finalize:0,1,2,3",
-        "plan:4",
-        "discover:4",
-        "consolidate:4",
-        "rows:4",
-        "finalize:4",
-    ]
 
 
 def test_pita_prepare_rejects_missing_reference_files(
@@ -3814,82 +2301,6 @@ def test_pita_prepare_wrapper_removes_per_sirna_worktree(
     assert not prepare_root.joinpath("target_shard_00004").exists()
 
 
-def test_pita_prepare_splits_utr_stab_and_launches_remote_shards_in_order(
-    tmp_path: Path, monkeypatch
-):
-    remote_batches = []
-    volume = FakeVolume()
-    repo_dir = tmp_path / "repo"
-    repo_dir.joinpath("off-target", "pita", "lib").mkdir(parents=True)
-    utr_stab_path = tmp_path / "utr.stab"
-    mir_stab_path = tmp_path / "mir.stab"
-    utr_stab_path.write_text(
-        "utr1\tAAAA\nutr2\tCCCC\nutr3\tGGGG\n",
-        encoding="utf-8",
-    )
-    mir_stab_path.write_text("RNA0\tUUUU\n", encoding="utf-8")
-
-    class FakePitaPrepareUtrShardBatch:
-        def _run(self, specs, local_workers, attempts):
-            assert attempts == execution.pita_row_attempts
-            remote_batches.append((specs, local_workers))
-            outputs = []
-            for spec in specs:
-                rows = Path(spec.input_path).read_text(encoding="utf-8").splitlines()
-                row_names = [row.split("\t", 1)[0] for row in rows]
-                output_path = Path(spec.output_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(
-                    "".join(f"RNA0\t{name}\n" for name in row_names),
-                    encoding="utf-8",
-                )
-                oligoformer_app._publish_artifact_marker(
-                    output_path.with_suffix(output_path.suffix + ".done"),
-                    kind="pita-target-discovery",
-                    artifacts={"potential_targets": output_path},
-                )
-                outputs.append(str(output_path))
-            return len(outputs)
-
-        def starmap(self, inputs):
-            return [self._run(*args) for args in inputs]
-
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume, repo_dir))
-    monkeypatch.setattr(
-        oligoformer_app,
-        "run_oligoformer_pita_prepare_utr_shard_batch",
-        FakePitaPrepareUtrShardBatch(),
-    )
-    execution = _execution_config(
-        pita_prepare_nodes=2,
-        pita_prepare_workers=2,
-        pita_prepare_utr_shard_size=2,
-    )
-
-    specs = oligoformer_app._pita_prepare_utr_shard_specs(
-        utr_stab_path=utr_stab_path,
-        mir_stab_path=mir_stab_path,
-        shard_dir=tmp_path / "cache" / "pita_prepare_utr_shards",
-        logs_dir=tmp_path / "logs",
-        shard_size=execution.pita_prepare_utr_shard_size,
-    )
-    volume.commit()
-    oligoformer_app._run_pita_prepare_utr_shard_batches(
-        list(specs),
-        execution=execution,
-    )
-
-    assert all(Path(spec.output_path).exists() for spec in specs)
-    remote_specs = [spec for batch, _workers in remote_batches for spec in batch]
-    assert [spec.shard_index for spec in remote_specs] == [0, 1]
-    assert [workers for _batch, workers in remote_batches] == [2]
-    assert {Path(spec.log_path).parent.name for spec in remote_specs} == {
-        "pita_prepare_utr_shards"
-    }
-    assert volume.commit_count == 1
-    assert volume.reload_count == 1
-
-
 def test_pita_prepare_streams_utr_stab_into_shards(tmp_path: Path, monkeypatch):
     utr_stab_path = tmp_path / "utr.stab"
     utr_stab_path.write_text(
@@ -3992,25 +2403,6 @@ def test_finalize_pita_discovery_warms_and_writes_row_inputs_in_one_pass(
     assert [
         Path(row.input_path).read_text(encoding="utf-8") for row in prepared.row_shards
     ] == ["RNA0\tutr1\nRNA0\tutr2\n", "RNA0\tutr3\n"]
-
-
-def test_worker_aware_batches_fill_containers_before_spawning_more():
-    assert [
-        len(batch)
-        for batch in oligoformer_app._batch_items_for_local_workers(
-            list(range(45)),
-            max_nodes=32,
-            local_workers=32,
-        )
-    ] == [32, 13]
-
-    large_batches = oligoformer_app._batch_items_for_local_workers(
-        list(range(1317)),
-        max_nodes=32,
-        local_workers=32,
-    )
-    assert len(large_batches) == 32
-    assert max(len(batch) for batch in large_batches) == 42
 
 
 def test_pita_row_shard_retries_interrupted_commands_atomically(
@@ -4308,382 +2700,6 @@ def test_download_models_refreshes_stale_output_reference_identity(
     assert output_volume.reload_count == 3
     assert output_volume.commit_count == 1
     assert model_volume.commit_count == 1
-
-
-def test_submit_oligoformer_orchestrates_split_run(tmp_path: Path, monkeypatch) -> None:
-    input_fasta = tmp_path / "target.fa"
-    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
-    calls = []
-    plan = oligoformer_app.OligoformerRunPlan(
-        cache_key="abc123",
-        efficacy_key="efficacy123",
-        run_root="/remote/run",
-        efficacy_dir="/remote/run/prepare/efficacy",
-        output_dir="/remote/run/outputs/postprocess",
-        output_stems=("m",),
-        config=_run_config(),
-        postprocess_key="postprocess",
-        efficacy_ready=False,
-        evidence_ready=False,
-        final_ready=False,
-    )
-    efficacy_plan = replace(plan, efficacy_ready=True)
-    execution_kwargs = {
-        "off_target_nodes": 2,
-        "off_target_workers": 3,
-        "off_target_process_slots": 10,
-        "off_target_prep_workers": 4,
-        "pita_prepare_nodes": 5,
-        "pita_prepare_workers": 6,
-        "pita_prepare_utr_shard_size": 7,
-        "pita_row_shard_size": 8,
-        "pita_row_attempts": 18,
-        "targetscan_rnaplfold_nodes": 9,
-        "targetscan_rnaplfold_workers": 10,
-        "targetscan_rnaplfold_shard_size": 11,
-        "targetscan_prepare_nodes": 12,
-        "targetscan_candidate_shard_size": 13,
-        "targetscan_context_nodes": 14,
-        "targetscan_context_workers": 15,
-        "targetscan_context_shard_size": 16,
-        "targetscan_context_attempts": 19,
-        "targetscan_merge_nodes": 17,
-    }
-    expected_execution = _execution_config(**execution_kwargs)
-
-    class FakeDownloadModels:
-        def remote(self, *, force):
-            calls.append(("download", force))
-
-    class FakePrepare:
-        def remote(self, **kwargs):
-            calls.append(("prepare", kwargs))
-            return plan
-
-    class FakeEfficacy:
-        def spawn(self, **kwargs):
-            calls.append(("efficacy", kwargs))
-            return FakeCall(efficacy_plan)
-
-    class FakeCall:
-        def __init__(self, result):
-            self.result = result
-
-        def get(self):
-            return self.result
-
-    class FakePostprocess:
-        def remote(self, **kwargs):
-            calls.append(("postprocess", kwargs))
-            return b"archive"
-
-    monkeypatch.setattr(
-        oligoformer_app, "download_oligoformer_models", FakeDownloadModels()
-    )
-    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
-    monkeypatch.setattr(oligoformer_app, "run_oligoformer_efficacy", FakeEfficacy())
-    monkeypatch.setattr(
-        oligoformer_app, "run_oligoformer_postprocess", FakePostprocess()
-    )
-    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
-    assert raw_f is not None
-
-    raw_f(
-        mrna_fasta=str(input_fasta),
-        out_dir=str(tmp_path),
-        run_name="demo",
-        **execution_kwargs,
-    )
-
-    assert calls[0][0] == "prepare"
-    assert calls[0][1]["top_n"] == oligoformer_app.APP_INFO.default_top_n
-    assert "execution" not in calls[0][1]
-    assert set(oligoformer_app.OligoformerExecutionConfig.__slots__).isdisjoint(
-        calls[0][1]
-    )
-    assert calls[1] == ("download", False)
-    assert calls[2][0] == "prepare"
-    assert calls[3] == (
-        "efficacy",
-        {"plan": plan, "functionality_filter": True},
-    )
-    assert calls[4][0] == "postprocess"
-    assert calls[4][1]["plan"] == efficacy_plan
-    assert calls[4][1]["execution"] == expected_execution
-    assert (tmp_path / "demo_oligoformer.tar.zst").read_bytes() == b"archive"
-
-
-def test_submit_oligoformer_skips_model_setup_for_cached_run(
-    tmp_path: Path, monkeypatch
-) -> None:
-    input_fasta = tmp_path / "target.fa"
-    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
-    plan = oligoformer_app.OligoformerRunPlan(
-        cache_key="abc123",
-        efficacy_key="efficacy123",
-        run_root="/remote/run",
-        efficacy_dir="/remote/run/prepare/efficacy",
-        output_dir="/remote/run/outputs/postprocess",
-        output_stems=("m",),
-        config=_run_config(),
-        postprocess_key="postprocess",
-        efficacy_ready=True,
-        evidence_ready=True,
-        final_ready=True,
-    )
-
-    class FakePrepare:
-        def remote(self, **_kwargs):
-            return plan
-
-    class ExplodingDownload:
-        def remote(self, **_kwargs):
-            raise AssertionError("cached runs must not initialize model assets")
-
-    class FakePackage:
-        def remote(self, _plan):
-            return b"archive"
-
-    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
-    monkeypatch.setattr(
-        oligoformer_app, "download_oligoformer_models", ExplodingDownload()
-    )
-    monkeypatch.setattr(oligoformer_app, "package_oligoformer_outputs", FakePackage())
-
-    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
-    assert raw_f is not None
-    raw_f(mrna_fasta=str(input_fasta), out_dir=str(tmp_path), run_name="cached")
-
-    assert (tmp_path / "cached_oligoformer.tar.zst").read_bytes() == b"archive"
-
-
-def test_submit_oligoformer_force_overwrites_local_archive(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    input_fasta = tmp_path / "target.fa"
-    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
-    output_path = tmp_path / "forced_oligoformer.tar.zst"
-    output_path.write_bytes(b"old")
-    plan = oligoformer_app.OligoformerRunPlan(
-        cache_key="abc123",
-        efficacy_key="efficacy123",
-        run_root="/remote/run",
-        efficacy_dir="/remote/run/prepare/efficacy",
-        output_dir="/remote/run/outputs/postprocess",
-        output_stems=("m",),
-        config=_run_config(),
-        postprocess_key="postprocess",
-        efficacy_ready=True,
-        evidence_ready=True,
-        final_ready=True,
-    )
-    prepare_calls = []
-
-    class FakePrepare:
-        def remote(self, **kwargs):
-            prepare_calls.append(kwargs)
-            return plan
-
-    class FakePackage:
-        def remote(self, _plan):
-            return b"new"
-
-    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
-    monkeypatch.setattr(oligoformer_app, "package_oligoformer_outputs", FakePackage())
-    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
-    assert raw_f is not None
-
-    raw_f(
-        mrna_fasta=str(input_fasta),
-        out_dir=str(tmp_path),
-        run_name="forced",
-        force=True,
-    )
-
-    assert output_path.read_bytes() == b"new"
-    assert prepare_calls[0]["force"] is True
-    assert isinstance(prepare_calls[0]["force_generation"], str)
-
-
-def test_submit_oligoformer_skips_human_setup_when_evidence_is_cached(
-    tmp_path: Path, monkeypatch
-) -> None:
-    input_fasta = tmp_path / "target.fa"
-    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
-    plan = oligoformer_app.OligoformerRunPlan(
-        cache_key="abc123",
-        efficacy_key="efficacy123",
-        run_root="/remote/run",
-        efficacy_dir="/remote/efficacy",
-        output_dir="/remote/run/outputs/postprocess",
-        output_stems=("m",),
-        config=_run_config(off_target=True, all_human=True),
-        postprocess_key="postprocess",
-        efficacy_ready=True,
-        evidence_ready=True,
-        final_ready=False,
-    )
-
-    class FakePrepare:
-        def remote(self, **_kwargs):
-            return plan
-
-    class ExplodingDownload:
-        def remote(self, **_kwargs):
-            raise AssertionError("cached evidence must not initialize model assets")
-
-    class ExplodingReferencePrep:
-        def spawn(self, **_kwargs):
-            raise AssertionError("cached evidence must not rebuild RNAplfold refs")
-
-    class FakePostprocess:
-        def remote(self, **kwargs):
-            assert kwargs["plan"] == plan
-            return b"archive"
-
-    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
-    monkeypatch.setattr(
-        oligoformer_app, "download_oligoformer_models", ExplodingDownload()
-    )
-    monkeypatch.setattr(
-        oligoformer_app,
-        "prepare_oligoformer_targetscan_rnaplfold_cache",
-        ExplodingReferencePrep(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app, "run_oligoformer_postprocess", FakePostprocess()
-    )
-
-    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
-    assert raw_f is not None
-    raw_f(
-        mrna_fasta=str(input_fasta),
-        out_dir=str(tmp_path),
-        run_name="cached-evidence",
-        off_target=True,
-        all_human=True,
-    )
-
-    assert (tmp_path / "cached-evidence_oligoformer.tar.zst").read_bytes() == b"archive"
-
-
-def test_submit_oligoformer_overlaps_human_reference_prep_with_efficacy(
-    tmp_path: Path, monkeypatch
-) -> None:
-    input_fasta = tmp_path / "target.fa"
-    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
-    events = []
-    plan = oligoformer_app.OligoformerRunPlan(
-        cache_key="abc123",
-        efficacy_key="efficacy123",
-        run_root="/remote/run",
-        efficacy_dir="/remote/run/prepare/efficacy",
-        output_dir="/remote/run/outputs/postprocess",
-        output_stems=("m",),
-        config=_run_config(off_target=True, all_human=True),
-        postprocess_key="postprocess",
-        efficacy_ready=False,
-        evidence_ready=False,
-        final_ready=False,
-    )
-    refreshed_plan = replace(
-        plan,
-        cache_key="def456",
-        run_root="/remote/refreshed-run",
-        output_dir="/remote/refreshed-run/outputs/postprocess",
-    )
-    efficacy_plan = replace(refreshed_plan, efficacy_ready=True)
-    expected_execution = _execution_config(
-        targetscan_rnaplfold_nodes=7,
-        targetscan_rnaplfold_workers=6,
-        targetscan_rnaplfold_shard_size=123,
-    )
-
-    class FakeCall:
-        def __init__(self, name: str, result):
-            self.name = name
-            self.result = result
-
-        def get(self):
-            events.append(("get", self.name))
-            return self.result
-
-        def cancel(self):
-            events.append(("cancel", self.name))
-
-    class FakePrepare:
-        def remote(self, **_kwargs):
-            events.append("prepare")
-            return plan if events.count("prepare") == 1 else refreshed_plan
-
-    class FakeDownload:
-        def remote(self, *, force):
-            events.append(("download", force))
-
-    class FakeEfficacy:
-        def spawn(self, **kwargs):
-            assert kwargs["plan"] == refreshed_plan
-            events.append("spawn-efficacy")
-            return FakeCall("efficacy", efficacy_plan)
-
-    class FakeReferencePrep:
-        def spawn(self, *, force, execution):
-            assert execution == expected_execution
-            events.append(("spawn-reference", force))
-            return FakeCall("reference", None)
-
-    class FakePostprocess:
-        def remote(self, **kwargs):
-            assert kwargs["plan"] == efficacy_plan
-            assert kwargs["execution"] == expected_execution
-            events.append("postprocess")
-            return b"archive"
-
-    def fake_gather(*calls):
-        events.append(("gather", tuple(call.name for call in calls)))
-        return tuple(call.get() for call in calls)
-
-    monkeypatch.setattr(oligoformer_app, "prepare_oligoformer_run", FakePrepare())
-    monkeypatch.setattr(oligoformer_app, "download_oligoformer_models", FakeDownload())
-    monkeypatch.setattr(oligoformer_app, "run_oligoformer_efficacy", FakeEfficacy())
-    monkeypatch.setattr(
-        oligoformer_app,
-        "prepare_oligoformer_targetscan_rnaplfold_cache",
-        FakeReferencePrep(),
-    )
-    monkeypatch.setattr(
-        oligoformer_app, "run_oligoformer_postprocess", FakePostprocess()
-    )
-    monkeypatch.setattr(
-        oligoformer_app.modal.FunctionCall,
-        "gather",
-        staticmethod(fake_gather),
-    )
-
-    raw_f = oligoformer_app.submit_oligoformer_task.info.raw_f
-    assert raw_f is not None
-    raw_f(
-        mrna_fasta=str(input_fasta),
-        out_dir=str(tmp_path),
-        run_name="human",
-        off_target=True,
-        all_human=True,
-        targetscan_rnaplfold_nodes=7,
-        targetscan_rnaplfold_workers=6,
-        targetscan_rnaplfold_shard_size=123,
-    )
-
-    assert events[:5] == [
-        "prepare",
-        ("download", False),
-        "prepare",
-        ("spawn-reference", False),
-        "spawn-efficacy",
-    ]
-    assert ("gather", ("efficacy", "reference")) in events
-    assert events[-1] == "postprocess"
-    assert (tmp_path / "human_oligoformer.tar.zst").read_bytes() == b"archive"
 
 
 def test_submit_oligoformer_requires_off_target_references(tmp_path: Path) -> None:

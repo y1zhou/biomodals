@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import tarfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ class SelectedStructureFile:
     volume_name: str
     size_bytes: int | None = None
     media_type: str | None = None
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,7 @@ def selected_structure_file_records_from_artifact(
                 volume_name=artifact.storage.volume_name,
                 size_bytes=root.stat().st_size,
                 media_type=artifact.storage.media_type,
+                content_sha256=_file_sha256(root),
             )
         ]
 
@@ -180,6 +183,7 @@ def selected_structure_file_records_from_artifact(
                 volume_name=artifact.storage.volume_name,
                 size_bytes=path.stat().st_size,
                 media_type=artifact.storage.media_type,
+                content_sha256=_file_sha256(path),
             )
         )
     return selected
@@ -190,20 +194,21 @@ def _selected_structure_file_records_from_tar_zst(
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[SelectedStructureFile]:
-    archive_size = archive_path.stat().st_size
     return _collect_tar_zst_members(
         archive_path,
         include=lambda member: matches_structure_pattern(member.name, patterns),
-        build=lambda member, _data: SelectedStructureFile(
+        build=lambda member, data: SelectedStructureFile(
             artifact_id=artifact.artifact_id,
             file_name=safe_selected_file_name(artifact.artifact_id, member.name),
             artifact_file_path=member.name,
             app_volume_path=artifact.storage.path,
             volume_name=artifact.storage.volume_name,
-            size_bytes=archive_size,
+            size_bytes=member.size,
             media_type=artifact.storage.media_type or ZSTD_MEDIA_TYPE,
+            content_sha256=hashlib.sha256(
+                _required_member_bytes(member, data)
+            ).hexdigest(),
         ),
-        read_data=False,
     )
 
 
@@ -246,6 +251,7 @@ def stage2_input_manifest_rows(
                         path=structure.artifact_file_path,
                         media_type=structure.media_type,
                         size_bytes=structure.size_bytes,
+                        content_sha256=structure.content_sha256,
                         expected=True,
                     )
                 ],
@@ -253,6 +259,11 @@ def stage2_input_manifest_rows(
             )
         )
     return rows
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def structure_files_from_artifact(
@@ -431,7 +442,7 @@ def rosetta_job_manifest_rows(
     rosetta_script: str | None = None,
     flags_file: str | None = None,
 ) -> list[dict[str, object]]:
-    """Build PPIFlow-owned Rosetta queue/job manifest rows."""
+    """Build PPIFlow-owned Rosetta job manifest rows."""
     rows = []
     for index, structure in enumerate(structures, start=1):
         input_pdb = f"inputs/{index}/{sanitize_filename(structure.candidate_id)}.pdb"

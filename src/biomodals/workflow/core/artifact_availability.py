@@ -6,21 +6,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from biomodals.execution import AvailabilityStatus
 from biomodals.schema import WorkflowArtifact
 from biomodals.workflow.core.artifacts import workflow_artifact_availability_errors
-
-try:
-    from enum import StrEnum
-except ImportError:  # pragma: no cover - Python 3.10 compatibility
-    from enum import StrEnum  # type: ignore[no-redef]
-
-
-class ArtifactAvailabilityStatus(StrEnum):
-    """Artifact availability states understood by the workflow runtime."""
-
-    AVAILABLE = "available"
-    MISSING = "missing"
-    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -28,14 +16,12 @@ class ArtifactAvailability:
     """Structured result for one artifact availability check."""
 
     artifact_id: str
-    status: ArtifactAvailabilityStatus
+    status: AvailabilityStatus
     errors: tuple[str, ...] = field(default_factory=tuple)
     unknown_reason: str | None = None
 
 
-ExternalArtifactChecker = Callable[
-    [WorkflowArtifact], ArtifactAvailability | list[str] | tuple[str, ...]
-]
+ExternalArtifactChecker = Callable[[WorkflowArtifact], ArtifactAvailability]
 
 
 def check_artifact_availability(
@@ -55,9 +41,7 @@ def check_artifact_availability(
         return ArtifactAvailability(
             artifact_id=artifact.artifact_id,
             status=(
-                ArtifactAvailabilityStatus.MISSING
-                if errors
-                else ArtifactAvailabilityStatus.AVAILABLE
+                AvailabilityStatus.MISSING if errors else AvailabilityStatus.AVAILABLE
             ),
             errors=tuple(errors),
         )
@@ -65,41 +49,25 @@ def check_artifact_availability(
     if external_artifact_checker is None:
         return ArtifactAvailability(
             artifact_id=artifact.artifact_id,
-            status=ArtifactAvailabilityStatus.UNKNOWN,
+            status=AvailabilityStatus.UNKNOWN,
             unknown_reason=(
                 f"external volume {artifact.storage.volume_name!r} was not checked"
             ),
         )
 
     try:
-        return _normalize_external_check_result(artifact, external_artifact_checker)
+        result = external_artifact_checker(artifact)
+        if not isinstance(result, ArtifactAvailability):
+            raise TypeError("external artifact checker returned an invalid result")
+        return result
     except Exception as exc:  # noqa: BLE001
         return ArtifactAvailability(
             artifact_id=artifact.artifact_id,
-            status=ArtifactAvailabilityStatus.MISSING,
-            errors=(
-                f"{artifact.artifact_id}: external artifact checker failed: {exc}",
+            status=AvailabilityStatus.UNKNOWN,
+            unknown_reason=(
+                f"{artifact.artifact_id}: external artifact checker failed: {exc}"
             ),
         )
-
-
-def check_external_artifact_availability(
-    artifact: WorkflowArtifact,
-    *,
-    workflow_volume_name: str,
-    volume_roots: Mapping[str, str | Path],
-) -> list[str]:
-    """Return missing-file errors for an artifact in an app-owned volume."""
-    availability = check_external_artifact_status(
-        artifact,
-        workflow_volume_name=workflow_volume_name,
-        volume_roots=volume_roots,
-    )
-    if availability.status == ArtifactAvailabilityStatus.MISSING:
-        return list(availability.errors)
-    if availability.status == ArtifactAvailabilityStatus.UNKNOWN:
-        return [availability.unknown_reason or "external artifact availability unknown"]
-    return []
 
 
 def check_external_artifact_status(
@@ -112,14 +80,14 @@ def check_external_artifact_status(
     if artifact.storage.volume_name == workflow_volume_name:
         return ArtifactAvailability(
             artifact_id=artifact.artifact_id,
-            status=ArtifactAvailabilityStatus.AVAILABLE,
+            status=AvailabilityStatus.AVAILABLE,
         )
 
     volume_root = volume_roots.get(artifact.storage.volume_name)
     if volume_root is None:
         return ArtifactAvailability(
             artifact_id=artifact.artifact_id,
-            status=ArtifactAvailabilityStatus.UNKNOWN,
+            status=AvailabilityStatus.UNKNOWN,
             unknown_reason=(
                 f"{artifact.artifact_id}: missing mounted volume root for "
                 f"external volume {artifact.storage.volume_name!r}"
@@ -133,11 +101,7 @@ def check_external_artifact_status(
     )
     return ArtifactAvailability(
         artifact_id=artifact.artifact_id,
-        status=(
-            ArtifactAvailabilityStatus.MISSING
-            if errors
-            else ArtifactAvailabilityStatus.AVAILABLE
-        ),
+        status=(AvailabilityStatus.MISSING if errors else AvailabilityStatus.AVAILABLE),
         errors=tuple(errors),
     )
 
@@ -158,22 +122,3 @@ def mounted_volume_checker(
         )
 
     return check
-
-
-def _normalize_external_check_result(
-    artifact: WorkflowArtifact,
-    external_artifact_checker: ExternalArtifactChecker,
-) -> ArtifactAvailability:
-    result = external_artifact_checker(artifact)
-    if isinstance(result, ArtifactAvailability):
-        return result
-    errors = tuple(result)
-    return ArtifactAvailability(
-        artifact_id=artifact.artifact_id,
-        status=(
-            ArtifactAvailabilityStatus.MISSING
-            if errors
-            else ArtifactAvailabilityStatus.AVAILABLE
-        ),
-        errors=errors,
-    )

@@ -14,10 +14,12 @@ import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
+from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
@@ -29,15 +31,13 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
-    NodeExecutionPolicy,
-    NodePlacement,
     VolumePath,
     WorkflowArtifact,
 )
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
-    RemoteNodeSubmission,
+    RemoteNodeCall,
     Workflow,
     WorkflowNativeNode,
     orchestrator,
@@ -47,8 +47,10 @@ from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
+from biomodals.workflow.core.execution import app_scientific_version
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
+_SCIENTIFIC_SCHEMA_VERSION = "1"
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -106,15 +108,6 @@ class LigandMPNNDesignSettings:
     number_of_packs_per_design: int
 
 
-@dataclass(frozen=True)
-class WorkflowModalNamespace:
-    """Hydrated Modal objects carried across the orchestrator boundary."""
-
-    rfdiffusion_infer: modal.Function
-    ligandmpnn_run: modal.Function
-    select_rfd_design: modal.Function
-
-
 @app.function(
     image=runtime_image,
     memory=(512, 16384),
@@ -123,7 +116,7 @@ class WorkflowModalNamespace:
 )
 def select_rfdiffusion_design(
     *, rfd_output_storage_path: str, rfd_run_name: str, design_index: int
-) -> dict[str, bytes | str]:
+) -> AppRunResult:
     """Read one RFdiffusion PDB/TRB pair and infer LigandMPNN redesign residues."""
     storage_path = VolumePath(
         volume_name=RFDIFFUSION_OUTPUT_VOLUME_NAME, path=rfd_output_storage_path
@@ -218,12 +211,27 @@ def select_rfdiffusion_design(
         )
     if not redesigned_labels:
         raise ValueError(f"No redesigned residues inferred for {pdb_path}")
-    return {
-        "pdb_name": pdb_path.name,
-        "pdb_bytes": pdb_bytes,
-        "trb_name": trb_path.name,
-        "redesigned_residues": " ".join(redesigned_labels),
-    }
+    redesigned_residues = " ".join(redesigned_labels)
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="selected_rfd_design",
+                kind=ArtifactKind.STRUCTURES,
+                storage=InlineBytes(
+                    data=pdb_bytes,
+                    filename=pdb_path.name,
+                    media_type="chemical/x-pdb",
+                ),
+                metadata={
+                    "rfd_run_name": safe_run_name,
+                    "design_index": str(design_index),
+                    "redesigned_residues": redesigned_residues,
+                    "trb_name": trb_path.name,
+                },
+            )
+        ],
+    )
 
 
 @dataclass
@@ -236,33 +244,65 @@ class RFdiffusionTrajectoryNode(AppBackedNode):
     contigs: str
     hotspot_res: str
     num_designs: int
-    modal_namespace: WorkflowModalNamespace = field(
-        repr=False, compare=False, metadata={"dag_hash": False}
-    )
     noise_scale_ca: float = 1.0
     noise_scale_frame: float = 1.0
     rfd_args: str = ""
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the RFdiffusion app function directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the RFdiffusion call for kernel submission."""
         safe_run_name = sanitize_filename(self.run_name)
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.rfdiffusion_infer.spawn(
-                input_pdb_bytes=self.pdb_content,
-                input_pdb_name=self.input_pdb_name,
-                run_name=safe_run_name,
-                hydra_overrides=rfdiffusion_app.build_rfdiffusion_hydra_overrides(
-                    contigs=self.contigs,
-                    num_designs=self.num_designs,
-                    hotspot_res=self.hotspot_res,
-                    noise_scale_ca=self.noise_scale_ca,
-                    noise_scale_frame=self.noise_scale_frame,
-                    rfd_args=self.rfd_args,
-                ),
-            ),
+        return RemoteNodeCall(
             function_name="rfdiffusion_infer",
+            uses_gpu=True,
+            kwargs={
+                "input_pdb_bytes": self.pdb_content,
+                "input_pdb_name": self.input_pdb_name,
+                "run_name": safe_run_name,
+                "hydra_overrides": (
+                    rfdiffusion_app.build_rfdiffusion_hydra_overrides(
+                        contigs=self.contigs,
+                        num_designs=self.num_designs,
+                        hotspot_res=self.hotspot_res,
+                        noise_scale_ca=self.noise_scale_ca,
+                        noise_scale_frame=self.noise_scale_frame,
+                        rfd_args=self.rfd_args,
+                    )
+                ),
+            },
+        )
+
+
+@dataclass
+class RFdiffusionSelectionNode(AppBackedNode):
+    """Select one RFdiffusion design through a tracked provider call."""
+
+    rfd_run_name: str
+    design_index: int
+
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare one deterministic RFdiffusion output selection."""
+        rfd_artifacts = context.inputs.get("rfd_output") or []
+        if len(rfd_artifacts) != 1:
+            raise ValueError(
+                "RFdiffusion selection node requires exactly one RFdiffusion output"
+            )
+        artifact = rfd_artifacts[0]
+        if artifact.storage.volume_name != RFDIFFUSION_OUTPUT_VOLUME_NAME:
+            raise ValueError(
+                "RFdiffusion artifact volume does not match the RFdiffusion "
+                f"output volume: {artifact.storage.volume_name}"
+            )
+        run_name = sanitize_filename(
+            str(artifact.metadata.get("run_name") or self.rfd_run_name)
+        )
+        return RemoteNodeCall(
+            function_name="select_rfdiffusion_design",
+            uses_gpu=False,
+            kwargs={
+                "rfd_output_storage_path": artifact.storage.path,
+                "rfd_run_name": run_name,
+                "design_index": self.design_index,
+            },
         )
 
 
@@ -273,39 +313,23 @@ class LigandMPNNDesignNode(AppBackedNode):
     rfd_run_name: str
     design_index: int
     run_name: str
-    modal_namespace: WorkflowModalNamespace = field(
-        repr=False, compare=False, metadata={"dag_hash": False}
-    )
     settings: LigandMPNNDesignSettings
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RERUN
-    placement: NodePlacement = NodePlacement.REMOTE
 
     def _select_ligandmpnn_inputs(
         self, context: NodeRunContext
     ) -> tuple[bytes, str, dict[str, str]]:
-        rfd_artifacts = context.inputs.get("rfd_output") or []
-        if len(rfd_artifacts) != 1:
+        selected_artifacts = context.inputs.get("selected_design") or []
+        if len(selected_artifacts) != 1:
             raise ValueError(
-                "LigandMPNN design node requires exactly one RFdiffusion output"
+                "LigandMPNN design node requires exactly one selected RFdiffusion "
+                "design"
             )
-        rfd_artifact = rfd_artifacts[0]
-        if rfd_artifact.storage.volume_name != RFDIFFUSION_OUTPUT_VOLUME_NAME:
-            raise ValueError(
-                "RFdiffusion artifact volume does not match the RFdiffusion "
-                f"output volume: {rfd_artifact.storage.volume_name}"
-            )
+        selected = selected_artifacts[0]
+        pdb_bytes = context.resolve_workflow_artifact(selected).read_bytes()
         safe_rfd_run_name = sanitize_filename(
-            str(rfd_artifact.metadata.get("run_name") or self.rfd_run_name)
+            str(selected.metadata.get("rfd_run_name") or self.rfd_run_name)
         )
-        selected = self.modal_namespace.select_rfd_design.remote(
-            rfd_output_storage_path=rfd_artifact.storage.path,
-            rfd_run_name=safe_rfd_run_name,
-            design_index=self.design_index,
-        )
-        pdb_bytes = selected["pdb_bytes"]
-        if not isinstance(pdb_bytes, bytes):
-            raise TypeError("RFdiffusion selector must return PDB bytes")
-        redesigned_residues = str(selected["redesigned_residues"])
+        redesigned_residues = str(selected.metadata["redesigned_residues"])
         return (
             pdb_bytes,
             redesigned_residues,
@@ -316,8 +340,8 @@ class LigandMPNNDesignNode(AppBackedNode):
             },
         )
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit the LigandMPNN app function directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare the LigandMPNN call for kernel submission."""
         pdb_bytes, redesigned_residues, metadata = self._select_ligandmpnn_inputs(
             context
         )
@@ -333,15 +357,16 @@ class LigandMPNNDesignNode(AppBackedNode):
             repack_everything=True,
             redesigned_residues=redesigned_residues,
         )
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.ligandmpnn_run.spawn(
-                run_name=sanitize_filename(self.run_name),
-                script_mode="run",
-                struct_bytes=pdb_bytes,
-                seeds=list(self.settings.seeds),
-                cli_args=cli_args,
-            ),
+        return RemoteNodeCall(
             function_name="ligandmpnn_run",
+            uses_gpu=True,
+            kwargs={
+                "run_name": sanitize_filename(self.run_name),
+                "script_mode": "run",
+                "struct_bytes": pdb_bytes,
+                "seeds": list(self.settings.seeds),
+                "cli_args": cli_args,
+            },
             metadata=metadata,
         )
 
@@ -366,7 +391,7 @@ class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
 
     num_rfdiffusion_trajectories: int
     num_rfdiffusion_designs: int
-    max_parallel: int
+    max_parallel: int = field(metadata={"dag_hash": False})
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Write a Markdown summary of LigandMPNN output artifacts."""
@@ -388,7 +413,7 @@ class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
             "",
             f"- RFdiffusion trajectories: {self.num_rfdiffusion_trajectories}",
             f"- RFdiffusion designs per trajectory: {self.num_rfdiffusion_designs}",
-            f"- Max parallel workflow nodes: {self.max_parallel}",
+            f"- Max parallel workflow Nodes: {self.max_parallel}",
             "",
             "| RFdiffusion run | Design index | LigandMPNN run | Volume | Path |",
             "| --- | --- | --- | --- | --- |",
@@ -480,11 +505,13 @@ def build_rfd_ligandmpnn_workflow(
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else input_stem
     )
-    workflow = Workflow("rfd_ligandmpnn")
-    modal_namespace = WorkflowModalNamespace(
-        rfdiffusion_infer=rfdiffusion_app.rfdiffusion_infer,
-        ligandmpnn_run=ligandmpnn_app.ligandmpnn_run,
-        select_rfd_design=select_rfdiffusion_design,
+    workflow = Workflow(
+        "rfd_ligandmpnn",
+        scientific_versions={
+            "biomodals.workflow.rfd_ligandmpnn": _SCIENTIFIC_SCHEMA_VERSION,
+            "ligandmpnn": app_scientific_version(ligandmpnn_app.CONF),
+            "rfdiffusion": app_scientific_version(rfdiffusion_app.CONF),
+        },
     )
     mpnn_handles = {}
 
@@ -498,7 +525,6 @@ def build_rfd_ligandmpnn_workflow(
                 contigs=contigs,
                 hotspot_res=hotspot_res,
                 num_designs=num_rfdiffusion_designs,
-                modal_namespace=modal_namespace,
                 noise_scale_ca=noise_scale_ca,
                 noise_scale_frame=noise_scale_frame,
                 rfd_args=rfd_args,
@@ -507,16 +533,25 @@ def build_rfd_ligandmpnn_workflow(
         )
         for design_index in range(num_rfdiffusion_designs):
             mpnn_run_name = f"{rfd_run_name}-d{design_index:03d}-mpnn"
+            selection = workflow.add_node(
+                RFdiffusionSelectionNode(
+                    rfd_run_name=rfd_run_name,
+                    design_index=design_index,
+                ),
+                id=f"select-{rfd_run_name}-d{design_index:03d}",
+                inputs={"rfd_output": rfd.outputs(kind=ArtifactKind.DIRECTORY)},
+            )
             mpnn = workflow.add_node(
                 LigandMPNNDesignNode(
                     rfd_run_name=rfd_run_name,
                     design_index=design_index,
                     run_name=mpnn_run_name,
-                    modal_namespace=modal_namespace,
                     settings=settings,
                 ),
                 id=f"ligandmpnn-{rfd_run_name}-d{design_index:03d}",
-                inputs={"rfd_output": rfd.outputs(kind=ArtifactKind.DIRECTORY)},
+                inputs={
+                    "selected_design": selection.outputs(kind=ArtifactKind.STRUCTURES)
+                },
             )
             mpnn_handles[f"{rfd_run_name}-d{design_index:03d}"] = mpnn
 
@@ -552,11 +587,14 @@ def submit_rfd_ligandmpnn_workflow(
     noise_scale_ca: float = 1.0,
     noise_scale_frame: float = 1.0,
     rfd_args: str = "",
-    force: bool = False,
     wait: bool = True,
     max_parallel: int = 16,
     dry_run: bool = False,
-    strict_artifact_checks: bool = False,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str | None = None,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run RFdiffusion trajectories followed by LigandMPNN sequence design.
 
@@ -576,13 +614,20 @@ def submit_rfd_ligandmpnn_workflow(
         noise_scale_ca: RFdiffusion denoiser CA noise scale.
         noise_scale_frame: RFdiffusion denoiser frame noise scale.
         rfd_args: Extra RFdiffusion Hydra overrides.
-        force: Replace an existing workflow run ledger before running.
         wait: Wait locally for the remote workflow result.
-        max_parallel: Maximum ready workflow nodes per scheduler wave.
+        max_parallel: Maximum ready workflow Nodes and active Provider Calls.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
-        strict_artifact_checks: Validate referenced RFdiffusion volume artifacts
-            before reusing completed workflow nodes.
+        use_deployed_coordinator: Submit through an exact named deployment.
+        deployment_environment: Modal Environment containing the deployment.
+        deployment_name: Modal app deployment name. Defaults to this workflow.
+        deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    if predecessor_execution_run_id is not None and not use_deployed_coordinator:
+        raise ValueError("restart_from requires an exact deployed workflow coordinator")
+    if max_parallel < 1:
+        raise ValueError("max_parallel must be at least 1")
     input_path = Path(input_pdb).expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
@@ -608,17 +653,41 @@ def submit_rfd_ligandmpnn_workflow(
     if dry_run:
         print_workflow_dag(workflow.validate())
         return
+    execution_run_id = uuid4()
+    deployment = DeploymentIdentity(
+        environment=(
+            deployment_environment if use_deployed_coordinator else "development"
+        ),
+        deployment_name=(
+            (deployment_name or CONF.name) if use_deployed_coordinator else CONF.name
+        ),
+        deployment_version=deployment_version if use_deployed_coordinator else 1,
+    )
+    coordinator = orchestrator.execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
     orchestrator_kwargs = {
         "workflow": workflow,
-        "run_id": resolved_run_id,
-        "force": force,
-        "max_ready_workers": max_parallel,
+        "workload_run_key": resolved_run_id,
+        "max_parallel_nodes": max_parallel,
+        "max_active_provider_calls": max_parallel,
+        "max_active_gpu_provider_calls": max_parallel,
+        "strict_external_artifact_checks": True,
+        "external_artifact_checker_function_name": (
+            "check_rfd_ligandmpnn_external_artifact"
+        ),
     }
-    if strict_artifact_checks:
-        orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker"] = (
-            check_rfd_ligandmpnn_external_artifact.remote
-        )
+    if not use_deployed_coordinator:
+        orchestrator_kwargs["development_function_handles"] = {
+            "rfdiffusion_infer": rfdiffusion_app.rfdiffusion_infer,
+            "select_rfdiffusion_design": select_rfdiffusion_design,
+            "ligandmpnn_run": ligandmpnn_app.ligandmpnn_run,
+            "check_rfd_ligandmpnn_external_artifact": (
+                check_rfd_ligandmpnn_external_artifact
+            ),
+        }
     total_structures = num_rfdiffusion_trajectories * num_rfdiffusion_designs
     print(
         f"Submitting {CONF.name} '{resolved_run_id}' with "
@@ -628,8 +697,17 @@ def submit_rfd_ligandmpnn_workflow(
         f"{total_structures} LigandMPNN node(s)",
         flush=True,
     )
-    orchestrator_handle = orchestrator.WorkflowOrchestrator()
-    fc = orchestrator_handle.run.spawn(**orchestrator_kwargs)
+    fc = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        coordinator_kwargs=orchestrator_kwargs,
+    )
+    print(
+        f"Coordinator FunctionCall ID: {getattr(fc, 'object_id', fc)}",
+        flush=True,
+    )
     if wait:
         result: AppRunResult | str = AppRunResult.model_validate(fc.get())
         print(f"{CONF.name} run finished with status: {result.status}", flush=True)

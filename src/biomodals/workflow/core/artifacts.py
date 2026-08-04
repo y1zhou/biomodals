@@ -122,7 +122,7 @@ def _materialize_inline_bytes(
     output_name: str,
     output_kind: ArtifactKind,
     workflow_volume_name: str,
-    attempt_dir: Path,
+    result_dir: Path,
     volume_root: Path | None,
     producing_node_id: str,
     metadata: dict[str, Any] | None = None,
@@ -137,7 +137,7 @@ def _materialize_inline_bytes(
     _validate_inline_text_bytes(storage, output_kind)
     safe_filename = sanitize_filename(storage.filename)
 
-    artifact_parent = artifact_parent or attempt_dir
+    artifact_parent = artifact_parent or result_dir
     materialized_dir = artifact_parent / artifact_id
     materialized_dir.mkdir(parents=True, exist_ok=True)
     materialized_file = materialized_dir.joinpath(safe_filename)
@@ -351,7 +351,7 @@ def _materialize_volume_path_copy(
     output_name: str,
     output_kind: ArtifactKind,
     workflow_volume_name: str,
-    attempt_dir: Path,
+    result_dir: Path,
     volume_root: Path | None,
     producing_node_id: str,
     metadata: dict[str, Any],
@@ -373,7 +373,7 @@ def _materialize_volume_path_copy(
     if not source_path.exists():
         raise FileNotFoundError(f"Volume output path not found: {source_path}")
 
-    artifact_parent = artifact_parent or attempt_dir
+    artifact_parent = artifact_parent or result_dir
     materialized_dir = artifact_parent / artifact_id
     _copy_volume_path_tree(
         source_path=source_path,
@@ -400,9 +400,10 @@ def materialize_app_run_result(
     *,
     result: AppRunResult,
     workflow_volume_name: str,
-    attempt_dir: Path,
+    result_dir: Path,
     artifact_dir: Path,
     producing_node_id: str,
+    artifact_id_scope: str | None = None,
     volume_root: Path | None = None,
     volume_path_mode: Literal["reference", "copy"] = "reference",
     volume_roots: Mapping[str, Path] | None = None,
@@ -412,6 +413,11 @@ def materialize_app_run_result(
     persisted_outputs: list[AppOutput] = []
     persisted_logs: list[AppOutput] = []
 
+    def scoped_output_name(output_name: str) -> str:
+        if artifact_id_scope is None:
+            return output_name
+        return f"{artifact_id_scope}-{output_name}"
+
     def materialize_output(
         output,
         *,
@@ -419,9 +425,10 @@ def materialize_app_run_result(
         source_app_output_name: str | None = None,
         artifact_parent: Path | None = None,
     ) -> tuple[WorkflowArtifact, AppOutput]:
+        artifact_output_name = scoped_output_name(artifact_output_name or output.name)
         artifact_id = _artifact_id(
             producing_node_id,
-            artifact_output_name or output.name,
+            artifact_output_name,
         )
         if isinstance(output.storage, InlineBytes):
             artifact = _materialize_inline_bytes(
@@ -429,7 +436,7 @@ def materialize_app_run_result(
                 output_name=output.name,
                 output_kind=output.kind,
                 workflow_volume_name=workflow_volume_name,
-                attempt_dir=attempt_dir,
+                result_dir=result_dir,
                 volume_root=volume_root,
                 producing_node_id=producing_node_id,
                 metadata=output.metadata,
@@ -446,7 +453,7 @@ def materialize_app_run_result(
                 output_name=output.name,
                 output_kind=output.kind,
                 workflow_volume_name=workflow_volume_name,
-                attempt_dir=attempt_dir,
+                result_dir=result_dir,
                 volume_root=volume_root,
                 producing_node_id=producing_node_id,
                 metadata=output.metadata,
@@ -495,7 +502,7 @@ def materialize_app_run_result(
             log_output,
             artifact_output_name=f"logs-{log_output.name}",
             source_app_output_name=log_output.name,
-            artifact_parent=attempt_dir / "logs",
+            artifact_parent=result_dir / "logs",
         )
         _write_json(artifact_dir / f"{artifact.artifact_id}.json", artifact)
         artifacts.append(artifact)

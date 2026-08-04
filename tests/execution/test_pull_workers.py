@@ -1,0 +1,621 @@
+"""SQLite-backed pull-worker assignment tests."""
+
+# ruff: noqa: D103, S106
+
+import sqlite3
+
+import pytest
+
+from biomodals.execution import (
+    AvailabilityStatus,
+    DispatchMode,
+    NodeAggregationPolicy,
+    NodeStatus,
+    ResultProvenance,
+    RunStatus,
+    TaskStatus,
+)
+
+from .provider_call_helpers import (
+    GPU_BINDING,
+    RUN_ID,
+    create_repository,
+    persist_pull_policy,
+)
+
+
+def _admit_workers(repository, count: int, *, max_worker_calls: int = 100):
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=2,
+        max_worker_calls=max_worker_calls,
+    )
+    claims = []
+    for index in range(count):
+        claim = repository.preclaim_pull_worker(
+            RUN_ID,
+            "inference",
+            submission_token=f"worker-{index}",
+            binding=GPU_BINDING,
+            compatibility_key="af3-seeds",
+            claim_capacity=2,
+            now=110 + index,
+        )
+        assert claim is not None
+        repository.attach_provider_call(
+            claim.call.provider_call_id,
+            provider_call_handle_id=f"fc-worker-{index}",
+            now=120 + index,
+        )
+        repository.mark_provider_call_running(
+            claim.call.provider_call_id,
+            now=130 + index,
+        )
+        claims.append(claim)
+    return claims
+
+
+def test_pull_worker_count_is_derived_from_unfinished_tasks_and_claim_capacity() -> (
+    None
+):
+    repository = create_repository(
+        task_count=5,
+        max_active_provider_calls=5,
+        max_active_gpu_provider_calls=5,
+    )
+
+    claims = _admit_workers(repository, 3)
+    excess = repository.preclaim_pull_worker(
+        RUN_ID,
+        "inference",
+        submission_token="worker-3",
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=2,
+        now=140,
+    )
+
+    assert all(claim.call.dispatch_mode == DispatchMode.PULL_WORKER for claim in claims)
+    assert excess is None
+
+
+def test_pull_worker_preclaim_enforces_the_node_worker_cap() -> None:
+    repository = create_repository(
+        task_count=100,
+        max_active_provider_calls=5,
+        max_active_gpu_provider_calls=5,
+    )
+
+    _admit_workers(repository, 1, max_worker_calls=1)
+    excess = repository.preclaim_pull_worker(
+        RUN_ID,
+        "inference",
+        submission_token="worker-1",
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=2,
+        now=140,
+    )
+
+    assert excess is None
+
+
+def test_claim_response_is_checkpointed_idempotent_and_ordered() -> None:
+    repository = create_repository(
+        task_count=5,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=3,
+    )
+    first, second, third = _admit_workers(repository, 3)
+
+    first_claim = repository.claim_pull_tasks(
+        first.call.provider_call_id,
+        request_id="first-claim",
+        capacity=2,
+        now=140,
+    )
+    duplicate = repository.claim_pull_tasks(
+        first.call.provider_call_id,
+        request_id="first-claim",
+        capacity=2,
+        now=141,
+    )
+    second_claim = repository.claim_pull_tasks(
+        second.call.provider_call_id,
+        request_id="second-claim",
+        capacity=2,
+        now=142,
+    )
+    third_claim = repository.claim_pull_tasks(
+        third.call.provider_call_id,
+        request_id="third-claim",
+        capacity=2,
+        now=143,
+    )
+    empty_after_race = repository.claim_pull_tasks(
+        second.call.provider_call_id,
+        request_id="second-empty",
+        capacity=2,
+        now=144,
+    )
+
+    assert [assignment.task_key for assignment in first_claim.assignments] == [
+        "seed-0",
+        "seed-1",
+    ]
+    assert duplicate == first_claim
+    assert [assignment.task_key for assignment in second_claim.assignments] == [
+        "seed-2",
+        "seed-3",
+    ]
+    assert [assignment.task_key for assignment in third_claim.assignments] == ["seed-4"]
+    assert empty_after_race.assignments == ()
+
+    tasks = repository.list_tasks(RUN_ID, "inference")
+    assert all(task.status == TaskStatus.RUNNING for task in tasks)
+    assert tasks[0].worker_provider_call_id == first.call.provider_call_id
+    assert tasks[2].worker_provider_call_id == second.call.provider_call_id
+    assert tasks[4].worker_provider_call_id == third.call.provider_call_id
+
+
+def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection, task_count=100)
+
+    claim_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT task_key
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND status = ?
+            AND result_observation = ?
+            AND provider_call_id IS NULL
+            AND worker_provider_call_id IS NULL
+            AND local_owned = 0
+            AND dispatch_policy_json IS NULL
+        ORDER BY ordinal
+        LIMIT ?
+        """,
+        (str(RUN_ID), "inference", "pending", "missing", 8),
+    ).fetchall()
+    count_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT COUNT(*)
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND status IN (?, ?)
+            AND dispatch_policy_json IS NULL
+        """,
+        (str(RUN_ID), "inference", "pending", "running"),
+    ).fetchall()
+    validation_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT task_key
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND status = 'pending'
+            AND result_observation IS NOT 'missing'
+            AND dispatch_policy_json IS NULL
+        LIMIT 1
+        """,
+        (str(RUN_ID), "inference"),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_unplanned_dispatch_idx" in str(row[3]) for row in claim_plan
+    )
+    assert any(
+        "execution_tasks_unplanned_dispatch_idx" in str(row[3])
+        or "execution_tasks_publication_recovery_idx" in str(row[3])
+        for row in count_plan
+    )
+    assert any(
+        "execution_tasks_unplanned_dispatch_idx" in str(row[3])
+        or "execution_tasks_publication_recovery_idx" in str(row[3])
+        for row in validation_plan
+    )
+
+
+def test_publication_recovery_omits_known_missing_pending_tasks() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=4)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="running",
+        capacity=2,
+        now=140,
+    )
+    connection.execute(
+        """
+        UPDATE execution_tasks
+        SET result_observation = NULL
+        WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+        """,
+        (str(RUN_ID), "inference", "seed-2"),
+    )
+
+    tasks = repository.list_tasks_requiring_publication_recovery(
+        RUN_ID,
+        "inference",
+    )
+
+    assert [task.task_key for task in tasks] == ["seed-0", "seed-1", "seed-2"]
+
+
+def test_publication_recovery_uses_its_status_index() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection)
+
+    query_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM execution_tasks
+        WHERE execution_run_id = ?
+            AND node_key = ?
+            AND (
+                status = 'running'
+                OR (
+                    status = 'pending'
+                    AND result_observation IS NOT 'missing'
+                )
+            )
+        ORDER BY ordinal
+        """,
+        (str(RUN_ID), "inference"),
+    ).fetchall()
+
+    assert any(
+        "execution_tasks_publication_recovery_idx" in str(row[3]) for row in query_plan
+    )
+
+
+def test_pull_worker_rejects_an_unobserved_pending_task() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(connection=connection, task_count=1)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=1,
+    )
+    connection.execute(
+        """
+        UPDATE execution_tasks
+        SET result_observation = NULL
+        WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
+        """,
+        (str(RUN_ID), "inference", "seed-0"),
+    )
+
+    with pytest.raises(ValueError, match="was not cache-validated"):
+        repository.preclaim_pull_worker(
+            RUN_ID,
+            "inference",
+            submission_token="must-not-spawn",
+            binding=GPU_BINDING,
+            compatibility_key="af3-seeds",
+            claim_capacity=1,
+            now=110,
+        )
+
+    assert repository.list_provider_calls(RUN_ID) == ()
+
+
+def test_worker_can_claim_after_spawn_before_call_attachment() -> None:
+    repository = create_repository(task_count=1)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=1,
+    )
+    worker = repository.preclaim_pull_worker(
+        RUN_ID,
+        "inference",
+        submission_token="worker-starting",
+        binding=GPU_BINDING,
+        compatibility_key="af3-seeds",
+        claim_capacity=1,
+        now=110,
+    )
+    assert worker is not None
+
+    claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="startup-race",
+        capacity=1,
+        now=111,
+    )
+
+    assert [assignment.task_key for assignment in claim.assignments] == ["seed-0"]
+
+
+def test_suspended_run_returns_no_new_pull_assignments() -> None:
+    repository = create_repository(task_count=2)
+    (worker,) = _admit_workers(repository, 1)
+    repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-0",
+        AvailabilityStatus.UNKNOWN,
+        now=140,
+    )
+
+    claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="while-suspended",
+        capacity=2,
+        now=141,
+    )
+
+    assert repository.get_run(RUN_ID).status == RunStatus.SUSPENDED
+    assert claim.assignments == ()
+    assert repository.get_task(RUN_ID, "inference", "seed-1").status == (
+        TaskStatus.PENDING
+    )
+
+
+def test_fail_fast_pull_claim_stops_unowned_siblings() -> None:
+    repository = create_repository(
+        task_count=2,
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    (worker,) = _admit_workers(repository, 1)
+    first = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="first",
+        capacity=1,
+        now=140,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        first.assignments[0].task_key,
+        request_id="failed-first",
+        observation=AvailabilityStatus.MISSING,
+        message="scientific output was missing",
+        now=141,
+    )
+
+    next_claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="after-failure",
+        capacity=1,
+        now=142,
+    )
+
+    assert next_claim.assignments == ()
+    assert repository.get_task(RUN_ID, "inference", "seed-1").status == (
+        TaskStatus.SKIPPED
+    )
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.RUNNING
+    assert (
+        repository.reconcile_node_tasks(
+            RUN_ID,
+            "inference",
+            now=143,
+        ).status
+        == NodeStatus.FAILED
+    )
+
+
+def test_fail_fast_provider_failure_stops_other_workers() -> None:
+    repository = create_repository(
+        task_count=3,
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    first, second = _admit_workers(repository, 2)
+    repository.claim_pull_tasks(
+        first.call.provider_call_id,
+        request_id="first",
+        capacity=1,
+        now=140,
+    )
+
+    repository.fail_provider_call(
+        first.call.provider_call_id,
+        message="worker failed",
+        now=141,
+    )
+
+    assert (
+        repository.claim_pull_tasks(
+            second.call.provider_call_id,
+            request_id="after-failure",
+            capacity=2,
+            now=142,
+        ).assignments
+        == ()
+    )
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.RUNNING
+    assert (
+        repository.reconcile_node_tasks(
+            RUN_ID,
+            "inference",
+            now=143,
+        ).status
+        == NodeStatus.FAILED
+    )
+
+
+def test_fail_fast_worker_return_stops_unowned_siblings() -> None:
+    repository = create_repository(
+        task_count=2,
+        aggregation_policy=NodeAggregationPolicy.FAIL_FAST,
+    )
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="first",
+        capacity=1,
+        now=140,
+    )
+
+    repository.record_provider_call_result(
+        worker.call.provider_call_id,
+        result_envelope={"claimed_tasks": 1},
+        now=141,
+    )
+
+    assert repository.get_node(RUN_ID, "inference").status == NodeStatus.RUNNING
+    assert [task.status for task in repository.list_tasks(RUN_ID, "inference")] == [
+        TaskStatus.FAILED,
+        TaskStatus.SKIPPED,
+    ]
+    assert (
+        repository.reconcile_node_tasks(
+            RUN_ID,
+            "inference",
+            now=142,
+        ).status
+        == NodeStatus.FAILED
+    )
+
+
+def test_claim_request_conflicts_and_failed_owner_never_reassigns_tasks() -> None:
+    repository = create_repository(task_count=3)
+    first, second = _admit_workers(repository, 2)
+    repository.claim_pull_tasks(
+        first.call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+        now=140,
+    )
+
+    with pytest.raises(ValueError, match="claim request ID was reused"):
+        repository.claim_pull_tasks(
+            second.call.provider_call_id,
+            request_id="claim",
+            capacity=1,
+            now=141,
+        )
+
+    failed_call = repository.fail_provider_call(
+        first.call.provider_call_id,
+        message="worker failed",
+        now=150,
+    )
+    remaining = repository.claim_pull_tasks(
+        second.call.provider_call_id,
+        request_id="remaining",
+        capacity=2,
+        now=151,
+    )
+
+    assert [assignment.task_key for assignment in remaining.assignments] == ["seed-2"]
+    assert failed_call.task_keys == ()
+    assert {
+        task.task_key: task.status
+        for task in repository.list_tasks(RUN_ID, "inference")
+    } == {
+        "seed-0": TaskStatus.FAILED,
+        "seed-1": TaskStatus.FAILED,
+        "seed-2": TaskStatus.RUNNING,
+    }
+
+
+def test_worker_completion_report_is_idempotent_and_publication_driven() -> None:
+    repository = create_repository(task_count=1)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+        now=140,
+    )
+
+    completed = repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="completion",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=150,
+    )
+    duplicate = repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="completion",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=151,
+    )
+
+    assert completed.status == TaskStatus.SUCCEEDED
+    assert completed.result_provenance == ResultProvenance.CURRENT_RUN
+    assert duplicate == completed
+
+    with pytest.raises(ValueError, match="completion request ID was reused"):
+        repository.record_pull_task_completion(
+            worker.call.provider_call_id,
+            "seed-0",
+            request_id="completion",
+            observation=AvailabilityStatus.MISSING,
+            now=152,
+        )
+
+
+def test_active_pull_worker_reconciliation_skips_assignment_history() -> None:
+    repository = create_repository(task_count=2)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+        now=140,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="complete-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=145,
+    )
+
+    [active] = repository.list_provider_calls_requiring_reconciliation(RUN_ID)
+
+    assert active.task_keys == ()
+    assert repository.get_provider_call(worker.call.provider_call_id).task_keys == (
+        "seed-0",
+        "seed-1",
+    )
+
+
+def test_successful_worker_fails_any_unreported_assignment() -> None:
+    repository = create_repository(task_count=2)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+        now=140,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="complete-0",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=145,
+    )
+
+    completed_call = repository.record_provider_call_result(
+        worker.call.provider_call_id,
+        result_envelope={"claimed_tasks": 2},
+        now=150,
+    )
+
+    assert completed_call.task_keys == ()
+    assert {
+        task.task_key: task.status
+        for task in repository.list_tasks(RUN_ID, "inference")
+    } == {
+        "seed-0": TaskStatus.SUCCEEDED,
+        "seed-1": TaskStatus.FAILED,
+    }

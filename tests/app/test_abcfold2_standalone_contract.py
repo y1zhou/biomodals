@@ -3,10 +3,14 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import sys
+from hashlib import sha256
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from uuid import UUID
 
 from biomodals.app.fold import abcfold2_app
+from biomodals.app.fold.abcfold2_execution import ABCFold2RunConfig
+from biomodals.execution import RunStatus
 
 
 class FakeOutputVolume:
@@ -15,6 +19,9 @@ class FakeOutputVolume:
 
     def commit(self) -> None:
         self.commit_count += 1
+
+    def reload(self) -> None:
+        pass
 
 
 def test_prepare_abcfold2_uses_hash_partitioned_app_run_root(
@@ -115,3 +122,188 @@ def test_prepare_abcfold2_uses_hash_partitioned_app_run_root(
     assert calls["prepare_chai"]["conf_file"] == run_root / f"{run_id}.yaml"
     assert calls["prepare_chai"]["out_dir"] == run_root
     assert output_volume.commit_count == 3
+
+
+def test_collectors_only_package_completed_seed_directories(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    volume = FakeOutputVolume()
+    workdir = tmp_path / "run"
+    boltz_dir = workdir / "boltz_models"
+    chai_dir = workdir / "chai_models"
+    boltz_dir.mkdir(parents=True)
+    chai_dir.mkdir()
+    (boltz_dir / "run.yaml").write_text("boltz")
+    (chai_dir / "run.yaml").write_text("chai")
+    monkeypatch.setattr(
+        abcfold2_app,
+        "CONF",
+        SimpleNamespace(output_volume=volume),
+    )
+    monkeypatch.setattr(
+        abcfold2_app, "package_outputs", lambda *_args, **_kwargs: b"tar"
+    )
+    run_conf = {"workdir": str(workdir), "run_id": "run"}
+
+    boltz = abcfold2_app.collect_abcfold2_boltz_data.get_raw_f()(
+        run_conf,
+        publication_key="boltz-key",
+    )
+    chai = abcfold2_app.collect_abcfold2_chai_data.get_raw_f()(
+        run_conf,
+        publication_key="chai-key",
+    )
+
+    assert Path(str(boltz["archive_path"])).read_bytes() == b"tar"
+    assert Path(str(chai["archive_path"])).read_bytes() == b"tar"
+    assert volume.commit_count == 2
+
+
+def test_seed_publication_rejects_an_old_parameter_key(tmp_path: Path) -> None:
+    result = tmp_path / "boltz_models" / "boltz_results_seed-1"
+    result.mkdir(parents=True)
+    abcfold2_app._write_publication_marker(
+        tmp_path / ".biomodals" / "boltz-seed-1.json",
+        {"publication_key": "old", "result_path": str(result)},
+    )
+
+    assert not abcfold2_app._seed_ready(tmp_path, "boltz", 1, "new")
+
+
+def test_publication_validators_reject_same_size_corruption(tmp_path: Path) -> None:
+    result = tmp_path / "boltz_models" / "boltz_results_seed-1"
+    result.mkdir(parents=True)
+    artifact = result / "prediction.cif"
+    artifact.write_bytes(b"ab")
+    abcfold2_app._write_publication_marker(
+        tmp_path / ".biomodals" / "boltz-seed-1.json",
+        {
+            "publication_key": "seed-key",
+            "result_path": str(result),
+            "artifacts": [
+                {
+                    "path": artifact.name,
+                    "size": 2,
+                    "sha256": sha256(b"ab").hexdigest(),
+                }
+            ],
+        },
+    )
+    archive = abcfold2_app._archive_path(tmp_path, "boltz")
+    archive.write_bytes(b"cd")
+    abcfold2_app._write_publication_marker(
+        tmp_path / ".biomodals" / "boltz-archive.json",
+        {
+            "publication_key": "archive-key",
+            "archive_path": str(archive),
+            "size": 2,
+            "sha256": sha256(b"cd").hexdigest(),
+        },
+    )
+
+    assert abcfold2_app._seed_ready(tmp_path, "boltz", 1, "seed-key")
+    assert abcfold2_app._archive_ready(tmp_path, "boltz", "archive-key")
+
+    artifact.write_bytes(b"ef")
+    archive.write_bytes(b"gh")
+
+    assert not abcfold2_app._seed_ready(tmp_path, "boltz", 1, "seed-key")
+    assert not abcfold2_app._archive_ready(tmp_path, "boltz", "archive-key")
+
+
+def test_local_entrypoint_launches_one_execution_coordinator(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    input_yaml = tmp_path / "input.yaml"
+    input_yaml.write_text("name: demo\n")
+    output_dir = tmp_path / "results"
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    captured = {}
+
+    class FakeVolume:
+        def read_file(self, path):
+            captured.setdefault("downloads", []).append(path)
+            yield b"tar"
+
+    class FakeMethod:
+        def spawn(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=RunStatus.SUCCEEDED,
+                        status_message=None,
+                        status_reason=None,
+                    )
+                ),
+            )
+
+    def stage(volume, run_id, request):
+        captured.update(volume=volume, run_id=run_id, request=request)
+
+    def coordinator_handle(**kwargs):
+        captured["handle_kwargs"] = kwargs
+        return SimpleNamespace(run=FakeMethod())
+
+    volume = FakeVolume()
+    monkeypatch.setattr(
+        abcfold2_app,
+        "CONF",
+        SimpleNamespace(
+            name="ABCFold2",
+            version="0.2.0",
+            repo_commit_hash="fcfdd49",
+            output_volume=volume,
+            output_volume_mountpoint="/abcfold2-output",
+        ),
+    )
+    monkeypatch.setattr(abcfold2_app, "uuid4", lambda: execution_run_id)
+    monkeypatch.setattr(abcfold2_app, "stage_execution_request", stage)
+    monkeypatch.setattr(
+        abcfold2_app,
+        "stage_execution_launch",
+        lambda _volume, run_id, predecessor: captured.update(
+            launch=(run_id, predecessor)
+        ),
+    )
+    monkeypatch.setattr(
+        abcfold2_app,
+        "_execution_coordinator_handle",
+        coordinator_handle,
+    )
+    monkeypatch.setattr(
+        abcfold2_app,
+        "run_config_from_overview",
+        lambda _snapshot: ABCFold2RunConfig(
+            run_id="abcdef-no-tmpl",
+            workdir="/abcfold2-output/ab/abcdef-no-tmpl",
+            seeds=(1,),
+            num_trunk_recycles=1,
+            num_diffn_timesteps=2,
+            num_diffn_samples=3,
+            num_trunk_samples=4,
+            boltz_additional_cli_args=None,
+        ),
+    )
+    raw = abcfold2_app.submit_abcfold2_task.info.raw_f
+    assert raw is not None
+
+    raw(
+        input_yaml=str(input_yaml),
+        out_dir=str(output_dir),
+        run_name="demo",
+        run_boltz=True,
+        run_chai=True,
+        max_parallel_children=3,
+    )
+
+    local = output_dir / "demo-no-tmpl"
+    assert captured["launch"] == (execution_run_id, None)
+    assert captured["request"].max_active_provider_calls == 3
+    assert captured["run_kwargs"] == {"development": True}
+    assert (local / "run-config.json").is_file()
+    assert (local / "boltz_models.tar.zst").read_bytes() == b"tar"
+    assert (local / "chai_models.tar.zst").read_bytes() == b"tar"

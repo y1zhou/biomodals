@@ -85,6 +85,7 @@ def candidate_file_record(
     path: str | None = None,
     media_type: str | None = None,
     size_bytes: int | None = None,
+    content_sha256: str | None = None,
     expected: bool = True,
 ) -> dict[str, object]:
     """Build one nested file record for a candidate manifest row."""
@@ -96,6 +97,7 @@ def candidate_file_record(
         "path": _optional_posix_path(path),
         "media_type": media_type,
         "size_bytes": size_bytes,
+        "content_sha256": content_sha256,
         "expected": expected,
     }
 

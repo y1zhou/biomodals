@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import pickle
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
+from uuid import UUID
 
-import modal
 import pytest
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
@@ -19,34 +19,22 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactKind,
     InlineBytes,
-    NodePlacement,
     VolumePath,
     WorkflowArtifact,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow import rfd_ligandmpnn_workflow
+from biomodals.workflow.core.execution import execution_plan
 from biomodals.workflow.core.nodes import NodeRunContext
 from biomodals.workflow.rfd_ligandmpnn_workflow import (
     LigandMPNNDesignNode,
     LigandMPNNDesignSettings,
+    RFdiffusionSelectionNode,
     RFdiffusionTrajectoryNode,
     RFDLigandMPNNSummaryNode,
-    WorkflowModalNamespace,
     build_rfd_ligandmpnn_workflow,
     select_rfdiffusion_design,
 )
-
-
-class UnexpectedRemoteFunction:
-    """Sentinel remote object for paths a test must not call."""
-
-    def remote(self, *args: object, **kwargs: object) -> object:
-        """Fail if the sentinel is invoked."""
-        pytest.fail(f"Unexpected remote call: args={args}, kwargs={kwargs}")
-
-    def spawn(self, *args: object, **kwargs: object) -> object:
-        """Fail if the sentinel is spawned."""
-        pytest.fail(f"Unexpected spawn call: args={args}, kwargs={kwargs}")
 
 
 class FakeFunctionCall:
@@ -63,7 +51,7 @@ class FakeFunctionCall:
         return self.result
 
 
-UNEXPECTED_REMOTE = cast(modal.Function, UnexpectedRemoteFunction())
+RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
 
 def _context(
@@ -73,11 +61,36 @@ def _context(
     tmp_path: Path,
 ) -> NodeRunContext:
     return NodeRunContext(
-        run_id="run-1",
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
         node_id=node_id,
-        attempt_id="attempt-1",
+        task_key="node",
+        work_dir=tmp_path / "result",
         cache_dir=tmp_path / "cache",
         inputs=inputs or {},
+        volume_root=tmp_path,
+        workflow_volume_name="workflow-volume",
+    )
+
+
+def _selected_rfd_artifact(tmp_path: Path) -> WorkflowArtifact:
+    selected_path = tmp_path / "selected" / "demo-rfd001_0.pdb"
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_path.write_bytes(b"ATOM\n")
+    return WorkflowArtifact(
+        artifact_id="selected-rfd-design",
+        producing_node_id="select-demo-rfd001-d000",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path="selected/demo-rfd001_0.pdb",
+            media_type="chemical/x-pdb",
+        ),
+        metadata={
+            "rfd_run_name": "demo-rfd001",
+            "design_index": "0",
+            "redesigned_residues": "A1 A2",
+        },
     )
 
 
@@ -124,37 +137,46 @@ def test_build_rfd_ligandmpnn_workflow_models_trajectory_design_fanout() -> None
     assert set(definition.nodes) == {
         "rfd-demo-rfd001",
         "rfd-demo-rfd002",
+        "select-demo-rfd001-d000",
+        "select-demo-rfd001-d001",
+        "select-demo-rfd002-d000",
+        "select-demo-rfd002-d001",
         "ligandmpnn-demo-rfd001-d000",
         "ligandmpnn-demo-rfd001-d001",
         "ligandmpnn-demo-rfd002-d000",
         "ligandmpnn-demo-rfd002-d001",
         "summary",
     }
-    assert definition.dependencies["ligandmpnn-demo-rfd001-d000"] == {"rfd-demo-rfd001"}
-    assert definition.dependencies["ligandmpnn-demo-rfd001-d001"] == {"rfd-demo-rfd001"}
-    assert definition.dependencies["ligandmpnn-demo-rfd002-d000"] == {"rfd-demo-rfd002"}
+    assert definition.dependencies["select-demo-rfd001-d000"] == {"rfd-demo-rfd001"}
+    assert definition.dependencies["select-demo-rfd002-d000"] == {"rfd-demo-rfd002"}
+    assert definition.dependencies["ligandmpnn-demo-rfd001-d000"] == {
+        "select-demo-rfd001-d000"
+    }
+    assert definition.dependencies["ligandmpnn-demo-rfd001-d001"] == {
+        "select-demo-rfd001-d001"
+    }
     assert definition.dependencies["summary"] == {
         "ligandmpnn-demo-rfd001-d000",
         "ligandmpnn-demo-rfd001-d001",
         "ligandmpnn-demo-rfd002-d000",
         "ligandmpnn-demo-rfd002-d001",
     }
-
     rfd_node = definition.nodes["rfd-demo-rfd001"].node
+    selection_node = definition.nodes["select-demo-rfd001-d000"].node
     mpnn_node = definition.nodes["ligandmpnn-demo-rfd001-d000"].node
     summary_node = definition.nodes["summary"].node
 
     assert isinstance(rfd_node, RFdiffusionTrajectoryNode)
-    assert rfd_node.placement == NodePlacement.REMOTE
     assert rfd_node.pdb_content == b"ATOM\n"
     assert rfd_node.run_name == "demo-rfd001"
     assert rfd_node.contigs == "100-150/0 E333-526"
     assert rfd_node.hotspot_res == "E405,E408"
     assert rfd_node.num_designs == 2
-    assert isinstance(rfd_node.modal_namespace, WorkflowModalNamespace)
+    assert isinstance(selection_node, RFdiffusionSelectionNode)
+    assert selection_node.rfd_run_name == "demo-rfd001"
+    assert selection_node.design_index == 0
 
     assert isinstance(mpnn_node, LigandMPNNDesignNode)
-    assert mpnn_node.placement == NodePlacement.REMOTE
     assert mpnn_node.rfd_run_name == "demo-rfd001"
     assert mpnn_node.design_index == 0
     assert mpnn_node.run_name == "demo-rfd001-d000-mpnn"
@@ -166,38 +188,42 @@ def test_build_rfd_ligandmpnn_workflow_models_trajectory_design_fanout() -> None
         sc_num_samples=7,
         number_of_packs_per_design=5,
     )
-    assert mpnn_node.modal_namespace is rfd_node.modal_namespace
+    restored = pickle.loads(pickle.dumps(workflow))  # noqa: S301
+    assert restored.validate() == definition
 
     assert isinstance(summary_node, RFDLigandMPNNSummaryNode)
     assert summary_node.max_parallel == 8
 
 
-def test_rfdiffusion_node_calls_app_function_with_hydra_overrides(
+def test_rfd_ligandmpnn_app_version_changes_plan_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fingerprint() -> str:
+        workflow = build_rfd_ligandmpnn_workflow(
+            input_pdb=("input.pdb", b"ATOM\n"),
+            contigs="100-150",
+            hotspot_res="A1",
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint()
+    monkeypatch.setattr(
+        rfdiffusion_app,
+        "CONF",
+        rfdiffusion_app.CONF.model_copy(
+            update={"repo_commit_hash": "changed-rfdiffusion"}
+        ),
+    )
+
+    assert fingerprint() != baseline
+
+
+def test_rfdiffusion_node_prepares_kernel_call_with_hydra_overrides(
     tmp_path: Path,
 ) -> None:
-    calls: dict[str, Any] = {}
-
-    class FakeRFdiffusionFunction:
-        def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            calls.update(kwargs)
-            return FakeFunctionCall(
-                "fc-rfd-run",
-                AppRunResult(
-                    status=AppRunStatus.SUCCEEDED,
-                    outputs=[
-                        AppOutput(
-                            name="RFdiffusion_outputs",
-                            kind=ArtifactKind.DIRECTORY,
-                            storage=VolumePath(
-                                volume_name=rfdiffusion_app.CONF.output_volume_name,
-                                path="demo-rfd001/outputs/rfd-scaffolds",
-                            ),
-                            metadata={"run_name": "demo-rfd001"},
-                        )
-                    ],
-                ),
-            )
-
     node = RFdiffusionTrajectoryNode(
         pdb_content=b"ATOM\n",
         input_pdb_name="input.pdb",
@@ -205,59 +231,16 @@ def test_rfdiffusion_node_calls_app_function_with_hydra_overrides(
         contigs="100-150/0 E333-526",
         hotspot_res="E405 E408",
         num_designs=2,
-        modal_namespace=WorkflowModalNamespace(
-            rfdiffusion_infer=cast(modal.Function, FakeRFdiffusionFunction()),
-            ligandmpnn_run=UNEXPECTED_REMOTE,
-            select_rfd_design=UNEXPECTED_REMOTE,
-        ),
     )
 
-    result = node.run(_context(tmp_path=tmp_path))
+    invocation = node.prepare_remote(_context(tmp_path=tmp_path))
 
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert calls["input_pdb_bytes"] == b"ATOM\n"
-    assert calls["input_pdb_name"] == "input.pdb"
-    assert calls["run_name"] == "demo-rfd001"
-    assert calls[
-        "hydra_overrides"
-    ] == rfdiffusion_app.build_rfdiffusion_hydra_overrides(
-        contigs="100-150/0 E333-526",
-        num_designs=2,
-        hotspot_res="E405 E408",
-    )
-
-
-def test_rfdiffusion_node_submits_app_function_directly(
-    tmp_path: Path,
-) -> None:
-    calls: dict[str, Any] = {}
-
-    class FakeRFdiffusionFunction:
-        def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            calls.update(kwargs)
-            return FakeFunctionCall("fc-rfd")
-
-    node = RFdiffusionTrajectoryNode(
-        pdb_content=b"ATOM\n",
-        input_pdb_name="input.pdb",
-        run_name="../demo-rfd001",
-        contigs="100-150/0 E333-526",
-        hotspot_res="E405 E408",
-        num_designs=2,
-        modal_namespace=WorkflowModalNamespace(
-            rfdiffusion_infer=cast(modal.Function, FakeRFdiffusionFunction()),
-            ligandmpnn_run=UNEXPECTED_REMOTE,
-            select_rfd_design=UNEXPECTED_REMOTE,
-        ),
-    )
-
-    submission = node.submit_remote(_context(tmp_path=tmp_path))
-
-    assert submission.function_name == "rfdiffusion_infer"
-    assert submission.function_call.object_id == "fc-rfd"
-    assert calls["input_pdb_bytes"] == b"ATOM\n"
-    assert calls["run_name"] == "demo-rfd001"
-    assert calls[
+    assert invocation.function_name == "rfdiffusion_infer"
+    assert invocation.uses_gpu is True
+    assert invocation.kwargs["input_pdb_bytes"] == b"ATOM\n"
+    assert invocation.kwargs["input_pdb_name"] == "input.pdb"
+    assert invocation.kwargs["run_name"] == "demo-rfd001"
+    assert invocation.kwargs[
         "hydra_overrides"
     ] == rfdiffusion_app.build_rfdiffusion_hydra_overrides(
         contigs="100-150/0 E333-526",
@@ -311,11 +294,16 @@ def test_select_rfdiffusion_design_reads_pdb_trb_and_infers_redesigned_residues(
     )
 
     assert fake_volume.reloaded is True
-    assert selected == {
-        "pdb_name": "demo-rfd001_0.pdb",
-        "pdb_bytes": pdb_bytes,
-        "trb_name": "demo-rfd001_0.trb",
+    output = selected.outputs[0]
+    assert selected.status == AppRunStatus.SUCCEEDED
+    assert output.kind == ArtifactKind.STRUCTURES
+    assert output.storage.data == pdb_bytes
+    assert output.storage.filename == "demo-rfd001_0.pdb"
+    assert output.metadata == {
+        "rfd_run_name": "demo-rfd001",
+        "design_index": "0",
         "redesigned_residues": "A1 A4 B11",
+        "trb_name": "demo-rfd001_0.trb",
     }
 
 
@@ -356,7 +344,7 @@ def test_select_rfdiffusion_design_uses_mask_1d_without_complex_metadata(
         design_index=0,
     )
 
-    assert selected["redesigned_residues"] == "A1 A3"
+    assert selected.outputs[0].metadata["redesigned_residues"] == "A1 A3"
 
 
 def test_select_rfdiffusion_design_rejects_mask_length_mismatch(
@@ -397,63 +385,10 @@ def test_select_rfdiffusion_design_rejects_mask_length_mismatch(
         )
 
 
-def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
-    tmp_path: Path,
-) -> None:
-    select_calls: dict[str, Any] = {}
-    ligandmpnn_calls: dict[str, Any] = {}
-
-    class FakeSelectorFunction:
-        def remote(self, **kwargs: object) -> dict[str, object]:
-            select_calls.update(kwargs)
-            return {
-                "pdb_name": "demo-rfd001_0.pdb",
-                "pdb_bytes": b"ATOM\n",
-                "trb_name": "demo-rfd001_0.trb",
-                "redesigned_residues": "A1 A2",
-            }
-
-    class FakeLigandMPNNFunction:
-        def _record(self, **kwargs: object) -> AppRunResult:
-            ligandmpnn_calls.update(kwargs)
-            return AppRunResult(
-                status=AppRunStatus.SUCCEEDED,
-                outputs=[
-                    AppOutput(
-                        name="LigandMPNN_outputs",
-                        kind=ArtifactKind.ARCHIVE,
-                        storage=InlineBytes(
-                            data=b"tarball",
-                            filename="demo-rfd001-d000-mpnn_LigandMPNN.tar.zst",
-                            media_type=ZSTD_MEDIA_TYPE,
-                        ),
-                    )
-                ],
-            )
-
-        def remote(self, **kwargs: object) -> AppRunResult:
-            return self._record(**kwargs)
-
-        def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            return FakeFunctionCall("fc-ligandmpnn-run", self._record(**kwargs))
-
-    node = LigandMPNNDesignNode(
+def test_rfd_selection_node_prepares_tracked_provider_call(tmp_path: Path) -> None:
+    node = RFdiffusionSelectionNode(
         rfd_run_name="demo-rfd001",
         design_index=0,
-        run_name="../demo-rfd001-d000-mpnn",
-        modal_namespace=WorkflowModalNamespace(
-            rfdiffusion_infer=UNEXPECTED_REMOTE,
-            ligandmpnn_run=cast(modal.Function, FakeLigandMPNNFunction()),
-            select_rfd_design=cast(modal.Function, FakeSelectorFunction()),
-        ),
-        settings=LigandMPNNDesignSettings(
-            model_type="protein_mpnn",
-            seeds=(7, 11),
-            batch_size=4,
-            number_of_batches=3,
-            sc_num_samples=7,
-            number_of_packs_per_design=5,
-        ),
     )
     rfd_artifact = WorkflowArtifact(
         artifact_id="rfd-output",
@@ -466,69 +401,26 @@ def test_ligandmpnn_node_selects_rfd_output_and_calls_ligandmpnn(
         metadata={"run_name": "demo-rfd001"},
     )
 
-    result = node.run(
-        _context(
-            node_id="ligandmpnn-demo-rfd001-d000",
-            inputs={"rfd_output": [rfd_artifact]},
-            tmp_path=tmp_path,
-        )
+    invocation = node.prepare_remote(
+        _context(inputs={"rfd_output": [rfd_artifact]}, tmp_path=tmp_path)
     )
 
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert select_calls == {
+    assert invocation.function_name == "select_rfdiffusion_design"
+    assert invocation.uses_gpu is False
+    assert invocation.kwargs == {
         "rfd_output_storage_path": "demo-rfd001/outputs/rfd-scaffolds",
         "rfd_run_name": "demo-rfd001",
         "design_index": 0,
     }
-    assert ligandmpnn_calls["run_name"] == "demo-rfd001-d000-mpnn"
-    assert ligandmpnn_calls["script_mode"] == "run"
-    assert ligandmpnn_calls["struct_bytes"] == b"ATOM\n"
-    assert ligandmpnn_calls["seeds"] == [7, 11]
-    assert ligandmpnn_calls["cli_args"] == ligandmpnn_app.build_ligandmpnn_cli_args(
-        script_mode="run",
-        model_type="protein_mpnn",
-        batch_size=4,
-        number_of_batches=3,
-        parse_atoms_with_zero_occupancy=True,
-        pack_side_chains=True,
-        number_of_packs_per_design=5,
-        sc_num_samples=7,
-        repack_everything=True,
-        redesigned_residues="A1 A2",
-    )
-    assert result.outputs[0].name == "LigandMPNN_outputs"
 
 
-def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
+def test_ligandmpnn_node_reads_selected_artifact_and_prepares_kernel_call(
     tmp_path: Path,
 ) -> None:
-    select_calls: dict[str, Any] = {}
-    ligandmpnn_calls: dict[str, Any] = {}
-
-    class FakeSelectorFunction:
-        def remote(self, **kwargs: object) -> dict[str, object]:
-            select_calls.update(kwargs)
-            return {
-                "pdb_name": "demo-rfd001_0.pdb",
-                "pdb_bytes": b"ATOM\n",
-                "trb_name": "demo-rfd001_0.trb",
-                "redesigned_residues": "A1 A2",
-            }
-
-    class FakeLigandMPNNFunction:
-        def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            ligandmpnn_calls.update(kwargs)
-            return FakeFunctionCall("fc-ligandmpnn")
-
     node = LigandMPNNDesignNode(
         rfd_run_name="demo-rfd001",
         design_index=0,
         run_name="../demo-rfd001-d000-mpnn",
-        modal_namespace=WorkflowModalNamespace(
-            rfdiffusion_infer=UNEXPECTED_REMOTE,
-            ligandmpnn_run=cast(modal.Function, FakeLigandMPNNFunction()),
-            select_rfd_design=cast(modal.Function, FakeSelectorFunction()),
-        ),
         settings=LigandMPNNDesignSettings(
             model_type="protein_mpnn",
             seeds=(7, 11),
@@ -538,42 +430,27 @@ def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
             number_of_packs_per_design=5,
         ),
     )
-    rfd_artifact = WorkflowArtifact(
-        artifact_id="rfd-output",
-        producing_node_id="rfd-demo-rfd001",
-        kind=ArtifactKind.DIRECTORY,
-        storage=VolumePath(
-            volume_name=rfdiffusion_app.CONF.output_volume_name,
-            path="demo-rfd001/outputs/rfd-scaffolds",
-        ),
-        metadata={"run_name": "demo-rfd001"},
-    )
+    selected_artifact = _selected_rfd_artifact(tmp_path)
 
-    submission = node.submit_remote(
+    invocation = node.prepare_remote(
         _context(
             node_id="ligandmpnn-demo-rfd001-d000",
-            inputs={"rfd_output": [rfd_artifact]},
+            inputs={"selected_design": [selected_artifact]},
             tmp_path=tmp_path,
         )
     )
 
-    assert submission.function_name == "ligandmpnn_run"
-    assert submission.function_call.object_id == "fc-ligandmpnn"
-    assert submission.metadata == {
+    assert invocation.function_name == "ligandmpnn_run"
+    assert invocation.metadata == {
         "rfd_run_name": "demo-rfd001",
         "design_index": "0",
         "redesigned_residues": "A1 A2",
     }
-    assert select_calls == {
-        "rfd_output_storage_path": "demo-rfd001/outputs/rfd-scaffolds",
-        "rfd_run_name": "demo-rfd001",
-        "design_index": 0,
-    }
-    assert ligandmpnn_calls["run_name"] == "demo-rfd001-d000-mpnn"
-    assert ligandmpnn_calls["script_mode"] == "run"
-    assert ligandmpnn_calls["struct_bytes"] == b"ATOM\n"
-    assert ligandmpnn_calls["seeds"] == [7, 11]
-    assert ligandmpnn_calls["cli_args"] == ligandmpnn_app.build_ligandmpnn_cli_args(
+    assert invocation.kwargs["run_name"] == "demo-rfd001-d000-mpnn"
+    assert invocation.kwargs["script_mode"] == "run"
+    assert invocation.kwargs["struct_bytes"] == b"ATOM\n"
+    assert invocation.kwargs["seeds"] == [7, 11]
+    assert invocation.kwargs["cli_args"] == ligandmpnn_app.build_ligandmpnn_cli_args(
         script_mode="run",
         model_type="protein_mpnn",
         batch_size=4,
@@ -601,7 +478,7 @@ def test_ligandmpnn_node_submits_app_function_directly_and_processes_metadata(
                 )
             ],
         ),
-        submission.metadata,
+        invocation.metadata,
     )
 
     assert processed.outputs[0].metadata == {
@@ -623,7 +500,7 @@ def test_rfd_ligandmpnn_summary_reports_design_artifacts(tmp_path: Path) -> None
         kind=ArtifactKind.ARCHIVE,
         storage=VolumePath(
             volume_name="Workflow-outputs",
-            path="attempt/mpnn-output",
+            path="results/mpnn-output",
             media_type=ZSTD_MEDIA_TYPE,
         ),
         metadata={
@@ -654,22 +531,19 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     calls: dict[str, Any] = {}
 
     class FakeOrchestratorMethod:
-        def remote(self, **kwargs: object) -> AppRunResult:
-            calls["remote"] = kwargs
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
-
-        def spawn(self, **kwargs: object) -> str:
+        def spawn(self, **kwargs: object) -> FakeFunctionCall:
             calls["spawn"] = kwargs
-            return "call-1"
+            return FakeFunctionCall("call-1")
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs: object) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
@@ -691,7 +565,6 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
         max_parallel=3,
     )
 
-    assert "remote" not in calls
     assert calls["spawn"]["workflow"].name == "rfd_ligandmpnn"
     definition = calls["spawn"]["workflow"].validate()
     rfd_node = definition.nodes["rfd-demo-rfd001"].node
@@ -700,15 +573,84 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert isinstance(mpnn_node, LigandMPNNDesignNode)
     assert rfd_node.run_name == "demo-rfd001"
     assert mpnn_node.settings.seeds == (7, 11)
-    assert calls["spawn"]["run_id"] == "demo"
-    assert calls["spawn"]["force"] is False
-    assert calls["spawn"]["max_ready_workers"] == 3
+    UUID(str(calls["coordinator"]["execution_run_id"]))
+    assert calls["spawn"]["workload_run_key"] == "demo"
+    assert calls["coordinator"]["deployment_environment"] == "development"
+    assert calls["coordinator"]["deployment_name"] == rfd_ligandmpnn_workflow.CONF.name
+    assert calls["coordinator"]["deployment_version"] == 1
+    assert calls["spawn"]["max_parallel_nodes"] == 3
+    assert calls["spawn"]["max_active_provider_calls"] == 3
+    assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
+    assert set(calls["spawn"]["development_function_handles"]) == {
+        "rfdiffusion_infer",
+        "select_rfdiffusion_design",
+        "ligandmpnn_run",
+        "check_rfd_ligandmpnn_external_artifact",
+    }
     stdout = strip_ansi(capsys.readouterr().out)
     assert "Submitting RFDLigandMPNNWorkflow 'demo'" in stdout
     assert "1 RFdiffusion trajector" in stdout
 
 
-def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
+def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text("ATOM\n", encoding="utf-8")
+    calls: dict[str, Any] = {}
+    predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    class UnexpectedRunMethod:
+        def spawn(self, **_kwargs: object) -> FakeFunctionCall:
+            raise AssertionError("restart must not create a root run")
+
+    class FakePrepareMethod:
+        def remote(self, **kwargs: object) -> None:
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self, **kwargs: object) -> FakeFunctionCall:
+            calls["drive"] = kwargs
+            return FakeFunctionCall("call-1")
+
+    class FakeCoordinator:
+        run = UnexpectedRunMethod()
+        prepare_restart_from = FakePrepareMethod()
+        drive_prepared = FakeDriveMethod()
+
+    def fake_coordinator_handle(**kwargs: object) -> FakeCoordinator:
+        calls["coordinator"] = kwargs
+        return FakeCoordinator()
+
+    monkeypatch.setattr(
+        rfd_ligandmpnn_workflow.orchestrator,
+        "execution_coordinator_handle",
+        fake_coordinator_handle,
+    )
+
+    raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
+    assert raw_f is not None
+    raw_f(
+        input_pdb=str(input_pdb),
+        contigs="100-150/0 E333-526",
+        hotspot_res="E405,E408",
+        run_id="demo",
+        wait=False,
+        use_deployed_coordinator=True,
+        deployment_name="rfd-mpnn-prod",
+        deployment_version=7,
+        restart_from=predecessor,
+    )
+
+    assert calls["coordinator"]["deployment"].environment == "main"
+    assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
+    assert calls["prepare"]["workload_run_key"] == "demo"
+    assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
+    assert calls["drive"] == {}
+
+
+def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -717,22 +659,19 @@ def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
     calls: dict[str, object] = {}
 
     class FakeOrchestratorMethod:
-        def remote(self, **kwargs: object) -> AppRunResult:
-            calls["remote"] = kwargs
-            return AppRunResult(status=AppRunStatus.SUCCEEDED)
-
-        def spawn(self, **kwargs: object) -> str:
+        def spawn(self, **kwargs: object) -> FakeFunctionCall:
             calls["spawn"] = kwargs
-            return "call-1"
+            return FakeFunctionCall("call-1")
 
-    class FakeWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class FakeExecutionCoordinator:
+        def __init__(self, **kwargs: object) -> None:
+            calls["coordinator"] = kwargs
             self.run = FakeOrchestratorMethod()
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        FakeWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        FakeExecutionCoordinator,
     )
 
     raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
@@ -745,14 +684,14 @@ def test_submit_rfd_ligandmpnn_workflow_can_enable_strict_external_checks(
         num_rfdiffusion_trajectories=1,
         num_rfdiffusion_designs=1,
         wait=False,
-        strict_artifact_checks=True,
     )
 
     spawn_kwargs = calls["spawn"]
     assert spawn_kwargs["strict_external_artifact_checks"] is True
-    checker = spawn_kwargs["external_artifact_checker"]
-    assert callable(checker)
-    assert "check_rfd_ligandmpnn_external_artifact" in repr(checker)
+    assert (
+        spawn_kwargs["external_artifact_checker_function_name"]
+        == "check_rfd_ligandmpnn_external_artifact"
+    )
 
 
 def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(
@@ -763,14 +702,14 @@ def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(
     input_pdb = tmp_path / "input.pdb"
     input_pdb.write_text("ATOM\n", encoding="utf-8")
 
-    class UnexpectedWorkflowOrchestrator:
-        def __init__(self) -> None:
+    class UnexpectedExecutionCoordinator:
+        def __init__(self, **_kwargs: object) -> None:
             pytest.fail("dry-run should not construct the orchestrator")
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
-        "WorkflowOrchestrator",
-        UnexpectedWorkflowOrchestrator,
+        "ExecutionCoordinator",
+        UnexpectedExecutionCoordinator,
     )
 
     raw_f = rfd_ligandmpnn_workflow.submit_rfd_ligandmpnn_workflow.info.raw_f
@@ -786,14 +725,18 @@ def test_submit_rfd_ligandmpnn_workflow_dry_run_prints_dag_without_orchestrator(
     )
 
     stdout = capsys.readouterr().out
-    assert "[workflow] DAG graph: node_id [placement; class] <- dependency" in stdout
+    assert "[workflow] DAG graph: node_id [execution; class] <- dependency" in stdout
     assert (
-        "[workflow]   rfd-demo-rfd001 [remote; RFdiffusionTrajectoryNode] <- -"
+        "[workflow]   rfd-demo-rfd001 [provider; RFdiffusionTrajectoryNode] <- -"
         in stdout
     )
     assert (
+        "[workflow]   select-demo-rfd001-d000 "
+        "[provider; RFdiffusionSelectionNode] <- rfd-demo-rfd001" in stdout
+    )
+    assert (
         "[workflow]   ligandmpnn-demo-rfd001-d000 "
-        "[remote; LigandMPNNDesignNode] <- rfd-demo-rfd001" in stdout
+        "[provider; LigandMPNNDesignNode] <- select-demo-rfd001-d000" in stdout
     )
     assert "rfd_ligandmpnn_workflow.RFdiffusionTrajectoryNode" not in stdout
     assert "Submitting RFDLigandMPNNWorkflow" not in stdout

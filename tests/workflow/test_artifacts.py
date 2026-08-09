@@ -109,6 +109,62 @@ def test_task_scope_keeps_repeated_output_names_distinct(
     assert second.artifacts[0].source_app_output_name == "structure"
 
 
+def test_long_scoped_artifact_ids_use_a_bounded_digest(tmp_path: Path) -> None:
+    output_name = "x" * 165
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name=output_name,
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="result.txt"),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="fanout",
+        artifact_id_scope="s" * 97,
+        volume_root=tmp_path,
+    )
+
+    [artifact] = materialized.artifacts
+    assert artifact.artifact_id.startswith("artifact-")
+    assert len(artifact.artifact_id.encode()) <= 200
+    assert artifact.source_app_output_name == output_name
+    assert (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").is_file()
+
+
+def test_inline_filename_rejects_an_overlong_component(tmp_path: Path) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="x" * 256),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="filename exceeds"):
+        materialize_app_run_result(
+            result=result,
+            workflow_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="summary",
+            volume_root=tmp_path,
+        )
+
+    assert not (tmp_path / "result").exists()
+    assert not (tmp_path / "artifacts").exists()
+
+
 def test_workflow_artifact_availability_accepts_existing_workflow_file(
     tmp_path: Path,
 ) -> None:

@@ -24,9 +24,15 @@ from biomodals.schema import (
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
+_MAX_ARTIFACT_ID_BYTES = 200
+_MAX_FILENAME_BYTES = 255
+
 
 def _artifact_id(producing_node_id: str, output_name: str) -> str:
-    return sanitize_filename(f"{producing_node_id}-{output_name}")
+    artifact_id = sanitize_filename(f"{producing_node_id}-{output_name}")
+    if len(artifact_id.encode("utf-8")) <= _MAX_ARTIFACT_ID_BYTES:
+        return artifact_id
+    return f"artifact-{hashlib.sha256(artifact_id.encode('utf-8')).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -237,6 +243,8 @@ def _materialize_inline_bytes(
     )
     _validate_inline_text_bytes(storage, output_kind)
     safe_filename = sanitize_filename(storage.filename)
+    if len(safe_filename.encode("utf-8")) > _MAX_FILENAME_BYTES:
+        raise ValueError("InlineBytes filename exceeds the filesystem limit")
 
     artifact_parent = artifact_parent or result_dir
     materialized_dir = artifact_parent / artifact_id

@@ -123,7 +123,7 @@ PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
 )
 APP_RUN_OUTPUT_STRUCTURE_PATTERNS = PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS
 _ROSETTA_PLAN_SCHEMA_VERSION = 1
-_SCIENTIFIC_SCHEMA_VERSION = "1"
+_SCIENTIFIC_SCHEMA_VERSION = "2"
 
 DEPENDENCY_APPS = (
     "ppiflow",
@@ -3625,19 +3625,6 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def _required_archive_member(
-    files: Sequence[tuple[str, bytes]],
-    member_name: str,
-) -> tuple[str, bytes]:
-    matches = [item for item in files if item[0] == member_name]
-    if len(matches) != 1:
-        raise ValueError(
-            f"AlphaFold3 request archive requires member {member_name!r}; "
-            f"found {len(matches)}"
-        )
-    return matches[0]
-
-
 def _run_one_refold_candidate(
     *,
     structure_name: str,
@@ -3716,8 +3703,14 @@ def _run_one_refold_candidate(
         tarball_bytes,
         suffixes=(".json",),
     )
+    best_summary_files = [item for item in json_files if item[0] == best_summary_member]
+    if len(best_summary_files) != 1:
+        raise ValueError(
+            f"AlphaFold3 request archive requires member {best_summary_member!r}; "
+            f"found {len(best_summary_files)}"
+        )
     metric_rows = ppiflow_tables.refold_metric_rows_from_json_files(
-        [_required_archive_member(json_files, best_summary_member)],
+        best_summary_files,
         candidate_id=candidate_id,
         stage_name=step_name,
     )
@@ -3748,9 +3741,6 @@ def _run_one_refold_candidate(
                 "archive_format": "tar.zst",
                 "structure_patterns": (best_model_member,),
                 "request_best_model_archive_member": best_model_member,
-                "request_best_summary_confidences_archive_member": (
-                    best_summary_member
-                ),
             },
         )
     ]

@@ -177,6 +177,23 @@ def test_ppiflow_workflow_declares_app_dependency() -> None:
     assert CONF.tags == {"depends_on": "-".join(CONF.depends_on_apps)}
 
 
+def test_ppiflow_plan_binds_ranked_refold_semantics() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
+        steps_yaml_bytes=b"""
+PPIFlowStep:
+  run_name: demo-run
+  args:
+    name: demo
+    specified_hotspots: A1
+    input_pdb: /inputs/demo.pdb
+    binder_chain: B
+""",
+    )
+
+    assert workflow.validate().scientific_versions["biomodals.workflow.ppiflow"] == "2"
+
+
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
 

@@ -537,15 +537,19 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     input_pdb.write_text("ATOM\n", encoding="utf-8")
     calls: dict[str, Any] = {}
 
-    class FakeOrchestratorMethod:
-        def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            calls["spawn"] = kwargs
+    class FakePrepareMethod:
+        def remote(self, **kwargs: object) -> None:
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self) -> FakeFunctionCall:
             return FakeFunctionCall("call-1")
 
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs: object) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = FakePrepareMethod()
+            self.drive_prepared = FakeDriveMethod()
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
@@ -572,8 +576,8 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
         max_parallel=3,
     )
 
-    assert calls["spawn"]["workflow"].name == "rfd_ligandmpnn"
-    definition = calls["spawn"]["workflow"].validate()
+    assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
+    definition = calls["prepare"]["workflow"].validate()
     rfd_node = definition.nodes["rfd-demo-rfd001"].node
     mpnn_node = definition.nodes["ligandmpnn-demo-rfd001-d000"].node
     assert isinstance(rfd_node, RFdiffusionTrajectoryNode)
@@ -581,14 +585,14 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert rfd_node.run_name == "demo-rfd001"
     assert mpnn_node.settings.seeds == (7, 11)
     UUID(str(calls["coordinator"]["execution_run_id"]))
-    assert calls["spawn"]["workload_run_key"] == "demo"
+    assert calls["prepare"]["workload_run_key"] == "demo"
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == rfd_ligandmpnn_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
-    assert calls["spawn"]["max_parallel_nodes"] == 3
-    assert calls["spawn"]["max_active_provider_calls"] == 3
-    assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
-    assert set(calls["spawn"]["development_function_handles"]) == {
+    assert calls["prepare"]["max_parallel_nodes"] == 3
+    assert calls["prepare"]["max_active_provider_calls"] == 3
+    assert calls["prepare"]["max_active_gpu_provider_calls"] == 3
+    assert set(calls["prepare"]["development_function_handles"]) == {
         "rfdiffusion_infer",
         "select_rfdiffusion_design",
         "ligandmpnn_run",
@@ -665,15 +669,19 @@ def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(
     input_pdb.write_text("ATOM\n", encoding="utf-8")
     calls: dict[str, object] = {}
 
-    class FakeOrchestratorMethod:
-        def spawn(self, **kwargs: object) -> FakeFunctionCall:
-            calls["spawn"] = kwargs
+    class FakePrepareMethod:
+        def remote(self, **kwargs: object) -> None:
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self) -> FakeFunctionCall:
             return FakeFunctionCall("call-1")
 
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs: object) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = FakePrepareMethod()
+            self.drive_prepared = FakeDriveMethod()
 
     monkeypatch.setattr(
         rfd_ligandmpnn_workflow.orchestrator,
@@ -693,10 +701,10 @@ def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(
         wait=False,
     )
 
-    spawn_kwargs = calls["spawn"]
-    assert spawn_kwargs["strict_external_artifact_checks"] is True
+    prepare_kwargs = calls["prepare"]
+    assert prepare_kwargs["strict_external_artifact_checks"] is True
     assert (
-        spawn_kwargs["external_artifact_checker_function_name"]
+        prepare_kwargs["external_artifact_checker_function_name"]
         == "check_rfd_ligandmpnn_external_artifact"
     )
 

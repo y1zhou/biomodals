@@ -993,33 +993,6 @@ class ExecutionRuntime:
             self._checkpoint_state()
         return claim
 
-    def record_pull_task_completions(
-        self,
-        provider_call_id: UUID,
-        completions: Collection[tuple[str, str, AvailabilityStatus, str | None]],
-        *,
-        now: int,
-    ) -> tuple[ExecutionTaskRecord, ...]:
-        """Checkpoint one idempotent worker publication microbatch."""
-        items = tuple(completions)
-        if not items:
-            return ()
-        with self._synchronize():
-            with self._transaction():
-                tasks = tuple(
-                    self.repository.record_pull_task_completion(
-                        provider_call_id,
-                        task_key,
-                        request_id=request_id,
-                        observation=observation,
-                        message=message,
-                        now=now,
-                    )
-                    for task_key, request_id, observation, message in items
-                )
-            self._checkpoint_state()
-        return tasks
-
     def record_pull_task_completions_and_claim(
         self,
         provider_call_id: UUID,
@@ -1028,19 +1001,21 @@ class ExecutionRuntime:
         request_id: str,
         capacity: int,
         now: int,
-    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim]:
+    ) -> PullTaskClaim:
         """Checkpoint one completed microbatch and its next claim together."""
         with self._synchronize():
             with self._transaction():
-                result = self.repository.record_pull_task_completions_and_claim(
-                    provider_call_id,
-                    completions,
-                    request_id=request_id,
-                    capacity=capacity,
-                    now=now,
+                _completed, claim = (
+                    self.repository.record_pull_task_completions_and_claim(
+                        provider_call_id,
+                        completions,
+                        request_id=request_id,
+                        capacity=capacity,
+                        now=now,
+                    )
                 )
             self._checkpoint_state()
-        return result
+        return claim
 
     def reconcile_provider_calls(
         self,
@@ -1051,6 +1026,8 @@ class ExecutionRuntime:
         now: int,
         finalize_result: Callable[[Any], Any] | None = None,
         discard_result: Callable[[Any], None] | None = None,
+        recover_terminal_publications: Callable[[tuple[ProviderCallRecord, ...]], None]
+        | None = None,
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
         """Observe and prepare outside the writer, then durably finalize results."""
         with ExitStack() as prepared_cleanup:
@@ -1095,6 +1072,22 @@ class ExecutionRuntime:
                 and not abandoned_submissions
             ):
                 return tuple((call, call) for call in originals)
+
+            terminal_calls = tuple(
+                call
+                for call in originals
+                if (
+                    (observed := observations.get(call.provider_call_id)) is not None
+                    and observed[0].kind
+                    in {
+                        ModalCallObservationKind.SUCCEEDED,
+                        ModalCallObservationKind.FAILED,
+                        ModalCallObservationKind.CANCELLED,
+                    }
+                )
+            )
+            if recover_terminal_publications is not None and terminal_calls:
+                recover_terminal_publications(terminal_calls)
 
             reconciled = []
             checkpoint_needed = bool(abandoned_submissions or preparation_errors)

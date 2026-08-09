@@ -49,6 +49,7 @@ class RecordingDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
         self.succeeded = False
+        self.failed = False
         self.state_unknown = False
         self.cancelled: set[str] = set()
 
@@ -70,6 +71,11 @@ class RecordingDriver:
             return ModalCallObservation(ModalCallObservationKind.CANCELLED)
         if self.state_unknown:
             return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
+        if self.failed:
+            return ModalCallObservation(
+                ModalCallObservationKind.FAILED,
+                message="completion RPC connection lost",
+            )
         if self.succeeded:
             return ModalCallObservation(
                 ModalCallObservationKind.SUCCEEDED,
@@ -128,6 +134,9 @@ def _runtime(
 
 def _publish_assignment(runtime, assignment) -> dict[str, object]:
     task = RosettaTaskSpec.from_dict(assignment.execution_payload)
+    input_path = runtime.run_root / task.pdb
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_bytes(f"ATOM {task.index}\n".encode())
 
     def run_command(command, *, output_mode, log_file):
         del command, output_mode
@@ -210,14 +219,13 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
             ))
         output = cast(FakeVolume, runtime.output_volume)
         commits = output.commits
-        completed, next_claim = runtime.complete_pull_tasks_and_claim(
+        next_claim = runtime.complete_pull_tasks_and_claim(
             call.provider_call_id,
             tuple(completions),
             request_id=f"claim-{ordinal}-next",
             capacity=2,
         )
         assert output.commits == commits + 1
-        assert len(completed) == len(completions)
         assert next_claim.assignments == ()
 
     assert claimed_keys == ["1", "2", "3"]
@@ -231,6 +239,50 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
             "rosetta-tasks",
         )
     } == {TaskStatus.SUCCEEDED}
+    runtime.close()
+
+
+def test_terminal_worker_recovers_committed_outputs_after_lost_callback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    driver = RecordingDriver()
+    runtime = _runtime(tmp_path, driver)
+    runtime._initialize()
+    runtime.advance_once()
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    for ordinal, call in enumerate(calls):
+        claim = runtime.claim_pull_tasks(
+            call.provider_call_id,
+            request_id=f"claim-{ordinal}",
+            capacity=2,
+        )
+        for assignment in claim.assignments:
+            _publish_assignment(runtime, assignment)
+
+    output = cast(FakeVolume, runtime.output_volume)
+    from biomodals.app.bioinfo.rosetta import execution_runtime as runtime_module
+
+    real_validate = runtime_module.validate_task_publication
+
+    def validate_after_reload(*args, **kwargs):
+        return output.reloads > 0 and real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "validate_task_publication",
+        validate_after_reload,
+    )
+    driver.failed = True
+
+    runtime.advance_once()
+
+    assert output.reloads == 1
+    assert {
+        task.status
+        for task in runtime.store.execution.list_tasks(RUN_ID, "rosetta-tasks")
+    } == {TaskStatus.SUCCEEDED}
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.SUCCEEDED
     runtime.close()
 
 
@@ -249,25 +301,30 @@ def test_one_worker_failure_is_recorded_without_losing_sibling_success(
             request_id=f"claim-{ordinal}",
             capacity=2,
         )
-        runtime.complete_pull_tasks(
-            call.provider_call_id,
-            tuple(
-                (
-                    assignment.task_key,
-                    f"complete-{assignment.task_key}",
+        batch_index = 0
+        while claim.assignments:
+            claim = runtime.complete_pull_tasks_and_claim(
+                call.provider_call_id,
+                tuple(
                     (
-                        {
-                            "status": "failed",
-                            "task_key": assignment.task_key,
-                            "error": "Rosetta failed",
-                        }
-                        if assignment.task_key == "2"
-                        else _publish_assignment(runtime, assignment)
-                    ),
-                )
-                for assignment in claim.assignments
-            ),
-        )
+                        assignment.task_key,
+                        f"complete-{assignment.task_key}",
+                        (
+                            {
+                                "status": "failed",
+                                "task_key": assignment.task_key,
+                                "error": "Rosetta failed",
+                            }
+                            if assignment.task_key == "2"
+                            else _publish_assignment(runtime, assignment)
+                        ),
+                    )
+                    for assignment in claim.assignments
+                ),
+                request_id=f"claim-{ordinal}-next-{batch_index}",
+                capacity=2,
+            )
+            batch_index += 1
 
     driver.succeeded = True
     runtime.advance_once()

@@ -1545,14 +1545,18 @@ def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
         capacity=1,
         now=111,
     )
-    (completed,) = runtime.record_pull_task_completions(
+    next_claim = runtime.record_pull_task_completions_and_claim(
         call.provider_call_id,
         (("seed-0", "complete-0", AvailabilityStatus.AVAILABLE, None),),
+        request_id="claim-1",
+        capacity=1,
         now=112,
     )
 
     assert [assignment.task_key for assignment in claim.assignments] == ["seed-0"]
+    completed = repository.get_task(RUN_ID, "inference", "seed-0")
     assert completed.status.value == "succeeded"
+    assert next_claim.assignments == ()
     assert checkpoints == ["checkpoint"] * 4
 
 
@@ -1587,14 +1591,19 @@ def test_pull_completion_microbatch_crosses_one_checkpoint() -> None:
         now=111,
     )
 
-    completed = runtime.record_pull_task_completions(
+    next_claim = runtime.record_pull_task_completions_and_claim(
         call.provider_call_id,
         (
             ("seed-0", "complete-0", AvailabilityStatus.AVAILABLE, None),
             ("seed-1", "complete-1", AvailabilityStatus.AVAILABLE, None),
         ),
+        request_id="claim-1",
+        capacity=2,
         now=112,
     )
 
-    assert [task.status.value for task in completed] == ["succeeded", "succeeded"]
+    assert [
+        task.status.value for task in repository.list_tasks(RUN_ID, "inference")
+    ] == ["succeeded", "succeeded"]
+    assert next_claim.assignments == ()
     assert checkpoints == ["checkpoint"] * 4

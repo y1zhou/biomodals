@@ -60,6 +60,7 @@ class WorkflowArtifactStore:
                 role TEXT,
                 media_type TEXT,
                 size_bytes INTEGER,
+                content_sha256 TEXT,
                 metadata_json TEXT NOT NULL,
                 PRIMARY KEY (artifact_id, path),
                 UNIQUE (artifact_id, ordinal)
@@ -455,9 +456,10 @@ class WorkflowArtifactStore:
                 role,
                 media_type,
                 size_bytes,
+                content_sha256,
                 metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -467,6 +469,7 @@ class WorkflowArtifactStore:
                     file.role,
                     file.media_type,
                     file.size_bytes,
+                    file.content_sha256,
                     _json_dumps(file.metadata),
                 )
                 for ordinal, file in enumerate(artifact.files)
@@ -521,6 +524,7 @@ class WorkflowArtifactStore:
                     "role": file_row["role"],
                     "media_type": file_row["media_type"],
                     "size_bytes": file_row["size_bytes"],
+                    "content_sha256": file_row["content_sha256"],
                     "metadata": _json_loads(file_row["metadata_json"]),
                 }
                 for file_row in file_rows

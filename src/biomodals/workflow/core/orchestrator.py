@@ -213,6 +213,44 @@ class ExecutionCoordinator:
                     self._close_runtime()
 
     @modal.method()
+    def prepare_run(
+        self,
+        workflow: Workflow,
+        workload_run_key: str,
+        max_active_provider_calls: int = 32,
+        max_active_gpu_provider_calls: int | None = None,
+        max_parallel_nodes: int = 32,
+        strict_external_artifact_checks: bool = False,
+        external_artifact_checker_function_name: str | None = None,
+        development_function_handles: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist and checkpoint a root Run before asynchronous driving."""
+        candidate = WorkflowCoordinatorPlan(
+            workflow=workflow,
+            workload_run_key=workload_run_key,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            max_parallel_nodes=max_parallel_nodes,
+            strict_external_artifact_checks=strict_external_artifact_checks,
+            external_artifact_checker_function_name=(
+                external_artifact_checker_function_name
+            ),
+        )
+        with self._drive_lock:
+            with self._lock():
+                plan = self._persist_or_verify_plan(candidate)
+                if development_function_handles is not None:
+                    self._development_function_handles = dict(
+                        development_function_handles
+                    )
+                runtime = self._open_runtime(plan, resolve_external_checker=False)
+            try:
+                runtime.prepare(workload_run_key=plan.workload_run_key)
+            finally:
+                with self._lock():
+                    self._close_runtime()
+
+    @modal.method()
     def status(self) -> ExecutionOverview:
         """Read the current kernel overview without advancing the Run."""
         with self._lock():
@@ -288,23 +326,6 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def complete_tasks(
-        self,
-        provider_call_id: str,
-        completions: tuple[tuple[str, str, AppRunResult], ...],
-    ) -> Any:
-        """Publish and checkpoint one pull-worker Task completion microbatch."""
-        with self._lock():
-            self._require_ledger()
-            plan = self._load_plan()
-            runtime = self._open_runtime(plan, resolve_external_checker=False)
-        runtime.attach(workload_run_key=plan.workload_run_key)
-        return runtime.complete_pull_tasks(
-            UUID(provider_call_id),
-            completions,
-        )
-
-    @modal.method()
     def complete_tasks_and_claim(
         self,
         provider_call_id: str,
@@ -318,7 +339,7 @@ class ExecutionCoordinator:
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
         runtime.attach(workload_run_key=plan.workload_run_key)
-        _, claim = runtime.complete_pull_tasks_and_claim(
+        claim = runtime.complete_pull_tasks_and_claim(
             UUID(provider_call_id),
             completions,
             request_id=request_id,
@@ -850,7 +871,10 @@ def submit_workflow_run(
 
     try:
         if predecessor_execution_run_id is None:
-            call = coordinator.run.spawn(**coordinator_kwargs)
+            coordinator.prepare_run.remote(**coordinator_kwargs)
+            report_identity()
+            identity_reported = True
+            call = coordinator.drive_prepared.spawn()
         else:
             coordinator.prepare_restart_from.remote(
                 predecessor_execution_run_id=str(predecessor_execution_run_id),

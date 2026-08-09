@@ -105,6 +105,7 @@ def test_execution_plan_preserves_parallel_gromacs_dag() -> None:
         "collect_traj_stats:nvt_",
         "collect_traj_stats:npt_",
         "collect_traj_stats:production_",
+        "prepare_tpr_gpu",
     }
     assert plan.terminal_node_keys == (PREPARE_RESULT,)
     assert plan.scientific_payload == {

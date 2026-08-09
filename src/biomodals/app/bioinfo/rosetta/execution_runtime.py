@@ -24,6 +24,7 @@ from biomodals.execution import (
     ExecutionRuntime,
     NodeStatus,
     ProviderBinding,
+    ProviderCallRecord,
     ProviderCallSubmission,
     PullTaskClaim,
     TaskPlan,
@@ -105,23 +106,6 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             provider_call_id,
             request_id=request_id,
             capacity=capacity,
-            now=self._now(),
-        )
-
-    def complete_pull_tasks(
-        self,
-        provider_call_id: UUID,
-        completions: tuple[
-            tuple[str, str, Mapping[str, object]],
-            ...,
-        ],
-    ):
-        """Validate and checkpoint one worker publication microbatch."""
-        if not completions:
-            return ()
-        return self._provider.record_pull_task_completions(
-            provider_call_id,
-            self._pull_completion_observations(provider_call_id, completions),
             now=self._now(),
         )
 
@@ -316,8 +300,29 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             self.execution_run_id,
             required_node_keys=required,
             encode_result=_result_envelope,
+            recover_terminal_publications=self._recover_terminal_publications,
             now=self._now(),
         )
+
+    def _recover_terminal_publications(
+        self,
+        terminal_calls: tuple[ProviderCallRecord, ...],
+    ) -> None:
+        """Refresh committed worker outputs before terminal call projection."""
+        terminal_call_ids = {call.provider_call_id for call in terminal_calls}
+        with self.store.synchronize():
+            has_unfinished_assignments = any(
+                not task.status.is_terminal
+                and task.worker_provider_call_id in terminal_call_ids
+                for task in self.store.execution.list_tasks(
+                    self.execution_run_id,
+                    ROSETTA_TASKS_NODE,
+                )
+            )
+        if not has_unfinished_assignments:
+            return
+        self._reload_output()
+        self._recover_publications()
 
     def _start_ready_node(self) -> None:
         with self.store.synchronize():

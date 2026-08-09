@@ -758,9 +758,12 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
     calls = {}
 
-    class FakeOrchestratorMethod:
-        def spawn(self, **kwargs):
-            calls["spawn"] = kwargs
+    class FakePrepareMethod:
+        def remote(self, **kwargs):
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self):
             return FakeFunctionCall(
                 "call-1",
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
@@ -769,7 +772,8 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = FakePrepareMethod()
+            self.drive_prepared = FakeDriveMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
@@ -787,8 +791,8 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         max_parallel=3,
     )
 
-    assert calls["spawn"]["workflow"].name == "shortmd"
-    definition = calls["spawn"]["workflow"].validate()
+    assert calls["prepare"]["workflow"].name == "shortmd"
+    definition = calls["prepare"]["workflow"].validate()
     prep_node = definition.nodes["prep-shortmd-run-alpha"].node
     replicate_node = definition.nodes["replicate-shortmd-run-alpha-r001"].node
     analysis_node = definition.nodes["analysis-shortmd-run-alpha-r001"].node
@@ -804,14 +808,14 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         "stats_function",
     }.isdisjoint(replicate_node.__dict__)
     UUID(str(calls["coordinator"]["execution_run_id"]))
-    assert calls["spawn"]["workload_run_key"] == "shortmd-run"
+    assert calls["prepare"]["workload_run_key"] == "shortmd-run"
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == shortmd_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
-    assert calls["spawn"]["max_parallel_nodes"] == 3
-    assert calls["spawn"]["max_active_provider_calls"] == 3
-    assert calls["spawn"]["max_active_gpu_provider_calls"] == 3
-    assert set(calls["spawn"]["development_function_handles"]) == {
+    assert calls["prepare"]["max_parallel_nodes"] == 3
+    assert calls["prepare"]["max_active_provider_calls"] == 3
+    assert calls["prepare"]["max_active_gpu_provider_calls"] == 3
+    assert set(calls["prepare"]["development_function_handles"]) == {
         "clear_shortmd_gromacs_run",
         "prepare_tpr_cpu",
         "prepare_tpr_gpu",
@@ -836,9 +840,12 @@ def test_submit_shortmd_workflow_enables_external_checks(
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
     calls = {}
 
-    class FakeOrchestratorMethod:
-        def spawn(self, **kwargs):
-            calls["spawn"] = kwargs
+    class FakePrepareMethod:
+        def remote(self, **kwargs):
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self):
             return FakeFunctionCall(
                 "call-1",
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
@@ -847,7 +854,8 @@ def test_submit_shortmd_workflow_enables_external_checks(
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = FakePrepareMethod()
+            self.drive_prepared = FakeDriveMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
@@ -864,9 +872,9 @@ def test_submit_shortmd_workflow_enables_external_checks(
         wait=True,
     )
 
-    assert calls["spawn"]["strict_external_artifact_checks"] is True
+    assert calls["prepare"]["strict_external_artifact_checks"] is True
     assert (
-        calls["spawn"]["external_artifact_checker_function_name"]
+        calls["prepare"]["external_artifact_checker_function_name"]
         == "check_shortmd_external_artifact"
     )
 
@@ -880,13 +888,17 @@ def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
     calls = {}
 
-    class FakeOrchestratorMethod:
-        def spawn(self, **kwargs):
-            calls["spawn"] = kwargs
+    class FakePrepareMethod:
+        def remote(self, **kwargs):
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self):
             return FakeFunctionCall("call-1")
 
     class FakeCoordinator:
-        run = FakeOrchestratorMethod()
+        prepare_run = FakePrepareMethod()
+        drive_prepared = FakeDriveMethod()
 
     def fake_coordinator_handle(**kwargs):
         calls["coordinator"] = kwargs
@@ -915,7 +927,7 @@ def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles
     assert deployment.deployment_name == "shortmd-prod"
     assert deployment.deployment_version == 7
     assert calls["coordinator"]["use_deployed_coordinator"] is True
-    assert "development_function_handles" not in calls["spawn"]
+    assert "development_function_handles" not in calls["prepare"]
 
 
 def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
@@ -1026,15 +1038,19 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
     calls = {}
 
-    class FakeOrchestratorMethod:
-        def spawn(self, **kwargs):
-            calls["spawn"] = kwargs
+    class FakePrepareMethod:
+        def remote(self, **kwargs):
+            calls["prepare"] = kwargs
+
+    class FakeDriveMethod:
+        def spawn(self):
             return FakeFunctionCall("call-1")
 
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = FakePrepareMethod()
+            self.drive_prepared = FakeDriveMethod()
 
     monkeypatch.setattr(
         shortmd_workflow.orchestrator,
@@ -1052,7 +1068,7 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
         wait=False,
     )
 
-    definition = calls["spawn"]["workflow"].validate()
+    definition = calls["prepare"]["workflow"].validate()
     clear_node = definition.nodes["clear-shortmd-run-alpha"].node
     clone_node = definition.nodes["clone-shortmd-run-alpha-r001"].node
 
@@ -1062,4 +1078,4 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
     }
     assert clone_node.overwrite_clone is True
     assert "clone_function" not in clone_node.__dict__
-    assert "force" not in calls["spawn"]
+    assert "force" not in calls["prepare"]

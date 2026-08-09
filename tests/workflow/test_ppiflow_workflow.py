@@ -1058,7 +1058,7 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
         output_dir="outputs/1",
         worker_log="logs/1.log",
         expected_files=("outputs/1/score.sc",),
-        input_sha256="a" * 64,
+        input_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
         candidate_id="candidate-a",
     )
     plan_path = tmp_path / "rosetta-plan.json"
@@ -1316,7 +1316,7 @@ def test_rosetta_worker_claims_executes_and_checkpoints_microbatch(
         output_dir="outputs/1",
         worker_log="logs/1.log",
         expected_files=("outputs/1/score.sc",),
-        input_sha256="a" * 64,
+        input_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
         candidate_id="candidate-a",
     )
     assignment = WorkerAssignmentRecord(
@@ -1509,7 +1509,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         node_id="stage2-rosetta-relax",
     )
 
-    assert result.status == AppRunStatus.SUCCEEDED
+    assert result.status == AppRunStatus.PARTIAL
     assert [output.name for output in result.outputs] == [
         "rosetta_outputs",
         "rosetta_job_manifest",
@@ -1986,6 +1986,7 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
 
     result = ppiflow_workflow.rank_ppiflow_artifacts.get_raw_f()(
         structures=[structure_artifact],
+        candidate_manifests=[],
         score_artifacts=[score_artifact],
         config={"gentype": "binder", "dockq_threshold": 0.49},
         run_id="run-1",
@@ -2003,6 +2004,7 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
             "role": "structure",
             "media_type": "chemical/x-pdb",
             "size_bytes": 7,
+            "content_sha256": hashlib.sha256(b"ATOM 1\n").hexdigest(),
         }
     ]
     assert result.outputs[1].metadata["rows"] == 1
@@ -2030,6 +2032,7 @@ def test_rank_transform_allows_empty_ranked_outputs(
 
     result = ppiflow_workflow.rank_ppiflow_artifacts.get_raw_f()(
         structures=[structure_artifact],
+        candidate_manifests=[],
         score_artifacts=[score_artifact],
         config={"gentype": "binder", "dockq_threshold": 0.49},
         run_id="run-1",
@@ -2066,6 +2069,28 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
         "design-1,FilterStep_stage2,true,passed\n"
         "design-2,FilterStep_stage2,false,filtered\n",
         encoding="utf-8",
+    )
+    stage1_dir = report_dir / "stage1"
+    stage1_dir.mkdir()
+    stage1_audit_csv = stage1_dir / "filter_audit.csv"
+    stage1_audit_csv.write_text(
+        "candidate_id,stage_name,passed,reason\n"
+        "design-0,FilterStep_stage1,false,filtered\n",
+        encoding="utf-8",
+    )
+    stage1_manifest_path = stage1_dir / ppiflow_manifests.MANIFEST_FILENAME
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="design-0",
+                stage_name="FilterStep_stage1",
+                stage_role="filter",
+                operation_mode="rejected",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[],
+            )
+        ],
+        stage1_manifest_path,
     )
     manifest_path = report_dir / ppiflow_manifests.MANIFEST_FILENAME
     ppiflow_manifests.write_manifest(
@@ -2137,9 +2162,28 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                             volume_name="workflow-volume",
                             path="report-inputs/filter_audit.csv",
                         ),
-                    )
+                    ),
+                    WorkflowArtifact(
+                        artifact_id="audit-stage1",
+                        producing_node_id="filter-stage1",
+                        kind=ArtifactKind.TABLE,
+                        storage=VolumePath(
+                            volume_name="workflow-volume",
+                            path="report-inputs/stage1/filter_audit.csv",
+                        ),
+                    ),
                 ],
                 "candidate_manifest": [
+                    WorkflowArtifact(
+                        artifact_id="manifest-stage1",
+                        producing_node_id="filter-stage1",
+                        kind=ArtifactKind.TABLE,
+                        storage=VolumePath(
+                            volume_name="workflow-volume",
+                            path=("report-inputs/stage1/candidate_manifest.parquet"),
+                            media_type=ppiflow_manifests.MANIFEST_MEDIA_TYPE,
+                        ),
+                    ),
                     WorkflowArtifact(
                         artifact_id="manifest",
                         producing_node_id="filter",
@@ -2149,7 +2193,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                             path="report-inputs/candidate_manifest.parquet",
                             media_type=ppiflow_manifests.MANIFEST_MEDIA_TYPE,
                         ),
-                    )
+                    ),
                 ],
             },
         )
@@ -2158,6 +2202,8 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
     markdown = result.outputs[0].storage.data.decode("utf-8")
     assert "## Candidate Attrition" in markdown
     assert "FilterStep_stage2" in markdown
+    assert "| FilterStep_stage1 | 1 | 0 | 1 | 0 | 0 | 1 |" in markdown
+    assert "| FilterStep_stage2 | 2 | 1 | 1 | 0 | 0 | 2 |" in markdown
     assert "## Ranked Designs" in markdown
     assert [output.name for output in result.outputs[:2]] == [
         "design_report",
@@ -2166,6 +2212,9 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
     assert [output.metadata["source_artifact_id"] for output in result.outputs[2:]] == [
         "ranked-structures",
         "rank",
+        "audit",
+        "audit-stage1",
+        "manifest-stage1",
         "manifest",
     ]
     assert result.outputs[2].metadata["files"] == [
@@ -2353,7 +2402,18 @@ PPIFlowStep:
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = SimpleNamespace(
+                remote=lambda **prepare_kwargs: calls.__setitem__(
+                    "spawn",
+                    prepare_kwargs,
+                )
+            )
+            self.drive_prepared = SimpleNamespace(
+                spawn=lambda: _FakeFunctionCall(
+                    "call-1",
+                    AppRunResult(status=AppRunStatus.SUCCEEDED),
+                )
+            )
 
     monkeypatch.setattr(
         ppiflow_workflow,
@@ -2610,7 +2670,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-dockq",
     }
     assert definition.nodes["stage2-rank"].partial_dependencies == {
-        "stage2-alphafold3-refold"
+        "stage2-alphafold3-refold",
+        "stage2-rosetta-relax",
     }
     assert (
         definition.nodes["stage2-rank"].inputs["refold_metrics"].kind
@@ -2631,11 +2692,16 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     assert definition.nodes["stage2-report"].inputs["rank"].kind == ArtifactKind.TABLE
     assert definition.dependencies["stage2-report"] == {
         "stage2-rank",
+        "stage2-rosetta-relax",
         "stage1-ligandmpnn",
         "stage1-filter",
         "stage2-ligandmpnn",
         "stage2-filter",
         "stage2-alphafold3-refold",
+    }
+    assert definition.nodes["stage2-report"].partial_dependencies == {
+        "stage2-alphafold3-refold",
+        "stage2-rosetta-relax",
     }
     restored = pickle.loads(pickle.dumps(workflow))  # noqa: S301
     assert restored.validate() == definition
@@ -3224,7 +3290,18 @@ PPIFlowStep:
     class FakeExecutionCoordinator:
         def __init__(self, **kwargs) -> None:
             calls["coordinator"] = kwargs
-            self.run = FakeOrchestratorMethod()
+            self.prepare_run = SimpleNamespace(
+                remote=lambda **prepare_kwargs: calls.__setitem__(
+                    "spawn",
+                    prepare_kwargs,
+                )
+            )
+            self.drive_prepared = SimpleNamespace(
+                spawn=lambda: _FakeFunctionCall(
+                    "call-1",
+                    AppRunResult(status=AppRunStatus.SUCCEEDED),
+                )
+            )
 
     monkeypatch.setattr(
         ppiflow_workflow.orchestrator,

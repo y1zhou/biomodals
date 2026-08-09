@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
@@ -65,6 +65,10 @@ class RosettaTaskSpec:
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
                 raise ValueError("Rosetta input digests must be lowercase SHA-256")
+        if (self.rosetta_script is None) != (self.script_sha256 is None):
+            raise ValueError("Rosetta script path and digest must be supplied together")
+        if (self.flags_file is None) != (self.flags_sha256 is None):
+            raise ValueError("Rosetta flags path and digest must be supplied together")
 
     @property
     def scientific_payload(self) -> dict[str, object]:
@@ -110,6 +114,7 @@ def execute_rosetta_task(
     root = Path(run_root)
     if validate_task_publication(root, task, task_fingerprint):
         return _execution_result(task)
+    _validate_task_inputs(root, task)
 
     output_dir = root.joinpath(*_relative_path(task.output_dir).parts)
     worker_log = root.joinpath(*_relative_path(task.worker_log).parts)
@@ -146,6 +151,28 @@ def execute_rosetta_task(
     artifacts = _collect_output_artifacts(root, task)
     _write_task_publication(root, task, task_fingerprint, artifacts)
     return _execution_result(task)
+
+
+def _validate_task_inputs(root: Path, task: RosettaTaskSpec) -> None:
+    """Reject staged inputs that do not match the fingerprinted request."""
+    inputs = (
+        ("PDB", task.pdb, task.input_sha256),
+        ("script", task.rosetta_script, task.script_sha256),
+        ("flags", task.flags_file, task.flags_sha256),
+    )
+    for label, relative_path, expected_digest in inputs:
+        if relative_path is None or expected_digest is None:
+            continue
+        path = root.joinpath(*_relative_path(relative_path).parts)
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise FileNotFoundError(path)
+            with path.open("rb") as stream:
+                actual_digest = file_digest(stream, "sha256").hexdigest()
+        except OSError as error:
+            raise ValueError(f"Rosetta {label} input is unavailable: {path}") from error
+        if actual_digest != expected_digest:
+            raise ValueError(f"Rosetta {label} input does not match its SHA-256")
 
 
 def validate_task_publication(

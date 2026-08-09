@@ -33,10 +33,23 @@ def _task(*, expected_files: tuple[str, ...] = ()) -> RosettaTaskSpec:
     )
 
 
+def _stage_inputs(root: Path) -> None:
+    inputs = {
+        "inputs/1/input.pdb": b"ATOM\n",
+        "inputs/_script/workflow.xml": b"<ROSETTASCRIPTS />",
+        "inputs/_flags/options.flags": b"-nstruct 1",
+    }
+    for relative_path, content in inputs.items():
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
 def test_execute_preserves_command_and_reuses_valid_publication(
     tmp_path: Path,
 ) -> None:
     task = _task(expected_files=("outputs/1/score.sc",))
+    _stage_inputs(tmp_path)
     calls = []
 
     def run_command(command, *, output_mode, log_file):
@@ -78,6 +91,7 @@ def test_execute_preserves_command_and_reuses_valid_publication(
 
 def test_missing_declared_output_never_publishes_success(tmp_path: Path) -> None:
     task = _task(expected_files=("outputs/1/score.sc",))
+    _stage_inputs(tmp_path)
 
     def run_command(command, *, output_mode, log_file):
         del command, output_mode
@@ -96,6 +110,7 @@ def test_missing_declared_output_never_publishes_success(tmp_path: Path) -> None
 
 def test_empty_undeclared_output_never_publishes_success(tmp_path: Path) -> None:
     task = _task()
+    _stage_inputs(tmp_path)
 
     def run_command(command, *, output_mode, log_file):
         del command, output_mode
@@ -116,6 +131,7 @@ def test_volume_probe_revalidates_marker_and_required_files(
     tmp_path: Path,
 ) -> None:
     task = _task(expected_files=("outputs/1/score.sc",))
+    _stage_inputs(tmp_path)
 
     def run_command(command, *, output_mode, log_file):
         del command, output_mode
@@ -168,3 +184,31 @@ def test_volume_probe_revalidates_marker_and_required_files(
         task,
         "fingerprint",
     )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "label"),
+    [
+        ("inputs/1/input.pdb", "PDB"),
+        ("inputs/_script/workflow.xml", "script"),
+        ("inputs/_flags/options.flags", "flags"),
+    ],
+)
+def test_execute_rejects_staged_input_digest_mismatch(
+    tmp_path: Path,
+    relative_path: str,
+    label: str,
+) -> None:
+    task = _task()
+    _stage_inputs(tmp_path)
+    (tmp_path / relative_path).write_bytes(b"CORRUPTED")
+
+    with pytest.raises(ValueError, match=rf"Rosetta {label} input does not match"):
+        execute_rosetta_task(
+            run_root=tmp_path,
+            task=task,
+            task_fingerprint="fingerprint",
+            run_command=lambda *_args, **_kwargs: pytest.fail(
+                "Rosetta must not run with mismatched inputs"
+            ),
+        )

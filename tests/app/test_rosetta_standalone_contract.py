@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -144,6 +145,16 @@ def test_rosetta_worker_uses_app_run_layout(
         def commit(self) -> None:
             self.commit_count += 1
 
+    run_root = tmp_path / "demo-abc123"
+    staged_inputs = {
+        "inputs/1/demo.pdb": b"ATOM\n",
+        "inputs/_script/script.xml": b"<ROSETTASCRIPTS />",
+        "inputs/_flags/options.flags": b"-nstruct 1",
+    }
+    for relative_path, content in staged_inputs.items():
+        path = run_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
     task = rosetta_app.RosettaTaskSpec(
         task_key="1",
         index=1,
@@ -154,9 +165,9 @@ def test_rosetta_worker_uses_app_run_layout(
         output_dir="outputs/1",
         worker_log="logs/1.log",
         expected_files=(),
-        input_sha256="a" * 64,
-        script_sha256="b" * 64,
-        flags_sha256="c" * 64,
+        input_sha256=sha256(staged_inputs["inputs/1/demo.pdb"]).hexdigest(),
+        script_sha256=sha256(staged_inputs["inputs/_script/script.xml"]).hexdigest(),
+        flags_sha256=sha256(staged_inputs["inputs/_flags/options.flags"]).hexdigest(),
     )
     assignment = WorkerAssignmentRecord(
         execution_run_id=EXECUTION_RUN_ID,
@@ -226,7 +237,6 @@ def test_rosetta_worker_uses_app_run_layout(
         max_parallel=1,
     )
 
-    run_root = tmp_path / "demo-abc123"
     assert captured["cmd"] == [
         "/usr/bin/relax",
         "-parser:protocol",

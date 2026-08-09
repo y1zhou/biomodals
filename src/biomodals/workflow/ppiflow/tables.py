@@ -122,6 +122,7 @@ def parse_fasta_records(text: str) -> list[tuple[str, str]]:
 def refold_metric_rows_from_json_files(
     files: Sequence[tuple[str, bytes]],
     *,
+    candidate_id: str,
     stage_name: str,
 ) -> list[dict[str, object]]:
     """Extract candidate-keyed AlphaFold3 ReFold metrics from JSON files."""
@@ -141,7 +142,7 @@ def refold_metric_rows_from_json_files(
         if not metric_values:
             continue
         rows.append({
-            "candidate_id": candidate_key(path.name),
+            "candidate_id": candidate_id,
             "stage_name": stage_name,
             "source_file": file_name,
             **metric_values,
@@ -292,6 +293,7 @@ def ranked_design_rows(
     score_frames: Sequence[pl.DataFrame],
     gentype: str,
     dockq_threshold: float,
+    candidate_ids_by_filename: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     """Rank retained structures using available DockQ/AF3/Rosetta score rows."""
     csv_rows = [row for frame in score_frames for row in frame.iter_rows(named=True)]
@@ -313,7 +315,10 @@ def ranked_design_rows(
     )
     ranked = []
     for file_name, _ in structures:
-        key = candidate_key(file_name)
+        key = (candidate_ids_by_filename or {}).get(
+            file_name,
+            candidate_key(file_name),
+        )
         dockq_row = dockq_by_key.get(key, {})
         af3_row = af3_by_key.get(key, {})
         rosetta_row = rosetta_by_key.get(key, {})

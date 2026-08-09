@@ -340,7 +340,7 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         "candidate-a",
         "candidate-b",
     ]
-    runtime.complete_pull_tasks(
+    terminal = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
         (
             (
@@ -370,7 +370,10 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
                 ),
             ),
         ),
+        request_id="terminal",
+        capacity=2,
     )
+    assert terminal.assignments == ()
 
     result = runtime.run(workload_run_key="ppiflow-rosetta-pull")
 

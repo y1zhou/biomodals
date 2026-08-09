@@ -104,6 +104,9 @@ class CompletingDriver:
                 )
         if kwargs.get("save_processed_traj"):
             (self.root / f"{prefix}{self.run_name}_nopbc.xtc").write_bytes(b"xtc")
+            (self.root / f"{prefix}{self.run_name}_nopbc_centered.pdb").write_bytes(
+                b"ATOM\n"
+            )
 
 
 class IncompletePreparationDriver(CompletingDriver):
@@ -352,6 +355,68 @@ def test_prepare_publication_requires_downstream_inputs(tmp_path: Path) -> None:
         assert [name for name, _kwargs in driver.spawns] == ["prepare_tpr_gpu"]
     finally:
         runtime.close()
+
+
+def test_terminal_publication_covers_required_user_outputs(tmp_path: Path) -> None:
+    request = _request()
+    runtime = _runtime(tmp_path, request, FakeClaims(), RUN_ID, None)
+    root = request.run_root(tmp_path)
+
+    paths = {
+        path.relative_to(root).as_posix()
+        for path in runtime._node_paths(request.execution_plan.terminal_node_keys[0])
+    }
+
+    assert {
+        "production.mdp",
+        f"production_{request.run_name}.tpr",
+        f"production_{request.run_name}_nopbc.xtc",
+        f"production_{request.run_name}_nopbc_centered.pdb",
+    } <= paths
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("missing_name", "repair_function"),
+    [
+        ("production.mdp", "prepare_tpr_gpu"),
+        ("production_example.tpr", "prepare_tpr_gpu"),
+        (
+            "production_example_nopbc_centered.pdb",
+            "collect_traj_stats",
+        ),
+    ],
+)
+def test_successor_repairs_missing_terminal_output(
+    tmp_path: Path,
+    missing_name: str,
+    repair_function: str,
+) -> None:
+    request = _request()
+    claims = FakeClaims()
+    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
+    assert owner.run().run.status == RunStatus.SUCCEEDED
+    owner.close()
+    (request.run_root(tmp_path) / missing_name).unlink()
+    driver = CompletingDriver(tmp_path, request.run_name)
+    successor = GromacsExecutionRuntime(
+        request=request,
+        execution_run_id=SECOND_RUN_ID,
+        predecessor_execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_claims=claims,
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 20,
+    )
+    try:
+        assert successor.run().run.status == RunStatus.SUCCEEDED
+        assert repair_function in {name for name, _kwargs in driver.spawns}
+    finally:
+        successor.close()
 
 
 def test_concurrent_same_name_roots_elect_one_output_owner(tmp_path: Path) -> None:

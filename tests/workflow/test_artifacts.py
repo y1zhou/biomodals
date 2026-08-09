@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -138,6 +139,66 @@ def test_workflow_artifact_availability_accepts_existing_workflow_file(
         )
         == []
     )
+
+
+def test_workflow_artifact_availability_rejects_same_size_corruption(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "run" / "model.pdb"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"HACK\n")
+    artifact = WorkflowArtifact(
+        artifact_id="ranked-structure",
+        producing_node_id="rank",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/model.pdb",
+        ),
+        files=[
+            ArtifactFile(
+                path="model.pdb",
+                size_bytes=5,
+                content_sha256=sha256(b"ATOM\n").hexdigest(),
+            )
+        ],
+    )
+
+    errors = workflow_artifact_availability_errors(
+        artifact,
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "SHA-256" in errors[0]
+
+
+def test_workflow_artifact_availability_rejects_empty_declared_file(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "run" / "empty.csv"
+    output_path.parent.mkdir(parents=True)
+    output_path.touch()
+    artifact = WorkflowArtifact(
+        artifact_id="empty-table",
+        producing_node_id="table",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/empty.csv",
+        ),
+        files=[ArtifactFile(path="empty.csv")],
+    )
+
+    errors = workflow_artifact_availability_errors(
+        artifact,
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "empty" in errors[0]
 
 
 def test_workflow_artifact_availability_reports_missing_workflow_file(

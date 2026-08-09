@@ -50,7 +50,6 @@ from biomodals.execution.scheduler import (
     select_admissible_candidates,
 )
 from biomodals.helper.app_execution import ExecutionVolume, ExecutionVolumeSync
-from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import AppRunResult, AppRunStatus, VolumePath, WorkflowArtifact
 from biomodals.workflow.core.artifact_availability import (
     ExternalArtifactChecker,
@@ -72,6 +71,11 @@ from biomodals.workflow.core.nodes import (
 from biomodals.workflow.core.run_store import WorkflowRunStore
 
 _TASK_KEY = "node"
+
+
+def _task_storage_scope(task_key: str) -> str:
+    """Map an arbitrary Task key to one collision-resistant path component."""
+    return hashlib.sha256(task_key.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -241,6 +245,11 @@ class WorkflowRuntime:
         """Open and verify a Run without refreshing worker publications."""
         self._initialize(workload_run_key, reload_volume=False)
 
+    def prepare(self, *, workload_run_key: str) -> None:
+        """Create and checkpoint a pending Run before asynchronous driving."""
+        self._initialize(workload_run_key, reload_volume=False)
+        self._checkpoint()
+
     def refresh_publications(self, *, workload_run_key: str) -> None:
         """Refresh worker publications and verify an existing Run."""
         self._initialize(workload_run_key, reload_volume=True)
@@ -260,20 +269,6 @@ class WorkflowRuntime:
             now=self._now(),
         )
 
-    def complete_pull_tasks(
-        self,
-        provider_call_id: UUID,
-        completions: tuple[tuple[str, str, AppRunResult], ...],
-    ) -> tuple[ExecutionTaskRecord, ...]:
-        """Publish and checkpoint one worker result microbatch."""
-        completed, _ = self._complete_pull_tasks(
-            provider_call_id,
-            completions,
-            next_request_id=None,
-            next_capacity=None,
-        )
-        return completed
-
     def complete_pull_tasks_and_claim(
         self,
         provider_call_id: UUID,
@@ -281,32 +276,10 @@ class WorkflowRuntime:
         *,
         request_id: str,
         capacity: int,
-    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim]:
+    ) -> PullTaskClaim:
         """Publish one microbatch and checkpoint its successor claim together."""
-        completed, claim = self._complete_pull_tasks(
-            provider_call_id,
-            completions,
-            next_request_id=request_id,
-            next_capacity=capacity,
-        )
-        if claim is None:  # pragma: no cover - guarded by the supplied claim args
-            raise RuntimeError("fused pull completion did not create a claim")
-        return completed, claim
-
-    def _complete_pull_tasks(
-        self,
-        provider_call_id: UUID,
-        completions: tuple[tuple[str, str, AppRunResult], ...],
-        *,
-        next_request_id: str | None,
-        next_capacity: int | None,
-    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim | None]:
         if not completions:
-            if next_request_id is not None or next_capacity is not None:
-                raise ValueError("fused pull completion requires a nonempty batch")
-            return (), None
-        if (next_request_id is None) != (next_capacity is None):
-            raise ValueError("next pull claim requires both request ID and capacity")
+            raise ValueError("fused pull completion requires a nonempty batch")
         validated = tuple(
             (task_key, request_id, AppRunResult.model_validate(result))
             for task_key, request_id, result in completions
@@ -355,7 +328,7 @@ class WorkflowRuntime:
                 result_dir=context.work_dir,
                 artifact_dir=self.store.output_root / "artifacts",
                 producing_node_id=call.node_key,
-                artifact_id_scope=task_key,
+                artifact_id_scope=_task_storage_scope(task_key),
                 volume_root=self.volume_root,
             )
             artifacts = tuple(materialized.artifacts)
@@ -409,36 +382,17 @@ class WorkflowRuntime:
                         observation,
                         message,
                     ))
-                if next_request_id is None:
-                    completed = tuple(
-                        self.store.execution.record_pull_task_completion(
-                            provider_call_id,
-                            task_key,
-                            request_id=completion_request_id,
-                            observation=observation,
-                            message=message,
-                            now=now,
-                        )
-                        for (
-                            task_key,
-                            completion_request_id,
-                            observation,
-                            message,
-                        ) in kernel_completions
+                _completed, claim = (
+                    self.store.execution.record_pull_task_completions_and_claim(
+                        provider_call_id,
+                        kernel_completions,
+                        request_id=request_id,
+                        capacity=capacity,
+                        now=now,
                     )
-                    claim = None
-                else:
-                    completed, claim = (
-                        self.store.execution.record_pull_task_completions_and_claim(
-                            provider_call_id,
-                            kernel_completions,
-                            request_id=next_request_id,
-                            capacity=cast(int, next_capacity),
-                            now=now,
-                        )
-                    )
+                )
             self._checkpoint()
-        return completed, claim
+        return claim
 
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""
@@ -1320,7 +1274,7 @@ class WorkflowRuntime:
             result_dir=context.work_dir,
             artifact_dir=self.store.output_root / "artifacts",
             producing_node_id=node_id,
-            artifact_id_scope=task_key,
+            artifact_id_scope=_task_storage_scope(task_key),
             volume_root=self.volume_root,
         )
         observation = self._artifact_observation(tuple(materialized.artifacts))
@@ -1817,7 +1771,7 @@ class WorkflowRuntime:
         definition: WorkflowDefinition,
         node_id: str,
         *,
-        task_key: str = _TASK_KEY,
+        task_key: str | None = None,
     ) -> NodeRunContext:
         spec = definition.nodes[node_id]
         with self.store.synchronize():
@@ -1826,11 +1780,12 @@ class WorkflowRuntime:
                 for input_name, selector in spec.inputs.items()
             }
         node_root = self.store.output_root / "nodes" / node_id
-        if task_key == _TASK_KEY:
+        context_task_key = _TASK_KEY if task_key is None else task_key
+        if task_key is None:
             work_dir = node_root / "result"
             cache_dir = node_root / "cache"
         else:
-            task_root = node_root / "tasks" / sanitize_filename(task_key)
+            task_root = node_root / "tasks" / _task_storage_scope(task_key)
             work_dir = task_root / "result"
             cache_dir = task_root / "cache"
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -1839,7 +1794,7 @@ class WorkflowRuntime:
             execution_run_id=self.execution_run_id,
             workload_run_key=self._require_workload_run_key(),
             node_id=node_id,
-            task_key=task_key,
+            task_key=context_task_key,
             work_dir=work_dir,
             cache_dir=cache_dir,
             inputs=inputs,

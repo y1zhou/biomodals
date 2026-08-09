@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from biomodals.schema.storage import VolumePath
 
@@ -35,7 +35,18 @@ class ArtifactFile(BaseModel):
     role: str | None = None
     media_type: str | None = None
     size_bytes: int | None = None
+    content_sha256: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("content_sha256")
+    @classmethod
+    def _validate_content_sha256(cls, value: str | None) -> str | None:
+        if value is not None and (
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("content_sha256 must be a lowercase SHA-256 digest")
+        return value
 
 
 class WorkflowArtifact(BaseModel):

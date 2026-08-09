@@ -154,6 +154,25 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
 
 
 @dataclass
+class KeyedRemoteFanoutNode(RemoteFanoutNode):
+    task_keys: tuple[str, ...] = ()
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        del context
+        return tuple(
+            RemoteWorkflowTask(
+                task_key=task_key,
+                scientific_payload={"text": text},
+                execution_payload={"text": text},
+            )
+            for task_key, text in zip(self.task_keys, self.texts, strict=True)
+        )
+
+
+@dataclass
 class BatchedRemoteFanoutNode(RemoteFanoutNode):
     def prepare_remote_task(
         self,
@@ -953,6 +972,41 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
     }.issuperset(task_artifact_ids)
 
 
+def test_remote_task_storage_scopes_do_not_collide_after_path_sanitization(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("colliding-task-keys")
+    workflow.add_node(
+        KeyedRemoteFanoutNode(
+            texts=("alpha", "beta", "gamma"),
+            task_keys=("a/b", "a_b", "node"),
+        ),
+        id="fanout",
+    )
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=FanoutModalDriver(),
+        max_calls=3,
+        max_gpu_calls=0,
+    )
+
+    result = runtime.run(workload_run_key="colliding-task-keys")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    artifacts = [
+        runtime.store.artifacts.load_task_output_artifacts("fanout", task_key)[0]
+        for task_key in ("a/b", "a_b", "node")
+    ]
+    assert len({artifact.artifact_id for artifact in artifacts}) == 3
+    assert len({artifact.storage.path for artifact in artifacts}) == 3
+    assert all("/tasks/" in artifact.storage.path for artifact in artifacts)
+    assert [
+        (tmp_path / artifact.storage.path).read_text(encoding="utf-8")
+        for artifact in artifacts
+    ] == ["alpha", "beta", "gamma"]
+
+
 def test_remote_task_admission_reuses_persisted_dispatch_policy(
     tmp_path: Path,
 ) -> None:
@@ -1045,19 +1099,24 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
             request_id=f"claim-{call_index}",
             capacity=2,
         )
-        commits = volume.commits
-        runtime.complete_pull_tasks(
-            call.provider_call_id,
-            tuple(
-                (
-                    assignment.task_key,
-                    f"complete-{assignment.task_key}",
-                    _text_result(str(dict(assignment.execution_payload)["text"])),
-                )
-                for assignment in claim.assignments
-            ),
-        )
-        assert volume.commits == commits + 1
+        batch_index = 0
+        while claim.assignments:
+            commits = volume.commits
+            claim = runtime.complete_pull_tasks_and_claim(
+                call.provider_call_id,
+                tuple(
+                    (
+                        assignment.task_key,
+                        f"complete-{assignment.task_key}",
+                        _text_result(str(dict(assignment.execution_payload)["text"])),
+                    )
+                    for assignment in claim.assignments
+                ),
+                request_id=f"claim-{call_index}-next-{batch_index}",
+                capacity=2,
+            )
+            assert volume.commits == commits + 1
+            batch_index += 1
 
     runtime.advance_once()
 
@@ -1102,7 +1161,7 @@ def test_pull_completion_and_next_claim_share_one_checkpoint(
         capacity=2,
     )
 
-    completed, second = runtime.complete_pull_tasks_and_claim(
+    second = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
         tuple(
             (
@@ -1116,12 +1175,11 @@ def test_pull_completion_and_next_claim_share_one_checkpoint(
         capacity=2,
     )
 
-    assert [task.task_key for task in completed] == [
-        "candidate-0",
-        "candidate-1",
-    ]
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")[:2]
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED]
     assert [assignment.task_key for assignment in second.assignments] == ["candidate-2"]
-    _, terminal = runtime.complete_pull_tasks_and_claim(
+    terminal = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
         (
             (
@@ -1170,7 +1228,7 @@ def test_pull_completion_reloads_worker_owned_workflow_volume_output(
     published.write_text("alpha")
     reloads = volume.reloads
 
-    _, terminal = runtime.complete_pull_tasks_and_claim(
+    terminal = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
         (
             (
@@ -1253,11 +1311,15 @@ def test_pull_task_node_uses_workload_publication_probe(tmp_path: Path) -> None:
         capacity=1,
     ).assignments
 
-    (task,) = runtime.complete_pull_tasks(
+    terminal = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
         ((assignment.task_key, "complete", _text_result("alpha")),),
+        request_id="terminal",
+        capacity=1,
     )
 
+    assert terminal.assignments == ()
+    task = runtime.store.execution.get_task(RUN_ID, "fanout", assignment.task_key)
     assert task.status == TaskStatus.FAILED
     assert node.publication_probes == ["candidate-0"]
 

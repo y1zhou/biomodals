@@ -337,6 +337,33 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     )
 
 
+def test_prepared_root_is_durable_and_immediately_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+    workflow = Workflow("prepared-root")
+    workflow.add_node(TextNode("must not run"), id="science")
+
+    raw_cls.prepare_run._get_raw_f()(
+        instance,
+        workflow=workflow,
+        workload_run_key="prepared-root",
+    )
+
+    store = WorkflowRunStore(tmp_path, RUN_ID)
+    try:
+        assert store.execution.get_run(RUN_ID).status == RunStatus.PENDING
+    finally:
+        store.close()
+    assert volume.commit_count == 1
+
+    overview = raw_cls.cancel._get_raw_f()(instance)
+
+    assert overview.run.status == RunStatus.CANCELLED
+
+
 def test_coordinator_rejects_a_changed_plan_for_the_same_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1258,7 +1285,7 @@ def test_submit_successor_reports_identity_between_prepare_and_drive(
     ]
 
 
-def test_submit_root_reports_identity_after_spawn(
+def test_submit_root_reports_identity_between_prepare_and_drive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -1267,7 +1294,10 @@ def test_submit_root_reports_identity_after_spawn(
         lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
     )
     coordinator = SimpleNamespace(
-        run=SimpleNamespace(spawn=lambda **_kwargs: events.append("run") or "fc-root")
+        prepare_run=SimpleNamespace(remote=lambda **_kwargs: events.append("prepare")),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda: events.append("drive") or "fc-root"
+        ),
     )
 
     call = orchestrator.submit_workflow_run(
@@ -1280,9 +1310,10 @@ def test_submit_root_reports_identity_after_spawn(
 
     assert call == "fc-root"
     assert events == [
-        "run",
+        "prepare",
         "print:Deployment Identity: main/DemoWorkflow/v7",
         f"print:Execution Run ID: {RUN_ID}",
+        "drive",
     ]
 
 

@@ -863,6 +863,7 @@ def derive_ppiflow_fixed_positions(
 def rank_ppiflow_artifacts(
     *,
     structures: list[WorkflowArtifact],
+    candidate_manifests: list[WorkflowArtifact],
     score_artifacts: list[WorkflowArtifact],
     config: dict[str, object],
     run_id: str,
@@ -887,12 +888,27 @@ def rank_ppiflow_artifacts(
     if not score_frames:
         raise ValueError(f"{step_name} did not find any supported score tables")
 
+    manifest_frame = _candidate_manifest_frame_from_inputs(
+        candidate_manifests,
+        selected_structures,
+        step_name=step_name,
+    )
+    candidate_structures = ppiflow_staging.candidate_structure_files_from_selected(
+        selected_structures,
+        manifest_frame=manifest_frame,
+    )
     structure_by_key = {}
-    for name, data in selected_structures:
-        key = ppiflow_tables.candidate_key(name)
-        if key in structure_by_key:
-            raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
-        structure_by_key[key] = (name, data)
+    candidate_ids_by_filename = {}
+    for structure in candidate_structures:
+        if structure.candidate_id in structure_by_key:
+            raise ValueError(
+                f"Duplicate PPIFlow candidate identity: {structure.candidate_id!r}"
+            )
+        structure_by_key[structure.candidate_id] = (
+            structure.file_name,
+            structure.data,
+        )
+        candidate_ids_by_filename[structure.file_name] = structure.candidate_id
     raw_dockq_threshold = config.get("dockq_threshold", 0.49)
     if not isinstance(raw_dockq_threshold, str | int | float):
         raise TypeError("dockq_threshold must be a string or number")
@@ -901,6 +917,7 @@ def rank_ppiflow_artifacts(
         score_frames=score_frames,
         gentype=str(config.get("gentype") or "binder"),
         dockq_threshold=float(raw_dockq_threshold),
+        candidate_ids_by_filename=candidate_ids_by_filename,
     )
     output_dir = (
         Path(WORKFLOW_OUTPUT_MOUNTPOINT)
@@ -928,6 +945,7 @@ def rank_ppiflow_artifacts(
                     else "chemical/x-mmcif"
                 ),
                 size_bytes=len(file_bytes),
+                content_sha256=hashlib.sha256(file_bytes).hexdigest(),
             )
         )
     ranked_csv = output_dir / str(config.get("output_csv_name") or "ranked_designs.csv")
@@ -2073,10 +2091,14 @@ def finalize_ppiflow_rosetta_stage(
         step_name=step_name,
         rows=rows,
     )
+    if successful_candidates == len(task_specs):
+        result_status = AppRunStatus.SUCCEEDED
+    elif successful_candidates:
+        result_status = AppRunStatus.PARTIAL
+    else:
+        result_status = AppRunStatus.FAILED
     return AppRunResult(
-        status=(
-            AppRunStatus.SUCCEEDED if successful_candidates else AppRunStatus.FAILED
-        ),
+        status=result_status,
         outputs=[
             volume_app_output(
                 name="rosetta_outputs",
@@ -2907,7 +2929,7 @@ class RankNode(RemoteWorkflowNode):
         score_artifacts = [
             artifact
             for input_name, artifact_list in context.inputs.items()
-            if input_name != "structures"
+            if input_name not in {"structures", "candidate_manifest"}
             for artifact in artifact_list
         ]
         if not structures:
@@ -2917,6 +2939,7 @@ class RankNode(RemoteWorkflowNode):
             uses_gpu=False,
             kwargs={
                 "structures": structures,
+                "candidate_manifests": (context.inputs.get("candidate_manifest") or []),
                 "score_artifacts": score_artifacts,
                 "config": self.config,
                 "run_id": context.workload_run_key,
@@ -2954,8 +2977,8 @@ class ReportNode(WorkflowNativeNode):
                 ranked_rows.extend(
                     pl.read_csv(path, infer_schema_length=0).iter_rows(named=True)
                 )
-        manifest_frames = []
-        audit_frames = []
+        manifest_frames: list[tuple[str, pl.DataFrame]] = []
+        audit_frames: dict[str, list[pl.DataFrame]] = {}
         for artifact in artifacts:
             path = ppiflow_staging.artifact_mount_path(
                 artifact,
@@ -2965,20 +2988,37 @@ class ReportNode(WorkflowNativeNode):
                 continue
             if path.suffix == ".parquet":
                 try:
-                    manifest_frames.append(ppiflow_manifests.read_manifest(path))
+                    manifest_frame = ppiflow_manifests.read_manifest(path)
                 except ValueError:
                     continue
+                stage_names = (
+                    manifest_frame.get_column("stage_name").unique().to_list()
+                    if manifest_frame.height
+                    else ["unknown"]
+                )
+                manifest_frames.extend(
+                    (
+                        str(stage_name),
+                        manifest_frame.filter(pl.col("stage_name") == stage_name),
+                    )
+                    for stage_name in stage_names
+                )
             elif path.name == "filter_audit.csv":
-                audit_frames.append(pl.read_csv(path, infer_schema_length=0))
-        for index, manifest_frame in enumerate(manifest_frames):
-            audit_frame = audit_frames[index] if index < len(audit_frames) else None
+                audit_frame = pl.read_csv(path, infer_schema_length=0)
+                if "stage_name" not in audit_frame.columns:
+                    continue
+                for stage_name in audit_frame.get_column("stage_name").unique():
+                    audit_frames.setdefault(str(stage_name), []).append(
+                        audit_frame.filter(pl.col("stage_name") == stage_name)
+                    )
+        for stage_name, manifest_frame in manifest_frames:
+            matching_audits = audit_frames.get(stage_name, [])
+            audit_frame = (
+                pl.concat(matching_audits, how="diagonal") if matching_audits else None
+            )
             attrition_rows.extend(
                 ppiflow_tables.candidate_attrition_rows(
-                    stage_name=str(
-                        manifest_frame.get_column("stage_name").item(0)
-                        if manifest_frame.height
-                        else "unknown"
-                    ),
+                    stage_name=stage_name,
                     manifest_frame=manifest_frame,
                     audit_frame=audit_frame,
                 )
@@ -2993,11 +3033,9 @@ class ReportNode(WorkflowNativeNode):
         report_filename = str(
             self.config.get("report_filename") or "design_report.html"
         )
-        scientific_artifacts = [
-            artifact
-            for input_name in ("structures", "rank", "candidate_manifest")
-            for artifact in context.inputs.get(input_name, [])
-        ]
+        scientific_artifacts = list(
+            {artifact.artifact_id: artifact for artifact in artifacts}.values()
+        )
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -3544,6 +3582,7 @@ def _run_one_refold_candidate(
             tarball_bytes,
             suffixes=(".json",),
         ),
+        candidate_id=candidate_id,
         stage_name=step_name,
     )
     metrics_output = _inline_csv_table_output(
@@ -4124,7 +4163,7 @@ def _add_stage2_nodes(
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
-        partial_tail = None
+        partial_tail = tail
 
     if _step_enabled(enabled, "RosettaFixStep") and _step_enabled(
         enabled, "PartialStep"
@@ -4309,19 +4348,24 @@ def _add_stage2_nodes(
             id="stage2-rank",
             inputs=inputs,
             accept_partial_from=_partial_sources(
-                partial_tail if relaxed is None else None,
+                relaxed if relaxed is not None else partial_tail,
                 refold,
             ),
         )
 
     if _step_enabled(enabled, "ReportStep"):
+        final_structures = relaxed or filtered
         inputs = (
             {
                 "structures": rank.outputs(kind=ArtifactKind.STRUCTURES),
                 "rank": rank.outputs(kind=ArtifactKind.TABLE),
+                "candidate_manifest": final_structures.outputs(
+                    kind=ArtifactKind.TABLE,
+                    role=ppiflow_manifests.MANIFEST_FILE_ROLE,
+                ),
             }
             if rank is not None
-            else _structure_inputs(filtered)
+            else _structure_inputs(final_structures)
         )
         inputs.update(report_table_inputs)
         workflow.add_node(
@@ -4329,7 +4373,7 @@ def _add_stage2_nodes(
             id="stage2-report",
             inputs=inputs,
             accept_partial_from=_partial_sources(
-                partial_tail if rank is None else None,
+                relaxed if relaxed is not None else partial_tail,
                 refold,
             ),
         )

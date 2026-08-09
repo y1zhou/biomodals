@@ -92,6 +92,7 @@ def execution_plan(
         NPT_ANALYSIS,
         PRODUCTION_ANALYSIS,
     )
+    prepare_node = operations[0].operation
     nodes = tuple(
         NodePlan(
             node_key=operation.operation,
@@ -105,7 +106,8 @@ def execution_plan(
         NodePlan(
             node_key=PREPARE_RESULT,
             dependencies=tuple(
-                NodeDependency(node_key=dependency) for dependency in analysis_nodes
+                NodeDependency(node_key=dependency)
+                for dependency in (prepare_node, *analysis_nodes)
             ),
         ),
     )

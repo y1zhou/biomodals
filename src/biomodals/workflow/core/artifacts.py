@@ -83,16 +83,23 @@ def _artifact_files(root: Path) -> list[ArtifactFile]:
             ArtifactFile(
                 path=root.name,
                 size_bytes=root.stat().st_size,
+                content_sha256=_file_sha256(root),
             )
         ]
     return [
         ArtifactFile(
             path=str(path.relative_to(root)),
             size_bytes=path.stat().st_size,
+            content_sha256=_file_sha256(path),
         )
         for path in sorted(root.rglob("*"))
         if path.is_file()
     ]
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def _declared_artifact_files(metadata: Mapping[str, Any]) -> list[ArtifactFile]:
@@ -317,15 +324,23 @@ def _artifact_file_metadata_errors(
     file_path: Path,
     file: ArtifactFile,
 ) -> list[str]:
-    if file.size_bytes is None:
-        return []
     actual_size = file_path.stat().st_size
-    if actual_size == file.size_bytes:
-        return []
-    return [
-        f"{artifact_id}: workflow artifact file {file.path} has size "
-        f"{actual_size}, expected {file.size_bytes}"
-    ]
+    if actual_size < 1 and file.size_bytes != 0:
+        return [f"{artifact_id}: workflow artifact file {file.path} is empty"]
+    if file.size_bytes is not None and actual_size != file.size_bytes:
+        return [
+            f"{artifact_id}: workflow artifact file {file.path} has size "
+            f"{actual_size}, expected {file.size_bytes}"
+        ]
+    if (
+        file.content_sha256 is not None
+        and _file_sha256(file_path) != file.content_sha256
+    ):
+        return [
+            f"{artifact_id}: workflow artifact file {file.path} does not match "
+            "its SHA-256"
+        ]
+    return []
 
 
 def _copy_volume_path_tree(

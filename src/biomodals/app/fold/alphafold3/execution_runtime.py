@@ -825,7 +825,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         planned: dict[str, _PlannedTask],
         claimed: dict[str, ClaimedSeed],
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        path = self._candidate_result_path(candidate)
+        path = self._result_path(candidate.node_key, candidate.task_keys)
         values = [planned[key].value for key in candidate.task_keys]
         if candidate.node_key == _RAW_SEARCHES:
             task = cast(RawSearchTask, values[0])
@@ -1203,7 +1203,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         result = load_execution_result(
             self.inference_runtime.output_root,
             reference,
-            expected_path=self._call_result_path(call),
+            expected_path=self._result_path(call.node_key, call.task_keys),
         )
         if result is None:
             diagnostic = envelope.get("invalid_result")
@@ -1463,12 +1463,6 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             (f"{self.execution_run_id}:{task.node_key}:{task.fingerprint}").encode()
         ).hexdigest()
 
-    def _candidate_result_path(
-        self,
-        candidate: ProviderCallCandidate,
-    ) -> PurePosixPath:
-        return self._result_path(candidate.node_key, candidate.task_keys)
-
     def _result_path(
         self,
         node_key: str,
@@ -1520,9 +1514,6 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 digest,
             )
         return self._result_path(node_key, (task_key,))
-
-    def _call_result_path(self, call: ProviderCallRecord) -> PurePosixPath:
-        return self._result_path(call.node_key, call.task_keys)
 
     def _reload_output(self) -> None:
         super()._reload_output()

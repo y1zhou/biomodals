@@ -364,11 +364,6 @@ def run_ppiflow_dockq_stage(
         patterns=_patterns_from_config(config),
         max_files=_optional_config_int(config, "max_structures"),
     )
-    models_selected = ppiflow_staging.select_structure_files_from_artifacts(
-        model_artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        max_files=_optional_config_int(config, "max_models"),
-    )
     manifest = _candidate_manifest_frame_from_inputs(
         candidate_manifests or [],
         references_selected,
@@ -378,10 +373,30 @@ def run_ppiflow_dockq_stage(
         references_selected,
         manifest_frame=manifest,
     )
-    models = ppiflow_staging.candidate_structure_files_from_selected(
-        models_selected,
-        manifest_frame=manifest,
-    )
+    models = []
+    for artifact in model_artifacts:
+        candidate_id = artifact.metadata.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValueError(
+                f"DockQ model artifact {artifact.artifact_id!r} has no "
+                "canonical candidate_id"
+            )
+        selected = ppiflow_staging.select_structure_files_from_artifacts(
+            [artifact],
+            PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        )
+        models.extend(
+            ppiflow_staging.CandidateStructureFile(
+                candidate_id=candidate_id,
+                file_name=file_name,
+                data=data,
+                source_path=file_name,
+            )
+            for file_name, data in selected
+        )
+    models.sort(key=lambda item: item.file_name)
+    if (max_models := _optional_config_int(config, "max_models")) is not None:
+        models = models[:max_models]
     pairs = ppiflow_staging.prepare_dockq_pairs_by_candidate(
         references=references,
         models=models,

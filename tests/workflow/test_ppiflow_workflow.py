@@ -1793,7 +1793,9 @@ def test_dockq_stage_rejects_unpaired_structure_counts(
     with pytest.raises(ValueError, match="pairing mismatch"):
         ppiflow_workflow.run_ppiflow_dockq_stage.get_raw_f()(
             reference_artifacts=[_upstream_structure_artifact()],
-            model_artifacts=[_upstream_structure_artifact()],
+            model_artifacts=[
+                _upstream_structure_artifact(metadata={"candidate_id": "model-a"})
+            ],
             candidate_manifests=None,
             config={},
             run_name="dockq-run",
@@ -1805,7 +1807,7 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
 ) -> None:
     selected = iter([
         [("candidate.pdb", b"ATOM REF\n")],
-        [("candidate.pdb", b"ATOM MODEL\n")],
+        [("workflow-ReFoldStep-candidate_model.cif", b"ATOM MODEL\n")],
     ])
     dockq = _FakeModalFunction(
         "unused",
@@ -1829,7 +1831,9 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
 
     ppiflow_workflow.run_ppiflow_dockq_stage.get_raw_f()(
         reference_artifacts=[_upstream_structure_artifact()],
-        model_artifacts=[_upstream_structure_artifact()],
+        model_artifacts=[
+            _upstream_structure_artifact(metadata={"candidate_id": "candidate"})
+        ],
         candidate_manifests=None,
         config={},
         run_name="dockq-run",

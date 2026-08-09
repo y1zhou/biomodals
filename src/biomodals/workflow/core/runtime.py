@@ -302,12 +302,12 @@ class WorkflowRuntime:
         if not isinstance(node, RemotePullTaskWorkflowNode):
             raise ValueError("Provider Call does not belong to a pull-worker Node")
         prepared = []
-        for task_key, request_id, result in validated:
+        for task_key, completion_request_id, result in validated:
             task = tasks[task_key]
             if result.status != AppRunStatus.SUCCEEDED:
                 prepared.append((
                     task,
-                    request_id,
+                    completion_request_id,
                     AvailabilityStatus.MISSING,
                     _node_error_message(result),
                     None,
@@ -343,7 +343,7 @@ class WorkflowRuntime:
             )
             prepared.append((
                 task,
-                request_id,
+                completion_request_id,
                 observation,
                 (
                     "Published workflow Task result is unavailable"
@@ -355,6 +355,9 @@ class WorkflowRuntime:
         now = self._now()
         with self.store.synchronize():
             with self.store.transaction():
+                cancellation_is_durable = self.store.execution.get_run(
+                    self.execution_run_id
+                ).cancellation_is_durable
                 kernel_completions = []
                 for (
                     task,
@@ -363,7 +366,7 @@ class WorkflowRuntime:
                     message,
                     publication,
                 ) in prepared:
-                    if publication is not None:
+                    if publication is not None and not cancellation_is_durable:
                         result, artifacts = publication
                         self.store.artifacts.record_task_publication(
                             call.node_key,
@@ -1525,6 +1528,13 @@ class WorkflowRuntime:
         implementation: RemoteTaskWorkflowNode,
     ) -> None:
         with self.store.transaction():
+            run = self.store.execution.get_run(self.execution_run_id)
+            node = self.store.execution.get_node(
+                self.execution_run_id,
+                node_id,
+            )
+            if run.cancellation_is_durable or node.status.is_terminal:
+                return
             self.store.execution.apply_task_failure_policy(
                 self.execution_run_id,
                 node_id,
@@ -1560,9 +1570,23 @@ class WorkflowRuntime:
             observation = self._artifact_observation(existing_artifacts)
             if observation == AvailabilityStatus.MISSING:
                 with self.store.transaction():
+                    run = self.store.execution.get_run(self.execution_run_id)
+                    node = self.store.execution.get_node(
+                        self.execution_run_id,
+                        node_id,
+                    )
+                    if run.cancellation_is_durable or node.status.is_terminal:
+                        return
                     self.store.artifacts.discard_node_publication(node_id)
             elif observation == AvailabilityStatus.UNKNOWN:
                 with self.store.transaction():
+                    run = self.store.execution.get_run(self.execution_run_id)
+                    node = self.store.execution.get_node(
+                        self.execution_run_id,
+                        node_id,
+                    )
+                    if run.cancellation_is_durable or node.status.is_terminal:
+                        return
                     self.store.execution.transition_run(
                         self.execution_run_id,
                         RunStatus.SUSPENDED,
@@ -1580,6 +1604,13 @@ class WorkflowRuntime:
                     )
                     return
                 with self.store.transaction():
+                    run = self.store.execution.get_run(self.execution_run_id)
+                    node = self.store.execution.get_node(
+                        self.execution_run_id,
+                        node_id,
+                    )
+                    if run.cancellation_is_durable or node.status.is_terminal:
+                        return
                     if empty_result:
                         self.store.execution.record_node_result_observation(
                             self.execution_run_id,
@@ -1689,6 +1720,13 @@ class WorkflowRuntime:
             return
 
         with self.store.transaction():
+            run = self.store.execution.get_run(self.execution_run_id)
+            node = self.store.execution.get_node(
+                self.execution_run_id,
+                node_id,
+            )
+            if run.cancellation_is_durable or node.status.is_terminal:
+                return
             self.store.artifacts.record_node_publication(
                 node_id,
                 result=combined_result,

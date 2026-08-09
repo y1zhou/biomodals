@@ -2,7 +2,7 @@
 
 # ruff: noqa: D101, D102, D103, D107
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -92,6 +92,11 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
         repr=False,
         metadata={"dag_hash": False},
     )
+    cancel_on_finalize: Callable[[], None] | None = field(
+        default=None,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
 
     def discover_remote_tasks(
         self,
@@ -130,6 +135,8 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
         results: Mapping[str, AppRunResult],
         errors: Mapping[str, str],
     ) -> AppRunResult:
+        if self.cancel_on_finalize is not None:
+            self.cancel_on_finalize()
         self.finalized_results.append((tuple(results), tuple(errors)))
         status = (
             AppRunStatus.PARTIAL
@@ -1332,6 +1339,119 @@ def test_pull_completion_and_next_claim_share_one_checkpoint(
     assert terminal.assignments == ()
     assert volume.commits == commits + 3
     assert volume.reloads == reloads
+
+
+def test_pull_completion_after_cancellation_does_not_publish(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("cancelled-pull-publication")
+    node = PullFanoutNode(("alpha",), max_worker_calls=1)
+    workflow.add_node(
+        node,
+        id="fanout",
+    )
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("cancelled-pull-publication")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+
+    runtime.cancel()
+    claim = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "complete", _text_result("alpha")),),
+        request_id="late-completion",
+        capacity=1,
+    )
+
+    assert claim.assignments == ()
+    assert (
+        runtime.store.artifacts.load_task_result(
+            "fanout",
+            assignment.task_key,
+        )
+        is None
+    )
+    assert (
+        runtime.store.artifacts.load_task_output_artifacts(
+            "fanout",
+            assignment.task_key,
+        )
+        == ()
+    )
+
+
+def test_pull_completion_replay_remains_idempotent_after_cancellation(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("cancelled-pull-replay")
+    workflow.add_node(
+        PullFanoutNode(("alpha",), max_worker_calls=1),
+        id="fanout",
+    )
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("cancelled-pull-replay")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+    completion = ((assignment.task_key, "complete", _text_result("alpha")),)
+
+    first = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        completion,
+        request_id="next",
+        capacity=1,
+    )
+    runtime.cancel()
+    replay = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        completion,
+        request_id="next",
+        capacity=1,
+    )
+
+    assert first == replay
+
+
+def test_remote_task_finalizer_does_not_publish_after_cancellation(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("cancelled-aggregate-publication")
+    node = RemoteFanoutNode(("alpha", "beta"))
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(tmp_path, workflow, driver=FanoutModalDriver())
+    node.cancel_on_finalize = runtime.cancel
+
+    runtime.run(workload_run_key="cancelled-aggregate-publication")
+
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.CANCELLED
+    assert runtime.store.execution.get_node(RUN_ID, "fanout").status == (
+        NodeStatus.CANCELLED
+    )
+    assert runtime.store.artifacts.load_node_result("fanout") is None
+    assert runtime.store.artifacts.load_node_output_artifacts("fanout") == ()
 
 
 def test_pull_completion_reloads_worker_owned_workflow_volume_output(

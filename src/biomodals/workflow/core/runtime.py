@@ -455,10 +455,7 @@ class WorkflowRuntime:
                     call.node_key,
                     task_key=task_key,
                 )
-                publication_token = uuid4().hex
-                publication_scope = (
-                    f"{_task_storage_scope(task_key)}-{publication_token}"
-                )
+                publication_scope = f"{_task_storage_scope(task_key)}-{uuid4().hex}"
                 publication_dir = context.work_dir / "completions" / publication_scope
                 staged_publications[task.task_key] = publication_dir
                 try:

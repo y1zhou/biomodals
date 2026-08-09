@@ -48,6 +48,7 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+    republish_workflow_artifact,
 )
 from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
@@ -607,7 +608,8 @@ class ShortMDSummaryNode(WorkflowNativeNode):
                         "replicates": str(self.replicates),
                         "max_parallel": str(self.max_parallel),
                     },
-                )
+                ),
+                *(republish_workflow_artifact(artifact) for artifact in artifacts),
             ],
         )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -34,6 +35,23 @@ class MaterializedAppRunResult:
 
     artifacts: list[WorkflowArtifact]
     result: AppRunResult
+
+
+def republish_workflow_artifact(artifact: WorkflowArtifact) -> AppOutput:
+    """Return an App output that keeps one upstream publication authoritative."""
+    metadata = dict(artifact.metadata)
+    metadata["source_artifact_id"] = artifact.artifact_id
+    if artifact.files:
+        metadata["files"] = [
+            file.model_dump(exclude_defaults=True, exclude_none=True)
+            for file in artifact.files
+        ]
+    return AppOutput(
+        name=f"artifact-{hashlib.sha256(artifact.artifact_id.encode()).hexdigest()[:16]}",
+        kind=artifact.kind,
+        storage=artifact.storage,
+        metadata=metadata,
+    )
 
 
 def _write_json(path: Path, payload: object) -> None:

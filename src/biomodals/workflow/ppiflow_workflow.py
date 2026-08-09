@@ -73,6 +73,7 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     VolumePath,
@@ -92,6 +93,7 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+    republish_workflow_artifact,
 )
 from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
@@ -911,9 +913,23 @@ def rank_ppiflow_artifacts(
         shutil.rmtree(output_dir)
     structures_dir = output_dir / "structures"
     structures_dir.mkdir(parents=True)
+    ranked_structure_files = []
     for row in ranked:
         file_name, file_bytes = structure_by_key[str(row["design"])]
-        (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
+        output_path = structures_dir / sanitize_filename(file_name)
+        output_path.write_bytes(file_bytes)
+        ranked_structure_files.append(
+            ArtifactFile(
+                path=output_path.name,
+                role="structure",
+                media_type=(
+                    "chemical/x-pdb"
+                    if output_path.suffix.lower() == ".pdb"
+                    else "chemical/x-mmcif"
+                ),
+                size_bytes=len(file_bytes),
+            )
+        )
     ranked_csv = output_dir / str(config.get("output_csv_name") or "ranked_designs.csv")
     if ranked:
         pl.DataFrame(ranked).write_csv(ranked_csv)
@@ -945,6 +961,7 @@ def rank_ppiflow_artifacts(
                     "structure_count": len(ranked),
                     "structure_patterns": ("*.pdb", "*.cif"),
                 },
+                files=ranked_structure_files,
             ),
             volume_app_output(
                 name="ranked_designs",
@@ -2976,6 +2993,11 @@ class ReportNode(WorkflowNativeNode):
         report_filename = str(
             self.config.get("report_filename") or "design_report.html"
         )
+        scientific_artifacts = [
+            artifact
+            for input_name in ("structures", "rank", "candidate_manifest")
+            for artifact in context.inputs.get(input_name, [])
+        ]
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -3000,6 +3022,10 @@ class ReportNode(WorkflowNativeNode):
                         media_type="text/html",
                     ),
                     metadata={"step_name": self.step_name},
+                ),
+                *(
+                    republish_workflow_artifact(artifact)
+                    for artifact in scientific_artifacts
                 ),
             ],
         )
@@ -4290,7 +4316,10 @@ def _add_stage2_nodes(
 
     if _step_enabled(enabled, "ReportStep"):
         inputs = (
-            {"rank": rank.outputs(kind=ArtifactKind.TABLE)}
+            {
+                "structures": rank.outputs(kind=ArtifactKind.STRUCTURES),
+                "rank": rank.outputs(kind=ArtifactKind.TABLE),
+            }
             if rank is not None
             else _structure_inputs(filtered)
         )

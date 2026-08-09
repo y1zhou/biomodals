@@ -88,8 +88,8 @@ ShortMD is the current reference for executable workflow apps. Its data flow is:
    GROMACS app does not need it.
 6. `ShortMDReplicateNode` runs each production replicate through the GROMACS app
    and collects trajectory stats.
-7. `ShortMDSummaryNode` emits a Markdown report from completed production
-   artifacts.
+7. `ShortMDSummaryNode` emits a Markdown report and republishes the completed
+   production artifacts as the terminal scientific boundary.
 
 Follow this structure for new app-composed workflows: stage local inputs before
 DAG construction, build a static fan-out DAG, keep app-specific runtime work in
@@ -113,7 +113,7 @@ flow is:
 4. Each `LigandMPNNDesignNode` calls the LigandMPNN app's workflow-compatible
    remote function with PDB bytes and MPNN CLI args, receiving a small inline
    zstd archive that the workflow runtime materializes.
-5. The summary node reports all LigandMPNN archive artifacts.
+5. The summary node reports and republishes all LigandMPNN archive artifacts.
 
 Use this pattern when the source app owns durable outputs but downstream nodes
 need selected small files or derived arguments. Keep selector/adaptation logic in
@@ -587,6 +587,14 @@ only aggregate manifests or emit text reports. Return reports as UTF-8
 `InlineBytes`; return small zstd archives as `InlineBytes` with
 `media_type="application/zstd"`; return other binary files, directories, and
 large archives as durable `VolumePath` outputs.
+
+A terminal report must also republish references to the final scientific
+artifacts it summarizes. Use `republish_workflow_artifact(...)` so the new
+terminal publication retains the upstream `VolumePath` and exact file
+manifest. Otherwise terminal-first Successor recovery can mistake an intact
+report for a complete result after an upstream scientific file was deleted.
+Do not solve this by recursively validating every ancestor in workflow core;
+each workload defines its own scientific result boundary.
 
 When adding a workflow-compatible app function, keep existing local entrypoint
 behavior unchanged and add a focused pytest contract test that does not call

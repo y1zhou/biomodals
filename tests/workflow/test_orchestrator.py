@@ -28,9 +28,15 @@ from biomodals.execution.modal import (
     ModalCallObservationKind,
 )
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
-from biomodals.schema import AppOutput, AppRunResult, AppRunStatus, ArtifactKind
-from biomodals.schema.storage import InlineBytes
-from biomodals.workflow import Workflow, WorkflowNativeNode
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+)
+from biomodals.schema.storage import InlineBytes, VolumePath
+from biomodals.workflow import Workflow, WorkflowNativeNode, ppiflow_workflow
 from biomodals.workflow.core import orchestrator
 from biomodals.workflow.core.nodes import (
     NodeRunContext,
@@ -88,6 +94,52 @@ class TextNode(WorkflowNativeNode):
                         media_type="text/plain",
                     ),
                 )
+            ],
+        )
+
+
+@dataclass
+class RankedScientificNode(WorkflowNativeNode):
+    text: str
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        if context.volume_root is None or context.workflow_volume_name is None:
+            raise RuntimeError("Workflow Volume context is unavailable")
+        output_dir = context.work_dir / "ranked"
+        structures_dir = output_dir / "structures"
+        structures_dir.mkdir(parents=True)
+        structure = structures_dir / "design.pdb"
+        structure.write_text(self.text, encoding="utf-8")
+        ranking = output_dir / "ranked_designs.csv"
+        ranking.write_text("design,rank_score\ndesign,1.0\n", encoding="utf-8")
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="ranked_structures",
+                    kind=ArtifactKind.STRUCTURES,
+                    storage=VolumePath(
+                        volume_name=context.workflow_volume_name,
+                        path=structures_dir.relative_to(context.volume_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [
+                            ArtifactFile(
+                                path=structure.name,
+                                size_bytes=structure.stat().st_size,
+                            ).model_dump(exclude_none=True)
+                        ],
+                    },
+                ),
+                AppOutput(
+                    name="ranked_designs",
+                    kind=ArtifactKind.TABLE,
+                    storage=VolumePath(
+                        volume_name=context.workflow_volume_name,
+                        path=ranking.relative_to(context.volume_root).as_posix(),
+                        media_type="text/csv",
+                    ),
+                ),
             ],
         )
 
@@ -785,6 +837,89 @@ def test_restart_recomputes_a_missing_predecessor_publication(
     assert node.status == NodeStatus.SUCCEEDED
     assert task.result_provenance == ResultProvenance.CURRENT_RUN
     assert str(SUCCESSOR_ID) in publication.storage.path
+    successor_store.close()
+
+
+def test_restart_repairs_missing_ranked_structure_behind_ppiflow_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setitem(
+        ppiflow_workflow.PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
+        tmp_path,
+    )
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = Workflow("report-boundary")
+    rank = workflow.add_node(
+        RankedScientificNode("ATOM\n"),
+        id="rank",
+    )
+    workflow.add_node(
+        ppiflow_workflow.ReportNode("ReportStep"),
+        id="report",
+        inputs={
+            "structures": rank.outputs(kind=ArtifactKind.STRUCTURES),
+            "rank": rank.outputs(kind=ArtifactKind.TABLE),
+        },
+    )
+    raw_cls.run._get_raw_f()(
+        predecessor_coordinator,
+        workflow=workflow,
+        workload_run_key="report-boundary",
+        development_function_handles={},
+    )
+    predecessor_store = WorkflowRunStore(tmp_path, RUN_ID)
+    publication = next(
+        artifact
+        for artifact in predecessor_store.artifacts.load_node_output_artifacts("rank")
+        if artifact.kind == ArtifactKind.STRUCTURES
+    )
+    predecessor_store.close()
+    missing_structure = tmp_path / publication.storage.path / "design.pdb"
+    missing_structure.unlink()
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    result = _restart(
+        raw_cls,
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    successor_store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    rank_task = successor_store.execution.get_task(
+        SUCCESSOR_ID,
+        "rank",
+        "node",
+    )
+    report_task = successor_store.execution.get_task(
+        SUCCESSOR_ID,
+        "report",
+        "node",
+    )
+    publication = next(
+        artifact
+        for artifact in successor_store.artifacts.load_node_output_artifacts("rank")
+        if artifact.kind == ArtifactKind.STRUCTURES
+    )
+    assert rank_task.result_provenance == ResultProvenance.CURRENT_RUN
+    assert report_task.result_provenance == ResultProvenance.CURRENT_RUN
+    assert (tmp_path / publication.storage.path / "design.pdb").is_file()
     successor_store.close()
 
 

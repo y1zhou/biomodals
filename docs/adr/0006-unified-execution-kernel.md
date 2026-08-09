@@ -323,6 +323,16 @@ Intermediate lifecycle history remains available for diagnosis but is not an
 all-Node vote on the scientific outcome. This generalizes the workflow
 runtime's existing terminal-pruning behavior to every kernel consumer.
 
+The terminal-publication completeness rule was amended on 2026-08-09. A
+summary or report is not by itself an authoritative scientific boundary when
+its usefulness depends on upstream files. Such a terminal Node republishes
+references to the final scientific artifacts alongside the human-readable
+report, preserving their exact file manifests. Terminal-first validation can
+then return a genuine cache hit or expand the Successor repair closure when a
+referenced result is missing. The kernel does not recursively inspect report
+contents or infer which ancestors matter; boundary construction remains
+workload-owned.
+
 The Node-result observation policy was accepted on 2026-07-29. Caller-owned
 workload code validates the Node publication before preparing dependency
 inputs or Tasks and records the shared `available`, `missing`, or `unknown`

@@ -17,6 +17,7 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     VolumePath,
@@ -503,6 +504,7 @@ def test_rfd_ligandmpnn_summary_reports_design_artifacts(tmp_path: Path) -> None
             path="results/mpnn-output",
             media_type=ZSTD_MEDIA_TYPE,
         ),
+        files=[ArtifactFile(path="designs.tar.zst", size_bytes=2048)],
         metadata={
             "rfd_run_name": "demo-rfd001",
             "design_index": "0",
@@ -519,6 +521,11 @@ def test_rfd_ligandmpnn_summary_reports_design_artifacts(tmp_path: Path) -> None
     report = result.outputs[0].storage.data.decode("utf-8")
     assert "# RFdiffusion + LigandMPNN Workflow Summary" in report
     assert "| demo-rfd001 | 0 | demo-rfd001-d000-mpnn | Workflow-outputs |" in report
+    assert result.outputs[1].metadata["source_artifact_id"] == "mpnn-output"
+    assert result.outputs[1].storage == artifact.storage
+    assert result.outputs[1].metadata["files"] == [
+        {"path": "designs.tar.zst", "size_bytes": 2048}
+    ]
 
 
 def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(

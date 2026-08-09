@@ -42,6 +42,7 @@ from biomodals.workflow.core import (
     WorkflowNativeNode,
     orchestrator,
     print_workflow_dag,
+    republish_workflow_artifact,
 )
 from biomodals.workflow.core.artifact_availability import (
     ArtifactAvailability,
@@ -449,7 +450,8 @@ class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
                         "num_rfdiffusion_designs": str(self.num_rfdiffusion_designs),
                         "max_parallel": str(self.max_parallel),
                     },
-                )
+                ),
+                *(republish_workflow_artifact(artifact) for artifact in artifacts),
             ],
         )
 

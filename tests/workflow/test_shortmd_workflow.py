@@ -13,6 +13,7 @@ from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     VolumePath,
@@ -683,6 +684,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
                         volume_name=gromacs_app.CONF.output_volume_name,
                         path="alpha-r001",
                     ),
+                    files=[ArtifactFile(path="trajectory.xtc", size_bytes=1024)],
                     metadata={
                         "source_run_name": "alpha",
                         "run_name": "alpha-r001",
@@ -709,7 +711,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
 
     result = node.run(context)
 
-    assert len(result.outputs) == 1
+    assert len(result.outputs) == 3
     output = result.outputs[0]
     assert output.name == "shortmd_summary"
     assert output.kind == ArtifactKind.REPORT
@@ -725,6 +727,14 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
         f"| alpha | alpha-r002 | {gromacs_app.CONF.output_volume_name} | alpha-r002 |"
         in report
     )
+    assert [output.metadata["source_artifact_id"] for output in result.outputs[1:]] == [
+        "alpha-r001",
+        "alpha-r002",
+    ]
+    assert result.outputs[1].storage == context.inputs["alpha-r001"][0].storage
+    assert result.outputs[1].metadata["files"] == [
+        {"path": "trajectory.xtc", "size_bytes": 1024}
+    ]
 
 
 def test_shortmd_app_includes_orchestrator_class() -> None:

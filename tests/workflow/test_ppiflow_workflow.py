@@ -31,6 +31,7 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     VolumePath,
@@ -1996,6 +1997,14 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
     assert [path.name for path in output_dir.iterdir()] == [
         "upstream-structures__design-1.pdb"
     ]
+    assert result.outputs[0].metadata["files"] == [
+        {
+            "path": "upstream-structures__design-1.pdb",
+            "role": "structure",
+            "media_type": "chemical/x-pdb",
+            "size_bytes": 7,
+        }
+    ]
     assert result.outputs[1].metadata["rows"] == 1
 
 
@@ -2045,6 +2054,10 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
     _, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
     report_dir = workflow_root / "report-inputs"
     report_dir.mkdir()
+    structures_dir = report_dir / "structures"
+    structures_dir.mkdir()
+    ranked_pdb = structures_dir / "design-1.pdb"
+    ranked_pdb.write_text("ATOM\n", encoding="utf-8")
     ranked_csv = report_dir / "ranked_designs.csv"
     ranked_csv.write_text("design,rank_score\ndesign-1,1.0\n", encoding="utf-8")
     audit_csv = report_dir / "filter_audit.csv"
@@ -2087,6 +2100,23 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
             work_dir=tmp_path / "result",
             cache_dir=tmp_path / "cache",
             inputs={
+                "structures": [
+                    WorkflowArtifact(
+                        artifact_id="ranked-structures",
+                        producing_node_id="rank",
+                        kind=ArtifactKind.STRUCTURES,
+                        storage=VolumePath(
+                            volume_name="workflow-volume",
+                            path="report-inputs/structures",
+                        ),
+                        files=[
+                            ArtifactFile(
+                                path=ranked_pdb.name,
+                                size_bytes=ranked_pdb.stat().st_size,
+                            )
+                        ],
+                    )
+                ],
                 "rank": [
                     WorkflowArtifact(
                         artifact_id="rank",
@@ -2129,6 +2159,18 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
     assert "## Candidate Attrition" in markdown
     assert "FilterStep_stage2" in markdown
     assert "## Ranked Designs" in markdown
+    assert [output.name for output in result.outputs[:2]] == [
+        "design_report",
+        "design_report_html",
+    ]
+    assert [output.metadata["source_artifact_id"] for output in result.outputs[2:]] == [
+        "ranked-structures",
+        "rank",
+        "manifest",
+    ]
+    assert result.outputs[2].metadata["files"] == [
+        {"path": "design-1.pdb", "size_bytes": 5}
+    ]
 
 
 def test_submit_ppiflow_workflow_dry_run_prints_dag_without_orchestrator(
@@ -2582,6 +2624,11 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         definition.nodes["stage2-report"].inputs["filter_tables"].kind
         == ArtifactKind.TABLE
     )
+    assert (
+        definition.nodes["stage2-report"].inputs["structures"].kind
+        == ArtifactKind.STRUCTURES
+    )
+    assert definition.nodes["stage2-report"].inputs["rank"].kind == ArtifactKind.TABLE
     assert definition.dependencies["stage2-report"] == {
         "stage2-rank",
         "stage1-ligandmpnn",

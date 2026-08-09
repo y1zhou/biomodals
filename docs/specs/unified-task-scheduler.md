@@ -479,6 +479,14 @@ partial publication is not an available complete Node result, but its
 successful Task publications remain eligible for granular reuse after the
 Node enters the repair closure.
 
+A terminal publication must cover the complete scientific result it claims to
+make reusable. A terminal summary or report whose value depends on upstream
+files republishes those final scientific artifacts as reference outputs next
+to the report and preserves their exact `ArtifactFile` manifests. Validation
+therefore checks both the presentation and the files it presents. The kernel
+does not parse report text, recursively validate every ancestor, or infer a
+workflow's intended outputs; the workload constructs this boundary explicitly.
+
 An `unknown` Node or Task result observation leaves that record nonterminal
 and moves the Run to `suspended` with
 `status_reason=result_validation_unknown`. New admission stops, attached

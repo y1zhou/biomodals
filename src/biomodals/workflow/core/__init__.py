@@ -7,6 +7,7 @@ from biomodals.workflow.core.artifact_availability import (
     check_external_artifact_status,
     mounted_volume_checker,
 )
+from biomodals.workflow.core.artifacts import republish_workflow_artifact
 from biomodals.workflow.core.builder import (
     NodeHandle,
     Workflow,
@@ -48,4 +49,5 @@ __all__ = [
     "check_external_artifact_status",
     "mounted_volume_checker",
     "print_workflow_dag",
+    "republish_workflow_artifact",
 ]

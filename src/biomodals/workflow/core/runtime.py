@@ -6,7 +6,8 @@ import hashlib
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -168,7 +169,7 @@ class WorkflowRuntime:
             modal_driver=modal_driver or ModalCallDriver(),
             checkpoint=self._checkpoint,
             transaction=self.store.transaction,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
         )
         self._definition: WorkflowDefinition | None = None
         self._workload_run_key: str | None = None
@@ -189,7 +190,7 @@ class WorkflowRuntime:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
         )
         return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
 
@@ -207,7 +208,7 @@ class WorkflowRuntime:
             reconcile_once=self.advance_once,
             checkpoint=self._checkpoint,
             current_repository=lambda: self.store.execution,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
             now=self._now(),
         )
         snapshot = drive_execution_run(
@@ -218,7 +219,7 @@ class WorkflowRuntime:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
         )
         return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
 
@@ -250,8 +251,9 @@ class WorkflowRuntime:
 
     def prepare(self, *, workload_run_key: str) -> None:
         """Create and checkpoint a pending Run before asynchronous driving."""
-        self._initialize(workload_run_key, reload_volume=False)
-        self._checkpoint()
+        with self._volume_io_lock:
+            self._initialize(workload_run_key, reload_volume=False)
+            self._checkpoint()
 
     def claim_pull_tasks(
         self,
@@ -852,18 +854,15 @@ class WorkflowRuntime:
                 )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        with self._volume_io_lock:
-            reconciled = self._provider.reconcile_provider_calls(
-                self.execution_run_id,
-                required_node_keys=required,
-                encode_result=self._prepare_result_envelope,
-                finalize_result=self._finalize_result_envelope,
-                discard_result=self._discard_prepared_result,
-                recover_terminal_publications=(
-                    self._recover_terminal_task_publications
-                ),
-                now=self._now(),
-            )
+        reconciled = self._provider.reconcile_provider_calls(
+            self.execution_run_id,
+            required_node_keys=required,
+            encode_result=self._prepare_result_envelope,
+            finalize_result=self._finalize_result_envelope,
+            discard_result=self._discard_prepared_result,
+            recover_terminal_publications=self._recover_terminal_task_publications,
+            now=self._now(),
+        )
         for _, call in reconciled:
             if (
                 call.status != ProviderCallStatus.SUCCEEDED
@@ -1002,6 +1001,13 @@ class WorkflowRuntime:
         self,
         call: ProviderCallRecord,
     ) -> None:
+        with self._volume_io_lock:
+            self._publish_provider_result_locked(call)
+
+    def _publish_provider_result_locked(
+        self,
+        call: ProviderCallRecord,
+    ) -> None:
         node_id = call.node_key
         envelope = call.result_envelope
         node = self._require_definition().nodes[node_id].node
@@ -1035,10 +1041,9 @@ class WorkflowRuntime:
         except Exception as error:
             self._fail_task(node_id, f"Could not decode provider result: {error}")
             return
-        with self._volume_io_lock:
-            if self._uses_workflow_volume(result):
-                self._reload_volume()
-            self._publish_result(node_id, result)
+        if self._uses_workflow_volume(result):
+            self._reload_volume()
+        self._publish_result(node_id, result)
 
     def _publish_provider_task_results(
         self,
@@ -1097,15 +1102,14 @@ class WorkflowRuntime:
                     f"Could not decode provider result: {error}",
                 )
             return
-        with self._volume_io_lock:
-            if any(self._uses_workflow_volume(result) for result in results.values()):
-                self._reload_volume()
-            for task in unfinished:
-                self._publish_task_result(
-                    node_id,
-                    task.task_key,
-                    results[task.task_key],
-                )
+        if any(self._uses_workflow_volume(result) for result in results.values()):
+            self._reload_volume()
+        for task in unfinished:
+            self._publish_task_result(
+                node_id,
+                task.task_key,
+                results[task.task_key],
+            )
 
     def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
         with self.store.synchronize():
@@ -1246,20 +1250,20 @@ class WorkflowRuntime:
                 )
             if task.status.is_terminal:
                 continue
-            with self.store.synchronize():
-                with self.store.transaction():
-                    acquired = self.store.execution.acquire_local_task(
-                        self.execution_run_id,
-                        node_record.node_key,
-                        _TASK_KEY,
-                        now=self._now(),
-                    )
-                if acquired:
-                    self._checkpoint()
-            if not acquired:
-                continue
-            progressed = True
             with self._volume_io_lock:
+                with self.store.synchronize():
+                    with self.store.transaction():
+                        acquired = self.store.execution.acquire_local_task(
+                            self.execution_run_id,
+                            node_record.node_key,
+                            _TASK_KEY,
+                            now=self._now(),
+                        )
+                    if acquired:
+                        self._checkpoint()
+                if not acquired:
+                    continue
+                progressed = True
                 context = self._node_context(definition, node_record.node_key)
                 try:
                     result = AppRunResult.model_validate(node.run(context))
@@ -2268,6 +2272,13 @@ class WorkflowRuntime:
                 repository = self.store.execution
                 self._provider.repository = repository
         return repository
+
+    @contextmanager
+    def _synchronize_kernel_state(self) -> Iterator[None]:
+        """Order explicit workflow Volume barriers before the SQLite writer."""
+        with self._volume_io_lock:
+            with self.store.synchronize():
+                yield
 
     def _reload_volume(self) -> None:
         """Refresh cross-container publications and reopen the shared ledger."""

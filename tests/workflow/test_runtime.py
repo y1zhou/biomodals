@@ -634,6 +634,102 @@ def test_provider_result_payload_is_file_backed_outside_the_ledger(
     runtime.close()
 
 
+def test_provider_envelope_read_excludes_volume_reload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    file_open = Event()
+    release_file = Event()
+    reload_started = Event()
+
+    class BusyVolume(FakeVolume):
+        def reload(self) -> None:
+            reload_started.set()
+            if file_open.is_set():
+                raise RuntimeError("reload while provider envelope is open")
+            super().reload()
+
+    workflow = Workflow("remote-envelope-concurrency")
+    workflow.add_node(RemoteTextNode("answer", "run_remote"), id="remote")
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=FakeModalDriver(),
+        volume=BusyVolume(),
+    )
+    runtime._initialize("remote-envelope-concurrency")
+    runtime.advance_once()
+    ((_, completed),) = runtime._provider.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"remote"},
+        encode_result=runtime._prepare_result_envelope,
+        finalize_result=runtime._finalize_result_envelope,
+        now=200,
+    )
+
+    original_read_bytes = Path.read_bytes
+
+    def block_envelope_read(path: Path) -> bytes:
+        if "provider-results" in path.parts:
+            with path.open("rb") as envelope:
+                file_open.set()
+                if not release_file.wait(timeout=5):
+                    raise TimeoutError("concurrent reload did not finish")
+                content = envelope.read()
+            file_open.clear()
+            return content
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", block_envelope_read)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publication = executor.submit(runtime._publish_provider_result, completed)
+        assert file_open.wait(timeout=5)
+        reload_volume = executor.submit(runtime._reload_volume)
+        assert not reload_started.wait(timeout=0.1)
+        release_file.set()
+        publication.result(timeout=5)
+        reload_volume.result(timeout=5)
+
+    assert reload_started.is_set()
+    assert runtime.store.artifacts.load_node_result("remote") is not None
+
+
+def test_provider_observation_does_not_hold_volume_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    observe_started = Event()
+    release_observe = Event()
+    workflow = Workflow("remote-observation-concurrency")
+    workflow.add_node(RemoteTextNode("answer", "run_remote"), id="remote")
+    driver = FakeModalDriver()
+    volume = FakeVolume()
+    runtime = _runtime(tmp_path, workflow, driver=driver, volume=volume)
+    runtime._initialize("remote-observation-concurrency")
+    runtime.advance_once()
+    original_observe = driver.observe
+
+    def block_observe(provider_call_handle_id):
+        observe_started.set()
+        if not release_observe.wait(timeout=5):
+            raise TimeoutError("concurrent reload did not finish")
+        return original_observe(provider_call_handle_id)
+
+    monkeypatch.setattr(driver, "observe", block_observe)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reconciliation = executor.submit(
+            runtime._reconcile_provider_calls,
+            {"remote"},
+        )
+        assert observe_started.wait(timeout=5)
+        reload_volume = executor.submit(runtime._reload_volume)
+        reload_volume.result(timeout=5)
+        release_observe.set()
+        reconciliation.result(timeout=5)
+
+    assert volume.reloads == 1
+
+
 def test_inline_provider_result_does_not_reload_the_workflow_volume(
     tmp_path: Path,
     monkeypatch,
@@ -2148,6 +2244,103 @@ def test_concurrent_pull_completion_excludes_volume_reload(
     assert all(
         task.status == TaskStatus.SUCCEEDED
         for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    )
+
+
+def test_pull_claim_checkpoint_excludes_open_materialization(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    file_open = Event()
+    release_file = Event()
+    commit_started = Event()
+
+    class BusyVolume(FakeVolume):
+        def commit(self) -> None:
+            commit_started.set()
+            if file_open.is_set():
+                raise RuntimeError("volume busy: open file during commit reload")
+            super().commit()
+
+    workflow = Workflow("pull-volume-checkpoint-concurrency")
+    workflow.add_node(
+        PullFanoutNode(("alpha", "beta", "gamma", "delta"), max_worker_calls=2),
+        id="fanout",
+    )
+    volume = BusyVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=2,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+        volume=volume,
+    )
+    runtime._initialize("pull-volume-checkpoint-concurrency")
+    runtime.advance_once()
+    first_call, second_call = runtime.store.execution.list_provider_calls(RUN_ID)
+    first_claim = runtime.claim_pull_tasks(
+        first_call.provider_call_id,
+        request_id="claim-first",
+        capacity=2,
+    )
+    commit_started.clear()
+
+    original_write_bytes = Path.write_bytes
+
+    def block_inline_write(path: Path, data: bytes) -> int:
+        if (
+            "completions" in path.parts
+            and path.name == "result.txt"
+            and data == b"alpha"
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as output:
+                output.write(data)
+                file_open.set()
+                if not release_file.wait(timeout=5):
+                    raise TimeoutError("concurrent claim did not finish")
+            file_open.clear()
+            return len(data)
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", block_inline_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completion = executor.submit(
+            runtime.complete_pull_tasks_and_claim,
+            first_call.provider_call_id,
+            tuple(
+                (
+                    assignment.task_key,
+                    f"complete-{assignment.task_key}",
+                    _text_result(str(dict(assignment.execution_payload)["text"])),
+                )
+                for assignment in first_claim.assignments
+            ),
+            request_id="first-terminal",
+            capacity=1,
+        )
+        assert file_open.wait(timeout=5)
+        claim = executor.submit(
+            runtime.claim_pull_tasks,
+            second_call.provider_call_id,
+            request_id="claim-second",
+            capacity=2,
+        )
+        assert not commit_started.wait(timeout=0.1)
+        release_file.set()
+        [_first_successor] = completion.result(timeout=5).assignments
+        [assignment] = claim.result(timeout=5).assignments
+
+    assert commit_started.is_set()
+    assert (
+        runtime.store.execution.get_task(
+            RUN_ID,
+            "fanout",
+            assignment.task_key,
+        ).status
+        == TaskStatus.RUNNING
     )
 
 

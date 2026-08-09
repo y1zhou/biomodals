@@ -705,11 +705,13 @@ may close. A secondary cache or model Volume is reloaded only after a newly
 successful Node that writes that specific Volume.
 
 Concurrent workflow inputs also share a separate run-scoped Volume-I/O lock.
-It excludes a workflow Volume reload from result materialization, publication
-validation, local Node file access, callback cleanup, and the fused
-publication checkpoint. This lock is not the SQLite writer: filesystem and
-workload I/O still run outside the short repository transition boundary. It
-exists because Modal rejects a reload while any mounted Volume file is open.
+It excludes workflow Volume reloads and explicit checkpoints from result
+materialization, publication validation, local Node file access, and callback
+cleanup. Checkpointing kernel operations acquire this lock before the SQLite
+writer; provider RPCs remain outside both. The Volume lock is not the SQLite
+writer: filesystem and workload I/O still run outside the short repository
+transition boundary. It exists because Modal reloads during both operations
+and rejects a reload while any mounted Volume file is open.
 
 The active-run lifecycle was accepted on 2026-07-29. Each remote top-level CLI
 app or workflow run submits one detached coordinator-loop input to its

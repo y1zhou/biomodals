@@ -75,6 +75,7 @@ runtime_image = (
     .env(CONF.default_env)
     .pipe(patch_image_for_helper, include_workflow_modules=True)
 )
+analysis_image = gromacs_app.biotite_image.add_local_python_source("biomodals.workflow")
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
@@ -230,7 +231,7 @@ def _content_bound_gromacs_files(run_name: str) -> list[ArtifactFile]:
 
 
 @app.function(
-    image=gromacs_app.biotite_image,
+    image=analysis_image,
     cpu=1,
     memory=(1024, 65536),
     timeout=CONF.timeout,

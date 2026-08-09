@@ -152,12 +152,53 @@ def test_claim_response_is_checkpointed_idempotent_and_ordered() -> None:
     ]
     assert [assignment.task_key for assignment in third_claim.assignments] == ["seed-4"]
     assert empty_after_race.assignments == ()
-
     tasks = repository.list_tasks(RUN_ID, "inference")
     assert all(task.status == TaskStatus.RUNNING for task in tasks)
     assert tasks[0].worker_provider_call_id == first.call.provider_call_id
     assert tasks[2].worker_provider_call_id == second.call.provider_call_id
     assert tasks[4].worker_provider_call_id == third.call.provider_call_id
+
+
+def test_worker_cannot_exceed_its_unfinished_claim_capacity() -> None:
+    repository = create_repository(task_count=5)
+    (worker,) = _admit_workers(repository, 1)
+
+    first = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="first",
+        capacity=2,
+        now=140,
+    )
+    while_full = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="while-full",
+        capacity=2,
+        now=141,
+    )
+    repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        first.assignments[0].task_key,
+        request_id="complete-one",
+        observation=AvailabilityStatus.AVAILABLE,
+        now=142,
+    )
+    after_completion = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="after-completion",
+        capacity=2,
+        now=143,
+    )
+
+    assert len(first.assignments) == 2
+    assert while_full.assignments == ()
+    assert len(after_completion.assignments) == 1
+    assert [task.status for task in repository.list_tasks(RUN_ID, "inference")] == [
+        TaskStatus.SUCCEEDED,
+        TaskStatus.RUNNING,
+        TaskStatus.RUNNING,
+        TaskStatus.PENDING,
+        TaskStatus.PENDING,
+    ]
 
 
 def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:

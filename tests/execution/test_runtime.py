@@ -24,6 +24,7 @@ from biomodals.execution import (
     RunStatus,
     RunStatusReason,
     SqliteExecutionRepository,
+    TaskStatus,
 )
 from biomodals.execution.coordinator import drive_execution_run
 from biomodals.execution.modal import (
@@ -1825,6 +1826,70 @@ def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
     assert completed.status.value == "succeeded"
     assert next_claim.assignments == ()
     assert checkpoints == ["checkpoint"] * 4
+
+
+def test_concurrent_claim_requests_share_the_worker_capacity() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    repository = create_repository(connection=connection, task_count=5)
+    persist_pull_policy(
+        repository,
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=2,
+    )
+    writer = RLock()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=connection.commit,
+        transaction=_transaction(connection),
+        synchronize=lambda: writer,
+    )
+    call = _submit_pull_worker(
+        runtime,
+        node_key="inference",
+        submission_token="worker-0",
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+        claim_capacity=2,
+        now=110,
+    )
+    assert call is not None
+    start = Event()
+    claims = []
+    failures: list[BaseException] = []
+
+    def claim(request_id: str) -> None:
+        assert start.wait(timeout=5)
+        try:
+            claims.append(
+                runtime.claim_pull_tasks(
+                    call.provider_call_id,
+                    request_id=request_id,
+                    capacity=2,
+                    now=111,
+                )
+            )
+        except BaseException as error:  # pragma: no cover - assertion aid
+            failures.append(error)
+
+    threads = [Thread(target=claim, args=(f"claim-{index}",)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    start.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert sorted(len(claim.assignments) for claim in claims) == [0, 2]
+    assert (
+        sum(
+            task.status == TaskStatus.RUNNING
+            for task in repository.list_tasks(RUN_ID, "inference")
+        )
+        == 2
+    )
 
 
 def test_pull_completion_microbatch_crosses_one_checkpoint() -> None:

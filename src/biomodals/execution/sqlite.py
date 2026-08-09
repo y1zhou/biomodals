@@ -1789,6 +1789,23 @@ class SqliteExecutionRepository:
         ).fetchone()
         if capacity > batch["claim_capacity"]:
             raise ValueError("claim capacity exceeds the pull-worker policy")
+        outstanding = self._connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM execution_tasks
+            WHERE worker_provider_call_id = ?
+                AND status IN (?, ?)
+            """,
+            (
+                str(provider_call_id),
+                TaskStatus.PENDING.value,
+                TaskStatus.RUNNING.value,
+            ),
+        ).fetchone()["count"]
+        available_capacity = min(
+            capacity,
+            max(0, batch["claim_capacity"] - outstanding),
+        )
 
         self._connection.execute(
             """
@@ -1835,7 +1852,7 @@ class SqliteExecutionRepository:
                 call.node_key,
                 TaskStatus.PENDING.value,
                 AvailabilityStatus.MISSING.value,
-                capacity,
+                available_capacity,
             ),
         ).fetchall()
         for ordinal, row in enumerate(rows):
@@ -1885,6 +1902,33 @@ class SqliteExecutionRepository:
             )
         return self._load_pull_task_claim(request_id)
 
+    def get_pull_task_completion_receipt(
+        self,
+        provider_call_id: UUID,
+        task_key: str,
+        *,
+        request_id: str,
+    ) -> tuple[AvailabilityStatus, str | None] | None:
+        """Load and validate one existing idempotent completion receipt."""
+        if not request_id:
+            raise ValueError("completion request ID cannot be empty")
+        existing = self._connection.execute(
+            """
+            SELECT provider_call_id, task_key, observation, message
+            FROM execution_task_completion_requests
+            WHERE request_id = ?
+            """,
+            (request_id,),
+        ).fetchone()
+        if existing is None:
+            return None
+        if (
+            existing["provider_call_id"] != str(provider_call_id)
+            or existing["task_key"] != task_key
+        ):
+            raise ValueError("completion request ID was reused")
+        return AvailabilityStatus(existing["observation"]), existing["message"]
+
     def record_pull_task_completion(
         self,
         provider_call_id: UUID,
@@ -1899,21 +1943,13 @@ class SqliteExecutionRepository:
         if not request_id:
             raise ValueError("completion request ID cannot be empty")
         call = self.get_provider_call(provider_call_id, include_task_keys=False)
-        existing = self._connection.execute(
-            """
-            SELECT provider_call_id, task_key, observation, message
-            FROM execution_task_completion_requests
-            WHERE request_id = ?
-            """,
-            (request_id,),
-        ).fetchone()
+        existing = self.get_pull_task_completion_receipt(
+            provider_call_id,
+            task_key,
+            request_id=request_id,
+        )
         if existing is not None:
-            if (
-                existing["provider_call_id"] != str(provider_call_id)
-                or existing["task_key"] != task_key
-                or existing["observation"] != observation.value
-                or existing["message"] != message
-            ):
+            if existing != (observation, message):
                 raise ValueError("completion request ID was reused")
             return self.get_task(call.execution_run_id, call.node_key, task_key)
         assignment = self._connection.execute(

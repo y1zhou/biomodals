@@ -293,7 +293,7 @@ def ranked_design_rows(
     score_frames: Sequence[pl.DataFrame],
     gentype: str,
     dockq_threshold: float,
-    candidate_ids_by_filename: Mapping[str, str] | None = None,
+    candidate_ids_by_filename: Mapping[str, str],
 ) -> list[dict[str, object]]:
     """Rank retained structures using available DockQ/AF3/Rosetta score rows."""
     csv_rows = [row for frame in score_frames for row in frame.iter_rows(named=True)]
@@ -315,10 +315,7 @@ def ranked_design_rows(
     )
     ranked = []
     for file_name, _ in structures:
-        key = (candidate_ids_by_filename or {}).get(
-            file_name,
-            candidate_key(file_name),
-        )
+        key = candidate_ids_by_filename[file_name]
         dockq_row = dockq_by_key.get(key, {})
         af3_row = af3_by_key.get(key, {})
         rosetta_row = rosetta_by_key.get(key, {})

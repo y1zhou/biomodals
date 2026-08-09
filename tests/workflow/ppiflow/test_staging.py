@@ -175,6 +175,51 @@ def test_candidate_structure_files_use_manifest_candidate_ids() -> None:
     ]
 
 
+def test_candidate_structure_files_preserve_nested_candidate_identity() -> None:
+    manifest = pl.DataFrame({
+        "candidate_id": ["candidate-a", "candidate-b"],
+        "source_artifact_id": ["upstream", "upstream"],
+        "source_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "derived_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "files": [
+            [{"path": "a/design.pdb"}],
+            [{"path": "b/design.pdb"}],
+        ],
+    })
+    selected = [
+        (staging.safe_selected_file_name("upstream", "a/design.pdb"), b"ATOM A\n"),
+        (staging.safe_selected_file_name("upstream", "b/design.pdb"), b"ATOM B\n"),
+    ]
+
+    structures = staging.candidate_structure_files_from_selected(
+        selected,
+        manifest_frame=manifest,
+    )
+
+    assert [structure.candidate_id for structure in structures] == [
+        "candidate-a",
+        "candidate-b",
+    ]
+
+
+def test_candidate_structure_files_reject_ambiguous_basename_alias() -> None:
+    manifest = pl.DataFrame({
+        "candidate_id": ["candidate-a", "candidate-b"],
+        "source_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "derived_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "files": [
+            [{"path": "a/design.pdb"}],
+            [{"path": "b/design.pdb"}],
+        ],
+    })
+
+    with pytest.raises(ValueError, match="Ambiguous PPIFlow candidate filename"):
+        staging.candidate_structure_files_from_selected(
+            [("legacy__design.pdb", b"ATOM\n")],
+            manifest_frame=manifest,
+        )
+
+
 def test_prepare_dockq_pairs_by_candidate_matches_ids() -> None:
     pairs = staging.prepare_dockq_pairs_by_candidate(
         references=[

@@ -169,6 +169,11 @@ def test_ranked_design_rows_exclude_below_threshold_and_missing_scores() -> None
         ],
         gentype="binder",
         dockq_threshold=0.49,
+        candidate_ids_by_filename={
+            "artifact__design-a.pdb": "design-a",
+            "artifact__design-b.pdb": "design-b",
+            "artifact__design-c.pdb": "design-c",
+        },
     )
 
     assert rows == [

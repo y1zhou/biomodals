@@ -740,6 +740,31 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
     assert file_record["content_sha256"] == hashlib.sha256(b"MODEL\n").hexdigest()
 
 
+def test_supplied_invalid_candidate_manifest_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    manifest_path = workflow_root / "broken.parquet"
+    manifest_path.write_bytes(b"not parquet")
+    artifact = WorkflowArtifact(
+        artifact_id="broken-manifest",
+        producing_node_id="source",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=manifest_path.name,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="broken-manifest"):
+        ppiflow_workflow._candidate_manifest_frame_from_inputs(
+            [artifact],
+            [("legacy.pdb", b"ATOM\n")],
+            step_name="FilterStep_stage2",
+        )
+
+
 def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1509,7 +1534,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         node_id="stage2-rosetta-relax",
     )
 
-    assert result.status == AppRunStatus.PARTIAL
+    assert result.status == AppRunStatus.SUCCEEDED
     assert [output.name for output in result.outputs] == [
         "rosetta_outputs",
         "rosetta_job_manifest",
@@ -2702,6 +2727,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     assert definition.nodes["stage2-report"].partial_dependencies == {
         "stage2-alphafold3-refold",
         "stage2-rosetta-relax",
+        "stage1-ligandmpnn",
+        "stage2-ligandmpnn",
     }
     restored = pickle.loads(pickle.dumps(workflow))  # noqa: S301
     assert restored.validate() == definition

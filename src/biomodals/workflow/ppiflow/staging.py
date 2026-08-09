@@ -353,13 +353,23 @@ def candidate_structure_files_from_selected(
     manifest_frame: pl.DataFrame | None = None,
 ) -> list[CandidateStructureFile]:
     """Attach candidate ids to selected structure bytes."""
-    lookup = _candidate_key_lookup(manifest_frame)
+    exact_lookup, legacy_lookup, ambiguous_legacy_keys = _candidate_lookups(
+        manifest_frame
+    )
     keyed = []
     for file_name, data in selected:
         key = tables.candidate_key(file_name)
+        if file_name in exact_lookup:
+            candidate_id = exact_lookup[file_name]
+        elif key in ambiguous_legacy_keys:
+            raise ValueError(
+                f"Ambiguous PPIFlow candidate filename alias: {file_name!r}"
+            )
+        else:
+            candidate_id = legacy_lookup.get(key, key)
         keyed.append(
             CandidateStructureFile(
-                candidate_id=lookup.get(key, key),
+                candidate_id=candidate_id,
                 file_name=file_name,
                 data=data,
                 source_path=file_name,
@@ -473,13 +483,62 @@ def write_rosetta_job_manifest(
     return manifest_path
 
 
-def _candidate_key_lookup(manifest_frame: pl.DataFrame | None) -> dict[str, str]:
+def _candidate_lookups(
+    manifest_frame: pl.DataFrame | None,
+) -> tuple[dict[str, str], dict[str, str], frozenset[str]]:
+    """Build exact selected-name and unambiguous legacy candidate lookups."""
     if manifest_frame is None or manifest_frame.is_empty():
-        return {}
-    return {
-        row["_candidate_key"]: row["candidate_id"]
-        for row in tables.manifest_candidate_key_pairs(manifest_frame)
+        return {}, {}, frozenset()
+
+    exact_candidates: dict[str, set[str]] = {}
+    for row in manifest_frame.iter_rows(named=True):
+        candidate_id = str(row["candidate_id"])
+        source_artifact_id = row.get("source_artifact_id")
+        if not source_artifact_id:
+            continue
+        for file_record in row.get("files") or ():
+            if not isinstance(file_record, Mapping):
+                continue
+            path = file_record.get("path")
+            if path:
+                selected_name = safe_selected_file_name(
+                    str(source_artifact_id),
+                    str(path),
+                )
+                exact_candidates.setdefault(selected_name, set()).add(candidate_id)
+    ambiguous_exact = {
+        name: candidate_ids
+        for name, candidate_ids in exact_candidates.items()
+        if len(candidate_ids) > 1
     }
+    if ambiguous_exact:
+        raise ValueError(
+            "Ambiguous exact PPIFlow candidate aliases: "
+            + ", ".join(sorted(ambiguous_exact))
+        )
+
+    legacy_candidates: dict[str, set[str]] = {}
+    for row in tables.manifest_candidate_key_pairs(manifest_frame):
+        legacy_candidates.setdefault(row["_candidate_key"], set()).add(
+            row["candidate_id"]
+        )
+    ambiguous_legacy = frozenset(
+        key
+        for key, candidate_ids in legacy_candidates.items()
+        if len(candidate_ids) > 1
+    )
+    return (
+        {
+            name: next(iter(candidate_ids))
+            for name, candidate_ids in exact_candidates.items()
+        },
+        {
+            key: next(iter(candidate_ids))
+            for key, candidate_ids in legacy_candidates.items()
+            if key not in ambiguous_legacy
+        },
+        ambiguous_legacy,
+    )
 
 
 def _unique_candidate_structures(

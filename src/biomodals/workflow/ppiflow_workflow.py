@@ -2091,12 +2091,9 @@ def finalize_ppiflow_rosetta_stage(
         step_name=step_name,
         rows=rows,
     )
-    if successful_candidates == len(task_specs):
-        result_status = AppRunStatus.SUCCEEDED
-    elif successful_candidates:
-        result_status = AppRunStatus.PARTIAL
-    else:
-        result_status = AppRunStatus.FAILED
+    result_status = (
+        AppRunStatus.SUCCEEDED if successful_candidates else AppRunStatus.FAILED
+    )
     return AppRunResult(
         status=result_status,
         outputs=[
@@ -3657,9 +3654,12 @@ def _candidate_manifest_frame_from_inputs(
     *,
     step_name: str,
 ) -> pl.DataFrame:
-    frames = _read_candidate_manifest_artifacts(candidate_manifests)
-    if frames:
-        return pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
+    if candidate_manifests:
+        frames = _read_candidate_manifest_artifacts(candidate_manifests)
+        frame = pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
+        if frame.is_empty():
+            raise ValueError("Supplied candidate manifests produced no usable rows")
+        return frame
 
     rows = [
         ppiflow_manifests.candidate_manifest_row(
@@ -3690,7 +3690,9 @@ def _read_candidate_manifest_artifacts(
     frames = []
     for artifact in artifacts:
         if artifact.kind != ArtifactKind.TABLE:
-            continue
+            raise ValueError(
+                f"Candidate manifest {artifact.artifact_id!r} is not a table"
+            )
         try:
             frames.append(
                 ppiflow_manifests.read_manifest_volume_path(
@@ -3698,8 +3700,10 @@ def _read_candidate_manifest_artifacts(
                     volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
                 )
             )
-        except (FileNotFoundError, ValueError, pl.exceptions.PolarsError):
-            continue
+        except (FileNotFoundError, ValueError, pl.exceptions.PolarsError) as error:
+            raise ValueError(
+                f"Could not read candidate manifest {artifact.artifact_id!r}: {error}"
+            ) from error
     return frames
 
 
@@ -3952,6 +3956,7 @@ def build_ppiflow_workflow(
         },
     )
     report_table_inputs: dict[str, Any] = {}
+    report_partial_sources: list[Any] = []
 
     stage1_tail = None
     stage1_allows_partial = False
@@ -3962,6 +3967,7 @@ def build_ppiflow_workflow(
             steps=steps_doc,
             gentype=gentype,
             report_table_inputs=report_table_inputs,
+            report_partial_sources=report_partial_sources,
             candidate_concurrency=candidate_concurrency,
         )
 
@@ -3980,6 +3986,7 @@ def build_ppiflow_workflow(
             upstream=stage2_upstream,
             upstream_allows_partial=stage1_allows_partial,
             report_table_inputs=report_table_inputs,
+            report_partial_sources=report_partial_sources,
             candidate_concurrency=candidate_concurrency,
         )
 
@@ -3993,6 +4000,7 @@ def _add_stage1_nodes(
     steps: dict[str, Any],
     gentype: str,
     report_table_inputs: dict[str, Any],
+    report_partial_sources: list[Any],
     candidate_concurrency: int,
 ):
     tail = None
@@ -4037,6 +4045,7 @@ def _add_stage1_nodes(
         )
         partial_tail = tail
         report_table_inputs["stage1_mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
+        report_partial_sources.append(tail)
 
     if _step_enabled(enabled, "FlowpackerStep_stage1"):
         tail = workflow.add_node(
@@ -4172,6 +4181,7 @@ def _add_stage2_nodes(
     upstream,
     upstream_allows_partial: bool,
     report_table_inputs: dict[str, Any],
+    report_partial_sources: list[Any],
     candidate_concurrency: int,
 ) -> None:
     tail = upstream
@@ -4248,6 +4258,7 @@ def _add_stage2_nodes(
         )
         partial_tail = tail
         report_table_inputs["mpnn_seqs"] = tail.outputs(kind=ArtifactKind.TABLE)
+        report_partial_sources.append(tail)
 
     if _step_enabled(enabled, "FlowpackerStep_stage2"):
         tail = workflow.add_node(
@@ -4402,6 +4413,7 @@ def _add_stage2_nodes(
             accept_partial_from=_partial_sources(
                 relaxed if relaxed is not None else partial_tail,
                 refold,
+                *report_partial_sources,
             ),
         )
 

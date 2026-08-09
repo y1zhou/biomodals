@@ -1384,6 +1384,39 @@ def test_submit_root_passes_development_handles_to_driver() -> None:
     }
 
 
+def test_submit_successor_passes_development_handles_to_driver() -> None:
+    handle = FakeHandle()
+    calls: dict[str, object] = {}
+    coordinator = SimpleNamespace(
+        prepare_restart_from=SimpleNamespace(
+            remote=lambda **kwargs: calls.update(prepare=kwargs)
+        ),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda **kwargs: calls.update(drive=kwargs) or "fc-successor"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        predecessor_execution_run_id=RUN_ID,
+        coordinator_kwargs={
+            "workload_run_key": "demo",
+            "development_function_handles": {"compute": handle},
+        },
+    )
+
+    assert call == "fc-successor"
+    assert cast(dict[str, object], calls["prepare"]) == {
+        "predecessor_execution_run_id": str(RUN_ID),
+        "workload_run_key": "demo",
+    }
+    assert cast(dict[str, object], calls["drive"])["development_function_handles"] == {
+        "compute": handle
+    }
+
+
 def test_submit_workflow_run_reports_identity_when_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

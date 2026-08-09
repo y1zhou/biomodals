@@ -825,30 +825,27 @@ def submit_workflow_run(
         print(f"Execution Run ID: {execution_run_id}", flush=True)
 
     try:
+        prepare_kwargs = dict(coordinator_kwargs)
+        development_handles = prepare_kwargs.pop(
+            "development_function_handles",
+            None,
+        )
         if predecessor_execution_run_id is None:
-            prepare_kwargs = dict(coordinator_kwargs)
-            development_handles = prepare_kwargs.pop(
-                "development_function_handles",
-                None,
-            )
             coordinator.prepare_run.remote(**prepare_kwargs)
-            report_identity()
-            identity_reported = True
-            call = (
-                coordinator.drive_prepared.spawn(
-                    development_function_handles=development_handles
-                )
-                if development_handles is not None
-                else coordinator.drive_prepared.spawn()
-            )
         else:
             coordinator.prepare_restart_from.remote(
                 predecessor_execution_run_id=str(predecessor_execution_run_id),
-                **coordinator_kwargs,
+                **prepare_kwargs,
             )
-            report_identity()
-            identity_reported = True
-            call = coordinator.drive_prepared.spawn()
+        report_identity()
+        identity_reported = True
+        call = (
+            coordinator.drive_prepared.spawn(
+                development_function_handles=development_handles
+            )
+            if development_handles is not None
+            else coordinator.drive_prepared.spawn()
+        )
     except (Exception, KeyboardInterrupt):
         if not identity_reported:
             report_identity()

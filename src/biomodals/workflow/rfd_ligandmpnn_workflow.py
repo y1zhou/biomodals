@@ -51,7 +51,7 @@ from biomodals.workflow.core.artifact_availability import (
 from biomodals.workflow.core.execution import app_scientific_version
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
-_SCIENTIFIC_SCHEMA_VERSION = "1"
+_SCIENTIFIC_SCHEMA_VERSION = "2"
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,

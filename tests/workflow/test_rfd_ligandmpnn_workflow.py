@@ -222,6 +222,19 @@ def test_rfd_ligandmpnn_app_version_changes_plan_identity(
     assert fingerprint() != baseline
 
 
+def test_rfd_ligandmpnn_plan_binds_terminal_publication_schema() -> None:
+    workflow = build_rfd_ligandmpnn_workflow(
+        input_pdb=("input.pdb", b"ATOM\n"),
+        contigs="100-150",
+        hotspot_res="A1",
+    )
+
+    assert (
+        workflow.validate().scientific_versions["biomodals.workflow.rfd_ligandmpnn"]
+        == "2"
+    )
+
+
 def test_rfdiffusion_node_prepares_kernel_call_with_hydra_overrides(
     tmp_path: Path,
 ) -> None:

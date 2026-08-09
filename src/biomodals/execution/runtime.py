@@ -271,14 +271,10 @@ class ExecutionRuntime:
         with self._synchronize():
             run = self.repository.get_run(execution_run_id)
         if run.status == RunStatus.CANCEL_REQUESTED:
-            reconcile_provider_calls(set(run.plan.node_keys))
-            decode_completed_calls()
-            if result_validation_is_suspended():
-                return
-            recover_publications_unless_cancelled()
-            reconcile()
-            return
-        if run.status == RunStatus.STATE_UNKNOWN:
+            required = None
+            required_nodes = set(run.plan.node_keys)
+            continue_admission = False
+        elif run.status == RunStatus.STATE_UNKNOWN:
             required = self.required_node_keys(execution_run_id)
             required_nodes = set(run.plan.node_keys if required is None else required)
             if required is not None:
@@ -287,29 +283,31 @@ class ExecutionRuntime:
                     required_node_keys=required,
                     now=now(),
                 )
-            reconcile_provider_calls(required_nodes)
-            decode_completed_calls()
-            if result_validation_is_suspended():
+            continue_admission = False
+        elif run.status in {RunStatus.PENDING, RunStatus.RUNNING}:
+            required = self.required_node_keys(execution_run_id)
+            if required is None:
                 return
-            recover_publications_unless_cancelled()
-            reconcile()
+            required_nodes = set(required)
+            self.prune_unrequired_nodes(
+                execution_run_id,
+                required_node_keys=required,
+                now=now(),
+            )
+            continue_admission = True
+        else:
             return
-        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-            return
-        required = self.required_node_keys(execution_run_id)
-        if required is None:
-            return
-        self.prune_unrequired_nodes(
-            execution_run_id,
-            required_node_keys=required,
-            now=now(),
-        )
-        reconcile_provider_calls(set(required))
+
+        reconcile_provider_calls(required_nodes)
         decode_completed_calls()
         if result_validation_is_suspended():
             return
         recover_publications_unless_cancelled()
         reconcile()
+        if not continue_admission:
+            return
+        if required is None:
+            return
         with self._synchronize():
             can_continue = self.repository.get_run(execution_run_id).status in {
                 RunStatus.PENDING,
@@ -317,7 +315,7 @@ class ExecutionRuntime:
             }
         if not can_continue:
             return
-        start_ready_nodes(set(required))
+        start_ready_nodes(required_nodes)
         if after_start_ready_nodes is not None:
             while after_start_ready_nodes():
                 recover_publications_unless_cancelled()

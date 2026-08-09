@@ -328,7 +328,24 @@ class ExecutionCoordinator:
         if development_function_handles is not None:
             with self._lock():
                 self._development_function_handles = dict(development_function_handles)
-        return self._drive_prepared()
+        with self._drive_lock:
+            with self._lock():
+                self._require_ledger()
+                plan = self._load_plan()
+            external_checker = self._resolve_external_checker(plan)
+            with self._lock():
+                runtime = self._open_runtime(
+                    plan,
+                    resolve_external_checker=True,
+                    external_checker=external_checker,
+                )
+            try:
+                return runtime.run(
+                    workload_run_key=plan.workload_run_key,
+                )
+            finally:
+                with self._lock():
+                    self._close_runtime()
 
     @modal.method()
     def prepare_restart_from(
@@ -437,27 +454,6 @@ class ExecutionCoordinator:
                     node_publications=node_publications,
                     task_publications=task_publications,
                 )
-
-    def _drive_prepared(self) -> AppRunResult:
-        """Open and drive one already persisted workflow plan."""
-        with self._drive_lock:
-            with self._lock():
-                self._require_ledger()
-                plan = self._load_plan()
-            external_checker = self._resolve_external_checker(plan)
-            with self._lock():
-                runtime = self._open_runtime(
-                    plan,
-                    resolve_external_checker=True,
-                    external_checker=external_checker,
-                )
-            try:
-                return runtime.run(
-                    workload_run_key=plan.workload_run_key,
-                )
-            finally:
-                with self._lock():
-                    self._close_runtime()
 
     @modal.exit()
     def exit(self) -> None:
@@ -852,6 +848,4 @@ def submit_workflow_run(
         )
         raise
 
-    if not identity_reported:
-        report_identity()
     return call

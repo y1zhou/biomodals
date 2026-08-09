@@ -289,6 +289,11 @@ class WorkflowRuntime:
         ):
             raise ValueError("fused pull completion contains duplicate request IDs")
         with self.store.synchronize():
+            self.store.execution.preflight_pull_task_claim(
+                provider_call_id,
+                request_id=request_id,
+                capacity=capacity,
+            )
             call = self.store.execution.get_provider_call(
                 provider_call_id,
                 include_task_keys=False,

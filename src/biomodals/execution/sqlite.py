@@ -1740,15 +1740,14 @@ class SqliteExecutionRepository:
             spawn_authorized=True,
         )
 
-    def claim_pull_tasks(
+    def preflight_pull_task_claim(
         self,
         provider_call_id: UUID,
         *,
         request_id: str,
         capacity: int,
-        now: int,
-    ) -> PullTaskClaim:
-        """Checkpoint an ordered Task microbatch before returning its payloads."""
+    ) -> PullTaskClaim | None:
+        """Validate one claim request and return its exact replay, if present."""
         if not request_id:
             raise ValueError("claim request ID cannot be empty")
         if capacity <= 0:
@@ -1789,6 +1788,33 @@ class SqliteExecutionRepository:
         ).fetchone()
         if capacity > batch["claim_capacity"]:
             raise ValueError("claim capacity exceeds the pull-worker policy")
+        return None
+
+    def claim_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        *,
+        request_id: str,
+        capacity: int,
+        now: int,
+    ) -> PullTaskClaim:
+        """Checkpoint an ordered Task microbatch before returning its payloads."""
+        existing = self.preflight_pull_task_claim(
+            provider_call_id,
+            request_id=request_id,
+            capacity=capacity,
+        )
+        if existing is not None:
+            return existing
+        call = self.get_provider_call(provider_call_id, include_task_keys=False)
+        batch = self._connection.execute(
+            """
+            SELECT claim_capacity
+            FROM execution_dispatch_batches
+            WHERE dispatch_batch_id = ?
+            """,
+            (str(call.dispatch_batch_id),),
+        ).fetchone()
         outstanding = self._connection.execute(
             """
             SELECT COUNT(*) AS count

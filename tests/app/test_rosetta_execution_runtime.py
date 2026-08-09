@@ -10,6 +10,7 @@ from uuid import UUID
 from biomodals.app.bioinfo.rosetta.execution_contracts import (
     RosettaTaskSpec,
     execute_rosetta_task,
+    task_publication_path,
 )
 from biomodals.app.bioinfo.rosetta.execution_request import (
     RosettaExecutionRequest,
@@ -239,6 +240,48 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
             "rosetta-tasks",
         )
     } == {TaskStatus.SUCCEEDED}
+    runtime.close()
+
+
+def test_fused_completion_replay_uses_its_durable_observations(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path, RecordingDriver())
+    runtime._initialize()
+    runtime.advance_once()
+    [call, _other_call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    claim = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+    )
+    completions = tuple(
+        (
+            assignment.task_key,
+            f"complete-{assignment.task_key}",
+            _publish_assignment(runtime, assignment),
+        )
+        for assignment in claim.assignments
+    )
+    next_claim = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        completions,
+        request_id="claim-next",
+        capacity=2,
+    )
+    task_publication_path(
+        runtime.run_root,
+        claim.assignments[0].task_key,
+    ).unlink()
+
+    replay = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        completions,
+        request_id="claim-next",
+        capacity=2,
+    )
+
+    assert replay == next_claim
     runtime.close()
 
 

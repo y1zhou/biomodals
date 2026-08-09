@@ -136,6 +136,16 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
                 provider_call_id,
                 include_task_keys=False,
             )
+            receipts = {
+                (task_key, request_id): (
+                    self.store.execution.get_pull_task_completion_receipt(
+                        provider_call_id,
+                        task_key,
+                        request_id=request_id,
+                    )
+                )
+                for task_key, request_id, _result in completions
+            }
             tasks = {
                 task_key: self.store.execution.get_task(
                     self.execution_run_id,
@@ -149,6 +159,10 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         specs = self._task_specs()
         observations = []
         for task_key, request_id, result in completions:
+            if (receipt := receipts[(task_key, request_id)]) is not None:
+                observation, message = receipt
+                observations.append((task_key, request_id, observation, message))
+                continue
             task = tasks[task_key]
             status = result.get("status")
             message = result.get("error")

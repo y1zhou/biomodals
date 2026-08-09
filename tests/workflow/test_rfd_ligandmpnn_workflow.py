@@ -660,7 +660,7 @@ def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "demo"
     assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
-    assert calls["drive"] == {}
+    assert calls["drive"] == {"development_function_handles": None}
 
 
 def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(

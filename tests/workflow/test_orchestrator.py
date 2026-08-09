@@ -1302,7 +1302,7 @@ def test_submit_successor_reports_identity_between_prepare_and_drive(
             remote=lambda **_kwargs: events.append("prepare")
         ),
         drive_prepared=SimpleNamespace(
-            spawn=lambda: events.append("drive") or "fc-successor"
+            spawn=lambda **_kwargs: events.append("drive") or "fc-successor"
         ),
     )
 
@@ -1334,7 +1334,7 @@ def test_submit_root_reports_identity_between_prepare_and_drive(
     coordinator = SimpleNamespace(
         prepare_run=SimpleNamespace(remote=lambda **_kwargs: events.append("prepare")),
         drive_prepared=SimpleNamespace(
-            spawn=lambda: events.append("drive") or "fc-root"
+            spawn=lambda **_kwargs: events.append("drive") or "fc-root"
         ),
     )
 

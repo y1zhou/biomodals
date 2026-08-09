@@ -546,10 +546,8 @@ class ShortMDAnalysisNode(AppBackedNode):
     replicate_run_name: str
     gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
 
-    def _app_kwargs_and_metadata(
-        self,
-        context: NodeRunContext,
-    ) -> tuple[dict[str, object], dict[str, str]]:
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare GROMACS analysis for kernel submission."""
         production_artifacts = context.inputs.get("production") or []
         if len(production_artifacts) != 1:
             raise ValueError(
@@ -567,39 +565,17 @@ class ShortMDAnalysisNode(AppBackedNode):
         safe_replicate_run_name = sanitize_filename(
             str(artifact.metadata.get("run_name") or self.replicate_run_name)
         )
-        return (
-            {
+        return RemoteNodeCall(
+            function_name="analyze_shortmd_gromacs_run",
+            uses_gpu=False,
+            kwargs={
                 "traj_prefix": "production_",
                 "run_name": safe_replicate_run_name,
                 "source_run_name": safe_source_run_name,
                 "save_processed_traj": self.gromacs.save_processed_traj,
                 "make_figures": self.gromacs.make_figures,
             },
-            {
-                "stage": "analysis",
-                "run_name": safe_replicate_run_name,
-                "source_run_name": safe_source_run_name,
-            },
         )
-
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare GROMACS analysis for kernel submission."""
-        kwargs, metadata = self._app_kwargs_and_metadata(context)
-        return RemoteNodeCall(
-            function_name="analyze_shortmd_gromacs_run",
-            uses_gpu=False,
-            kwargs=kwargs,
-            metadata=metadata,
-        )
-
-    def process_remote_result(
-        self,
-        result: object,
-        metadata: Mapping[str, object],
-    ) -> AppRunResult:
-        """Publish the analyzed production directory."""
-        del metadata
-        return AppRunResult.model_validate(result)
 
 
 @dataclass

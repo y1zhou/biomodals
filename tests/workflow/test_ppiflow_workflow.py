@@ -2557,7 +2557,7 @@ PPIFlowStep:
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "demo"
     assert calls["prepare"]["workflow"].name == "ppiflow-v2"
-    assert calls["drive"] == {}
+    assert calls["drive"] == {"development_function_handles": None}
 
 
 def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:

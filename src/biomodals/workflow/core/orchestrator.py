@@ -839,12 +839,8 @@ def submit_workflow_run(
             )
         report_identity()
         identity_reported = True
-        call = (
-            coordinator.drive_prepared.spawn(
-                development_function_handles=development_handles
-            )
-            if development_handles is not None
-            else coordinator.drive_prepared.spawn()
+        call = coordinator.drive_prepared.spawn(
+            development_function_handles=development_handles
         )
     except (Exception, KeyboardInterrupt):
         if not identity_reported:

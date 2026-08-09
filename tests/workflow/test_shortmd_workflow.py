@@ -659,11 +659,7 @@ def test_shortmd_analysis_node_prepares_and_publishes_analyzed_output(
         "save_processed_traj": True,
         "make_figures": True,
     }
-    assert invocation.metadata == {
-        "stage": "analysis",
-        "run_name": "source-r001",
-        "source_run_name": "source",
-    }
+    assert invocation.metadata == {}
     assert result.status == AppRunStatus.SUCCEEDED
     assert result.outputs[0].name == "gromacs_production"
     assert result.outputs[0].storage == VolumePath(
@@ -1026,7 +1022,7 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "shortmd-run"
     assert calls["prepare"]["workflow"].name == "shortmd"
-    assert calls["drive"] == {}
+    assert calls["drive"] == {"development_function_handles": None}
 
 
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(

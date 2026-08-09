@@ -669,6 +669,51 @@ def test_workflow_volume_reference_enriches_declared_file(tmp_path: Path) -> Non
     ]
 
 
+def test_workflow_volume_reference_hashes_only_declared_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run-1"
+    output_dir.mkdir()
+    (output_dir / "model.pdb").write_bytes(b"ATOM\n")
+    (output_dir / "unrelated.bin").write_bytes(b"large unrelated payload")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.workflow.core.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+                metadata={"files": [{"path": "model.pdb"}]},
+            )
+        ],
+    )
+
+    materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="models",
+        volume_root=tmp_path,
+    )
+
+    assert hashed == ["model.pdb", "model.pdb"]
+
+
 def test_materialize_volume_path_rejects_missing_workflow_volume_reference(
     tmp_path: Path,
 ) -> None:

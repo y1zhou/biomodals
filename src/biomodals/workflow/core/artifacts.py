@@ -140,9 +140,28 @@ def _reference_artifact_files(
     artifact_path = _resolve_volume_child(volume_root, storage.path)
     if not artifact_path.exists():
         return declared
-    actual_by_path = {file.path: file for file in _artifact_files(artifact_path)}
     if not declared:
-        return list(actual_by_path.values())
+        return _artifact_files(artifact_path)
+
+    if artifact_path.is_file():
+        actual_files = (
+            _artifact_files(artifact_path)
+            if declared[0].path == artifact_path.name
+            else []
+        )
+    else:
+        actual_files = []
+        for file in declared:
+            file_path = _resolve_artifact_file(artifact_path, file.path)
+            if file_path.is_file():
+                actual_files.append(
+                    ArtifactFile(
+                        path=file.path,
+                        size_bytes=file_path.stat().st_size,
+                        content_sha256=_file_sha256(file_path),
+                    )
+                )
+    actual_by_path = {file.path: file for file in actual_files}
 
     return [
         file.model_copy(

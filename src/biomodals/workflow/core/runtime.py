@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import orjson
 from pydantic import BaseModel
@@ -280,36 +280,144 @@ class WorkflowRuntime:
             (task_key, request_id, AppRunResult.model_validate(result))
             for task_key, request_id, result in completions
         )
-        if any(
-            self._uses_workflow_volume(result)
-            for _task_key, _request_id, result in validated
+        if len({task_key for task_key, _request_id, _result in validated}) != len(
+            validated
         ):
-            self._reload_volume()
+            raise ValueError("fused pull completion contains duplicate Task keys")
+        if len({request_id for _task_key, request_id, _result in validated}) != len(
+            validated
+        ):
+            raise ValueError("fused pull completion contains duplicate request IDs")
         with self.store.synchronize():
             call = self.store.execution.get_provider_call(
                 provider_call_id,
                 include_task_keys=False,
             )
-            tasks = {
-                task_key: self.store.execution.get_task(
+            cancellation_is_durable = self.store.execution.get_run(
+                self.execution_run_id
+            ).cancellation_is_durable
+            preflight = []
+            for task_key, completion_request_id, _result in validated:
+                task = self.store.execution.get_task(
                     self.execution_run_id,
                     call.node_key,
                     task_key,
                 )
-                for task_key, _request_id, _result in validated
-            }
+                if task.worker_provider_call_id != provider_call_id:
+                    raise ValueError("Task is not assigned to this Provider Call")
+                receipt = self.store.execution.get_pull_task_completion_receipt(
+                    provider_call_id,
+                    task_key,
+                    request_id=completion_request_id,
+                )
+                published_result = self.store.artifacts.load_task_result(
+                    call.node_key,
+                    task_key,
+                )
+                published_artifacts = (
+                    self.store.artifacts.load_task_output_artifacts(
+                        call.node_key,
+                        task_key,
+                    )
+                    if published_result is not None
+                    else ()
+                )
+                if (
+                    receipt is None
+                    and not cancellation_is_durable
+                    and published_result is None
+                    and task.status.is_terminal
+                ):
+                    raise ValueError(
+                        f"cannot complete terminal Task {task.status.value}"
+                    )
+                preflight.append((
+                    task,
+                    receipt,
+                    published_result,
+                    published_artifacts,
+                ))
         node = self._require_definition().nodes[call.node_key].node
         if not isinstance(node, RemotePullTaskWorkflowNode):
             raise ValueError("Provider Call does not belong to a pull-worker Node")
+        if any(
+            receipt is None
+            and not cancellation_is_durable
+            and published_result is None
+            and self._uses_workflow_volume(result)
+            for (
+                (_task_key, _request_id, result),
+                (_task, receipt, published_result, _published_artifacts),
+            ) in zip(validated, preflight, strict=True)
+        ):
+            self._reload_volume()
         prepared = []
-        for task_key, completion_request_id, result in validated:
-            task = tasks[task_key]
+        for (
+            (task_key, completion_request_id, result),
+            (task, receipt, published_result, published_artifacts),
+        ) in zip(validated, preflight, strict=True):
+            if receipt is not None:
+                observation, message = receipt
+                prepared.append((
+                    task,
+                    completion_request_id,
+                    observation,
+                    message,
+                    None,
+                    None,
+                ))
+                continue
+            if cancellation_is_durable:
+                prepared.append((
+                    task,
+                    completion_request_id,
+                    AvailabilityStatus.MISSING,
+                    "Completion ignored after workflow cancellation",
+                    None,
+                    None,
+                ))
+                continue
+            if published_result is not None:
+                if task.status == TaskStatus.SUCCEEDED:
+                    observation = AvailabilityStatus.AVAILABLE
+                else:
+                    context = self._node_context(
+                        self._require_definition(),
+                        call.node_key,
+                        task_key=task_key,
+                    )
+                    observation = self._observe_remote_task_publication(
+                        node,
+                        context,
+                        RemoteWorkflowTask(
+                            task_key=task.task_key,
+                            scientific_payload=task.scientific_payload,
+                            execution_payload=task.execution_payload,
+                        ),
+                        task.fingerprint,
+                        published_result,
+                        published_artifacts,
+                    )
+                prepared.append((
+                    task,
+                    completion_request_id,
+                    observation,
+                    (
+                        "Published workflow Task result is unavailable"
+                        if observation == AvailabilityStatus.MISSING
+                        else None
+                    ),
+                    None,
+                    (published_result, published_artifacts),
+                ))
+                continue
             if result.status != AppRunStatus.SUCCEEDED:
                 prepared.append((
                     task,
                     completion_request_id,
                     AvailabilityStatus.MISSING,
                     _node_error_message(result),
+                    None,
                     None,
                 ))
                 continue
@@ -318,13 +426,14 @@ class WorkflowRuntime:
                 call.node_key,
                 task_key=task_key,
             )
+            publication_scope = f"{_task_storage_scope(task_key)}-{uuid4().hex}"
             materialized = materialize_app_run_result(
                 result=result,
                 workflow_volume_name=self.workflow_volume_name,
-                result_dir=context.work_dir,
+                result_dir=(context.work_dir / "completions" / publication_scope),
                 artifact_dir=self.store.output_root / "artifacts",
                 producing_node_id=call.node_key,
-                artifact_id_scope=_task_storage_scope(task_key),
+                artifact_id_scope=publication_scope,
                 volume_root=self.volume_root,
             )
             artifacts = tuple(materialized.artifacts)
@@ -351,6 +460,7 @@ class WorkflowRuntime:
                     else None
                 ),
                 (materialized.result, artifacts),
+                None,
             ))
         now = self._now()
         with self.store.synchronize():
@@ -365,8 +475,65 @@ class WorkflowRuntime:
                     observation,
                     message,
                     publication,
+                    revalidated_publication,
                 ) in prepared:
-                    if publication is not None and not cancellation_is_durable:
+                    receipt = self.store.execution.get_pull_task_completion_receipt(
+                        provider_call_id,
+                        task.task_key,
+                        request_id=completion_request_id,
+                    )
+                    existing_publication = self.store.artifacts.load_task_result(
+                        call.node_key,
+                        task.task_key,
+                    )
+                    current_task = self.store.execution.get_task(
+                        self.execution_run_id,
+                        call.node_key,
+                        task.task_key,
+                    )
+                    if receipt is not None:
+                        observation, message = receipt
+                    elif cancellation_is_durable:
+                        observation = AvailabilityStatus.MISSING
+                        message = "Completion ignored after workflow cancellation"
+                    elif (
+                        existing_publication is not None
+                        and current_task.status == TaskStatus.SUCCEEDED
+                    ):
+                        observation = AvailabilityStatus.AVAILABLE
+                        message = None
+                    elif revalidated_publication is not None:
+                        revalidated_result, revalidated_artifacts = (
+                            revalidated_publication
+                        )
+                        current_artifacts = (
+                            self.store.artifacts.load_task_output_artifacts(
+                                call.node_key,
+                                task.task_key,
+                            )
+                            if existing_publication is not None
+                            else ()
+                        )
+                        if (
+                            existing_publication != revalidated_result
+                            or current_artifacts != revalidated_artifacts
+                        ):
+                            observation = (
+                                current_task.result_observation
+                                or AvailabilityStatus.MISSING
+                            )
+                            message = None
+                    elif existing_publication is not None:
+                        observation = (
+                            current_task.result_observation
+                            or AvailabilityStatus.MISSING
+                        )
+                        message = None
+                    elif current_task.status.is_terminal:
+                        raise ValueError(
+                            f"cannot complete terminal Task {current_task.status.value}"
+                        )
+                    elif publication is not None:
                         result, artifacts = publication
                         self.store.artifacts.record_task_publication(
                             call.node_key,
@@ -1520,6 +1687,16 @@ class WorkflowRuntime:
                 now=self._now(),
             )
 
+    def _node_publication_is_fenced(self, node_id: str) -> bool:
+        """Return whether cancellation or terminal state forbids publication."""
+        return (
+            self.store.execution.get_run(self.execution_run_id).cancellation_is_durable
+            or self.store.execution.get_node(
+                self.execution_run_id,
+                node_id,
+            ).status.is_terminal
+        )
+
     def _finalize_remote_task_node(
         self,
         node_id: str,
@@ -1528,12 +1705,7 @@ class WorkflowRuntime:
         implementation: RemoteTaskWorkflowNode,
     ) -> None:
         with self.store.transaction():
-            run = self.store.execution.get_run(self.execution_run_id)
-            node = self.store.execution.get_node(
-                self.execution_run_id,
-                node_id,
-            )
-            if run.cancellation_is_durable or node.status.is_terminal:
+            if self._node_publication_is_fenced(node_id):
                 return
             self.store.execution.apply_task_failure_policy(
                 self.execution_run_id,
@@ -1570,22 +1742,12 @@ class WorkflowRuntime:
             observation = self._artifact_observation(existing_artifacts)
             if observation == AvailabilityStatus.MISSING:
                 with self.store.transaction():
-                    run = self.store.execution.get_run(self.execution_run_id)
-                    node = self.store.execution.get_node(
-                        self.execution_run_id,
-                        node_id,
-                    )
-                    if run.cancellation_is_durable or node.status.is_terminal:
+                    if self._node_publication_is_fenced(node_id):
                         return
                     self.store.artifacts.discard_node_publication(node_id)
             elif observation == AvailabilityStatus.UNKNOWN:
                 with self.store.transaction():
-                    run = self.store.execution.get_run(self.execution_run_id)
-                    node = self.store.execution.get_node(
-                        self.execution_run_id,
-                        node_id,
-                    )
-                    if run.cancellation_is_durable or node.status.is_terminal:
+                    if self._node_publication_is_fenced(node_id):
                         return
                     self.store.execution.transition_run(
                         self.execution_run_id,
@@ -1604,12 +1766,7 @@ class WorkflowRuntime:
                     )
                     return
                 with self.store.transaction():
-                    run = self.store.execution.get_run(self.execution_run_id)
-                    node = self.store.execution.get_node(
-                        self.execution_run_id,
-                        node_id,
-                    )
-                    if run.cancellation_is_durable or node.status.is_terminal:
+                    if self._node_publication_is_fenced(node_id):
                         return
                     if empty_result:
                         self.store.execution.record_node_result_observation(
@@ -1672,6 +1829,9 @@ class WorkflowRuntime:
                     f"finalizer returned {finalization.status.value}; "
                     f"expected {expected_status.value}"
                 )
+            with self.store.synchronize():
+                if self._node_publication_is_fenced(node_id):
+                    return
             materialized = materialize_app_run_result(
                 result=finalization,
                 workflow_volume_name=self.workflow_volume_name,
@@ -1720,12 +1880,7 @@ class WorkflowRuntime:
             return
 
         with self.store.transaction():
-            run = self.store.execution.get_run(self.execution_run_id)
-            node = self.store.execution.get_node(
-                self.execution_run_id,
-                node_id,
-            )
-            if run.cancellation_is_durable or node.status.is_terminal:
+            if self._node_publication_is_fenced(node_id):
                 return
             self.store.artifacts.record_node_publication(
                 node_id,

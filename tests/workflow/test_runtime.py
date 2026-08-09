@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import cast
 from uuid import UUID
 
+import pytest
+
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -1350,6 +1352,7 @@ def test_pull_completion_after_cancellation_does_not_publish(
         node,
         id="fanout",
     )
+    volume = FakeVolume()
     runtime = _runtime(
         tmp_path,
         workflow,
@@ -1357,6 +1360,7 @@ def test_pull_completion_after_cancellation_does_not_publish(
         max_calls=1,
         max_gpu_calls=0,
         pull_worker_coordinator="run-pool",
+        volume=volume,
     )
     runtime._initialize("cancelled-pull-publication")
     runtime.advance_once()
@@ -1368,9 +1372,29 @@ def test_pull_completion_after_cancellation_does_not_publish(
     ).assignments
 
     runtime.cancel()
+    reloads = volume.reloads
     claim = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
-        ((assignment.task_key, "complete", _text_result("alpha")),),
+        (
+            (
+                assignment.task_key,
+                "complete",
+                AppRunResult(
+                    status=AppRunStatus.SUCCEEDED,
+                    outputs=[
+                        AppOutput(
+                            name="text",
+                            kind=ArtifactKind.REPORT,
+                            storage=VolumePath(
+                                volume_name="Workflow-outputs",
+                                path="worker/result.txt",
+                                media_type="text/plain",
+                            ),
+                        )
+                    ],
+                ),
+            ),
+        ),
         request_id="late-completion",
         capacity=1,
     )
@@ -1390,6 +1414,9 @@ def test_pull_completion_after_cancellation_does_not_publish(
         )
         == ()
     )
+    assert node.publication_probes == []
+    assert volume.reloads == reloads
+    assert list(tmp_path.rglob("completions")) == []
 
 
 def test_pull_completion_replay_remains_idempotent_after_cancellation(
@@ -1416,23 +1443,222 @@ def test_pull_completion_replay_remains_idempotent_after_cancellation(
         request_id="claim",
         capacity=1,
     ).assignments
-    completion = ((assignment.task_key, "complete", _text_result("alpha")),)
-
     first = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
-        completion,
+        ((assignment.task_key, "complete", _text_result("alpha")),),
+        request_id="next",
+        capacity=1,
+    )
+    [artifact] = runtime.store.artifacts.load_task_output_artifacts(
+        "fanout",
+        assignment.task_key,
+    )
+    artifact_path = tmp_path / artifact.storage.path
+    live_replay = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "complete", _text_result("EVIL")),),
         request_id="next",
         capacity=1,
     )
     runtime.cancel()
     replay = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
-        completion,
+        ((assignment.task_key, "complete", _text_result("WORSE")),),
         request_id="next",
         capacity=1,
     )
 
-    assert first == replay
+    assert first == live_replay == replay
+    assert artifact_path.read_bytes() == b"alpha"
+    assert artifact.files[0].content_sha256 == sha256(b"alpha").hexdigest()
+    assert len(list(tmp_path.rglob("completions"))) == 1
+
+
+def test_pull_completion_rejects_another_worker_before_file_work(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("wrong-pull-owner")
+    workflow.add_node(
+        PullFanoutNode(("alpha", "beta", "gamma"), max_worker_calls=2),
+        id="fanout",
+    )
+    volume = FakeVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=2,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+        volume=volume,
+    )
+    runtime._initialize("wrong-pull-owner")
+    runtime.advance_once()
+    first_call, second_call = runtime.store.execution.list_provider_calls(RUN_ID)
+    [victim, *_] = runtime.claim_pull_tasks(
+        first_call.provider_call_id,
+        request_id="first-claim",
+        capacity=2,
+    ).assignments
+    runtime.claim_pull_tasks(
+        second_call.provider_call_id,
+        request_id="second-claim",
+        capacity=2,
+    )
+    reloads = volume.reloads
+
+    with pytest.raises(ValueError, match="not assigned"):
+        runtime.complete_pull_tasks_and_claim(
+            second_call.provider_call_id,
+            (
+                (
+                    victim.task_key,
+                    "wrong-owner-completion",
+                    AppRunResult(
+                        status=AppRunStatus.SUCCEEDED,
+                        outputs=[
+                            AppOutput(
+                                name="text",
+                                kind=ArtifactKind.REPORT,
+                                storage=VolumePath(
+                                    volume_name="Workflow-outputs",
+                                    path="worker/result.txt",
+                                ),
+                            )
+                        ],
+                    ),
+                ),
+            ),
+            request_id="wrong-owner-next",
+            capacity=2,
+        )
+
+    assert volume.reloads == reloads
+    assert list(tmp_path.rglob("completions")) == []
+
+
+def test_new_pull_completion_revalidates_unknown_publication(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("unknown-pull-publication")
+    node = PullFanoutNode(
+        ("alpha",),
+        max_worker_calls=1,
+        publication_observation=AvailabilityStatus.UNKNOWN,
+    )
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("unknown-pull-publication")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+
+    runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "first", _text_result("alpha")),),
+        request_id="first-next",
+        capacity=1,
+    )
+    [artifact] = runtime.store.artifacts.load_task_output_artifacts(
+        "fanout",
+        assignment.task_key,
+    )
+    artifact_path = tmp_path / artifact.storage.path
+    runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "second", _text_result("EVIL")),),
+        request_id="second-next",
+        capacity=1,
+    )
+
+    task = runtime.store.execution.get_task(RUN_ID, "fanout", assignment.task_key)
+    assert task.status == TaskStatus.RUNNING
+    assert task.result_observation == AvailabilityStatus.UNKNOWN
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.SUSPENDED
+    assert node.publication_probes == [assignment.task_key, assignment.task_key]
+    assert artifact_path.read_bytes() == b"alpha"
+    assert len(list(tmp_path.rglob("completions"))) == 1
+
+
+def test_pull_revalidation_does_not_restore_discarded_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = Workflow("raced-pull-revalidation")
+    node = PullFanoutNode(
+        ("alpha",),
+        max_worker_calls=1,
+        publication_observation=AvailabilityStatus.UNKNOWN,
+    )
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("raced-pull-revalidation")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+    runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "first", _text_result("alpha")),),
+        request_id="first-next",
+        capacity=1,
+    )
+
+    def discard_during_probe(*_args: object) -> AvailabilityStatus:
+        with runtime.store.synchronize():
+            with runtime.store.transaction():
+                runtime.store.artifacts.discard_task_publication(
+                    "fanout",
+                    assignment.task_key,
+                )
+                runtime.store.execution.record_task_result_observation(
+                    RUN_ID,
+                    "fanout",
+                    assignment.task_key,
+                    AvailabilityStatus.MISSING,
+                    now=200,
+                )
+        return AvailabilityStatus.AVAILABLE
+
+    monkeypatch.setattr(
+        node,
+        "observe_remote_task_publication",
+        discard_during_probe,
+    )
+    runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "second", _text_result("EVIL")),),
+        request_id="second-next",
+        capacity=1,
+    )
+
+    task = runtime.store.execution.get_task(RUN_ID, "fanout", assignment.task_key)
+    assert task.status == TaskStatus.FAILED
+    assert task.result_observation == AvailabilityStatus.MISSING
+    assert (
+        runtime.store.artifacts.load_task_result("fanout", assignment.task_key) is None
+    )
 
 
 def test_remote_task_finalizer_does_not_publish_after_cancellation(
@@ -1452,6 +1678,8 @@ def test_remote_task_finalizer_does_not_publish_after_cancellation(
     )
     assert runtime.store.artifacts.load_node_result("fanout") is None
     assert runtime.store.artifacts.load_node_output_artifacts("fanout") == ()
+    assert not (tmp_path / "nodes" / "fanout" / "result" / "aggregate").exists()
+    assert not (tmp_path / "artifacts" / "fanout-aggregate-summary.json").exists()
 
 
 def test_pull_completion_reloads_worker_owned_workflow_volume_output(

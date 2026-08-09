@@ -945,6 +945,8 @@ class SqliteExecutionRepository:
     ) -> ExecutionNodeRecord:
         """Record caller-owned Node validation without storing its evidence."""
         node = self.get_node(execution_run_id, node_key)
+        if self.get_run(execution_run_id).cancellation_is_durable:
+            return node
         if node.status.is_terminal:
             raise ValueError(
                 f"cannot record a result for terminal Node {node.status.value}"
@@ -998,6 +1000,8 @@ class SqliteExecutionRepository:
         if not message:
             raise ValueError("Node failure message cannot be empty")
         node = self.get_node(execution_run_id, node_key)
+        if self.get_run(execution_run_id).cancellation_is_durable:
+            return node
         if node.status == NodeStatus.FAILED and node.error_message == message:
             return node
         if node.status != NodeStatus.RUNNING:
@@ -1044,6 +1048,8 @@ class SqliteExecutionRepository:
     ) -> ExecutionTaskRecord:
         """Record caller-owned Task validation and any conclusive cache hit."""
         task = self.get_task(execution_run_id, node_key, task_key)
+        if self.get_run(execution_run_id).cancellation_is_durable:
+            return task
         if task.status.is_terminal:
             raise ValueError(
                 f"cannot record a result for terminal Task {task.status.value}"
@@ -2059,6 +2065,8 @@ class SqliteExecutionRepository:
     ) -> ExecutionTaskRecord:
         """Record one conclusive workload or publication failure."""
         task = self.get_task(execution_run_id, node_key, task_key)
+        if self.get_run(execution_run_id).cancellation_is_durable:
+            return task
         if task.status == TaskStatus.FAILED:
             return task
         if task.status.is_terminal:

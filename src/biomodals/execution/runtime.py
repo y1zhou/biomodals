@@ -260,8 +260,10 @@ class ExecutionRuntime:
 
         def recover_publications_unless_cancelled() -> None:
             with self._synchronize():
-                if self.repository.get_run(execution_run_id).cancellation_is_durable:
-                    return
+                cancellation_is_durable = self.repository.get_run(
+                    execution_run_id
+                ).cancellation_is_durable
+            if not cancellation_is_durable:
                 recover_publications()
 
         recover_publications_unless_cancelled()

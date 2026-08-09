@@ -462,6 +462,10 @@ class WorkflowRuntime:
                 for node_id in frontier
             ]
             with self.store.transaction():
+                if self.store.execution.get_run(
+                    self.execution_run_id
+                ).cancellation_is_durable:
+                    return
                 for node_id, observation in observed:
                     if self.store.execution.get_node(
                         self.execution_run_id,
@@ -556,6 +560,10 @@ class WorkflowRuntime:
         if not task_observations:
             return
         with self.store.transaction():
+            if self.store.execution.get_run(
+                self.execution_run_id
+            ).cancellation_is_durable:
+                return
             for node_id, task_key, observation in task_observations:
                 if self.store.execution.get_task(
                     self.execution_run_id,

@@ -1499,6 +1499,97 @@ def test_durable_cancellation_skips_cycle_publication_recovery() -> None:
     assert recoveries == []
 
 
+def test_cycle_publication_recovery_runs_outside_the_writer_lock() -> None:
+    repository = create_repository(task_count=1)
+    writer = RLock()
+    depth = 0
+
+    @contextmanager
+    def synchronize():
+        nonlocal depth
+        with writer:
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: None,
+        synchronize=synchronize,
+    )
+    recovery_depths: list[int] = []
+
+    runtime.advance_once(
+        RUN_ID,
+        recover_publications=lambda: recovery_depths.append(depth),
+        reconcile_provider_calls=lambda _required: None,
+        decode_completed_calls=lambda: None,
+        start_ready_nodes=lambda _required: None,
+        admit_remote_tasks=lambda _required: None,
+        reconcile_results=lambda: None,
+        now=lambda: 120,
+    )
+
+    assert recovery_depths
+    assert set(recovery_depths) == {0}
+
+
+@pytest.mark.parametrize("observation", list(AvailabilityStatus))
+def test_cancellation_during_recovery_fences_observation(
+    observation: AvailabilityStatus,
+) -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: None,
+    )
+    assert (
+        _submit_fixed(
+            runtime,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+        is not None
+    )
+
+    def recover() -> None:
+        runtime.cancel_run(RUN_ID, now=111)
+        repository.record_task_result_observation(
+            RUN_ID,
+            "inference",
+            "seed-0",
+            observation,
+            now=112,
+        )
+
+    runtime.advance_once(
+        RUN_ID,
+        recover_publications=recover,
+        reconcile_provider_calls=lambda _required: None,
+        decode_completed_calls=lambda: None,
+        start_ready_nodes=lambda _required: None,
+        admit_remote_tasks=lambda _required: None,
+        reconcile_results=lambda: None,
+        now=lambda: 120,
+    )
+
+    task = repository.get_task(RUN_ID, "inference", "seed-0")
+    assert repository.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
+    assert task.status.value == "running"
+    assert task.result_observation == AvailabilityStatus.MISSING
+
+
 def test_recovery_collects_attached_call_once_then_replays_durable_envelope() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

@@ -337,7 +337,7 @@ class ExecutionRunRecord:
     @property
     def cancellation_is_durable(self) -> bool:
         """Return whether unfinished work must retain cancellation intent."""
-        return self.status == RunStatus.CANCEL_REQUESTED or (
+        return self.status in {RunStatus.CANCEL_REQUESTED, RunStatus.CANCELLED} or (
             self.status == RunStatus.STATE_UNKNOWN
             and self.status_reason == RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN
         )

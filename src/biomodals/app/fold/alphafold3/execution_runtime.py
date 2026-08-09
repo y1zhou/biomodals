@@ -496,12 +496,12 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                         now=self._now(),
                     )
 
-    def _run_local_tasks(self) -> None:
+    def _run_local_tasks(self) -> bool:
         with self.store.synchronize():
             repository = self.store.execution
             node = repository.get_node(self.execution_run_id, _STAGE_INFERENCE)
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
-                return
+                return False
             task = repository.get_task(
                 self.execution_run_id,
                 _STAGE_INFERENCE,
@@ -511,7 +511,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             task.status.is_terminal
             or task.result_observation != AvailabilityStatus.MISSING
         ):
-            return
+            return False
         with self.store.synchronize():
             with self.store.transaction():
                 acquired = self.store.execution.acquire_local_task(
@@ -523,7 +523,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             if acquired:
                 self._checkpoint()
         if not acquired:
-            return
+            return False
         prepared = self._prepared_inference()
         try:
             stage_inference_run(self.output_volume, prepared)
@@ -544,7 +544,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                     _STAGE_INFERENCE,
                     task.task_key,
                 ).status.is_terminal:
-                    return
+                    return True
                 repository.fail_task(
                     self.execution_run_id,
                     _STAGE_INFERENCE,
@@ -552,7 +552,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                     message=f"Could not stage inference input: {error}",
                     now=self._now(),
                 )
-            return
+            return True
         with self.store.transaction():
             repository = self.store.execution
             if repository.get_task(
@@ -560,7 +560,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 _STAGE_INFERENCE,
                 task.task_key,
             ).status.is_terminal:
-                return
+                return True
             repository.record_task_result_observation(
                 self.execution_run_id,
                 _STAGE_INFERENCE,
@@ -568,6 +568,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 AvailabilityStatus.AVAILABLE,
                 now=self._now(),
             )
+        return True
 
     def _publish_request_receipt(self) -> None:
         with self.store.synchronize():

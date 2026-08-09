@@ -18,7 +18,6 @@ from pydantic import BaseModel
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
-    DispatchMode,
     ExecutionNodeRecord,
     ExecutionRuntime,
     ExecutionTaskRecord,
@@ -52,7 +51,7 @@ from biomodals.execution.scheduler import (
 )
 from biomodals.helper.app_execution import ExecutionVolume, ExecutionVolumeSync
 from biomodals.helper.shell import sanitize_filename
-from biomodals.schema import AppRunResult, AppRunStatus, WorkflowArtifact
+from biomodals.schema import AppRunResult, AppRunStatus, VolumePath, WorkflowArtifact
 from biomodals.workflow.core.artifact_availability import (
     ExternalArtifactChecker,
     check_artifact_availability,
@@ -267,12 +266,56 @@ class WorkflowRuntime:
         completions: tuple[tuple[str, str, AppRunResult], ...],
     ) -> tuple[ExecutionTaskRecord, ...]:
         """Publish and checkpoint one worker result microbatch."""
+        completed, _ = self._complete_pull_tasks(
+            provider_call_id,
+            completions,
+            next_request_id=None,
+            next_capacity=None,
+        )
+        return completed
+
+    def complete_pull_tasks_and_claim(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[tuple[str, str, AppRunResult], ...],
+        *,
+        request_id: str,
+        capacity: int,
+    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim]:
+        """Publish one microbatch and checkpoint its successor claim together."""
+        completed, claim = self._complete_pull_tasks(
+            provider_call_id,
+            completions,
+            next_request_id=request_id,
+            next_capacity=capacity,
+        )
+        if claim is None:  # pragma: no cover - guarded by the supplied claim args
+            raise RuntimeError("fused pull completion did not create a claim")
+        return completed, claim
+
+    def _complete_pull_tasks(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[tuple[str, str, AppRunResult], ...],
+        *,
+        next_request_id: str | None,
+        next_capacity: int | None,
+    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim | None]:
         if not completions:
-            return ()
+            if next_request_id is not None or next_capacity is not None:
+                raise ValueError("fused pull completion requires a nonempty batch")
+            return (), None
+        if (next_request_id is None) != (next_capacity is None):
+            raise ValueError("next pull claim requires both request ID and capacity")
         validated = tuple(
             (task_key, request_id, AppRunResult.model_validate(result))
             for task_key, request_id, result in completions
         )
+        if any(
+            self._uses_workflow_volume(result)
+            for _task_key, _request_id, result in validated
+        ):
+            self._reload_volume()
         with self.store.synchronize():
             call = self.store.execution.get_provider_call(
                 provider_call_id,
@@ -339,10 +382,17 @@ class WorkflowRuntime:
                 ),
                 (materialized.result, artifacts),
             ))
+        now = self._now()
         with self.store.synchronize():
             with self.store.transaction():
-                completed = []
-                for task, request_id, observation, message, publication in prepared:
+                kernel_completions = []
+                for (
+                    task,
+                    completion_request_id,
+                    observation,
+                    message,
+                    publication,
+                ) in prepared:
                     if publication is not None:
                         result, artifacts = publication
                         self.store.artifacts.record_task_publication(
@@ -351,20 +401,44 @@ class WorkflowRuntime:
                             task_fingerprint=task.fingerprint,
                             result=result,
                             artifacts=artifacts,
-                            now=self._now(),
+                            now=now,
                         )
-                    completed.append(
+                    kernel_completions.append((
+                        task.task_key,
+                        completion_request_id,
+                        observation,
+                        message,
+                    ))
+                if next_request_id is None:
+                    completed = tuple(
                         self.store.execution.record_pull_task_completion(
                             provider_call_id,
-                            task.task_key,
-                            request_id=request_id,
+                            task_key,
+                            request_id=completion_request_id,
                             observation=observation,
                             message=message,
-                            now=self._now(),
+                            now=now,
+                        )
+                        for (
+                            task_key,
+                            completion_request_id,
+                            observation,
+                            message,
+                        ) in kernel_completions
+                    )
+                    claim = None
+                else:
+                    completed, claim = (
+                        self.store.execution.record_pull_task_completions_and_claim(
+                            provider_call_id,
+                            kernel_completions,
+                            request_id=next_request_id,
+                            capacity=cast(int, next_capacity),
+                            now=now,
                         )
                     )
             self._checkpoint()
-        return tuple(completed)
+        return completed, claim
 
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""
@@ -563,13 +637,6 @@ class WorkflowRuntime:
             discard_result=self._discard_prepared_result,
             now=self._now(),
         )
-        if any(
-            not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-            and updated.dispatch_mode != DispatchMode.PULL_WORKER
-            for original, updated in reconciled
-        ):
-            self._reload_volume()
         for _, call in reconciled:
             if (
                 call.status != ProviderCallStatus.SUCCEEDED
@@ -615,6 +682,8 @@ class WorkflowRuntime:
         except Exception as error:
             self._fail_task(node_id, f"Could not decode provider result: {error}")
             return
+        if self._uses_workflow_volume(result):
+            self._reload_volume()
         self._publish_result(node_id, result)
 
     def _publish_provider_task_results(
@@ -674,6 +743,8 @@ class WorkflowRuntime:
                     f"Could not decode provider result: {error}",
                 )
             return
+        if any(self._uses_workflow_volume(result) for result in results.values()):
+            self._reload_volume()
         for task in unfinished:
             self._publish_task_result(
                 node_id,
@@ -798,7 +869,8 @@ class WorkflowRuntime:
         except Exception as error:
             return _PreparedNode(node_id, context, (), error)
 
-    def _run_local_tasks(self, definition: WorkflowDefinition) -> None:
+    def _run_local_tasks(self, definition: WorkflowDefinition) -> bool:
+        progressed = False
         with self.store.synchronize():
             node_records = self.store.execution.list_nodes(self.execution_run_id)
         for node_record in node_records:
@@ -830,6 +902,7 @@ class WorkflowRuntime:
                     self._checkpoint()
             if not acquired:
                 continue
+            progressed = True
             context = self._node_context(definition, node_record.node_key)
             try:
                 result = AppRunResult.model_validate(node.run(context))
@@ -840,6 +913,7 @@ class WorkflowRuntime:
                 )
                 continue
             self._publish_result(node_record.node_key, result)
+        return progressed
 
     def _admit_remote_tasks(
         self,
@@ -1645,6 +1719,13 @@ class WorkflowRuntime:
         if AvailabilityStatus.MISSING in statuses:
             return AvailabilityStatus.MISSING
         return AvailabilityStatus.AVAILABLE
+
+    def _uses_workflow_volume(self, result: AppRunResult) -> bool:
+        return any(
+            isinstance(output.storage, VolumePath)
+            and output.storage.volume_name == self.workflow_volume_name
+            for output in (*result.outputs, *result.logs)
+        )
 
     def _prepare_result_envelope(self, result: object) -> _PreparedProviderResult:
         """Serialize a provider return without touching the shared Volume."""

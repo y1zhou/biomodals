@@ -189,13 +189,16 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
     for spawn in driver.spawns:
         kwargs = cast(dict[str, Any], spawn["kwargs"])
         assert kwargs["coordinator"] == "coordinator"
-    claimed_keys = []
-    for ordinal, call in enumerate(calls):
-        claim = runtime.claim_pull_tasks(
+    claims = [
+        runtime.claim_pull_tasks(
             call.provider_call_id,
             request_id=f"claim-{ordinal}",
             capacity=2,
         )
+        for ordinal, call in enumerate(calls)
+    ]
+    claimed_keys = []
+    for ordinal, (call, claim) in enumerate(zip(calls, claims, strict=True)):
         completions = []
         for assignment in claim.assignments:
             claimed_keys.append(assignment.task_key)
@@ -207,8 +210,15 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
             ))
         output = cast(FakeVolume, runtime.output_volume)
         commits = output.commits
-        runtime.complete_pull_tasks(call.provider_call_id, tuple(completions))
+        completed, next_claim = runtime.complete_pull_tasks_and_claim(
+            call.provider_call_id,
+            tuple(completions),
+            request_id=f"claim-{ordinal}-next",
+            capacity=2,
+        )
         assert output.commits == commits + 1
+        assert len(completed) == len(completions)
+        assert next_claim.assignments == ()
 
     assert claimed_keys == ["1", "2", "3"]
     driver.succeeded = True

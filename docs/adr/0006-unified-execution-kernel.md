@@ -540,6 +540,12 @@ remaining GPU slots, selection continues to CPU candidates rather than
 leaving total slots idle. The kernel adds no active-image heuristic, fairness
 cursor, priority weights, preemption, or scheduler plugin surface.
 
+The drive-cycle refill behavior was amended on 2026-08-09. Coordinator-local
+Tasks are run and reconciled to a fixed point before remote admission. When a
+completed remote branch unlocks a local adapter and then another remote Node,
+the downstream call may therefore occupy the freed slot in the same polling
+cycle instead of waiting for a later scheduler wave.
+
 The dispatch-batching policy was accepted on 2026-07-30. The kernel implements
 exactly two remote dispatch mechanics. In fixed-batch dispatch, the workload
 declares each Task's provider binding, GPU use, compatibility key, positive
@@ -573,6 +579,16 @@ The coordinator does not cancel excess workers when the target shrinks; they
 finish owned work and exit when no unowned Task remains. A claim race may
 produce a successful zero-Task call. The kernel adds no adaptive throughput
 controller, lease, or idle timeout.
+
+The pull-worker callback cadence was amended on 2026-08-09. A worker obtains
+its first microbatch through one checkpointed claim. After executing each
+nonempty microbatch and publishing its outputs, it sends the idempotent
+completions together with the next stable claim request. The single writer
+records both in one SQLite transaction and crosses one Volume checkpoint
+before returning the successor payloads. The last such transaction returns an
+empty claim. This preserves assignment-before-exposure and
+publication-before-completion while reducing `B` worker microbatches from
+`2B + 1` coordinator checkpoints to `B + 1`.
 
 The GPU and runtime-image tie-break policy was accepted on 2026-07-30. DAG
 depth and downstream unblocking span remain primary, so lower-ranked GPU work
@@ -619,12 +635,15 @@ Volume snapshots for ordinary progress freshness. They do not explicitly
 commit or reload the Volume on every scheduling pass. An explicit Volume
 checkpoint remains required when state must survive before an external side
 effect or cross-container response, including provider preclaim, returned call
-attachment, pull assignment, pull completion acknowledgement, cancellation,
-and terminal or error handoff. A reload is reserved for observing publications
-made by another container and invalidates any caller-owned planning cache. The
-coordinator host owns the initial reload; a workload runtime does not
-immediately reload the same Volume again. SQLite stays open for local-only
-commits and is closed only across an explicit Volume commit or reload.
+attachment, the initial pull assignment, fused pull completion-and-successor
+claim, cancellation, and terminal or error handoff. A reload is reserved for
+observing publications made by another container and invalidates any
+caller-owned planning cache. Workflow result handling reloads its own Volume
+only when the returned publication references that Volume; inline and external
+Volume results do not trigger a blanket reload. The coordinator host owns the
+initial reload; a workload runtime does not immediately reload the same Volume
+again. SQLite stays open for local-only commits and is closed only across an
+explicit Volume commit or reload.
 
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by

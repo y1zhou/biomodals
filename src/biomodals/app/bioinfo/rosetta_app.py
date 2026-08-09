@@ -38,6 +38,7 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
+    PullTaskClaim,
     RunStatus,
     WorkerAssignmentRecord,
 )
@@ -140,18 +141,22 @@ def run_rosetta_worker(
                 "error": str(error) or type(error).__name__,
             }
 
-    def complete_batch(
+    def complete_and_claim(
         completions: tuple[
             tuple[WorkerAssignmentRecord, str, dict[str, object]],
             ...,
         ],
-    ) -> None:
-        coordinator.complete_tasks.remote(
+        request_id: str,
+        capacity: int,
+    ) -> PullTaskClaim:
+        return coordinator.complete_tasks_and_claim.remote(
             provider_call_id,
             tuple(
-                (assignment.task_key, request_id, result)
-                for assignment, request_id, result in completions
+                (assignment.task_key, completion_request_id, result)
+                for assignment, completion_request_id, result in completions
             ),
+            request_id,
+            capacity,
         )
 
     summary = drive_pull_worker(
@@ -159,7 +164,7 @@ def run_rosetta_worker(
         claim_capacity=claim_capacity,
         claim=claim,
         execute=execute,
-        complete_batch=complete_batch,
+        complete_and_claim=complete_and_claim,
         checkpoint_batch=CONF.output_volume.commit,
         max_parallel=max_parallel,
     )
@@ -299,18 +304,22 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def complete_tasks(
+    def complete_tasks_and_claim(
         self,
         provider_call_id: str,
         completions: tuple[
             tuple[str, str, dict[str, object]],
             ...,
         ],
+        request_id: str,
+        capacity: int,
     ):
-        """Validate and checkpoint one pull Task result microbatch."""
-        return self._adapter().complete_tasks(
+        """Complete one pull microbatch and return its successor claim."""
+        return self._adapter().complete_tasks_and_claim(
             UUID(provider_call_id),
             completions,
+            request_id=request_id,
+            capacity=capacity,
         )
 
     @modal.exit()

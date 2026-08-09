@@ -102,6 +102,36 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             completions,
         )
 
+    def complete_tasks_and_claim(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[
+            tuple[str, str, dict[str, object]],
+            ...,
+        ],
+        *,
+        request_id: str,
+        capacity: int,
+    ) -> PullTaskClaim:
+        """Validate one microbatch and return its checkpointed successor claim."""
+        with self._writer_lock:
+            request = load_execution_request(
+                self.volume_root,
+                self.execution_run_id,
+            )
+            runtime = self._open_runtime(
+                request,
+                predecessor_execution_run_id=self._existing_predecessor(),
+            )
+        runtime.refresh_publications()
+        _, claim = runtime.complete_pull_tasks_and_claim(
+            provider_call_id,
+            completions,
+            request_id=request_id,
+            capacity=capacity,
+        )
+        return claim
+
     def prepare_restart(
         self,
         *,

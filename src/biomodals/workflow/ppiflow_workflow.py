@@ -55,6 +55,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     NodeAggregationPolicy,
+    PullTaskClaim,
     WorkerAssignmentRecord,
 )
 from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
@@ -1874,18 +1875,22 @@ def run_ppiflow_rosetta_worker(
             metrics={"candidate_id": task.candidate_id or task.task_key},
         )
 
-    def complete_batch(
+    def complete_and_claim(
         completions: tuple[
             tuple[WorkerAssignmentRecord, str, AppRunResult],
             ...,
         ],
-    ) -> None:
-        coordinator.complete_tasks.remote(
+        request_id: str,
+        capacity: int,
+    ) -> PullTaskClaim:
+        return coordinator.complete_tasks_and_claim.remote(
             provider_call_id,
             tuple(
-                (assignment.task_key, request_id, result)
-                for assignment, request_id, result in completions
+                (assignment.task_key, completion_request_id, result)
+                for assignment, completion_request_id, result in completions
             ),
+            request_id,
+            capacity,
         )
 
     summary = drive_pull_worker(
@@ -1893,7 +1898,7 @@ def run_ppiflow_rosetta_worker(
         claim_capacity=claim_capacity,
         claim=claim,
         execute=execute,
-        complete_batch=complete_batch,
+        complete_and_claim=complete_and_claim,
         checkpoint_batch=ROSETTA_OUTPUT_VOLUME.commit,
         max_parallel=max_parallel,
     )

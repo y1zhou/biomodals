@@ -53,14 +53,18 @@ def drive_pull_worker[Result](
     claim_capacity: int,
     claim: Callable[[str, int], PullTaskClaim],
     execute: Callable[[WorkerAssignmentRecord], Result],
-    complete_batch: Callable[[tuple[PullWorkerCompletion[Result], ...]], None],
+    complete_and_claim: Callable[
+        [tuple[PullWorkerCompletion[Result], ...], str, int],
+        PullTaskClaim,
+    ],
     checkpoint_batch: Callable[[], None] | None = None,
     max_parallel: int | None = None,
 ) -> PullWorkerSummary:
     """Claim, execute, and report deterministic Task microbatches until empty.
 
     ``checkpoint_batch`` runs after every nonempty batch finishes execution and
-    before any of that batch's completions are reported.
+    before any of that batch's completions are reported. ``complete_and_claim``
+    durably applies those completions together with the next claim.
     """
     if claim_capacity < 1:
         raise ValueError("claim_capacity must be positive")
@@ -70,9 +74,8 @@ def drive_pull_worker[Result](
 
     claimed_tasks = 0
     claim_ordinal = 0
+    claimed = claim(f"{provider_call_id}:claim:{claim_ordinal}", claim_capacity)
     while True:
-        claim_request_id = f"{provider_call_id}:claim:{claim_ordinal}"
-        claimed = claim(claim_request_id, claim_capacity)
         assignments = claimed.assignments
         if not assignments:
             return PullWorkerSummary(
@@ -86,7 +89,9 @@ def drive_pull_worker[Result](
             results = tuple(executor.map(execute, assignments))
         if checkpoint_batch is not None:
             checkpoint_batch()
-        complete_batch(
+        claimed_tasks += len(assignments)
+        claim_ordinal += 1
+        claimed = complete_and_claim(
             tuple(
                 (
                     assignment,
@@ -94,7 +99,7 @@ def drive_pull_worker[Result](
                     result,
                 )
                 for assignment, result in zip(assignments, results, strict=True)
-            )
+            ),
+            f"{provider_call_id}:claim:{claim_ordinal}",
+            claim_capacity,
         )
-        claimed_tasks += len(assignments)
-        claim_ordinal += 1

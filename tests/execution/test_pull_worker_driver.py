@@ -45,19 +45,20 @@ def test_pull_worker_replays_stable_request_ids_and_drains_until_empty() -> None
             assignments=claims[len(claim_calls) - 1],
         )
 
-    def complete_batch(completions) -> None:
+    def complete_and_claim(completions, request_id, capacity) -> PullTaskClaim:
         completion_batch_sizes.append(len(completions))
         completion_calls.extend(
-            (assignment.task_key, request_id, result)
-            for assignment, request_id, result in completions
+            (assignment.task_key, completion_request_id, result)
+            for assignment, completion_request_id, result in completions
         )
+        return claim(request_id, capacity)
 
     summary = drive_pull_worker(
         provider_call_id=CALL_ID,
         claim_capacity=2,
         claim=claim,
         execute=lambda assignment: str(assignment.execution_payload["index"]),
-        complete_batch=complete_batch,
+        complete_and_claim=complete_and_claim,
         max_parallel=2,
     )
 
@@ -100,7 +101,7 @@ def test_pull_worker_pool_bounds_claims_to_parallel_capacity(
     )
 
 
-def test_pull_worker_checkpoints_each_completed_microbatch_before_reporting() -> None:
+def test_pull_worker_checkpoints_outputs_before_fused_completion_and_claim() -> None:
     claims = [
         (_assignment("task-0", 0), _assignment("task-1", 1)),
         (_assignment("task-2", 2),),
@@ -120,16 +121,20 @@ def test_pull_worker_checkpoints_each_completed_microbatch_before_reporting() ->
             assignments=assignments,
         )
 
+    def complete_and_claim(completions, request_id, capacity) -> PullTaskClaim:
+        events.extend(
+            f"complete:{assignment.task_key}"
+            for assignment, _request_id, _result in completions
+        )
+        return claim(request_id, capacity)
+
     drive_pull_worker(
         provider_call_id=CALL_ID,
         claim_capacity=2,
         claim=claim,
         execute=lambda assignment: events.append(f"execute:{assignment.task_key}"),
         checkpoint_batch=lambda: events.append("checkpoint"),
-        complete_batch=lambda completions: events.extend(
-            f"complete:{assignment.task_key}"
-            for assignment, _request_id, _result in completions
-        ),
+        complete_and_claim=complete_and_claim,
         max_parallel=1,
     )
 

@@ -586,19 +586,19 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
 
-    def _complete_local_result(self) -> None:
+    def _complete_local_result(self) -> bool:
         with self.store.synchronize():
             repository = self.store.execution
             node = repository.get_node(self.execution_run_id, PREPARE_RESULT)
             if node.status != NodeStatus.RUNNING:
-                return
+                return False
             task = repository.get_task(
                 self.execution_run_id,
                 PREPARE_RESULT,
                 "operation",
             )
         if task.status != TaskStatus.PENDING:
-            return
+            return False
         with self.store.synchronize():
             with self.store.transaction():
                 acquired = self.store.execution.acquire_local_task(
@@ -610,7 +610,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             if acquired:
                 self._checkpoint()
         if not acquired:
-            return
+            return False
         self._write_node_publication(PREPARE_RESULT)
         observation = self._node_observation(PREPARE_RESULT)
         with self.store.transaction():
@@ -620,7 +620,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 PREPARE_RESULT,
                 "operation",
             ).status.is_terminal:
-                return
+                return True
             if observation == AvailabilityStatus.MISSING:
                 repository.fail_task(
                     self.execution_run_id,
@@ -637,6 +637,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                     observation,
                     now=self._now(),
                 )
+        return True
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
         with self.store.synchronize():

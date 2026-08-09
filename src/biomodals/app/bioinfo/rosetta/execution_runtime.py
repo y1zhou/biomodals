@@ -119,6 +119,42 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         """Validate and checkpoint one worker publication microbatch."""
         if not completions:
             return ()
+        return self._provider.record_pull_task_completions(
+            provider_call_id,
+            self._pull_completion_observations(provider_call_id, completions),
+            now=self._now(),
+        )
+
+    def complete_pull_tasks_and_claim(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[
+            tuple[str, str, Mapping[str, object]],
+            ...,
+        ],
+        *,
+        request_id: str,
+        capacity: int,
+    ):
+        """Validate one microbatch and checkpoint its next claim atomically."""
+        if not completions:
+            raise ValueError("fused pull completion requires a nonempty batch")
+        return self._provider.record_pull_task_completions_and_claim(
+            provider_call_id,
+            self._pull_completion_observations(provider_call_id, completions),
+            request_id=request_id,
+            capacity=capacity,
+            now=self._now(),
+        )
+
+    def _pull_completion_observations(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[
+            tuple[str, str, Mapping[str, object]],
+            ...,
+        ],
+    ) -> tuple[tuple[str, str, AvailabilityStatus, str | None], ...]:
         with self.store.synchronize():
             call = self.store.execution.get_provider_call(
                 provider_call_id,
@@ -165,11 +201,7 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             elif status != "failed":
                 raise ValueError(f"Unknown Rosetta worker status {status!r}")
             observations.append((task_key, request_id, observation, message))
-        return self._provider.record_pull_task_completions(
-            provider_call_id,
-            observations,
-            now=self._now(),
-        )
+        return tuple(observations)
 
     def advance_once(self) -> None:
         """Apply one result-driven recovery and greedy admission cycle."""

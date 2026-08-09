@@ -241,7 +241,7 @@ class ExecutionRuntime:
         decode_completed_calls: Callable[[], None],
         start_ready_nodes: Callable[[set[str]], None],
         admit_remote_tasks: Callable[[set[str]], None],
-        after_start_ready_nodes: Callable[[], None] | None = None,
+        after_start_ready_nodes: Callable[[], bool] | None = None,
         reconcile_results: Callable[[], None] | None = None,
         now: Callable[[], int],
     ) -> None:
@@ -296,7 +296,20 @@ class ExecutionRuntime:
             return
         start_ready_nodes(set(required))
         if after_start_ready_nodes is not None:
-            after_start_ready_nodes()
+            while after_start_ready_nodes():
+                recover_publications()
+                reconcile()
+                with self._synchronize():
+                    can_continue = self.repository.get_run(execution_run_id).status in {
+                        RunStatus.PENDING,
+                        RunStatus.RUNNING,
+                    }
+                if not can_continue:
+                    return
+                required = self.required_node_keys(execution_run_id)
+                if required is None:
+                    return
+                start_ready_nodes(set(required))
         recover_publications()
         required = self.required_node_keys(execution_run_id)
         if required is not None:
@@ -1006,6 +1019,28 @@ class ExecutionRuntime:
                 )
             self._checkpoint_state()
         return tasks
+
+    def record_pull_task_completions_and_claim(
+        self,
+        provider_call_id: UUID,
+        completions: Collection[tuple[str, str, AvailabilityStatus, str | None]],
+        *,
+        request_id: str,
+        capacity: int,
+        now: int,
+    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim]:
+        """Checkpoint one completed microbatch and its next claim together."""
+        with self._synchronize():
+            with self._transaction():
+                result = self.repository.record_pull_task_completions_and_claim(
+                    provider_call_id,
+                    completions,
+                    request_id=request_id,
+                    capacity=capacity,
+                    now=now,
+                )
+            self._checkpoint_state()
+        return result
 
     def reconcile_provider_calls(
         self,

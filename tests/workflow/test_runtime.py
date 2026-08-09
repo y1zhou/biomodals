@@ -325,6 +325,21 @@ class CancellingModalDriver(FakeModalDriver):
         return ModalCallObservation(ModalCallObservationKind.RUNNING)
 
 
+class SelectivelyCompletingModalDriver(FakeModalDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completed: set[str] = set()
+
+    def observe(self, provider_call_handle_id):
+        self.events.append(f"observe:{provider_call_handle_id}")
+        if provider_call_handle_id not in self.completed:
+            return ModalCallObservation(ModalCallObservationKind.RUNNING)
+        return ModalCallObservation(
+            ModalCallObservationKind.SUCCEEDED,
+            result=self.results[provider_call_handle_id],
+        )
+
+
 class StateUnknownUntilCancelledModalDriver(CancellingModalDriver):
     def observe(self, provider_call_handle_id):
         self.events.append(f"observe:{provider_call_handle_id}")
@@ -540,7 +555,7 @@ def test_provider_result_payload_is_file_backed_outside_the_ledger(
     runtime.close()
 
 
-def test_provider_publication_reload_follows_success_observation(
+def test_inline_provider_result_does_not_reload_the_workflow_volume(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -574,6 +589,67 @@ def test_provider_publication_reload_follows_success_observation(
     def publish(call) -> None:
         events.append("publish")
         original_publish(call)
+
+    monkeypatch.setattr(driver, "observe", observe)
+    monkeypatch.setattr(runtime._volume_sync, "reload", reload)
+    monkeypatch.setattr(runtime, "_publish_provider_result", publish)
+
+    runtime.advance_once()
+
+    assert events == ["observe", "publish"]
+    runtime.close()
+
+
+def test_workflow_volume_log_reloads_before_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workflow = Workflow("remote-volume")
+    workflow.add_node(
+        RemoteTextNode("hello", "remote_text"),
+        id="remote",
+    )
+    driver = FakeModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        volume=FakeVolume(),
+    )
+    runtime._initialize("remote-volume")
+    runtime.advance_once()
+    published = tmp_path / "worker" / "result.txt"
+    published.parent.mkdir()
+    published.write_text("hello")
+    result = _text_result("hello")
+    result.logs = [
+        AppOutput(
+            name="log",
+            kind=ArtifactKind.LOGS,
+            storage=VolumePath(
+                volume_name="Workflow-outputs",
+                path=published.relative_to(tmp_path).as_posix(),
+                media_type="text/plain",
+            ),
+        )
+    ]
+    driver.results["fc-remote_text"] = result
+    events: list[str] = []
+    original_observe = driver.observe
+    original_reload = runtime._volume_sync.reload
+    original_publish = runtime._publish_provider_result
+
+    def observe(provider_call_handle_id):
+        events.append("observe")
+        return original_observe(provider_call_handle_id)
+
+    def reload() -> None:
+        events.append("reload")
+        original_reload()
+
+    def publish(call) -> None:
+        original_publish(call)
+        events.append("publish")
 
     monkeypatch.setattr(driver, "observe", observe)
     monkeypatch.setattr(runtime._volume_sync, "reload", reload)
@@ -666,7 +742,7 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
         ProviderCallStatus.SUCCEEDED,
     ]
     assert volume.commits > 0
-    assert volume.reloads > 0
+    assert volume.reloads == 0
 
 
 def test_node_parallelism_is_independent_from_provider_call_limits(
@@ -694,6 +770,52 @@ def test_node_parallelism_is_independent_from_provider_call_limits(
         NodeStatus.PENDING,
     ]
     assert len(snapshot.provider_calls) == 1
+
+
+def test_completed_branch_refills_provider_capacity_in_the_same_cycle(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("constant-refill")
+    for branch in ("a", "b"):
+        upstream = workflow.add_node(
+            RemoteTextNode(branch, f"upstream_{branch}"),
+            id=f"upstream-{branch}",
+        )
+        bridge = workflow.add_node(
+            TextNode(f"selected-{branch}"),
+            id=f"bridge-{branch}",
+            inputs={"upstream": upstream.outputs(kind=ArtifactKind.REPORT)},
+        )
+        workflow.add_node(
+            RemoteTextNode(branch, f"downstream_{branch}"),
+            id=f"downstream-{branch}",
+            inputs={"bridge": bridge.outputs(kind=ArtifactKind.REPORT)},
+        )
+    driver = SelectivelyCompletingModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_parallel_nodes=2,
+        max_calls=2,
+        max_gpu_calls=0,
+    )
+    runtime._initialize("constant-refill")
+
+    runtime.advance_once()
+    assert [event for event in driver.events if event.startswith("spawn:")] == [
+        "spawn:upstream_a",
+        "spawn:upstream_b",
+    ]
+
+    driver.completed.add("fc-upstream_a")
+    runtime.advance_once()
+
+    assert [event for event in driver.events if event.startswith("spawn:")] == [
+        "spawn:upstream_a",
+        "spawn:upstream_b",
+        "spawn:downstream_a",
+    ]
 
 
 def test_cancel_requested_workflow_reconciles_provider_cancellation(
@@ -946,6 +1068,136 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
     assert node.finalized_results == [
         (("candidate-0", "candidate-1", "candidate-2"), ()),
     ]
+
+
+def test_pull_completion_and_next_claim_share_one_checkpoint(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("fused-pull-fanout")
+    workflow.add_node(
+        PullFanoutNode(
+            ("alpha", "beta", "gamma"),
+            max_worker_calls=1,
+        ),
+        id="fanout",
+    )
+    volume = FakeVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+        volume=volume,
+    )
+    runtime._initialize("fused-pull-fanout")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    commits = volume.commits
+    reloads = volume.reloads
+    first = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim-0",
+        capacity=2,
+    )
+
+    completed, second = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        tuple(
+            (
+                assignment.task_key,
+                f"complete-{assignment.task_key}",
+                _text_result(str(dict(assignment.execution_payload)["text"])),
+            )
+            for assignment in first.assignments
+        ),
+        request_id="claim-1",
+        capacity=2,
+    )
+
+    assert [task.task_key for task in completed] == [
+        "candidate-0",
+        "candidate-1",
+    ]
+    assert [assignment.task_key for assignment in second.assignments] == ["candidate-2"]
+    _, terminal = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        (
+            (
+                "candidate-2",
+                "complete-candidate-2",
+                _text_result("gamma"),
+            ),
+        ),
+        request_id="claim-2",
+        capacity=2,
+    )
+
+    assert terminal.assignments == ()
+    assert volume.commits == commits + 3
+    assert volume.reloads == reloads
+
+
+def test_pull_completion_reloads_worker_owned_workflow_volume_output(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("pull-volume-publication")
+    workflow.add_node(
+        PullFanoutNode(("alpha",), max_worker_calls=1),
+        id="fanout",
+    )
+    volume = FakeVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+        volume=volume,
+    )
+    runtime._initialize("pull-volume-publication")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim-0",
+        capacity=1,
+    ).assignments
+    published = tmp_path / "worker" / "result.txt"
+    published.parent.mkdir()
+    published.write_text("alpha")
+    reloads = volume.reloads
+
+    _, terminal = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        (
+            (
+                assignment.task_key,
+                "complete-candidate-0",
+                AppRunResult(
+                    status=AppRunStatus.SUCCEEDED,
+                    outputs=[
+                        AppOutput(
+                            name="text",
+                            kind=ArtifactKind.REPORT,
+                            storage=VolumePath(
+                                volume_name="Workflow-outputs",
+                                path=published.relative_to(tmp_path).as_posix(),
+                                media_type="text/plain",
+                            ),
+                        )
+                    ],
+                ),
+            ),
+        ),
+        request_id="claim-1",
+        capacity=1,
+    )
+
+    assert terminal.assignments == ()
+    assert volume.reloads == reloads + 1
 
 
 def test_pull_task_node_limits_its_concurrent_worker_calls(tmp_path: Path) -> None:

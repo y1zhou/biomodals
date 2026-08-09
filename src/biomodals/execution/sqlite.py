@@ -1971,6 +1971,35 @@ class SqliteExecutionRepository:
             now=now,
         )
 
+    def record_pull_task_completions_and_claim(
+        self,
+        provider_call_id: UUID,
+        completions: Collection[tuple[str, str, AvailabilityStatus, str | None]],
+        *,
+        request_id: str,
+        capacity: int,
+        now: int,
+    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim]:
+        """Complete one microbatch and claim its successor atomically."""
+        completed = tuple(
+            self.record_pull_task_completion(
+                provider_call_id,
+                task_key,
+                request_id=completion_request_id,
+                observation=observation,
+                message=message,
+                now=now,
+            )
+            for task_key, completion_request_id, observation, message in completions
+        )
+        claim = self.claim_pull_tasks(
+            provider_call_id,
+            request_id=request_id,
+            capacity=capacity,
+            now=now,
+        )
+        return completed, claim
+
     def acquire_local_task(
         self,
         execution_run_id: UUID,

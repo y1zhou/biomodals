@@ -298,11 +298,33 @@ class ExecutionCoordinator:
             self._require_ledger()
             plan = self._load_plan()
             runtime = self._open_runtime(plan, resolve_external_checker=False)
-        runtime.refresh_publications(workload_run_key=plan.workload_run_key)
+        runtime.attach(workload_run_key=plan.workload_run_key)
         return runtime.complete_pull_tasks(
             UUID(provider_call_id),
             completions,
         )
+
+    @modal.method()
+    def complete_tasks_and_claim(
+        self,
+        provider_call_id: str,
+        completions: tuple[tuple[str, str, AppRunResult], ...],
+        request_id: str,
+        capacity: int,
+    ) -> Any:
+        """Publish one microbatch and return its checkpointed successor claim."""
+        with self._lock():
+            self._require_ledger()
+            plan = self._load_plan()
+            runtime = self._open_runtime(plan, resolve_external_checker=False)
+        runtime.attach(workload_run_key=plan.workload_run_key)
+        _, claim = runtime.complete_pull_tasks_and_claim(
+            UUID(provider_call_id),
+            completions,
+            request_id=request_id,
+            capacity=capacity,
+        )
+        return claim
 
     @modal.method()
     def prepare_restart(

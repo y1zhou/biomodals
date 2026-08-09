@@ -652,6 +652,11 @@ repository for mutations. A repository reference must not cross a Volume
 barrier because that barrier closes and reopens SQLite. Cache and model Volumes
 are refreshed only for successful Nodes whose functions write those Volumes.
 
+Within one drive cycle, coordinator-local Tasks are executed and reconciled to
+a fixed point before remote admission. A completed branch can therefore cross
+local adapter Nodes and refill a newly free Provider Call slot without waiting
+for another polling interval.
+
 ## Responsibility boundary
 
 | Concern | Execution kernel owns | Workload or host owns |
@@ -1013,13 +1018,23 @@ retains its work. A conclusively failed owner call fails its unfinished Tasks;
 no different Provider Call may claim them in the same Execution Run.
 
 Workers publish their outputs before sending an idempotent completion report.
-The coordinator records individual Task outcomes in one serialized
-transaction. An early validated completion report may finish a Task while its
-worker call is still active. The call retains its single active slot until its
-terminal Result Envelope is durable, then releases that slot independently of
-any unfinished Task publication. A lost completion response is harmless, and
-publication validation reconciles output that became durable before its
-completion report.
+After the initial claim, each nonempty worker microbatch uses one fused
+`complete-and-claim` command. The coordinator validates the completed
+publications, records every individual Task outcome, and claims the next
+bounded microbatch in one SQLite transaction, then crosses one Volume
+checkpoint before returning the next payloads. The final fused command returns
+an empty claim. Thus a worker that processes `B` microbatches requires `B + 1`
+coordinator checkpoints rather than separate completion and claim checkpoints
+for every batch. Stable completion and claim request IDs make a lost fused
+response safe to replay.
+
+An early validated completion report may finish a Task while its worker call
+is still active. The call retains its single active slot until its terminal
+Result Envelope is durable, then releases that slot independently of any
+unfinished Task publication. Publication validation reconciles output that
+became durable before its completion report. A workflow coordinator reloads
+its own Volume only when the returned result actually references a publication
+on that Volume; external or inline results do not trigger a blanket reload.
 
 Provider redelivery is not a second kernel submission. A claim request may
 repeat automatically before or after a Worker Assignment is committed, and

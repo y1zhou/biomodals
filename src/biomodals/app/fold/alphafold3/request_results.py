@@ -797,6 +797,31 @@ def _presentation_archive_path(
     return selected.parent / name
 
 
+def request_archive_member_for_role(
+    manifest: dict[str, object],
+    *,
+    role: str,
+    display_name: str,
+) -> str:
+    """Return the exact local archive member published for one result role."""
+    _, _, canonical_name, artifacts, _ = _validated_manifest_artifacts(manifest)
+    if manifest["submitted_display_name"] != display_name:
+        raise ValueError("Archive display_name does not match the request view")
+    matches = [artifact for artifact in artifacts if artifact["role"] == role]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Request manifest requires exactly one {role!r} artifact; "
+            f"found {len(matches)}"
+        )
+    presentation_name = sanitize_af3_name(display_name)
+    relative = _presentation_archive_path(
+        cast(str, matches[0]["archive_path"]),
+        canonical_name=canonical_name,
+        presentation_name=presentation_name,
+    )
+    return (PurePosixPath(presentation_name) / relative).as_posix()
+
+
 def _download_artifact(
     reader: VolumeReader,
     artifact: dict[str, object],

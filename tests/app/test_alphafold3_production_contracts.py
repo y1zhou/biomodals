@@ -124,6 +124,7 @@ from biomodals.app.fold.alphafold3.request_results import (
     create_request_archive,
     load_request_manifest,
     publish_request_results,
+    request_archive_member_for_role,
     request_manifest_path,
     request_view_id,
 )
@@ -3246,6 +3247,57 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
             output_dir=tmp_path,
             display_name="Readable Name",
         )
+
+
+def test_request_archive_member_role_uses_ranked_presentation_path() -> None:
+    run_id = "d" * 64
+    canonical_name = canonical_output_name(run_id)
+    root = f"{run_id[:2]}/{run_id}"
+
+    def artifact(role: str, name: str) -> dict[str, object]:
+        return {
+            "role": role,
+            "volume_path": f"{root}/{name}",
+            "archive_path": name,
+            "size_bytes": 1,
+            "sha256": hashlib.sha256(b"x").hexdigest(),
+        }
+
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=[1],
+        display_name="Workload Z",
+        sample_count=2,
+        artifacts=[
+            artifact("input", f"{canonical_name}_data.json"),
+            artifact("request_best_model", f"{canonical_name}_model.cif"),
+            artifact(
+                "request_best_summary_confidences",
+                f"{canonical_name}_summary_confidences.json",
+            ),
+            artifact(
+                "seed_model_cif",
+                f"seed-1_sample-0/{canonical_name}_seed-1_sample-0_model.cif",
+            ),
+        ],
+    )
+
+    assert (
+        request_archive_member_for_role(
+            manifest,
+            role="request_best_model",
+            display_name="Workload Z",
+        )
+        == "Workload_Z/Workload_Z_model.cif"
+    )
+    assert (
+        request_archive_member_for_role(
+            manifest,
+            role="request_best_summary_confidences",
+            display_name="Workload Z",
+        )
+        == "Workload_Z/Workload_Z_summary_confidences.json"
+    )
 
 
 def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> None:

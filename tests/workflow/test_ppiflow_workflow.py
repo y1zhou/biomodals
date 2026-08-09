@@ -1650,6 +1650,84 @@ def test_refold_uses_alphafold3_helpers_from_their_owning_modules() -> None:
     )
 
 
+def test_refold_publishes_only_request_ranked_model_and_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    best_model = "Workload_Z/Workload_Z_model.cif"
+    best_summary = "Workload_Z/Workload_Z_summary_confidences.json"
+    archive_bytes = _tar_zst_bytes({
+        best_model: b"RANKED BEST",
+        best_summary: orjson.dumps({"iptm": 0.9}),
+        "Workload_Z/seed-1_sample-0/sample_model.cif": b"UNRANKED SAMPLE",
+        "Workload_Z/seed-1_sample-0/sample_summary_confidences.json": (
+            orjson.dumps({"iptm": 0.1})
+        ),
+    })
+    prepared = SimpleNamespace(
+        run_id="a" * 64,
+        request_id="b" * 64,
+        submitted_seeds=(1,),
+        normalized_seeds=(1,),
+        sample_count=2,
+        display_name="Workload Z",
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "_af3_config_for_refold",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "resolve_msa_and_templates",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "prepare_inference_run",
+        lambda *_args, **_kwargs: prepared,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "load_request_manifest",
+        lambda *_args, **_kwargs: {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "request_archive_member_for_role",
+        lambda _manifest, *, role, display_name: {
+            "request_best_model": best_model,
+            "request_best_summary_confidences": best_summary,
+        }[role],
+    )
+
+    def create_archive(_reader, _manifest, *, output_dir, display_name):
+        path = Path(output_dir) / f"{display_name}.tar.zst"
+        path.write_bytes(archive_bytes)
+        return path
+
+    monkeypatch.setattr(ppiflow_workflow, "create_request_archive", create_archive)
+
+    outputs = ppiflow_workflow._run_one_refold_candidate(
+        structure_name="candidate.pdb",
+        structure_bytes=b"ATOM\n",
+        candidate_id="candidate-a",
+        run_name="Workload Z",
+        step_name="ReFoldStep",
+        config={"sample": 2},
+    )
+
+    structures = next(
+        output for output in outputs if output.kind == ArtifactKind.STRUCTURES
+    )
+    assert structures.metadata["structure_patterns"] == (best_model,)
+    assert structures.metadata["request_best_model_archive_member"] == best_model
+    metrics = next(output for output in outputs if output.kind == ArtifactKind.TABLE)
+    frame = pl.read_csv(BytesIO(metrics.storage.data))
+    assert frame.select("source_file", "iptm").to_dicts() == [
+        {"source_file": best_summary, "iptm": 0.9}
+    ]
+
+
 def test_refold_builds_af3_config_without_app_reexports() -> None:
     config = ppiflow_workflow._af3_config_for_refold(
         structure_name="candidate.pdb",
@@ -1813,6 +1891,12 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
         "unused",
         AppRunResult(status=AppRunStatus.SUCCEEDED),
     )
+    selected_patterns = []
+
+    def select_structures(*args, **kwargs):
+        selected_patterns.append(kwargs.get("patterns"))
+        return next(selected)
+
     monkeypatch.setattr(
         ppiflow_workflow,
         "_reload_ppiflow_source_volumes",
@@ -1821,7 +1905,7 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
     monkeypatch.setattr(
         ppiflow_workflow.ppiflow_staging,
         "select_structure_files_from_artifacts",
-        lambda *args, **kwargs: next(selected),
+        select_structures,
     )
     monkeypatch.setattr(
         ppiflow_workflow.dockq_app,
@@ -1832,16 +1916,27 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
     ppiflow_workflow.run_ppiflow_dockq_stage.get_raw_f()(
         reference_artifacts=[_upstream_structure_artifact()],
         model_artifacts=[
-            _upstream_structure_artifact(metadata={"candidate_id": "candidate"})
+            _upstream_structure_artifact(
+                metadata={
+                    "candidate_id": "candidate",
+                    "request_best_model_archive_member": (
+                        "workflow/workflow_model.cif"
+                    ),
+                }
+            )
         ],
         candidate_manifests=None,
-        config={},
+        config={"structure_patterns": "*.cif"},
         run_name="dockq-run",
     )
 
     assert dockq.kwargs["run_name"] == "dockq-run"
     assert len(dockq.kwargs["pairs"]) == 1
     assert dockq.kwargs["pairs"][0]["candidate_id"] == "candidate"
+    assert selected_patterns == [
+        ("*.cif",),
+        ("workflow/workflow_model.cif",),
+    ]
 
 
 def test_filter_step_delegates_score_filtering(

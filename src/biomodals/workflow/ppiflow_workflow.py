@@ -45,6 +45,7 @@ from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     create_request_archive,
     load_request_manifest,
+    request_archive_member_for_role,
     request_manifest_from_result,
 )
 from biomodals.app.fold.alphafold3.search_pipeline import (
@@ -381,10 +382,29 @@ def run_ppiflow_dockq_stage(
                 f"DockQ model artifact {artifact.artifact_id!r} has no "
                 "canonical candidate_id"
             )
+        best_model_member = artifact.metadata.get("request_best_model_archive_member")
+        if best_model_member is not None and (
+            not isinstance(best_model_member, str) or not best_model_member
+        ):
+            raise ValueError(
+                f"DockQ model artifact {artifact.artifact_id!r} has an invalid "
+                "request-ranked AlphaFold3 model member"
+            )
+        model_patterns = (
+            (best_model_member,)
+            if isinstance(best_model_member, str) and best_model_member
+            else _patterns_from_config(config)
+        )
         selected = ppiflow_staging.select_structure_files_from_artifacts(
             [artifact],
             PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            patterns=model_patterns,
         )
+        if best_model_member is not None and len(selected) != 1:
+            raise ValueError(
+                f"DockQ model artifact {artifact.artifact_id!r} did not contain "
+                "exactly one request-ranked AlphaFold3 model"
+            )
         models.extend(
             ppiflow_staging.CandidateStructureFile(
                 candidate_id=candidate_id,
@@ -3605,6 +3625,19 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def _required_archive_member(
+    files: Sequence[tuple[str, bytes]],
+    member_name: str,
+) -> tuple[str, bytes]:
+    matches = [item for item in files if item[0] == member_name]
+    if len(matches) != 1:
+        raise ValueError(
+            f"AlphaFold3 request archive requires member {member_name!r}; "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
 def _run_one_refold_candidate(
     *,
     structure_name: str,
@@ -3669,11 +3702,22 @@ def _run_one_refold_candidate(
             display_name=run_name,
         )
         tarball_bytes = archive_path.read_bytes()
+    best_model_member = request_archive_member_for_role(
+        manifest,
+        role="request_best_model",
+        display_name=run_name,
+    )
+    best_summary_member = request_archive_member_for_role(
+        manifest,
+        role="request_best_summary_confidences",
+        display_name=run_name,
+    )
+    json_files = ppiflow_staging.files_from_tar_zst_bytes(
+        tarball_bytes,
+        suffixes=(".json",),
+    )
     metric_rows = ppiflow_tables.refold_metric_rows_from_json_files(
-        ppiflow_staging.files_from_tar_zst_bytes(
-            tarball_bytes,
-            suffixes=(".json",),
-        ),
+        [_required_archive_member(json_files, best_summary_member)],
         candidate_id=candidate_id,
         stage_name=step_name,
     )
@@ -3702,6 +3746,11 @@ def _run_one_refold_candidate(
                 "candidate_id": candidate_id,
                 "source_structure": structure_name,
                 "archive_format": "tar.zst",
+                "structure_patterns": (best_model_member,),
+                "request_best_model_archive_member": best_model_member,
+                "request_best_summary_confidences_archive_member": (
+                    best_summary_member
+                ),
             },
         )
     ]

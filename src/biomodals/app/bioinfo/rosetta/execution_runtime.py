@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,6 @@ from biomodals.app.bioinfo.rosetta.execution_request import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
-    ExecutionRuntime,
     NodeStatus,
     ProviderBinding,
     ProviderCallRecord,
@@ -39,7 +37,6 @@ from biomodals.execution.scheduler import (
 from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
-    ExecutionVolumeSync,
 )
 
 
@@ -62,24 +59,19 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         now: Callable[[], int] | None = None,
     ) -> None:
         """Bind the kernel writer to Rosetta's Task publications."""
-        self.request = request
-        self.execution_run_id = execution_run_id
-        self.deployment = deployment
-        self.store = store
-        self.output_volume = output_volume
-        self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
+        self._bind_execution_runtime(
+            request=request,
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            store=store,
+            modal_driver=modal_driver,
+            output_volume=output_volume,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            poll_interval_seconds=poll_interval_seconds,
+            now=now,
+        )
         self.output_root = Path(output_root)
         self.pull_worker_coordinator = pull_worker_coordinator
-        self.predecessor_execution_run_id = predecessor_execution_run_id
-        self.poll_interval_seconds = poll_interval_seconds
-        self._now = now or (lambda: int(time.time()))
-        self._provider = ExecutionRuntime(
-            self.store.execution,
-            modal_driver=modal_driver,
-            checkpoint=self._checkpoint,
-            transaction=self.store.transaction,
-            synchronize=self.store.synchronize,
-        )
 
     @property
     def run_root(self) -> Path:
@@ -203,16 +195,11 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
     def _initialize(self, *, reload_output: bool = False):
         if reload_output:
             self._reload_output()
-        self._provider.create_or_verify_run(
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=self.predecessor_execution_run_id,
+        return self._create_or_verify_run(
             plan=self.request.execution_plan,
-            deployment=self.deployment,
             max_active_provider_calls=self.request.max_active_provider_calls,
             max_active_gpu_provider_calls=0,
-            now=self._now(),
         )
-        return self.store.execution
 
     def _recover_publications(self) -> None:
         with self.store.synchronize():

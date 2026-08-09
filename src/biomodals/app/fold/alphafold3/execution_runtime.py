@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -90,7 +89,6 @@ from biomodals.app.fold.alphafold3.template_search import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
-    ExecutionRuntime,
     NodeStatus,
     ProviderBinding,
     ProviderCallRecord,
@@ -111,7 +109,6 @@ from biomodals.execution.scheduler import (
 from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
-    ExecutionVolumeSync,
 )
 
 (
@@ -170,25 +167,20 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         now: Callable[[], int] | None = None,
     ) -> None:
         """Bind existing AlphaFold3 plans, publications, and Modal functions."""
-        self.request = request
-        self.execution_run_id = execution_run_id
-        self.deployment = deployment
-        self.store = store
-        self.output_volume = output_volume
-        self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
+        self._bind_execution_runtime(
+            request=request,
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            store=store,
+            modal_driver=modal_driver,
+            output_volume=output_volume,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            poll_interval_seconds=poll_interval_seconds,
+            now=now,
+        )
         self.search_runtime = search_runtime
         self.template_runtime = template_runtime
         self.inference_runtime = inference_runtime
-        self.predecessor_execution_run_id = predecessor_execution_run_id
-        self.poll_interval_seconds = poll_interval_seconds
-        self._now = now or (lambda: int(time.time()))
-        self._provider = ExecutionRuntime(
-            self.store.execution,
-            modal_driver=modal_driver,
-            checkpoint=self._checkpoint,
-            transaction=self.store.transaction,
-            synchronize=self.store.synchronize,
-        )
         self._msa_inventory_cache: (
             tuple[
                 tuple[RawSearchTask, ...],
@@ -220,16 +212,11 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._provider.create_or_verify_run(
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=self.predecessor_execution_run_id,
+        return self._create_or_verify_run(
             plan=self.request.execution_plan,
-            deployment=self.deployment,
             max_active_provider_calls=self.request.max_active_provider_calls,
             max_active_gpu_provider_calls=self.request.max_num_gpus,
-            now=self._now(),
         )
-        return self.store.execution
 
     def _recover_publications(self) -> None:
         """Probe result Nodes backward until reusable work closes each branch."""

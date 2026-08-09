@@ -145,7 +145,9 @@ These existing decisions remain binding during the refactor:
   human run name is allowed only for the same Workload Plan Fingerprint; a
   changed input or simulation setting requires another run name. Preparation
   is reusable only when the input PDB and every NVT, NPT, and production file
-  required by downstream Nodes validates against its publication marker.
+  required by downstream Nodes validates against its publication marker. The
+  terminal result validates the production MDP and TPR, no-PBC trajectory,
+  centered structure, and every declared analysis table and plot.
 - Before writing an incomplete GROMACS directory, the adapter atomically
   claims its human run name in a workload-scoped Modal Dict. The Volume marker
   records the elected Execution Run but never acts as a file lock. Matching
@@ -159,6 +161,14 @@ These existing decisions remain binding during the refactor:
   exception: they create no Tasks or ledger rows and are outside Run-scoped
   call-limit accounting. Do not use this exception as a template for new apps.
 - PPIFlow keeps a fixed stage DAG while candidate work fans out inside a stage.
+- PPIFlow carries one canonical candidate ID through ReFold, ranking, and
+  reporting even when filenames differ. A mixed Rosetta stage is `partial`,
+  and downstream rank/report edges explicitly accept that usable partial
+  result. Its terminal report republishes every scientific artifact it
+  consumes and associates manifests and audits by stage name, never list
+  position.
+- Rosetta validates the SHA-256 digests of every staged PDB, script, and flags
+  file before executing paid work.
 - Provider workers never write the coordinator's SQLite repository.
 - Ready Task rows and Worker Assignments are the durable pull-work queue.
 - A remote SQLite coordinator is routed by Execution Run and pinned deployment
@@ -486,6 +496,10 @@ to the report and preserves their exact `ArtifactFile` manifests. Validation
 therefore checks both the presentation and the files it presents. The kernel
 does not parse report text, recursively validate every ancestor, or infer a
 workflow's intended outputs; the workload constructs this boundary explicitly.
+Workflow-owned `ArtifactFile` entries include byte size and SHA-256 whenever
+the runtime can read the file. Validation rejects missing, unexpectedly empty,
+size-mismatched, or digest-mismatched files. A zero-byte file is accepted only
+when its manifest explicitly declares `size_bytes = 0`.
 
 An `unknown` Node or Task result observation leaves that record nonterminal
 and moves the Run to `suspended` with
@@ -619,6 +633,12 @@ kernel-computed fingerprint, and workload validation all match. The first
 version uses one fixed standard-library SHA-256/canonical-JSON implementation;
 it has no codec or hashing plugin layer and never reads large files while
 fingerprinting Tasks.
+
+The Task key itself is never sanitized into a physical identity. Workflow
+task directories and artifact ID scopes use a SHA-256-derived component of the
+complete key, including keys equal to aggregate labels such as `node`.
+Sanitized text may be used only for presentation. This makes valid keys such
+as `a/b` and `a_b` physically distinct before artifact rows are inserted.
 
 ### Admission-set and synchronization boundaries
 
@@ -791,6 +811,12 @@ ledger and reusable publication rows so immediate cancellation can act on
 durable state. A workflow entrypoint's `--restart-from` option uses the same
 two-input boundary through `prepare_restart_from` and `drive_prepared`; the
 combined workflow coordinator method is intentionally not exposed.
+
+Root workflows use the same two-step boundary: `prepare_run` persists and
+checkpoints the pending ledger, the CLI reports the Execution Run ID, and only
+then does `drive_prepared` spawn. A reported workflow identity is therefore
+immediately inspectable and cancellable; the older one-shot root `run` method
+is not part of the launch surface.
 
 Whenever a direct-app coordinator opens a staged request, it compares the
 plan's declared scientific versions with the versions loaded by the target
@@ -1036,13 +1062,26 @@ coordinator checkpoints rather than separate completion and claim checkpoints
 for every batch. Stable completion and claim request IDs make a lost fused
 response safe to replay.
 
+There is no production completion-only pull-worker command. Workers either
+make their initial claim or atomically report a nonempty completed microbatch
+and request the next claim. This keeps one durability protocol and prevents a
+caller from accidentally splitting publication completion from work
+redistribution.
+
 An early validated completion report may finish a Task while its worker call
 is still active. The call retains its single active slot until its terminal
 Result Envelope is durable, then releases that slot independently of any
 unfinished Task publication. Publication validation reconciles output that
 became durable before its completion report. A workflow coordinator reloads
 its own Volume only when the returned result actually references a publication
-on that Volume; external or inline results do not trigger a blanket reload.
+on that Volume, including result logs; external or inline results do not
+trigger a blanket reload.
+
+If a pull-worker call becomes terminal after committing publications but
+before its completion callback arrives, the coordinator revalidates those
+publications before failing unfinished assignments. It reloads only when a
+newly terminal call still owns unfinished Tasks, so ordinary running polls and
+already-recorded completion reports do not add Volume barriers.
 
 Provider redelivery is not a second kernel submission. A claim request may
 repeat automatically before or after a Worker Assignment is committed, and

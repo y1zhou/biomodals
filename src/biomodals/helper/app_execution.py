@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from uuid import UUID
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionOverview,
+    ExecutionPlan,
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
     ExecutionRuntime,
@@ -367,6 +369,56 @@ class ExecutionRuntimeLifecycle:
     _now: Callable[[], int]
     _provider: ExecutionRuntime
     _volume_sync: ExecutionVolumeSync
+
+    def _bind_execution_runtime(
+        self,
+        *,
+        request: Any,
+        execution_run_id: UUID,
+        deployment: DeploymentIdentity,
+        store: ExecutionRunStore,
+        modal_driver: Any,
+        output_volume: Any,
+        predecessor_execution_run_id: UUID | None,
+        poll_interval_seconds: float,
+        now: Callable[[], int] | None,
+    ) -> None:
+        """Bind the common host state shared by direct App runtimes."""
+        self.request = request
+        self.execution_run_id = execution_run_id
+        self.deployment = deployment
+        self.store = store
+        self.output_volume = output_volume
+        self.predecessor_execution_run_id = predecessor_execution_run_id
+        self.poll_interval_seconds = poll_interval_seconds
+        self._now = now or (lambda: int(time.time()))
+        self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
+        self._provider = ExecutionRuntime(
+            store.execution,
+            modal_driver=modal_driver,
+            checkpoint=self._checkpoint,
+            transaction=store.transaction,
+            synchronize=store.synchronize,
+        )
+
+    def _create_or_verify_run(
+        self,
+        *,
+        plan: ExecutionPlan,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+    ) -> SqliteExecutionRepository:
+        """Create or verify this bound App Run against its immutable plan."""
+        self._provider.create_or_verify_run(
+            execution_run_id=self.execution_run_id,
+            predecessor_execution_run_id=self.predecessor_execution_run_id,
+            plan=plan,
+            deployment=self.deployment,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            now=self._now(),
+        )
+        return self.store.execution
 
     def run(self) -> ExecutionOverview:
         """Create or recover the Run and drive it until it stops."""

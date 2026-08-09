@@ -30,7 +30,6 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionOverview,
-    ExecutionRuntime,
     NodeStatus,
     ProviderCallStatus,
     ProviderCallSubmission,
@@ -42,7 +41,6 @@ from biomodals.helper.app_execution import (
     ExecutionRequestFile,
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
-    ExecutionVolumeSync,
 )
 from biomodals.helper.output_claim import (
     acquire_output_claim,
@@ -212,26 +210,21 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         now: Callable[[], int] | None = None,
     ) -> None:
         """Bind the kernel writer to the established output directory."""
-        self.request = request
-        self.execution_run_id = execution_run_id
-        self.deployment = deployment
-        self.store = store
-        self.output_volume = output_volume
+        self._bind_execution_runtime(
+            request=request,
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            store=store,
+            modal_driver=modal_driver,
+            output_volume=output_volume,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            poll_interval_seconds=poll_interval_seconds,
+            now=now,
+        )
         self.output_claims = output_claims
         self.output_root = Path(output_root)
-        self.predecessor_execution_run_id = predecessor_execution_run_id
-        self.poll_interval_seconds = poll_interval_seconds
-        self._now = now or (lambda: int(time.time()))
         self._run_identity_verified = False
         self._verified_available_nodes: set[str] = set()
-        self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
-        self._provider = ExecutionRuntime(
-            store.execution,
-            modal_driver=modal_driver,
-            checkpoint=self._checkpoint,
-            transaction=store.transaction,
-            synchronize=store.synchronize,
-        )
 
     def advance_once(self) -> None:
         """Apply one publication, recovery, and admission cycle."""
@@ -247,16 +240,11 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _initialize(self):
-        self._provider.create_or_verify_run(
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=self.predecessor_execution_run_id,
+        return self._create_or_verify_run(
             plan=self.request.execution_plan,
-            deployment=self.deployment,
             max_active_provider_calls=self.request.max_active_provider_calls,
             max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
-            now=self._now(),
         )
-        return self.store.execution
 
     def _recover_publications(self) -> None:
         if not self._run_identity_verified:

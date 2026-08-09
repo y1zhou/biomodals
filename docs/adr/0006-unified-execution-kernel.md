@@ -112,11 +112,11 @@ that arrives before `run` or `restart` cannot misclassify a successor as a
 root Run. Generic and workflow-specific restart first ask the target
 coordinator to validate and persist the exact Successor request or workflow
 plan, then spawn a separate drive call. Direct apps persist the launch record;
-workflows may persist the pending ledger and reusable publication rows. The
-preparation boundary must complete before the CLI reports or starts the drive,
-so immediate cancellation always has enough durable input to initialize the
-Successor correctly. Workload arguments and output-claim metadata are not
-lineage.
+workflows persist the pending root or Successor ledger and any reusable
+publication rows. The preparation boundary must checkpoint before the CLI
+reports the identity or starts the drive, so immediate cancellation always
+has durable state to act on. Workload arguments and output-claim metadata are
+not lineage.
 
 The CLI location policy was accepted on 2026-07-29 and simplified the same
 day. App and workflow launch commands print the Deployment Identity, Execution
@@ -311,6 +311,12 @@ key, Task key, computed fingerprint, and workload validation all match. The
 kernel has no pluggable hash registry, custom codec framework, or repeated
 large-file hashing.
 
+Task keys remain scientific identity, not filesystem names. Workflow task
+directories and artifact IDs use a collision-resistant digest of the complete
+Task key; sanitized display text and reserved aggregate labels never select
+physical storage. Distinct valid Task keys therefore cannot overwrite one
+another before SQLite detects a duplicate publication.
+
 The result-boundary policy was accepted on 2026-07-29. Terminal Execution
 Nodes—the DAG leaves with no downstream dependency—collectively define the
 scientific result boundary. The scheduler validates their workload
@@ -331,7 +337,10 @@ report, preserving their exact file manifests. Terminal-first validation can
 then return a genuine cache hit or expand the Successor repair closure when a
 referenced result is missing. The kernel does not recursively inspect report
 contents or infer which ancestors matter; boundary construction remains
-workload-owned.
+workload-owned. Workflow-owned `ArtifactFile` entries record their byte size
+and SHA-256 digest; validators reject missing, unexpectedly empty,
+size-mismatched, or digest-mismatched files. A deliberately empty result is
+valid only when its manifest explicitly declares zero bytes.
 
 The Node-result observation policy was accepted on 2026-07-29. Caller-owned
 workload code validates the Node publication before preparing dependency
@@ -598,7 +607,16 @@ records both in one SQLite transaction and crosses one Volume checkpoint
 before returning the successor payloads. The last such transaction returns an
 empty claim. This preserves assignment-before-exposure and
 publication-before-completion while reducing `B` worker microbatches from
-`2B + 1` coordinator checkpoints to `B + 1`.
+`2B + 1` coordinator checkpoints to `B + 1`. Workload coordinators expose only
+this fused completion path; a second completion-only endpoint would add an
+unused durability protocol.
+
+If the completion response is lost after a worker commits its publication,
+the coordinator may later observe the worker call as terminal without the
+callback. Before projecting unfinished assignments to failure, it reloads and
+revalidates publications for only those terminal calls that still own
+unfinished Tasks. This recovers committed science without adding a blanket
+reload to ordinary provider polling.
 
 The GPU and runtime-image tie-break policy was accepted on 2026-07-30. DAG
 depth and downstream unblocking span remain primary, so lower-ranked GPU work

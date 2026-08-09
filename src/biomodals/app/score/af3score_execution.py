@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
@@ -17,7 +16,6 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionPlan,
-    ExecutionRuntime,
     NodeDependency,
     NodePlan,
     ProviderBinding,
@@ -30,7 +28,6 @@ from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
-    ExecutionVolumeSync,
     StandardExecutionRuntimeLifecycle,
 )
 from biomodals.helper.app_run import AppRunLayout
@@ -265,28 +262,23 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         now: Callable[[], int] | None = None,
     ) -> None:
         """Bind the kernel writer to AF3Score's existing publications."""
-        self.request = request
+        self._bind_execution_runtime(
+            request=request,
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            store=store,
+            modal_driver=modal_driver,
+            output_volume=output_volume,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            poll_interval_seconds=poll_interval_seconds,
+            now=now,
+        )
         self._plan = request.execution_plan
         self._input_digests = request.input_digests
         self._publication_key = self._plan.workload_plan_fingerprint
-        self.execution_run_id = execution_run_id
-        self.deployment = deployment
-        self.store = store
-        self.output_volume = output_volume
         self.output_claims = output_claims
         self.output_root = Path(output_root)
-        self.predecessor_execution_run_id = predecessor_execution_run_id
-        self.poll_interval_seconds = poll_interval_seconds
-        self._now = now or (lambda: int(time.time()))
         self._claim_acquired = False
-        self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
-        self._provider = ExecutionRuntime(
-            store.execution,
-            modal_driver=modal_driver,
-            checkpoint=self._checkpoint,
-            transaction=store.transaction,
-            synchronize=store.synchronize,
-        )
 
     @property
     def layout(self) -> AppRunLayout:
@@ -294,16 +286,11 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         return AppRunLayout.from_run_root(self.output_root / self.request.run_name)
 
     def _initialize(self):
-        self._provider.create_or_verify_run(
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=self.predecessor_execution_run_id,
+        return self._create_or_verify_run(
             plan=self._plan,
-            deployment=self.deployment,
             max_active_provider_calls=self.request.max_batches,
             max_active_gpu_provider_calls=self.request.max_batches,
-            now=self._now(),
         )
-        return self.store.execution
 
     def _recover_publications(self) -> None:
         self._provider.recover_publications(

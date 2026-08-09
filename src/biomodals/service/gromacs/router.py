@@ -8,7 +8,7 @@ import re
 import time
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import orjson
@@ -92,10 +92,6 @@ class SubmissionForbiddenResponse(CodedErrorResponse):
     code: Literal["account_disabled", "csrf_invalid", "origin_not_allowed"]
 
 
-class GromacsAdapter(GromacsExecutionAdapter, Protocol):
-    """Complete GROMACS service boundary used by routes and coordination."""
-
-
 async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
     content = bytearray()
     try:
@@ -149,7 +145,7 @@ def _request_identity(
 
 
 def create_router(
-    adapter: GromacsAdapter,
+    adapter: GromacsExecutionAdapter,
     *,
     lifecycle_locks: JobLifecycleLocks,
     job_logs_supported: bool,
@@ -299,7 +295,7 @@ def create_router(
 
 
 def create_registration(
-    adapter: GromacsAdapter,
+    adapter: GromacsExecutionAdapter,
     *,
     reconciler: Reconciler | None = None,
     lifecycle_locks: JobLifecycleLocks | None = None,

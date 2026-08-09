@@ -258,7 +258,13 @@ class ExecutionRuntime:
                 and current.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
             )
 
-        recover_publications()
+        def recover_publications_unless_cancelled() -> None:
+            with self._synchronize():
+                if self.repository.get_run(execution_run_id).cancellation_is_durable:
+                    return
+                recover_publications()
+
+        recover_publications_unless_cancelled()
         reconcile()
         with self._synchronize():
             run = self.repository.get_run(execution_run_id)
@@ -267,7 +273,7 @@ class ExecutionRuntime:
             decode_completed_calls()
             if result_validation_is_suspended():
                 return
-            recover_publications()
+            recover_publications_unless_cancelled()
             reconcile()
             return
         if run.status == RunStatus.STATE_UNKNOWN:
@@ -283,7 +289,7 @@ class ExecutionRuntime:
             decode_completed_calls()
             if result_validation_is_suspended():
                 return
-            recover_publications()
+            recover_publications_unless_cancelled()
             reconcile()
             return
         if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
@@ -300,7 +306,7 @@ class ExecutionRuntime:
         decode_completed_calls()
         if result_validation_is_suspended():
             return
-        recover_publications()
+        recover_publications_unless_cancelled()
         reconcile()
         with self._synchronize():
             can_continue = self.repository.get_run(execution_run_id).status in {
@@ -312,7 +318,7 @@ class ExecutionRuntime:
         start_ready_nodes(set(required))
         if after_start_ready_nodes is not None:
             while after_start_ready_nodes():
-                recover_publications()
+                recover_publications_unless_cancelled()
                 reconcile()
                 with self._synchronize():
                     can_continue = self.repository.get_run(execution_run_id).status in {
@@ -325,7 +331,7 @@ class ExecutionRuntime:
                 if required is None:
                     return
                 start_ready_nodes(set(required))
-        recover_publications()
+        recover_publications_unless_cancelled()
         required = self.required_node_keys(execution_run_id)
         if required is not None:
             admit_remote_tasks(set(required))
@@ -1105,9 +1111,16 @@ class ExecutionRuntime:
             checkpoint_needed = bool(abandoned_submissions or preparation_errors)
             first_error: Exception | None = None
             with self._synchronize():
+                cancellation_is_durable = self.repository.get_run(
+                    execution_run_id
+                ).cancellation_is_durable
                 deferred_terminal_calls = (
                     frozenset(recover_terminal_publications(terminal_calls) or ())
-                    if recover_terminal_publications is not None and terminal_calls
+                    if (
+                        recover_terminal_publications is not None
+                        and terminal_calls
+                        and not cancellation_is_durable
+                    )
                     else frozenset()
                 )
                 with self._transaction():

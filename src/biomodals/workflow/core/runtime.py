@@ -611,16 +611,18 @@ class WorkflowRuntime:
         if not pull_calls:
             return frozenset()
 
+        call_ids_by_node: dict[str, set[UUID]] = {}
+        for call in pull_calls.values():
+            call_ids_by_node.setdefault(call.node_key, set()).add(call.provider_call_id)
         tasks = [
             task
-            for call in pull_calls.values()
+            for node_key, call_ids in call_ids_by_node.items()
             for task in self.store.execution.list_tasks(
                 self.execution_run_id,
-                call.node_key,
+                node_key,
             )
             if (
-                not task.status.is_terminal
-                and task.worker_provider_call_id == call.provider_call_id
+                not task.status.is_terminal and task.worker_provider_call_id in call_ids
             )
         ]
         prepared: list[

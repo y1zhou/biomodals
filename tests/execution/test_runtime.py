@@ -1417,6 +1417,88 @@ def test_terminal_publication_recovery_runs_under_the_writer_lock() -> None:
     )
 
 
+def test_durable_cancellation_skips_terminal_publication_recovery() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+    call = _submit_fixed(
+        runtime,
+        _candidate(),
+        submission_token="batch",
+        now=110,
+    )
+    assert call is not None
+    runtime.cancel_run(RUN_ID, now=111)
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.SUCCEEDED,
+        result={"status": "succeeded"},
+    )
+    recovery_calls = []
+
+    runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
+        encode_result=lambda result: result,
+        recover_terminal_publications=lambda calls: recovery_calls.append(calls),
+        now=120,
+    )
+
+    assert recovery_calls == []
+    assert repository.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
+    assert repository.get_task(RUN_ID, "inference", "seed-0").status.value == (
+        "cancelled"
+    )
+
+
+def test_durable_cancellation_skips_cycle_publication_recovery() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: None,
+    )
+    assert (
+        _submit_fixed(
+            runtime,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+        is not None
+    )
+    runtime.cancel_run(RUN_ID, now=111)
+    recoveries: list[str] = []
+
+    runtime.advance_once(
+        RUN_ID,
+        recover_publications=lambda: recoveries.append("recover"),
+        reconcile_provider_calls=lambda _required: None,
+        decode_completed_calls=lambda: None,
+        start_ready_nodes=lambda _required: None,
+        admit_remote_tasks=lambda _required: None,
+        reconcile_results=lambda: None,
+        now=lambda: 120,
+    )
+
+    assert recoveries == []
+
+
 def test_recovery_collects_attached_call_once_then_replays_durable_envelope() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

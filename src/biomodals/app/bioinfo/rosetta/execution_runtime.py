@@ -294,7 +294,7 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
     def _recover_terminal_publications(
         self,
         terminal_calls: tuple[ProviderCallRecord, ...],
-    ) -> None:
+    ) -> frozenset[UUID]:
         """Refresh committed worker outputs before terminal call projection."""
         terminal_call_ids = {call.provider_call_id for call in terminal_calls}
         with self.store.synchronize():
@@ -307,9 +307,23 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
                 )
             )
         if not has_unfinished_assignments:
-            return
+            return frozenset()
         self._reload_output()
         self._recover_publications()
+        deferred: set[UUID] = set()
+        for task in self.store.execution.list_tasks(
+            self.execution_run_id,
+            ROSETTA_TASKS_NODE,
+        ):
+            owner = task.worker_provider_call_id
+            if (
+                not task.status.is_terminal
+                and task.result_observation == AvailabilityStatus.UNKNOWN
+                and owner in terminal_call_ids
+                and owner is not None
+            ):
+                deferred.add(owner)
+        return frozenset(deferred)
 
     def _start_ready_node(self) -> None:
         with self.store.synchronize():

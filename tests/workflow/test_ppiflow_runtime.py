@@ -385,3 +385,79 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         NodeStatus.PARTIAL
     )
     assert driver.events.count("spawn:run_ppiflow_rosetta_worker") == 1
+
+
+def test_ppiflow_rosetta_recovers_committed_task_after_lost_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = RosettaTaskSpec(
+        task_key="candidate-a",
+        index=1,
+        binary="relax",
+        pdb="inputs/1/candidate-a.pdb",
+        rosetta_script=None,
+        flags_file=None,
+        output_dir="outputs/1",
+        worker_log="logs/1.log",
+        expected_files=("outputs/1/score.sc",),
+        input_sha256="1" * 64,
+        candidate_id="candidate-a",
+    )
+    workflow = Workflow("ppiflow-rosetta-callback-recovery")
+    source = workflow.add_node(RosettaPlanSourceNode((task,)), id="prepare")
+    workflow.add_node(
+        RosettaWorkerNode("RosettaRelaxStep", {}),
+        id="workers",
+        inputs={
+            "rosetta_plan": source.outputs(kind=ArtifactKind.TABLE),
+        },
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "validate_task_publication_from_volume",
+        lambda *_args: True,
+    )
+    runtime = WorkflowRuntime(
+        workflow=workflow,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        workflow_volume_name="Workflow-outputs",
+        modal_driver=RosettaPullModalDriver(),
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
+        pull_worker_coordinator="run-pool",
+        now=iter(range(100, 1000)).__next__,
+        poll_interval_seconds=0,
+    )
+    runtime._initialize("ppiflow-rosetta-callback-recovery")
+    for _ in range(3):
+        runtime.advance_once()
+        calls = runtime.store.execution.list_provider_calls(RUN_ID)
+        if calls:
+            break
+    [call] = calls
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+
+    runtime.advance_once()
+
+    recovered = runtime.store.artifacts.load_task_result(
+        "workers",
+        assignment.task_key,
+    )
+    assert recovered is not None
+    assert recovered.status == AppRunStatus.SUCCEEDED
+    assert [output.name for output in recovered.outputs] == ["rosetta_task_receipt"]
+    assert (
+        runtime.store.execution.get_task(
+            RUN_ID,
+            "workers",
+            assignment.task_key,
+        ).status
+        == TaskStatus.SUCCEEDED
+    )

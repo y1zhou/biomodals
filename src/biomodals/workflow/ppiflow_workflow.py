@@ -2662,6 +2662,31 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
     ) -> AvailabilityStatus:
         """Revalidate the fingerprint-bound Rosetta marker and required files."""
         del context, result, artifacts
+        try:
+            recovered = self._recover_task_result(task, expected_fingerprint)
+        except Exception:  # noqa: BLE001
+            return AvailabilityStatus.UNKNOWN
+        return (
+            AvailabilityStatus.AVAILABLE
+            if recovered is not None
+            else AvailabilityStatus.MISSING
+        )
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        """Rebuild the canonical receipt after a lost completion callback."""
+        del context
+        return self._recover_task_result(task, expected_fingerprint)
+
+    @staticmethod
+    def _recover_task_result(
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
         payload = task.execution_payload
         if not isinstance(payload, Mapping):
             raise TypeError("Rosetta Task execution payload must be an object")
@@ -2669,16 +2694,18 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
         run_root = payload.get("run_root")
         if not isinstance(run_root, str):
             raise TypeError("Rosetta Task run_root must be text")
-        try:
-            available = validate_task_publication_from_volume(
-                ROSETTA_OUTPUT_VOLUME,
-                run_root,
-                spec,
-                expected_fingerprint,
-            )
-        except Exception:  # noqa: BLE001
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+        if not validate_task_publication_from_volume(
+            ROSETTA_OUTPUT_VOLUME,
+            run_root,
+            spec,
+            expected_fingerprint,
+        ):
+            return None
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[_rosetta_task_receipt(spec, expected_fingerprint)],
+            metrics={"candidate_id": spec.candidate_id or spec.task_key},
+        )
 
     def finalize_remote_tasks(
         self,

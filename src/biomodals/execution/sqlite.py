@@ -1979,9 +1979,9 @@ class SqliteExecutionRepository:
         request_id: str,
         capacity: int,
         now: int,
-    ) -> tuple[tuple[ExecutionTaskRecord, ...], PullTaskClaim]:
+    ) -> PullTaskClaim:
         """Complete one microbatch and claim its successor atomically."""
-        completed = tuple(
+        for task_key, completion_request_id, observation, message in completions:
             self.record_pull_task_completion(
                 provider_call_id,
                 task_key,
@@ -1990,15 +1990,12 @@ class SqliteExecutionRepository:
                 message=message,
                 now=now,
             )
-            for task_key, completion_request_id, observation, message in completions
-        )
-        claim = self.claim_pull_tasks(
+        return self.claim_pull_tasks(
             provider_call_id,
             request_id=request_id,
             capacity=capacity,
             now=now,
         )
-        return completed, claim
 
     def acquire_local_task(
         self,
@@ -3434,6 +3431,11 @@ class SqliteExecutionRepository:
         now: int,
     ) -> None:
         run = self.get_run(execution_run_id)
+        if (
+            run.status == RunStatus.SUSPENDED
+            and run.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
+        ):
+            return
         if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
             raise ValueError(
                 f"cannot suspend result validation while Run is {run.status.value}"

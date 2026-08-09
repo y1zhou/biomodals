@@ -382,14 +382,12 @@ class WorkflowRuntime:
                         observation,
                         message,
                     ))
-                _completed, claim = (
-                    self.store.execution.record_pull_task_completions_and_claim(
-                        provider_call_id,
-                        kernel_completions,
-                        request_id=request_id,
-                        capacity=capacity,
-                        now=now,
-                    )
+                claim = self.store.execution.record_pull_task_completions_and_claim(
+                    provider_call_id,
+                    kernel_completions,
+                    request_id=request_id,
+                    capacity=capacity,
+                    now=now,
                 )
             self._checkpoint()
         return claim
@@ -589,6 +587,7 @@ class WorkflowRuntime:
             encode_result=self._prepare_result_envelope,
             finalize_result=self._finalize_result_envelope,
             discard_result=self._discard_prepared_result,
+            recover_terminal_publications=(self._recover_terminal_task_publications),
             now=self._now(),
         )
         for _, call in reconciled:
@@ -598,6 +597,127 @@ class WorkflowRuntime:
             ):
                 continue
             self._publish_provider_result(call)
+
+    def _recover_terminal_task_publications(
+        self,
+        terminal_calls: tuple[ProviderCallRecord, ...],
+    ) -> frozenset[UUID]:
+        """Recover callback-lost pull publications before owner projection."""
+        definition = self._require_definition()
+        pull_calls = {
+            call.provider_call_id: call
+            for call in terminal_calls
+            if isinstance(
+                definition.nodes[call.node_key].node,
+                RemotePullTaskWorkflowNode,
+            )
+        }
+        if not pull_calls:
+            return frozenset()
+
+        tasks = [
+            task
+            for call in pull_calls.values()
+            for task in self.store.execution.list_tasks(
+                self.execution_run_id,
+                call.node_key,
+            )
+            if (
+                not task.status.is_terminal
+                and task.worker_provider_call_id == call.provider_call_id
+            )
+        ]
+        prepared: list[
+            tuple[
+                ExecutionTaskRecord,
+                AvailabilityStatus,
+                AppRunResult | None,
+                tuple[WorkflowArtifact, ...],
+            ]
+        ] = []
+        for task in tasks:
+            implementation = definition.nodes[task.node_key].node
+            if not isinstance(implementation, RemotePullTaskWorkflowNode):
+                continue
+            context = self._node_context(
+                definition,
+                task.node_key,
+                task_key=task.task_key,
+            )
+            task_definition = RemoteWorkflowTask(
+                task_key=task.task_key,
+                scientific_payload=task.scientific_payload,
+                execution_payload=task.execution_payload,
+            )
+            try:
+                result = implementation.recover_remote_task_result(
+                    context,
+                    task_definition,
+                    task.fingerprint,
+                )
+            except Exception:  # noqa: BLE001 - inconclusive workload validation
+                prepared.append((
+                    task,
+                    AvailabilityStatus.UNKNOWN,
+                    None,
+                    (),
+                ))
+                continue
+            if result is None:
+                continue
+            result = AppRunResult.model_validate(result)
+            if result.status != AppRunStatus.SUCCEEDED:
+                raise ValueError("Recovered workflow Task result must be succeeded")
+            materialized = materialize_app_run_result(
+                result=result,
+                workflow_volume_name=self.workflow_volume_name,
+                result_dir=context.work_dir,
+                artifact_dir=self.store.output_root / "artifacts",
+                producing_node_id=task.node_key,
+                artifact_id_scope=_task_storage_scope(task.task_key),
+                volume_root=self.volume_root,
+            )
+            artifacts = tuple(materialized.artifacts)
+            prepared.append((
+                task,
+                self._artifact_observation(artifacts),
+                materialized.result,
+                artifacts,
+            ))
+
+        deferred: set[UUID] = set()
+        if prepared:
+            with self.store.transaction():
+                for task, observation, result, artifacts in prepared:
+                    current = self.store.execution.get_task(
+                        self.execution_run_id,
+                        task.node_key,
+                        task.task_key,
+                    )
+                    if current.status.is_terminal:
+                        continue
+                    if observation == AvailabilityStatus.UNKNOWN:
+                        if current.worker_provider_call_id is not None:
+                            deferred.add(current.worker_provider_call_id)
+                    elif observation == AvailabilityStatus.MISSING:
+                        continue
+                    elif result is not None:
+                        self.store.artifacts.record_task_publication(
+                            task.node_key,
+                            task.task_key,
+                            task_fingerprint=task.fingerprint,
+                            result=result,
+                            artifacts=artifacts,
+                            now=self._now(),
+                        )
+                    self.store.execution.record_task_result_observation(
+                        self.execution_run_id,
+                        task.node_key,
+                        task.task_key,
+                        observation,
+                        now=self._now(),
+                    )
+        return frozenset(deferred)
 
     def _publish_provider_result(
         self,

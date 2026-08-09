@@ -40,7 +40,10 @@ def _repository() -> SqliteExecutionRepository:
     repository.discover_tasks(
         RUN_ID,
         "inference",
-        (TaskPlan(task_key="seed-1", scientific_payload={"seed": 1}),),
+        (
+            TaskPlan(task_key="seed-1", scientific_payload={"seed": 1}),
+            TaskPlan(task_key="seed-2", scientific_payload={"seed": 2}),
+        ),
         now=102,
     )
     return repository
@@ -94,5 +97,29 @@ def test_unknown_task_publication_suspends_without_changing_ownership() -> None:
 
     run = repository.get_run(RUN_ID)
     assert task.status == TaskStatus.PENDING
+    assert run.status == RunStatus.SUSPENDED
+    assert run.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
+
+
+def test_repeated_unknown_task_publications_keep_the_same_suspension() -> None:
+    repository = _repository()
+
+    repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-1",
+        AvailabilityStatus.UNKNOWN,
+        now=110,
+    )
+    second = repository.record_task_result_observation(
+        RUN_ID,
+        "inference",
+        "seed-2",
+        AvailabilityStatus.UNKNOWN,
+        now=111,
+    )
+
+    run = repository.get_run(RUN_ID)
+    assert second.result_observation == AvailabilityStatus.UNKNOWN
     assert run.status == RunStatus.SUSPENDED
     assert run.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN

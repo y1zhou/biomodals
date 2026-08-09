@@ -223,6 +223,16 @@ class RemotePullTaskWorkflowNode(RemoteTaskWorkflowNode):
         """Prepare the immutable worker-pool binding for this Node."""
         raise NotImplementedError
 
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        """Reconstruct a result whose workload publication is already durable."""
+        del context, task, expected_fingerprint
+        return None
+
     def prepare_remote_task(
         self,
         context: NodeRunContext,

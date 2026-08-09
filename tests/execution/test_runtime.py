@@ -1362,6 +1362,61 @@ def test_batch_recovery_marks_abandoned_preclaim_outcome_unknown() -> None:
     assert checkpoints == [ProviderCallStatus.OUTCOME_UNKNOWN]
 
 
+def test_terminal_publication_recovery_runs_under_the_writer_lock() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    driver = FakeModalDriver()
+    writer = RLock()
+    depth = 0
+
+    @contextmanager
+    def synchronize():
+        nonlocal depth
+        with writer:
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+        synchronize=synchronize,
+    )
+    call = _submit_fixed(
+        runtime,
+        _candidate(),
+        submission_token="batch",
+        now=110,
+    )
+    assert call is not None
+    driver.observation = ModalCallObservation(
+        ModalCallObservationKind.FAILED,
+        message="worker exited",
+    )
+    recovery_depths: list[int] = []
+
+    runtime.reconcile_provider_calls(
+        RUN_ID,
+        required_node_keys={"inference"},
+        encode_result=lambda result: result,
+        recover_terminal_publications=lambda _calls: recovery_depths.append(depth),
+        now=120,
+    )
+
+    assert recovery_depths == [1]
+    assert repository.get_provider_call(call.provider_call_id).status == (
+        ProviderCallStatus.FAILED
+    )
+
+
 def test_recovery_collects_attached_call_once_then_replays_durable_envelope() -> None:
     repository = create_repository(task_count=1)
     persist_fixed_policy(

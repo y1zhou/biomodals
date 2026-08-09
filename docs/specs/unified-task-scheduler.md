@@ -666,6 +666,13 @@ Ordinary planning, cache observation, policy persistence, and unchanged or
 running provider polls use only their local SQLite transactions. They do not
 issue a remote Volume commit.
 
+After a terminal provider observation, the coordinator acquires the writer
+before workload publication recovery and retains it through provider-state
+projection. This narrow terminal exception fences late pull callbacks from
+claiming a successor microbatch for a dead owner. An inconclusive recovery
+keeps that Provider Call nonterminal, records `result_validation_unknown`, and
+waits for explicit Run resume.
+
 The run-scoped drive lock excludes a second scheduling loop. Status and
 pull-worker callbacks do not acquire it; cancellation acquires it only when
 taking over driving after its request is durable. The SQLite writer protects
@@ -1079,9 +1086,12 @@ trigger a blanket reload.
 
 If a pull-worker call becomes terminal after committing publications but
 before its completion callback arrives, the coordinator revalidates those
-publications before failing unfinished assignments. It reloads only when a
-newly terminal call still owns unfinished Tasks, so ordinary running polls and
-already-recorded completion reports do not add Volume barriers.
+publications before failing unfinished assignments. A workflow-owned pull Node
+reconstructs and stores its canonical Task result and receipt after validating
+the raw workload publication; a kernel status update alone is insufficient.
+It reloads only when a newly terminal call still owns unfinished Tasks, so
+ordinary running polls and already-recorded completion reports do not add
+Volume barriers.
 
 Provider redelivery is not a second kernel submission. A claim request may
 repeat automatically before or after a Worker Assignment is committed, and

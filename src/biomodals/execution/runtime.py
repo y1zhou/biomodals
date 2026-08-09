@@ -249,6 +249,15 @@ class ExecutionRuntime:
         reconcile = reconcile_results or (
             lambda: self.reconcile_nodes_and_run(execution_run_id, now=now())
         )
+
+        def result_validation_is_suspended() -> bool:
+            with self._synchronize():
+                current = self.repository.get_run(execution_run_id)
+            return (
+                current.status == RunStatus.SUSPENDED
+                and current.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
+            )
+
         recover_publications()
         reconcile()
         with self._synchronize():
@@ -256,6 +265,8 @@ class ExecutionRuntime:
         if run.status == RunStatus.CANCEL_REQUESTED:
             reconcile_provider_calls(set(run.plan.node_keys))
             decode_completed_calls()
+            if result_validation_is_suspended():
+                return
             recover_publications()
             reconcile()
             return
@@ -270,6 +281,8 @@ class ExecutionRuntime:
                 )
             reconcile_provider_calls(required_nodes)
             decode_completed_calls()
+            if result_validation_is_suspended():
+                return
             recover_publications()
             reconcile()
             return
@@ -285,6 +298,8 @@ class ExecutionRuntime:
         )
         reconcile_provider_calls(set(required))
         decode_completed_calls()
+        if result_validation_is_suspended():
+            return
         recover_publications()
         reconcile()
         with self._synchronize():
@@ -1005,14 +1020,12 @@ class ExecutionRuntime:
         """Checkpoint one completed microbatch and its next claim together."""
         with self._synchronize():
             with self._transaction():
-                _completed, claim = (
-                    self.repository.record_pull_task_completions_and_claim(
-                        provider_call_id,
-                        completions,
-                        request_id=request_id,
-                        capacity=capacity,
-                        now=now,
-                    )
+                claim = self.repository.record_pull_task_completions_and_claim(
+                    provider_call_id,
+                    completions,
+                    request_id=request_id,
+                    capacity=capacity,
+                    now=now,
                 )
             self._checkpoint_state()
         return claim
@@ -1026,7 +1039,9 @@ class ExecutionRuntime:
         now: int,
         finalize_result: Callable[[Any], Any] | None = None,
         discard_result: Callable[[Any], None] | None = None,
-        recover_terminal_publications: Callable[[tuple[ProviderCallRecord, ...]], None]
+        recover_terminal_publications: Callable[
+            [tuple[ProviderCallRecord, ...]], Collection[UUID] | None
+        ]
         | None = None,
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
         """Observe and prepare outside the writer, then durably finalize results."""
@@ -1086,13 +1101,15 @@ class ExecutionRuntime:
                     }
                 )
             )
-            if recover_terminal_publications is not None and terminal_calls:
-                recover_terminal_publications(terminal_calls)
-
             reconciled = []
             checkpoint_needed = bool(abandoned_submissions or preparation_errors)
             first_error: Exception | None = None
             with self._synchronize():
+                deferred_terminal_calls = (
+                    frozenset(recover_terminal_publications(terminal_calls) or ())
+                    if recover_terminal_publications is not None and terminal_calls
+                    else frozenset()
+                )
                 with self._transaction():
                     for original in originals:
                         provider_call_id = original.provider_call_id
@@ -1131,6 +1148,17 @@ class ExecutionRuntime:
                         prepared = observations.get(provider_call_id)
                         if prepared is None:
                             reconciled.append((original, original))
+                            continue
+
+                        if provider_call_id in deferred_terminal_calls:
+                            reconciled.append((
+                                original,
+                                self.repository.get_provider_call(
+                                    provider_call_id,
+                                    include_task_keys=False,
+                                ),
+                            ))
+                            checkpoint_needed = True
                             continue
 
                         observation, prepared_result = prepared

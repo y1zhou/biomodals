@@ -615,8 +615,14 @@ If the completion response is lost after a worker commits its publication,
 the coordinator may later observe the worker call as terminal without the
 callback. Before projecting unfinished assignments to failure, it reloads and
 revalidates publications for only those terminal calls that still own
-unfinished Tasks. This recovers committed science without adding a blanket
-reload to ordinary provider polling.
+unfinished Tasks. Workflow pull Nodes may reconstruct their deterministic
+Task result and receipt from that validated workload publication. The writer
+is held from this terminal recovery through provider-state projection so a
+late fused callback cannot claim more work for an owner already observed as
+terminal. Inconclusive validation suspends the Run and defers that projection;
+repeated unknown observations preserve the same suspension. This recovers
+committed science without adding a blanket reload to ordinary provider
+polling.
 
 The GPU and runtime-image tie-break policy was accepted on 2026-07-30. DAG
 depth and downstream unblocking span remain primary, so lower-ranked GPU work

@@ -228,6 +228,16 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
 class PullFanoutNode(RemotePullTaskWorkflowNode):
     texts: tuple[str, ...]
     max_worker_calls: int = 2
+    recoverable_publications: set[str] = field(
+        default_factory=set,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+    recovery_is_unknown: bool = field(
+        default=False,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
     publication_observation: AvailabilityStatus | None = field(
         default=None,
         repr=False,
@@ -281,6 +291,19 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
         del context, expected_fingerprint, result, artifacts
         self.publication_probes.append(task.task_key)
         return self.publication_observation
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        if self.recovery_is_unknown:
+            raise OSError("publication store is unavailable")
+        if task.task_key not in self.recoverable_publications:
+            return None
+        return _text_result(str(dict(task.execution_payload)["text"]))
 
     def finalize_remote_tasks(
         self,
@@ -1127,6 +1150,94 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
     assert node.finalized_results == [
         (("candidate-0", "candidate-1", "candidate-2"), ()),
     ]
+
+
+def test_terminal_pull_worker_recovers_publication_after_lost_callback(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("pull-callback-recovery")
+    node = PullFanoutNode(
+        ("alpha",),
+        max_worker_calls=1,
+        recoverable_publications={"candidate-0"},
+    )
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("pull-callback-recovery")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+
+    runtime.advance_once()
+
+    task = runtime.store.execution.get_task(
+        RUN_ID,
+        "fanout",
+        assignment.task_key,
+    )
+    assert task.status == TaskStatus.SUCCEEDED
+    recovered = runtime.store.artifacts.load_task_result(
+        "fanout",
+        assignment.task_key,
+    )
+    assert recovered is not None
+    assert recovered.status == AppRunStatus.SUCCEEDED
+    assert [output.name for output in recovered.outputs] == ["text"]
+
+
+def test_unknown_pull_publication_defers_terminal_owner_projection(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("pull-callback-unknown")
+    workflow.add_node(
+        PullFanoutNode(
+            ("alpha",),
+            max_worker_calls=1,
+            recovery_is_unknown=True,
+        ),
+        id="fanout",
+    )
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("pull-callback-unknown")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+
+    runtime.advance_once()
+
+    task = runtime.store.execution.get_task(
+        RUN_ID,
+        "fanout",
+        assignment.task_key,
+    )
+    assert task.status == TaskStatus.RUNNING
+    assert task.result_observation == AvailabilityStatus.UNKNOWN
+    assert runtime.store.execution.get_provider_call(call.provider_call_id).status == (
+        ProviderCallStatus.ATTACHED
+    )
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.SUSPENDED
 
 
 def test_pull_completion_and_next_claim_share_one_checkpoint(

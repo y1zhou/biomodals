@@ -1002,48 +1002,42 @@ class WorkflowRuntime:
         call: ProviderCallRecord,
     ) -> None:
         with self._volume_io_lock:
-            self._publish_provider_result_locked(call)
-
-    def _publish_provider_result_locked(
-        self,
-        call: ProviderCallRecord,
-    ) -> None:
-        node_id = call.node_key
-        envelope = call.result_envelope
-        node = self._require_definition().nodes[node_id].node
-        if isinstance(node, RemotePullTaskWorkflowNode):
-            return
-        if isinstance(node, RemoteTaskWorkflowNode):
-            self._publish_provider_task_results(
-                node_id,
-                call.task_keys,
-                envelope,
-                node,
-            )
-            return
-        with self.store.synchronize():
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                node_id,
-                _TASK_KEY,
-            )
-        if task.status.is_terminal:
-            return
-        if not isinstance(node, RemoteWorkflowNode):
-            self._fail_task(node_id, "Provider result belongs to a local Node")
-            return
-        try:
-            raw_result = self._raw_result(envelope)
-            metadata = _remote_metadata(task.execution_payload)
-            result = AppRunResult.model_validate(
-                node.process_remote_result(raw_result, metadata)
-            )
-        except Exception as error:
-            self._fail_task(node_id, f"Could not decode provider result: {error}")
-            return
-        if self._uses_workflow_volume(result):
-            self._reload_volume()
-        self._publish_result(node_id, result)
+            node_id = call.node_key
+            envelope = call.result_envelope
+            node = self._require_definition().nodes[node_id].node
+            if isinstance(node, RemotePullTaskWorkflowNode):
+                return
+            if isinstance(node, RemoteTaskWorkflowNode):
+                self._publish_provider_task_results(
+                    node_id,
+                    call.task_keys,
+                    envelope,
+                    node,
+                )
+                return
+            with self.store.synchronize():
+                task = self.store.execution.get_task(
+                    self.execution_run_id,
+                    node_id,
+                    _TASK_KEY,
+                )
+            if task.status.is_terminal:
+                return
+            if not isinstance(node, RemoteWorkflowNode):
+                self._fail_task(node_id, "Provider result belongs to a local Node")
+                return
+            try:
+                raw_result = self._raw_result(envelope)
+                metadata = _remote_metadata(task.execution_payload)
+                result = AppRunResult.model_validate(
+                    node.process_remote_result(raw_result, metadata)
+                )
+            except Exception as error:
+                self._fail_task(node_id, f"Could not decode provider result: {error}")
+                return
+            if self._uses_workflow_volume(result):
+                self._reload_volume()
+            self._publish_result(node_id, result)
 
     def _publish_provider_task_results(
         self,
@@ -2276,18 +2270,16 @@ class WorkflowRuntime:
     @contextmanager
     def _synchronize_kernel_state(self) -> Iterator[None]:
         """Order explicit workflow Volume barriers before the SQLite writer."""
-        with self._volume_io_lock:
-            with self.store.synchronize():
-                yield
+        with self._volume_io_lock, self.store.synchronize():
+            yield
 
     def _reload_volume(self) -> None:
         """Refresh cross-container publications and reopen the shared ledger."""
-        with self._volume_io_lock:
-            with self.store.synchronize():
-                try:
-                    self._volume_sync.reload()
-                finally:
-                    self._provider.repository = self.store.execution
+        with self._volume_io_lock, self.store.synchronize():
+            try:
+                self._volume_sync.reload()
+            finally:
+                self._provider.repository = self.store.execution
 
     def _require_definition(self) -> WorkflowDefinition:
         if self._definition is None:

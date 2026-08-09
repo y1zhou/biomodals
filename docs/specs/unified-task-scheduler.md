@@ -686,6 +686,11 @@ filesystem or provider work after releasing it, and reacquire the current
 repository for mutations. A repository reference must not cross a Volume
 barrier because that barrier closes and reopens SQLite. Cache and model Volumes
 are refreshed only for successful Nodes whose functions write those Volumes.
+Concurrent workflow inputs serialize workflow-Volume reads, writes, validation,
+cleanup, reloads, and publication checkpoints with a separate run-scoped
+Volume-I/O lock. The lock prevents a reload while another input has an open
+Volume file and does not extend the SQLite writer across filesystem or workload
+I/O.
 
 Within one drive cycle, coordinator-local Tasks are executed and reconciled to
 a fixed point before remote admission. A completed branch can therefore cross

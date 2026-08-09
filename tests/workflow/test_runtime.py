@@ -3,9 +3,11 @@
 # ruff: noqa: D101, D102, D103, D107
 
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
+from threading import Event
 from typing import cast
 from uuid import UUID
 
@@ -2027,6 +2029,126 @@ def test_pull_completion_reloads_before_materializing_its_batch(
     )
 
     assert volume.reloads == 1
+
+
+def test_concurrent_pull_completion_excludes_volume_reload(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    file_open = Event()
+    release_file = Event()
+    reload_started = Event()
+
+    class BusyVolume(FakeVolume):
+        def reload(self) -> None:
+            reload_started.set()
+            if file_open.is_set():
+                raise RuntimeError("volume busy: open file")
+            super().reload()
+
+    workflow = Workflow("pull-volume-concurrency")
+    workflow.add_node(
+        PullFanoutNode(("alpha", "beta", "gamma"), max_worker_calls=2),
+        id="fanout",
+    )
+    volume = BusyVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=2,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+        volume=volume,
+    )
+    runtime._initialize("pull-volume-concurrency")
+    runtime.advance_once()
+    first_call, second_call = runtime.store.execution.list_provider_calls(RUN_ID)
+    first_claim = runtime.claim_pull_tasks(
+        first_call.provider_call_id,
+        request_id="claim-first",
+        capacity=2,
+    )
+    [second_assignment] = runtime.claim_pull_tasks(
+        second_call.provider_call_id,
+        request_id="claim-second",
+        capacity=2,
+    ).assignments
+    published = tmp_path / "worker" / "result.txt"
+    published.parent.mkdir()
+    published.write_text("gamma")
+
+    original_write_bytes = Path.write_bytes
+
+    def block_inline_write(path: Path, data: bytes) -> int:
+        if (
+            "completions" in path.parts
+            and path.name == "result.txt"
+            and data == b"alpha"
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as output:
+                output.write(data)
+                file_open.set()
+                if not release_file.wait(timeout=5):
+                    raise TimeoutError("concurrent callback did not finish")
+            file_open.clear()
+            return len(data)
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", block_inline_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            runtime.complete_pull_tasks_and_claim,
+            first_call.provider_call_id,
+            tuple(
+                (
+                    assignment.task_key,
+                    f"complete-{assignment.task_key}",
+                    _text_result(str(dict(assignment.execution_payload)["text"])),
+                )
+                for assignment in first_claim.assignments
+            ),
+            request_id="first-terminal",
+            capacity=2,
+        )
+        assert file_open.wait(timeout=5)
+        second = executor.submit(
+            runtime.complete_pull_tasks_and_claim,
+            second_call.provider_call_id,
+            (
+                (
+                    second_assignment.task_key,
+                    f"complete-{second_assignment.task_key}",
+                    AppRunResult(
+                        status=AppRunStatus.SUCCEEDED,
+                        outputs=[
+                            AppOutput(
+                                name="text",
+                                kind=ArtifactKind.REPORT,
+                                storage=VolumePath(
+                                    volume_name="Workflow-outputs",
+                                    path=published.relative_to(tmp_path).as_posix(),
+                                ),
+                            )
+                        ],
+                    ),
+                ),
+            ),
+            request_id="second-terminal",
+            capacity=2,
+        )
+        assert not reload_started.wait(timeout=0.1)
+        release_file.set()
+        assert first.result(timeout=5).assignments == ()
+        assert second.result(timeout=5).assignments == ()
+
+    assert reload_started.is_set()
+    assert volume.reloads == 1
+    assert all(
+        task.status == TaskStatus.SUCCEEDED
+        for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    )
 
 
 def test_pull_task_node_limits_its_concurrent_worker_calls(tmp_path: Path) -> None:

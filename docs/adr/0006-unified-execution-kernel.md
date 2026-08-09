@@ -704,6 +704,13 @@ retain a repository backed by a connection that an interleaved Volume barrier
 may close. A secondary cache or model Volume is reloaded only after a newly
 successful Node that writes that specific Volume.
 
+Concurrent workflow inputs also share a separate run-scoped Volume-I/O lock.
+It excludes a workflow Volume reload from result materialization, publication
+validation, local Node file access, callback cleanup, and the fused
+publication checkpoint. This lock is not the SQLite writer: filesystem and
+workload I/O still run outside the short repository transition boundary. It
+exists because Modal rejects a reload while any mounted Volume file is open.
+
 The active-run lifecycle was accepted on 2026-07-29. Each remote top-level CLI
 app or workflow run submits one detached coordinator-loop input to its
 Run-Scoped Coordinator Pool. This is an internal activity, not a CLI

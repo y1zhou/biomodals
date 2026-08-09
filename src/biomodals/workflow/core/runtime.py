@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, BinaryIO, cast
 from uuid import UUID, uuid4
 
@@ -122,6 +123,7 @@ class WorkflowRuntime:
         external_volume_roots: Mapping[str, str | Path] | None = None,
         pull_worker_coordinator: Any | None = None,
         store: WorkflowRunStore | None = None,
+        volume_io_lock: Any | None = None,
         now: Callable[[], int] | None = None,
         poll_interval_seconds: float = 1.0,
     ) -> None:
@@ -155,6 +157,7 @@ class WorkflowRuntime:
         self.pull_worker_coordinator = pull_worker_coordinator
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
+        self._volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
         self.store = store or WorkflowRunStore(self.volume_root, execution_run_id)
         self._volume_sync = ExecutionVolumeSync(
             volume=workflow_volume,
@@ -274,6 +277,22 @@ class WorkflowRuntime:
         capacity: int,
     ) -> PullTaskClaim:
         """Publish one microbatch and checkpoint its successor claim together."""
+        with self._volume_io_lock:
+            return self._complete_pull_tasks_and_claim(
+                provider_call_id,
+                completions,
+                request_id=request_id,
+                capacity=capacity,
+            )
+
+    def _complete_pull_tasks_and_claim(
+        self,
+        provider_call_id: UUID,
+        completions: tuple[tuple[str, str, AppRunResult], ...],
+        *,
+        request_id: str,
+        capacity: int,
+    ) -> PullTaskClaim:
         if not completions:
             raise ValueError("fused pull completion requires a nonempty batch")
         if len({task_key for task_key, _request_id, _result in completions}) != len(
@@ -686,6 +705,10 @@ class WorkflowRuntime:
             return repository
 
     def _recover_publications(self) -> None:
+        with self._volume_io_lock:
+            self._recover_publications_locked()
+
+    def _recover_publications_locked(self) -> None:
         definition = self._require_definition()
         with self.store.synchronize():
             repository = self.store.execution
@@ -829,15 +852,18 @@ class WorkflowRuntime:
                 )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=self._prepare_result_envelope,
-            finalize_result=self._finalize_result_envelope,
-            discard_result=self._discard_prepared_result,
-            recover_terminal_publications=(self._recover_terminal_task_publications),
-            now=self._now(),
-        )
+        with self._volume_io_lock:
+            reconciled = self._provider.reconcile_provider_calls(
+                self.execution_run_id,
+                required_node_keys=required,
+                encode_result=self._prepare_result_envelope,
+                finalize_result=self._finalize_result_envelope,
+                discard_result=self._discard_prepared_result,
+                recover_terminal_publications=(
+                    self._recover_terminal_task_publications
+                ),
+                now=self._now(),
+            )
         for _, call in reconciled:
             if (
                 call.status != ProviderCallStatus.SUCCEEDED
@@ -1009,9 +1035,10 @@ class WorkflowRuntime:
         except Exception as error:
             self._fail_task(node_id, f"Could not decode provider result: {error}")
             return
-        if self._uses_workflow_volume(result):
-            self._reload_volume()
-        self._publish_result(node_id, result)
+        with self._volume_io_lock:
+            if self._uses_workflow_volume(result):
+                self._reload_volume()
+            self._publish_result(node_id, result)
 
     def _publish_provider_task_results(
         self,
@@ -1070,14 +1097,15 @@ class WorkflowRuntime:
                     f"Could not decode provider result: {error}",
                 )
             return
-        if any(self._uses_workflow_volume(result) for result in results.values()):
-            self._reload_volume()
-        for task in unfinished:
-            self._publish_task_result(
-                node_id,
-                task.task_key,
-                results[task.task_key],
-            )
+        with self._volume_io_lock:
+            if any(self._uses_workflow_volume(result) for result in results.values()):
+                self._reload_volume()
+            for task in unfinished:
+                self._publish_task_result(
+                    node_id,
+                    task.task_key,
+                    results[task.task_key],
+                )
 
     def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
         with self.store.synchronize():
@@ -1092,10 +1120,11 @@ class WorkflowRuntime:
         if not ready or available_slots <= 0:
             return
 
-        prepared = [
-            self._prepare_node(definition, node_id)
-            for node_id in ready[:available_slots]
-        ]
+        with self._volume_io_lock:
+            prepared = [
+                self._prepare_node(definition, node_id)
+                for node_id in ready[:available_slots]
+            ]
         with self.store.transaction():
             for item in prepared:
                 if self.store.execution.get_node(
@@ -1230,16 +1259,17 @@ class WorkflowRuntime:
             if not acquired:
                 continue
             progressed = True
-            context = self._node_context(definition, node_record.node_key)
-            try:
-                result = AppRunResult.model_validate(node.run(context))
-            except Exception as error:
-                self._fail_task(
-                    node_record.node_key,
-                    f"Coordinator-local Node failed: {error}",
-                )
-                continue
-            self._publish_result(node_record.node_key, result)
+            with self._volume_io_lock:
+                context = self._node_context(definition, node_record.node_key)
+                try:
+                    result = AppRunResult.model_validate(node.run(context))
+                except Exception as error:
+                    self._fail_task(
+                        node_record.node_key,
+                        f"Coordinator-local Node failed: {error}",
+                    )
+                    continue
+                self._publish_result(node_record.node_key, result)
         return progressed
 
     def _admit_remote_tasks(
@@ -1306,9 +1336,10 @@ class WorkflowRuntime:
                 continue
             if isinstance(node, RemotePullTaskWorkflowNode):
                 try:
-                    invocation = node.prepare_pull_worker(
-                        self._node_context(definition, node_id)
-                    )
+                    with self._volume_io_lock:
+                        invocation = node.prepare_pull_worker(
+                            self._node_context(definition, node_id)
+                        )
                 except Exception as error:
                     self._fail_node_publication(
                         node_id,
@@ -1363,31 +1394,34 @@ class WorkflowRuntime:
         ) -> TaskDispatchDescriptor | None:
             node = definition.nodes[node_record.node_key].node
             try:
-                if isinstance(node, RemoteTaskWorkflowNode):
-                    invocation = node.prepare_remote_task(
-                        self._node_context(
-                            definition,
-                            node_record.node_key,
-                            task_key=task.task_key,
-                        ),
-                        RemoteWorkflowTask(
-                            task_key=task.task_key,
-                            scientific_payload=task.scientific_payload,
-                            execution_payload=task.execution_payload,
-                        ),
-                    )
-                    _json_value(_execution_payload(invocation))
-                elif isinstance(node, RemoteWorkflowNode):
-                    invocation = node.prepare_remote(
-                        self._node_context(definition, node_record.node_key)
-                    )
-                    payload = _json_value(_execution_payload(invocation))
-                    if payload != task.execution_payload:
-                        raise ValueError(
-                            "Remote Node preparation changed after Task discovery"
+                with self._volume_io_lock:
+                    if isinstance(node, RemoteTaskWorkflowNode):
+                        invocation = node.prepare_remote_task(
+                            self._node_context(
+                                definition,
+                                node_record.node_key,
+                                task_key=task.task_key,
+                            ),
+                            RemoteWorkflowTask(
+                                task_key=task.task_key,
+                                scientific_payload=task.scientific_payload,
+                                execution_payload=task.execution_payload,
+                            ),
                         )
-                else:  # pragma: no cover - filtered by fixed_node_keys
-                    raise TypeError("Fixed dispatch requires a remote workflow Node")
+                        _json_value(_execution_payload(invocation))
+                    elif isinstance(node, RemoteWorkflowNode):
+                        invocation = node.prepare_remote(
+                            self._node_context(definition, node_record.node_key)
+                        )
+                        payload = _json_value(_execution_payload(invocation))
+                        if payload != task.execution_payload:
+                            raise ValueError(
+                                "Remote Node preparation changed after Task discovery"
+                            )
+                    else:  # pragma: no cover - filtered by fixed_node_keys
+                        raise TypeError(
+                            "Fixed dispatch requires a remote workflow Node"
+                        )
             except Exception as error:
                 self._fail_discovered_task(
                     node_record.node_key,
@@ -1482,50 +1516,53 @@ class WorkflowRuntime:
                     for task_key in candidate.task_keys
                 )
             try:
-                if isinstance(node, RemoteTaskWorkflowNode):
-                    task_definitions = tuple(
-                        RemoteWorkflowTask(
-                            task_key=task.task_key,
-                            scientific_payload=task.scientific_payload,
-                            execution_payload=task.execution_payload,
+                with self._volume_io_lock:
+                    if isinstance(node, RemoteTaskWorkflowNode):
+                        task_definitions = tuple(
+                            RemoteWorkflowTask(
+                                task_key=task.task_key,
+                                scientific_payload=task.scientific_payload,
+                                execution_payload=task.execution_payload,
+                            )
+                            for task in tasks
                         )
-                        for task in tasks
-                    )
-                    if len(task_definitions) == 1:
-                        invocation = node.prepare_remote_task(
-                            self._node_context(
-                                definition,
-                                candidate.node_key,
-                                task_key=task_definitions[0].task_key,
-                            ),
-                            task_definitions[0],
+                        if len(task_definitions) == 1:
+                            invocation = node.prepare_remote_task(
+                                self._node_context(
+                                    definition,
+                                    candidate.node_key,
+                                    task_key=task_definitions[0].task_key,
+                                ),
+                                task_definitions[0],
+                            )
+                        else:
+                            invocation = node.prepare_remote_task_batch(
+                                self._node_context(
+                                    definition,
+                                    candidate.node_key,
+                                    task_key=task_definitions[0].task_key,
+                                ),
+                                task_definitions,
+                            )
+                    elif isinstance(node, RemoteWorkflowNode):
+                        if len(tasks) != 1:  # pragma: no cover - scheduler contract
+                            raise RuntimeError(
+                                "Only remote Task Nodes may own batched calls"
+                            )
+                        invocation = node.prepare_remote(
+                            self._node_context(definition, candidate.node_key)
                         )
-                    else:
-                        invocation = node.prepare_remote_task_batch(
-                            self._node_context(
-                                definition,
-                                candidate.node_key,
-                                task_key=task_definitions[0].task_key,
-                            ),
-                            task_definitions,
+                        if (
+                            _json_value(_execution_payload(invocation))
+                            != tasks[0].execution_payload
+                        ):
+                            raise ValueError(
+                                "Remote Node preparation changed after Task discovery"
+                            )
+                    else:  # pragma: no cover - scheduler contract
+                        raise TypeError(
+                            "Fixed dispatch requires a remote workflow Node"
                         )
-                elif isinstance(node, RemoteWorkflowNode):
-                    if len(tasks) != 1:  # pragma: no cover - scheduler contract
-                        raise RuntimeError(
-                            "Only remote Task Nodes may own batched calls"
-                        )
-                    invocation = node.prepare_remote(
-                        self._node_context(definition, candidate.node_key)
-                    )
-                    if (
-                        _json_value(_execution_payload(invocation))
-                        != tasks[0].execution_payload
-                    ):
-                        raise ValueError(
-                            "Remote Node preparation changed after Task discovery"
-                        )
-                else:  # pragma: no cover - scheduler contract
-                    raise TypeError("Fixed dispatch requires a remote workflow Node")
 
                 invocation_binding = ProviderBinding(
                     environment=run.deployment.environment,
@@ -1737,12 +1774,13 @@ class WorkflowRuntime:
                 continue
             implementation = definition.nodes[node.node_key].node
             if isinstance(implementation, RemoteTaskWorkflowNode):
-                self._finalize_remote_task_node(
-                    node.node_key,
-                    node.aggregation_policy,
-                    node.allow_empty_result,
-                    implementation,
-                )
+                with self._volume_io_lock:
+                    self._finalize_remote_task_node(
+                        node.node_key,
+                        node.aggregation_policy,
+                        node.allow_empty_result,
+                        implementation,
+                    )
                 continue
             with self.store.transaction():
                 self.store.execution.reconcile_node_tasks(
@@ -2233,11 +2271,12 @@ class WorkflowRuntime:
 
     def _reload_volume(self) -> None:
         """Refresh cross-container publications and reopen the shared ledger."""
-        with self.store.synchronize():
-            try:
-                self._volume_sync.reload()
-            finally:
-                self._provider.repository = self.store.execution
+        with self._volume_io_lock:
+            with self.store.synchronize():
+                try:
+                    self._volume_sync.reload()
+                finally:
+                    self._provider.repository = self.store.execution
 
     def _require_definition(self) -> WorkflowDefinition:
         if self._definition is None:

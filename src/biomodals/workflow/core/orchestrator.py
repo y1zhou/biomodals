@@ -160,6 +160,7 @@ class ExecutionCoordinator:
     def enter(self) -> None:
         """Refresh durable state before serving this run-scoped pool."""
         self._writer_lock = RLock()
+        self._volume_io_lock = RLock()
         self._drive_lock = Lock()
         self._runtime = None
         self._development_function_handles = None
@@ -472,6 +473,13 @@ class ExecutionCoordinator:
             self._writer_lock = lock
         return lock
 
+    def _volume_lock(self) -> RLock:
+        lock = getattr(self, "_volume_io_lock", None)
+        if lock is None:
+            lock = RLock()
+            self._volume_io_lock = lock
+        return lock
+
     def _persist_or_verify_plan(
         self,
         candidate: WorkflowCoordinatorPlan,
@@ -531,6 +539,7 @@ class ExecutionCoordinator:
             external_artifact_checker=external_checker,
             pull_worker_coordinator=self._worker_coordinator_handle(),
             store=self._run_store(),
+            volume_io_lock=self._volume_lock(),
         )
         self._runtime = runtime
         return runtime

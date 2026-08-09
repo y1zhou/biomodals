@@ -250,10 +250,6 @@ class WorkflowRuntime:
         self._initialize(workload_run_key, reload_volume=False)
         self._checkpoint()
 
-    def refresh_publications(self, *, workload_run_key: str) -> None:
-        """Refresh worker publications and verify an existing Run."""
-        self._initialize(workload_run_key, reload_volume=True)
-
     def claim_pull_tasks(
         self,
         provider_call_id: UUID,

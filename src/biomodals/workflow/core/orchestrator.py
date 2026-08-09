@@ -167,52 +167,6 @@ class ExecutionCoordinator:
         OUT_VOLUME.reload()
 
     @modal.method()
-    def run(
-        self,
-        workflow: Workflow,
-        workload_run_key: str,
-        max_active_provider_calls: int = 32,
-        max_active_gpu_provider_calls: int | None = None,
-        max_parallel_nodes: int = 32,
-        strict_external_artifact_checks: bool = False,
-        external_artifact_checker_function_name: str | None = None,
-        development_function_handles: Mapping[str, Any] | None = None,
-    ) -> AppRunResult:
-        """Persist one plan and drive its Execution Run until it stops."""
-        candidate = WorkflowCoordinatorPlan(
-            workflow=workflow,
-            workload_run_key=workload_run_key,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-            max_parallel_nodes=max_parallel_nodes,
-            strict_external_artifact_checks=strict_external_artifact_checks,
-            external_artifact_checker_function_name=(
-                external_artifact_checker_function_name
-            ),
-        )
-        with self._drive_lock:
-            with self._lock():
-                plan = self._persist_or_verify_plan(candidate)
-                if development_function_handles is not None:
-                    self._development_function_handles = dict(
-                        development_function_handles
-                    )
-            external_checker = self._resolve_external_checker(plan)
-            with self._lock():
-                runtime = self._open_runtime(
-                    plan,
-                    resolve_external_checker=True,
-                    external_checker=external_checker,
-                )
-            try:
-                return runtime.run(
-                    workload_run_key=plan.workload_run_key,
-                )
-            finally:
-                with self._lock():
-                    self._close_runtime()
-
-    @modal.method()
     def prepare_run(
         self,
         workflow: Workflow,
@@ -222,7 +176,6 @@ class ExecutionCoordinator:
         max_parallel_nodes: int = 32,
         strict_external_artifact_checks: bool = False,
         external_artifact_checker_function_name: str | None = None,
-        development_function_handles: Mapping[str, Any] | None = None,
     ) -> None:
         """Persist and checkpoint a root Run before asynchronous driving."""
         candidate = WorkflowCoordinatorPlan(
@@ -239,10 +192,6 @@ class ExecutionCoordinator:
         with self._drive_lock:
             with self._lock():
                 plan = self._persist_or_verify_plan(candidate)
-                if development_function_handles is not None:
-                    self._development_function_handles = dict(
-                        development_function_handles
-                    )
                 runtime = self._open_runtime(plan, resolve_external_checker=False)
             try:
                 runtime.prepare(workload_run_key=plan.workload_run_key)
@@ -371,8 +320,14 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def drive_prepared(self) -> AppRunResult:
-        """Drive one previously prepared workflow Successor."""
+    def drive_prepared(
+        self,
+        development_function_handles: Mapping[str, Any] | None = None,
+    ) -> AppRunResult:
+        """Drive one previously prepared workflow Run."""
+        if development_function_handles is not None:
+            with self._lock():
+                self._development_function_handles = dict(development_function_handles)
         return self._drive_prepared()
 
     @modal.method()
@@ -871,10 +826,21 @@ def submit_workflow_run(
 
     try:
         if predecessor_execution_run_id is None:
-            coordinator.prepare_run.remote(**coordinator_kwargs)
+            prepare_kwargs = dict(coordinator_kwargs)
+            development_handles = prepare_kwargs.pop(
+                "development_function_handles",
+                None,
+            )
+            coordinator.prepare_run.remote(**prepare_kwargs)
             report_identity()
             identity_reported = True
-            call = coordinator.drive_prepared.spawn()
+            call = (
+                coordinator.drive_prepared.spawn(
+                    development_function_handles=development_handles
+                )
+                if development_handles is not None
+                else coordinator.drive_prepared.spawn()
+            )
         else:
             coordinator.prepare_restart_from.remote(
                 predecessor_execution_run_id=str(predecessor_execution_run_id),

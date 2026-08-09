@@ -544,7 +544,7 @@ def test_initialization_reuses_the_host_volume_view(
     runtime.attach(workload_run_key="friendly-name")
     runtime.attach(workload_run_key="friendly-name")
     assert volume.reloads == 0
-    runtime.refresh_publications(workload_run_key="friendly-name")
+    runtime._initialize("friendly-name", reload_volume=True)
     assert volume.reloads == 1
     runtime.close()
 

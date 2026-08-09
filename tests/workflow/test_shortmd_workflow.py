@@ -806,7 +806,8 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
             calls["prepare"] = kwargs
 
     class FakeDriveMethod:
-        def spawn(self):
+        def spawn(self, **kwargs):
+            calls["drive"] = kwargs
             return FakeFunctionCall(
                 "call-1",
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
@@ -858,7 +859,8 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert calls["prepare"]["max_parallel_nodes"] == 3
     assert calls["prepare"]["max_active_provider_calls"] == 3
     assert calls["prepare"]["max_active_gpu_provider_calls"] == 3
-    assert set(calls["prepare"]["development_function_handles"]) == {
+    assert "development_function_handles" not in calls["prepare"]
+    assert set(calls["drive"]["development_function_handles"]) == {
         "clear_shortmd_gromacs_run",
         "prepare_tpr_cpu",
         "prepare_tpr_gpu",
@@ -888,7 +890,7 @@ def test_submit_shortmd_workflow_enables_external_checks(
             calls["prepare"] = kwargs
 
     class FakeDriveMethod:
-        def spawn(self):
+        def spawn(self, **_kwargs):
             return FakeFunctionCall(
                 "call-1",
                 AppRunResult(status=AppRunStatus.SUCCEEDED),
@@ -936,7 +938,7 @@ def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles
             calls["prepare"] = kwargs
 
     class FakeDriveMethod:
-        def spawn(self):
+        def spawn(self, **_kwargs):
             return FakeFunctionCall("call-1")
 
     class FakeCoordinator:
@@ -1086,7 +1088,7 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
             calls["prepare"] = kwargs
 
     class FakeDriveMethod:
-        def spawn(self):
+        def spawn(self, **_kwargs):
             return FakeFunctionCall("call-1")
 
     class FakeExecutionCoordinator:

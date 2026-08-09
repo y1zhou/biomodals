@@ -390,9 +390,11 @@ app = modal.App(...).include(orchestrator.app)
 All remote orchestration functions should live as methods on
 `ExecutionCoordinator`. Workflow apps obtain the class handle with
 `orchestrator.execution_coordinator_handle(...)` and call
-`orchestrator.submit_workflow_run(...)`. That helper submits `run` for a root
-Run, or synchronously calls `prepare_restart_from` before spawning
-`drive_prepared` for a Successor. The reusable orchestrator must not discover
+`orchestrator.submit_workflow_run(...)`. That helper synchronously calls
+`prepare_run` for a root Run or `prepare_restart_from` for a Successor before
+spawning `drive_prepared`. Development function handles are passed to the
+driver input so a replacement coordinator container does not lose them. The
+reusable orchestrator must not discover
 workflow modules, perform floating deployed-app lookups, or own
 workflow-specific input staging. Domain-specific staging, DAG construction,
 and development function handles belong in top-level workflow scripts.
@@ -408,23 +410,23 @@ Use `ExecutionSnapshot` and the durable execution, Provider Call, and workflow
 artifact rows for diagnostics. Do not expose private scheduler, repository, or
 Volume-sync collaborators as routine workflow authoring APIs.
 
-Keep the public coordinator surface minimal: `run`, `status`, `cancel`,
+Keep the public coordinator surface minimal: `prepare_run`, `status`, `cancel`,
 `resume`, `prepare_restart`, `prepare_restart_from`, `drive_prepared`, and the
-pull-worker claim/completion callbacks. The coordinator does not expose generic
-per-Node execution methods; runtime-managed Nodes only prepare work and the
-kernel owns submission.
+pull-worker claim/completion callbacks. The coordinator does not expose
+generic per-Node execution methods; runtime-managed Nodes only prepare work
+and the kernel owns submission.
 
 The reusable orchestrator module should not expose a local entrypoint for generic
 workflow submission. Each user-facing workflow script owns its own local
 entrypoint, stages its own inputs, builds its `Workflow` object, and submits that
 object to the included `ExecutionCoordinator`.
 
-The coordinator API accepts `Workflow` objects only. Workflow scripts build the
-DAG locally and submit that object to `ExecutionCoordinator.run`. The
-coordinator should not accept serialized workflow dictionaries or workflow
-factory import strings as its primary run contract. Workflow Node classes must
-therefore be importable in remote containers by canonical package-qualified
-module names.
+The coordinator API accepts `Workflow` objects only. Workflow scripts build
+the DAG locally and submit that object to `ExecutionCoordinator.prepare_run`.
+The coordinator should not accept serialized workflow dictionaries or
+workflow factory import strings as its primary run contract. Workflow Node
+classes must therefore be importable in remote containers by canonical
+package-qualified module names.
 
 ## CLI Namespace
 

@@ -273,6 +273,17 @@ def _restart(raw_cls: Any, coordinator: Any, **kwargs: object) -> AppRunResult:
     return raw_cls.drive_prepared._get_raw_f()(coordinator)
 
 
+def _run_root(raw_cls: Any, coordinator: Any, **kwargs: object) -> AppRunResult:
+    prepare_kwargs = dict(kwargs)
+    development_handles = prepare_kwargs.pop("development_function_handles", None)
+    raw_cls.prepare_run._get_raw_f()(coordinator, **prepare_kwargs)
+    coordinator._development_function_handles = None
+    return raw_cls.drive_prepared._get_raw_f()(
+        coordinator,
+        development_function_handles=development_handles,
+    )
+
+
 def test_coordinator_binds_parameterized_identity_and_persists_plan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -285,6 +296,9 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
             calls["init"] = kwargs
             self.store = WorkflowRunStore(tmp_path, RUN_ID)
 
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
         def run(self, *, workload_run_key: str) -> AppRunResult:
             calls["workload_run_key"] = workload_run_key
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
@@ -296,7 +310,8 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
     workflow = Workflow("demo")
 
-    result = raw_cls.run._get_raw_f()(
+    result = _run_root(
+        raw_cls,
         instance,
         workflow=workflow,
         workload_run_key="friendly-name",
@@ -307,7 +322,8 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
 
     assert result.status == AppRunStatus.SUCCEEDED
     init = cast(dict[str, object], calls["init"])
-    assert init["workflow"] is workflow
+    assert init["workflow"] is not workflow
+    assert cast(Workflow, init["workflow"]).validate() == workflow.validate()
     assert init["execution_run_id"] == RUN_ID
     assert init["deployment"] == DEPLOYMENT
     assert init["volume_root"] == tmp_path
@@ -374,6 +390,9 @@ def test_coordinator_rejects_a_changed_plan_for_the_same_run(
         def __init__(self, **_kwargs: object) -> None:
             self.store = WorkflowRunStore(tmp_path, RUN_ID)
 
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
         def run(self, **_kwargs: object) -> AppRunResult:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
@@ -382,14 +401,16 @@ def test_coordinator_rejects_a_changed_plan_for_the_same_run(
 
     monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         instance,
         workflow=Workflow("first"),
         workload_run_key="demo",
     )
 
     with pytest.raises(ValueError, match="does not match"):
-        raw_cls.run._get_raw_f()(
+        _run_root(
+            raw_cls,
             instance,
             workflow=Workflow("changed"),
             workload_run_key="demo",
@@ -408,6 +429,9 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
             calls.update(kwargs)
             self.store = WorkflowRunStore(tmp_path, RUN_ID)
 
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
         def run(self, **_kwargs: object) -> AppRunResult:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
@@ -423,7 +447,8 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
         deployment_environment="development",
         deployment_version=1,
     )
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         instance,
         workflow=Workflow("demo"),
         workload_run_key="demo",
@@ -451,6 +476,9 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
             calls.update(kwargs)
             self.store = WorkflowRunStore(tmp_path, RUN_ID)
 
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
         def run(self, **_kwargs: object) -> AppRunResult:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
@@ -465,7 +493,8 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
         deployment_environment="development",
         deployment_version=1,
     )
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         instance,
         workflow=Workflow("demo"),
         workload_run_key="demo",
@@ -489,7 +518,8 @@ def test_status_and_terminal_cancel_are_read_only_kernel_views(
     workflow = Workflow("demo")
     workflow.add_node(TextNode("complete"), id="write")
 
-    result = raw_cls.run._get_raw_f()(
+    result = _run_root(
+        raw_cls,
         instance,
         workflow=workflow,
         workload_run_key="demo",
@@ -516,7 +546,8 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     )
     workflow = Workflow("demo")
     workflow.add_node(TextNode("complete"), id="write")
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="demo",
@@ -580,7 +611,8 @@ def test_launch_restart_prepares_candidate_before_driving(
     )
     workflow = Workflow("demo")
     workflow.add_node(TextNode("complete", workers=8), id="write")
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="demo",
@@ -639,7 +671,8 @@ def test_generic_restart_prepares_successor_before_driving(
     )
     workflow = Workflow("demo")
     workflow.add_node(TextNode("complete"), id="write")
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="demo",
@@ -683,7 +716,8 @@ def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
     )
     predecessor_workflow = Workflow("demo")
     predecessor_workflow.add_node(TextNode("original"), id="write")
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=predecessor_workflow,
         workload_run_key="demo",
@@ -722,7 +756,8 @@ def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
     )
     workflow = Workflow("demo")
     workflow.add_node(TextNode("unchanged"), id="write")
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="original",
@@ -772,7 +807,8 @@ def test_restart_reuses_successful_task_publications_from_partial_node(
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
     )
 
-    predecessor_result = raw_cls.run._get_raw_f()(
+    predecessor_result = _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="fanout",
@@ -829,7 +865,8 @@ def test_restart_recomputes_a_missing_predecessor_publication(
     )
     workflow = Workflow("demo")
     workflow.add_node(TextNode("replacement"), id="write")
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="demo",
@@ -895,7 +932,8 @@ def test_restart_repairs_missing_ranked_structure_behind_ppiflow_report(
             "rank": rank.outputs(kind=ArtifactKind.TABLE),
         },
     )
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=workflow,
         workload_run_key="report-boundary",
@@ -960,7 +998,8 @@ def test_restart_rejects_a_mismatched_predecessor_deployment(
         tmp_path,
         volume,
     )
-    raw_cls.run._get_raw_f()(
+    _run_root(
+        raw_cls,
         predecessor_coordinator,
         workflow=Workflow("demo"),
         workload_run_key="demo",
@@ -1153,8 +1192,7 @@ def test_workflow_cancel_does_not_start_a_second_driver(
 
     run_thread = Thread(
         target=call,
-        args=(raw_cls.run._get_raw_f(),),
-        kwargs={"workflow": plan.workflow, "workload_run_key": "demo"},
+        args=(raw_cls.drive_prepared._get_raw_f(),),
     )
     run_thread.start()
     assert runtime.started.wait(timeout=1)
@@ -1315,6 +1353,35 @@ def test_submit_root_reports_identity_between_prepare_and_drive(
         f"print:Execution Run ID: {RUN_ID}",
         "drive",
     ]
+
+
+def test_submit_root_passes_development_handles_to_driver() -> None:
+    handle = FakeHandle()
+    calls: dict[str, object] = {}
+    coordinator = SimpleNamespace(
+        prepare_run=SimpleNamespace(
+            remote=lambda **kwargs: calls.update(prepare=kwargs)
+        ),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda **kwargs: calls.update(drive=kwargs) or "fc-root"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        predecessor_execution_run_id=None,
+        coordinator_kwargs={
+            "workload_run_key": "demo",
+            "development_function_handles": {"compute": handle},
+        },
+    )
+
+    assert call == "fc-root"
+    assert cast(dict[str, object], calls["drive"])["development_function_handles"] == {
+        "compute": handle
+    }
 
 
 def test_submit_workflow_run_reports_identity_when_interrupted(

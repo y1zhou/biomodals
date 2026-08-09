@@ -542,7 +542,8 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
             calls["prepare"] = kwargs
 
     class FakeDriveMethod:
-        def spawn(self) -> FakeFunctionCall:
+        def spawn(self, **kwargs) -> FakeFunctionCall:
+            calls["drive"] = kwargs
             return FakeFunctionCall("call-1")
 
     class FakeExecutionCoordinator:
@@ -592,7 +593,8 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert calls["prepare"]["max_parallel_nodes"] == 3
     assert calls["prepare"]["max_active_provider_calls"] == 3
     assert calls["prepare"]["max_active_gpu_provider_calls"] == 3
-    assert set(calls["prepare"]["development_function_handles"]) == {
+    assert "development_function_handles" not in calls["prepare"]
+    assert set(calls["drive"]["development_function_handles"]) == {
         "rfdiffusion_infer",
         "select_rfdiffusion_design",
         "ligandmpnn_run",
@@ -674,7 +676,7 @@ def test_submit_rfd_ligandmpnn_workflow_enables_external_checks(
             calls["prepare"] = kwargs
 
     class FakeDriveMethod:
-        def spawn(self) -> FakeFunctionCall:
+        def spawn(self, **_kwargs) -> FakeFunctionCall:
             return FakeFunctionCall("call-1")
 
     class FakeExecutionCoordinator:

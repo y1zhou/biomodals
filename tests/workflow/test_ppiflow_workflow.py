@@ -2447,7 +2447,7 @@ PPIFlowStep:
                 )
             )
             self.drive_prepared = SimpleNamespace(
-                spawn=lambda: _FakeFunctionCall(
+                spawn=lambda **_kwargs: _FakeFunctionCall(
                     "call-1",
                     AppRunResult(status=AppRunStatus.SUCCEEDED),
                 )
@@ -3337,7 +3337,7 @@ PPIFlowStep:
                 )
             )
             self.drive_prepared = SimpleNamespace(
-                spawn=lambda: _FakeFunctionCall(
+                spawn=lambda **_kwargs: _FakeFunctionCall(
                     "call-1",
                     AppRunResult(status=AppRunStatus.SUCCEEDED),
                 )

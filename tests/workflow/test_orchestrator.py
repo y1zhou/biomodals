@@ -538,7 +538,24 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    volume = FakeVolume()
+    class LockCheckingVolume(FakeVolume):
+        coordinator: Any | None = None
+
+        def _assert_successor_locks(self) -> None:
+            if self.coordinator is None:
+                return
+            assert self.coordinator._volume_lock()._is_owned()
+            assert self.coordinator._lock()._is_owned()
+
+        def commit(self) -> None:
+            self._assert_successor_locks()
+            super().commit()
+
+        def reload(self) -> None:
+            self._assert_successor_locks()
+            super().reload()
+
+    volume = LockCheckingVolume()
     raw_cls, predecessor_coordinator = _raw_coordinator(
         monkeypatch,
         tmp_path,
@@ -560,6 +577,7 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
         execution_run_id=str(SUCCESSOR_ID),
         deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
     )
+    volume.coordinator = successor_coordinator
 
     first = _restart(
         raw_cls,

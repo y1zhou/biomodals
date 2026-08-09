@@ -394,7 +394,7 @@ class ExecutionCoordinator:
         if successor_id == predecessor_execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
         with self._drive_lock:
-            with self._lock():
+            with self._volume_lock(), self._lock():
                 OUT_VOLUME.reload()
                 (
                     predecessor,

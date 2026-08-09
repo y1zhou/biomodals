@@ -736,6 +736,67 @@ def test_workflow_volume_reference_hashes_only_declared_files(
     assert hashed == ["model.pdb"]
 
 
+def test_partial_and_mixed_reference_manifests_hash_each_file_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run-1"
+    output_dir.mkdir()
+    (output_dir / "model.pdb").write_bytes(b"ATOM\n")
+    (output_dir / "scores.csv").write_bytes(b"score\n1\n")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.workflow.core.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="results",
+                kind=ArtifactKind.DIRECTORY,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+                metadata={
+                    "files": [
+                        {
+                            "path": "model.pdb",
+                            "size_bytes": len(b"ATOM\n"),
+                        },
+                        {
+                            "path": "scores.csv",
+                            "size_bytes": len(b"score\n1\n"),
+                            "content_sha256": sha256(b"score\n1\n").hexdigest(),
+                        },
+                    ]
+                },
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="results",
+        volume_root=tmp_path,
+    )
+
+    assert hashed == ["model.pdb", "scores.csv"]
+    assert all(
+        file.size_bytes is not None and file.content_sha256 is not None
+        for file in materialized.artifacts[0].files
+    )
+
+
 def test_workflow_volume_reference_rejects_symlink_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

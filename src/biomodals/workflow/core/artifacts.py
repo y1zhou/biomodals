@@ -173,25 +173,32 @@ def _reference_artifact_files(
                 )
     actual_by_path = {file.path: file for file in actual_files}
 
-    files = [
-        file.model_copy(
-            update={
-                "size_bytes": (
-                    file.size_bytes
-                    if file.size_bytes is not None
-                    else actual.size_bytes
-                ),
-                "content_sha256": file.content_sha256 or actual.content_sha256,
-            }
+    if any(file.path not in actual_by_path for file in declared):
+        return declared, False
+
+    files = []
+    for file in declared:
+        actual = actual_by_path[file.path]
+        if file.size_bytes is not None and file.size_bytes != actual.size_bytes:
+            raise FileNotFoundError(
+                f"Workflow artifact file size does not match: {file.path}"
+            )
+        if (
+            file.content_sha256 is not None
+            and file.content_sha256 != actual.content_sha256
+        ):
+            raise FileNotFoundError(
+                f"Workflow artifact file SHA-256 does not match: {file.path}"
+            )
+        files.append(
+            file.model_copy(
+                update={
+                    "size_bytes": actual.size_bytes,
+                    "content_sha256": actual.content_sha256,
+                }
+            )
         )
-        if (actual := actual_by_path.get(file.path)) is not None
-        else file
-        for file in declared
-    ]
-    fully_bound = all(file.path in actual_by_path for file in declared) and all(
-        file.size_bytes is None and file.content_sha256 is None for file in declared
-    )
-    return files, fully_bound
+    return files, True
 
 
 def _validate_inline_text_bytes(

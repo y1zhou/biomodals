@@ -125,6 +125,42 @@ def _declared_artifact_files(metadata: Mapping[str, Any]) -> list[ArtifactFile]:
     return files
 
 
+def _reference_artifact_files(
+    *,
+    storage: VolumePath,
+    metadata: Mapping[str, Any],
+    workflow_volume_name: str,
+    volume_root: Path | None,
+) -> list[ArtifactFile]:
+    """Bind workflow-owned references to their current file contents."""
+    declared = _declared_artifact_files(metadata)
+    if storage.volume_name != workflow_volume_name or volume_root is None:
+        return declared
+
+    artifact_path = _resolve_volume_child(volume_root, storage.path)
+    if not artifact_path.exists():
+        return declared
+    actual_by_path = {file.path: file for file in _artifact_files(artifact_path)}
+    if not declared:
+        return list(actual_by_path.values())
+
+    return [
+        file.model_copy(
+            update={
+                "size_bytes": (
+                    file.size_bytes
+                    if file.size_bytes is not None
+                    else actual.size_bytes
+                ),
+                "content_sha256": file.content_sha256 or actual.content_sha256,
+            }
+        )
+        if (actual := actual_by_path.get(file.path)) is not None
+        else file
+        for file in declared
+    ]
+
+
 def _validate_inline_text_bytes(
     storage: InlineBytes, output_kind: ArtifactKind
 ) -> None:
@@ -502,7 +538,12 @@ def materialize_app_run_result(
             producing_node_id=producing_node_id,
             kind=output.kind,
             storage=output.storage,
-            files=_declared_artifact_files(output.metadata),
+            files=_reference_artifact_files(
+                storage=output.storage,
+                metadata=output.metadata,
+                workflow_volume_name=workflow_volume_name,
+                volume_root=volume_root,
+            ),
             source_app_output_name=source_app_output_name or output.name,
             metadata=output.metadata,
         )

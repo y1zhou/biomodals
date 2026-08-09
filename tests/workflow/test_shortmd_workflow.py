@@ -2,8 +2,10 @@
 
 # ruff: noqa: D103
 
+import hashlib
 import pickle
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -11,6 +13,7 @@ import pytest
 from biomodals.app.bioinfo import gromacs_app
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
+    AppOutput,
     AppRunResult,
     AppRunStatus,
     ArtifactFile,
@@ -630,15 +633,29 @@ def test_shortmd_analysis_node_prepares_and_publishes_analyzed_output(
         )
     )
     result = node.process_remote_result(
-        f"{gromacs_app.CONF.output_volume_mountpoint}/source-r001",
+        AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="gromacs_production",
+                    kind=ArtifactKind.DIRECTORY,
+                    storage=VolumePath(
+                        volume_name=gromacs_app.CONF.output_volume_name,
+                        path="source-r001",
+                    ),
+                    metadata={"files": []},
+                )
+            ],
+        ),
         invocation.metadata,
     )
 
-    assert invocation.function_name == "collect_traj_stats"
+    assert invocation.function_name == "analyze_shortmd_gromacs_run"
     assert invocation.uses_gpu is False
     assert invocation.kwargs == {
         "traj_prefix": "production_",
         "run_name": "source-r001",
+        "source_run_name": "source",
         "save_processed_traj": True,
         "make_figures": True,
     }
@@ -653,20 +670,46 @@ def test_shortmd_analysis_node_prepares_and_publishes_analyzed_output(
         volume_name=gromacs_app.CONF.output_volume_name,
         path="source-r001",
     )
-    assert result.outputs[0].metadata["files"] == [
-        {"path": "production_source-r001.xtc", "role": "trajectory"},
-        {"path": "production_source-r001.tpr", "role": "production_topology"},
-        {
-            "path": "production_source-r001_nopbc_centered.pdb",
-            "role": "centered_structure",
-        },
-        {"path": "rmsd_production_source-r001.csv", "role": "rmsd"},
-        {
-            "path": "rg_production_source-r001.csv",
-            "role": "radius_of_gyration",
-        },
-        {"path": "rmsf_production_source-r001.csv", "role": "rmsf"},
-    ]
+    assert result.outputs[0].metadata["files"] == []
+
+
+def test_analyze_shortmd_gromacs_run_binds_final_file_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_name = "source-r001"
+    run_root = tmp_path / run_name
+    run_root.mkdir()
+    expected = gromacs_app.production_workflow_files(run_name)
+    for index, file in enumerate(expected):
+        (run_root / file.path).write_bytes(f"file-{index}\n".encode())
+    monkeypatch.setattr(
+        shortmd_workflow,
+        "GROMACS_OUTPUT_MOUNTPOINT",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        gromacs_app,
+        "collect_traj_stats",
+        SimpleNamespace(
+            get_raw_f=lambda: lambda **_kwargs: str(run_root),
+        ),
+    )
+
+    result = shortmd_workflow.analyze_shortmd_gromacs_run.get_raw_f()(
+        traj_prefix="production_",
+        run_name=run_name,
+        source_run_name="source",
+        save_processed_traj=True,
+        make_figures=True,
+    )
+
+    files = result.outputs[0].metadata["files"]
+    assert [file["path"] for file in files] == [file.path for file in expected]
+    for file in files:
+        data = (run_root / file["path"]).read_bytes()
+        assert file["size_bytes"] == len(data)
+        assert file["content_sha256"] == hashlib.sha256(data).hexdigest()
 
 
 def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
@@ -745,7 +788,7 @@ def test_shortmd_app_includes_orchestrator_class() -> None:
     assert "prepare_tpr_gpu" in functions
     assert "production_run_cpu" in functions
     assert "production_run_gpu" in functions
-    assert "collect_traj_stats" in functions
+    assert "analyze_shortmd_gromacs_run" in functions
 
 
 def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
@@ -822,7 +865,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         "clone_prepared_shortmd_run",
         "production_run_cpu",
         "production_run_gpu",
-        "collect_traj_stats",
+        "analyze_shortmd_gromacs_run",
         "check_shortmd_external_artifact",
     }
     stdout = strip_ansi(capsys.readouterr().out)

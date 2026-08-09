@@ -989,6 +989,15 @@ def rank_ppiflow_artifacts(
                 volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
                 media_type="text/csv",
                 metadata={"step_name": step_name, "rows": len(ranked)},
+                files=[
+                    ArtifactFile(
+                        path=ranked_csv.name,
+                        role="ranked_designs",
+                        media_type="text/csv",
+                        size_bytes=ranked_csv.stat().st_size,
+                        content_sha256=_file_sha256(ranked_csv),
+                    )
+                ],
             ),
         ],
         warnings=warnings,
@@ -2048,6 +2057,42 @@ def finalize_ppiflow_rosetta_stage(
             successful_candidates += 1
         elif error is not None:
             warnings.append(f"{candidate_id}: {error}")
+        candidate_files = []
+        if success:
+            output_dir = run_root / str(row["expected_output_dir"])
+            for path in sorted(output_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                candidate_files.append(
+                    ppiflow_manifests.candidate_file_record(
+                        role=(
+                            "structure"
+                            if path.suffix.lower() in {".pdb", ".cif"}
+                            else "score"
+                        ),
+                        volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
+                        app_volume_path=path.relative_to(
+                            ROSETTA_OUTPUT_MOUNTPOINT
+                        ).as_posix(),
+                        path=path.relative_to(output_dir).as_posix(),
+                        size_bytes=path.stat().st_size,
+                        content_sha256=_file_sha256(path),
+                    )
+                )
+        if log_path.is_file():
+            candidate_files.append(
+                ppiflow_manifests.candidate_file_record(
+                    role="worker_log",
+                    volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
+                    app_volume_path=log_path.relative_to(
+                        ROSETTA_OUTPUT_MOUNTPOINT
+                    ).as_posix(),
+                    path=log_path.relative_to(run_root).as_posix(),
+                    size_bytes=log_path.stat().st_size,
+                    content_sha256=_file_sha256(log_path),
+                    expected=False,
+                )
+            )
         rows.append(
             ppiflow_manifests.candidate_manifest_row(
                 candidate_id=candidate_id,
@@ -2058,26 +2103,7 @@ def finalize_ppiflow_rosetta_stage(
                 source_path=str(row["pdb"]),
                 derived_path=str(row["expected_output_dir"]),
                 error=error,
-                files=[
-                    ppiflow_manifests.candidate_file_record(
-                        role="score",
-                        volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
-                        app_volume_path=str(
-                            Path(str(plan["run_name"]) + "-" + str(plan["run_id"]))
-                            / str(row["expected_score_file"])
-                        ),
-                        expected=True,
-                    ),
-                    ppiflow_manifests.candidate_file_record(
-                        role="worker_log",
-                        volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
-                        app_volume_path=str(
-                            Path(str(plan["run_name"]) + "-" + str(plan["run_id"]))
-                            / str(row["worker_log"])
-                        ),
-                        expected=log_path.is_file(),
-                    ),
-                ],
+                files=candidate_files,
                 summary={
                     "index": row["index"],
                     "num_pods": worker_count,
@@ -2085,6 +2111,16 @@ def finalize_ppiflow_rosetta_stage(
             )
         )
 
+    rosetta_files = [
+        ArtifactFile(
+            path=path.relative_to(run_root).as_posix(),
+            role=("structure" if path.suffix.lower() in {".pdb", ".cif"} else "result"),
+            size_bytes=path.stat().st_size,
+            content_sha256=_file_sha256(path),
+        )
+        for path in sorted(run_root.rglob("*"))
+        if path.is_file()
+    ]
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
@@ -2111,6 +2147,7 @@ def finalize_ppiflow_rosetta_stage(
                     "num_pods": worker_count,
                     "structure_patterns": APP_RUN_OUTPUT_STRUCTURE_PATTERNS,
                 },
+                files=rosetta_files,
             ),
             volume_app_output(
                 name="rosetta_job_manifest",
@@ -2123,6 +2160,15 @@ def finalize_ppiflow_rosetta_stage(
                     "step_name": step_name,
                     "rows": _config_int(plan, "num_jobs", 0),
                 },
+                files=[
+                    ArtifactFile(
+                        path=job_manifest.name,
+                        role="job_manifest",
+                        media_type="text/csv",
+                        size_bytes=job_manifest.stat().st_size,
+                        content_sha256=_file_sha256(job_manifest),
+                    )
+                ],
             ),
             manifest_output,
         ],
@@ -3518,6 +3564,13 @@ def _ppiflow_candidate_result(
                     | {
                         "candidate_id": candidate_id,
                         "candidate_files": candidate_files,
+                        "files": [
+                            ArtifactFile.model_validate(file_record).model_dump(
+                                exclude_defaults=True,
+                                exclude_none=True,
+                            )
+                            for file_record in candidate_files
+                        ],
                         "source_structure": source_structure,
                         "step_name": step_name,
                         "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,

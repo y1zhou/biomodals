@@ -738,6 +738,10 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
         "partial-run-candidate-1/outputs/designed.pdb"
     )
     assert file_record["content_sha256"] == hashlib.sha256(b"MODEL\n").hexdigest()
+    assert (
+        result.outputs[0].metadata["files"][0]["content_sha256"]
+        == (file_record["content_sha256"])
+    )
 
 
 def test_supplied_invalid_candidate_manifest_fails_closed(
@@ -1540,6 +1544,10 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         "rosetta_job_manifest",
         "candidate_manifest",
     ]
+    output_files = result.outputs[0].metadata["files"]
+    assert output_files
+    assert all(file["size_bytes"] for file in output_files)
+    assert all(file["content_sha256"] for file in output_files)
     frame = ppiflow_manifests.read_manifest(
         workflow_root / result.outputs[-1].storage.path
     )
@@ -1547,6 +1555,11 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         {"candidate_id": "candidate-a", "candidate_status": "succeeded"},
         {"candidate_id": "candidate-b", "candidate_status": "failed"},
     ]
+    [successful_row] = frame.filter(
+        pl.col("candidate_status") == "succeeded"
+    ).to_dicts()
+    assert all(file["size_bytes"] for file in successful_row["files"])
+    assert all(file["content_sha256"] for file in successful_row["files"])
     assert result.metrics == {
         "successful_candidates": 1,
         "failed_candidates": 1,

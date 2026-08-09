@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+import hashlib
 from pathlib import Path
 
 import polars as pl
@@ -113,6 +114,10 @@ def test_manifest_output_is_table_artifact_with_parquet_file(
     )
     assert output.metadata["files"][0]["path"] == "candidate_manifest.parquet"
     assert output.metadata["files"][0]["role"] == "candidate_manifest"
+    assert (
+        output.metadata["files"][0]["content_sha256"]
+        == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    )
 
 
 def test_strict_candidate_join_requires_all_candidate_ids() -> None:
@@ -158,6 +163,7 @@ def test_expected_file_errors_check_workflow_and_app_volume_paths(
                     volume_name="app-volume",
                     app_volume_path="outputs/model.pdb",
                     size_bytes=5,
+                    content_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
                 ),
             ],
         )
@@ -184,6 +190,40 @@ def test_expected_file_errors_check_workflow_and_app_volume_paths(
         },
         workflow_volume_name="workflow-volume",
     ) == ["candidate-a: missing expected file app-volume:outputs/model.pdb"]
+
+
+def test_expected_file_errors_reject_same_size_corruption(tmp_path: Path) -> None:
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    model_path = app_root / "model.pdb"
+    model_path.write_bytes(b"HACK\n")
+    rows = [
+        manifests.candidate_manifest_row(
+            candidate_id="candidate-a",
+            stage_name="Stage",
+            stage_role="test",
+            operation_mode="test",
+            candidate_status=AppRunStatus.SUCCEEDED.value,
+            files=[
+                manifests.candidate_file_record(
+                    role="structure",
+                    volume_name="app-volume",
+                    app_volume_path="model.pdb",
+                    size_bytes=5,
+                    content_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
+                )
+            ],
+        )
+    ]
+
+    errors = manifests.expected_file_errors(
+        rows,
+        volume_roots={"app-volume": app_root},
+        workflow_volume_name="workflow-volume",
+    )
+
+    assert len(errors) == 1
+    assert "SHA-256" in errors[0]
 
 
 def test_reusable_completed_candidates_require_expected_files(

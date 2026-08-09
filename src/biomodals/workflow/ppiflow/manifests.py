@@ -206,6 +206,7 @@ def manifest_artifact_output(
                 role=MANIFEST_FILE_ROLE,
                 media_type=MANIFEST_MEDIA_TYPE,
                 size_bytes=manifest_path.stat().st_size,
+                content_sha256=_file_sha256(manifest_path),
             )
         ],
     )
@@ -307,6 +308,16 @@ def expected_file_errors(
                     f"{candidate_id}: expected file {volume_name}:{path} has size "
                     f"{file_path.stat().st_size}, expected {expected_size}"
                 )
+                continue
+            expected_sha256 = file_record.get("content_sha256")
+            if (
+                expected_sha256 is not None
+                and _file_sha256(file_path) != expected_sha256
+            ):
+                errors.append(
+                    f"{candidate_id}: expected file {volume_name}:{path} "
+                    "does not match its SHA-256"
+                )
     return errors
 
 
@@ -340,6 +351,11 @@ def reusable_completed_candidate_ids(
 def _candidate_id(payload: Mapping[str, object]) -> str:
     encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
     return f"cand_{hashlib.sha256(encoded).hexdigest()[:16]}"
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _normalized_basename(path: str) -> str:

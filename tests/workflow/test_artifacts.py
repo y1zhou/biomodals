@@ -588,6 +588,87 @@ def test_materialize_volume_path_references_existing_remote_output(
     assert (tmp_path / "artifacts" / "score-scores.json").exists()
 
 
+def test_workflow_volume_reference_records_content_identity(tmp_path: Path) -> None:
+    output_path = tmp_path / "run-1" / "scores.csv"
+    output_path.parent.mkdir()
+    output_path.write_bytes(b"score\n1\n")
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1/scores.csv",
+                ),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="score",
+        volume_root=tmp_path,
+    )
+
+    [file] = materialized.artifacts[0].files
+    assert file == ArtifactFile(
+        path="scores.csv",
+        size_bytes=len(b"score\n1\n"),
+        content_sha256=sha256(b"score\n1\n").hexdigest(),
+    )
+    output_path.write_bytes(b"score\n2\n")
+    errors = workflow_artifact_availability_errors(
+        materialized.artifacts[0],
+        workflow_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+    assert len(errors) == 1
+    assert "SHA-256" in errors[0]
+
+
+def test_workflow_volume_reference_enriches_declared_file(tmp_path: Path) -> None:
+    output_path = tmp_path / "run-1" / "model.pdb"
+    output_path.parent.mkdir()
+    output_path.write_bytes(b"ATOM\n")
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+                metadata={"files": [{"path": "model.pdb", "role": "structure"}]},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        workflow_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="models",
+        volume_root=tmp_path,
+    )
+
+    assert materialized.artifacts[0].files == [
+        ArtifactFile(
+            path="model.pdb",
+            role="structure",
+            size_bytes=len(b"ATOM\n"),
+            content_sha256=sha256(b"ATOM\n").hexdigest(),
+        )
+    ]
+
+
 def test_materialize_volume_path_rejects_missing_workflow_volume_reference(
     tmp_path: Path,
 ) -> None:

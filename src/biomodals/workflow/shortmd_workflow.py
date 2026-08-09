@@ -11,6 +11,7 @@ the reusable Biomodals workflow runtime.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from collections.abc import Mapping
@@ -205,6 +206,69 @@ def clone_prepared_shortmd_run(
 
     GROMACS_OUTPUT_VOLUME.commit()
     return str(replicate_dir)
+
+
+def _content_bound_gromacs_files(run_name: str) -> list[ArtifactFile]:
+    """Return the final ShortMD file manifest with content identities."""
+    run_root = Path(GROMACS_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
+    files = []
+    for declared in gromacs_app.production_workflow_files(run_name):
+        path = run_root / declared.path
+        if not path.is_file():
+            raise FileNotFoundError(f"Expected ShortMD output not found: {path}")
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        files.append(
+            declared.model_copy(
+                update={
+                    "size_bytes": path.stat().st_size,
+                    "content_sha256": digest,
+                }
+            )
+        )
+    return files
+
+
+@app.function(
+    image=gromacs_app.biotite_image,
+    cpu=1,
+    memory=(1024, 65536),
+    timeout=CONF.timeout,
+    volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
+)
+def analyze_shortmd_gromacs_run(
+    *,
+    traj_prefix: str,
+    run_name: str,
+    source_run_name: str,
+    save_processed_traj: bool,
+    make_figures: bool,
+) -> AppRunResult:
+    """Analyze one replicate and publish its content-bound final files."""
+    workdir = gromacs_app.collect_traj_stats.get_raw_f()(
+        traj_prefix=traj_prefix,
+        run_name=run_name,
+        save_processed_traj=save_processed_traj,
+        make_figures=make_figures,
+    )
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name="gromacs_production",
+                kind=ArtifactKind.DIRECTORY,
+                remote_path=str(workdir),
+                mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                volume_name=GROMACS_OUTPUT_VOLUME_NAME,
+                metadata={
+                    "stage": "analysis",
+                    "run_name": sanitize_filename(run_name),
+                    "source_run_name": sanitize_filename(source_run_name),
+                },
+                files=_content_bound_gromacs_files(run_name),
+            )
+        ],
+    )
 
 
 @dataclass
@@ -506,6 +570,7 @@ class ShortMDAnalysisNode(AppBackedNode):
             {
                 "traj_prefix": "production_",
                 "run_name": safe_replicate_run_name,
+                "source_run_name": safe_source_run_name,
                 "save_processed_traj": self.gromacs.save_processed_traj,
                 "make_figures": self.gromacs.make_figures,
             },
@@ -520,7 +585,7 @@ class ShortMDAnalysisNode(AppBackedNode):
         """Prepare GROMACS analysis for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
         return RemoteNodeCall(
-            function_name="collect_traj_stats",
+            function_name="analyze_shortmd_gromacs_run",
             uses_gpu=False,
             kwargs=kwargs,
             metadata=metadata,
@@ -532,29 +597,8 @@ class ShortMDAnalysisNode(AppBackedNode):
         metadata: Mapping[str, object],
     ) -> AppRunResult:
         """Publish the analyzed production directory."""
-        if isinstance(result, AppRunResult):
-            return result
-        safe_replicate_run_name = str(metadata["run_name"])
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                volume_app_output(
-                    name="gromacs_production",
-                    kind=ArtifactKind.DIRECTORY,
-                    remote_path=str(result),
-                    mount_root=GROMACS_OUTPUT_MOUNTPOINT,
-                    volume_name=GROMACS_OUTPUT_VOLUME_NAME,
-                    metadata={
-                        "stage": "analysis",
-                        "run_name": safe_replicate_run_name,
-                        "source_run_name": str(metadata["source_run_name"]),
-                    },
-                    files=gromacs_app.production_workflow_files(
-                        safe_replicate_run_name
-                    ),
-                )
-            ],
-        )
+        del metadata
+        return AppRunResult.model_validate(result)
 
 
 @dataclass
@@ -846,7 +890,7 @@ def submit_shortmd_workflow(
             "clone_prepared_shortmd_run": clone_prepared_shortmd_run,
             "production_run_cpu": gromacs_app.production_run_cpu,
             "production_run_gpu": gromacs_app.production_run_gpu,
-            "collect_traj_stats": gromacs_app.collect_traj_stats,
+            "analyze_shortmd_gromacs_run": analyze_shortmd_gromacs_run,
             "check_shortmd_external_artifact": check_shortmd_external_artifact,
         }
     print(

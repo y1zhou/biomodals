@@ -101,12 +101,18 @@ PPIFlow keeps rejected, failed, and skipped candidates available for reporting e
 PPIFlow validates a candidate's expected output files before completing a Task
 from cache or copying a successful publication into a Successor Execution
 Run. Candidate manifest rows are durable provenance, but they do not replace
-artifact availability checks. Missing output authorizes new work only when no
-active or unknown predecessor ownership remains.
+artifact availability checks. Expected scientific files record byte size and
+SHA-256 so same-size corruption is not reusable. Missing output authorizes new
+work only when no active or unknown predecessor ownership remains.
 
 ## Record workflow and app-volume candidate file locations
 
 PPIFlow candidate manifests record both workflow-relative artifact paths and app-volume paths when both are available. Workflow-relative paths support materialized downstream artifacts and user inspection, while app-volume paths plus volume identity support strict availability checks for app-owned durable outputs without guessing storage ownership.
+
+Supplied manifests fail closed when they cannot be parsed or validated; the
+legacy filename-derived identity fallback applies only when no manifest was
+supplied. Exact source-artifact and full-path aliases take precedence over
+basename aliases, and ambiguous basename aliases are rejected.
 
 ## Generate PPIFlow candidate ids from provenance
 

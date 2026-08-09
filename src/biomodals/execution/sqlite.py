@@ -1949,6 +1949,8 @@ class SqliteExecutionRepository:
                 now,
             ),
         )
+        if self.get_run(call.execution_run_id).cancellation_is_durable:
+            return self.get_task(call.execution_run_id, call.node_key, task_key)
         if observation == AvailabilityStatus.MISSING:
             failed = self.fail_task(
                 call.execution_run_id,

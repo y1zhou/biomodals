@@ -562,6 +562,47 @@ def test_worker_completion_report_is_idempotent_and_publication_driven() -> None
         )
 
 
+@pytest.mark.parametrize("observation", list(AvailabilityStatus))
+def test_late_worker_completion_does_not_override_cancellation(
+    observation: AvailabilityStatus,
+) -> None:
+    repository = create_repository(task_count=1)
+    (worker,) = _admit_workers(repository, 1)
+    repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+        now=140,
+    )
+    repository.request_run_cancellation(RUN_ID, now=145)
+
+    completed = repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="completion",
+        observation=observation,
+        now=150,
+    )
+    duplicate = repository.record_pull_task_completion(
+        worker.call.provider_call_id,
+        "seed-0",
+        request_id="completion",
+        observation=observation,
+        now=151,
+    )
+    next_claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="next-claim",
+        capacity=1,
+        now=152,
+    )
+
+    assert repository.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
+    assert completed.status == TaskStatus.RUNNING
+    assert duplicate == completed
+    assert next_claim.assignments == ()
+
+
 def test_active_pull_worker_reconciliation_skips_assignment_history() -> None:
     repository = create_repository(task_count=2)
     (worker,) = _admit_workers(repository, 1)

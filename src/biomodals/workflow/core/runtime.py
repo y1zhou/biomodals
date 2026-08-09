@@ -339,6 +339,7 @@ class WorkflowRuntime:
                 task.fingerprint,
                 materialized.result,
                 artifacts,
+                workflow_artifacts_validated=True,
             )
             prepared.append((
                 task,
@@ -686,7 +687,10 @@ class WorkflowRuntime:
             artifacts = tuple(materialized.artifacts)
             prepared.append((
                 task,
-                self._artifact_observation(artifacts),
+                self._artifact_observation(
+                    artifacts,
+                    workflow_artifacts_validated=True,
+                ),
                 materialized.result,
                 artifacts,
             ))
@@ -1333,7 +1337,10 @@ class WorkflowRuntime:
             producing_node_id=node_id,
             volume_root=self.volume_root,
         )
-        observation = self._artifact_observation(tuple(materialized.artifacts))
+        observation = self._artifact_observation(
+            tuple(materialized.artifacts),
+            workflow_artifacts_validated=True,
+        )
         with self.store.transaction():
             if self.store.execution.get_task(
                 self.execution_run_id,
@@ -1403,7 +1410,10 @@ class WorkflowRuntime:
             artifact_id_scope=_task_storage_scope(task_key),
             volume_root=self.volume_root,
         )
-        observation = self._artifact_observation(tuple(materialized.artifacts))
+        observation = self._artifact_observation(
+            tuple(materialized.artifacts),
+            workflow_artifacts_validated=True,
+        )
         with self.store.transaction():
             if self.store.execution.get_task(
                 self.execution_run_id,
@@ -1663,7 +1673,14 @@ class WorkflowRuntime:
                 }
             )
             artifacts = (*task_artifacts, *materialized.artifacts)
-            observation = self._artifact_observation(artifacts)
+            observation = self._artifact_observation((
+                *task_artifacts,
+                *(
+                    artifact
+                    for artifact in materialized.artifacts
+                    if artifact.storage.volume_name != self.workflow_volume_name
+                ),
+            ))
         except Exception as error:
             self._fail_node_publication(
                 node_id,
@@ -1767,9 +1784,14 @@ class WorkflowRuntime:
         expected_fingerprint: str,
         result: AppRunResult,
         artifacts: tuple[WorkflowArtifact, ...],
+        *,
+        workflow_artifacts_validated: bool = False,
     ) -> AvailabilityStatus:
         """Combine durable workflow artifacts with a workload-specific probe."""
-        artifact_observation = self._artifact_observation(artifacts)
+        artifact_observation = self._artifact_observation(
+            artifacts,
+            workflow_artifacts_validated=workflow_artifacts_validated,
+        )
         if artifact_observation != AvailabilityStatus.AVAILABLE:
             return artifact_observation
         workload_observation = implementation.observe_remote_task_publication(
@@ -1784,6 +1806,8 @@ class WorkflowRuntime:
     def _artifact_observation(
         self,
         artifacts: tuple[WorkflowArtifact, ...],
+        *,
+        workflow_artifacts_validated: bool = False,
     ) -> AvailabilityStatus:
         statuses = [
             check_artifact_availability(
@@ -1793,6 +1817,10 @@ class WorkflowRuntime:
                 external_artifact_checker=self.external_artifact_checker,
             ).status
             for artifact in artifacts
+            if not (
+                workflow_artifacts_validated
+                and artifact.storage.volume_name == self.workflow_volume_name
+            )
         ]
         if AvailabilityStatus.UNKNOWN in statuses:
             return AvailabilityStatus.UNKNOWN

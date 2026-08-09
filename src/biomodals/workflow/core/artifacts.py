@@ -136,22 +136,22 @@ def _reference_artifact_files(
     metadata: Mapping[str, Any],
     workflow_volume_name: str,
     volume_root: Path | None,
-) -> list[ArtifactFile]:
+) -> tuple[list[ArtifactFile], bool]:
     """Bind workflow-owned references to their current file contents."""
     declared = _declared_artifact_files(metadata)
     if storage.volume_name != workflow_volume_name or volume_root is None:
-        return declared
+        return declared, False
 
     artifact_path = _resolve_volume_child(volume_root, storage.path)
     if not artifact_path.exists():
-        return declared
+        return declared, False
     if declared and all(
         file.size_bytes is not None and file.content_sha256 is not None
         for file in declared
     ):
-        return declared
+        return declared, False
     if not declared:
-        return _artifact_files(artifact_path)
+        return _artifact_files(artifact_path), True
 
     if artifact_path.is_file():
         actual_files = (
@@ -173,7 +173,7 @@ def _reference_artifact_files(
                 )
     actual_by_path = {file.path: file for file in actual_files}
 
-    return [
+    files = [
         file.model_copy(
             update={
                 "size_bytes": (
@@ -188,6 +188,10 @@ def _reference_artifact_files(
         else file
         for file in declared
     ]
+    fully_bound = all(file.path in actual_by_path for file in declared) and all(
+        file.size_bytes is None and file.content_sha256 is None for file in declared
+    )
+    return files, fully_bound
 
 
 def _validate_inline_text_bytes(
@@ -542,7 +546,6 @@ def materialize_app_run_result(
                 source_app_output_name=source_app_output_name,
                 artifact_parent=artifact_parent,
             )
-            raise_for_unavailable_workflow_artifact(artifact)
             return artifact, _persisted_output(output, artifact.storage)
 
         if volume_path_mode == "copy":
@@ -560,23 +563,24 @@ def materialize_app_run_result(
                 source_app_output_name=source_app_output_name,
                 artifact_parent=artifact_parent,
             )
-            raise_for_unavailable_workflow_artifact(artifact)
             return artifact, _persisted_output(output, artifact.storage)
+        reference_files, workflow_reference_validated = _reference_artifact_files(
+            storage=output.storage,
+            metadata=output.metadata,
+            workflow_volume_name=workflow_volume_name,
+            volume_root=volume_root,
+        )
         artifact = WorkflowArtifact(
             artifact_id=artifact_id,
             producing_node_id=producing_node_id,
             kind=output.kind,
             storage=output.storage,
-            files=_reference_artifact_files(
-                storage=output.storage,
-                metadata=output.metadata,
-                workflow_volume_name=workflow_volume_name,
-                volume_root=volume_root,
-            ),
+            files=reference_files,
             source_app_output_name=source_app_output_name or output.name,
             metadata=output.metadata,
         )
-        raise_for_unavailable_workflow_artifact(artifact)
+        if not workflow_reference_validated:
+            raise_for_unavailable_workflow_artifact(artifact)
         return artifact, _persisted_output(output, artifact.storage)
 
     def raise_for_unavailable_workflow_artifact(artifact: WorkflowArtifact) -> None:

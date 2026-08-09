@@ -4,6 +4,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 from uuid import UUID
@@ -546,6 +547,31 @@ def test_initialization_reuses_the_host_volume_view(
     assert volume.reloads == 0
     runtime._initialize("friendly-name", reload_volume=True)
     assert volume.reloads == 1
+    runtime.close()
+
+
+def test_new_workflow_artifact_is_hashed_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workflow = Workflow("local")
+    workflow.add_node(TextNode("hello"), id="local")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.workflow.core.artifacts._file_sha256",
+        record_sha256,
+    )
+    runtime = _runtime(tmp_path, workflow)
+
+    result = runtime.run(workload_run_key="local")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert hashed == ["result.txt"]
     runtime.close()
 
 

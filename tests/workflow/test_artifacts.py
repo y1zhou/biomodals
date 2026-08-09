@@ -588,10 +588,23 @@ def test_materialize_volume_path_references_existing_remote_output(
     assert (tmp_path / "artifacts" / "score-scores.json").exists()
 
 
-def test_workflow_volume_reference_records_content_identity(tmp_path: Path) -> None:
+def test_workflow_volume_reference_records_content_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     output_path = tmp_path / "run-1" / "scores.csv"
     output_path.parent.mkdir()
     output_path.write_bytes(b"score\n1\n")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.workflow.core.artifacts._file_sha256",
+        record_sha256,
+    )
     result = AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
@@ -621,6 +634,7 @@ def test_workflow_volume_reference_records_content_identity(tmp_path: Path) -> N
         size_bytes=len(b"score\n1\n"),
         content_sha256=sha256(b"score\n1\n").hexdigest(),
     )
+    assert hashed == ["scores.csv"]
     output_path.write_bytes(b"score\n2\n")
     errors = workflow_artifact_availability_errors(
         materialized.artifacts[0],

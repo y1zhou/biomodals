@@ -357,6 +357,7 @@ class WorkflowRuntime:
         ):
             self._reload_volume()
         prepared = []
+        staged_publications: dict[str, tuple[Path, str]] = {}
         for (
             (task_key, completion_request_id, result),
             (task, receipt, published_result, published_artifacts),
@@ -391,18 +392,24 @@ class WorkflowRuntime:
                         call.node_key,
                         task_key=task_key,
                     )
-                    observation = self._observe_remote_task_publication(
-                        node,
-                        context,
-                        RemoteWorkflowTask(
-                            task_key=task.task_key,
-                            scientific_payload=task.scientific_payload,
-                            execution_payload=task.execution_payload,
-                        ),
-                        task.fingerprint,
-                        published_result,
-                        published_artifacts,
-                    )
+                    try:
+                        observation = self._observe_remote_task_publication(
+                            node,
+                            context,
+                            RemoteWorkflowTask(
+                                task_key=task.task_key,
+                                scientific_payload=task.scientific_payload,
+                                execution_payload=task.execution_payload,
+                            ),
+                            task.fingerprint,
+                            published_result,
+                            published_artifacts,
+                        )
+                    except Exception:
+                        self._discard_pull_completion_staging(
+                            *staged_publications.values()
+                        )
+                        raise
                 prepared.append((
                     task,
                     completion_request_id,
@@ -431,30 +438,53 @@ class WorkflowRuntime:
                 call.node_key,
                 task_key=task_key,
             )
-            publication_scope = f"{_task_storage_scope(task_key)}-{uuid4().hex}"
-            materialized = materialize_app_run_result(
-                result=result,
-                workflow_volume_name=self.workflow_volume_name,
-                result_dir=(context.work_dir / "completions" / publication_scope),
-                artifact_dir=self.store.output_root / "artifacts",
-                producing_node_id=call.node_key,
-                artifact_id_scope=publication_scope,
-                volume_root=self.volume_root,
+            publication_token = uuid4().hex
+            publication_scope = f"{_task_storage_scope(task_key)}-{publication_token}"
+            publication_dir = context.work_dir / "completions" / publication_scope
+            staged_publications[task.task_key] = (
+                publication_dir,
+                publication_token,
             )
-            artifacts = tuple(materialized.artifacts)
-            observation = self._observe_remote_task_publication(
-                node,
-                context,
-                RemoteWorkflowTask(
-                    task_key=task.task_key,
-                    scientific_payload=task.scientific_payload,
-                    execution_payload=task.execution_payload,
-                ),
-                task.fingerprint,
-                materialized.result,
-                artifacts,
-                workflow_artifacts_validated=True,
-            )
+            try:
+                materialized = materialize_app_run_result(
+                    result=result,
+                    workflow_volume_name=self.workflow_volume_name,
+                    result_dir=publication_dir,
+                    artifact_dir=self.store.output_root / "artifacts",
+                    producing_node_id=call.node_key,
+                    artifact_id_scope=publication_scope,
+                    volume_root=self.volume_root,
+                )
+                artifacts = tuple(materialized.artifacts)
+                observation = self._observe_remote_task_publication(
+                    node,
+                    context,
+                    RemoteWorkflowTask(
+                        task_key=task.task_key,
+                        scientific_payload=task.scientific_payload,
+                        execution_payload=task.execution_payload,
+                    ),
+                    task.fingerprint,
+                    materialized.result,
+                    artifacts,
+                    workflow_artifacts_validated=True,
+                )
+            except (FileNotFoundError, ValueError) as error:
+                self._discard_pull_completion_staging(
+                    staged_publications.pop(task.task_key)
+                )
+                prepared.append((
+                    task,
+                    completion_request_id,
+                    AvailabilityStatus.MISSING,
+                    f"Could not publish workflow Task result: {error}",
+                    None,
+                    None,
+                ))
+                continue
+            except Exception:
+                self._discard_pull_completion_staging(*staged_publications.values())
+                raise
             prepared.append((
                 task,
                 completion_request_id,
@@ -468,101 +498,129 @@ class WorkflowRuntime:
                 None,
             ))
         now = self._now()
+        published_staging: set[str] = set()
         with self.store.synchronize():
-            with self.store.transaction():
-                cancellation_is_durable = self.store.execution.get_run(
-                    self.execution_run_id
-                ).cancellation_is_durable
-                kernel_completions = []
-                for (
-                    task,
-                    completion_request_id,
-                    observation,
-                    message,
-                    publication,
-                    revalidated_publication,
-                ) in prepared:
-                    receipt = self.store.execution.get_pull_task_completion_receipt(
-                        provider_call_id,
-                        task.task_key,
-                        request_id=completion_request_id,
-                    )
-                    existing_publication = self.store.artifacts.load_task_result(
-                        call.node_key,
-                        task.task_key,
-                    )
-                    current_task = self.store.execution.get_task(
-                        self.execution_run_id,
-                        call.node_key,
-                        task.task_key,
-                    )
-                    if receipt is not None:
-                        observation, message = receipt
-                    elif cancellation_is_durable:
-                        observation = AvailabilityStatus.MISSING
-                        message = "Completion ignored after workflow cancellation"
-                    elif (
-                        existing_publication is not None
-                        and current_task.status == TaskStatus.SUCCEEDED
-                    ):
-                        observation = AvailabilityStatus.AVAILABLE
-                        message = None
-                    elif revalidated_publication is not None:
-                        revalidated_result, revalidated_artifacts = (
-                            revalidated_publication
+            try:
+                with self.store.transaction():
+                    cancellation_is_durable = self.store.execution.get_run(
+                        self.execution_run_id
+                    ).cancellation_is_durable
+                    kernel_completions = []
+                    for (
+                        task,
+                        completion_request_id,
+                        observation,
+                        message,
+                        publication,
+                        revalidated_publication,
+                    ) in prepared:
+                        receipt = self.store.execution.get_pull_task_completion_receipt(
+                            provider_call_id,
+                            task.task_key,
+                            request_id=completion_request_id,
                         )
-                        current_artifacts = (
-                            self.store.artifacts.load_task_output_artifacts(
-                                call.node_key,
-                                task.task_key,
-                            )
-                            if existing_publication is not None
-                            else ()
+                        existing_publication = self.store.artifacts.load_task_result(
+                            call.node_key,
+                            task.task_key,
                         )
-                        if (
-                            existing_publication != revalidated_result
-                            or current_artifacts != revalidated_artifacts
+                        current_task = self.store.execution.get_task(
+                            self.execution_run_id,
+                            call.node_key,
+                            task.task_key,
+                        )
+                        if receipt is not None:
+                            observation, message = receipt
+                        elif cancellation_is_durable:
+                            observation = AvailabilityStatus.MISSING
+                            message = "Completion ignored after workflow cancellation"
+                        elif (
+                            existing_publication is not None
+                            and current_task.status == TaskStatus.SUCCEEDED
                         ):
+                            observation = AvailabilityStatus.AVAILABLE
+                            message = None
+                        elif revalidated_publication is not None:
+                            revalidated_result, revalidated_artifacts = (
+                                revalidated_publication
+                            )
+                            current_artifacts = (
+                                self.store.artifacts.load_task_output_artifacts(
+                                    call.node_key,
+                                    task.task_key,
+                                )
+                                if existing_publication is not None
+                                else ()
+                            )
+                            if (
+                                existing_publication != revalidated_result
+                                or current_artifacts != revalidated_artifacts
+                            ):
+                                observation = (
+                                    current_task.result_observation
+                                    or AvailabilityStatus.MISSING
+                                )
+                                message = None
+                        elif existing_publication is not None:
                             observation = (
                                 current_task.result_observation
                                 or AvailabilityStatus.MISSING
                             )
                             message = None
-                    elif existing_publication is not None:
-                        observation = (
-                            current_task.result_observation
-                            or AvailabilityStatus.MISSING
-                        )
-                        message = None
-                    elif current_task.status.is_terminal:
-                        raise ValueError(
-                            f"cannot complete terminal Task {current_task.status.value}"
-                        )
-                    elif publication is not None:
-                        result, artifacts = publication
-                        self.store.artifacts.record_task_publication(
-                            call.node_key,
+                        elif current_task.status.is_terminal:
+                            raise ValueError(
+                                f"cannot complete terminal Task {current_task.status.value}"
+                            )
+                        elif publication is not None:
+                            result, artifacts = publication
+                            self.store.artifacts.record_task_publication(
+                                call.node_key,
+                                task.task_key,
+                                task_fingerprint=task.fingerprint,
+                                result=result,
+                                artifacts=artifacts,
+                                now=now,
+                            )
+                            published_staging.add(task.task_key)
+                        kernel_completions.append((
                             task.task_key,
-                            task_fingerprint=task.fingerprint,
-                            result=result,
-                            artifacts=artifacts,
-                            now=now,
-                        )
-                    kernel_completions.append((
-                        task.task_key,
-                        completion_request_id,
-                        observation,
-                        message,
-                    ))
-                claim = self.store.execution.record_pull_task_completions_and_claim(
-                    provider_call_id,
-                    kernel_completions,
-                    request_id=request_id,
-                    capacity=capacity,
-                    now=now,
+                            completion_request_id,
+                            observation,
+                            message,
+                        ))
+                    claim = self.store.execution.record_pull_task_completions_and_claim(
+                        provider_call_id,
+                        kernel_completions,
+                        request_id=request_id,
+                        capacity=capacity,
+                        now=now,
+                    )
+            except Exception:
+                self._discard_pull_completion_staging(*staged_publications.values())
+                raise
+            self._discard_pull_completion_staging(
+                *(
+                    staged
+                    for task_key, staged in staged_publications.items()
+                    if task_key not in published_staging
                 )
+            )
             self._checkpoint()
         return claim
+
+    def _discard_pull_completion_staging(
+        self,
+        *staged: tuple[Path, str],
+    ) -> None:
+        """Remove callback-owned output scopes that were not published."""
+        artifact_dir = self.store.output_root / "artifacts"
+        for result_dir, publication_token in staged:
+            shutil.rmtree(result_dir, ignore_errors=True)
+            try:
+                result_dir.parent.rmdir()
+            except OSError:
+                pass
+            for sidecar in artifact_dir.glob(f"*{publication_token}*.json"):
+                sidecar.unlink(missing_ok=True)
 
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""

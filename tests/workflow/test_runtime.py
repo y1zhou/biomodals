@@ -1586,6 +1586,70 @@ def test_pull_completion_rejects_invalid_successor_claim_before_file_work(
     assert list((tmp_path / "artifacts").glob("*.json")) == []
 
 
+def test_malformed_pull_completion_fails_task_without_staging_leaks(
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow("malformed-pull-completion")
+    workflow.add_node(
+        PullFanoutNode(("alpha",), max_worker_calls=1),
+        id="fanout",
+    )
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("malformed-pull-completion")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+    malformed = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="valid",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"alpha", filename="valid.txt"),
+            ),
+            AppOutput(
+                name="invalid",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"\xff", filename="invalid.txt"),
+            ),
+        ],
+    )
+
+    first = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "completion", malformed),),
+        request_id="successor",
+        capacity=1,
+    )
+    second = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "completion", malformed),),
+        request_id="successor",
+        capacity=1,
+    )
+
+    task = runtime.store.execution.get_task(RUN_ID, "fanout", assignment.task_key)
+    assert first == second
+    assert task.status == TaskStatus.FAILED
+    assert task.result_observation == AvailabilityStatus.MISSING
+    assert (
+        runtime.store.artifacts.load_task_result("fanout", assignment.task_key) is None
+    )
+    assert list(tmp_path.rglob("completions")) == []
+    assert list((tmp_path / "artifacts").glob("*.json")) == []
+
+
 def test_new_pull_completion_revalidates_unknown_publication(
     tmp_path: Path,
 ) -> None:

@@ -78,6 +78,8 @@ def _write_json(path: Path, payload: object) -> None:
 
 
 def _artifact_files(root: Path) -> list[ArtifactFile]:
+    if root.is_symlink():
+        raise ValueError("Workflow artifact paths must not be symlinks")
     if root.is_file():
         return [
             ArtifactFile(
@@ -86,13 +88,16 @@ def _artifact_files(root: Path) -> list[ArtifactFile]:
                 content_sha256=_file_sha256(root),
             )
         ]
+    paths = sorted(root.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        raise ValueError("Workflow artifact trees must not contain symlinks")
     return [
         ArtifactFile(
             path=str(path.relative_to(root)),
             size_bytes=path.stat().st_size,
             content_sha256=_file_sha256(path),
         )
-        for path in sorted(root.rglob("*"))
+        for path in paths
         if path.is_file()
     ]
 
@@ -139,6 +144,11 @@ def _reference_artifact_files(
 
     artifact_path = _resolve_volume_child(volume_root, storage.path)
     if not artifact_path.exists():
+        return declared
+    if declared and all(
+        file.size_bytes is not None and file.content_sha256 is not None
+        for file in declared
+    ):
         return declared
     if not declared:
         return _artifact_files(artifact_path)

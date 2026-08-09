@@ -697,7 +697,15 @@ def test_workflow_volume_reference_hashes_only_declared_files(
                     volume_name="Workflow-outputs",
                     path="run-1",
                 ),
-                metadata={"files": [{"path": "model.pdb"}]},
+                metadata={
+                    "files": [
+                        {
+                            "path": "model.pdb",
+                            "size_bytes": len(b"ATOM\n"),
+                            "content_sha256": sha256(b"ATOM\n").hexdigest(),
+                        }
+                    ]
+                },
             )
         ],
     )
@@ -711,7 +719,53 @@ def test_workflow_volume_reference_hashes_only_declared_files(
         volume_root=tmp_path,
     )
 
-    assert hashed == ["model.pdb", "model.pdb"]
+    assert hashed == ["model.pdb"]
+
+
+def test_workflow_volume_reference_rejects_symlink_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run-1"
+    output_dir.mkdir()
+    secret = tmp_path.with_name(f"{tmp_path.name}-secret.bin")
+    secret.write_bytes(b"secret")
+    (output_dir / "leak.bin").symlink_to(secret)
+    hashed: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.workflow.core.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="directory",
+                kind=ArtifactKind.DIRECTORY,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_app_run_result(
+            result=result,
+            workflow_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="directory",
+            volume_root=tmp_path,
+        )
+
+    assert hashed == []
 
 
 def test_materialize_volume_path_rejects_missing_workflow_volume_reference(

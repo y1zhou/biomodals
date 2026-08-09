@@ -271,9 +271,7 @@ class ExecutionRuntime:
         with self._synchronize():
             run = self.repository.get_run(execution_run_id)
         if run.status == RunStatus.CANCEL_REQUESTED:
-            required = None
             required_nodes = set(run.plan.node_keys)
-            continue_admission = False
         elif run.status == RunStatus.STATE_UNKNOWN:
             required = self.required_node_keys(execution_run_id)
             required_nodes = set(run.plan.node_keys if required is None else required)
@@ -283,7 +281,6 @@ class ExecutionRuntime:
                     required_node_keys=required,
                     now=now(),
                 )
-            continue_admission = False
         elif run.status in {RunStatus.PENDING, RunStatus.RUNNING}:
             required = self.required_node_keys(execution_run_id)
             if required is None:
@@ -294,7 +291,6 @@ class ExecutionRuntime:
                 required_node_keys=required,
                 now=now(),
             )
-            continue_admission = True
         else:
             return
 
@@ -304,9 +300,7 @@ class ExecutionRuntime:
             return
         recover_publications_unless_cancelled()
         reconcile()
-        if not continue_admission:
-            return
-        if required is None:
+        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
             return
         with self._synchronize():
             can_continue = self.repository.get_run(execution_run_id).status in {
@@ -1312,8 +1306,12 @@ class ExecutionRuntime:
             return self._modal.resolve(binding)
         except ModalDeploymentUnavailableError as error:
             with self._synchronize():
+                run = self.repository.get_run(execution_run_id)
                 if (
-                    self.repository.active_provider_call_counts(execution_run_id).total
+                    not run.cancellation_is_durable
+                    and self.repository.active_provider_call_counts(
+                        execution_run_id
+                    ).total
                     == 0
                 ):
                     with self._transaction():
@@ -1620,7 +1618,12 @@ class AsyncExecutionRuntime:
         try:
             return await self._modal.resolve(binding)
         except ModalDeploymentUnavailableError as error:
-            if self.repository.active_provider_call_counts(execution_run_id).total == 0:
+            run = self.repository.get_run(execution_run_id)
+            if (
+                not run.cancellation_is_durable
+                and self.repository.active_provider_call_counts(execution_run_id).total
+                == 0
+            ):
                 self.repository.transition_run(
                     execution_run_id,
                     RunStatus.FAILED,

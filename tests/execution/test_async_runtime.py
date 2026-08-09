@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from biomodals.execution import ProviderCallStatus, RunStatusReason
+from biomodals.execution import ProviderCallStatus, RunStatus, RunStatusReason
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -277,5 +277,47 @@ def test_async_runtime_fails_a_missing_exact_deployment_before_preclaim() -> Non
         run = repository.get_run(RUN_ID)
         assert run.status_reason == RunStatusReason.DEPLOYMENT_UNAVAILABLE
         assert repository.list_provider_calls(RUN_ID) == ()
+
+    asyncio.run(scenario())
+
+
+def test_async_unavailable_deployment_does_not_override_cancellation() -> None:
+    async def scenario() -> None:
+        repository = create_repository(task_count=1)
+        persist_fixed_policy(
+            repository,
+            ("seed-0",),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
+
+        class CancellingUnavailableDriver(AsyncFakeModalDriver):
+            runtime: AsyncExecutionRuntime
+
+            async def resolve(self, binding):
+                await self.runtime.cancel_run(RUN_ID, now=109)
+                raise ModalDeploymentUnavailableError("version expired")
+
+        driver = CancellingUnavailableDriver()
+        runtime = AsyncExecutionRuntime(
+            repository,
+            modal_driver=driver,
+            checkpoint=lambda: None,
+        )
+        driver.runtime = runtime
+
+        assert (
+            await runtime.submit_fixed_batch(
+                RUN_ID,
+                _candidate(),
+                submission_token="batch",
+                now=110,
+            )
+            is None
+        )
+        run = repository.get_run(RUN_ID)
+        assert run.status == RunStatus.CANCEL_REQUESTED
+        assert run.cancellation_is_durable
+        assert run.status_reason is None
 
     asyncio.run(scenario())

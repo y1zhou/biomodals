@@ -1010,6 +1010,45 @@ def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
     assert repository.list_provider_calls(RUN_ID) == ()
 
 
+def test_unavailable_deployment_does_not_override_cancellation() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+
+    class CancellingUnavailableResolver(FakeModalDriver):
+        runtime: ExecutionRuntime
+
+        def resolve(self, binding):
+            self.runtime.cancel_run(RUN_ID, now=109)
+            raise ModalDeploymentUnavailableError("version 23 is unavailable")
+
+    driver = CancellingUnavailableResolver()
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=driver,
+        checkpoint=lambda: None,
+    )
+    driver.runtime = runtime
+
+    assert (
+        _submit_fixed(
+            runtime,
+            _candidate(),
+            submission_token="batch",
+            now=110,
+        )
+        is None
+    )
+    run = repository.get_run(RUN_ID)
+    assert run.status == RunStatus.CANCEL_REQUESTED
+    assert run.cancellation_is_durable
+    assert run.status_reason is None
+
+
 def test_unavailable_deployment_first_drains_attached_calls() -> None:
     """Known child ownership remains observable before the Run fails closed."""
     repository = create_repository(task_count=2)

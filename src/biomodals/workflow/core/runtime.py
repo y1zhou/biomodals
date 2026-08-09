@@ -276,16 +276,12 @@ class WorkflowRuntime:
         """Publish one microbatch and checkpoint its successor claim together."""
         if not completions:
             raise ValueError("fused pull completion requires a nonempty batch")
-        validated = tuple(
-            (task_key, request_id, AppRunResult.model_validate(result))
-            for task_key, request_id, result in completions
-        )
-        if len({task_key for task_key, _request_id, _result in validated}) != len(
-            validated
+        if len({task_key for task_key, _request_id, _result in completions}) != len(
+            completions
         ):
             raise ValueError("fused pull completion contains duplicate Task keys")
-        if len({request_id for _task_key, request_id, _result in validated}) != len(
-            validated
+        if len({request_id for _task_key, request_id, _result in completions}) != len(
+            completions
         ):
             raise ValueError("fused pull completion contains duplicate request IDs")
         with self.store.synchronize():
@@ -302,7 +298,7 @@ class WorkflowRuntime:
                 self.execution_run_id
             ).cancellation_is_durable
             preflight = []
-            for task_key, completion_request_id, _result in validated:
+            for task_key, completion_request_id, _result in completions:
                 task = self.store.execution.get_task(
                     self.execution_run_id,
                     call.node_key,
@@ -345,54 +341,67 @@ class WorkflowRuntime:
         node = self._require_definition().nodes[call.node_key].node
         if not isinstance(node, RemotePullTaskWorkflowNode):
             raise ValueError("Provider Call does not belong to a pull-worker Node")
+        decoded_results: list[AppRunResult | Exception | None] = []
+        for (
+            (_task_key, _completion_request_id, raw_result),
+            (_task, receipt, published_result, _published_artifacts),
+        ) in zip(completions, preflight, strict=True):
+            if (
+                receipt is not None
+                or cancellation_is_durable
+                or published_result is not None
+            ):
+                decoded_results.append(None)
+                continue
+            try:
+                decoded_results.append(AppRunResult.model_validate(raw_result))
+            except (TypeError, ValueError) as error:
+                decoded_results.append(error)
         if any(
-            receipt is None
-            and not cancellation_is_durable
-            and published_result is None
+            isinstance(result, AppRunResult)
+            and result.status == AppRunStatus.SUCCEEDED
             and self._uses_workflow_volume(result)
-            for (
-                (_task_key, _request_id, result),
-                (_task, receipt, published_result, _published_artifacts),
-            ) in zip(validated, preflight, strict=True)
+            for result in decoded_results
         ):
             self._reload_volume()
         prepared = []
-        staged_publications: dict[str, tuple[Path, str]] = {}
-        for (
-            (task_key, completion_request_id, result),
-            (task, receipt, published_result, published_artifacts),
-        ) in zip(validated, preflight, strict=True):
-            if receipt is not None:
-                observation, message = receipt
-                prepared.append((
-                    task,
-                    completion_request_id,
-                    observation,
-                    message,
-                    None,
-                    None,
-                ))
-                continue
-            if cancellation_is_durable:
-                prepared.append((
-                    task,
-                    completion_request_id,
-                    AvailabilityStatus.MISSING,
-                    "Completion ignored after workflow cancellation",
-                    None,
-                    None,
-                ))
-                continue
-            if published_result is not None:
-                if task.status == TaskStatus.SUCCEEDED:
-                    observation = AvailabilityStatus.AVAILABLE
-                else:
-                    context = self._node_context(
-                        self._require_definition(),
-                        call.node_key,
-                        task_key=task_key,
-                    )
-                    try:
+        staged_publications: dict[str, Path] = {}
+        try:
+            for (
+                (task_key, completion_request_id, _raw_result),
+                (task, receipt, published_result, published_artifacts),
+                decoded_result,
+            ) in zip(completions, preflight, decoded_results, strict=True):
+                if receipt is not None:
+                    observation, message = receipt
+                    prepared.append((
+                        task,
+                        completion_request_id,
+                        observation,
+                        message,
+                        None,
+                        None,
+                    ))
+                    continue
+                if cancellation_is_durable:
+                    prepared.append((
+                        task,
+                        completion_request_id,
+                        AvailabilityStatus.MISSING,
+                        "Completion ignored after workflow cancellation",
+                        None,
+                        None,
+                    ))
+                    continue
+                if published_result is not None:
+                    if task.status == TaskStatus.SUCCEEDED:
+                        observation = AvailabilityStatus.AVAILABLE
+                    else:
+                        context = self._node_context(
+                            self._require_definition(),
+                            call.node_key,
+                            task_key=task_key,
+                        )
                         observation = self._observe_remote_task_publication(
                             node,
                             context,
@@ -405,11 +414,90 @@ class WorkflowRuntime:
                             published_result,
                             published_artifacts,
                         )
-                    except Exception:
-                        self._discard_pull_completion_staging(
-                            *staged_publications.values()
-                        )
-                        raise
+                    prepared.append((
+                        task,
+                        completion_request_id,
+                        observation,
+                        (
+                            "Published workflow Task result is unavailable"
+                            if observation == AvailabilityStatus.MISSING
+                            else None
+                        ),
+                        None,
+                        (published_result, published_artifacts),
+                    ))
+                    continue
+                if isinstance(decoded_result, Exception):
+                    prepared.append((
+                        task,
+                        completion_request_id,
+                        AvailabilityStatus.MISSING,
+                        f"Could not decode workflow Task result: {decoded_result}",
+                        None,
+                        None,
+                    ))
+                    continue
+                if decoded_result is None:
+                    raise RuntimeError("Workflow Task result was not decoded")
+                result = decoded_result
+                if result.status != AppRunStatus.SUCCEEDED:
+                    prepared.append((
+                        task,
+                        completion_request_id,
+                        AvailabilityStatus.MISSING,
+                        _node_error_message(result),
+                        None,
+                        None,
+                    ))
+                    continue
+                context = self._node_context(
+                    self._require_definition(),
+                    call.node_key,
+                    task_key=task_key,
+                )
+                publication_token = uuid4().hex
+                publication_scope = (
+                    f"{_task_storage_scope(task_key)}-{publication_token}"
+                )
+                publication_dir = context.work_dir / "completions" / publication_scope
+                staged_publications[task.task_key] = publication_dir
+                try:
+                    materialized = materialize_app_run_result(
+                        result=result,
+                        workflow_volume_name=self.workflow_volume_name,
+                        result_dir=publication_dir,
+                        artifact_dir=publication_dir / "artifacts",
+                        producing_node_id=call.node_key,
+                        artifact_id_scope=publication_scope,
+                        volume_root=self.volume_root,
+                    )
+                    artifacts = tuple(materialized.artifacts)
+                    observation = self._observe_remote_task_publication(
+                        node,
+                        context,
+                        RemoteWorkflowTask(
+                            task_key=task.task_key,
+                            scientific_payload=task.scientific_payload,
+                            execution_payload=task.execution_payload,
+                        ),
+                        task.fingerprint,
+                        materialized.result,
+                        artifacts,
+                        workflow_artifacts_validated=True,
+                    )
+                except (FileNotFoundError, ValueError) as error:
+                    self._discard_pull_completion_staging(
+                        staged_publications.pop(task.task_key)
+                    )
+                    prepared.append((
+                        task,
+                        completion_request_id,
+                        AvailabilityStatus.MISSING,
+                        f"Could not publish workflow Task result: {error}",
+                        None,
+                        None,
+                    ))
+                    continue
                 prepared.append((
                     task,
                     completion_request_id,
@@ -419,84 +507,12 @@ class WorkflowRuntime:
                         if observation == AvailabilityStatus.MISSING
                         else None
                     ),
-                    None,
-                    (published_result, published_artifacts),
-                ))
-                continue
-            if result.status != AppRunStatus.SUCCEEDED:
-                prepared.append((
-                    task,
-                    completion_request_id,
-                    AvailabilityStatus.MISSING,
-                    _node_error_message(result),
-                    None,
+                    (materialized.result, artifacts),
                     None,
                 ))
-                continue
-            context = self._node_context(
-                self._require_definition(),
-                call.node_key,
-                task_key=task_key,
-            )
-            publication_token = uuid4().hex
-            publication_scope = f"{_task_storage_scope(task_key)}-{publication_token}"
-            publication_dir = context.work_dir / "completions" / publication_scope
-            staged_publications[task.task_key] = (
-                publication_dir,
-                publication_token,
-            )
-            try:
-                materialized = materialize_app_run_result(
-                    result=result,
-                    workflow_volume_name=self.workflow_volume_name,
-                    result_dir=publication_dir,
-                    artifact_dir=self.store.output_root / "artifacts",
-                    producing_node_id=call.node_key,
-                    artifact_id_scope=publication_scope,
-                    volume_root=self.volume_root,
-                )
-                artifacts = tuple(materialized.artifacts)
-                observation = self._observe_remote_task_publication(
-                    node,
-                    context,
-                    RemoteWorkflowTask(
-                        task_key=task.task_key,
-                        scientific_payload=task.scientific_payload,
-                        execution_payload=task.execution_payload,
-                    ),
-                    task.fingerprint,
-                    materialized.result,
-                    artifacts,
-                    workflow_artifacts_validated=True,
-                )
-            except (FileNotFoundError, ValueError) as error:
-                self._discard_pull_completion_staging(
-                    staged_publications.pop(task.task_key)
-                )
-                prepared.append((
-                    task,
-                    completion_request_id,
-                    AvailabilityStatus.MISSING,
-                    f"Could not publish workflow Task result: {error}",
-                    None,
-                    None,
-                ))
-                continue
-            except Exception:
-                self._discard_pull_completion_staging(*staged_publications.values())
-                raise
-            prepared.append((
-                task,
-                completion_request_id,
-                observation,
-                (
-                    "Published workflow Task result is unavailable"
-                    if observation == AvailabilityStatus.MISSING
-                    else None
-                ),
-                (materialized.result, artifacts),
-                None,
-            ))
+        except Exception:
+            self._discard_pull_completion_staging(*staged_publications.values())
+            raise
         now = self._now()
         published_staging: set[str] = set()
         with self.store.synchronize():
@@ -609,18 +625,15 @@ class WorkflowRuntime:
 
     def _discard_pull_completion_staging(
         self,
-        *staged: tuple[Path, str],
+        *staged: Path,
     ) -> None:
         """Remove callback-owned output scopes that were not published."""
-        artifact_dir = self.store.output_root / "artifacts"
-        for result_dir, publication_token in staged:
+        for result_dir in staged:
             shutil.rmtree(result_dir, ignore_errors=True)
             try:
                 result_dir.parent.rmdir()
             except OSError:
                 pass
-            for sidecar in artifact_dir.glob(f"*{publication_token}*.json"):
-                sidecar.unlink(missing_ok=True)
 
     def close(self) -> None:
         """Close local resources without cancelling attached child calls."""

@@ -1650,6 +1650,115 @@ def test_malformed_pull_completion_fails_task_without_staging_leaks(
     assert list((tmp_path / "artifacts").glob("*.json")) == []
 
 
+def test_invalid_pull_result_schema_fails_only_its_task(tmp_path: Path) -> None:
+    workflow = Workflow("invalid-pull-result-schema")
+    workflow.add_node(
+        PullFanoutNode(("alpha",), max_worker_calls=1),
+        id="fanout",
+    )
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("invalid-pull-result-schema")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+    invalid = cast(AppRunResult, {"status": "bogus"})
+
+    first = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "completion", invalid),),
+        request_id="successor",
+        capacity=1,
+    )
+    second = runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        ((assignment.task_key, "completion", invalid),),
+        request_id="successor",
+        capacity=1,
+    )
+
+    task = runtime.store.execution.get_task(RUN_ID, "fanout", assignment.task_key)
+    assert first == second
+    assert task.status == TaskStatus.FAILED
+    assert task.result_observation == AvailabilityStatus.MISSING
+    assert (
+        runtime.store.artifacts.load_task_result("fanout", assignment.task_key) is None
+    )
+    assert list(tmp_path.rglob("completions")) == []
+    assert list((tmp_path / "artifacts").glob("*.json")) == []
+
+
+def test_retryable_pull_probe_failure_cleans_long_id_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = Workflow("retryable-pull-probe")
+    node = PullFanoutNode(("alpha",), max_worker_calls=1)
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    runtime._initialize("retryable-pull-probe")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    [assignment] = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=1,
+    ).assignments
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="x" * 165,
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"alpha", filename="result.txt"),
+            )
+        ],
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> AvailabilityStatus:
+        raise OSError("publication store unavailable")
+
+    monkeypatch.setattr(node, "observe_remote_task_publication", unavailable)
+    for _ in range(2):
+        with pytest.raises(OSError, match="publication store unavailable"):
+            runtime.complete_pull_tasks_and_claim(
+                call.provider_call_id,
+                ((assignment.task_key, "completion", result),),
+                request_id="successor",
+                capacity=1,
+            )
+
+    task = runtime.store.execution.get_task(RUN_ID, "fanout", assignment.task_key)
+    assert task.status == TaskStatus.RUNNING
+    assert (
+        runtime.store.execution.get_pull_task_completion_receipt(
+            call.provider_call_id,
+            assignment.task_key,
+            request_id="completion",
+        )
+        is None
+    )
+    assert list(tmp_path.rglob("completions")) == []
+    assert list(tmp_path.rglob("*.json")) == []
+
+
 def test_new_pull_completion_revalidates_unknown_publication(
     tmp_path: Path,
 ) -> None:
@@ -1854,6 +1963,70 @@ def test_pull_completion_reloads_worker_owned_workflow_volume_output(
 
     assert terminal.assignments == ()
     assert volume.reloads == reloads + 1
+
+
+def test_pull_completion_reloads_before_materializing_its_batch(
+    tmp_path: Path,
+) -> None:
+    class CheckingVolume(FakeVolume):
+        def reload(self) -> None:
+            assert list(tmp_path.rglob("completions")) == []
+            super().reload()
+
+    workflow = Workflow("pull-volume-reload-order")
+    workflow.add_node(
+        PullFanoutNode(("alpha", "beta"), max_worker_calls=1),
+        id="fanout",
+    )
+    volume = CheckingVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=PullModalDriver(),
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+        volume=volume,
+    )
+    runtime._initialize("pull-volume-reload-order")
+    runtime.advance_once()
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    first, second = runtime.claim_pull_tasks(
+        call.provider_call_id,
+        request_id="claim",
+        capacity=2,
+    ).assignments
+    published = tmp_path / "worker" / "result.txt"
+    published.parent.mkdir()
+    published.write_text("beta")
+
+    runtime.complete_pull_tasks_and_claim(
+        call.provider_call_id,
+        (
+            (first.task_key, "complete-first", _text_result("alpha")),
+            (
+                second.task_key,
+                "complete-second",
+                AppRunResult(
+                    status=AppRunStatus.SUCCEEDED,
+                    outputs=[
+                        AppOutput(
+                            name="text",
+                            kind=ArtifactKind.REPORT,
+                            storage=VolumePath(
+                                volume_name="Workflow-outputs",
+                                path=published.relative_to(tmp_path).as_posix(),
+                            ),
+                        )
+                    ],
+                ),
+            ),
+        ),
+        request_id="terminal",
+        capacity=2,
+    )
+
+    assert volume.reloads == 1
 
 
 def test_pull_task_node_limits_its_concurrent_worker_calls(tmp_path: Path) -> None:

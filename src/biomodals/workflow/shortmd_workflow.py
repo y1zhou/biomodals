@@ -58,7 +58,7 @@ from biomodals.workflow.core.artifact_availability import (
 from biomodals.workflow.core.execution import app_scientific_version
 
 DEPENDENCY_APPS = ("gromacs",)
-_SCIENTIFIC_SCHEMA_VERSION = "1"
+_SCIENTIFIC_SCHEMA_VERSION = "2"
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -114,7 +114,6 @@ class ShortMDGromacsSettings:
     ld_seed: int = -1
     gen_seed: int = -1
     genion_seed: int = 0
-    save_processed_traj: bool = True
     make_figures: bool = True
 
 
@@ -209,11 +208,27 @@ def clone_prepared_shortmd_run(
     return str(replicate_dir)
 
 
-def _content_bound_gromacs_files(run_name: str) -> list[ArtifactFile]:
+def _content_bound_gromacs_files(
+    run_name: str,
+    *,
+    make_figures: bool,
+) -> list[ArtifactFile]:
     """Return the final ShortMD file manifest with content identities."""
     run_root = Path(GROMACS_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
+    prefix = f"production_{run_name}"
+    declared_files = [
+        *gromacs_app.production_workflow_files(run_name),
+        ArtifactFile(path="production.mdp", role="production_parameters"),
+        ArtifactFile(path=f"{prefix}_nopbc.xtc", role="trajectory_no_pbc"),
+    ]
+    if make_figures:
+        declared_files.extend([
+            ArtifactFile(path=f"rmsd_{prefix}.png", role="rmsd_plot"),
+            ArtifactFile(path=f"rg_{prefix}.png", role="radius_of_gyration_plot"),
+            ArtifactFile(path=f"rmsf_{prefix}.png", role="rmsf_plot"),
+        ])
     files = []
-    for declared in gromacs_app.production_workflow_files(run_name):
+    for declared in declared_files:
         path = run_root / declared.path
         if not path.is_file():
             raise FileNotFoundError(f"Expected ShortMD output not found: {path}")
@@ -242,14 +257,13 @@ def analyze_shortmd_gromacs_run(
     traj_prefix: str,
     run_name: str,
     source_run_name: str,
-    save_processed_traj: bool,
     make_figures: bool,
 ) -> AppRunResult:
     """Analyze one replicate and publish its content-bound final files."""
     workdir = gromacs_app.collect_traj_stats.get_raw_f()(
         traj_prefix=traj_prefix,
         run_name=run_name,
-        save_processed_traj=save_processed_traj,
+        save_processed_traj=True,
         make_figures=make_figures,
     )
     return AppRunResult(
@@ -266,7 +280,10 @@ def analyze_shortmd_gromacs_run(
                     "run_name": sanitize_filename(run_name),
                     "source_run_name": sanitize_filename(source_run_name),
                 },
-                files=_content_bound_gromacs_files(run_name),
+                files=_content_bound_gromacs_files(
+                    run_name,
+                    make_figures=make_figures,
+                ),
             )
         ],
     )
@@ -572,7 +589,6 @@ class ShortMDAnalysisNode(AppBackedNode):
                 "traj_prefix": "production_",
                 "run_name": safe_replicate_run_name,
                 "source_run_name": safe_source_run_name,
-                "save_processed_traj": self.gromacs.save_processed_traj,
                 "make_figures": self.gromacs.make_figures,
             },
         )

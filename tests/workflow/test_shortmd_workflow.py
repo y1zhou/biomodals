@@ -656,7 +656,6 @@ def test_shortmd_analysis_node_prepares_and_publishes_analyzed_output(
         "traj_prefix": "production_",
         "run_name": "source-r001",
         "source_run_name": "source",
-        "save_processed_traj": True,
         "make_figures": True,
     }
     assert invocation.metadata == {}
@@ -676,7 +675,15 @@ def test_analyze_shortmd_gromacs_run_binds_final_file_contents(
     run_name = "source-r001"
     run_root = tmp_path / run_name
     run_root.mkdir()
-    expected = gromacs_app.production_workflow_files(run_name)
+    prefix = f"production_{run_name}"
+    expected = [
+        *gromacs_app.production_workflow_files(run_name),
+        ArtifactFile(path="production.mdp", role="production_parameters"),
+        ArtifactFile(path=f"{prefix}_nopbc.xtc", role="trajectory_no_pbc"),
+        ArtifactFile(path=f"rmsd_{prefix}.png", role="rmsd_plot"),
+        ArtifactFile(path=f"rg_{prefix}.png", role="radius_of_gyration_plot"),
+        ArtifactFile(path=f"rmsf_{prefix}.png", role="rmsf_plot"),
+    ]
     for index, file in enumerate(expected):
         (run_root / file.path).write_bytes(f"file-{index}\n".encode())
     monkeypatch.setattr(
@@ -696,7 +703,6 @@ def test_analyze_shortmd_gromacs_run_binds_final_file_contents(
         traj_prefix="production_",
         run_name=run_name,
         source_run_name="source",
-        save_processed_traj=True,
         make_figures=True,
     )
 

@@ -26,7 +26,7 @@ from biomodals.app.config import AppConfig
 from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
-    ExecutionSnapshot,
+    ExecutionOverview,
     RunStatus,
 )
 from biomodals.execution.modal import (
@@ -877,22 +877,22 @@ class ExecutionCoordinator:
         CONF.output_volume.reload()
 
     @modal.method()
-    def run(self, development: bool = False) -> ExecutionSnapshot:
+    def run(self, development: bool = False) -> ExecutionOverview:
         """Drive one staged root App Run until it stops."""
         return self._adapter(development=development).run()
 
     @modal.method()
-    def status(self) -> ExecutionSnapshot:
+    def status(self) -> ExecutionOverview:
         """Read this Run's durable kernel snapshot."""
         return self._adapter().status()
 
     @modal.method()
-    def cancel(self) -> ExecutionSnapshot:
+    def cancel(self) -> ExecutionOverview:
         """Request idempotent cancellation for this Run."""
         return self._adapter().cancel()
 
     @modal.method()
-    def resume(self) -> ExecutionSnapshot:
+    def resume(self) -> ExecutionOverview:
         """Resume this Run without retrying failed Tasks."""
         return self._adapter().resume()
 
@@ -919,31 +919,9 @@ class ExecutionCoordinator:
         )
 
     @modal.method()
-    def drive_prepared(self) -> ExecutionSnapshot:
+    def drive_prepared(self) -> ExecutionOverview:
         """Drive one previously prepared root or Successor Run."""
         return self._adapter().drive_prepared()
-
-    @modal.method()
-    def restart(
-        self,
-        predecessor_execution_run_id: str,
-        predecessor_deployment_environment: str,
-        predecessor_deployment_name: str,
-        predecessor_deployment_version: int,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-    ) -> ExecutionSnapshot:
-        """Create and drive one compatible Successor Run."""
-        return self._adapter().restart(
-            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
-            predecessor_deployment=DeploymentIdentity(
-                predecessor_deployment_environment,
-                predecessor_deployment_name,
-                predecessor_deployment_version,
-            ),
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
-        )
 
     @modal.method()
     def restart_from(
@@ -952,15 +930,17 @@ class ExecutionCoordinator:
         workload_plan_fingerprint: str,
         max_active_provider_calls: int,
         max_active_gpu_provider_calls: int,
-    ) -> ExecutionSnapshot:
+    ) -> ExecutionOverview:
         """Create a compatible Successor while inferring predecessor identity."""
-        return self._adapter().restart(
+        adapter = self._adapter()
+        adapter.prepare_restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
             expected_workload_plan_fingerprint=workload_plan_fingerprint,
         )
+        return adapter.drive_prepared()
 
     @modal.exit()
     def exit(self) -> None:

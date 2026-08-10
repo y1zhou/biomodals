@@ -32,15 +32,29 @@ CLI -> deployed app/workflow coordinator -> biomodals.execution -> Modal functio
 Browser -> static frontend -> FastAPI service -> biomodals.execution -> Modal functions
 ```
 
-For a workflow run, the workflow core supplies the scientific DAG and
-workload-specific hooks while the execution kernel owns durable orchestration:
+Coordinated apps and workflows both use the execution kernel. Workflows supply
+their scientific DAG and hooks through the workflow core; direct apps supply
+an app-specific plan and hooks without involving the workflow core:
 
 ```mermaid
+---
+config:
+  theme: base
+  layout: elk
+  look: handDrawn
+  elk:
+    mergeEdges: false
+    nodePlacementStrategy: LINEAR_SEGMENTS
+  flowchart:
+    curve: rounded
+---
 flowchart TD
-    Caller["Workflow CLI or coordinator entrypoint"] --> Core
+    WorkflowCaller["Workflow launch"] --> Core
+    AppCaller["Direct app launch"] --> AppAdapter
 
-    subgraph Coordinator["Remote workflow coordinator"]
+    subgraph Coordinator["Remote coordinator"]
         Core["biomodals.workflow.core<br/>Build the DAG and provide workload hooks"]
+        AppAdapter["App execution adapter<br/>Build the app plan and provide workload hooks"]
 
         subgraph Kernel["biomodals.execution"]
             Runtime["Runtime and scheduler<br/>Admit, recover, and cancel work"]
@@ -48,12 +62,14 @@ flowchart TD
             Driver["Modal call driver"]
         end
 
-        Core -->|"Execution plan and hooks"| Runtime
-        Runtime -->|"Persist state transitions"| Ledger
-        Ledger -->|"Ready Tasks and durable state"| Runtime
-        Runtime -->|"Submit, observe, or cancel"| Driver
-        Driver -->|"Provider call observations"| Runtime
-        Runtime -->|"Validate and assemble results"| Core
+        Core -->|"Execution plan<br/>and hooks"| Runtime
+        AppAdapter -->|"Execution plan<br/>and hooks"| Runtime
+        Runtime -->|"Persist state<br/>transitions"| Ledger
+        Ledger -->|"Ready Tasks &<br/>durable state"| Runtime
+        Runtime -->|"Submit/observe/cancel"| Driver
+        Driver -->|"Provider call<br/>observations"| Runtime
+        Runtime -->|"Validate and<br/>assemble results"| Core
+        Runtime -->|"Validate and<br/>assemble results"| AppAdapter
     end
 
     subgraph Modal["Modal"]
@@ -63,10 +79,13 @@ flowchart TD
     end
 
     Driver -->|"Spawn calls"| Workers
-    Workers -->|"Outcomes and result references"| Driver
-    Volumes -->|"Cache and publication probes"| Core
+    Workers -->|"Outcomes and<br/>result references"| Driver
+    Volumes -->|"Cache and<br/>publication probes"| Core
+    Volumes -->|"Cache and<br/>publication probes"| AppAdapter
     Runtime -->|"Terminal Run outcome"| Core
-    Core -->|"Workflow result"| Caller
+    Runtime -->|"Terminal Run outcome"| AppAdapter
+    Core -->|"Workflow result"| WorkflowCaller
+    AppAdapter -->|"App result"| AppCaller
 ```
 
 `biomodals.execution` is an embedded Python library, not a central scheduler

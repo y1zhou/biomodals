@@ -379,26 +379,6 @@ def candidate_structure_files_from_selected(
     return keyed
 
 
-def candidate_structure_files_from_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
-    volume_roots: Mapping[str, str],
-    *,
-    manifest_frame: pl.DataFrame | None = None,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> list[CandidateStructureFile]:
-    """Read selected structures and return candidate-keyed records."""
-    return candidate_structure_files_from_selected(
-        select_structure_files_from_artifacts(
-            artifacts,
-            volume_roots,
-            patterns=patterns,
-            max_files=max_files,
-        ),
-        manifest_frame=manifest_frame,
-    )
-
-
 def prepare_dockq_pairs_by_candidate(
     *,
     references: Sequence[CandidateStructureFile],

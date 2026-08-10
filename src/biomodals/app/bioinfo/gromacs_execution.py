@@ -15,7 +15,6 @@ from biomodals.execution import (
 NVT_ANALYSIS = "collect_traj_stats:nvt_"
 NPT_ANALYSIS = "collect_traj_stats:npt_"
 PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
-FINAL_OPERATION = PRODUCTION_ANALYSIS
 PREPARE_RESULT = "prepare_result"
 REQUIRED_FUNCTIONS = (
     "prepare_tpr_cpu",

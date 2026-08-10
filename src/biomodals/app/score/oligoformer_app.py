@@ -704,11 +704,6 @@ def _hash_directory(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _fasta_record_names(fasta_bytes: bytes) -> tuple[str, ...]:
-    """Return safe upstream-normalized FASTA record names."""
-    return _sanitize_fasta_record_names(fasta_bytes, label="mRNA")[1]
-
-
 def _safe_fasta_record_name(raw_name: str, *, label: str) -> str:
     """Return one unique-path-safe upstream FASTA identifier."""
     if not raw_name:
@@ -892,21 +887,6 @@ def _package_output_tables(output_dir: Path, output_stems: tuple[str, ...]) -> b
             "OligoFormer final output tables are incomplete: " + ", ".join(missing)
         )
     return package_outputs(output_dir, paths_to_bundle=bundle_paths)
-
-
-def _marker_matches(marker: Path, expected: dict[str, object]) -> bool:
-    """Return whether a cache marker contains expected metadata."""
-    import orjson
-
-    if not marker.exists():
-        return False
-    try:
-        metadata = orjson.loads(marker.read_bytes())
-    except orjson.JSONDecodeError:
-        return False
-    if not isinstance(metadata, dict):
-        return False
-    return all(metadata.get(key) == value for key, value in expected.items())
 
 
 def _paths_ready(
@@ -2439,14 +2419,6 @@ def _off_target_shard_spec(
         orf_path=orf_path,
         row_shard_size=row_shard_size,
     )
-
-
-def _write_fasta_pairs(records: list[tuple[str, str]], path: Path) -> None:
-    """Write simple FASTA-like records."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for name, sequence in records:
-            handle.write(f">{name}\n{sequence}\n")
 
 
 def _targetscan_reference_shards(

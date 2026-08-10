@@ -129,7 +129,6 @@ _REMOTE_NODE_FUNCTIONS = {
     _INFERENCE_SUMMARY: "finalize_inference_summary",
     _REQUEST_PUBLICATION: "finalize_inference_request",
 }
-_LOCAL_NODE_KEYS = {_STAGE_REQUEST, _STAGE_INFERENCE}
 _EMPTY_PUBLICATION_SCHEMA = 1
 
 

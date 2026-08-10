@@ -106,15 +106,6 @@ from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
 
-PPI_FLOW_OUTPUT_LAYOUT = (
-    "stage1/",
-    "stage2/",
-    "design_output/",
-    "design_output/ranked_designs.csv",
-    "design_output/design_report.md",
-    "design_output/design_report.html",
-)
-PPI_FLOW_APP_STEPS = ("PPIFlowStep", "PartialStep")
 PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
     "outputs/*.pdb",
     "outputs/**/*.pdb",

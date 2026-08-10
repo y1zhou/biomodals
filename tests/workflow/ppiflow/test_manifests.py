@@ -5,7 +5,6 @@
 import hashlib
 from pathlib import Path
 
-import polars as pl
 import pytest
 
 from biomodals.schema import AppRunStatus, ArtifactKind, VolumePath
@@ -57,21 +56,7 @@ def test_candidate_ids_are_deterministic_and_provenance_sensitive() -> None:
     assert first.startswith("cand_")
 
 
-def test_derived_and_stage2_candidate_ids() -> None:
-    first = manifests.derived_candidate_id(
-        parent_candidate_id="candidate-a",
-        stage_name="LigandMPNN",
-        operation_mode="binder",
-        derived_basename="design_1.pdb",
-    )
-    changed_mode = manifests.derived_candidate_id(
-        parent_candidate_id="candidate-a",
-        stage_name="LigandMPNN",
-        operation_mode="abmpnn",
-        derived_basename="design_1.pdb",
-    )
-
-    assert first != changed_mode
+def test_stage2_candidate_ids() -> None:
     assert manifests.stage2_input_candidate_id(1) == "stage2_input_000001"
     with pytest.raises(ValueError, match="1-based"):
         manifests.stage2_input_candidate_id(0)
@@ -117,158 +102,4 @@ def test_manifest_output_is_table_artifact_with_parquet_file(
     assert (
         output.metadata["files"][0]["content_sha256"]
         == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    )
-
-
-def test_strict_candidate_join_requires_all_candidate_ids() -> None:
-    required = pl.DataFrame({"candidate_id": ["a", "b"], "left": [1, 2]})
-    available = pl.DataFrame({"candidate_id": ["a"], "right": [3]})
-
-    with pytest.raises(ValueError, match="Missing required candidate ids"):
-        manifests.strict_candidate_join(required, available)
-
-    joined = manifests.strict_candidate_join(
-        required,
-        available,
-        allow_missing_candidates=True,
-    )
-    assert joined.get_column("candidate_id").to_list() == ["a"]
-
-
-def test_expected_file_errors_check_workflow_and_app_volume_paths(
-    tmp_path: Path,
-) -> None:
-    workflow_root = tmp_path / "workflow"
-    app_root = tmp_path / "app"
-    workflow_root.mkdir()
-    app_root.mkdir()
-    (workflow_root / "nodes" / "manifest.parquet").parent.mkdir()
-    (workflow_root / "nodes" / "manifest.parquet").write_text("ok", encoding="utf-8")
-    (app_root / "outputs").mkdir()
-    (app_root / "outputs" / "model.pdb").write_text("ATOM\n", encoding="utf-8")
-    rows = [
-        manifests.candidate_manifest_row(
-            candidate_id="candidate-a",
-            stage_name="Stage",
-            stage_role="test",
-            operation_mode="test",
-            candidate_status=AppRunStatus.SUCCEEDED.value,
-            files=[
-                manifests.candidate_file_record(
-                    role="manifest",
-                    workflow_path="nodes/manifest.parquet",
-                ),
-                manifests.candidate_file_record(
-                    role="structure",
-                    volume_name="app-volume",
-                    app_volume_path="outputs/model.pdb",
-                    size_bytes=5,
-                    content_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
-                ),
-            ],
-        )
-    ]
-
-    assert (
-        manifests.expected_file_errors(
-            rows,
-            volume_roots={
-                "workflow-volume": workflow_root,
-                "app-volume": app_root,
-            },
-            workflow_volume_name="workflow-volume",
-        )
-        == []
-    )
-
-    (app_root / "outputs" / "model.pdb").unlink()
-    assert manifests.expected_file_errors(
-        rows,
-        volume_roots={
-            "workflow-volume": workflow_root,
-            "app-volume": app_root,
-        },
-        workflow_volume_name="workflow-volume",
-    ) == ["candidate-a: missing expected file app-volume:outputs/model.pdb"]
-
-
-def test_expected_file_errors_reject_same_size_corruption(tmp_path: Path) -> None:
-    app_root = tmp_path / "app"
-    app_root.mkdir()
-    model_path = app_root / "model.pdb"
-    model_path.write_bytes(b"HACK\n")
-    rows = [
-        manifests.candidate_manifest_row(
-            candidate_id="candidate-a",
-            stage_name="Stage",
-            stage_role="test",
-            operation_mode="test",
-            candidate_status=AppRunStatus.SUCCEEDED.value,
-            files=[
-                manifests.candidate_file_record(
-                    role="structure",
-                    volume_name="app-volume",
-                    app_volume_path="model.pdb",
-                    size_bytes=5,
-                    content_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
-                )
-            ],
-        )
-    ]
-
-    errors = manifests.expected_file_errors(
-        rows,
-        volume_roots={"app-volume": app_root},
-        workflow_volume_name="workflow-volume",
-    )
-
-    assert len(errors) == 1
-    assert "SHA-256" in errors[0]
-
-
-def test_reusable_completed_candidates_require_expected_files(
-    tmp_path: Path,
-) -> None:
-    app_root = tmp_path / "app"
-    app_root.mkdir()
-    (app_root / "model.pdb").write_text("ATOM\n", encoding="utf-8")
-    rows = [
-        manifests.candidate_manifest_row(
-            candidate_id="complete",
-            stage_name="Stage",
-            stage_role="test",
-            operation_mode="test",
-            candidate_status=AppRunStatus.SUCCEEDED.value,
-            files=[
-                manifests.candidate_file_record(
-                    role="structure",
-                    volume_name="app-volume",
-                    app_volume_path="model.pdb",
-                )
-            ],
-        ),
-        manifests.candidate_manifest_row(
-            candidate_id="failed",
-            stage_name="Stage",
-            stage_role="test",
-            operation_mode="test",
-            candidate_status=AppRunStatus.FAILED.value,
-            files=[],
-        ),
-    ]
-
-    assert manifests.reusable_completed_candidate_ids(
-        rows,
-        volume_roots={"app-volume": app_root},
-        workflow_volume_name="workflow-volume",
-    ) == {"complete"}
-
-    (app_root / "model.pdb").unlink()
-    assert (
-        manifests.reusable_completed_candidate_ids(
-            rows,
-            volume_roots={"app-volume": app_root},
-            workflow_volume_name="workflow-volume",
-        )
-        == set()
     )

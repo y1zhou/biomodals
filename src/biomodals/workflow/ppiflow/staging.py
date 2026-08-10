@@ -411,20 +411,6 @@ def prepare_dockq_pairs_by_candidate(
     return pairs
 
 
-def discover_partial_sample_dirs(root: str | Path) -> list[Path]:
-    """Return PPIFlow partial sample directories below a run root."""
-    root = Path(root)
-    if not root.exists():
-        raise FileNotFoundError(f"PPIFlow partial root was not found: {root}")
-    return sorted({
-        path.parent
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in STRUCTURE_SUFFIXES
-        and ("sample" in path.parent.name.lower() or "partial" in path.parts)
-    })
-
-
 def rosetta_job_manifest_rows(
     structures: Sequence[CandidateStructureFile],
     *,

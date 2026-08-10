@@ -274,17 +274,6 @@ def test_prepare_dockq_pairs_by_candidate_rejects_missing_pairs() -> None:
         )
 
 
-def test_discover_partial_sample_dirs(tmp_path: Path) -> None:
-    sample_dir = tmp_path / "stage2" / "partial" / "sample_0"
-    sample_dir.mkdir(parents=True)
-    (sample_dir / "model.pdb").write_text("ATOM\n", encoding="utf-8")
-    other_dir = tmp_path / "stage2" / "other"
-    other_dir.mkdir()
-    (other_dir / "model.pdb").write_text("ATOM\n", encoding="utf-8")
-
-    assert staging.discover_partial_sample_dirs(tmp_path) == [sample_dir]
-
-
 def test_rosetta_job_manifest_rows_and_writer(tmp_path: Path) -> None:
     rows = staging.rosetta_job_manifest_rows(
         [

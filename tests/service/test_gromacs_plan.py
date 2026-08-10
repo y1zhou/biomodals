@@ -108,15 +108,18 @@ def test_execution_plan_preserves_parallel_gromacs_dag() -> None:
         "prepare_tpr_gpu",
     }
     assert plan.terminal_node_keys == (PREPARE_RESULT,)
-    assert plan.scientific_payload == {
+    scientific_payload = dict(plan.scientific_payload)
+    ld_seed = scientific_payload.pop("ld_seed")
+    gen_seed = scientific_payload.pop("gen_seed")
+    assert scientific_payload == {
         "cpu_only": False,
-        "gen_seed": -1,
         "genion_seed": 0,
-        "ld_seed": -1,
         "pdb_sha256": "abc123",
         "run_pdbfixer": True,
         "simulation_time_ns": 20,
     }
+    assert isinstance(ld_seed, int) and 1 <= ld_seed < 2**31
+    assert isinstance(gen_seed, int) and 1 <= gen_seed < 2**31
     assert plan.scientific_versions["gromacs"] == GROMACS_SCIENTIFIC_VERSION
 
 

@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 import modal
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
 from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import volume_app_output
@@ -187,6 +188,13 @@ def clone_prepared_shortmd_run(
     if not source_tpr.exists():
         raise FileNotFoundError(f"Prepared production TPR not found: {source_tpr}")
     shutil.copy2(source_tpr, replicate_dir / f"production_{replicate_run_name}.tpr")
+
+    destination_mdp = replicate_dir / "production.mdp"
+    if not destination_mdp.exists():
+        source_mdp = source_dir / "production.mdp"
+        if not source_mdp.exists():
+            raise FileNotFoundError(f"Prepared production MDP not found: {source_mdp}")
+        shutil.copy2(source_mdp, destination_mdp)
 
     if created_clone:
         keep_tpr = f"production_{replicate_run_name}.tpr"
@@ -656,7 +664,7 @@ def discover_pdb_inputs(input_dir: str | Path) -> list[tuple[str, bytes]]:
     input_path = Path(input_dir).expanduser().resolve()
     if not input_path.is_dir():
         raise NotADirectoryError(input_path)
-    pdb_paths = list(input_path.glob("*.pdb"))
+    pdb_paths = sorted(input_path.glob("*.pdb"))
     if not pdb_paths:
         raise ValueError(f"No PDB files found in {input_path}")
     return [(path.name, path.read_bytes()) for path in pdb_paths]
@@ -691,14 +699,31 @@ def build_shortmd_workflow(
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else None
     )
+    seed_identity = hashlib.sha256(
+        b"".join(
+            len(file_name.encode()).to_bytes(8, "big")
+            + file_name.encode()
+            + len(pdb_content).to_bytes(8, "big")
+            + pdb_content
+            for file_name, pdb_content in input_pdbs
+        )
+    ).hexdigest()
     gromacs = ShortMDGromacsSettings(
         simulation_time_ns=simulation_time_ns,
         run_pdbfixer=run_pdbfixer,
         cpu_only=cpu_only,
         num_threads=num_threads,
         use_openmp_threads=use_openmp_threads,
-        ld_seed=ld_seed,
-        gen_seed=gen_seed,
+        ld_seed=concrete_gromacs_seed(
+            ld_seed,
+            scientific_identity=seed_identity,
+            purpose="ld-seed",
+        ),
+        gen_seed=concrete_gromacs_seed(
+            gen_seed,
+            scientific_identity=seed_identity,
+            purpose="gen-seed",
+        ),
         genion_seed=genion_seed,
     )
     used_run_names: set[str] = set()
@@ -810,8 +835,8 @@ def submit_shortmd_workflow(
         cpu_only: Whether to run GROMACS preparation and production on CPU only.
         num_threads: Number of CPU threads to pass to GROMACS.
         use_openmp_threads: Whether to use OpenMP threading in GROMACS.
-        ld_seed: Random seed for Langevin dynamics during preparation.
-        gen_seed: Random seed for initial velocity generation during preparation.
+        ld_seed: Langevin seed. -1 derives a stable seed from the workflow input.
+        gen_seed: Velocity seed. -1 derives a stable seed from the workflow input.
         genion_seed: Random seed for ion placement during preparation.
         force: Replace existing ShortMD-managed app outputs before running.
         wait: Wait locally for the remote workflow result. Disable to print the

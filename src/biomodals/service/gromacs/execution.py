@@ -6,11 +6,14 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping
+from hashlib import sha256
 from typing import Any, Protocol
 from uuid import UUID
 
 from biomodals.app.bioinfo.gromacs_execution import (
     PREPARE_RESULT,
+    concrete_gromacs_seed,
+    gromacs_seed_identity,
     modal_invocation,
     operation_provider_binding,
     operation_task_plan,
@@ -711,11 +714,26 @@ class GromacsExecutionCoordinator:
             pdb_content = self.store.load_job_input(job.job_id)
             if pdb_content is None:
                 raise RuntimeError("Staged GROMACS input is unavailable")
+            seed_identity = gromacs_seed_identity(
+                pdb_sha256=sha256(pdb_content).hexdigest(),
+                simulation_time_ns=options.simulation_time_ns,
+                run_pdbfixer=options.run_pdbfixer,
+            )
             return {
                 "pdb_content": pdb_content,
                 "run_name": job.run_name,
                 "simulation_time_ns": options.simulation_time_ns,
                 "run_pdbfixer": options.run_pdbfixer,
+                "ld_seed": concrete_gromacs_seed(
+                    -1,
+                    scientific_identity=seed_identity,
+                    purpose="ld-seed",
+                ),
+                "gen_seed": concrete_gromacs_seed(
+                    -1,
+                    scientific_identity=seed_identity,
+                    purpose="gen-seed",
+                ),
             }
         return modal_invocation(
             operation,

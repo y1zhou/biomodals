@@ -85,6 +85,47 @@ def test_gromacs_declares_workflow_expected_files() -> None:
     ]
 
 
+def test_gromacs_preparation_rebuilds_an_incomplete_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_name = "demo"
+    run_root = tmp_path / run_name
+    run_root.mkdir()
+    (run_root / f"production_{run_name}.tpr").write_bytes(b"tpr")
+    (run_root / "production.mdp").write_bytes(b"mdp")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "prepare-tpr.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    calls = []
+
+    def run_command(command, **kwargs):
+        assert not (run_root / f"production_{run_name}.tpr").exists()
+        calls.append((command, kwargs))
+        for relative_path in gromacs_app.preparation_execution_paths(run_name):
+            (run_root / relative_path).write_bytes(b"result")
+
+    monkeypatch.setattr(
+        gromacs_app.CONF,
+        "output_volume_mountpoint",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        gromacs_app.CONF,
+        "output_volume",
+        SimpleNamespace(commit=lambda: None),
+    )
+    monkeypatch.setattr(gromacs_app.APP_INFO, "gmx_scripts", str(scripts))
+    monkeypatch.setattr(gromacs_app, "run_command", run_command)
+
+    gromacs_app.prepare_tpr_gpu.get_raw_f()(
+        pdb_content=b"ATOM\n",
+        run_name=run_name,
+    )
+
+    assert len(calls) == 1
+
+
 def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     tmp_path: Path,
     monkeypatch,
@@ -148,6 +189,8 @@ def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     assert request.run_name == "single"
     assert request.pdb_content == b"ATOM\n"
     assert request.simulation_time_ns == 3
+    assert request.ld_seed != -1
+    assert request.gen_seed != -1
     assert request.num_threads == 2
     assert request.max_active_provider_calls == 3
     assert request.max_active_gpu_provider_calls == 0

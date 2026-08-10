@@ -20,10 +20,13 @@ from biomodals.app.bioinfo.gromacs_execution import (
     NVT_ANALYSIS,
     PREPARE_RESULT,
     PRODUCTION_ANALYSIS,
+    concrete_gromacs_seed,
     execution_plan,
+    gromacs_seed_identity,
     modal_invocation,
     operation_provider_binding,
     operation_task_plan,
+    preparation_execution_paths,
 )
 from biomodals.execution import (
     AvailabilityStatus,
@@ -85,6 +88,32 @@ class GromacsExecutionRequest:
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
+        object.__setattr__(
+            self,
+            "ld_seed",
+            concrete_gromacs_seed(
+                self.ld_seed,
+                scientific_identity=gromacs_seed_identity(
+                    pdb_sha256=sha256(self.pdb_content).hexdigest(),
+                    simulation_time_ns=self.simulation_time_ns,
+                    run_pdbfixer=self.run_pdbfixer,
+                ),
+                purpose="ld-seed",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "gen_seed",
+            concrete_gromacs_seed(
+                self.gen_seed,
+                scientific_identity=gromacs_seed_identity(
+                    pdb_sha256=sha256(self.pdb_content).hexdigest(),
+                    simulation_time_ns=self.simulation_time_ns,
+                    run_pdbfixer=self.run_pdbfixer,
+                ),
+                purpose="gen-seed",
+            ),
+        )
         require_safe_filename_component(self.run_name, field_name="run_name")
         if not self.pdb_content:
             raise ValueError("pdb_content cannot be empty")
@@ -454,15 +483,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
     def _node_paths(self, node_key: str) -> tuple[Path, ...]:
         root = self.request.run_root(self.output_root)
         name = self.request.run_name
-        prepare = (
-            root / f"{name}.pdb",
-            root / f"nvt_{name}.tpr",
-            root / f"nvt_{name}.xtc",
-            root / f"npt_{name}.tpr",
-            root / f"npt_{name}.xtc",
-            root / f"production_{name}.tpr",
-            root / "production.mdp",
-        )
+        prepare = tuple(root / path for path in preparation_execution_paths(name))
 
         def analysis(prefix: str) -> tuple[Path, ...]:
             return tuple(

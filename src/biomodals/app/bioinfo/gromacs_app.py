@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 import modal
 
+from biomodals.app.bioinfo.gromacs_execution import preparation_execution_paths
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
@@ -100,6 +101,29 @@ def production_workflow_files(run_name: str) -> list[ArtifactFile]:
         ArtifactFile(path=f"rg_{prefix}.csv", role="radius_of_gyration"),
         ArtifactFile(path=f"rmsf_{prefix}.csv", role="rmsf"),
     ]
+
+
+def _invalidate_incomplete_preparation(work_path: Path, run_name: str) -> None:
+    """Remove stage sentinels whose declared preparation outputs are incomplete."""
+    nvt_complete = all(
+        (work_path / f"nvt_{run_name}.{suffix}").is_file() for suffix in ("tpr", "xtc")
+    )
+    npt_complete = all(
+        (work_path / f"npt_{run_name}.{suffix}").is_file() for suffix in ("tpr", "xtc")
+    )
+    if not nvt_complete:
+        (work_path / f"nvt_{run_name}.gro").unlink(missing_ok=True)
+    if not nvt_complete or not npt_complete:
+        (work_path / f"npt_{run_name}.gro").unlink(missing_ok=True)
+    if (
+        not nvt_complete
+        or not npt_complete
+        or not all(
+            (work_path / relative_path).is_file()
+            for relative_path in (f"production_{run_name}.tpr", "production.mdp")
+        )
+    ):
+        (work_path / f"production_{run_name}.tpr").unlink(missing_ok=True)
 
 
 runtime_image = (
@@ -299,16 +323,13 @@ def prepare_tpr_gpu(
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
 
-    # Skip prep if production tpr already exists
     if all(
-        f.exists()
-        for f in (
-            work_path / f"production_{run_name}.tpr",
-            work_path / "production.mdp",
-        )
+        (work_path / relative_path).is_file()
+        for relative_path in preparation_execution_paths(run_name)
     ):
         print("✅ Preparation already completed, skipping.")
         return str(work_path)
+    _invalidate_incomplete_preparation(work_path, run_name)
 
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
     staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
@@ -374,16 +395,13 @@ def prepare_tpr_cpu(
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
 
-    # Skip prep if production tpr already exists
     if all(
-        f.exists()
-        for f in (
-            work_path / f"production_{run_name}.tpr",
-            work_path / "production.mdp",
-        )
+        (work_path / relative_path).is_file()
+        for relative_path in preparation_execution_paths(run_name)
     ):
         print("✅ Preparation already completed, skipping.")
         return str(work_path)
+    _invalidate_incomplete_preparation(work_path, run_name)
 
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
     staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
@@ -1025,9 +1043,9 @@ def submit_gromacs_task(
         num_threads: Number of CPU threads to use for GROMACS.
         use_openmp_threads: Whether to use OpenMP threading in GROMACS.
         ld_seed: Random seed for the Langevin dynamics thermostat during
-            equilibration. If -1, a random seed will be chosen.
+            equilibration. -1 derives a stable seed from the scientific input.
         gen_seed: Random seed for initial velocity generation during
-            equilibration. If -1, a random seed will be chosen.
+            equilibration. -1 derives a stable seed from the scientific input.
         genion_seed: Random seed for ion placement during system neutralization.
         max_parallel_analysis: Maximum number of trajectory-analysis containers
             to run at once.

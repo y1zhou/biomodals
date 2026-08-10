@@ -152,6 +152,8 @@ def test_build_shortmd_workflow_models_production_analysis_dependencies() -> Non
     assert isinstance(prep_node, ShortMDPrepNode)
     assert prep_node.run_name == "alpha"
     assert prep_node.pdb_content == b"ATOM\n"
+    assert prep_node.gromacs.ld_seed != -1
+    assert prep_node.gromacs.gen_seed != -1
     assert {
         "app_name",
         "prep_cpu_function",
@@ -363,6 +365,7 @@ def test_clone_prepared_shortmd_run_copies_prepared_inputs_into_replicate(
     source_dir.mkdir(parents=True)
     source_dir.joinpath("source.pdb").write_text("ATOM\n", encoding="utf-8")
     source_dir.joinpath("production_source.tpr").write_text("tpr\n", encoding="utf-8")
+    source_dir.joinpath("production.mdp").write_text("mdp\n", encoding="utf-8")
     source_dir.joinpath("production_source.xtc").write_text("stale\n", encoding="utf-8")
     source_dir.joinpath("npt_source.gro").write_text("npt\n", encoding="utf-8")
 
@@ -385,6 +388,9 @@ def test_clone_prepared_shortmd_run_copies_prepared_inputs_into_replicate(
         == "tpr\n"
     )
     assert not replicate_dir.joinpath("production_source.xtc").exists()
+    assert replicate_dir.joinpath("production.mdp").read_text(encoding="utf-8") == (
+        "mdp\n"
+    )
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
 

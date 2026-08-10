@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 
 from biomodals.execution import (
     ExecutionPlan,
@@ -25,6 +26,42 @@ REQUIRED_FUNCTIONS = (
 )
 GROMACS_SCIENTIFIC_VERSION = "2026.1"
 EXECUTION_PLAN_SCHEMA_VERSION = "2"
+
+
+def concrete_gromacs_seed(
+    seed: int,
+    *,
+    scientific_identity: str,
+    purpose: str,
+) -> int:
+    """Resolve GROMACS' random sentinel to a stable scientific seed."""
+    if seed != -1:
+        return seed
+    digest = sha256(f"{scientific_identity}:{purpose}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31 - 1) + 1
+
+
+def gromacs_seed_identity(
+    *,
+    pdb_sha256: str,
+    simulation_time_ns: int,
+    run_pdbfixer: bool,
+) -> str:
+    """Return the stable identity used to materialize random seed sentinels."""
+    return f"{pdb_sha256}:{simulation_time_ns}:{int(run_pdbfixer)}"
+
+
+def preparation_execution_paths(run_name: str) -> tuple[str, ...]:
+    """Return every file required to reuse a completed preparation."""
+    return (
+        f"{run_name}.pdb",
+        f"nvt_{run_name}.tpr",
+        f"nvt_{run_name}.xtc",
+        f"npt_{run_name}.tpr",
+        f"npt_{run_name}.xtc",
+        f"production_{run_name}.tpr",
+        "production.mdp",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +122,21 @@ def execution_plan(
     execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION,
 ) -> ExecutionPlan:
     """Express the established service workflow as one immutable kernel plan."""
+    seed_identity = gromacs_seed_identity(
+        pdb_sha256=pdb_sha256,
+        simulation_time_ns=simulation_time_ns,
+        run_pdbfixer=run_pdbfixer,
+    )
+    ld_seed = concrete_gromacs_seed(
+        ld_seed,
+        scientific_identity=seed_identity,
+        purpose="ld-seed",
+    )
+    gen_seed = concrete_gromacs_seed(
+        gen_seed,
+        scientific_identity=seed_identity,
+        purpose="gen-seed",
+    )
     operations = _operation_plan(cpu_only=cpu_only)
     analysis_nodes = (
         NVT_ANALYSIS,

@@ -178,6 +178,9 @@ def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
     request = _request()
     fingerprint = request.execution_plan.workload_plan_fingerprint
 
+    assert request.ld_seed != -1
+    assert request.gen_seed != -1
+    assert GromacsExecutionRequest.from_bytes(request.to_bytes()) == request
     assert (
         replace(request, ld_seed=17).execution_plan.workload_plan_fingerprint
         != fingerprint

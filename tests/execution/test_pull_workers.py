@@ -24,6 +24,14 @@ from .provider_call_helpers import (
 )
 
 
+class _CountingConnection(sqlite3.Connection):
+    executemany_calls = 0
+
+    def executemany(self, *args, **kwargs):
+        self.executemany_calls += 1
+        return super().executemany(*args, **kwargs)
+
+
 def _admit_workers(repository, count: int, *, max_worker_calls: int = 100):
     persist_pull_policy(
         repository,
@@ -55,6 +63,28 @@ def _admit_workers(repository, count: int, *, max_worker_calls: int = 100):
         )
         claims.append(claim)
     return claims
+
+
+def test_discovery_and_pull_claims_use_bulk_writes() -> None:
+    connection = _CountingConnection(":memory:")
+    repository = create_repository(connection=connection, task_count=3)
+
+    assert connection.executemany_calls == 1
+
+    (worker,) = _admit_workers(repository, 1)
+    connection.executemany_calls = 0
+    claim = repository.claim_pull_tasks(
+        worker.call.provider_call_id,
+        request_id="bulk-claim",
+        capacity=2,
+        now=140,
+    )
+
+    assert [assignment.task_key for assignment in claim.assignments] == [
+        "seed-0",
+        "seed-1",
+    ]
+    assert connection.executemany_calls == 2
 
 
 def test_pull_worker_count_is_derived_from_unfinished_tasks_and_claim_capacity() -> (

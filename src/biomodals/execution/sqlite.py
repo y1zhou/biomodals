@@ -853,31 +853,32 @@ class SqliteExecutionRepository:
             raise ValueError("Task discovery is already complete")
 
         seen: set[str] = set()
-        prepared: list[tuple[TaskPlan, str, str, str]] = []
+        prepared: list[tuple[Any, ...]] = []
         plan_fingerprint = self.get_run(execution_run_id).plan.workload_plan_fingerprint
-        for task_plan in task_plans:
+        for ordinal, task_plan in enumerate(task_plans):
             if not task_plan.task_key:
                 raise ValueError("Task key cannot be empty")
             if task_plan.task_key in seen:
                 raise ValueError(f"duplicate Task key {task_plan.task_key!r}")
             seen.add(task_plan.task_key)
             prepared.append((
-                task_plan,
+                str(execution_run_id),
+                node_key,
+                task_plan.task_key,
+                ordinal,
                 task_plan.fingerprint(
                     workload_plan_fingerprint=plan_fingerprint,
                     node_key=node_key,
                 ),
                 _dump_json(task_plan.scientific_payload),
                 _dump_json(task_plan.execution_payload),
+                TaskStatus.PENDING.value,
+                now,
+                now,
             ))
 
-        for ordinal, (
-            task_plan,
-            fingerprint,
-            scientific_payload_json,
-            execution_payload_json,
-        ) in enumerate(prepared):
-            self._connection.execute(
+        if prepared:
+            self._connection.executemany(
                 """
                 INSERT INTO execution_tasks (
                     execution_run_id,
@@ -893,18 +894,7 @@ class SqliteExecutionRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    str(execution_run_id),
-                    node_key,
-                    task_plan.task_key,
-                    ordinal,
-                    fingerprint,
-                    scientific_payload_json,
-                    execution_payload_json,
-                    TaskStatus.PENDING.value,
-                    now,
-                    now,
-                ),
+                prepared,
             )
         if prepared or node.allow_empty_result:
             status = NodeStatus.RUNNING
@@ -1881,8 +1871,8 @@ class SqliteExecutionRepository:
                 available_capacity,
             ),
         ).fetchall()
-        for ordinal, row in enumerate(rows):
-            self._connection.execute(
+        if rows:
+            self._connection.executemany(
                 """
                 INSERT INTO execution_worker_assignments (
                     execution_run_id,
@@ -1896,16 +1886,19 @@ class SqliteExecutionRepository:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    str(call.execution_run_id),
-                    call.node_key,
-                    row["task_key"],
-                    str(provider_call_id),
-                    request_id,
-                    ordinal,
-                    now,
+                    (
+                        str(call.execution_run_id),
+                        call.node_key,
+                        row["task_key"],
+                        str(provider_call_id),
+                        request_id,
+                        ordinal,
+                        now,
+                    )
+                    for ordinal, row in enumerate(rows)
                 ),
             )
-            self._connection.execute(
+            self._connection.executemany(
                 """
                 UPDATE execution_tasks
                 SET status = ?,
@@ -1917,13 +1910,16 @@ class SqliteExecutionRepository:
                     AND task_key = ?
                 """,
                 (
-                    TaskStatus.RUNNING.value,
-                    str(provider_call_id),
-                    now,
-                    now,
-                    str(call.execution_run_id),
-                    call.node_key,
-                    row["task_key"],
+                    (
+                        TaskStatus.RUNNING.value,
+                        str(provider_call_id),
+                        now,
+                        now,
+                        str(call.execution_run_id),
+                        call.node_key,
+                        row["task_key"],
+                    )
+                    for row in rows
                 ),
             )
         return self._load_pull_task_claim(request_id)

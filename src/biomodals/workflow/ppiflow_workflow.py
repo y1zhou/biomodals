@@ -7,7 +7,7 @@ import hashlib
 import os
 import shlex
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
@@ -114,7 +114,7 @@ PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
 )
 APP_RUN_OUTPUT_STRUCTURE_PATTERNS = PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS
 _ROSETTA_PLAN_SCHEMA_VERSION = 1
-_SCIENTIFIC_SCHEMA_VERSION = "2"
+_SCIENTIFIC_SCHEMA_VERSION = "3"
 
 DEPENDENCY_APPS = (
     "ppiflow",
@@ -173,6 +173,9 @@ FLOWPACKER_OUTPUT_MOUNTPOINT = flowpacker_app.CONF.output_volume_mountpoint
 AF3SCORE_OUTPUT_VOLUME = af3score_app.CONF.output_volume
 AF3SCORE_OUTPUT_VOLUME_NAME = af3score_app.CONF.output_volume_name
 AF3SCORE_OUTPUT_MOUNTPOINT = af3score_app.CONF.output_volume_mountpoint
+ALPHAFOLD3_OUTPUT_VOLUME = alphafold3_app.CONF.output_volume
+ALPHAFOLD3_OUTPUT_VOLUME_NAME = alphafold3_app.CONF.output_volume_name
+ALPHAFOLD3_OUTPUT_MOUNTPOINT = alphafold3_app.CONF.output_volume_mountpoint
 ROSETTA_OUTPUT_VOLUME = rosetta_app.CONF.output_volume
 ROSETTA_OUTPUT_VOLUME_NAME = rosetta_app.CONF.output_volume_name
 ROSETTA_OUTPUT_MOUNTPOINT = rosetta_app.CONF.output_volume_mountpoint
@@ -183,8 +186,17 @@ PPI_FLOW_SOURCE_VOLUME_ROOTS = {
     PPI_FLOW_OUTPUT_VOLUME_NAME: PPI_FLOW_OUTPUT_MOUNTPOINT,
     FLOWPACKER_OUTPUT_VOLUME_NAME: FLOWPACKER_OUTPUT_MOUNTPOINT,
     AF3SCORE_OUTPUT_VOLUME_NAME: AF3SCORE_OUTPUT_MOUNTPOINT,
+    ALPHAFOLD3_OUTPUT_VOLUME_NAME: ALPHAFOLD3_OUTPUT_MOUNTPOINT,
     ROSETTA_OUTPUT_VOLUME_NAME: ROSETTA_OUTPUT_MOUNTPOINT,
     WORKFLOW_OUTPUT_VOLUME_NAME: WORKFLOW_OUTPUT_MOUNTPOINT,
+}
+PPI_FLOW_SOURCE_VOLUMES = {
+    PPI_FLOW_OUTPUT_VOLUME_NAME: PPI_FLOW_OUTPUT_VOLUME,
+    FLOWPACKER_OUTPUT_VOLUME_NAME: FLOWPACKER_OUTPUT_VOLUME,
+    AF3SCORE_OUTPUT_VOLUME_NAME: AF3SCORE_OUTPUT_VOLUME,
+    ALPHAFOLD3_OUTPUT_VOLUME_NAME: ALPHAFOLD3_OUTPUT_VOLUME,
+    ROSETTA_OUTPUT_VOLUME_NAME: ROSETTA_OUTPUT_VOLUME,
+    WORKFLOW_OUTPUT_VOLUME_NAME: WORKFLOW_OUTPUT_VOLUME,
 }
 PPI_FLOW_SOURCE_VOLUME_MOUNTS: dict[
     str | PurePosixPath, modal.Volume | modal.CloudBucketMount
@@ -192,6 +204,7 @@ PPI_FLOW_SOURCE_VOLUME_MOUNTS: dict[
     PPI_FLOW_OUTPUT_MOUNTPOINT: PPI_FLOW_OUTPUT_VOLUME,
     FLOWPACKER_OUTPUT_MOUNTPOINT: FLOWPACKER_OUTPUT_VOLUME,
     AF3SCORE_OUTPUT_MOUNTPOINT: AF3SCORE_OUTPUT_VOLUME,
+    ALPHAFOLD3_OUTPUT_MOUNTPOINT: ALPHAFOLD3_OUTPUT_VOLUME,
     ROSETTA_OUTPUT_MOUNTPOINT: ROSETTA_OUTPUT_VOLUME,
     WORKFLOW_OUTPUT_MOUNTPOINT: WORKFLOW_OUTPUT_VOLUME,
 }
@@ -235,6 +248,7 @@ def _reload_ppiflow_source_volumes() -> None:
     PPI_FLOW_OUTPUT_VOLUME.reload()
     FLOWPACKER_OUTPUT_VOLUME.reload()
     AF3SCORE_OUTPUT_VOLUME.reload()
+    ALPHAFOLD3_OUTPUT_VOLUME.reload()
     ROSETTA_OUTPUT_VOLUME.reload()
     WORKFLOW_OUTPUT_VOLUME.reload()
 
@@ -463,6 +477,7 @@ def normalize_ppiflow_stage2_input(
 ) -> AppRunResult:
     """Normalize Stage2Input structures into a workflow-owned manifest."""
     _reload_ppiflow_source_volumes()
+    _validate_stage2_input_snapshot(storage=storage, config=config)
     structure_artifact = WorkflowArtifact(
         artifact_id=f"{sanitize_filename(node_id)}-stage2-input-structures",
         producing_node_id=node_id,
@@ -3616,6 +3631,28 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def _copy_file_content_bound(source: Path, destination: Path) -> ArtifactFile:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with source.open("rb") as input_file, temporary.open("xb") as output_file:
+            while chunk := input_file.read(1024 * 1024):
+                output_file.write(chunk)
+                digest.update(chunk)
+                size_bytes += len(chunk)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return ArtifactFile(
+        path=destination.name,
+        media_type=ZSTD_MEDIA_TYPE,
+        size_bytes=size_bytes,
+        content_sha256=digest.hexdigest(),
+    )
+
+
 def _run_one_refold_candidate(
     *,
     structure_name: str,
@@ -3679,7 +3716,19 @@ def _run_one_refold_candidate(
             output_dir=temp_dir,
             display_name=run_name,
         )
-        tarball_bytes = archive_path.read_bytes()
+        published_archive = (
+            Path(ALPHAFOLD3_OUTPUT_MOUNTPOINT)
+            / "ppiflow"
+            / "refold"
+            / sanitize_filename(run_name)
+            / archive_path.name
+        )
+        archive_file = _copy_file_content_bound(archive_path, published_archive)
+        json_files = ppiflow_staging.files_from_tar_zst_path(
+            published_archive,
+            suffixes=(".json",),
+        )
+    ALPHAFOLD3_OUTPUT_VOLUME.commit()
     best_model_member = request_archive_member_for_role(
         manifest,
         role="request_best_model",
@@ -3689,10 +3738,6 @@ def _run_one_refold_candidate(
         manifest,
         role="request_best_summary_confidences",
         display_name=run_name,
-    )
-    json_files = ppiflow_staging.files_from_tar_zst_bytes(
-        tarball_bytes,
-        suffixes=(".json",),
     )
     best_summary_files = [item for item in json_files if item[0] == best_summary_member]
     if len(best_summary_files) != 1:
@@ -3719,10 +3764,11 @@ def _run_one_refold_candidate(
         AppOutput(
             name=f"alphafold3_refolded_structures_{sanitize_filename(candidate_id)}",
             kind=ArtifactKind.STRUCTURES,
-            storage=InlineBytes(
-                data=tarball_bytes,
-                filename=f"{run_name}_alphafold3.tar.zst",
-                media_type=ZSTD_MEDIA_TYPE,
+            storage=volume_path_from_mount_path(
+                str(published_archive),
+                ALPHAFOLD3_OUTPUT_MOUNTPOINT,
+                ALPHAFOLD3_OUTPUT_VOLUME_NAME,
+                ZSTD_MEDIA_TYPE,
             ),
             metadata={
                 "step_name": step_name,
@@ -3732,6 +3778,12 @@ def _run_one_refold_candidate(
                 "archive_format": "tar.zst",
                 "structure_patterns": (best_model_member,),
                 "request_best_model_archive_member": best_model_member,
+                "files": [
+                    archive_file.model_dump(
+                        exclude_defaults=True,
+                        exclude_none=True,
+                    )
+                ],
             },
         )
     ]
@@ -4556,6 +4608,256 @@ def _stage2_input_node(
     )
 
 
+_STAGE2_INPUT_SNAPSHOT_KEY = "_input_snapshot"
+
+
+def _streamed_volume_file_record(
+    *,
+    volume_name: str,
+    path: str,
+    chunks: Iterable[bytes],
+) -> dict[str, object]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    for chunk in chunks:
+        digest.update(chunk)
+        size_bytes += len(chunk)
+    return {
+        "volume_name": volume_name,
+        "path": path,
+        "size_bytes": size_bytes,
+        "content_sha256": digest.hexdigest(),
+    }
+
+
+def _client_volume_file_record(storage: VolumePath) -> dict[str, object]:
+    volume = PPI_FLOW_SOURCE_VOLUMES.get(storage.volume_name)
+    if volume is None:
+        raise ValueError(f"Unknown Stage2Input volume {storage.volume_name!r}")
+    return _streamed_volume_file_record(
+        volume_name=storage.volume_name,
+        path=storage.path,
+        chunks=volume.read_file(storage.path),
+    )
+
+
+def _mounted_volume_file_record(storage: VolumePath) -> dict[str, object]:
+    root = PPI_FLOW_SOURCE_VOLUME_ROOTS.get(storage.volume_name)
+    if root is None:
+        raise ValueError(f"Unknown Stage2Input volume {storage.volume_name!r}")
+    path = storage.at_mountpoint(root)
+    if not path.is_file():
+        raise FileNotFoundError(f"Stage2Input file was not found: {storage}")
+    with path.open("rb") as handle:
+        return _streamed_volume_file_record(
+            volume_name=storage.volume_name,
+            path=storage.path,
+            chunks=iter(lambda: handle.read(1024 * 1024), b""),
+        )
+
+
+def _manifest_structure_storages(
+    frame: pl.DataFrame,
+) -> list[tuple[VolumePath, int, str]]:
+    records: dict[tuple[str, str], tuple[VolumePath, int, str]] = {}
+    for row in frame.iter_rows(named=True):
+        for raw_file in row["files"]:
+            if raw_file.get("role") != "structure":
+                continue
+            volume_name = raw_file.get("volume_name")
+            app_volume_path = raw_file.get("app_volume_path")
+            size_bytes = raw_file.get("size_bytes")
+            content_sha256 = raw_file.get("content_sha256")
+            if not volume_name or not app_volume_path:
+                raise ValueError(
+                    "Stage2Input manifest structure files require volume_name "
+                    "and app_volume_path"
+                )
+            if size_bytes is None or not content_sha256:
+                raise ValueError(
+                    "Stage2Input manifest structure files require size_bytes "
+                    "and content_sha256"
+                )
+            storage = VolumePath(
+                volume_name=str(volume_name),
+                path=str(app_volume_path),
+            )
+            key = (storage.volume_name, storage.path)
+            bound = (storage, int(size_bytes), str(content_sha256))
+            previous = records.setdefault(key, bound)
+            if previous != bound:
+                raise ValueError(
+                    f"Stage2Input manifest has conflicting records for {storage}"
+                )
+    if not records:
+        raise ValueError("Stage2Input manifest contains no structure files")
+    return [records[key] for key in sorted(records)]
+
+
+def _read_client_manifest(storage: VolumePath) -> tuple[bytes, pl.DataFrame]:
+    volume = PPI_FLOW_SOURCE_VOLUMES.get(storage.volume_name)
+    if volume is None:
+        raise ValueError(f"Unknown Stage2Input volume {storage.volume_name!r}")
+    data = b"".join(volume.read_file(storage.path))
+    frame = pl.read_parquet(BytesIO(data))
+    ppiflow_manifests.validate_manifest_frame(frame)
+    return data, frame
+
+
+def _client_stage2_structure_storages(
+    storage: VolumePath,
+    *,
+    patterns: Sequence[str] | None,
+) -> list[VolumePath]:
+    volume = PPI_FLOW_SOURCE_VOLUMES.get(storage.volume_name)
+    if volume is None:
+        raise ValueError(f"Unknown Stage2Input volume {storage.volume_name!r}")
+    entries = sorted(
+        str(entry.path).lstrip("/")
+        for entry in volume.iterdir(storage.path, recursive=True)
+        if int(entry.type) == 1
+    )
+    root = PurePosixPath(storage.path)
+    if entries == [storage.path]:
+        return [storage]
+    selected = []
+    for path in entries:
+        try:
+            relative = PurePosixPath(path).relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if ppiflow_staging.matches_structure_pattern(relative, patterns):
+            selected.append(VolumePath(volume_name=storage.volume_name, path=path))
+    if not selected:
+        raise FileNotFoundError(f"Stage2Input did not find structures under {storage}")
+    return selected
+
+
+def _bind_stage2_input_identity(
+    *,
+    task_doc: dict[str, Any],
+    steps_doc: dict[str, Any],
+    stage: int | None,
+) -> dict[str, Any]:
+    """Bind a stage-2-only workflow to the exact external input bytes."""
+    if stage != 2:
+        return steps_doc
+    raw_cfg = steps_doc.get("Stage2Input") or _task_section(task_doc).get(
+        "stage2_input"
+    )
+    if not isinstance(raw_cfg, Mapping):
+        raise ValueError("stage=2 PPIFlow runs require a Stage2Input mapping")
+    config = dict(raw_cfg)
+    raw_path = config.get("path")
+    if raw_path is None:
+        raise ValueError("Stage2Input requires a 'path' value")
+    storage = _volume_path_from_stage_config(
+        str(raw_path),
+        volume_name=str(config.get("volume_name", PPI_FLOW_OUTPUT_VOLUME_NAME)),
+    )
+    manifest_storage = _stage2_manifest_storage_from_config(
+        config,
+        default_volume_name=storage.volume_name,
+    )
+    snapshot: dict[str, object] = {}
+    if manifest_storage is not None:
+        manifest_bytes, frame = _read_client_manifest(manifest_storage)
+        snapshot["manifest"] = _streamed_volume_file_record(
+            volume_name=manifest_storage.volume_name,
+            path=manifest_storage.path,
+            chunks=(manifest_bytes,),
+        )
+        manifest_structures = _manifest_structure_storages(frame)
+        structure_storages = [item[0] for item in manifest_structures]
+        expected = {
+            (item[0].volume_name, item[0].path): (item[1], item[2])
+            for item in manifest_structures
+        }
+    else:
+        structure_storages = _client_stage2_structure_storages(
+            storage,
+            patterns=_patterns_from_config(config),
+        )
+        expected = {}
+    structure_records = [
+        _client_volume_file_record(item) for item in structure_storages
+    ]
+    for record in structure_records:
+        key = (str(record["volume_name"]), str(record["path"]))
+        if key in expected and expected[key] != (
+            record["size_bytes"],
+            record["content_sha256"],
+        ):
+            raise ValueError(
+                "Stage2Input manifest digest does not match structure bytes: "
+                f"{record['path']}"
+            )
+    snapshot["structures"] = structure_records
+    config[_STAGE2_INPUT_SNAPSHOT_KEY] = snapshot
+    bound = deepcopy(steps_doc)
+    if "Stage2Input" in bound:
+        bound["Stage2Input"] = config
+    else:
+        task = _task_section(task_doc)
+        task["stage2_input"] = config
+    return bound
+
+
+def _validate_stage2_input_snapshot(
+    *, storage: VolumePath, config: Mapping[str, object]
+) -> None:
+    snapshot = config.get(_STAGE2_INPUT_SNAPSHOT_KEY)
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("Stage2Input is missing its content snapshot")
+    manifest = snapshot.get("manifest")
+    if manifest is not None:
+        if not isinstance(manifest, Mapping):
+            raise ValueError("Stage2Input manifest snapshot is invalid")
+        manifest = cast(Mapping[str, object], manifest)
+        manifest_storage = VolumePath(
+            volume_name=str(manifest["volume_name"]),
+            path=str(manifest["path"]),
+        )
+        if _mounted_volume_file_record(manifest_storage) != dict(manifest):
+            raise ValueError("Stage2Input manifest changed after submission")
+    raw_structures = snapshot.get("structures")
+    if not isinstance(raw_structures, list) or not raw_structures:
+        raise ValueError("Stage2Input snapshot contains no structures")
+    if any(not isinstance(record, Mapping) for record in raw_structures):
+        raise ValueError("Stage2Input structure snapshot is invalid")
+    expected_records = [
+        dict(cast(Mapping[str, object], record)) for record in raw_structures
+    ]
+    actual_records = [
+        _mounted_volume_file_record(
+            VolumePath(
+                volume_name=str(record["volume_name"]),
+                path=str(record["path"]),
+            )
+        )
+        for record in expected_records
+    ]
+    if actual_records != expected_records:
+        raise ValueError("Stage2Input structures changed after submission")
+
+    if manifest is None:
+        root = storage.at_mountpoint(PPI_FLOW_SOURCE_VOLUME_ROOTS[storage.volume_name])
+        if root.is_file():
+            current_paths = [storage.path]
+        else:
+            patterns = _patterns_from_config(config)
+            current_paths = sorted(
+                str(PurePosixPath(storage.path) / path.relative_to(root).as_posix())
+                for path in root.rglob("*")
+                if path.is_file()
+                and ppiflow_staging.matches_structure_pattern(
+                    path.relative_to(root).as_posix(), patterns
+                )
+            )
+        if current_paths != [str(record["path"]) for record in expected_records]:
+            raise ValueError("Stage2Input structure set changed after submission")
+
+
 def _stage2_manifest_storage_from_config(
     config: Mapping[str, object],
     *,
@@ -4837,6 +5139,11 @@ def submit_ppiflow_workflow(
         app_steps=_active_ppiflow_app_steps(task_doc, stage),
     )
     steps_doc = _inline_rosetta_config_files(steps_doc)
+    steps_doc = _bind_stage2_input_identity(
+        task_doc=task_doc,
+        steps_doc=steps_doc,
+        stage=stage,
+    )
     provider_call_limit = min(
         max_parallel,
         ppiflow_coordinators.candidate_concurrency_from_config(
@@ -4847,7 +5154,7 @@ def submit_ppiflow_workflow(
     if max_child_calls is not None:
         provider_call_limit = min(provider_call_limit, max_child_calls)
     workflow = build_ppiflow_workflow(
-        task_yaml_bytes=task_yaml_bytes,
+        task_yaml_bytes=yaml.safe_dump(task_doc).encode("utf-8"),
         steps_yaml_bytes=yaml.safe_dump(steps_doc).encode("utf-8"),
         stage=stage,
         max_child_calls=max_child_calls,

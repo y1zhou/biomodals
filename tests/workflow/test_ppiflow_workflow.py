@@ -154,6 +154,21 @@ def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Pat
     return source_root, workflow_root
 
 
+def _mounted_stage2_snapshot(
+    *storages: VolumePath,
+    manifest: VolumePath | None = None,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "structures": [
+            ppiflow_workflow._mounted_volume_file_record(storage)
+            for storage in storages
+        ]
+    }
+    if manifest is not None:
+        snapshot["manifest"] = ppiflow_workflow._mounted_volume_file_record(manifest)
+    return snapshot
+
+
 def _tar_zst_bytes(files: dict[str, bytes]) -> bytes:
     tar_buffer = BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
@@ -191,7 +206,7 @@ PPIFlowStep:
 """,
     )
 
-    assert workflow.validate().scientific_versions["biomodals.workflow.ppiflow"] == "2"
+    assert workflow.validate().scientific_versions["biomodals.workflow.ppiflow"] == "3"
 
 
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
@@ -1669,6 +1684,7 @@ def test_refold_uses_alphafold3_helpers_from_their_owning_modules() -> None:
 
 def test_refold_publishes_only_request_ranked_model_and_metrics(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     best_model = "Workload_Z/Workload_Z_model.cif"
     best_summary = "Workload_Z/Workload_Z_summary_confidences.json"
@@ -1723,6 +1739,24 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
         return path
 
     monkeypatch.setattr(ppiflow_workflow, "create_request_archive", create_archive)
+    output_root = tmp_path / "alphafold3-output"
+    commit_count = 0
+
+    def commit() -> None:
+        nonlocal commit_count
+        commit_count += 1
+
+    monkeypatch.setattr(
+        ppiflow_workflow, "ALPHAFOLD3_OUTPUT_MOUNTPOINT", str(output_root)
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow, "ALPHAFOLD3_OUTPUT_VOLUME_NAME", "AlphaFold3-outputs"
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "ALPHAFOLD3_OUTPUT_VOLUME",
+        SimpleNamespace(commit=commit),
+    )
 
     outputs = ppiflow_workflow._run_one_refold_candidate(
         structure_name="candidate.pdb",
@@ -1736,6 +1770,19 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
     structures = next(
         output for output in outputs if output.kind == ArtifactKind.STRUCTURES
     )
+    assert isinstance(structures.storage, VolumePath)
+    assert structures.storage.volume_name == "AlphaFold3-outputs"
+    published = output_root / structures.storage.path
+    assert published.read_bytes() == archive_bytes
+    assert structures.metadata["files"] == [
+        {
+            "path": published.name,
+            "media_type": "application/zstd",
+            "size_bytes": len(archive_bytes),
+            "content_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        }
+    ]
+    assert commit_count == 1
     assert structures.metadata["structure_patterns"] == (best_model,)
     assert structures.metadata["request_best_model_archive_member"] == best_model
     metrics = next(output for output in outputs if output.kind == ArtifactKind.TABLE)
@@ -3304,6 +3351,159 @@ RosettaFixStep: {}
     assert first_hash != changed_hash
 
 
+def test_stage2_input_bytes_are_bound_before_plan_admission(monkeypatch) -> None:
+    class FakeVolume:
+        def __init__(self, payloads: dict[str, bytes]) -> None:
+            self.payloads = payloads
+
+        def iterdir(self, path: str, *, recursive: bool):
+            assert recursive is True
+            return [
+                SimpleNamespace(path=name, type=1)
+                for name in sorted(self.payloads)
+                if name.startswith(f"{path}/")
+            ]
+
+        def read_file(self, path: str):
+            data = self.payloads[path]
+            midpoint = len(data) // 2
+            yield data[:midpoint]
+            yield data[midpoint:]
+
+    task_doc = ppiflow_workflow._load_yaml_bytes(
+        _task_yaml(enabled_steps="  RosettaFixStep: true\n")
+    )
+    steps_doc = ppiflow_workflow._load_yaml_bytes(b"""
+Stage2Input:
+  volume_name: source-volume
+  path: existing
+  structure_patterns: '*.pdb'
+RosettaFixStep: {}
+""")
+    volume = FakeVolume({
+        "existing/a/design.pdb": b"ATOM A\n",
+        "existing/b/design.pdb": b"ATOM B\n",
+    })
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUMES",
+        {"source-volume": volume},
+    )
+
+    first_steps = ppiflow_workflow._bind_stage2_input_identity(
+        task_doc=task_doc,
+        steps_doc=steps_doc,
+        stage=2,
+    )
+    first = build_ppiflow_workflow(
+        task_yaml_bytes=yaml.safe_dump(task_doc).encode(),
+        steps_yaml_bytes=yaml.safe_dump(first_steps).encode(),
+        stage=2,
+    ).validate()
+    snapshot = first_steps["Stage2Input"][ppiflow_workflow._STAGE2_INPUT_SNAPSHOT_KEY]
+    assert [record["path"] for record in snapshot["structures"]] == [
+        "existing/a/design.pdb",
+        "existing/b/design.pdb",
+    ]
+
+    volume.payloads["existing/b/design.pdb"] = b"ATOM CHANGED\n"
+    changed_steps = ppiflow_workflow._bind_stage2_input_identity(
+        task_doc=task_doc,
+        steps_doc=steps_doc,
+        stage=2,
+    )
+    changed = build_ppiflow_workflow(
+        task_yaml_bytes=yaml.safe_dump(task_doc).encode(),
+        steps_yaml_bytes=yaml.safe_dump(changed_steps).encode(),
+        stage=2,
+    ).validate()
+
+    assert hashing.dag_hash(first) != hashing.dag_hash(changed)
+
+
+def test_stage2_input_rejects_bytes_changed_after_submission(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root, _workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    structure = source_root / "existing" / "design.pdb"
+    structure.parent.mkdir()
+    structure.write_bytes(b"ATOM ORIGINAL\n")
+    storage = VolumePath(volume_name="source-volume", path="existing/design.pdb")
+    snapshot = _mounted_stage2_snapshot(storage)
+    structure.write_bytes(b"ATOM MUTATED!\n")
+
+    with pytest.raises(ValueError, match="changed after submission"):
+        ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
+            storage=storage,
+            config={ppiflow_workflow._STAGE2_INPUT_SNAPSHOT_KEY: snapshot},
+            run_id="run-1",
+            node_id="stage2-existing-input",
+            step_name="Stage2Input",
+        )
+
+
+def test_stage2_input_rejects_manifest_digest_mismatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest_path = tmp_path / "candidate_manifest.parquet"
+    ppiflow_manifests.write_manifest(
+        [
+            ppiflow_manifests.candidate_manifest_row(
+                candidate_id="candidate-a",
+                stage_name="Stage2Input",
+                stage_role="stage2_input",
+                operation_mode="provided_manifest",
+                candidate_status=AppRunStatus.SUCCEEDED.value,
+                files=[
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        volume_name="source-volume",
+                        app_volume_path="existing/design.pdb",
+                        size_bytes=5,
+                        content_sha256=hashlib.sha256(b"WRONG").hexdigest(),
+                    )
+                ],
+            )
+        ],
+        manifest_path,
+    )
+
+    class FakeVolume:
+        def __init__(self, payloads: dict[str, bytes]) -> None:
+            self.payloads = payloads
+
+        def read_file(self, path: str):
+            yield self.payloads[path]
+
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "PPI_FLOW_SOURCE_VOLUMES",
+        {
+            "source-volume": FakeVolume({"existing/design.pdb": b"RIGHT"}),
+            "manifest-volume": FakeVolume({
+                "provided/candidate_manifest.parquet": manifest_path.read_bytes()
+            }),
+        },
+    )
+    with pytest.raises(ValueError, match="digest does not match"):
+        ppiflow_workflow._bind_stage2_input_identity(
+            task_doc=ppiflow_workflow._load_yaml_bytes(
+                _task_yaml(enabled_steps="  RosettaFixStep: true\n")
+            ),
+            steps_doc=ppiflow_workflow._load_yaml_bytes(b"""
+Stage2Input:
+  volume_name: source-volume
+  path: existing
+  manifest_volume_name: manifest-volume
+  manifest_path: provided/candidate_manifest.parquet
+RosettaFixStep: {}
+"""),
+            stage=2,
+        )
+
+
 def test_stage2_input_normalization_scans_path_and_writes_manifest(
     tmp_path: Path,
     monkeypatch,
@@ -3316,7 +3516,14 @@ def test_stage2_input_normalization_scans_path_and_writes_manifest(
 
     result = ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
         storage=VolumePath(volume_name="source-volume", path="existing"),
-        config={"run_name": "stage2-run", "structure_patterns": "*.pdb"},
+        config={
+            "run_name": "stage2-run",
+            "structure_patterns": "*.pdb",
+            ppiflow_workflow._STAGE2_INPUT_SNAPSHOT_KEY: _mounted_stage2_snapshot(
+                VolumePath(volume_name="source-volume", path="existing/design-a.pdb"),
+                VolumePath(volume_name="source-volume", path="existing/design-b.pdb"),
+            ),
+        },
         run_id="run-1",
         node_id="stage2-existing-input",
         step_name="Stage2Input",
@@ -3345,7 +3552,8 @@ def test_stage2_input_normalization_accepts_explicit_manifest(
     source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
     existing_dir = source_root / "existing"
     existing_dir.mkdir()
-    (existing_dir / "design-a.pdb").write_text("ATOM A\n", encoding="utf-8")
+    structure_path = existing_dir / "design-a.pdb"
+    structure_path.write_text("ATOM A\n", encoding="utf-8")
     explicit_manifest = workflow_root / "provided" / "candidate_manifest.parquet"
     ppiflow_manifests.write_manifest(
         [
@@ -3363,6 +3571,8 @@ def test_stage2_input_normalization_accepts_explicit_manifest(
                         role="structure",
                         volume_name="source-volume",
                         app_volume_path="existing/design-a.pdb",
+                        size_bytes=structure_path.stat().st_size,
+                        content_sha256=ppiflow_workflow._file_sha256(structure_path),
                     )
                 ],
             )
@@ -3375,6 +3585,13 @@ def test_stage2_input_normalization_accepts_explicit_manifest(
         config={
             "manifest_volume_name": "workflow-volume",
             "manifest_path": "provided/candidate_manifest.parquet",
+            ppiflow_workflow._STAGE2_INPUT_SNAPSHOT_KEY: _mounted_stage2_snapshot(
+                VolumePath(volume_name="source-volume", path="existing/design-a.pdb"),
+                manifest=VolumePath(
+                    volume_name="workflow-volume",
+                    path="provided/candidate_manifest.parquet",
+                ),
+            ),
         },
         run_id="run-1",
         node_id="stage2-existing-input",

@@ -138,6 +138,25 @@ def files_from_tar_zst_bytes(
     )
 
 
+def files_from_tar_zst_path(
+    path: Path,
+    *,
+    suffixes: Sequence[str] | None = None,
+) -> list[tuple[str, bytes]]:
+    """Read selected files from a tar.zst path without buffering the archive."""
+    suffix_set = {suffix.lower() for suffix in suffixes or ()}
+    return _collect_tar_zst_members(
+        path,
+        include=lambda member: (
+            not suffix_set or Path(member.name).suffix.lower() in suffix_set
+        ),
+        build=lambda member, member_data: (
+            member.name,
+            _required_member_bytes(member, member_data),
+        ),
+    )
+
+
 def selected_structure_file_records_from_artifact(
     artifact: WorkflowArtifact,
     patterns: Sequence[str] | None,

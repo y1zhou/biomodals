@@ -20,18 +20,6 @@ from typing import ClassVar, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeHandle,
-    append_log,
-    artifact_record,
-    json_bytes,
-    load_artifact_bytes,
-    require_regular_file,
-    sha256_bytes,
-    utc_now,
-    write_bytes_atomic,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -57,6 +45,18 @@ from biomodals.app.fold.alphafold3.profiles import (
     HMMER_VERSION,
     SOURCE_DB_VOLUME_NAME,
     resolve_database_profile,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    append_log,
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    write_bytes_atomic,
+    write_json_atomic,
 )
 
 DEFAULT_MAX_TEMPLATE_DATE = "2021-09-30"

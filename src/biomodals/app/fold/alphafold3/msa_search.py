@@ -22,20 +22,6 @@ from typing import Any, ClassVar, Literal, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    MAX_MSA_FIELD_BYTES,
-    VolumeHandle,
-    append_log,
-    artifact_record,
-    json_bytes,
-    load_artifact_bytes,
-    load_json_object,
-    require_regular_file,
-    sha256_bytes,
-    utc_now,
-    write_bytes_atomic,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -44,6 +30,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     assert_generation_current,
     finish_generation_claim,
 )
+from biomodals.app.fold.alphafold3.inference_inputs import MAX_MSA_FIELD_BYTES
 from biomodals.app.fold.alphafold3.profile_manifest import (
     profile_search_identity,
     validate_profile_manifest,
@@ -57,6 +44,19 @@ from biomodals.app.fold.alphafold3.profiles import (
     profile_root,
     resolve_database_profile,
     shard_names,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    append_log,
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    load_json_object,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    write_bytes_atomic,
+    write_json_atomic,
 )
 
 Polymer = Literal["protein", "rna"]

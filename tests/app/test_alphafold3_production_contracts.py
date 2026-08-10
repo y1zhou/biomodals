@@ -29,14 +29,6 @@ from biomodals.app.fold.alphafold3 import (
     request_results,
     template_search,
 )
-from biomodals.app.fold.alphafold3.artifacts import (
-    artifact_record,
-    json_bytes,
-    load_artifact_bytes,
-    read_volume_bytes,
-    validate_artifact_record,
-    write_bytes_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     GenerationClaim,
@@ -148,6 +140,14 @@ from biomodals.app.fold.alphafold3.template_search import (
     TemplateTask,
     build_template_context,
     load_template_entry,
+)
+from biomodals.helper.artifacts import (
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    read_volume_bytes,
+    validate_artifact_record,
+    write_bytes_atomic,
 )
 from biomodals.helper.shell import run_command
 

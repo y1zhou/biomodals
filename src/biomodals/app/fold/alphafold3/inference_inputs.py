@@ -25,21 +25,21 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    MAX_MSA_FIELD_BYTES,
+from biomodals.app.fold.alphafold3.profiles import (
+    ALPHAFOLD3_COMMIT,
+    ALPHAFOLD3_REPOSITORY,
+)
+from biomodals.helper.artifacts import (
     json_bytes,
     load_artifact_bytes,
     read_bounded_file_bytes,
     sha256_bytes,
 )
-from biomodals.app.fold.alphafold3.profiles import (
-    ALPHAFOLD3_COMMIT,
-    ALPHAFOLD3_REPOSITORY,
-)
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
+MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024
 STAGED_INPUT_SCHEMA_VERSION = 2
 MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES

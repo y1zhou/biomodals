@@ -10,12 +10,6 @@ from typing import cast
 import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeReader,
-    json_bytes,
-    read_volume_bytes,
-    sha256_bytes,
-)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     DECLARED_MODEL_IDENTITY,
@@ -56,6 +50,12 @@ from biomodals.app.fold.alphafold3.template_search import (
     TEMPLATE_IDENTITY_SCHEMA_VERSION,
     TEMPLATE_RESULT_SCHEMA_VERSION,
     template_search_parameters,
+)
+from biomodals.helper.artifacts import (
+    VolumeReader,
+    json_bytes,
+    read_volume_bytes,
+    sha256_bytes,
 )
 
 INVOCATION_IDENTITY_SCHEMA = "biomodals-alphafold3-invocation-v1"

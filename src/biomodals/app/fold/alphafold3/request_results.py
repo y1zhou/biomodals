@@ -25,16 +25,6 @@ from typing import IO, cast
 import orjson
 import polars as pl
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeReader,
-    json_bytes,
-    read_bounded_file_bytes,
-    read_volume_bytes,
-    require_regular_file,
-    sha256_file,
-    write_bytes_atomic,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_STAGED_INPUT_BYTES,
     PreparedInferenceRun,
@@ -52,6 +42,16 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     load_seed_marker,
     ranked_rows,
     validate_run_id,
+)
+from biomodals.helper.artifacts import (
+    VolumeReader,
+    json_bytes,
+    read_bounded_file_bytes,
+    read_volume_bytes,
+    require_regular_file,
+    sha256_file,
+    write_bytes_atomic,
+    write_json_atomic,
 )
 from biomodals.helper.shell import run_command
 

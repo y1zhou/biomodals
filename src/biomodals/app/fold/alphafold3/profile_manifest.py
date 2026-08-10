@@ -11,13 +11,6 @@ import re
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    json_bytes,
-    load_json_object,
-    require_regular_file,
-    sha256_bytes,
-    sha256_file,
-)
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
@@ -42,6 +35,13 @@ from biomodals.app.fold.alphafold3.profiles import (
     record_multiset_identity,
     shard_names,
     validate_seqkit_threads,
+)
+from biomodals.helper.artifacts import (
+    json_bytes,
+    load_json_object,
+    require_regular_file,
+    sha256_bytes,
+    sha256_file,
 )
 
 

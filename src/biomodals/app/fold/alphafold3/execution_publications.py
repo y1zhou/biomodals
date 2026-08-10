@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
+from biomodals.helper.artifacts import (
     VolumeHandle,
     artifact_record,
     load_artifact_bytes,

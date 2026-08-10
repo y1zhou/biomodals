@@ -23,15 +23,6 @@ from typing import cast
 import orjson
 import polars as pl
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeHandle,
-    artifact_record,
-    require_regular_file,
-    sha256_bytes,
-    utc_now,
-    validate_artifact_record,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -46,6 +37,15 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     validate_inference_parameters,
     validate_inference_workload,
     validate_model_seed,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    artifact_record,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    validate_artifact_record,
+    write_json_atomic,
 )
 
 SEED_PREDICTION_CLAIM_DICT_NAME = "AlphaFold3-inference-claims"

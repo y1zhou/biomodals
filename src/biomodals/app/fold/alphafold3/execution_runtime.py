@@ -12,10 +12,6 @@ from uuid import UUID
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    load_json_object,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.execution_plan import (
     ALPHAFOLD3_EXECUTION_NODE_KEYS,
 )
@@ -109,6 +105,10 @@ from biomodals.execution.scheduler import (
 from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
+)
+from biomodals.helper.artifacts import (
+    load_json_object,
+    write_json_atomic,
 )
 
 (

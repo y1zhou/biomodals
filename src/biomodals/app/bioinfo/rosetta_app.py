@@ -53,7 +53,7 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
-from biomodals.helper import hash_string, patch_image_for_helper
+from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
@@ -484,7 +484,7 @@ def _prepare_input_csv(
                 allow_search_path=True,
             )
             file_abs_paths.append(str(local_path))
-            file_hashes.append(hash_string(local_path.read_text()))
+            file_hashes.append(sha256(local_path.read_bytes()).hexdigest())
         return df_files.with_columns(
             pl.Series(hash_col_name, file_hashes),
             pl.Series(real_path_col_name, file_abs_paths),

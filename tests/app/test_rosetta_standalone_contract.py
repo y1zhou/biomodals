@@ -132,6 +132,26 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
     )
 
 
+def test_rosetta_staging_hashes_exact_script_and_flag_bytes(
+    tmp_path: Path,
+) -> None:
+    pdb = tmp_path / "input.pdb"
+    script = tmp_path / "protocol.xml"
+    flags = tmp_path / "options.flags"
+    pdb.write_bytes(b"ATOM\r\n")
+    script.write_bytes(b"<ROSETTASCRIPTS />\r\n")
+    flags.write_bytes(b"-nstruct 1\r\n")
+
+    [row] = rosetta_app._prepare_input_csv(
+        input_pdb=str(pdb),
+        input_rosetta_script=str(script),
+        input_flags_file=str(flags),
+    ).to_dicts()
+
+    assert row["script_hash"] == sha256(script.read_bytes()).hexdigest()
+    assert row["flags_hash"] == sha256(flags.read_bytes()).hexdigest()
+
+
 def test_rosetta_worker_uses_app_run_layout(
     tmp_path: Path,
     monkeypatch,

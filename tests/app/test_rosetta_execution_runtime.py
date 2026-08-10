@@ -4,6 +4,7 @@
 
 from hashlib import sha256
 from pathlib import Path
+from threading import RLock
 from typing import Any, cast
 from uuid import UUID
 
@@ -118,6 +119,8 @@ def _request() -> RosettaExecutionRequest:
 def _runtime(
     tmp_path: Path,
     driver: RecordingDriver,
+    *,
+    volume_io_lock: Any | None = None,
 ) -> RosettaExecutionRuntime:
     return RosettaExecutionRuntime(
         request=_request(),
@@ -130,7 +133,36 @@ def _runtime(
         pull_worker_coordinator="coordinator",
         poll_interval_seconds=0,
         now=lambda: 10,
+        volume_io_lock=volume_io_lock,
     )
+
+
+def test_volume_barriers_own_the_run_scoped_lock(tmp_path: Path) -> None:
+    volume_io_lock = RLock()
+    runtime = _runtime(
+        tmp_path,
+        RecordingDriver(),
+        volume_io_lock=volume_io_lock,
+    )
+    output = cast(FakeVolume, runtime.output_volume)
+    real_commit = output.commit
+    real_reload = output.reload
+
+    def commit() -> None:
+        assert volume_io_lock._is_owned()
+        real_commit()
+
+    def reload() -> None:
+        assert volume_io_lock._is_owned()
+        real_reload()
+
+    output.commit = commit
+    output.reload = reload
+
+    runtime._initialize()
+    runtime.advance_once()
+    runtime.refresh_publications()
+    runtime.close()
 
 
 def _publish_assignment(runtime, assignment) -> dict[str, object]:

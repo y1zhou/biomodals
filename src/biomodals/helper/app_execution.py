@@ -367,6 +367,7 @@ class ExecutionRuntimeLifecycle:
         predecessor_execution_run_id: UUID | None,
         poll_interval_seconds: float,
         now: Callable[[], int] | None,
+        volume_io_lock: RLock | None = None,
     ) -> None:
         """Bind the common host state shared by direct App runtimes."""
         self.request = request
@@ -377,13 +378,14 @@ class ExecutionRuntimeLifecycle:
         self.predecessor_execution_run_id = predecessor_execution_run_id
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
+        self._volume_io_lock = volume_io_lock
         self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
         self._provider = ExecutionRuntime(
             store.execution,
             modal_driver=modal_driver,
             checkpoint=self._checkpoint,
             transaction=store.transaction,
-            synchronize=store.synchronize,
+            synchronize=self._synchronize_kernel_state,
         )
 
     def _create_or_verify_run(
@@ -407,7 +409,7 @@ class ExecutionRuntimeLifecycle:
 
     def run(self) -> ExecutionOverview:
         """Create or recover the Run and drive it until it stops."""
-        with self.store.synchronize():
+        with self._synchronize_kernel_state():
             repository = self._initialize()
         return drive_execution_run(
             repository,
@@ -417,12 +419,12 @@ class ExecutionRuntimeLifecycle:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
         )
 
     def resume(self) -> ExecutionOverview:
         """Resume this Run without retrying conclusive failures."""
-        with self.store.synchronize():
+        with self._synchronize_kernel_state():
             repository = self._initialize()
         resume_execution_run(
             repository,
@@ -430,7 +432,7 @@ class ExecutionRuntimeLifecycle:
             reconcile_once=self.advance_once,
             checkpoint=self._checkpoint,
             current_repository=lambda: self.store.execution,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
             now=self._now(),
         )
         return drive_execution_run(
@@ -441,19 +443,19 @@ class ExecutionRuntimeLifecycle:
             current_repository=lambda: self.store.execution,
             now=self._now,
             poll_interval_seconds=self.poll_interval_seconds,
-            synchronize=self.store.synchronize,
+            synchronize=self._synchronize_kernel_state,
         )
 
     def cancel(self) -> ExecutionOverview:
         """Request cancellation while retaining uncertain call ownership."""
-        with self.store.synchronize():
+        with self._synchronize_kernel_state():
             repository = self.store.execution
             try:
                 repository.get_run(self.execution_run_id)
             except ExecutionRunNotFoundError:
                 repository = self._initialize()
         self._provider.cancel_run(self.execution_run_id, now=self._now())
-        with self.store.synchronize():
+        with self._synchronize_kernel_state():
             return self.store.execution.overview(self.execution_run_id)
 
     def close(self) -> None:
@@ -468,7 +470,7 @@ class ExecutionRuntimeLifecycle:
         raise NotImplementedError
 
     def _checkpoint(self) -> SqliteExecutionRepository:
-        with self.store.synchronize():
+        with self._synchronize_kernel_state():
             try:
                 self._volume_sync.commit()
             finally:
@@ -477,11 +479,22 @@ class ExecutionRuntimeLifecycle:
         return repository
 
     def _reload_output(self) -> None:
-        with self.store.synchronize():
+        with self._synchronize_kernel_state():
             try:
                 self._volume_sync.reload()
             finally:
                 self._provider.repository = self.store.execution
+
+    @contextmanager
+    def _synchronize_kernel_state(self) -> Iterator[None]:
+        """Order an optional output-Volume barrier before the SQLite writer."""
+        volume_io_lock = getattr(self, "_volume_io_lock", None)
+        if volume_io_lock is None:
+            with self.store.synchronize():
+                yield
+            return
+        with volume_io_lock, self.store.synchronize():
+            yield
 
 
 class _SingleTaskAdmissionHooks(Protocol):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from uuid import UUID
 
@@ -50,6 +51,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             target_scientific_versions={"rosetta": app_version},
         )
         self.output_volume = output_volume
+        self._volume_io_lock = RLock()
         self.modal_driver = modal_driver
         self.pull_worker_coordinator = pull_worker_coordinator
         self.poll_interval_seconds = poll_interval_seconds
@@ -62,21 +64,22 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         capacity: int,
     ) -> PullTaskClaim:
         """Checkpoint one worker claim through the serialized writer."""
-        with self._writer_lock:
-            request = load_execution_request(
-                self.volume_root,
-                self.execution_run_id,
+        with self._volume_io_lock:
+            with self._writer_lock:
+                request = load_execution_request(
+                    self.volume_root,
+                    self.execution_run_id,
+                )
+                runtime = self._open_runtime(
+                    request,
+                    predecessor_execution_run_id=self._existing_predecessor(),
+                )
+            runtime.attach()
+            return runtime.claim_pull_tasks(
+                provider_call_id,
+                request_id=request_id,
+                capacity=capacity,
             )
-            runtime = self._open_runtime(
-                request,
-                predecessor_execution_run_id=self._existing_predecessor(),
-            )
-        runtime.attach()
-        return runtime.claim_pull_tasks(
-            provider_call_id,
-            request_id=request_id,
-            capacity=capacity,
-        )
 
     def complete_tasks_and_claim(
         self,
@@ -90,23 +93,23 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         capacity: int,
     ) -> PullTaskClaim:
         """Validate one microbatch and return its checkpointed successor claim."""
-        with self._writer_lock:
-            request = load_execution_request(
-                self.volume_root,
-                self.execution_run_id,
+        with self._volume_io_lock:
+            with self._writer_lock:
+                request = load_execution_request(
+                    self.volume_root,
+                    self.execution_run_id,
+                )
+                runtime = self._open_runtime(
+                    request,
+                    predecessor_execution_run_id=self._existing_predecessor(),
+                )
+            runtime.refresh_publications()
+            return runtime.complete_pull_tasks_and_claim(
+                provider_call_id,
+                completions,
+                request_id=request_id,
+                capacity=capacity,
             )
-            runtime = self._open_runtime(
-                request,
-                predecessor_execution_run_id=self._existing_predecessor(),
-            )
-        runtime.refresh_publications()
-        claim = runtime.complete_pull_tasks_and_claim(
-            provider_call_id,
-            completions,
-            request_id=request_id,
-            capacity=capacity,
-        )
-        return claim
 
     def prepare_restart(
         self,
@@ -120,7 +123,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
     ) -> None:
         """Validate and persist a Successor request without driving it."""
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,
@@ -170,4 +173,5 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             output_root=self.volume_root,
             pull_worker_coordinator=self.pull_worker_coordinator,
             poll_interval_seconds=self.poll_interval_seconds,
+            volume_io_lock=self._volume_io_lock,
         )

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from threading import RLock
+from typing import Any, cast
 from uuid import UUID
 
 import orjson
@@ -57,8 +58,10 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         predecessor_execution_run_id: UUID | None = None,
         poll_interval_seconds: float = 1.0,
         now: Callable[[], int] | None = None,
+        volume_io_lock: RLock | None = None,
     ) -> None:
         """Bind the kernel writer to Rosetta's Task publications."""
+        volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
         self._bind_execution_runtime(
             request=request,
             execution_run_id=execution_run_id,
@@ -69,6 +72,7 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
             predecessor_execution_run_id=predecessor_execution_run_id,
             poll_interval_seconds=poll_interval_seconds,
             now=now,
+            volume_io_lock=volume_io_lock,
         )
         self.output_root = Path(output_root)
         self.pull_worker_coordinator = pull_worker_coordinator
@@ -115,13 +119,15 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         """Validate one microbatch and checkpoint its next claim atomically."""
         if not completions:
             raise ValueError("fused pull completion requires a nonempty batch")
-        return self._provider.record_pull_task_completions_and_claim(
-            provider_call_id,
-            self._pull_completion_observations(provider_call_id, completions),
-            request_id=request_id,
-            capacity=capacity,
-            now=self._now(),
-        )
+        volume_io_lock = cast(Any, self._volume_io_lock)
+        with volume_io_lock:
+            return self._provider.record_pull_task_completions_and_claim(
+                provider_call_id,
+                self._pull_completion_observations(provider_call_id, completions),
+                request_id=request_id,
+                capacity=capacity,
+                now=self._now(),
+            )
 
     def _pull_completion_observations(
         self,
@@ -216,6 +222,12 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         )
 
     def _recover_publications(self) -> None:
+        volume_io_lock = cast(Any, self._volume_io_lock)
+        with volume_io_lock:
+            self._recover_publications_locked()
+
+    def _recover_publications_locked(self) -> None:
+        """Recover Rosetta publications while owning the Volume-I/O lock."""
         with self.store.synchronize():
             repository = self.store.execution
             node = repository.get_node(self.execution_run_id, ROSETTA_TASKS_NODE)
@@ -340,6 +352,12 @@ class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
         return frozenset(deferred)
 
     def _start_ready_node(self) -> None:
+        volume_io_lock = cast(Any, self._volume_io_lock)
+        with volume_io_lock:
+            self._start_ready_node_locked()
+
+    def _start_ready_node_locked(self) -> None:
+        """Discover and validate Rosetta Tasks under the Volume-I/O lock."""
         with self.store.synchronize():
             repository = self.store.execution
             statuses = {

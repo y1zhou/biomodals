@@ -2,27 +2,15 @@
 
 from __future__ import annotations
 
-import sys
-
 from biomodals.workflow.core.builder import WorkflowDefinition
 from biomodals.workflow.core.nodes import RemoteTaskWorkflowNode, RemoteWorkflowNode
 
-__all__ = ["print_workflow_dag", "print_workflow_message"]
-
-
-def print_workflow_message(renderable: object, *, style: str | None = None) -> None:
-    """Print a workflow runtime message."""
-    del style
-    sys.stdout.write(f"{renderable}\n")
-    sys.stdout.flush()
+__all__ = ["print_workflow_dag"]
 
 
 def print_workflow_dag(definition: WorkflowDefinition) -> None:
     """Print a compact workflow DAG graph."""
-    print_workflow_message(
-        "[workflow] DAG graph: node_id [execution; class] <- dependency",
-        style="bold blue",
-    )
+    print("[workflow] DAG graph: node_id [execution; class] <- dependency", flush=True)
     for node_id, spec in definition.nodes.items():
         dependencies = sorted(definition.dependencies[node_id])
         dependency_text = ", ".join(dependencies) if dependencies else "-"
@@ -32,6 +20,7 @@ def print_workflow_dag(definition: WorkflowDefinition) -> None:
             if isinstance(spec.node, RemoteWorkflowNode | RemoteTaskWorkflowNode)
             else "coordinator-local"
         )
-        print_workflow_message(
-            f"[workflow]   {node_id} [{execution}; {node_class}] <- {dependency_text}"
+        print(
+            f"[workflow]   {node_id} [{execution}; {node_class}] <- {dependency_text}",
+            flush=True,
         )

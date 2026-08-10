@@ -133,11 +133,6 @@ class AppFunction:
     docstring: str | None
     argument_rows: tuple[tuple[str, str], ...] = ()
 
-    @property
-    def args_table(self) -> list[str]:
-        """Return the complete rendered CLI argument table."""
-        return self.visible_args_table()
-
     def visible_args_table(
         self,
         *,

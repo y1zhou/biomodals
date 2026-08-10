@@ -408,7 +408,7 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
         table_rows = f.visible_args_table(hidden_parameters=hidden_parameters)
         console.print(
             _docstring_without_args(f.docstring)
-            if f.args_table
+            if f.argument_rows
             else f.docstring or "No documentation available."
         )
         if table_rows:
@@ -460,7 +460,7 @@ def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) 
                 )
                 console.print(Markdown("\n".join(table_rows)))
                 console.print()
-            elif f.args_table:
+            elif f.argument_rows:
                 console.print(
                     f"[bold green]{f.name}[/bold green] has no "
                     "entrypoint-specific CLI flags.\n"

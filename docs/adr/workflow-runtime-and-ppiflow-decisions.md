@@ -200,10 +200,6 @@ PPIFlow stage-specific remote wrappers mount only the workflow and app volumes n
 
 PPIFlow stage-specific remote wrappers start with the current workflow resource defaults. Separate wrappers preserve a clean path for later CPU, memory, timeout, GPU, and mount tuning, but this refactor should not guess resource settings before real stage telemetry exists.
 
-## Commit the PPIFlow refactor by phase
-
-The PPIFlow refactor should be committed in phase-sized changes rather than one large commit. Phase commits make review, bisecting, and rollback easier; pushing remains a separate explicit action.
-
 ## Prune workflow runs from terminal nodes
 
 The workflow runtime will decide run completion and resume scope from terminal workflow nodes. If every terminal node has durable completion and non-missing recorded outputs, the run succeeds without scheduling intermediate nodes, even when stale failed, running, or incomplete intermediate state remains. If some terminal nodes are incomplete, the scheduler only considers those terminals and their ancestor closure.

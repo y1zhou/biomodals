@@ -26,10 +26,7 @@ from biomodals.execution import (
     RunStatusReason,
     SqliteExecutionRepository,
 )
-from biomodals.service.runtime_config import (
-    JobAdmissionConfiguration,
-    ModalConfigurationSnapshot,
-)
+from biomodals.service.runtime_config import JobAdmissionConfiguration
 
 
 class UserAlreadyExistsError(ValueError):
@@ -304,15 +301,6 @@ class JobRecord:
                 )
             )
         return history
-
-    @property
-    def modal_configuration(self) -> ModalConfigurationSnapshot:
-        """Return the provider identity captured when this Job was admitted."""
-        return ModalConfigurationSnapshot(
-            environment=self.modal_environment,
-            app_name=self.modal_app_name,
-            app_version=self.modal_app_version,
-        )
 
 
 @dataclass(frozen=True, slots=True)

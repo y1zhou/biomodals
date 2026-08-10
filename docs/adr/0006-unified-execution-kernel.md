@@ -173,14 +173,12 @@ The workflow runtime composes the shared execution repository and a narrow
 Workflow Artifact Store over the same connection. The physical
 `ledger.sqlite3` file remains.
 
-The workflow cutover policy was accepted on 2026-07-29. Kernel modules and
-tests are built beside the unchanged workflow execution implementation. There
-is no `WorkflowLedger` compatibility facade, dual schema, dual write, or
-attempt-preserving adapter. Once the kernel replacement is complete, one
-cutover commit switches the workflow composition root, deletes the old
-execution methods and attempt model, and rejects old unfinished ledgers.
-Rollback reverts that commit and recreates unfinished runs; scientific
-publications remain reusable.
+The workflow cutover policy was accepted on 2026-07-29 and is now implemented.
+The workflow composition root uses `SqliteExecutionRepository` directly with
+its workflow-owned artifact store. There is no `WorkflowLedger` compatibility
+facade, dual schema, dual write, attempt model, or compatibility reader for old
+unfinished ledgers. Scientific publications remain independently reusable
+when their workload validators accept them.
 
 The repository implementation was accepted on 2026-07-29. The first kernel
 uses one concrete `SqliteExecutionRepository` over a host-supplied SQLite

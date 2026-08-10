@@ -135,6 +135,10 @@ These existing decisions remain binding during the refactor:
   every app or model that can affect its publications. These versions enter
   the Workload Plan Fingerprint even when a particular Node class has no
   node-local version hook.
+- Mutable model weights or reference datasets that are not themselves bound by
+  content digest require a new declared scientific version whenever their
+  bytes change. Reusing a version for different bytes invalidates cache and
+  Successor correctness.
 - Workflow Node parallelism and Run-level Provider Call limits are different
   controls.
 - AlphaFold3 raw searches, assemblies, templates, and seeds retain their
@@ -737,12 +741,11 @@ src/biomodals/execution/
   runtime.py              # caller-driven composition facade
 ```
 
-The initial internal interface should be no larger than:
+The supported internal interface is centered on:
 
 - `ExecutionPlan`
 - `NodePlan`
 - `TaskPlan`
-- `TaskResult`
 - `ExecutionRuntime`
 
 Each composition root supplies its SQLite connection and transaction,
@@ -1456,44 +1459,25 @@ cursor, aging, priority weights, per-Node quota, preemption, or scheduler
 plugin. A high-ranked Node may fill every available call slot; lower-ranked
 finite work becomes eligible as those calls finish.
 
-### Workflow Ledger decomposition
+### Workflow run-store composition
 
-The existing physical workflow `ledger.sqlite3` file remains useful. The
-existing `WorkflowLedger` class and its generic execution schema should not
-remain as a parallel implementation.
+Each physical workflow `ledger.sqlite3` file composes the shared execution
+repository with workflow-owned artifact records on one SQLite connection.
+There is no separate `WorkflowLedger` execution implementation.
 
-The target split is:
-
-| Current Workflow Ledger concern | Destination |
+| Concern | Owner |
 | --- | --- |
-| Execution columns from `runs`, `nodes`, and `remote_calls` | Shared execution SQLite schema |
-| `attempts`, `current_attempt_id`, attempt foreign keys, and attempt counters | Delete; move the one retained result or error to Task, Node, Provider Call, or artifact state |
-| Run, Node, Task, Dispatch Batch, Worker Assignment, and Provider Call transitions | Shared execution repository implementation |
-| `RunStatus`, `NodeStatus`, placement, and recovery policy | Shared execution models imported directly after cutover |
-| `NodeExecutionPolicy`, `AttemptRecord`, and `NodeStatusRecord.attempts` | Delete; provider redelivery and Successor Execution Runs replace generic rerun policy |
+| Run, Node, Task, Worker Assignment, and Provider Call state | Shared execution repository |
+| Status, placement, admission, and recovery policy | Shared execution models and scheduler |
 | `artifacts`, `artifact_files`, `node_inputs`, and `node_outputs` tables | Workflow-specific run store |
 | `WorkflowArtifact`, `ArtifactSelector`, and materialized `AppRunResult` handling | Workflow-specific artifact module |
 | Run-root directories, node/task output paths, connection closure, and Volume synchronization | Workflow-specific run store |
-| Finalizing execution state and artifacts together | One host-owned SQLite transaction spanning both implementations |
+| Finalizing execution state and artifacts together | One host-owned SQLite transaction |
 
-This leaves one SQLite file per workflow run, not an execution database beside
-a workflow database. The file contains shared execution tables and
-workflow-specific artifact tables on the same connection.
-
-The kernel implementation and its tests are built alongside the current
-workflow runtime, but the current `WorkflowLedger` is never adapted into a
-compatibility facade and never dual-writes the new schema. One direct cutover
-commit switches the workflow composition root to
-`SqliteExecutionRepository` plus a narrow `WorkflowArtifactStore`, deletes the
-old execution methods and attempt model, and rejects old unfinished ledgers.
-The deletion test is that removing the old `WorkflowLedger` class must not
-redistribute generic SQL or transition logic back into workflow callers.
-
-The service follows the same pattern. The user-facing Service Job points to an
-Execution Run. `job_operations`, persisted `JobOperationState`, and persisted
-compute `JobState` are replaced by shared Execution Nodes, Tasks, and Provider
-Calls. Service projections retain the existing HTTP state and timeline
-vocabulary without preserving a second operation state machine.
+The API service follows the same ownership boundary: a user-facing Service Job
+points to an Execution Run, while HTTP state and timeline vocabulary are
+projections of shared execution state rather than a second compute state
+machine.
 
 ### Paid-call lifecycle
 
@@ -1755,38 +1739,13 @@ These policies neither cancel already-owned work nor authorize another
 submission. A failed Task remains failed for that Execution Run; retry
 requires an explicit Successor Execution Run.
 
-## State-transition policy
+## Pre-release schema policy
 
-This pre-release refactor does not carry old execution history into the new
-model.
-
-For the API service:
-
-- preserve `users`, password and session data, `service_settings`, and
-  `workload_settings`;
-- recreate the Service Job table around its one-way `execution_run_id`;
-- remove `job_operations` and all persisted compute-state columns;
-- create the shared execution schema at the current kernel version;
-- discard old Job history, result-cache rows, and unfinished execution state;
-- leave remote Modal Volumes and workload publications untouched.
-
-The transition is an explicit offline CLI operation, not an automatic
-destructive startup migration. It stops if the source schema is unexpected,
-performs the service-table preservation and execution-state replacement in a
-transaction, and records the new schema version. No compatibility reader,
-dual-write path, or automatic backup is required.
-
-For workflows:
-
-- write an execution-schema version into each new physical Workflow Ledger;
-- reject an older ledger with a clear instruction to restart or force the run;
-- do not migrate old Nodes, attempts, calls, or artifact rows;
-- retain app-owned Volume outputs so workload validators can reuse valid
-  scientific publications in the restarted run.
-
-Local staged API result files left by discarded Job rows are service cache, not
-kernel state. Clean them through the existing administrator cache-management
-path rather than teaching the execution migration about service files.
+Execution databases declare one exact kernel schema version. Unsupported
+versions fail closed; the kernel has no compatibility reader, dual-write path,
+or automatic destructive migration. Service-owned identity and configuration
+data remain the service's responsibility, and app-owned Modal publications
+remain available for validation by a newly created Execution Run.
 
 ## Verification matrix
 

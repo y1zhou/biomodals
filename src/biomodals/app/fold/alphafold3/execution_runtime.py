@@ -705,20 +705,16 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         if any(candidate.node_key == _SEED_PREDICTIONS for candidate in selected):
             super()._reload_output()
             self._seed_prediction_cache = None
-        resolved_functions: dict[ProviderBinding, Any] = {}
+        resolved_functions = self._provider.resolve_provider_bindings(
+            self.execution_run_id,
+            (candidate.binding for candidate in selected),
+            now=self._now(),
+        )
+        if resolved_functions is None:
+            return
         submissions = []
         for candidate in selected:
             planned = planned_by_node[candidate.node_key]
-            binding_function = resolved_functions.get(candidate.binding)
-            if binding_function is None:
-                binding_function = self._provider.resolve_provider_binding(
-                    self.execution_run_id,
-                    candidate.binding,
-                    now=self._now(),
-                )
-                if binding_function is None:
-                    return
-                resolved_functions[candidate.binding] = binding_function
             selected_candidate, claimed = self._claim_seed_candidate(
                 candidate,
                 planned,
@@ -733,7 +729,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             submissions.append(
                 ProviderCallSubmission(
                     candidate=selected_candidate,
-                    function=binding_function,
+                    function=resolved_functions[selected_candidate.binding],
                     submission_token=selected_candidate.candidate_key,
                     args=args,
                     kwargs=kwargs,

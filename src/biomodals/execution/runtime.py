@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
@@ -739,15 +739,23 @@ class ExecutionRuntime:
             )
         return persisted
 
-    def resolve_provider_binding(
+    def resolve_provider_bindings(
         self,
         execution_run_id: UUID,
-        binding: ProviderBinding,
+        bindings: Iterable[ProviderBinding],
         *,
         now: int,
-    ) -> Any | None:
-        """Preflight one exact binding before workload writer coordination."""
-        return self._resolve_provider(execution_run_id, binding, now=now)
+    ) -> dict[ProviderBinding, Any] | None:
+        """Resolve each exact binding once before workload-owned preparation."""
+        resolved: dict[ProviderBinding, Any] = {}
+        for binding in bindings:
+            if binding in resolved:
+                continue
+            function = self._resolve_provider(execution_run_id, binding, now=now)
+            if function is None:
+                return None
+            resolved[binding] = function
+        return resolved
 
     def submit_provider_calls(
         self,
@@ -792,21 +800,23 @@ class ExecutionRuntime:
                 now=now,
             )
 
-        functions: dict[ProviderBinding, Any] = {}
+        unresolved = tuple(
+            submission.candidate.binding
+            for submission in submissions
+            if submission.function is None
+        )
+        functions = self.resolve_provider_bindings(
+            execution_run_id,
+            unresolved,
+            now=now,
+        )
+        if functions is None:
+            return tuple(None for _ in submissions)
         resolved: list[Any | None] = []
         for submission in submissions:
             binding = submission.candidate.binding
             function = submission.function
             if function is None:
-                if binding not in functions:
-                    resolved_function = self._resolve_provider(
-                        execution_run_id,
-                        binding,
-                        now=now,
-                    )
-                    if resolved_function is None:
-                        return tuple(None for _ in submissions)
-                    functions[binding] = resolved_function
                 function = functions[binding]
             else:
                 functions.setdefault(binding, function)

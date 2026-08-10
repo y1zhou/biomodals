@@ -194,11 +194,7 @@ class ExecutionCoordinator:
             with self._lock():
                 plan = self._persist_or_verify_plan(candidate)
                 runtime = self._open_runtime(plan, resolve_external_checker=False)
-            try:
-                runtime.prepare(workload_run_key=plan.workload_run_key)
-            finally:
-                with self._lock():
-                    self._close_runtime()
+            runtime.prepare(workload_run_key=plan.workload_run_key)
 
     @modal.method()
     def status(self) -> ExecutionOverview:
@@ -220,19 +216,12 @@ class ExecutionCoordinator:
             with self._lock():
                 overview = self._verified_overview()
                 if overview.run.status.is_terminal:
-                    self._close_runtime()
                     return overview
                 plan = self._load_plan()
                 runtime = self._open_runtime(plan, resolve_external_checker=False)
-            try:
-                runtime.run(
-                    workload_run_key=plan.workload_run_key,
-                )
-                with self._lock():
-                    return self._verified_overview()
-            finally:
-                with self._lock():
-                    self._close_runtime()
+            runtime.run(workload_run_key=plan.workload_run_key)
+            with self._lock():
+                return self._verified_overview()
 
     @modal.method()
     def resume(self) -> AppRunResult:
@@ -248,13 +237,7 @@ class ExecutionCoordinator:
                     resolve_external_checker=True,
                     external_checker=external_checker,
                 )
-            try:
-                return runtime.resume(
-                    workload_run_key=plan.workload_run_key,
-                )
-            finally:
-                with self._lock():
-                    self._close_runtime()
+            return runtime.resume(workload_run_key=plan.workload_run_key)
 
     @modal.method()
     def claim_tasks(
@@ -340,13 +323,7 @@ class ExecutionCoordinator:
                     resolve_external_checker=True,
                     external_checker=external_checker,
                 )
-            try:
-                return runtime.run(
-                    workload_run_key=plan.workload_run_key,
-                )
-            finally:
-                with self._lock():
-                    self._close_runtime()
+            return runtime.run(workload_run_key=plan.workload_run_key)
 
     @modal.method()
     def prepare_restart_from(
@@ -514,6 +491,17 @@ class ExecutionCoordinator:
     ) -> WorkflowRuntime:
         runtime = getattr(self, "_runtime", None)
         if runtime is not None:
+            if resolve_external_checker and plan.strict_external_artifact_checks:
+                if external_checker is None:
+                    raise RuntimeError("External artifact checker was not preflighted")
+            if resolve_external_checker and (
+                plan.strict_external_artifact_checks
+                or self._development_function_handles is not None
+            ):
+                runtime.configure_provider_boundary(
+                    modal_driver=self._modal_driver(),
+                    external_artifact_checker=external_checker,
+                )
             return runtime
         execution_run_id, deployment = self._identity()
         driver = self._modal_driver()

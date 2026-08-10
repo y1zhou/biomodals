@@ -625,7 +625,6 @@ class ExecutionCoordinatorLifecycle:
                 overview = runtime.store.execution.overview(self.execution_run_id)
                 self._verify_overview(overview)
                 if overview.run.status.is_terminal:
-                    self._close_runtime()
                     return overview
             return self._drive(runtime, resume=False)
 
@@ -660,13 +659,9 @@ class ExecutionCoordinatorLifecycle:
                 self._close_runtime()
 
     def _drive(self, runtime: Any, *, resume: bool) -> ExecutionOverview:
-        try:
-            overview = runtime.resume() if resume else runtime.run()
-            self._verify_overview(overview)
-            return overview
-        finally:
-            with self._writer_lock:
-                self._close_runtime()
+        overview = runtime.resume() if resume else runtime.run()
+        self._verify_overview(overview)
+        return overview
 
     def _run_store(self) -> ExecutionRunStore:
         return ExecutionRunStore(

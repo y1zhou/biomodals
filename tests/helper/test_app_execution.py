@@ -197,6 +197,7 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
             self.active_drivers = 0
             self.max_active_drivers = 0
             self.closed_while_driving = False
+            self.close_count = 0
             self._lock = Lock()
             self.store = SimpleNamespace(
                 execution=SimpleNamespace(overview=lambda _run_id: self.snapshot())
@@ -234,6 +235,7 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
 
         def close(self) -> None:
             with self._lock:
+                self.close_count += 1
                 self.closed_while_driving |= self.active_drivers > 0
 
     runtime = FakeRuntime()
@@ -271,6 +273,11 @@ def test_app_coordinator_cancel_does_not_start_a_second_driver(
     assert errors == []
     assert runtime.max_active_drivers == 1
     assert not runtime.closed_while_driving
+    assert coordinator._runtime is runtime
+    assert runtime.close_count == 0
+
+    coordinator.close()
+    assert runtime.close_count == 1
 
 
 def test_app_coordinator_status_is_available_during_provider_io(

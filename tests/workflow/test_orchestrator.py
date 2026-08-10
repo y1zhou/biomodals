@@ -322,8 +322,7 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
 
     assert result.status == AppRunStatus.SUCCEEDED
     init = cast(dict[str, object], calls["init"])
-    assert init["workflow"] is not workflow
-    assert cast(Workflow, init["workflow"]).validate() == workflow.validate()
+    assert init["workflow"] is workflow
     assert init["execution_run_id"] == RUN_ID
     assert init["deployment"] == DEPLOYMENT
     assert init["volume_root"] == tmp_path
@@ -333,6 +332,10 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert init["max_active_provider_calls"] == 9
     assert init["max_active_gpu_provider_calls"] == 3
     assert calls["workload_run_key"] == "friendly-name"
+    assert "closed" not in calls
+
+    raw_cls.exit._get_raw_f()(instance)
+
     assert calls["closed"] is True
     assert volume.reload_count == 1
     assert volume.commit_count == 0
@@ -435,6 +438,9 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
         def run(self, **_kwargs: object) -> AppRunResult:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
+        def configure_provider_boundary(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+
         def close(self) -> None:
             pass
 
@@ -482,6 +488,9 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
         def run(self, **_kwargs: object) -> AppRunResult:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
+        def configure_provider_boundary(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+
         def close(self) -> None:
             pass
 
@@ -506,7 +515,6 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
     resolved_checker = cast(Any, calls["external_artifact_checker"])
     assert resolved_checker.__self__ is checker
     assert checker.hydrated is True
-    assert calls["strict_external_artifact_checks"] is True
 
 
 def test_status_and_terminal_cancel_are_read_only_kernel_views(
@@ -1112,7 +1120,119 @@ def test_resume_reloads_the_persisted_plan(
     assert result.status == AppRunStatus.SUCCEEDED
     assert calls["workload_run_key"] == "friendly-name"
     assert cast(dict[str, object], calls["init"])["deployment"] == DEPLOYMENT
+    assert "closed" not in calls
+
+    raw_cls.exit._get_raw_f()(instance)
+
     assert calls["closed"] is True
+
+
+def test_existing_runtime_installs_strict_checker_before_drive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_cls, instance = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        FakeVolume(),
+    )
+    checker = object()
+
+    class FakeRuntime:
+        external_artifact_checker = None
+
+        def configure_provider_boundary(
+            self,
+            *,
+            modal_driver: object,
+            external_artifact_checker: object,
+        ) -> None:
+            del modal_driver
+            self.external_artifact_checker = external_artifact_checker
+
+    runtime = FakeRuntime()
+    instance._runtime = runtime
+    plan = orchestrator.WorkflowCoordinatorPlan(
+        workflow=Workflow("demo"),
+        workload_run_key="demo",
+        strict_external_artifact_checks=True,
+        external_artifact_checker_function_name="check_outputs",
+    )
+
+    opened = instance._open_runtime(
+        plan,
+        resolve_external_checker=True,
+        external_checker=checker,
+    )
+
+    assert opened is runtime
+    assert runtime.external_artifact_checker is checker
+
+
+def test_drive_keeps_runtime_open_for_concurrent_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_cls, instance = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        FakeVolume(),
+    )
+    plan = orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo")
+    callback_attached = Event()
+    release_callback = Event()
+
+    class FakeRuntime:
+        external_artifact_checker = None
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def attach(self, **_kwargs: object) -> None:
+            callback_attached.set()
+            assert release_callback.wait(timeout=1)
+
+        def claim_pull_tasks(self, *_args: object, **_kwargs: object) -> str:
+            if self.closed:
+                raise RuntimeError("callback observed a closed runtime")
+            return "claim"
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            self.closed = True
+
+    runtime = FakeRuntime()
+    instance._runtime = runtime
+    instance._require_ledger = lambda: None
+    instance._load_plan = lambda: plan
+    callback_result: list[object] = []
+
+    def claim() -> None:
+        callback_result.append(
+            raw_cls.claim_tasks._get_raw_f()(
+                instance,
+                str(UUID(int=1)),
+                "claim-request",
+                1,
+            )
+        )
+
+    callback = Thread(target=claim)
+    callback.start()
+    assert callback_attached.wait(timeout=1)
+
+    raw_cls.drive_prepared._get_raw_f()(instance)
+    release_callback.set()
+    callback.join(timeout=1)
+
+    assert not callback.is_alive()
+    assert callback_result == ["claim"]
+    assert not runtime.closed
+
+    raw_cls.exit._get_raw_f()(instance)
+    assert runtime.closed
 
 
 def test_enter_and_exit_close_without_cancelling(

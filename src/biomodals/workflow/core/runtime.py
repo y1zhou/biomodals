@@ -175,6 +175,16 @@ class WorkflowRuntime:
         self._definition: WorkflowDefinition | None = None
         self._workload_run_key: str | None = None
 
+    def configure_provider_boundary(
+        self,
+        *,
+        modal_driver: ModalCallDriver,
+        external_artifact_checker: ExternalArtifactChecker | None,
+    ) -> None:
+        """Install driver-only dependencies unavailable to callback-first opens."""
+        self._provider._modal = modal_driver
+        self.external_artifact_checker = external_artifact_checker
+
     def run(
         self,
         *,

@@ -1403,11 +1403,26 @@ class SqliteExecutionRepository:
             compatibility_key=compatibility_key,
             max_tasks_per_call=max_tasks_per_call,
         )
-        tasks = [
-            self.get_task(execution_run_id, node_key, task_key)
-            for task_key in task_keys
-        ]
-        for task in tasks:
+        task_placeholders = ", ".join("?" for _ in task_keys)
+        task_rows = self._connection.execute(
+            f"""
+            SELECT *
+            FROM execution_tasks
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND task_key IN ({task_placeholders})
+            """,  # noqa: S608 - placeholders are generated, not user input
+            (str(execution_run_id), node_key, *task_keys),
+        ).fetchall()
+        task_rows_by_key = {str(row["task_key"]): row for row in task_rows}
+        if len(task_rows_by_key) != len(task_keys):
+            missing = sorted(set(task_keys).difference(task_rows_by_key))
+            raise KeyError(
+                f"Tasks do not exist in Node {node_key!r}: {', '.join(missing)}"
+            )
+        for task_key in task_keys:
+            task_row = task_rows_by_key[task_key]
+            task = _task_from_row(task_row)
             if (
                 task.status != TaskStatus.PENDING
                 or task.result_observation != AvailabilityStatus.MISSING
@@ -1418,20 +1433,7 @@ class SqliteExecutionRepository:
                 raise ValueError(
                     f"Task {task.task_key!r} is not ready for Provider Call ownership"
                 )
-            policy_row = self._connection.execute(
-                """
-                SELECT dispatch_policy_json
-                FROM execution_tasks
-                WHERE execution_run_id = ?
-                    AND node_key = ?
-                    AND task_key = ?
-                """,
-                (str(execution_run_id), node_key, task.task_key),
-            ).fetchone()
-            if (
-                policy_row is None
-                or policy_row["dispatch_policy_json"] != expected_policy_json
-            ):
+            if task_row["dispatch_policy_json"] != expected_policy_json:
                 raise ValueError(
                     "fixed-batch dispatch policy cannot change within a Run"
                 )
@@ -1502,30 +1504,31 @@ class SqliteExecutionRepository:
                 now,
             ),
         )
-        for task_key in task_keys:
-            self._connection.execute(
-                """
-                UPDATE execution_tasks
-                SET status = ?,
-                    dispatch_batch_id = ?,
-                    provider_call_id = ?,
-                    started_at = ?,
-                    updated_at = ?
-                WHERE execution_run_id = ?
-                    AND node_key = ?
-                    AND task_key = ?
-                """,
-                (
-                    TaskStatus.RUNNING.value,
-                    str(dispatch_batch_id),
-                    str(provider_call_id),
-                    now,
-                    now,
-                    str(execution_run_id),
-                    node_key,
-                    task_key,
-                ),
-            )
+        updated = self._connection.execute(
+            f"""
+            UPDATE execution_tasks
+            SET status = ?,
+                dispatch_batch_id = ?,
+                provider_call_id = ?,
+                started_at = ?,
+                updated_at = ?
+            WHERE execution_run_id = ?
+                AND node_key = ?
+                AND task_key IN ({task_placeholders})
+            """,  # noqa: S608 - placeholders are generated, not user input
+            (
+                TaskStatus.RUNNING.value,
+                str(dispatch_batch_id),
+                str(provider_call_id),
+                now,
+                now,
+                str(execution_run_id),
+                node_key,
+                *task_keys,
+            ),
+        )
+        if updated.rowcount != len(task_keys):
+            raise RuntimeError("fixed-batch preclaim did not update every Task")
         return ProviderCallPreclaim(
             call=self.get_provider_call(provider_call_id),
             spawn_authorized=True,

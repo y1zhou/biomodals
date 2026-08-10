@@ -108,6 +108,52 @@ def test_preclaim_atomically_enforces_total_and_gpu_subset_limits() -> None:
     )
 
 
+def test_fixed_preclaim_uses_constant_task_sql_crossings() -> None:
+    crossing_counts = []
+    for task_count in (1, 100):
+        connection = sqlite3.connect(":memory:")
+        repository = create_repository(
+            connection=connection,
+            task_count=task_count,
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=1,
+        )
+        task_keys = tuple(f"seed-{index}" for index in range(task_count))
+        persist_fixed_policy(
+            repository,
+            task_keys,
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            max_tasks_per_call=task_count,
+        )
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+
+        claim = repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            task_keys,
+            submission_token=f"gpu-{task_count}",
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            max_tasks_per_call=task_count,
+            now=110,
+        )
+
+        connection.set_trace_callback(None)
+        assert claim is not None
+        normalized = [" ".join(statement.split()).upper() for statement in statements]
+        crossing_counts.append((
+            sum("FROM EXECUTION_TASKS" in statement for statement in normalized),
+            sum(
+                statement.startswith("UPDATE EXECUTION_TASKS")
+                for statement in normalized
+            ),
+        ))
+
+    assert crossing_counts == [(2, 1), (2, 1)]
+
+
 def test_unknown_calls_retain_slots_and_durable_success_releases_them() -> None:
     repository = create_repository(
         task_count=3,

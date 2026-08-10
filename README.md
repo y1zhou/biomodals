@@ -32,6 +32,43 @@ CLI -> deployed app/workflow coordinator -> biomodals.execution -> Modal functio
 Browser -> static frontend -> FastAPI service -> biomodals.execution -> Modal functions
 ```
 
+For a workflow run, the workflow core supplies the scientific DAG and
+workload-specific hooks while the execution kernel owns durable orchestration:
+
+```mermaid
+flowchart TD
+    Caller["Workflow CLI or coordinator entrypoint"] --> Core
+
+    subgraph Coordinator["Remote workflow coordinator"]
+        Core["biomodals.workflow.core<br/>Build the DAG and provide workload hooks"]
+
+        subgraph Kernel["biomodals.execution"]
+            Runtime["Runtime and scheduler<br/>Admit, recover, and cancel work"]
+            Ledger[("SQLite execution ledger<br/>Runs · Nodes · Tasks · provider calls")]
+            Driver["Modal call driver"]
+        end
+
+        Core -->|"Execution plan and hooks"| Runtime
+        Runtime -->|"Persist state transitions"| Ledger
+        Ledger -->|"Ready Tasks and durable state"| Runtime
+        Runtime -->|"Submit, observe, or cancel"| Driver
+        Driver -->|"Provider call observations"| Runtime
+        Runtime -->|"Validate and assemble results"| Core
+    end
+
+    subgraph Modal["Modal"]
+        Workers["Deployed functions<br/>Provider workers"]
+        Volumes[("Modal Volumes<br/>Scientific inputs and outputs")]
+        Workers --> Volumes
+    end
+
+    Driver -->|"Spawn calls"| Workers
+    Workers -->|"Outcomes and result references"| Driver
+    Volumes -->|"Cache and publication probes"| Core
+    Runtime -->|"Terminal Run outcome"| Core
+    Core -->|"Workflow result"| Caller
+```
+
 `biomodals.execution` is an embedded Python library, not a central scheduler
 service. Each coordinator embeds it and owns the database for the work it
 coordinates.

@@ -20,10 +20,8 @@ from biomodals.execution import (
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
-    ProviderCallSubmission,
     TaskPlan,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_execution import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
@@ -490,47 +488,6 @@ class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
         )
         _workload_module()._validate_preparation_plan(plan)
         return plan
-
-    def _admit_remote_tasks(self, required: set[str]) -> None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            run = repository.get_run(self.execution_run_id)
-            counts = repository.active_provider_call_counts(self.execution_run_id)
-        selected = self._provider.fixed_call_candidates(
-            self.execution_run_id,
-            required_node_keys=required,
-            describe_task=lambda node, task, rank: TaskDispatchDescriptor(
-                node_key=node.node_key,
-                node_ordinal=node.ordinal,
-                task_key=task.task_key,
-                task_ordinal=task.ordinal,
-                binding=self._binding(node.node_key),
-                compatibility_key=self._binding(node.node_key).function_name,
-                max_tasks_per_call=1,
-                depth=rank.depth,
-                unblocking_span=rank.unblocking_span,
-            ),
-            available_total_slots=max(0, run.max_active_provider_calls - counts.total),
-            available_gpu_slots=max(0, run.max_active_gpu_provider_calls - counts.gpu),
-            now=self._now(),
-        )
-        for candidate in selected:
-            self._ensure_publication_claim(candidate.node_key)
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    kwargs=self._invocation_kwargs(
-                        candidate.node_key,
-                        candidate.task_keys[0],
-                    ),
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
-        )
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

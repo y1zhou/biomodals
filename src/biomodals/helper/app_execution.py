@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Lock, RLock
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from biomodals.execution import (
@@ -20,10 +20,13 @@ from biomodals.execution import (
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
     ExecutionRuntime,
+    ProviderBinding,
+    ProviderCallSubmission,
     SqliteExecutionRepository,
     drive_execution_run,
     resume_execution_run,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 
 LEDGER_FILENAME = "ledger.sqlite3"
 
@@ -499,6 +502,20 @@ class ExecutionRuntimeLifecycle:
                 self._provider.repository = self.store.execution
 
 
+class _SingleTaskAdmissionHooks(Protocol):
+    """Workload hooks for the standard one-Task-per-call admission path."""
+
+    def _binding(self, node_key: str) -> ProviderBinding: ...
+
+    def _ensure_publication_claim(self, node_key: str) -> None: ...
+
+    def _invocation_kwargs(
+        self,
+        node_key: str,
+        task_key: str,
+    ) -> dict[str, object]: ...
+
+
 class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
     """Share the standard publication, recovery, and admission cycle."""
 
@@ -527,7 +544,47 @@ class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
         raise NotImplementedError
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
-        raise NotImplementedError
+        """Admit fixed Provider Calls containing one Task each."""
+        hooks = cast(_SingleTaskAdmissionHooks, self)
+        with self.store.synchronize():
+            repository = self.store.execution
+            run = repository.get_run(self.execution_run_id)
+            counts = repository.active_provider_call_counts(self.execution_run_id)
+        selected = self._provider.fixed_call_candidates(
+            self.execution_run_id,
+            required_node_keys=required,
+            describe_task=lambda node, task, rank: TaskDispatchDescriptor(
+                node_key=node.node_key,
+                node_ordinal=node.ordinal,
+                task_key=task.task_key,
+                task_ordinal=task.ordinal,
+                binding=hooks._binding(node.node_key),
+                compatibility_key=hooks._binding(node.node_key).function_name,
+                max_tasks_per_call=1,
+                depth=rank.depth,
+                unblocking_span=rank.unblocking_span,
+            ),
+            available_total_slots=max(0, run.max_active_provider_calls - counts.total),
+            available_gpu_slots=max(0, run.max_active_gpu_provider_calls - counts.gpu),
+            now=self._now(),
+        )
+        for candidate in selected:
+            hooks._ensure_publication_claim(candidate.node_key)
+        self._provider.submit_provider_calls(
+            self.execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=candidate.candidate_key,
+                    kwargs=hooks._invocation_kwargs(
+                        candidate.node_key,
+                        candidate.task_keys[0],
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
 
 
 class ExecutionCoordinatorLifecycle:

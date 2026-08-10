@@ -32,6 +32,7 @@ from biomodals.execution.modal import (
     ModalCallObservationKind,
 )
 from biomodals.helper.app_execution import ExecutionRunStore
+from biomodals.helper.artifacts import file_size_sha256
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "BoltzGen", 7)
@@ -152,6 +153,39 @@ def _publish_run(
     write_boltzgen_task_publication(
         final.parent,
         task_fingerprint=_task_fingerprint(request, run_id),
+    )
+
+
+def _publish_collection(
+    tmp_path: Path,
+    request: BoltzGenExecutionRequest,
+) -> None:
+    for run_id in request.run_ids:
+        _publish_run(tmp_path, request, run_id)
+    artifacts = []
+    for run_id in request.run_ids:
+        run_root = boltzgen_run_root(tmp_path, request.run_name, run_id)
+        for path in sorted(run_root.rglob("*")):
+            if not path.is_file():
+                continue
+            size_bytes, digest = file_size_sha256(path)
+            artifacts.append({
+                "path": path.relative_to(tmp_path).as_posix(),
+                "size_bytes": size_bytes,
+                "sha256": digest,
+            })
+    write_collection_publication(
+        tmp_path,
+        request.collection_publication_path,
+        {
+            "run_name": request.run_name,
+            "run_ids": list(request.run_ids),
+            "task_fingerprints": {
+                run_id: _task_fingerprint(request, run_id) for run_id in request.run_ids
+            },
+            "filtered": False,
+            "artifacts": artifacts,
+        },
     )
 
 
@@ -308,15 +342,7 @@ def test_terminal_collection_publication_prunes_all_calls(
     monkeypatch,
 ) -> None:
     request = _request()
-    write_collection_publication(
-        tmp_path,
-        request.collection_publication_path,
-        {
-            "run_name": request.run_name,
-            "run_ids": list(request.run_ids),
-            "filtered": False,
-        },
-    )
+    _publish_collection(tmp_path, request)
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
     runtime._initialize()
@@ -355,15 +381,7 @@ def test_unknown_run_prunes_calls_after_terminal_publication_appears(
                 now=11,
             )
     driver.state_unknown = True
-    write_collection_publication(
-        tmp_path,
-        request.collection_publication_path,
-        {
-            "run_name": request.run_name,
-            "run_ids": list(request.run_ids),
-            "filtered": False,
-        },
-    )
+    _publish_collection(tmp_path, request)
 
     overview = runtime.resume()
     snapshot = runtime.store.execution.snapshot(RUN_ID)

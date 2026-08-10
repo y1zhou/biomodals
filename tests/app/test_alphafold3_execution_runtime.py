@@ -407,6 +407,11 @@ def test_completed_invocation_prunes_every_ancestor_without_a_call(
         "load_invocation_manifest",
         lambda *args, **kwargs: {"status": "complete"},
     )
+    monkeypatch.setattr(
+        execution_runtime,
+        "request_manifest_artifacts_available",
+        lambda *args, **kwargs: True,
+    )
     runtime._initialize()
 
     runtime.advance_once()

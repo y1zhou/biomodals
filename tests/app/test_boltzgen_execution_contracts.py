@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,9 @@ from biomodals.app.design import boltzgen_app
 from biomodals.app.design.boltzgen.execution_contracts import (
     boltzgen_output_claim_key,
     is_boltzgen_run_complete,
+    load_collection_publication,
     write_boltzgen_task_publication,
+    write_collection_publication,
 )
 from biomodals.helper.output_claim import (
     acquire_output_claim,
@@ -240,4 +243,85 @@ def test_task_publication_rejects_corrupt_final_evidence(tmp_path: Path) -> None
     assert not is_boltzgen_run_complete(
         run_dir,
         task_fingerprint=fingerprint,
+    )
+
+
+def test_collection_publication_rejects_changed_archive_bytes(tmp_path: Path) -> None:
+    archive = tmp_path / "results.tar.zst"
+    archive.write_bytes(b"AAAA")
+    fingerprints = {"run-a": "a" * 64}
+    publication = Path("example/results/fingerprint.json")
+    write_collection_publication(
+        tmp_path,
+        publication,
+        {
+            "run_name": "example",
+            "run_ids": ["run-a"],
+            "task_fingerprints": fingerprints,
+            "filtered": True,
+            "archive_path": archive.name,
+            "archive_size_bytes": 4,
+            "archive_sha256": sha256(b"AAAA").hexdigest(),
+        },
+    )
+
+    assert (
+        load_collection_publication(
+            tmp_path,
+            publication,
+            run_name="example",
+            run_ids=("run-a",),
+            task_fingerprints=fingerprints,
+        )
+        is not None
+    )
+    archive.write_bytes(b"BBBB")
+    assert (
+        load_collection_publication(
+            tmp_path,
+            publication,
+            run_name="example",
+            run_ids=("run-a",),
+            task_fingerprints=fingerprints,
+        )
+        is None
+    )
+
+
+def test_collection_publication_rejects_missing_unfiltered_artifact(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "example" / "outputs" / "run-a" / "result.cif"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"data")
+    fingerprints = {"run-a": "a" * 64}
+    publication = Path("example/results/fingerprint.json")
+    write_collection_publication(
+        tmp_path,
+        publication,
+        {
+            "run_name": "example",
+            "run_ids": ["run-a"],
+            "task_fingerprints": fingerprints,
+            "filtered": False,
+            "artifacts": [
+                {
+                    "path": artifact.relative_to(tmp_path).as_posix(),
+                    "size_bytes": 4,
+                    "sha256": sha256(b"data").hexdigest(),
+                }
+            ],
+        },
+    )
+
+    artifact.unlink()
+    assert (
+        load_collection_publication(
+            tmp_path,
+            publication,
+            run_name="example",
+            run_ids=("run-a",),
+            task_fingerprints=fingerprints,
+        )
+        is None
     )

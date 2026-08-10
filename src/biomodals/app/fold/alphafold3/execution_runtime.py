@@ -68,6 +68,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     load_request_manifest,
+    request_manifest_artifacts_available,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
@@ -303,6 +304,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         return (
             AvailabilityStatus.AVAILABLE
             if manifest is not None
+            and request_manifest_artifacts_available(self.output_volume, manifest)
             else AvailabilityStatus.MISSING
         )
 

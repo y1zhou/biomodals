@@ -11,6 +11,7 @@
 import os
 from collections.abc import Iterable
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -51,6 +52,7 @@ from biomodals.execution.modal import (
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
+from biomodals.helper.artifacts import file_size_sha256
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.output_claim import acquire_output_claim
 from biomodals.helper.shell import (
@@ -373,6 +375,7 @@ def collect_boltzgen_data(
     publication: dict[str, object] = {
         "run_name": run_name,
         "run_ids": run_ids,
+        "task_fingerprints": task_fingerprints,
         "filtered": filter_results,
     }
     if filter_results:
@@ -401,9 +404,21 @@ def collect_boltzgen_data(
                 archive_path.relative_to(CONF.output_volume_mountpoint)
             ),
             "archive_size_bytes": len(tarball_bytes),
+            "archive_sha256": sha256(tarball_bytes).hexdigest(),
         })
     else:
         print(f"💊 Results are available at: {vol_path}.")
+        publication["artifacts"] = [
+            {
+                "path": path.relative_to(CONF.output_volume_mountpoint).as_posix(),
+                "size_bytes": size_bytes,
+                "sha256": digest,
+            }
+            for run_dir in all_run_dirs
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file()
+            for size_bytes, digest in [file_size_sha256(path)]
+        ]
     out_vol.commit()
     record = write_collection_publication(
         CONF.output_volume_mountpoint,

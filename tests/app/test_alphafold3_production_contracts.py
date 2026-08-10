@@ -117,6 +117,7 @@ from biomodals.app.fold.alphafold3.request_results import (
     load_request_manifest,
     publish_request_results,
     request_archive_member_for_role,
+    request_manifest_artifacts_available,
     request_manifest_path,
     request_view_id,
 )
@@ -2901,6 +2902,17 @@ def test_invocation_receipt_resolves_and_binds_the_manifest(
 
     assert load_invocation_manifest(FakeVolumeReader({}), invocation) is None
     assert load_invocation_manifest(FakeVolumeReader(files), invocation) == manifest
+
+    input_volume_path = cast(str, manifest["artifacts"][0]["volume_path"])
+    assert request_manifest_artifacts_available(
+        FakeVolumeReader({input_volume_path: input_bytes}),
+        manifest,
+    )
+    assert not request_manifest_artifacts_available(
+        FakeVolumeReader({input_volume_path: b"changed"}),
+        manifest,
+    )
+    assert not request_manifest_artifacts_available(FakeVolumeReader({}), manifest)
 
     corrupted = manifest_bytes.replace(b'"complete"', b'"corruptx"', 1)
     with pytest.raises(RuntimeError, match="digest is invalid"):

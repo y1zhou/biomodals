@@ -822,6 +822,36 @@ def request_archive_member_for_role(
     return (PurePosixPath(presentation_name) / relative).as_posix()
 
 
+def request_manifest_artifacts_available(
+    reader: VolumeReader,
+    manifest: dict[str, object],
+) -> bool:
+    """Stream and validate every final artifact named by a request manifest."""
+    _, _, _, artifacts, _ = _validated_manifest_artifacts(manifest)
+    for artifact in artifacts:
+        volume_path = cast(str, artifact["volume_path"])
+        expected_size = cast(int, artifact["size_bytes"])
+        expected_sha256 = cast(str, artifact["sha256"])
+        size_bytes = 0
+        digest = hashlib.sha256()
+        try:
+            chunks = reader.read_file(volume_path)
+            for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError(
+                        f"Volume reader returned non-bytes for {volume_path}"
+                    )
+                size_bytes += len(chunk)
+                if size_bytes > expected_size:
+                    return False
+                digest.update(chunk)
+        except FileNotFoundError:
+            return False
+        if size_bytes != expected_size or digest.hexdigest() != expected_sha256:
+            return False
+    return True
+
+
 def _download_artifact(
     reader: VolumeReader,
     artifact: dict[str, object],

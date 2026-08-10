@@ -223,10 +223,22 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 # publications are validated after atomic Task discovery.
                 return AvailabilityStatus.MISSING
             elif node_key == COLLECT_RESULTS_NODE:
+                task_fingerprints = {
+                    item.plan.task_key: item.plan.fingerprint(
+                        workload_plan_fingerprint=(
+                            self.request.execution_plan.workload_plan_fingerprint
+                        ),
+                        node_key=DESIGN_RUNS_NODE,
+                    )
+                    for item in self._planned_tasks(DESIGN_RUNS_NODE)
+                }
                 available = (
                     load_collection_publication(
                         self.output_root,
                         self.request.collection_publication_path,
+                        run_name=self.request.run_name,
+                        run_ids=self.request.run_ids,
+                        task_fingerprints=task_fingerprints,
                     )
                     is not None
                 )

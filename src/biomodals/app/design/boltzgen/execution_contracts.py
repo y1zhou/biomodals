@@ -133,8 +133,12 @@ def write_collection_publication(
 def load_collection_publication(
     output_root: str | Path,
     relative_path: str | PurePosixPath,
+    *,
+    run_name: str,
+    run_ids: tuple[str, ...],
+    task_fingerprints: dict[str, str],
 ) -> dict[str, object] | None:
-    """Load one structurally valid final collection publication."""
+    """Load one exact, content-bound final collection publication."""
     path = _contained_path(output_root, relative_path)
     if not path.is_file():
         return None
@@ -146,20 +150,38 @@ def load_collection_publication(
         not isinstance(value, dict)
         or value.get("schema_version") != COLLECTION_PUBLICATION_SCHEMA_VERSION
         or value.get("status") != "complete"
-        or not isinstance(value.get("run_name"), str)
-        or not isinstance(value.get("run_ids"), list)
-        or not all(isinstance(item, str) and item for item in value["run_ids"])
+        or value.get("run_name") != run_name
+        or value.get("run_ids") != list(run_ids)
+        or value.get("task_fingerprints") != task_fingerprints
+        or not isinstance(value.get("filtered"), bool)
     ):
         return None
     archive_path = value.get("archive_path")
-    if archive_path is not None:
+    if value["filtered"]:
         if not isinstance(archive_path, str):
             return None
         archive = _contained_path(output_root, archive_path)
-        if not archive.is_file() or archive.stat().st_size != value.get(
-            "archive_size_bytes"
+        if not archive.is_file() or file_size_sha256(archive) != (
+            value.get("archive_size_bytes"),
+            value.get("archive_sha256"),
         ):
             return None
+    else:
+        artifacts = value.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            return None
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                return None
+            artifact_path = artifact.get("path")
+            if not isinstance(artifact_path, str):
+                return None
+            path = _contained_path(output_root, artifact_path)
+            if not path.is_file() or file_size_sha256(path) != (
+                artifact.get("size_bytes"),
+                artifact.get("sha256"),
+            ):
+                return None
     return value
 
 

@@ -24,17 +24,31 @@ Modal call tracking, cancellation, and recovery for all three paths.
 
 ## Architecture
 
-There are two main execution paths:
+Direct apps, workflows, and web Jobs all use the same execution kernel. A
+workflow reaches it through `biomodals.workflow.core`; a direct app does not:
 
-```text
-CLI -> deployed app/workflow coordinator -> biomodals.execution -> Modal functions
-
-Browser -> static frontend -> FastAPI service -> biomodals.execution -> Modal functions
+```mermaid
+---
+config:
+  theme: base
+  layout: elk
+  look: handDrawn
+  elk:
+    mergeEdges: false
+    nodePlacementStrategy: LINEAR_SEGMENTS
+  flowchart:
+    curve: rounded
+---
+flowchart LR
+    App["Direct app coordinator<br/>App plan and hooks"] --> Kernel
+    Workflow["Workflow coordinator<br/>biomodals.workflow.core"] --> Kernel
+    Service["FastAPI service<br/>Workload adapter"] --> Kernel
+    Kernel["biomodals.execution<br/>Durable Task orchestration"]
+    Kernel <-->|"Calls and outcomes"| Modal["Deployed Modal functions"]
 ```
 
-Coordinated apps and workflows both use the execution kernel. Workflows supply
-their scientific DAG and hooks through the workflow core; direct apps supply
-an app-specific plan and hooks without involving the workflow core:
+Inside the kernel, the coordinator runtime combines a pure scheduler with
+durable state and a narrow Modal boundary. Workload-owned hooks remain outside:
 
 ```mermaid
 ---
@@ -49,43 +63,21 @@ config:
     curve: rounded
 ---
 flowchart TD
-    WorkflowCaller["Workflow launch"] --> Core
-    AppCaller["Direct app launch"] --> AppAdapter
+    Plan["Execution plan<br/>Nodes · dependencies · Tasks"] --> Runtime
+    Hooks["Workload hooks<br/>Cache validation and result assembly"] <--> Runtime
 
-    subgraph Coordinator["Remote coordinator"]
-        Core["biomodals.workflow.core<br/>Build the DAG and provide workload hooks"]
-        AppAdapter["App execution adapter<br/>Build the app plan and provide workload hooks"]
+    subgraph Kernel["biomodals.execution"]
+        Runtime["Coordinator runtime<br/>Drive, recover, and cancel"]
+        Scheduler["Scheduler<br/>DAG readiness and admission"]
+        Ledger[("SQLite repository<br/>Durable state and atomic claims")]
+        Driver["Modal call driver<br/>Provider boundary"]
 
-        subgraph Kernel["biomodals.execution"]
-            Runtime["Runtime and scheduler<br/>Admit, recover, and cancel work"]
-            Ledger[("SQLite execution ledger<br/>Runs · Nodes · Tasks · provider calls")]
-            Driver["Modal call driver"]
-        end
-
-        Core -->|"Execution plan<br/>and hooks"| Runtime
-        AppAdapter -->|"Execution plan<br/>and hooks"| Runtime
-        Runtime -->|"Persist state<br/>transitions"| Ledger
-        Ledger -->|"Ready Tasks &<br/>durable state"| Runtime
-        Runtime -->|"Submit/observe/cancel"| Driver
-        Driver -->|"Provider call<br/>observations"| Runtime
-        Runtime -->|"Validate and<br/>assemble results"| Core
-        Runtime -->|"Validate and<br/>assemble results"| AppAdapter
+        Runtime <-->|"Priorities and candidates"| Scheduler
+        Runtime <-->|"State and claims"| Ledger
+        Runtime <-->|"Calls and observations"| Driver
     end
 
-    subgraph Modal["Modal"]
-        Workers["Deployed functions<br/>Provider workers"]
-        Volumes[("Modal Volumes<br/>Scientific inputs and outputs")]
-        Workers --> Volumes
-    end
-
-    Driver -->|"Spawn calls"| Workers
-    Workers -->|"Outcomes and<br/>result references"| Driver
-    Volumes -->|"Cache and<br/>publication probes"| Core
-    Volumes -->|"Cache and<br/>publication probes"| AppAdapter
-    Runtime -->|"Terminal Run outcome"| Core
-    Runtime -->|"Terminal Run outcome"| AppAdapter
-    Core -->|"Workflow result"| WorkflowCaller
-    AppAdapter -->|"App result"| AppCaller
+    Driver <--> Modal["Modal"]
 ```
 
 `biomodals.execution` is an embedded Python library, not a central scheduler

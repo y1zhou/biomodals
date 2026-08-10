@@ -528,12 +528,15 @@ def af3score_run(
             log_file=out_dir / f"{batch_name}.log",
         )
         for input_id in input_ids:
-            _write_input_publication(
-                out_dir,
-                input_id,
-                publication_key=publication_key,
-                input_sha256=input_digests[input_id],
-            )
+            try:
+                _write_input_publication(
+                    out_dir,
+                    input_id,
+                    publication_key=publication_key,
+                    input_sha256=input_digests[input_id],
+                )
+            except RuntimeError as error:
+                print(f"⚠️ {error}")
         CONF.output_volume.commit()
 
 

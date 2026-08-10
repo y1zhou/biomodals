@@ -26,7 +26,13 @@ from biomodals.app.score.af3score_execution import (
     TaskSpec,
     persist_execution_request,
 )
-from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution import (
+    DeploymentIdentity,
+    NodeAggregationPolicy,
+    NodeStatus,
+    RunStatus,
+    TaskStatus,
+)
 from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
@@ -62,11 +68,18 @@ class FakeClaims:
 
 
 class CompletingDriver:
-    def __init__(self, root: Path, request: AF3ScoreExecutionRequest) -> None:
+    def __init__(
+        self,
+        root: Path,
+        request: AF3ScoreExecutionRequest,
+        *,
+        missing_input_id: str | None = None,
+    ) -> None:
         self.root = root / request.run_name
         self.request = request
         self.calls: dict[str, tuple[Any, dict[str, object]]] = {}
         self.spawns: list[tuple[str, dict[str, object]]] = []
+        self.missing_input_id = missing_input_id
 
     def resolve(self, binding):
         return binding
@@ -108,6 +121,8 @@ class CompletingDriver:
             )
         if function_name == "af3score_run":
             for path in Path(str(kwargs["batch_json_dir"])).glob("*.json"):
+                if path.stem == self.missing_input_id:
+                    continue
                 sample = self.root / "outputs" / path.stem / COMPLETION_SAMPLE_SUBDIR
                 sample.mkdir(parents=True, exist_ok=True)
                 for required in COMPLETION_REQUIRED_FILES:
@@ -186,6 +201,10 @@ def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
         POSTPROCESS_NODE,
     )
     assert decoded.execution_plan.terminal_node_keys == (POSTPROCESS_NODE,)
+    batches, postprocess = decoded.execution_plan.nodes[1:]
+    assert batches.aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
+    assert postprocess.dependencies[0].node_key == BATCHES_NODE
+    assert postprocess.dependencies[0].accept_partial
     assert decoded.execution_plan.scientific_payload["inputs"] == [
         {"name": name, "sha256": sha256(content).hexdigest()}
         for name, content in INPUT_CONTENT.items()
@@ -477,6 +496,38 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     )
     assert batch_call.task_keys == ("a", "b")
     assert str(RUN_ID) in claims.values.values()
+    runtime.close()
+
+
+def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    _stage_request_inputs(tmp_path, request)
+    driver = CompletingDriver(tmp_path, request, missing_input_id="b")
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    overview = runtime.run()
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+
+    assert overview.run.status == RunStatus.SUCCEEDED
+    batches = next(node for node in snapshot.nodes if node.node_key == BATCHES_NODE)
+    assert batches.status == NodeStatus.PARTIAL
+    assert [
+        task.status for task in snapshot.tasks if task.node_key == BATCHES_NODE
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED]
+    assert [name for name, _kwargs in driver.spawns][-1] == "af3score_postprocess"
     runtime.close()
 
 

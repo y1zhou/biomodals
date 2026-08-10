@@ -16,6 +16,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionPlan,
+    NodeAggregationPolicy,
     NodeDependency,
     NodePlan,
     ProviderBinding,
@@ -145,10 +146,11 @@ class AF3ScoreExecutionRequest:
                 NodePlan(
                     BATCHES_NODE,
                     dependencies=(NodeDependency(PREPARE_NODE),),
+                    aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
                 ),
                 NodePlan(
                     POSTPROCESS_NODE,
-                    dependencies=(NodeDependency(BATCHES_NODE),),
+                    dependencies=(NodeDependency(BATCHES_NODE, accept_partial=True),),
                 ),
             ),
             scientific_payload={

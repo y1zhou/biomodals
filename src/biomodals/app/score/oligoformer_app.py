@@ -134,6 +134,8 @@ from biomodals.execution.modal import (
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.artifacts import sha256_bytes
+from biomodals.helper.artifacts import sha256_file as _hash_path
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
@@ -679,16 +681,7 @@ def _hash_bytes(data: bytes | None) -> str:
     """Return a stable hash for optional bytes."""
     if data is None:
         return ""
-    return hashlib.sha256(data).hexdigest()
-
-
-def _hash_path(path: Path) -> str:
-    """Return a stable SHA-256 digest for one file."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_bytes(data)
 
 
 def _hash_directory(path: Path) -> str:
@@ -4023,11 +4016,6 @@ def _scan_targetscan_table(path: Path) -> pl.LazyFrame:
         new_columns=list(TARGETSCAN_COLUMNS),
         schema_overrides={"targetscan_score": pl.Float64},
     )
-
-
-def _read_targetscan_table(path: Path) -> pl.DataFrame:
-    """Read headerless or header-only TargetScan raw output."""
-    return _scan_targetscan_table(path).collect(engine="streaming")
 
 
 def _off_target_evidence_identity(run_root: str | Path, stem: str) -> str:

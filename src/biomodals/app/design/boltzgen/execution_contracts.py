@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -10,12 +9,12 @@ from typing import Any
 import orjson
 
 from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.artifacts import file_size_sha256, replace_bytes_atomic
 
 COLLECTION_PUBLICATION_SCHEMA_VERSION = 1
 TASK_PUBLICATION_SCHEMA_VERSION = 1
 _TASK_PUBLICATION_PATH = PurePosixPath(".biomodals") / "task.json"
 _FINAL_PDF_PATH = PurePosixPath("final_ranked_designs") / "results_overview.pdf"
-_HASH_CHUNK_BYTES = 1024 * 1024
 _OUTPUT_CLAIM_PREFIX = "boltzgen-output"
 
 
@@ -57,7 +56,7 @@ def is_boltzgen_run_complete(
         and isinstance(value.get("artifact_sha256"), str)
     ):
         return False
-    size_bytes, digest = _hash_file(final_pdf)
+    size_bytes, digest = file_size_sha256(final_pdf)
     return (
         size_bytes == value["artifact_size_bytes"]
         and digest == value["artifact_sha256"]
@@ -77,9 +76,8 @@ def write_boltzgen_task_publication(
     final_pdf = run_dir.joinpath(*_FINAL_PDF_PATH.parts)
     if not final_pdf.is_file():
         raise RuntimeError("BoltzGen returned without its final publication")
-    size_bytes, digest = _hash_file(final_pdf)
+    size_bytes, digest = file_size_sha256(final_pdf)
     marker = run_dir.joinpath(*_TASK_PUBLICATION_PATH.parts)
-    marker.parent.mkdir(parents=True, exist_ok=True)
     content = orjson.dumps(
         {
             "schema_version": TASK_PUBLICATION_SCHEMA_VERSION,
@@ -91,9 +89,7 @@ def write_boltzgen_task_publication(
         },
         option=orjson.OPT_SORT_KEYS,
     )
-    temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
-    temporary.write_bytes(content)
-    temporary.replace(marker)
+    replace_bytes_atomic(marker, content)
 
 
 def boltzgen_output_claim_key(
@@ -130,10 +126,7 @@ def write_collection_publication(
         **publication,
     }
     content = orjson.dumps(record, option=orjson.OPT_SORT_KEYS)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f".{time.time_ns()}.tmp")
-    temporary.write_bytes(content)
-    temporary.replace(path)
+    replace_bytes_atomic(path, content)
     return record
 
 
@@ -183,13 +176,3 @@ def _contained_path(
     path = root_path.joinpath(*relative.parts).resolve()
     path.relative_to(root_path)
     return path
-
-
-def _hash_file(path: Path) -> tuple[int, str]:
-    digest = sha256()
-    size_bytes = 0
-    with path.open("rb") as stream:
-        while chunk := stream.read(_HASH_CHUNK_BYTES):
-            size_bytes += len(chunk)
-            digest.update(chunk)
-    return size_bytes, digest.hexdigest()

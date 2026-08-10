@@ -31,9 +31,8 @@ import os
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
-from hashlib import file_digest, sha256
+from hashlib import sha256
 from pathlib import Path
-from stat import S_ISREG
 from uuid import UUID, uuid4
 
 import modal
@@ -65,6 +64,8 @@ from biomodals.execution.modal import (
 )
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.artifacts import file_matches_sha256
+from biomodals.helper.artifacts import replace_bytes_atomic as _atomic_write
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
     MODEL_VOLUME,
@@ -201,7 +202,7 @@ def _msa_task_ready(task: ProtenixMsaTaskSpec) -> bool:
         isinstance(marker, dict)
         and marker.get("publication_key") == task.publication_key
         and marker.get("expected_json_path") == str(expected)
-        and _publication_file_matches(
+        and file_matches_sha256(
             expected,
             marker.get("size"),
             marker.get("sha256"),
@@ -230,7 +231,7 @@ def _prepared_ready(plan: ProtenixPreparationPlan) -> bool:
     return (
         isinstance(marker, dict)
         and marker.get("preparation_key") == plan.preparation_key
-        and _publication_file_matches(
+        and file_matches_sha256(
             path,
             marker.get("size"),
             marker.get("sha256"),
@@ -266,38 +267,12 @@ def _result_ready(result_key: str, run_name: str) -> bool:
     return (
         isinstance(marker, dict)
         and marker.get("result_key") == result_key
-        and _publication_file_matches(
+        and file_matches_sha256(
             path,
             marker.get("size"),
             marker.get("sha256"),
         )
     )
-
-
-def _publication_file_matches(
-    path: Path,
-    expected_size: object,
-    expected_digest: object,
-) -> bool:
-    """Validate one regular artifact without hiding inconclusive I/O errors."""
-    if (
-        not isinstance(expected_size, int)
-        or isinstance(expected_size, bool)
-        or expected_size < 1
-        or not isinstance(expected_digest, str)
-        or len(expected_digest) != 64
-    ):
-        return False
-    try:
-        if path.is_symlink():
-            return False
-        stat = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    if not S_ISREG(stat.st_mode) or stat.st_size != expected_size:
-        return False
-    with path.open("rb") as stream:
-        return file_digest(stream, "sha256").hexdigest() == expected_digest
 
 
 def _publish_result(
@@ -321,16 +296,6 @@ def _publish_result(
     )
     CONF.output_volume.commit()
     return {"result_path": str(path), "size": len(content), "sha256": digest}
-
-
-def _atomic_write(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(content)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 ##########################################

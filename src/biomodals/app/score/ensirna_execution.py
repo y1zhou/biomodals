@@ -28,6 +28,7 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     StandardExecutionRuntimeLifecycle,
 )
+from biomodals.helper.artifacts import sha256_file
 from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
@@ -382,13 +383,12 @@ class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 ),
             )
         if node_key == CHUNKS_NODE:
-            app = _workload_module()
             plan = self._plan_from_node(PREPARE_NODE)
             return tuple(
                 TaskPlan(
                     chunk.chunk_name,
                     scientific_payload={
-                        "csv_sha256": app._file_sha256(Path(chunk.csv_path))
+                        "csv_sha256": sha256_file(Path(chunk.csv_path))
                     },
                     execution_payload={"chunk": asdict(chunk)},
                 )

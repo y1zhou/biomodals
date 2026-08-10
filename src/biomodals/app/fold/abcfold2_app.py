@@ -18,7 +18,7 @@
 
 import os
 from dataclasses import dataclass
-from hashlib import file_digest, sha256
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from uuid import UUID, uuid4
@@ -53,6 +53,11 @@ from biomodals.execution.modal import (
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.artifacts import (
+    file_matches_sha256,
+    replace_bytes_atomic,
+    sha256_file,
+)
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.shell import package_outputs
 from biomodals.helper.web import download_files
@@ -392,7 +397,7 @@ def _archive_ready(
         isinstance(marker, dict)
         and marker.get("publication_key") == publication_key
         and marker.get("archive_path") == str(path)
-        and _publication_file_matches(
+        and file_matches_sha256(
             path,
             marker.get("size"),
             marker.get("sha256"),
@@ -432,44 +437,7 @@ def _seed_ready(
 
 
 def _write_publication_marker(path: Path, value: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(orjson.dumps(value, option=orjson.OPT_SORT_KEYS))
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _publication_file_matches(
-    path: Path,
-    expected_size: object,
-    expected_digest: object,
-) -> bool:
-    if (
-        not isinstance(expected_size, int)
-        or isinstance(expected_size, bool)
-        or expected_size < 1
-        or not isinstance(expected_digest, str)
-        or len(expected_digest) != 64
-    ):
-        return False
-    try:
-        if path.is_symlink():
-            return False
-        stat = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    return (
-        S_ISREG(stat.st_mode)
-        and stat.st_size == expected_size
-        and _sha256_file(path) == expected_digest
-    )
-
-
-def _sha256_file(path: Path) -> str:
-    with path.open("rb") as stream:
-        return file_digest(stream, "sha256").hexdigest()
+    replace_bytes_atomic(path, orjson.dumps(value, option=orjson.OPT_SORT_KEYS))
 
 
 def _directory_artifacts(directory: Path) -> list[dict[str, str | int]]:
@@ -485,7 +453,7 @@ def _directory_artifacts(directory: Path) -> list[dict[str, str | int]]:
         artifacts.append({
             "path": path.relative_to(directory).as_posix(),
             "size": stat.st_size,
-            "sha256": _sha256_file(path),
+            "sha256": sha256_file(path),
         })
     if not artifacts:
         raise RuntimeError("ABCFold2 seed output contains no files")
@@ -506,7 +474,7 @@ def _directory_publication_matches(directory: Path, raw_artifacts: object) -> bo
         if relative.is_absolute() or not relative.parts or ".." in relative.parts:
             return False
         seen.add(relative_text)
-        if not _publication_file_matches(
+        if not file_matches_sha256(
             directory.joinpath(*relative.parts),
             artifact.get("size"),
             artifact.get("sha256"),
@@ -523,12 +491,7 @@ def _publish_archive(
 ) -> dict[str, str | int]:
     """Atomically publish one bounded provider result into the output volume."""
     path = _archive_path(workdir, model_name)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(content)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    replace_bytes_atomic(path, content)
     digest = sha256(content).hexdigest()
     _write_publication_marker(
         _publication_dir(workdir) / f"{model_name}-archive.json",

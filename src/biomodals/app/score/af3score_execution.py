@@ -31,11 +31,11 @@ from biomodals.helper.app_execution import (
     StandardExecutionRuntimeLifecycle,
 )
 from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
 )
-from biomodals.helper.shell import sanitize_filename
 
 REQUEST_SCHEMA_VERSION = 3
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
@@ -98,8 +98,7 @@ class AF3ScoreExecutionRequest:
 
     def __post_init__(self) -> None:
         """Reject unsafe paths, duplicate inputs, and unusable limits."""
-        if not self.run_name or sanitize_filename(self.run_name) != self.run_name:
-            raise ValueError("run_name must be a safe filename component")
+        require_safe_filename_component(self.run_name, field_name="run_name")
         if not self.inputs:
             raise ValueError("AF3Score inputs cannot be empty")
         names = tuple(name for name, _digest in self.inputs)

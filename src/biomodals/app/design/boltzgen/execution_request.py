@@ -15,7 +15,7 @@ from biomodals.app.design.boltzgen.execution_contracts import (
 )
 from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
 from biomodals.helper.app_execution import ExecutionRequestFile
-from biomodals.helper.shell import sanitize_filename
+from biomodals.helper.io import require_safe_filename_component
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
@@ -55,9 +55,9 @@ class BoltzGenExecutionRequest:
             raise ValueError("run_name cannot be empty")
         if not self.run_ids or len(self.run_ids) != len(set(self.run_ids)):
             raise ValueError("run_ids must be a non-empty unique collection")
-        _require_safe_filename_component("run_name", self.run_name)
+        require_safe_filename_component(self.run_name, field_name="run_name")
         for run_id in self.run_ids:
-            _require_safe_filename_component("run_id", run_id)
+            require_safe_filename_component(run_id, field_name="run_id")
         if self.num_designs < 1:
             raise ValueError("num_designs must be positive")
         if self.max_active_provider_calls < 1:
@@ -245,13 +245,3 @@ def load_execution_request_from_volume(
     """Load a completed run's request through the client-side Volume API."""
     content = _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
     return BoltzGenExecutionRequest.from_bytes(content)
-
-
-def _require_safe_filename_component(field_name: str, value: str) -> None:
-    """Reject workload identities that can select another path."""
-    try:
-        safe_value = sanitize_filename(value)
-    except ValueError as error:
-        raise ValueError(f"{field_name} must be a safe filename component") from error
-    if safe_value != value:
-        raise ValueError(f"{field_name} must be a safe filename component")

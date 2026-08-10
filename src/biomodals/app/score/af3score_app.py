@@ -17,7 +17,6 @@ import string
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
-from hashlib import file_digest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
@@ -60,6 +59,7 @@ from biomodals.helper.app_run import (
     AppRunLayout,
     volume_path_from_mount_path,
 )
+from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.shell import (
     copy_files,
     run_command,
@@ -138,11 +138,6 @@ def _metrics_publication_path(run_root: str | Path) -> Path:
     return Path(run_root) / ".biomodals" / "af3score-metrics.json"
 
 
-def _file_sha256(path: Path) -> str:
-    with path.open("rb") as stream:
-        return file_digest(stream, "sha256").hexdigest()
-
-
 def _input_output_dir(output_dir: str | Path, input_id: str) -> Path:
     if not input_id or Path(input_id).name != input_id or input_id in {".", ".."}:
         raise ValueError("AF3Score input ID must be a safe path component")
@@ -168,7 +163,7 @@ def _input_output_records(
             raise RuntimeError(f"AF3Score output is incomplete for '{input_id}'")
         records[filename] = {
             "size": path.stat().st_size,
-            "sha256": _file_sha256(path),
+            "sha256": sha256_file(path),
         }
     return records
 
@@ -183,23 +178,18 @@ def _write_input_publication(
     """Atomically bind one complete AF3Score output to its scientific input."""
     outputs = _input_output_records(output_dir, input_id)
     marker = _input_publication_path(output_dir, input_id)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker.with_name(f".{marker.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(
-            orjson.dumps(
-                {
-                    "schema_version": _INPUT_PUBLICATION_SCHEMA_VERSION,
-                    "publication_key": publication_key,
-                    "input_sha256": input_sha256,
-                    "outputs": outputs,
-                },
-                option=orjson.OPT_SORT_KEYS,
-            )
-        )
-        temporary.replace(marker)
-    finally:
-        temporary.unlink(missing_ok=True)
+    replace_bytes_atomic(
+        marker,
+        orjson.dumps(
+            {
+                "schema_version": _INPUT_PUBLICATION_SCHEMA_VERSION,
+                "publication_key": publication_key,
+                "input_sha256": input_sha256,
+                "outputs": outputs,
+            },
+            option=orjson.OPT_SORT_KEYS,
+        ),
+    )
 
 
 def _input_publication_ready(
@@ -261,24 +251,19 @@ def _write_metrics_publication(
     if size < 1:
         raise RuntimeError("AF3Score metrics publication is empty")
     marker = _metrics_publication_path(run_root)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    temporary = marker.with_name(f".{marker.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(
-            orjson.dumps(
-                {
-                    "schema_version": _METRICS_PUBLICATION_SCHEMA_VERSION,
-                    "publication_key": publication_key,
-                    "metrics_filename": metrics_path.name,
-                    "size": size,
-                    "sha256": _file_sha256(metrics_path),
-                },
-                option=orjson.OPT_SORT_KEYS,
-            )
-        )
-        temporary.replace(marker)
-    finally:
-        temporary.unlink(missing_ok=True)
+    replace_bytes_atomic(
+        marker,
+        orjson.dumps(
+            {
+                "schema_version": _METRICS_PUBLICATION_SCHEMA_VERSION,
+                "publication_key": publication_key,
+                "metrics_filename": metrics_path.name,
+                "size": size,
+                "sha256": sha256_file(metrics_path),
+            },
+            option=orjson.OPT_SORT_KEYS,
+        ),
+    )
 
 
 def _metrics_publication_ready(
@@ -312,7 +297,7 @@ def _metrics_publication_ready(
         return (
             not metrics.is_symlink()
             and metrics.stat().st_size == marker["size"]
-            and _file_sha256(metrics) == marker["sha256"]
+            and sha256_file(metrics) == marker["sha256"]
         )
     except (FileNotFoundError, NotADirectoryError):
         return False
@@ -845,7 +830,9 @@ def submit_af3score_task(
         execution_run_id = uuid4()
         request = AF3ScoreExecutionRequest(
             run_name=run_name,
-            inputs=tuple((path.name, _file_sha256(path)) for path in all_files),
+            inputs=tuple(
+                (path.name, sha256_file(path.resolve())) for path in all_files
+            ),
             staged_input_execution_run_id=str(execution_run_id),
             prepare_workers=prepare_workers,
             max_batches=max_batches,

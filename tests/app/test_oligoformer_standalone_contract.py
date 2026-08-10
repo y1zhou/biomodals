@@ -1582,7 +1582,13 @@ def test_merge_targetscan_context_outputs_writes_header_only_empty_table(
     assert output_path.read_text(encoding="utf-8") == (
         "refseq\tsiRNA\ttargetscan_score\n"
     )
-    assert oligoformer_app._read_targetscan_table(output_path).height == 0
+    assert (
+        oligoformer_app
+        ._scan_targetscan_table(output_path)
+        .collect(engine="streaming")
+        .height
+        == 0
+    )
 
 
 def test_merge_targetscan_batch_outputs_sorts_upstream_order(tmp_path: Path):
@@ -1920,7 +1926,9 @@ def test_targetscan_multi_candidate_reference_tiles_merge_all_pairs(
         output_path=output_path,
     )
 
-    merged = oligoformer_app._read_targetscan_table(output_path)
+    merged = oligoformer_app._scan_targetscan_table(output_path).collect(
+        engine="streaming"
+    )
     assert merged.height == 6
     assert set(merged.select("refseq", "siRNA").iter_rows()) == {
         (reference, candidate)

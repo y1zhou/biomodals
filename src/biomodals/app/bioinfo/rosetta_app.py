@@ -57,7 +57,8 @@ from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
-from biomodals.helper.shell import package_outputs, sanitize_filename, warmup_directory
+from biomodals.helper.io import require_safe_filename_component
+from biomodals.helper.shell import package_outputs, warmup_directory
 
 ##########################################
 # Modal configs
@@ -109,10 +110,8 @@ def run_rosetta_worker(
     """Claim, execute, and report Rosetta Tasks until the durable pool is empty."""
     from biomodals.helper.shell import run_command
 
-    if sanitize_filename(run_name) != run_name:
-        raise ValueError("run_name must be a safe filename component")
-    if sanitize_filename(run_id) != run_id:
-        raise ValueError("run_id must be a safe filename component")
+    require_safe_filename_component(run_name, field_name="run_name")
+    require_safe_filename_component(run_id, field_name="run_id")
     layout = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / f"{run_name}-{run_id}"
     )

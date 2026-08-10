@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from stat import S_ISREG
 from typing import Any, Protocol, cast
 
 import orjson
@@ -134,9 +135,11 @@ def sha256_file(
     forbidden_bytes: bytes | None = None,
 ) -> str:
     """Compute a digest and optionally reject a byte marker while streaming."""
-    require_regular_file(path)
     if forbidden_bytes == b"":
         raise ValueError("forbidden_bytes must be nonempty")
+    if forbidden_bytes is None:
+        return file_size_sha256(path, chunk_size=chunk_size)[1]
+    require_regular_file(path)
     digest = hashlib.sha256()
     overlap = b""
     with path.open("rb") as handle:
@@ -151,15 +154,68 @@ def sha256_file(
     return digest.hexdigest()
 
 
+def file_size_sha256(
+    path: Path,
+    *,
+    chunk_size: int = 16 * 1024 * 1024,
+) -> tuple[int, str]:
+    """Return one regular file's size and SHA-256 digest in one pass."""
+    require_regular_file(path)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            size_bytes += len(chunk)
+            digest.update(chunk)
+    return size_bytes, digest.hexdigest()
+
+
+def file_matches_sha256(
+    path: Path,
+    expected_size: object,
+    expected_digest: object,
+) -> bool:
+    """Return whether a regular file matches one size and SHA-256 record."""
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size < 1
+        or not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+    ):
+        return False
+    try:
+        if path.is_symlink():
+            return False
+        stat = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return (
+        S_ISREG(stat.st_mode)
+        and stat.st_size == expected_size
+        and sha256_file(path) == expected_digest
+    )
+
+
+def replace_bytes_atomic(path: Path, value: bytes) -> None:
+    """Atomically replace one byte artifact without forcing a disk sync."""
+    _write_bytes_atomic(path, value, sync=False)
+
+
 def write_bytes_atomic(path: Path, value: bytes) -> None:
     """Atomically publish one byte artifact on the destination filesystem."""
+    _write_bytes_atomic(path, value, sync=True)
+
+
+def _write_bytes_atomic(path: Path, value: bytes, *, sync: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("xb") as handle:
             handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
+            if sync:
+                handle.flush()
+                os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

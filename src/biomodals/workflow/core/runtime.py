@@ -51,7 +51,8 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import ExecutionVolume, ExecutionVolumeSync
+from biomodals.helper.app_execution import ExecutionVolumeSync
+from biomodals.helper.artifacts import VolumeHandle
 from biomodals.schema import AppRunResult, AppRunStatus, VolumePath, WorkflowArtifact
 from biomodals.workflow.core.artifact_availability import (
     ExternalArtifactChecker,
@@ -114,7 +115,7 @@ class WorkflowRuntime:
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         workflow_volume_name: str,
-        workflow_volume: ExecutionVolume | None = None,
+        workflow_volume: VolumeHandle | None = None,
         modal_driver: ModalDriver | None = None,
         max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,

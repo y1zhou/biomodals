@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from biomodals.app.score import ensirna_app
+from biomodals.helper.artifacts import sha256_bytes
 
 
 class FakeVolume:
@@ -79,7 +80,7 @@ def seal_candidate_csv(layout, fasta: bytes) -> None:
     ensirna_app._write_candidate_csv_marker(
         layout=layout,
         cache_key=ensirna_app._cache_key_for_fasta(canonical_fasta),
-        input_sha256=ensirna_app._bytes_sha256(canonical_fasta),
+        input_sha256=sha256_bytes(canonical_fasta),
         facts=facts,
     )
 
@@ -209,9 +210,7 @@ def test_pinned_get_pdb_patch_repairs_only_mismatched_features(tmp_path: Path) -
         Path(__file__).parents[1] / "fixtures" / "ensirna" / "get_pdb.py.gz.b64"
     )
     pinned_source = gzip.decompress(base64.b64decode(fixture_path.read_bytes()))
-    assert ensirna_app._bytes_sha256(pinned_source) == (
-        ensirna_app.APP_INFO.get_pdb_source_sha256
-    )
+    assert sha256_bytes(pinned_source) == (ensirna_app.APP_INFO.get_pdb_source_sha256)
     ensirna_dir = tmp_path / "ENsiRNA"
     source_path = ensirna_dir / "data" / "get_pdb.py"
     source_path.parent.mkdir(parents=True)
@@ -603,9 +602,7 @@ def test_prepare_inputs_regenerates_unmarked_truncated_csv_and_preserves_pdb_cac
     assert ensirna_app._candidate_csv_valid(
         layout=layout,
         cache_key=cache_key,
-        input_sha256=ensirna_app._bytes_sha256(
-            ensirna_app._sanitize_fasta_for_upstream(fasta)
-        ),
+        input_sha256=sha256_bytes(ensirna_app._sanitize_fasta_for_upstream(fasta)),
     )
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1

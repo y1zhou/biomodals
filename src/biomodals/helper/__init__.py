@@ -4,6 +4,8 @@ from collections.abc import Iterable
 
 from modal import Image
 
+from biomodals.helper.artifacts import sha256_bytes
+
 
 def patch_image_for_helper(
     image: Image,
@@ -88,6 +90,4 @@ def patch_image_for_helper(
 
 def hash_string(s: str) -> str:
     """Hash a string using a simple algorithm."""
-    import hashlib
-
-    return hashlib.sha256(s.encode()).hexdigest()
+    return sha256_bytes(s.encode())

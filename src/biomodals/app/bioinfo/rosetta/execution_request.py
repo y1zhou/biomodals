@@ -12,7 +12,7 @@ import orjson
 from biomodals.app.bioinfo.rosetta.execution_contracts import RosettaTaskSpec
 from biomodals.execution import ExecutionPlan, NodeAggregationPolicy, NodePlan
 from biomodals.helper.app_execution import ExecutionRequestFile
-from biomodals.helper.shell import sanitize_filename
+from biomodals.helper.io import require_safe_filename_component
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -40,8 +40,8 @@ class RosettaExecutionRequest:
         """Reject an unusable worker policy or duplicate Task identity."""
         if not self.run_name or not self.run_id or not self.tasks:
             raise ValueError("Rosetta run identity and Tasks cannot be empty")
-        _require_safe_filename_component("run_name", self.run_name)
-        _require_safe_filename_component("run_id", self.run_id)
+        require_safe_filename_component(self.run_name, field_name="run_name")
+        require_safe_filename_component(self.run_id, field_name="run_id")
         keys = tuple(task.task_key for task in self.tasks)
         if len(keys) != len(set(keys)):
             raise ValueError("Rosetta Task keys must be unique")
@@ -161,13 +161,3 @@ def load_execution_request_from_volume(
     """Load a request through Modal's local chunked Volume API."""
     content = _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
     return RosettaExecutionRequest.from_bytes(content)
-
-
-def _require_safe_filename_component(field_name: str, value: str) -> None:
-    """Reject workload identities that can select another path."""
-    try:
-        safe_value = sanitize_filename(value)
-    except ValueError as error:
-        raise ValueError(f"{field_name} must be a safe filename component") from error
-    if safe_value != value:
-        raise ValueError(f"{field_name} must be a safe filename component")

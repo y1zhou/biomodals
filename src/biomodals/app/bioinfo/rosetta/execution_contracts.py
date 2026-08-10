@@ -2,23 +2,23 @@
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from hashlib import file_digest, sha256
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 import orjson
 
+from biomodals.helper.artifacts import (
+    VolumeReader,
+    file_size_sha256,
+    read_volume_bytes,
+    replace_bytes_atomic,
+)
+
 PUBLICATION_SCHEMA_VERSION = 2
 _MAX_PUBLICATION_BYTES = 4 * 1024 * 1024
-_HASH_CHUNK_BYTES = 1024 * 1024
-
-
-class _VolumeReader(Protocol):
-    def read_file(self, path: str) -> Iterable[bytes]:
-        """Yield chunks for one Volume-relative file."""
 
 
 @dataclass(frozen=True)
@@ -201,7 +201,7 @@ def validate_task_publication(
 
 
 def validate_task_publication_from_volume(
-    volume: _VolumeReader,
+    volume: VolumeReader,
     run_root: str | PurePosixPath,
     task: RosettaTaskSpec,
     task_fingerprint: str,
@@ -214,13 +214,12 @@ def validate_task_publication_from_volume(
         / "tasks"
         / f"{sha256(task.task_key.encode()).hexdigest()}.json"
     )
-    try:
-        marker = _read_volume_file(
-            volume,
-            marker_path.as_posix(),
-            max_bytes=_MAX_PUBLICATION_BYTES,
-        )
-    except FileNotFoundError:
+    marker = read_volume_bytes(
+        volume,
+        marker_path.as_posix(),
+        max_bytes=_MAX_PUBLICATION_BYTES,
+    )
+    if marker is None:
         return False
     try:
         value: Any = orjson.loads(marker)
@@ -283,9 +282,7 @@ def _write_task_publication(
     )
     if len(content) > _MAX_PUBLICATION_BYTES:
         raise RuntimeError("Rosetta Task publication exceeds its byte limit")
-    temporary = path.with_suffix(f".{time.time_ns()}.tmp")
-    temporary.write_bytes(content)
-    temporary.replace(path)
+    replace_bytes_atomic(path, content)
 
 
 def _execution_result(task: RosettaTaskSpec) -> dict[str, object]:
@@ -368,7 +365,7 @@ def _collect_output_artifacts(
         if not path.is_file():
             continue
         relative = path.relative_to(run_root).as_posix()
-        size_bytes, digest = _hash_local_file(path)
+        size_bytes, digest = file_size_sha256(path)
         artifacts.append((relative, size_bytes, digest))
     if not artifacts:
         raise RuntimeError("Rosetta returned without output files")
@@ -384,36 +381,10 @@ def _local_artifact_matches(
     path = run_root.joinpath(*_relative_path(relative_path).parts)
     if path.is_symlink() or not path.is_file():
         return False
-    return _hash_local_file(path) == (size_bytes, digest)
+    return file_size_sha256(path) == (size_bytes, digest)
 
 
-def _hash_local_file(path: Path) -> tuple[int, str]:
-    digest = sha256()
-    size_bytes = 0
-    with path.open("rb") as stream:
-        while chunk := stream.read(_HASH_CHUNK_BYTES):
-            size_bytes += len(chunk)
-            digest.update(chunk)
-    return size_bytes, digest.hexdigest()
-
-
-def _read_volume_file(
-    volume: _VolumeReader,
-    path: str,
-    *,
-    max_bytes: int,
-) -> bytes:
-    content = bytearray()
-    for chunk in volume.read_file(path):
-        if not isinstance(chunk, bytes):
-            raise TypeError(f"Volume returned non-bytes for {path}")
-        if len(content) + len(chunk) > max_bytes:
-            raise ValueError(f"Volume file exceeds {max_bytes} bytes: {path}")
-        content.extend(chunk)
-    return bytes(content)
-
-
-def _volume_file_exists(volume: _VolumeReader, path: str) -> bool:
+def _volume_file_exists(volume: VolumeReader, path: str) -> bool:
     try:
         iterator = iter(volume.read_file(path))
         next(iterator, None)
@@ -422,7 +393,7 @@ def _volume_file_exists(volume: _VolumeReader, path: str) -> bool:
     return True
 
 
-def _hash_volume_file(volume: _VolumeReader, path: str) -> tuple[int, str]:
+def _hash_volume_file(volume: VolumeReader, path: str) -> tuple[int, str]:
     digest = sha256()
     size_bytes = 0
     for chunk in volume.read_file(path):

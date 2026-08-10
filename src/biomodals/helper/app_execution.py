@@ -27,6 +27,7 @@ from biomodals.execution import (
     resume_execution_run,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
+from biomodals.helper.artifacts import VolumeHandle, read_volume_bytes
 
 LEDGER_FILENAME = "ledger.sqlite3"
 
@@ -58,7 +59,11 @@ class ExecutionRequestFile:
         """Idempotently stage bytes through the client-side Volume API."""
         self._validate(content)
         path = self.path(execution_run_id)
-        existing = self._read_volume(output_volume, path)
+        existing = read_volume_bytes(
+            output_volume,
+            path.as_posix(),
+            max_bytes=self.max_bytes,
+        )
         if existing is not None:
             if existing != content:
                 raise RuntimeError(f"Existing {self.name} conflicts with this run")
@@ -105,28 +110,15 @@ class ExecutionRequestFile:
     ) -> bytes:
         """Load bytes through the client-side Volume API."""
         path = self.path(execution_run_id)
-        content = self._read_volume(output_volume, path)
+        content = read_volume_bytes(
+            output_volume,
+            path.as_posix(),
+            max_bytes=self.max_bytes,
+        )
         if content is None:
             raise FileNotFoundError(path.as_posix())
         self._validate(content)
         return content
-
-    def _read_volume(
-        self,
-        output_volume: Any,
-        path: PurePosixPath,
-    ) -> bytes | None:
-        content = bytearray()
-        try:
-            for chunk in output_volume.read_file(path.as_posix()):
-                if not isinstance(chunk, bytes):
-                    raise TypeError(f"Volume returned non-bytes for {path}")
-                if len(content) + len(chunk) > self.max_bytes:
-                    raise ValueError(f"Volume file exceeds its byte limit: {path}")
-                content.extend(chunk)
-        except FileNotFoundError:
-            return None
-        return bytes(content)
 
     def _validate(self, content: bytes) -> None:
         if not isinstance(content, bytes):
@@ -324,23 +316,13 @@ class ExecutionRunStore:
             connection.close()
 
 
-class ExecutionVolume(Protocol):
-    """Minimal Modal Volume boundary used by execution hosts."""
-
-    def commit(self) -> object:
-        """Persist pending writes."""
-
-    def reload(self) -> object:
-        """Refresh writes made by other containers."""
-
-
 class ExecutionVolumeSync:
     """Close a Run store while synchronizing its backing Volume."""
 
     def __init__(
         self,
         *,
-        volume: ExecutionVolume | None,
+        volume: VolumeHandle | None,
         store: ExecutionRunStore,
     ) -> None:
         """Bind one optional Volume to its closeable local Run store."""

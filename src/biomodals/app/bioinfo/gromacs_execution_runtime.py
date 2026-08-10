@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import time
 from base64 import b64decode, b64encode
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from hashlib import file_digest, sha256
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from typing import Any
@@ -41,11 +40,16 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
 )
+from biomodals.helper.artifacts import (
+    file_matches_sha256,
+    replace_bytes_atomic,
+    sha256_file,
+)
+from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
 )
-from biomodals.helper.shell import sanitize_filename
 
 REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
@@ -81,8 +85,7 @@ class GromacsExecutionRequest:
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
-        if not self.run_name or sanitize_filename(self.run_name) != self.run_name:
-            raise ValueError("run_name must be a safe filename component")
+        require_safe_filename_component(self.run_name, field_name="run_name")
         if not self.pdb_content:
             raise ValueError("pdb_content cannot be empty")
         if self.simulation_time_ns < 1 or self.num_threads < 1:
@@ -343,13 +346,10 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         expected = scientific_identity | {"owner_execution_run_id": owner}
         if recorded == expected:
             return False
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
-        try:
-            temporary.write_bytes(orjson.dumps(expected, option=orjson.OPT_SORT_KEYS))
-            temporary.replace(marker)
-        finally:
-            temporary.unlink(missing_ok=True)
+        replace_bytes_atomic(
+            marker,
+            orjson.dumps(expected, option=orjson.OPT_SORT_KEYS),
+        )
         return True
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
@@ -409,7 +409,7 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             relative = PurePosixPath(relative_text)
             if relative.is_absolute() or ".." in relative.parts:
                 return False
-            if not self._artifact_matches(
+            if not file_matches_sha256(
                 root.joinpath(*relative.parts),
                 artifact.get("size"),
                 artifact.get("sha256"),
@@ -430,62 +430,26 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 artifacts.append({
                     "path": path.relative_to(root).as_posix(),
                     "size": stat.st_size,
-                    "sha256": self._file_sha256(path),
+                    "sha256": sha256_file(path),
                 })
         except (FileNotFoundError, NotADirectoryError):
             return False
         marker = self._node_publication_path(node_key)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        temporary = marker.with_suffix(f".{time.time_ns()}.tmp")
-        try:
-            temporary.write_bytes(
-                orjson.dumps(
-                    {
-                        "schema_version": _PUBLICATION_SCHEMA_VERSION,
-                        "node_key": node_key,
-                        "workload_plan_fingerprint": (
-                            self.request.execution_plan.workload_plan_fingerprint
-                        ),
-                        "artifacts": artifacts,
-                    },
-                    option=orjson.OPT_SORT_KEYS,
-                )
-            )
-            temporary.replace(marker)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return True
-
-    @staticmethod
-    def _artifact_matches(
-        path: Path,
-        expected_size: object,
-        expected_digest: object,
-    ) -> bool:
-        if (
-            not isinstance(expected_size, int)
-            or isinstance(expected_size, bool)
-            or expected_size < 1
-            or not isinstance(expected_digest, str)
-            or len(expected_digest) != 64
-        ):
-            return False
-        try:
-            if path.is_symlink():
-                return False
-            stat = path.stat()
-        except (FileNotFoundError, NotADirectoryError):
-            return False
-        return (
-            S_ISREG(stat.st_mode)
-            and stat.st_size == expected_size
-            and GromacsExecutionRuntime._file_sha256(path) == expected_digest
+        replace_bytes_atomic(
+            marker,
+            orjson.dumps(
+                {
+                    "schema_version": _PUBLICATION_SCHEMA_VERSION,
+                    "node_key": node_key,
+                    "workload_plan_fingerprint": (
+                        self.request.execution_plan.workload_plan_fingerprint
+                    ),
+                    "artifacts": artifacts,
+                },
+                option=orjson.OPT_SORT_KEYS,
+            ),
         )
-
-    @staticmethod
-    def _file_sha256(path: Path) -> str:
-        with path.open("rb") as stream:
-            return file_digest(stream, "sha256").hexdigest()
+        return True
 
     def _node_paths(self, node_key: str) -> tuple[Path, ...]:
         root = self.request.run_root(self.output_root)

@@ -65,6 +65,13 @@ from biomodals.execution.modal import (
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.artifacts import (
+    replace_bytes_atomic as _atomic_write,
+)
+from biomodals.helper.artifacts import (
+    sha256_bytes,
+    sha256_file,
+)
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import build_local_output_path, resolve_local_output_dir
 from biomodals.helper.shell import run_command, sanitize_filename
@@ -643,7 +650,7 @@ def _result_ready(layout: AppRunLayout, cache_key: str) -> bool:
         and marker.get("schema_version") == APP_INFO.cache_schema_version
         and marker.get("cache_key") == cache_key
         and marker.get("size") == result_path.stat().st_size
-        and marker.get("sha256") == _file_sha256(result_path)
+        and marker.get("sha256") == sha256_file(result_path)
     )
 
 
@@ -655,37 +662,6 @@ def _required_prepared_paths(layout: AppRunLayout) -> tuple[Path, ...]:
         layout.outputs_dir / f"{stem}.json",
         layout.outputs_dir / f"{stem}_processed" / "_metainfo",
     )
-
-
-def _atomic_write(path: Path, content: bytes) -> None:
-    """Publish bytes with a same-directory atomic replacement."""
-    from uuid import uuid4
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(content)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _file_sha256(path: Path) -> str:
-    """Return a streaming SHA-256 digest for one artifact."""
-    from hashlib import sha256
-
-    digest = sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _bytes_sha256(content: bytes) -> str:
-    """Return the SHA-256 digest for an in-memory artifact."""
-    from hashlib import sha256
-
-    return sha256(content).hexdigest()
 
 
 def _candidate_csv_facts(
@@ -717,7 +693,7 @@ def _candidate_csv_facts(
         return None
     try:
         size = csv_path.stat().st_size
-        sha256 = _file_sha256(csv_path)
+        sha256 = sha256_file(csv_path)
     except (FileNotFoundError, NotADirectoryError):
         return None
     return {
@@ -871,7 +847,7 @@ def _processed_manifest_facts(
             "size": part_path.stat().st_size,
         }
         if include_digests:
-            fact["sha256"] = _file_sha256(part_path)
+            fact["sha256"] = sha256_file(part_path)
         facts.append(fact)
     return facts
 
@@ -1000,7 +976,7 @@ def _prepared_metadata(layout: AppRunLayout) -> dict | None:
         _validate_candidate_ids([str(record["siRNA"]) for record in records])
     except ValueError:
         return None
-    if metadata.get("json_sha256") != _file_sha256(json_path):
+    if metadata.get("json_sha256") != sha256_file(json_path):
         return None
     processed_dir = layout.outputs_dir / f"{APP_INFO.input_stem}_processed"
     processed_parts = _processed_manifest_facts(processed_dir, candidate_count)
@@ -1068,7 +1044,7 @@ def _write_prepared_marker(
             "json_records": json_records,
             "json_path": plan.json_path,
             "processed_dir": plan.processed_dir,
-            "json_sha256": _file_sha256(json_path),
+            "json_sha256": sha256_file(json_path),
             "processed_parts": processed_parts,
         }),
     )
@@ -1294,7 +1270,7 @@ def ensirna_prepare_inputs(
 
     mrna_fasta = layout.inputs_dir / APP_INFO.input_fasta_name
     _atomic_write(mrna_fasta, canonical_fasta)
-    input_sha256 = _bytes_sha256(canonical_fasta)
+    input_sha256 = sha256_bytes(canonical_fasta)
     stem = APP_INFO.input_stem
     csv_path = layout.outputs_dir / f"{stem}.csv"
     if not _candidate_csv_valid(
@@ -1616,7 +1592,7 @@ def ensirna_preprocess_dataset(
         shard_lines = json_lines[offset : offset + preprocess_shard_size]
         shard_count = len(shard_lines)
         shard_content = b"\n".join(shard_lines) + b"\n"
-        shard_input_sha256 = _bytes_sha256(shard_content)
+        shard_input_sha256 = sha256_bytes(shard_content)
         shard_dir = shards_dir / f"shard_{shard_index:04d}"
         shard_output = shard_dir / "processed"
         if not _processed_shard_valid(
@@ -1810,7 +1786,7 @@ def run_ensirna_inference(prepared_dir: str, force: bool = False) -> bytes:
                 "schema_version": APP_INFO.cache_schema_version,
                 "cache_key": cache_key,
                 "size": result_xlsx.stat().st_size,
-                "sha256": _file_sha256(result_xlsx),
+                "sha256": sha256_file(result_xlsx),
             }),
         )
         CONF.output_volume.commit()
@@ -2089,11 +2065,5 @@ def submit_ensirna_task(
     result_path = _layout_for_cache_key(cache_key).outputs_dir / "mrna_result.xlsx"
     relative_result = result_path.relative_to(CONF.output_volume_mountpoint)
     xlsx_bytes = b"".join(CONF.output_volume.read_file(relative_result.as_posix()))
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = out_file.with_name(f".{out_file.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_bytes(xlsx_bytes)
-        temporary.replace(out_file)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _atomic_write(out_file, xlsx_bytes)
     print(f"🧬 ENsiRNA run complete! Results saved to {out_file}")

@@ -724,7 +724,12 @@ def build_shortmd_workflow(
             scientific_identity=seed_identity,
             purpose="gen-seed",
         ),
-        genion_seed=genion_seed,
+        genion_seed=concrete_gromacs_seed(
+            genion_seed,
+            scientific_identity=seed_identity,
+            purpose="genion-seed",
+            random_sentinel=0,
+        ),
     )
     used_run_names: set[str] = set()
     analysis_handles = {}

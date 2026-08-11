@@ -88,16 +88,17 @@ class GromacsExecutionRequest:
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
+        seed_identity = gromacs_seed_identity(
+            pdb_sha256=sha256(self.pdb_content).hexdigest(),
+            simulation_time_ns=self.simulation_time_ns,
+            run_pdbfixer=self.run_pdbfixer,
+        )
         object.__setattr__(
             self,
             "ld_seed",
             concrete_gromacs_seed(
                 self.ld_seed,
-                scientific_identity=gromacs_seed_identity(
-                    pdb_sha256=sha256(self.pdb_content).hexdigest(),
-                    simulation_time_ns=self.simulation_time_ns,
-                    run_pdbfixer=self.run_pdbfixer,
-                ),
+                scientific_identity=seed_identity,
                 purpose="ld-seed",
             ),
         )
@@ -106,12 +107,18 @@ class GromacsExecutionRequest:
             "gen_seed",
             concrete_gromacs_seed(
                 self.gen_seed,
-                scientific_identity=gromacs_seed_identity(
-                    pdb_sha256=sha256(self.pdb_content).hexdigest(),
-                    simulation_time_ns=self.simulation_time_ns,
-                    run_pdbfixer=self.run_pdbfixer,
-                ),
+                scientific_identity=seed_identity,
                 purpose="gen-seed",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "genion_seed",
+            concrete_gromacs_seed(
+                self.genion_seed,
+                scientific_identity=seed_identity,
+                purpose="genion-seed",
+                random_sentinel=0,
             ),
         )
         require_safe_filename_component(self.run_name, field_name="run_name")
@@ -389,7 +396,20 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
             available = self._node_publication_ready(node_key)
         except OSError:
             return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+        if available:
+            return AvailabilityStatus.AVAILABLE
+        if (
+            node_key != PREPARE_RESULT
+            and self._node_publication_path(node_key).is_file()
+        ):
+            self._invalidate_node_publication(node_key)
+        return AvailabilityStatus.MISSING
+
+    def _invalidate_node_publication(self, node_key: str) -> None:
+        """Remove a digest-invalid publication before authorizing repair."""
+        for path in self._node_paths(node_key):
+            path.unlink(missing_ok=True)
+        self._node_publication_path(node_key).unlink(missing_ok=True)
 
     def _node_publication_path(self, node_key: str) -> Path:
         marker = sha256(node_key.encode()).hexdigest() + ".json"

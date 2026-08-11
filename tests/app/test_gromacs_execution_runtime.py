@@ -180,6 +180,7 @@ def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
 
     assert request.ld_seed != -1
     assert request.gen_seed != -1
+    assert request.genion_seed != 0
     assert GromacsExecutionRequest.from_bytes(request.to_bytes()) == request
     assert (
         replace(request, ld_seed=17).execution_plan.workload_plan_fingerprint
@@ -418,6 +419,38 @@ def test_successor_repairs_missing_terminal_output(
     try:
         assert successor.run().run.status == RunStatus.SUCCEEDED
         assert repair_function in {name for name, _kwargs in driver.spawns}
+    finally:
+        successor.close()
+
+
+def test_successor_replaces_digest_invalid_preparation_output(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    claims = FakeClaims()
+    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
+    assert owner.run().run.status == RunStatus.SUCCEEDED
+    owner.close()
+    production_mdp = request.run_root(tmp_path) / "production.mdp"
+    production_mdp.write_bytes(b"bad")
+    driver = CompletingDriver(tmp_path, request.run_name)
+    successor = GromacsExecutionRuntime(
+        request=request,
+        execution_run_id=SECOND_RUN_ID,
+        predecessor_execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_claims=claims,
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 20,
+    )
+    try:
+        assert successor.run().run.status == RunStatus.SUCCEEDED
+        assert "prepare_tpr_gpu" in {name for name, _kwargs in driver.spawns}
+        assert production_mdp.read_bytes() == b"mdp"
     finally:
         successor.close()
 

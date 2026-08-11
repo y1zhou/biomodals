@@ -33,9 +33,10 @@ def concrete_gromacs_seed(
     *,
     scientific_identity: str,
     purpose: str,
+    random_sentinel: int = -1,
 ) -> int:
     """Resolve GROMACS' random sentinel to a stable scientific seed."""
-    if seed != -1:
+    if seed != random_sentinel:
         return seed
     digest = sha256(f"{scientific_identity}:{purpose}".encode()).digest()
     return int.from_bytes(digest[:4], "big") % (2**31 - 1) + 1
@@ -136,6 +137,12 @@ def execution_plan(
         gen_seed,
         scientific_identity=seed_identity,
         purpose="gen-seed",
+    )
+    genion_seed = concrete_gromacs_seed(
+        genion_seed,
+        scientific_identity=seed_identity,
+        purpose="genion-seed",
+        random_sentinel=0,
     )
     operations = _operation_plan(cpu_only=cpu_only)
     analysis_nodes = (

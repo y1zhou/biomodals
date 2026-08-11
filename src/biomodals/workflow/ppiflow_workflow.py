@@ -66,6 +66,7 @@ from biomodals.helper.app_run import (
     volume_app_output,
     volume_path_from_mount_path,
 )
+from biomodals.helper.artifacts import publish_content_addressed_file
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
@@ -3649,28 +3650,6 @@ def _file_sha256(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def _copy_file_content_bound(source: Path, destination: Path) -> ArtifactFile:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
-    digest = hashlib.sha256()
-    size_bytes = 0
-    try:
-        with source.open("rb") as input_file, temporary.open("xb") as output_file:
-            while chunk := input_file.read(1024 * 1024):
-                output_file.write(chunk)
-                digest.update(chunk)
-                size_bytes += len(chunk)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return ArtifactFile(
-        path=destination.name,
-        media_type=ZSTD_MEDIA_TYPE,
-        size_bytes=size_bytes,
-        content_sha256=digest.hexdigest(),
-    )
-
-
 def _run_one_refold_candidate(
     *,
     structure_name: str,
@@ -3734,14 +3713,21 @@ def _run_one_refold_candidate(
             output_dir=temp_dir,
             display_name=run_name,
         )
-        published_archive = (
+        publication_root = (
             Path(ALPHAFOLD3_OUTPUT_MOUNTPOINT)
             / "ppiflow"
             / "refold"
             / sanitize_filename(run_name)
-            / archive_path.name
         )
-        archive_file = _copy_file_content_bound(archive_path, published_archive)
+        published_archive, archive_size, archive_sha256 = (
+            publish_content_addressed_file(archive_path, publication_root)
+        )
+        archive_file = ArtifactFile(
+            path=published_archive.name,
+            media_type=ZSTD_MEDIA_TYPE,
+            size_bytes=archive_size,
+            content_sha256=archive_sha256,
+        )
         json_files = ppiflow_staging.files_from_tar_zst_path(
             published_archive,
             suffixes=(".json",),
@@ -3796,6 +3782,19 @@ def _run_one_refold_candidate(
                 "archive_format": "tar.zst",
                 "structure_patterns": (best_model_member,),
                 "request_best_model_archive_member": best_model_member,
+                "candidate_files": [
+                    ppiflow_manifests.candidate_file_record(
+                        role="structure",
+                        volume_name=ALPHAFOLD3_OUTPUT_VOLUME_NAME,
+                        app_volume_path=published_archive.relative_to(
+                            ALPHAFOLD3_OUTPUT_MOUNTPOINT
+                        ).as_posix(),
+                        path=published_archive.name,
+                        media_type=ZSTD_MEDIA_TYPE,
+                        size_bytes=archive_size,
+                        content_sha256=archive_sha256,
+                    )
+                ],
                 "files": [
                     archive_file.model_dump(
                         exclude_defaults=True,

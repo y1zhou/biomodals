@@ -1802,12 +1802,26 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
     assert structures.storage.volume_name == "AlphaFold3-outputs"
     published = output_root / structures.storage.path
     assert published.read_bytes() == archive_bytes
+    assert published.parent.name == hashlib.sha256(archive_bytes).hexdigest()
     assert structures.metadata["files"] == [
         {
             "path": published.name,
             "media_type": "application/zstd",
             "size_bytes": len(archive_bytes),
             "content_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        }
+    ]
+    assert structures.metadata["candidate_files"] == [
+        {
+            "role": "structure",
+            "workflow_path": None,
+            "volume_name": "AlphaFold3-outputs",
+            "app_volume_path": structures.storage.path,
+            "path": published.name,
+            "media_type": "application/zstd",
+            "size_bytes": len(archive_bytes),
+            "content_sha256": hashlib.sha256(archive_bytes).hexdigest(),
+            "expected": True,
         }
     ]
     assert commit_count == 1
@@ -1818,6 +1832,32 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
     assert frame.select("source_file", "iptm").to_dicts() == [
         {"source_file": best_summary, "iptm": 0.9}
     ]
+    aggregate = ppiflow_workflow.ReFoldNode(
+        "ReFoldStep",
+        {"run_name": "refold-run"},
+    ).finalize_remote_tasks(
+        NodeRunContext(
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
+            node_id="stage2-alphafold3-refold",
+            task_key="node",
+            work_dir=tmp_path / "aggregate",
+            cache_dir=tmp_path / "cache",
+            inputs={},
+            volume_root=tmp_path,
+            workflow_volume_name="workflow-volume",
+        ),
+        {
+            "candidate-a": AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=outputs,
+            )
+        },
+        {},
+    )
+    manifest_path = tmp_path / aggregate.outputs[0].storage.path
+    [manifest_row] = ppiflow_manifests.read_manifest(manifest_path).to_dicts()
+    assert manifest_row["files"] == structures.metadata["candidate_files"]
 
 
 def test_refold_builds_af3_config_without_app_reexports() -> None:

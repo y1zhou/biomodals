@@ -7,6 +7,7 @@ from pathlib import Path
 from biomodals.helper.artifacts import (
     file_matches_sha256,
     file_size_sha256,
+    publish_content_addressed_file,
     replace_bytes_atomic,
     sha256_bytes,
 )
@@ -38,3 +39,19 @@ def test_replace_bytes_atomic_replaces_content(tmp_path: Path) -> None:
 
     assert path.read_bytes() == b"second"
     assert not tuple(path.parent.glob(".*.tmp"))
+
+
+def test_publish_content_addressed_file_uses_digest_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "artifact.bin"
+    source.parent.mkdir()
+    source.write_bytes(b"artifact")
+
+    destination, size, digest = publish_content_addressed_file(
+        source,
+        tmp_path / "published",
+    )
+
+    assert destination == tmp_path / "published" / digest / source.name
+    assert destination.read_bytes() == b"artifact"
+    assert size == 8
+    assert digest == sha256_bytes(b"artifact")

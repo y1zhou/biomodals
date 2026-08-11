@@ -170,6 +170,28 @@ def file_size_sha256(
     return size_bytes, digest.hexdigest()
 
 
+def publish_content_addressed_file(source: Path, root: Path) -> tuple[Path, int, str]:
+    """Copy one file into ``root/<sha256>/<name>`` in a single read pass."""
+    require_regular_file(source)
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = root / f".{source.name}.{uuid.uuid4().hex}.tmp"
+    digest = hashlib.sha256()
+    size_bytes = 0
+    try:
+        with source.open("rb") as input_file, temporary.open("xb") as output_file:
+            while chunk := input_file.read(16 * 1024 * 1024):
+                output_file.write(chunk)
+                digest.update(chunk)
+                size_bytes += len(chunk)
+        content_sha256 = digest.hexdigest()
+        destination = root / content_sha256 / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination, size_bytes, content_sha256
+
+
 def file_matches_sha256(
     path: Path,
     expected_size: object,

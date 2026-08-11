@@ -11,7 +11,6 @@ from uuid import UUID
 
 from biomodals.app.bioinfo.gromacs_execution import (
     PREPARE_RESULT,
-    concrete_gromacs_seed,
     modal_invocation,
     operation_provider_binding,
     operation_task_plan,
@@ -178,6 +177,23 @@ class GromacsExecutionCoordinator:
             execution_run_id = job.execution_run_id
 
             with self.store.async_execution_runtime(self.adapter) as runtime:
+                run = runtime.repository.get_run(execution_run_id)
+                if run.cancellation_is_durable:
+                    await runtime.cancel_run(execution_run_id, now=self._now())
+                    await runtime.reconcile_provider_calls(
+                        execution_run_id,
+                        required_node_keys=set(),
+                        encode_result=_result_envelope,
+                        now=self._now(),
+                    )
+                    self._reconcile_running_nodes(runtime, execution_run_id)
+                    run = runtime.repository.finalize_run_from_results(
+                        execution_run_id,
+                        now=self._now(),
+                    )
+                    runtime.checkpoint()
+                    self._project_terminal_or_running_job(job, run.status)
+                    return
                 archive = await self._recover_node_publications(runtime, job)
                 required = self._required_nodes(runtime, execution_run_id)
                 if required is None:
@@ -698,6 +714,7 @@ class GromacsExecutionCoordinator:
                         job,
                         candidate.node_key,
                         options,
+                        run.plan.scientific_payload,
                     ),
                 )
                 for candidate in selected
@@ -712,6 +729,7 @@ class GromacsExecutionCoordinator:
         job: JobRecord,
         operation: str,
         options: GromacsJobOptions,
+        scientific_payload: object,
     ) -> dict[str, object]:
         if job.run_name is None:
             raise ValueError("GROMACS Job has no run name")
@@ -719,28 +737,16 @@ class GromacsExecutionCoordinator:
             pdb_content = self.store.load_job_input(job.job_id)
             if pdb_content is None:
                 raise RuntimeError("Staged GROMACS input is unavailable")
-            seed_run_id = str(job.execution_run_id)
+            if not isinstance(scientific_payload, Mapping):
+                raise TypeError("GROMACS plan scientific payload is invalid")
             return {
                 "pdb_content": pdb_content,
                 "run_name": job.run_name,
                 "simulation_time_ns": options.simulation_time_ns,
                 "run_pdbfixer": options.run_pdbfixer,
-                "ld_seed": concrete_gromacs_seed(
-                    -1,
-                    run_identity=seed_run_id,
-                    purpose="ld-seed",
-                ),
-                "gen_seed": concrete_gromacs_seed(
-                    -1,
-                    run_identity=seed_run_id,
-                    purpose="gen-seed",
-                ),
-                "genion_seed": concrete_gromacs_seed(
-                    0,
-                    run_identity=seed_run_id,
-                    purpose="genion-seed",
-                    random_sentinel=0,
-                ),
+                "ld_seed": int(scientific_payload["ld_seed"]),
+                "gen_seed": int(scientific_payload["gen_seed"]),
+                "genion_seed": int(scientific_payload["genion_seed"]),
             }
         return modal_invocation(
             operation,

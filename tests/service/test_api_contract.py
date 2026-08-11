@@ -2604,6 +2604,28 @@ def test_failed_jobs_expose_safe_typed_errors_only(tmp_path: Path) -> None:
     ]
 
 
+def test_reconciliation_replays_durable_cancellation(tmp_path: Path) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    _advance_gromacs(
+        store,
+        adapter,
+        job_id,
+        completed=("fc-1",),
+        now=1_799_999_999,
+    )
+    job = store.get_job_by_id(job_id)
+    assert job is not None
+    store.request_cancel(job.owner_user_id, job_id, now=1_800_000_000)
+
+    _advance_gromacs(store, adapter, job_id, now=1_800_000_001)
+
+    assert adapter.cancellations == ["fc-2", "fc-3", "fc-4"]
+
+
 def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     client, auth, store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
@@ -2640,7 +2662,14 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     assert first.json()["state"] == "cancel_requested"
     assert replay.status_code == 202
     assert replay.json()["state"] == "cancel_requested"
-    assert adapter.cancellations == ["fc-2", "fc-3", "fc-4"]
+    assert adapter.cancellations == [
+        "fc-2",
+        "fc-3",
+        "fc-4",
+        "fc-2",
+        "fc-3",
+        "fc-4",
+    ]
     assert old_delete_route.status_code == 405
 
     _advance_gromacs(

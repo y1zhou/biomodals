@@ -43,6 +43,7 @@ class FakeGromacsExecutionAdapter:
         self.spawn_waves: list[list[str]] = []
         self._current_wave: list[str] = []
         self._calls: dict[str, str] = {}
+        self.spawn_kwargs: list[dict[str, object]] = []
         self.publish_count = 0
         self.recover_count = 0
         self.archive_published = False
@@ -58,6 +59,7 @@ class FakeGromacsExecutionAdapter:
         call_id = f"fc-{len(self._calls)}"
         self._calls[call_id] = function.function_name
         self._current_wave.append(function.function_name)
+        self.spawn_kwargs.append(dict(kwargs))
         return call_id
 
     async def observe(self, provider_call_handle_id):
@@ -254,6 +256,10 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
             ["collect_traj_stats"],
             [],
         ]
+        assert {
+            key: adapter.spawn_kwargs[0][key]
+            for key in ("ld_seed", "gen_seed", "genion_seed")
+        } == {"ld_seed": 11, "gen_seed": 12, "genion_seed": 13}
         with store.execution_repository() as repository:
             snapshot = repository.snapshot(RUN_ID)
         assert snapshot.run.status == RunStatus.SUCCEEDED

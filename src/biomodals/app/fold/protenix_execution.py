@@ -109,7 +109,7 @@ class ProtenixExecutionRequest:
         )
         if (
             self.max_active_provider_calls < 1
-            or self.max_active_gpu_provider_calls < 0
+            or self.max_active_gpu_provider_calls < 1
             or self.max_active_gpu_provider_calls > self.max_active_provider_calls
         ):
             raise ValueError("Protenix provider-call limits are invalid")

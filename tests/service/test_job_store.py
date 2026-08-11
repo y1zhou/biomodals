@@ -57,6 +57,22 @@ def make_store(tmp_path: Path) -> tuple[ServiceStore, UUID, UUID]:
     return store, alice.user_id, bob.user_id
 
 
+def test_service_schema_indexes_active_job_joins(tmp_path: Path) -> None:
+    store, _alice, _bob = make_store(tmp_path)
+
+    with sqlite3.connect(store.path) as connection:
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+
+    assert "execution_runs_status_idx" in indexes
+    assert "jobs_owner_execution" in indexes
+    assert "jobs_workload_execution" in indexes
+
+
 def configuration(
     workload: str = "gromacs",
     *,

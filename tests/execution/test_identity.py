@@ -77,6 +77,29 @@ def test_create_run_persists_opaque_identity_plan_and_nodes() -> None:
     assert nodes[1].dependencies == (NodeDependency(node_key="search"),)
 
 
+def test_list_nodes_loads_all_dependencies_in_one_query() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = SqliteExecutionRepository(connection)
+    repository.initialize_schema()
+    execution_run_id = UUID("d4e4744e-aacf-4478-92d6-a58681805162")
+    repository.create_run(
+        execution_run_id=execution_run_id,
+        plan=_plan(),
+        deployment=DeploymentIdentity("production", "biomodals-af3", 23),
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=1,
+        now=100,
+    )
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+
+    nodes = repository.list_nodes(execution_run_id)
+
+    connection.set_trace_callback(None)
+    assert len(nodes) == 2
+    assert sum("FROM execution_node_dependencies" in sql for sql in statements) == 1
+
+
 def test_run_identity_is_not_inferred_from_workload_key() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SqliteExecutionRepository(connection)

@@ -156,6 +156,10 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE INDEX execution_runs_status_idx
+    ON execution_runs(status, execution_run_id)
+    """,
+    """
     CREATE TABLE execution_nodes (
         execution_run_id TEXT NOT NULL
             REFERENCES execution_runs(execution_run_id) ON DELETE CASCADE,
@@ -437,6 +441,12 @@ class SqliteExecutionRepository:
                 raise UnsupportedExecutionSchemaVersionError(
                     f"Unsupported execution schema version {version}"
                 )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS execution_runs_status_idx
+                ON execution_runs(status, execution_run_id)
+                """
+            )
             return
 
         for statement in _SCHEMA_STATEMENTS:
@@ -777,6 +787,7 @@ class SqliteExecutionRepository:
 
     def list_nodes(self, execution_run_id: UUID) -> tuple[ExecutionNodeRecord, ...]:
         """Load planned Nodes in their persisted encounter order."""
+        run_id = str(execution_run_id)
         rows = self._connection.execute(
             """
             SELECT *
@@ -784,9 +795,27 @@ class SqliteExecutionRepository:
             WHERE execution_run_id = ?
             ORDER BY ordinal
             """,
-            (str(execution_run_id),),
+            (run_id,),
         ).fetchall()
-        return tuple(self._node_from_row(row) for row in rows)
+        dependency_rows = self._connection.execute(
+            """
+            SELECT node_key, dependency_node_key, accept_partial
+            FROM execution_node_dependencies
+            WHERE execution_run_id = ?
+            ORDER BY node_key, ordinal
+            """,
+            (run_id,),
+        ).fetchall()
+        dependencies: dict[str, list[sqlite3.Row]] = {}
+        for dependency in dependency_rows:
+            dependencies.setdefault(dependency["node_key"], []).append(dependency)
+        return tuple(
+            self._node_from_row_with_dependencies(
+                row,
+                dependencies.get(row["node_key"], ()),
+            )
+            for row in rows
+        )
 
     def get_node(
         self,
@@ -3352,42 +3381,45 @@ class SqliteExecutionRepository:
         ordered_keys = tuple(dict.fromkeys(node_keys))
         if not ordered_keys:
             return ()
-        rows: list[sqlite3.Row] = []
-        for node_key in ordered_keys:
-            rows.extend(
-                self._connection.execute(
-                    """
-                    SELECT task.*, node.ordinal AS node_ordinal
-                    FROM execution_tasks AS task
-                    JOIN execution_nodes AS node
-                        ON node.execution_run_id = task.execution_run_id
-                        AND node.node_key = task.node_key
-                    WHERE task.execution_run_id = ?
-                        AND task.node_key = ?
-                        AND node.status = ?
-                        AND node.discovery_complete = 1
-                        AND task.status = ?
-                        AND task.result_observation = ?
-                        AND task.dispatch_policy_json IS NOT NULL
-                        AND json_extract(
-                            task.dispatch_policy_json,
-                            '$.binding.uses_gpu'
-                        ) = ?
-                    ORDER BY task.ordinal
-                    LIMIT ?
-                    """,
-                    (
-                        str(execution_run_id),
-                        node_key,
-                        NodeStatus.RUNNING.value,
-                        TaskStatus.PENDING.value,
-                        AvailabilityStatus.MISSING.value,
-                        int(uses_gpu),
-                        limit_per_node,
-                    ),
-                ).fetchall()
+        placeholders = ", ".join("?" for _ in ordered_keys)
+        rows = self._connection.execute(
+            f"""
+            WITH ready AS (
+                SELECT task.*, node.ordinal AS node_ordinal,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task.node_key
+                           ORDER BY task.ordinal
+                       ) AS ready_ordinal
+                FROM execution_tasks AS task
+                JOIN execution_nodes AS node
+                    ON node.execution_run_id = task.execution_run_id
+                    AND node.node_key = task.node_key
+                WHERE task.execution_run_id = ?
+                    AND task.node_key IN ({placeholders})
+                    AND node.status = ?
+                    AND node.discovery_complete = 1
+                    AND task.status = ?
+                    AND task.result_observation = ?
+                    AND task.dispatch_policy_json IS NOT NULL
+                    AND json_extract(
+                        task.dispatch_policy_json,
+                        '$.binding.uses_gpu'
+                    ) = ?
             )
-        rows.sort(key=lambda row: (row["node_ordinal"], row["ordinal"]))
+            SELECT * FROM ready
+            WHERE ready_ordinal <= ?
+            ORDER BY node_ordinal, ordinal
+            """,  # noqa: S608 - placeholders are generated, not user input
+            (
+                str(execution_run_id),
+                *ordered_keys,
+                NodeStatus.RUNNING.value,
+                TaskStatus.PENDING.value,
+                AvailabilityStatus.MISSING.value,
+                int(uses_gpu),
+                limit_per_node,
+            ),
+        ).fetchall()
         return tuple(
             _task_dispatch_descriptor_from_row(
                 row,

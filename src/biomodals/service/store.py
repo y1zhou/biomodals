@@ -163,6 +163,8 @@ CREATE TABLE jobs (
 );
 CREATE INDEX jobs_owner_created ON jobs(owner_user_id, created_at DESC);
 CREATE INDEX jobs_workload ON jobs(workload);
+CREATE INDEX jobs_owner_execution ON jobs(owner_user_id, execution_run_id);
+CREATE INDEX jobs_workload_execution ON jobs(workload, execution_run_id);
 
 CREATE TABLE job_inputs (
     job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
@@ -479,6 +481,18 @@ class ServiceStore:
                 )
             else:
                 SqliteExecutionRepository(conn).initialize_schema()
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS jobs_owner_execution
+                ON jobs(owner_user_id, execution_run_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS jobs_workload_execution
+                ON jobs(workload, execution_run_id)
+                """
+            )
             conn.execute("PRAGMA journal_mode = WAL")
         self.path.chmod(0o600)
         for path in (self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):

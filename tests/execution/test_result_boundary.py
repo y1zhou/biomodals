@@ -87,6 +87,26 @@ def test_unknown_result_observation_authorizes_no_work() -> None:
     )
 
 
+def test_required_closure_handles_deep_dag_iteratively() -> None:
+    nodes = [NodePlan(node_key="root")]
+    for index in range(1, 1_200):
+        nodes.append(
+            NodePlan(
+                node_key=f"node-{index}",
+                dependencies=(NodeDependency(node_key=nodes[-1].node_key),),
+            )
+        )
+    plan = ExecutionPlan(workload_name="deep", nodes=tuple(reversed(nodes)))
+
+    assert (
+        required_node_keys(
+            plan,
+            {key: AvailabilityStatus.MISSING for key in plan.node_keys},
+        )
+        == plan.node_keys
+    )
+
+
 def test_result_probe_frontier_stops_at_available_ancestor() -> None:
     plan = _linear_plan()
     observations: dict[str, AvailabilityStatus | None] = {

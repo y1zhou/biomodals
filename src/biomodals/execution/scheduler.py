@@ -1,6 +1,6 @@
 """Pure DAG readiness and admission decisions."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -79,47 +79,50 @@ def required_node_ranks(
 ) -> dict[str, NodeAdmissionRank]:
     """Calculate depth and unfinished descendant span in one required closure."""
     nodes = {node.node_key: node for node in plan.nodes}
-    depths: dict[str, int] = {}
-
-    def depth(node_key: str) -> int:
-        if node_key in depths:
-            return depths[node_key]
-        node = nodes[node_key]
-        dependency_depths = [
-            depth(dependency.node_key)
-            for dependency in node.dependencies
-            if dependency.node_key in required_node_keys
-        ]
-        value = max(dependency_depths) + 1 if dependency_depths else 0
-        depths[node_key] = value
-        return value
-
-    for node_key in required_node_keys:
-        depth(node_key)
-
     dependents: dict[str, list[str]] = defaultdict(list)
-    for node in plan.nodes:
-        if node.node_key not in required_node_keys:
-            continue
+    indegree = {node_key: 0 for node_key in required_node_keys}
+    for node_key in required_node_keys:
+        node = nodes[node_key]
         for dependency in node.dependencies:
             if dependency.node_key in required_node_keys:
-                dependents[dependency.node_key].append(node.node_key)
+                dependents[dependency.node_key].append(node_key)
+                indegree[node_key] += 1
 
-    def unfinished_descendants(node_key: str) -> set[str]:
-        found: set[str] = set()
-        remaining = list(dependents[node_key])
-        while remaining:
-            descendant = remaining.pop()
-            if descendant in found:
-                continue
-            found.add(descendant)
-            remaining.extend(dependents[descendant])
-        return found & unfinished_node_keys
+    ready = deque(
+        node.node_key
+        for node in plan.nodes
+        if node.node_key in required_node_keys and indegree[node.node_key] == 0
+    )
+    topological: list[str] = []
+    depths = {node_key: 0 for node_key in required_node_keys}
+    while ready:
+        node_key = ready.popleft()
+        topological.append(node_key)
+        for dependent in dependents[node_key]:
+            depths[dependent] = max(depths[dependent], depths[node_key] + 1)
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready.append(dependent)
+
+    unfinished_bits = {
+        node_key: 1 << index
+        for index, node_key in enumerate(
+            node.node_key
+            for node in plan.nodes
+            if node.node_key in unfinished_node_keys
+        )
+    }
+    descendant_bits = {node_key: 0 for node_key in required_node_keys}
+    for node_key in reversed(topological):
+        for dependent in dependents[node_key]:
+            descendant_bits[node_key] |= (
+                unfinished_bits.get(dependent, 0) | descendant_bits[dependent]
+            )
 
     return {
         node.node_key: NodeAdmissionRank(
             depth=depths[node.node_key],
-            unblocking_span=len(unfinished_descendants(node.node_key)),
+            unblocking_span=descendant_bits[node.node_key].bit_count(),
         )
         for node in plan.nodes
         if node.node_key in required_node_keys
@@ -345,20 +348,24 @@ def required_node_keys(
     """Return missing result work, or ``None`` when validation is unknown."""
     nodes = {node.node_key: node for node in plan.nodes}
     required: set[str] = set()
-
-    def visit(node_key: str) -> bool:
+    pending = list(reversed(plan.terminal_node_keys))
+    while pending:
+        node_key = pending.pop()
         observation = observations[node_key]
         if observation == AvailabilityStatus.UNKNOWN:
-            return False
+            return None
         if observation == AvailabilityStatus.AVAILABLE:
-            return True
+            continue
+        if node_key in required:
+            continue
         required.add(node_key)
-        return all(
-            visit(dependency.node_key) for dependency in nodes[node_key].dependencies
+        pending.extend(
+            reversed(
+                tuple(
+                    dependency.node_key for dependency in nodes[node_key].dependencies
+                )
+            )
         )
-
-    if not all(visit(node_key) for node_key in plan.terminal_node_keys):
-        return None
     return tuple(node.node_key for node in plan.nodes if node.node_key in required)
 
 

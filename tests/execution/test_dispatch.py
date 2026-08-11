@@ -298,14 +298,12 @@ def test_ready_dispatch_window_bounds_each_eligible_node() -> None:
 
     connection.set_trace_callback(None)
     window_queries = [
-        statement
-        for statement in statements
-        if "SELECT task.*, node.ordinal AS node_ordinal" in statement
+        statement for statement in statements if "WITH ready AS" in statement
     ]
     assert [(item.node_key, item.task_key) for item in window] == [
         (node_key, "task") for node_key in node_keys
     ]
-    assert len(window_queries) == len(node_keys)
+    assert len(window_queries) == 1
 
 
 def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:

@@ -99,6 +99,29 @@ def test_required_node_rank_accepts_non_topological_encounter_order() -> None:
     assert ranks["downstream"].depth == 1
 
 
+def test_required_node_rank_handles_deep_shared_dag_iteratively() -> None:
+    nodes = [NodePlan(node_key="root")]
+    for index in range(1, 1_200):
+        nodes.append(
+            NodePlan(
+                node_key=f"node-{index}",
+                dependencies=(NodeDependency(node_key=nodes[-1].node_key),),
+            )
+        )
+    plan = ExecutionPlan(workload_name="deep", nodes=tuple(reversed(nodes)))
+    required = set(plan.node_keys)
+
+    ranks = required_node_ranks(
+        plan,
+        required_node_keys=required,
+        unfinished_node_keys=required,
+    )
+
+    assert ranks["root"].depth == 0
+    assert ranks["root"].unblocking_span == 1_199
+    assert ranks["node-1199"].depth == 1_199
+
+
 def test_admission_keeps_graph_rank_primary_then_gpu_and_image_cohorts() -> None:
     candidates = (
         _candidate("cpu-critical", 0, binding=CPU_X, depth=3),

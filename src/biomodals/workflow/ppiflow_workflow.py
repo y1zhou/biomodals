@@ -4123,6 +4123,10 @@ def build_ppiflow_workflow(
             "flowpacker": app_scientific_version(flowpacker_app.CONF),
             "ligandmpnn": app_scientific_version(ligandmpnn_app.CONF),
             "ppiflow": app_scientific_version(ppiflow_app.CONF),
+            **{
+                f"ppiflow.model.{name}": file_id
+                for name, file_id in ppiflow_app.PPI_FLOW_MODEL_FILE_IDS.items()
+            },
             "rosetta": app_scientific_version(rosetta_app.CONF),
         },
     )

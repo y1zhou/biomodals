@@ -282,6 +282,14 @@ class PPIFlowArgs(BaseModel):
 ##########################################
 # Fetch model weights
 ##########################################
+PPI_FLOW_MODEL_FILE_IDS = {
+    "antibody.ckpt": "1WBSjCTEtia9S1hJ54mYH1PZdDqpLVsgw",
+    "binder.ckpt": "1PbpoC7VdkCpoNlxduDhnQ3RuLyWwAuOT",
+    "monomer.ckpt": "1Oo9nbSH3MwT8KIriij5clmnTFrhDJEn5",
+    "nanobody.ckpt": "1aEwzmdlSN9tiIOl5TgM_muHjfFPLue8a",
+}
+
+
 @app.function(
     volumes=CONF.mounts(model_volume=True, model_ro=False), timeout=MAX_TIMEOUT
 )
@@ -290,10 +298,8 @@ def fetch_model_weights(force: bool = False) -> None:
     model_dir = Path(CONF.model_volume_mountpoint)
     base_url = "https://drive.google.com/uc?export=download&confirm=t&id="
     tasks = {
-        f"{base_url}1WBSjCTEtia9S1hJ54mYH1PZdDqpLVsgw": model_dir / "antibody.ckpt",
-        f"{base_url}1PbpoC7VdkCpoNlxduDhnQ3RuLyWwAuOT": model_dir / "binder.ckpt",
-        f"{base_url}1Oo9nbSH3MwT8KIriij5clmnTFrhDJEn5": model_dir / "monomer.ckpt",
-        f"{base_url}1aEwzmdlSN9tiIOl5TgM_muHjfFPLue8a": model_dir / "nanobody.ckpt",
+        f"{base_url}{file_id}": model_dir / name
+        for name, file_id in PPI_FLOW_MODEL_FILE_IDS.items()
     }
     raise RuntimeError(
         "This doesn't work because Google Drive requires confirmation for "

@@ -37,6 +37,7 @@ from biomodals.helper.output_claim import (
 )
 
 REQUEST_SCHEMA_VERSION = 1
+PROTENIX_DATA_RELEASE = "v1.0.0"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 DOWNLOAD_NODE = "download-model-data"
 PLAN_NODE = "plan-preprocessing"
@@ -169,6 +170,8 @@ class ProtenixExecutionRequest:
             },
             scientific_versions={
                 "protenix": self.app_version,
+                "protenix.model": self.model_name,
+                "protenix.reference_data": PROTENIX_DATA_RELEASE,
                 "biomodals.protenix.execution_request": str(REQUEST_SCHEMA_VERSION),
             },
         )

@@ -1488,7 +1488,7 @@ class WorkflowRuntime:
         if not selected:
             self._provider.suspend_for_unavailable_gpu_capacity(
                 self.execution_run_id,
-                required_node_keys=required,
+                required_node_keys=fixed_node_keys,
                 additional_gpu_work=any(
                     candidate.binding.uses_gpu for candidate in pull_candidates
                 ),

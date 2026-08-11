@@ -264,19 +264,14 @@ class PPIFlowArgs(BaseModel):
     @cached_property
     def model_weights_name(self) -> str:
         """Determine which PPIFlow model weights to use based on the config."""
-        return ppiflow_model_weights_name(self.args)
-
-
-def ppiflow_model_weights_name(args: CommonConfig) -> str:
-    """Return the checkpoint selected by one validated PPIFlow config."""
-    if isinstance(
-        args,
-        (SampleAntibodyNanobodyConfig, SampleAntibodyNanobodyPartialConfig),
-    ):
-        return "nanobody.ckpt" if args.light_chain is None else "antibody.ckpt"
-    if isinstance(args, (SampleBinderConfig, SampleBinderPartialConfig)):
-        return "binder.ckpt"
-    raise ValueError(f"Unsupported config type: {type(args)}")
+        if isinstance(
+            self.args,
+            (SampleAntibodyNanobodyConfig, SampleAntibodyNanobodyPartialConfig),
+        ):
+            return "nanobody.ckpt" if self.args.light_chain is None else "antibody.ckpt"
+        if isinstance(self.args, (SampleBinderConfig, SampleBinderPartialConfig)):
+            return "binder.ckpt"
+        raise ValueError(f"Unsupported config type: {type(self.args)}")
 
 
 ##########################################

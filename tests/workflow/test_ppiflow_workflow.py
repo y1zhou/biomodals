@@ -320,6 +320,56 @@ PPIFlowStep:
         )
 
 
+def test_checked_in_ppiflow_workflow_builds() -> None:
+    repository_root = Path(__file__).parents[2]
+
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=(
+            repository_root / "examples/data/ppiflow_workflow_task.yaml"
+        ).read_bytes(),
+        steps_yaml_bytes=(
+            repository_root / "examples/data/ppiflow_workflow_steps.yaml"
+        ).read_bytes(),
+    )
+
+    assert (
+        workflow.validate().scientific_versions["ppiflow.model.nanobody.ckpt"]
+        == ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["nanobody.ckpt"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("structure_field", "expected_model"),
+    [("complex_pdb", "antibody.ckpt"), ("input_pdb", "binder.ckpt")],
+)
+def test_partial_model_identity_uses_runtime_structure_mode(
+    structure_field: str,
+    expected_model: str,
+) -> None:
+    raw_args = {
+        "name": "demo",
+        "specified_hotspots": "A1",
+        "fixed_positions": "A1",
+        "start_t": 0.15,
+        structure_field: "/inputs/candidate.pdb",
+    }
+    if structure_field == "complex_pdb":
+        raw_args.update({
+            "cdr_position": "H1",
+            "antigen_chain": "A",
+            "heavy_chain": "H",
+            "light_chain": "L",
+        })
+
+    assert (
+        ppiflow_workflow._ppiflow_step_model_weights_name(
+            {"args": raw_args},
+            partial=True,
+        )
+        == expected_model
+    )
+
+
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
 

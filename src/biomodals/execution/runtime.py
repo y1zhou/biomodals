@@ -735,7 +735,7 @@ class ExecutionRuntime:
         required_node_keys: set[str],
         additional_gpu_work: bool = False,
         now: int,
-    ) -> bool:
+    ) -> None:
         """Suspend only when the remaining ready frontier requires a GPU."""
         with self._synchronize():
             with self._transaction():
@@ -747,7 +747,7 @@ class ExecutionRuntime:
                         execution_run_id
                     ).total
                 ):
-                    return False
+                    return
                 blocked_gpu_work = additional_gpu_work or bool(
                     self.repository.list_ready_fixed_dispatch_descriptors(
                         execution_run_id,
@@ -759,7 +759,7 @@ class ExecutionRuntime:
                     )
                 )
                 if not blocked_gpu_work:
-                    return False
+                    return
                 self.repository.transition_run(
                     execution_run_id,
                     RunStatus.SUSPENDED,
@@ -771,7 +771,6 @@ class ExecutionRuntime:
                     now=now,
                 )
             self._checkpoint_state()
-            return True
 
     def persist_fixed_dispatch_policy(
         self,

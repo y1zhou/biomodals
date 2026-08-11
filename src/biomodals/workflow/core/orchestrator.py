@@ -682,7 +682,7 @@ class ExecutionCoordinator:
             )
             if existing is None:
                 with store.transaction():
-                    existing = store.execution.create_run(
+                    store.execution.create_run(
                         execution_run_id=execution_run_id,
                         predecessor_execution_run_id=(predecessor.execution_run_id),
                         plan=predecessor.plan,

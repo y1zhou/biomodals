@@ -1106,6 +1106,34 @@ def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
     assert result.status == AppRunStatus.PARTIAL
 
 
+def test_af3score_batch_reports_partial_for_mixed_tasks(tmp_path: Path) -> None:
+    node = ppiflow_workflow.AF3ScoreBatchNode(
+        "AF3scoreStep_stage1",
+        {"run_name": "af3-run"},
+    )
+    context = NodeRunContext(
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
+        node_id="stage1-af3score-batches",
+        task_key="node",
+        work_dir=tmp_path / "result",
+        cache_dir=tmp_path / "cache",
+        inputs={},
+    )
+
+    result = node.finalize_remote_tasks(
+        context,
+        {"candidate-a": AppRunResult(status=AppRunStatus.SUCCEEDED)},
+        {"candidate-b": "worker failed"},
+    )
+
+    assert (
+        node.aggregation_policy == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
+    )
+    assert result.status == AppRunStatus.PARTIAL
+    assert result.metrics == {"failed_candidates": 1, "scored_candidates": 1}
+
+
 def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
     tmp_path: Path,
 ) -> None:

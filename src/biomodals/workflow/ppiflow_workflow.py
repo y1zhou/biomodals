@@ -1596,6 +1596,7 @@ def postprocess_ppiflow_af3score_stage(
         publication_key=publication_key,
     )
     metrics_csv = str(metrics["metrics_csv"])
+    failed_ids = {path.stem for path in Path(str(metrics["failed_dir"])).glob("*.err")}
     status = ppiflow_tables.score_table_status(
         requested_count=len(input_files),
         usable_rows=int(metrics.get("metrics_rows", 0)),
@@ -1611,20 +1612,28 @@ def postprocess_ppiflow_af3score_stage(
                 stage_name=step_name,
                 stage_role="score",
                 operation_mode="af3score",
-                candidate_status=status.value,
+                candidate_status=(
+                    AppRunStatus.FAILED.value
+                    if Path(str(candidate_payload["input_name"])).stem in failed_ids
+                    else AppRunStatus.SUCCEEDED.value
+                ),
                 source_path=str(candidate_payload["input_name"]),
                 derived_path=metrics_csv,
-                files=[
-                    ppiflow_manifests.candidate_file_record(
-                        role="scores",
-                        volume_name=AF3SCORE_OUTPUT_VOLUME_NAME,
-                        app_volume_path=volume_path_from_mount_path(
-                            metrics_csv,
-                            AF3SCORE_OUTPUT_MOUNTPOINT,
-                            AF3SCORE_OUTPUT_VOLUME_NAME,
-                        ).path,
-                    )
-                ],
+                files=(
+                    []
+                    if Path(str(candidate_payload["input_name"])).stem in failed_ids
+                    else [
+                        ppiflow_manifests.candidate_file_record(
+                            role="scores",
+                            volume_name=AF3SCORE_OUTPUT_VOLUME_NAME,
+                            app_volume_path=volume_path_from_mount_path(
+                                metrics_csv,
+                                AF3SCORE_OUTPUT_MOUNTPOINT,
+                                AF3SCORE_OUTPUT_VOLUME_NAME,
+                            ).path,
+                        )
+                    ]
+                ),
                 summary=metrics,
             )
             for candidate in candidates
@@ -2479,6 +2488,8 @@ class AF3ScorePrepareNode(_ConfiguredAppStepNode):
 class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     """Schedule candidate Tasks through AF3Score's prepared GPU batches."""
 
+    aggregation_policy = NodeAggregationPolicy.ALLOW_PARTIAL
+
     def _plan(self, context: NodeRunContext) -> dict[str, object]:
         return _read_af3score_plan_artifacts(context.inputs.get("af3score_plan") or [])
 
@@ -2618,8 +2629,15 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     ) -> AppRunResult:
         """Record the aggregate batch outcome; postprocessing publishes scores."""
         del context
+        status = (
+            AppRunStatus.PARTIAL
+            if errors and results
+            else AppRunStatus.FAILED
+            if errors
+            else AppRunStatus.SUCCEEDED
+        )
         return AppRunResult(
-            status=AppRunStatus.FAILED if errors else AppRunStatus.SUCCEEDED,
+            status=status,
             warnings=[f"{key}: {errors[key]}" for key in sorted(errors)],
             metrics={
                 "failed_candidates": len(errors),
@@ -4243,7 +4261,7 @@ def _add_stage1_nodes(
             ),
             id="stage1-filter",
             inputs=inputs,
-            accept_partial_from=_partial_sources(partial_tail),
+            accept_partial_from=_partial_sources(partial_tail, score),
         )
         partial_tail = None
         report_table_inputs["stage1_filter_tables"] = tail.outputs(
@@ -4283,6 +4301,7 @@ def _add_af3score_nodes(
             "af3score_plan": prepare.outputs(kind=ArtifactKind.TABLE),
         },
         depends_on=[batches],
+        accept_partial_from=[batches],
     )
 
 
@@ -4457,7 +4476,7 @@ def _add_stage2_nodes(
             ),
             id="stage2-filter",
             inputs=inputs,
-            accept_partial_from=_partial_sources(partial_tail),
+            accept_partial_from=_partial_sources(partial_tail, score),
         )
         partial_tail = None
         report_table_inputs["filter_tables"] = filtered.outputs(kind=ArtifactKind.TABLE)

@@ -108,6 +108,40 @@ def test_missing_declared_output_never_publishes_success(tmp_path: Path) -> None
     assert not validate_task_publication(tmp_path, task, "fingerprint")
 
 
+def test_task_publication_propagates_transient_read_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task(expected_files=("outputs/1/score.sc",))
+    _stage_inputs(tmp_path)
+
+    def run_command(command, *, output_mode, log_file):
+        del command, output_mode
+        Path(log_file).write_text("log\n", encoding="utf-8")
+        score = tmp_path / "outputs/1/score.sc"
+        score.parent.mkdir(parents=True, exist_ok=True)
+        score.write_text("score\n", encoding="utf-8")
+
+    execute_rosetta_task(
+        run_root=tmp_path,
+        task=task,
+        task_fingerprint="fingerprint",
+        run_command=run_command,
+    )
+    marker = next((tmp_path / ".biomodals/tasks").glob("*.json"))
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(path: Path) -> bytes:
+        if path == marker:
+            raise PermissionError("temporarily unavailable")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    with pytest.raises(PermissionError, match="temporarily unavailable"):
+        validate_task_publication(tmp_path, task, "fingerprint")
+
+
 def test_empty_undeclared_output_never_publishes_success(tmp_path: Path) -> None:
     task = _task()
     _stage_inputs(tmp_path)

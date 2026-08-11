@@ -221,7 +221,7 @@ def _input_publication_ready(
         return False
     try:
         return marker["outputs"] == _input_output_records(output_dir, input_id)
-    except (OSError, RuntimeError):
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError, RuntimeError):
         return False
 
 

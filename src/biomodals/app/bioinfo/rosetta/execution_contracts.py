@@ -12,6 +12,7 @@ import orjson
 
 from biomodals.helper.artifacts import (
     VolumeReader,
+    file_matches_sha256,
     file_size_sha256,
     read_volume_bytes,
     replace_bytes_atomic,
@@ -182,11 +183,11 @@ def validate_task_publication(
 ) -> bool:
     """Return whether this exact Task has a complete durable publication."""
     path = task_publication_path(run_root, task.task_key)
-    if not path.is_file():
-        return False
     try:
         value: Any = orjson.loads(path.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return False
+    except orjson.JSONDecodeError:
         return False
     artifacts = _publication_artifacts(value, task, task_fingerprint)
     if artifacts is None:
@@ -379,9 +380,7 @@ def _local_artifact_matches(
     digest: str,
 ) -> bool:
     path = run_root.joinpath(*_relative_path(relative_path).parts)
-    if path.is_symlink() or not path.is_file():
-        return False
-    return file_size_sha256(path) == (size_bytes, digest)
+    return file_matches_sha256(path, size_bytes, digest)
 
 
 def _volume_file_exists(volume: VolumeReader, path: str) -> bool:

@@ -329,3 +329,49 @@ def test_collection_publication_rejects_missing_unfiltered_artifact(
         )
         is None
     )
+
+
+def test_collection_publication_propagates_transient_read_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "example/outputs/run-a/result.cif"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"data")
+    fingerprints = {"run-a": "a" * 64}
+    publication = Path("example/results/fingerprint.json")
+    write_collection_publication(
+        tmp_path,
+        publication,
+        {
+            "run_name": "example",
+            "run_ids": ["run-a"],
+            "task_fingerprints": fingerprints,
+            "filtered": False,
+            "artifacts": [
+                {
+                    "path": artifact.relative_to(tmp_path).as_posix(),
+                    "size_bytes": 4,
+                    "sha256": sha256(b"data").hexdigest(),
+                }
+            ],
+        },
+    )
+    marker = tmp_path / publication
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(path: Path) -> bytes:
+        if path == marker:
+            raise PermissionError("temporarily unavailable")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    with pytest.raises(PermissionError, match="temporarily unavailable"):
+        load_collection_publication(
+            tmp_path,
+            publication,
+            run_name="example",
+            run_ids=("run-a",),
+            task_fingerprints=fingerprints,
+        )

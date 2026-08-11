@@ -264,6 +264,27 @@ def test_input_publication_binds_and_invalidates_output_content(
     assert not af3score_app._invalidate_input_publications(tmp_path, ("a",))
 
 
+def test_input_publication_propagates_transient_read_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
+    _publish_input(tmp_path, "a", digest, "plan")
+
+    def unavailable(_path: Path) -> str:
+        raise PermissionError("temporarily unavailable")
+
+    monkeypatch.setattr(af3score_app, "sha256_file", unavailable)
+
+    with pytest.raises(PermissionError, match="temporarily unavailable"):
+        af3score_app._input_publication_ready(
+            tmp_path,
+            "a",
+            publication_key="plan",
+            input_sha256=digest,
+        )
+
+
 def test_directory_inputs_have_deterministic_order(tmp_path: Path) -> None:
     inputs = tmp_path / "inputs"
     stage = tmp_path / "stage"

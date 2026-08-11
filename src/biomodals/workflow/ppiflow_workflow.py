@@ -1603,6 +1603,10 @@ def postprocess_ppiflow_af3score_stage(
         usable_rows=int(metrics.get("metrics_rows", 0)),
         failed_count=int(metrics.get("failed", 0)),
     )
+    if status == AppRunStatus.PARTIAL:
+        # Candidate failures remain explicit in the manifest. The terminal
+        # postprocessor itself succeeded once it published the usable subset.
+        status = AppRunStatus.SUCCEEDED
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
@@ -4291,6 +4295,7 @@ def _add_af3score_nodes(
         inputs={
             "af3score_plan": prepare.outputs(kind=ArtifactKind.TABLE),
         },
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
         allow_empty_result=True,
     )
     return workflow.add_node(

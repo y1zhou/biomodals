@@ -9,7 +9,11 @@ from typing import Any
 import orjson
 
 from biomodals.helper.app_run import AppRunLayout
-from biomodals.helper.artifacts import file_size_sha256, replace_bytes_atomic
+from biomodals.helper.artifacts import (
+    file_matches_sha256,
+    file_size_sha256,
+    replace_bytes_atomic,
+)
 
 COLLECTION_PUBLICATION_SCHEMA_VERSION = 2
 TASK_PUBLICATION_SCHEMA_VERSION = 1
@@ -39,11 +43,11 @@ def is_boltzgen_run_complete(
     if task_fingerprint is None:
         return True
     marker = run_dir.joinpath(*_TASK_PUBLICATION_PATH.parts)
-    if not marker.is_file():
-        return False
     try:
         value: Any = orjson.loads(marker.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return False
+    except orjson.JSONDecodeError:
         return False
     if not (
         isinstance(value, dict)
@@ -157,11 +161,11 @@ def load_collection_publication(
 ) -> dict[str, object] | None:
     """Load one exact, content-bound final collection publication."""
     path = _contained_path(output_root, relative_path)
-    if not path.is_file():
-        return None
     try:
         value: Any = orjson.loads(path.read_bytes())
-    except (OSError, orjson.JSONDecodeError):
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return None
+    except orjson.JSONDecodeError:
         return None
     if (
         not isinstance(value, dict)
@@ -178,7 +182,8 @@ def load_collection_publication(
         if not isinstance(archive_path, str):
             return None
         archive = _contained_path(output_root, archive_path)
-        if not archive.is_file() or file_size_sha256(archive) != (
+        if not file_matches_sha256(
+            archive,
             value.get("archive_size_bytes"),
             value.get("archive_sha256"),
         ):
@@ -188,14 +193,17 @@ def load_collection_publication(
         if not isinstance(manifest_relative, str):
             return None
         manifest_path = _contained_path(output_root, manifest_relative)
-        if not manifest_path.is_file() or file_size_sha256(manifest_path) != (
+        if not file_matches_sha256(
+            manifest_path,
             value.get("artifact_manifest_size_bytes"),
             value.get("artifact_manifest_sha256"),
         ):
             return None
         try:
             manifest: Any = orjson.loads(manifest_path.read_bytes())
-        except (OSError, orjson.JSONDecodeError):
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            return None
+        except orjson.JSONDecodeError:
             return None
         artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
         if not isinstance(artifacts, list) or not artifacts:
@@ -207,7 +215,8 @@ def load_collection_publication(
             if not isinstance(artifact_path, str):
                 return None
             path = _contained_path(output_root, artifact_path)
-            if not path.is_file() or file_size_sha256(path) != (
+            if not file_matches_sha256(
+                path,
                 artifact.get("size_bytes"),
                 artifact.get("sha256"),
             ):

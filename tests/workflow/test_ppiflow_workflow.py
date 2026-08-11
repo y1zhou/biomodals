@@ -2889,6 +2889,10 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage1-af3score-prepare",
         "stage1-af3score-batches",
     }
+    assert (
+        definition.nodes["stage1-af3score-batches"].aggregation_policy
+        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
+    )
     assert definition.dependencies["stage2-partial-ppiflow"] == {
         "stage2-fixed-positions"
     }

@@ -294,6 +294,61 @@ def test_async_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
     asyncio.run(scenario())
 
 
+def test_async_attachment_set_rolls_back_before_classifying_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        repository = create_repository(task_count=2)
+        persist_fixed_policy(
+            repository,
+            ("seed-0", "seed-1"),
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+        )
+        driver = AsyncFakeModalDriver()
+        runtime = AsyncExecutionRuntime(
+            repository,
+            modal_driver=driver,
+            checkpoint=lambda: None,
+        )
+        original_attach = repository.attach_provider_call
+        attachments = 0
+
+        def fail_second_attachment(*args, **kwargs):
+            nonlocal attachments
+            attachments += 1
+            if attachments == 2:
+                raise RuntimeError("second attachment failed")
+            return original_attach(*args, **kwargs)
+
+        monkeypatch.setattr(
+            repository,
+            "attach_provider_call",
+            fail_second_attachment,
+        )
+
+        with pytest.raises(RuntimeError, match="second attachment failed"):
+            await runtime.submit_provider_calls(
+                RUN_ID,
+                (
+                    ProviderCallSubmission(_candidate(), "batch-0"),
+                    ProviderCallSubmission(_second_candidate(), "batch-1"),
+                ),
+                now=110,
+            )
+
+        assert [call.status for call in repository.list_provider_calls(RUN_ID)] == [
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+            ProviderCallStatus.OUTCOME_UNKNOWN,
+        ]
+        assert driver.cancelled == [
+            f"fc-{GPU_BINDING.function_name}-1",
+            f"fc-{GPU_BINDING.function_name}-2",
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_async_runtime_fails_a_missing_exact_deployment_before_preclaim() -> None:
     """API-hosted coordination uses the same deployment-loss transition."""
 

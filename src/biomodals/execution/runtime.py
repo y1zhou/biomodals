@@ -1513,36 +1513,37 @@ class AsyncExecutionRuntime:
         cancellation_requested = False
         if authorized:
             try:
-                for preclaim in authorized:
-                    provider_call_id = preclaim.call.provider_call_id
-                    current = self.repository.get_provider_call(
-                        provider_call_id,
-                        include_task_keys=False,
-                    )
-                    if current.status.is_terminal:
-                        continue
-                    error = errors.get(provider_call_id)
-                    if isinstance(error, ModalDefiniteSubmissionError):
-                        self.repository.fail_provider_call(
+                with self.repository.savepoint("async_attachment_set"):
+                    for preclaim in authorized:
+                        provider_call_id = preclaim.call.provider_call_id
+                        current = self.repository.get_provider_call(
                             provider_call_id,
-                            message=str(error),
-                            now=now,
+                            include_task_keys=False,
                         )
-                    elif error is not None:
-                        self.repository.mark_submission_outcome_unknown(
-                            provider_call_id,
-                            message=str(error),
-                            now=now,
-                        )
-                    else:
-                        self.repository.attach_provider_call(
-                            provider_call_id,
-                            provider_call_handle_id=spawned[provider_call_id],
-                            now=now,
-                        )
-                cancellation_requested = self.repository.get_run(
-                    execution_run_id
-                ).cancellation_is_durable
+                        if current.status.is_terminal:
+                            continue
+                        error = errors.get(provider_call_id)
+                        if isinstance(error, ModalDefiniteSubmissionError):
+                            self.repository.fail_provider_call(
+                                provider_call_id,
+                                message=str(error),
+                                now=now,
+                            )
+                        elif error is not None:
+                            self.repository.mark_submission_outcome_unknown(
+                                provider_call_id,
+                                message=str(error),
+                                now=now,
+                            )
+                        else:
+                            self.repository.attach_provider_call(
+                                provider_call_id,
+                                provider_call_handle_id=spawned[provider_call_id],
+                                now=now,
+                            )
+                    cancellation_requested = self.repository.get_run(
+                        execution_run_id
+                    ).cancellation_is_durable
                 self._checkpoint_state()
             except Exception:
                 for handle_id in spawned.values():
@@ -1554,17 +1555,27 @@ class AsyncExecutionRuntime:
                             handle_id,
                             exc_info=True,
                         )
-                for preclaim in authorized:
-                    call = self.repository.get_provider_call(
-                        preclaim.call.provider_call_id,
-                        include_task_keys=False,
-                    )
-                    if call.status == ProviderCallStatus.SUBMITTING:
-                        self.repository.mark_submission_outcome_unknown(
-                            call.provider_call_id,
-                            message="Modal call attachment was not durable",
-                            now=now,
+                with self.repository.savepoint("async_attachment_failure"):
+                    for preclaim in authorized:
+                        call = self.repository.get_provider_call(
+                            preclaim.call.provider_call_id,
+                            include_task_keys=False,
                         )
+                        if call.status != ProviderCallStatus.SUBMITTING:
+                            continue
+                        error = errors.get(call.provider_call_id)
+                        if isinstance(error, ModalDefiniteSubmissionError):
+                            self.repository.fail_provider_call(
+                                call.provider_call_id,
+                                message=str(error),
+                                now=now,
+                            )
+                        else:
+                            self.repository.mark_submission_outcome_unknown(
+                                call.provider_call_id,
+                                message="Modal call attachment was not durable",
+                                now=now,
+                            )
                 self._checkpoint_state()
                 raise
 

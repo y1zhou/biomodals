@@ -189,7 +189,6 @@ def test_provider_limits_round_trip_independently_of_batch_count() -> None:
 def test_request_allows_zero_gpu_capacity_for_cached_results() -> None:
     request = replace(
         _request(),
-        max_active_provider_calls=2,
         max_active_gpu_provider_calls=0,
     )
 

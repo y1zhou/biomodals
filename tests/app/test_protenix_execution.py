@@ -183,6 +183,12 @@ def test_request_round_trip_preserves_msa_fanout_graph() -> None:
         FINALIZE_NODE,
         INFERENCE_NODE,
     )
+    assert decoded.execution_plan.scientific_versions["protenix.model"] == (
+        decoded.model_name
+    )
+    assert decoded.execution_plan.scientific_versions["protenix.reference_data"] == (
+        "v1.0.0"
+    )
     assert decoded.execution_plan.terminal_node_keys == (INFERENCE_NODE,)
 
 

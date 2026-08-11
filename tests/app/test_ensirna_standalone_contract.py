@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import orjson
 import pytest
 
 from biomodals.app.score import ensirna_app
@@ -1382,6 +1383,19 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     class FakeVolume:
         def read_file(self, path):
             captured["download"] = path
+            if path.endswith(ensirna_app.APP_INFO.result_marker_name):
+                request = captured["request"]
+                cache_key = ensirna_app._cache_key_for_fasta(
+                    request.fasta_content,
+                    force_generation=request.force_generation,
+                )
+                yield orjson.dumps({
+                    "schema_version": ensirna_app.APP_INFO.cache_schema_version,
+                    "cache_key": cache_key,
+                    "size": 4,
+                    "sha256": sha256_bytes(b"xlsx"),
+                })
+                return
             yield b"xlsx"
 
     class FakeMethod:
@@ -1465,7 +1479,20 @@ def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
     captured = {}
 
     class FakeVolume:
-        def read_file(self, _path):
+        def read_file(self, path):
+            if path.endswith(ensirna_app.APP_INFO.result_marker_name):
+                request = captured["request"]
+                cache_key = ensirna_app._cache_key_for_fasta(
+                    request.fasta_content,
+                    force_generation=request.force_generation,
+                )
+                yield orjson.dumps({
+                    "schema_version": ensirna_app.APP_INFO.cache_schema_version,
+                    "cache_key": cache_key,
+                    "size": 4,
+                    "sha256": sha256_bytes(b"xlsx"),
+                })
+                return
             yield b"xlsx"
 
     class RestartMethod:

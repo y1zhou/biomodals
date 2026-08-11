@@ -55,6 +55,8 @@ from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import (
     file_matches_sha256,
+    read_volume_file_exact,
+    read_volume_json,
     replace_bytes_atomic,
     sha256_file,
 )
@@ -402,6 +404,31 @@ def _archive_ready(
             marker.get("size"),
             marker.get("sha256"),
         )
+    )
+
+
+def _download_archive(
+    workdir: str | Path,
+    model_name: str,
+    publication_key: str,
+) -> bytes:
+    """Download the exact model archive named by its publication marker."""
+    path = _archive_path(workdir, model_name)
+    relative_path = path.relative_to(CONF.output_volume_mountpoint).as_posix()
+    marker_path = _publication_dir(workdir) / f"{model_name}-archive.json"
+    relative_marker = marker_path.relative_to(CONF.output_volume_mountpoint)
+    marker = read_volume_json(CONF.output_volume, relative_marker.as_posix())
+    if not (
+        isinstance(marker, dict)
+        and marker.get("publication_key") == publication_key
+        and marker.get("archive_path") == str(path)
+    ):
+        raise RuntimeError(f"ABCFold2 {model_name} publication is unavailable")
+    return read_volume_file_exact(
+        CONF.output_volume,
+        relative_path,
+        size_bytes=marker.get("size"),
+        content_sha256=marker.get("sha256"),
     )
 
 
@@ -982,8 +1009,11 @@ def submit_abcfold2_task(
         if not enabled:
             continue
         remote_path = _archive_path(run_conf.workdir, model_name)
-        relative_path = remote_path.relative_to(CONF.output_volume_mountpoint)
-        data = b"".join(CONF.output_volume.read_file(relative_path.as_posix()))
+        data = _download_archive(
+            run_conf.workdir,
+            model_name,
+            _model_publication_key(model_name, local_run_conf),
+        )
         (local_out_dir / remote_path.name).write_bytes(data)
 
     print(f"🧬 ABCFold2 run complete! Results saved to {local_out_dir}")

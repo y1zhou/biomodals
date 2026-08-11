@@ -13,7 +13,7 @@ import orjson
 from biomodals.app.design.boltzgen.execution_contracts import (
     collection_publication_path,
 )
-from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
+from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
 from biomodals.helper.app_execution import ExecutionRequestFile
 from biomodals.helper.io import require_safe_filename_component
 
@@ -116,6 +116,22 @@ class BoltzGenExecutionRequest:
             run_name=self.run_name,
             workload_plan_fingerprint=(self.execution_plan.workload_plan_fingerprint),
         )
+
+    @property
+    def design_task_fingerprints(self) -> dict[str, str]:
+        """Return deterministic fingerprints for the finite design Task set."""
+        workload_fingerprint = self.execution_plan.workload_plan_fingerprint
+        return {
+            run_id: TaskPlan(
+                task_key=run_id,
+                scientific_payload={"run_id": run_id},
+                execution_payload={"run_id": run_id},
+            ).fingerprint(
+                workload_plan_fingerprint=workload_fingerprint,
+                node_key=DESIGN_RUNS_NODE,
+            )
+            for run_id in self.run_ids
+        }
 
     @property
     def config_path(self) -> PurePosixPath:

@@ -64,7 +64,11 @@ from biomodals.execution.modal import (
 )
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
-from biomodals.helper.artifacts import file_matches_sha256
+from biomodals.helper.artifacts import (
+    file_matches_sha256,
+    read_volume_file_exact,
+    read_volume_json,
+)
 from biomodals.helper.artifacts import replace_bytes_atomic as _atomic_write
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
@@ -272,6 +276,24 @@ def _result_ready(result_key: str, run_name: str) -> bool:
             marker.get("size"),
             marker.get("sha256"),
         )
+    )
+
+
+def _download_result(result_key: str, run_name: str) -> bytes:
+    """Download the exact archive validated by its durable publication."""
+    path = _result_path(result_key, run_name)
+    relative = path.relative_to(CONF.output_volume_mountpoint).as_posix()
+    marker = read_volume_json(
+        CONF.output_volume,
+        f"{relative}.complete.json",
+    )
+    if not isinstance(marker, dict) or marker.get("result_key") != result_key:
+        raise RuntimeError("Protenix result publication is unavailable")
+    return read_volume_file_exact(
+        CONF.output_volume,
+        relative,
+        size_bytes=marker.get("size"),
+        content_sha256=marker.get("sha256"),
     )
 
 
@@ -1073,8 +1095,6 @@ def submit_protenix_task(
             f"{overview.run.status.value}: {diagnostic}"
         )
 
-    result_path = _result_path(request.result_key, request.run_name)
-    relative_path = result_path.relative_to(CONF.output_volume_mountpoint)
-    tarball_bytes = b"".join(CONF.output_volume.read_file(relative_path.as_posix()))
+    tarball_bytes = _download_result(request.result_key, request.run_name)
     write_local_tarball(out_file, tarball_bytes)
     print(f"🧬 Protenix run complete! Results saved to {out_file}")

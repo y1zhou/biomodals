@@ -22,6 +22,7 @@ from biomodals.app.config import AppConfig
 from biomodals.app.design.boltzgen.execution_contracts import (
     boltzgen_output_claim_key,
     is_boltzgen_run_complete,
+    load_filtered_collection_archive_from_volume,
     write_boltzgen_task_publication,
     write_collection_publication,
 )
@@ -1058,10 +1059,15 @@ def submit_boltzgen_task(
     local_out_dir = Path(out_dir).expanduser().resolve()
     local_out_dir.mkdir(parents=True, exist_ok=True)
     if completed_request.filter_results:
-        archive_path = completed_request.collection_publication_path.with_suffix(
-            ".tar.zst"
+        archive = load_filtered_collection_archive_from_volume(
+            CONF.output_volume,
+            completed_request.collection_publication_path,
+            run_name=completed_request.run_name,
+            run_ids=completed_request.run_ids,
+            task_fingerprints=completed_request.design_task_fingerprints,
         )
-        archive = b"".join(CONF.output_volume.read_file(archive_path.as_posix()))
+        if archive is None:
+            raise RuntimeError("BoltzGen result publication is unavailable")
         (local_out_dir / f"{completed_request.run_name}.tar.zst").write_bytes(archive)
     else:
         (local_out_dir / "outputs").mkdir(exist_ok=True)

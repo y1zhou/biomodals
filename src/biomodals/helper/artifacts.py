@@ -64,6 +64,52 @@ def read_volume_bytes(
     return bytes(content)
 
 
+def read_volume_file_exact(
+    reader: VolumeReader,
+    path: str,
+    *,
+    size_bytes: object,
+    content_sha256: object,
+) -> bytes:
+    """Read one Volume file only when it matches its publication record."""
+    if (
+        not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes < 1
+        or not isinstance(content_sha256, str)
+        or not _SHA256_PATTERN.fullmatch(content_sha256)
+    ):
+        raise ValueError("Volume publication has invalid size or SHA-256 metadata")
+    content = bytearray()
+    digest = hashlib.sha256()
+    for chunk in reader.read_file(path):
+        if not isinstance(chunk, bytes):
+            raise TypeError(f"Volume returned non-bytes for {path}")
+        if len(content) + len(chunk) > size_bytes:
+            raise RuntimeError(f"Volume file exceeds its published size: {path}")
+        content.extend(chunk)
+        digest.update(chunk)
+    if len(content) != size_bytes or digest.hexdigest() != content_sha256:
+        raise RuntimeError(f"Volume file does not match its publication: {path}")
+    return bytes(content)
+
+
+def read_volume_json(
+    reader: VolumeReader,
+    path: str,
+    *,
+    max_bytes: int = 64 * 1024,
+) -> object | None:
+    """Read one bounded JSON record, returning ``None`` when absent or invalid."""
+    content = read_volume_bytes(reader, path, max_bytes=max_bytes)
+    if content is None:
+        return None
+    try:
+        return orjson.loads(content)
+    except orjson.JSONDecodeError:
+        return None
+
+
 def read_bounded_file_bytes(
     path: Path,
     *,

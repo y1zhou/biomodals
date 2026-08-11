@@ -170,6 +170,14 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     class FakeOutputVolume:
         def read_file(self, path):
             captured["download"] = path
+            if path.endswith(".complete.json"):
+                request = captured["request"]
+                yield orjson.dumps({
+                    "result_key": request.result_key,
+                    "size": 3,
+                    "sha256": sha256(b"tar").hexdigest(),
+                })
+                return
             yield b"tar"
 
     class FakeMethod:

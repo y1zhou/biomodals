@@ -66,11 +66,13 @@ from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.app_execution import stage_execution_launch
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import (
-    replace_bytes_atomic as _atomic_write,
-)
-from biomodals.helper.artifacts import (
+    read_volume_file_exact,
+    read_volume_json,
     sha256_bytes,
     sha256_file,
+)
+from biomodals.helper.artifacts import (
+    replace_bytes_atomic as _atomic_write,
 )
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import build_local_output_path, resolve_local_output_dir
@@ -651,6 +653,27 @@ def _result_ready(layout: AppRunLayout, cache_key: str) -> bool:
         and marker.get("cache_key") == cache_key
         and marker.get("size") == result_path.stat().st_size
         and marker.get("sha256") == sha256_file(result_path)
+    )
+
+
+def _download_result(layout: AppRunLayout, cache_key: str) -> bytes:
+    """Download the exact XLSX bound to the current cache publication."""
+    result_path = layout.outputs_dir / f"{APP_INFO.input_stem}_result.xlsx"
+    marker_path = _result_marker_path(layout)
+    relative_result = result_path.relative_to(CONF.output_volume_mountpoint)
+    relative_marker = marker_path.relative_to(CONF.output_volume_mountpoint)
+    marker = read_volume_json(CONF.output_volume, relative_marker.as_posix())
+    if not (
+        isinstance(marker, dict)
+        and marker.get("schema_version") == APP_INFO.cache_schema_version
+        and marker.get("cache_key") == cache_key
+    ):
+        raise RuntimeError("ENsiRNA result publication is unavailable")
+    return read_volume_file_exact(
+        CONF.output_volume,
+        relative_result.as_posix(),
+        size_bytes=marker.get("size"),
+        content_sha256=marker.get("sha256"),
     )
 
 
@@ -2063,8 +2086,6 @@ def submit_ensirna_task(
         request.fasta_content,
         force_generation=request.force_generation,
     )
-    result_path = _layout_for_cache_key(cache_key).outputs_dir / "mrna_result.xlsx"
-    relative_result = result_path.relative_to(CONF.output_volume_mountpoint)
-    xlsx_bytes = b"".join(CONF.output_volume.read_file(relative_result.as_posix()))
+    xlsx_bytes = _download_result(_layout_for_cache_key(cache_key), cache_key)
     _atomic_write(out_file, xlsx_bytes)
     print(f"🧬 ENsiRNA run complete! Results saved to {out_file}")

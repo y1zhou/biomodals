@@ -8,6 +8,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from uuid import UUID
 
+import orjson
+
 from biomodals.app.fold import abcfold2_app
 from biomodals.app.fold.abcfold2_execution import ABCFold2RunConfig
 from biomodals.execution import RunStatus
@@ -225,6 +227,29 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     class FakeVolume:
         def read_file(self, path):
             captured.setdefault("downloads", []).append(path)
+            if path.endswith("-archive.json"):
+                model_name = Path(path).name.removesuffix("-archive.json")
+                workdir = "/abcfold2-output/ab/abcdef-no-tmpl"
+                run_conf = ABCFold2RunConfig(
+                    run_id="abcdef-no-tmpl",
+                    workdir=workdir,
+                    seeds=(1,),
+                    num_trunk_recycles=1,
+                    num_diffn_timesteps=2,
+                    num_diffn_samples=3,
+                    num_trunk_samples=4,
+                    boltz_additional_cli_args=None,
+                ).as_kwargs()
+                yield orjson.dumps({
+                    "publication_key": abcfold2_app._model_publication_key(
+                        model_name,
+                        run_conf,
+                    ),
+                    "archive_path": f"{workdir}/{model_name}_models.tar.zst",
+                    "size": 3,
+                    "sha256": sha256(b"tar").hexdigest(),
+                })
+                return
             yield b"tar"
 
     class FakeMethod:

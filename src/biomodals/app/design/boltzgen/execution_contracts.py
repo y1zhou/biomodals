@@ -10,8 +10,11 @@ import orjson
 
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import (
+    VolumeReader,
     file_matches_sha256,
     file_size_sha256,
+    read_volume_bytes,
+    read_volume_file_exact,
     replace_bytes_atomic,
 )
 
@@ -162,20 +165,16 @@ def load_collection_publication(
     """Load one exact, content-bound final collection publication."""
     path = _contained_path(output_root, relative_path)
     try:
-        value: Any = orjson.loads(path.read_bytes())
+        content = path.read_bytes()
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return None
-    except orjson.JSONDecodeError:
-        return None
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != COLLECTION_PUBLICATION_SCHEMA_VERSION
-        or value.get("status") != "complete"
-        or value.get("run_name") != run_name
-        or value.get("run_ids") != list(run_ids)
-        or value.get("task_fingerprints") != task_fingerprints
-        or not isinstance(value.get("filtered"), bool)
-    ):
+    value = _parse_collection_publication(
+        content,
+        run_name=run_name,
+        run_ids=run_ids,
+        task_fingerprints=task_fingerprints,
+    )
+    if value is None:
         return None
     archive_path = value.get("archive_path")
     if value["filtered"]:
@@ -222,6 +221,71 @@ def load_collection_publication(
             ):
                 return None
     return value
+
+
+def load_filtered_collection_archive_from_volume(
+    volume: VolumeReader,
+    relative_path: str | PurePosixPath,
+    *,
+    run_name: str,
+    run_ids: tuple[str, ...],
+    task_fingerprints: dict[str, str],
+) -> bytes | None:
+    """Download one exact filtered archive through the Volume client API."""
+    marker_path = _volume_relative_path(relative_path)
+    content = read_volume_bytes(volume, marker_path, max_bytes=1024 * 1024)
+    if content is None:
+        return None
+    value = _parse_collection_publication(
+        content,
+        run_name=run_name,
+        run_ids=run_ids,
+        task_fingerprints=task_fingerprints,
+    )
+    if value is None or value["filtered"] is not True:
+        return None
+    archive_path = value.get("archive_path")
+    if not isinstance(archive_path, str):
+        return None
+    return read_volume_file_exact(
+        volume,
+        _volume_relative_path(archive_path),
+        size_bytes=value.get("archive_size_bytes"),
+        content_sha256=value.get("archive_sha256"),
+    )
+
+
+def _parse_collection_publication(
+    content: bytes,
+    *,
+    run_name: str,
+    run_ids: tuple[str, ...],
+    task_fingerprints: dict[str, str],
+) -> dict[str, object] | None:
+    try:
+        value: Any = orjson.loads(content)
+    except orjson.JSONDecodeError:
+        return None
+    if not (
+        isinstance(value, dict)
+        and value.get("schema_version") == COLLECTION_PUBLICATION_SCHEMA_VERSION
+        and value.get("status") == "complete"
+        and value.get("run_name") == run_name
+        and value.get("run_ids") == list(run_ids)
+        and value.get("task_fingerprints") == task_fingerprints
+        and isinstance(value.get("filtered"), bool)
+    ):
+        return None
+    return value
+
+
+def _volume_relative_path(value: str | PurePosixPath) -> str:
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError("BoltzGen Volume path must be relative and contained")
+    return relative.as_posix()
 
 
 def _contained_path(

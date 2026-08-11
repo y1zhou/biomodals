@@ -4,13 +4,27 @@
 
 from pathlib import Path
 
+import pytest
+
 from biomodals.helper.artifacts import (
     file_matches_sha256,
     file_size_sha256,
     publish_content_addressed_file,
+    read_volume_file_exact,
+    read_volume_json,
     replace_bytes_atomic,
     sha256_bytes,
 )
+
+
+class _Reader:
+    def __init__(self, files: dict[str, bytes]) -> None:
+        self.files = files
+
+    def read_file(self, path: str):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        yield self.files[path]
 
 
 def test_file_size_sha256_reads_one_regular_file(tmp_path: Path) -> None:
@@ -55,3 +69,32 @@ def test_publish_content_addressed_file_uses_digest_directory(tmp_path: Path) ->
     assert destination.read_bytes() == b"artifact"
     assert size == 8
     assert digest == sha256_bytes(b"artifact")
+
+
+def test_volume_file_download_requires_exact_publication() -> None:
+    reader = _Reader({"artifact.bin": b"artifact"})
+
+    assert (
+        read_volume_file_exact(
+            reader,
+            "artifact.bin",
+            size_bytes=8,
+            content_sha256=sha256_bytes(b"artifact"),
+        )
+        == b"artifact"
+    )
+    with pytest.raises(RuntimeError, match="does not match"):
+        read_volume_file_exact(
+            reader,
+            "artifact.bin",
+            size_bytes=8,
+            content_sha256=sha256_bytes(b"changed!"),
+        )
+
+
+def test_volume_json_is_bounded_and_fail_closed() -> None:
+    reader = _Reader({"record.json": b'{"value":1}', "invalid.json": b"{"})
+
+    assert read_volume_json(reader, "record.json") == {"value": 1}
+    assert read_volume_json(reader, "invalid.json") is None
+    assert read_volume_json(reader, "missing.json") is None

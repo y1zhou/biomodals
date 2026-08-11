@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Protocol
 
 import polars as pl
 
@@ -20,10 +21,34 @@ from biomodals.workflow.ppiflow import manifests, tables
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_DECOMPRESSED_BYTES = MAX_ARCHIVE_EXPANDED_BYTES + 64 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 100_000
 MAX_ARCHIVE_SELECTED_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_SELECTED_MEMBERS = 10_000
 _ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
+
+
+class _Readable(Protocol):
+    def read(self, size: int = -1) -> bytes: ...
+
+
+class _BoundedArchiveReader:
+    """Count every decompressed tar byte, including metadata and padding."""
+
+    def __init__(self, stream: _Readable) -> None:
+        self._stream = stream
+        self._bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining_with_probe = MAX_ARCHIVE_DECOMPRESSED_BYTES - self._bytes_read + 1
+        requested = (
+            remaining_with_probe if size < 0 else min(size, remaining_with_probe)
+        )
+        data = self._stream.read(requested)
+        self._bytes_read += len(data)
+        if self._bytes_read > MAX_ARCHIVE_DECOMPRESSED_BYTES:
+            raise ValueError("Archive exceeds the decompressed-stream limit")
+        return data
 
 
 @dataclass(frozen=True)
@@ -584,7 +609,8 @@ def _collect_tar_zst_members[ArchiveItem](
     )
     with compressed_context as compressed:
         reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+        bounded_reader = _BoundedArchiveReader(reader)
+        with reader, tarfile.open(fileobj=bounded_reader, mode="r|") as tar:
             for member in tar:
                 member_count, expanded_bytes = _check_archive_input_limits(
                     member,
@@ -596,7 +622,6 @@ def _collect_tar_zst_members[ArchiveItem](
                 _check_archive_selection_limits(
                     selected_members=len(selected) + 1,
                     selected_bytes=selected_bytes + member.size,
-                    member=member,
                 )
                 member_data = None
                 if read_data:
@@ -627,7 +652,8 @@ def _stream_tar_zst_member_records[ArchiveItem](
     expanded_bytes = 0
     with source.open("rb") as compressed:
         reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+        bounded_reader = _BoundedArchiveReader(reader)
+        with reader, tarfile.open(fileobj=bounded_reader, mode="r|") as tar:
             for member in tar:
                 member_count, expanded_bytes = _check_archive_input_limits(
                     member,
@@ -639,7 +665,6 @@ def _stream_tar_zst_member_records[ArchiveItem](
                 _check_archive_selection_limits(
                     selected_members=len(selected) + 1,
                     selected_bytes=selected_bytes + member.size,
-                    member=member,
                 )
                 extracted = tar.extractfile(member)
                 if extracted is None:
@@ -662,12 +687,9 @@ def _check_archive_selection_limits(
     *,
     selected_members: int,
     selected_bytes: int,
-    member: tarfile.TarInfo,
 ) -> None:
     if selected_members > MAX_ARCHIVE_SELECTED_MEMBERS:
         raise ValueError("Archive contains too many selected files")
-    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
-        raise ValueError(f"Archive member is too large: {member.name}")
     if selected_bytes > MAX_ARCHIVE_SELECTED_BYTES:
         raise ValueError("Selected archive files exceed the expanded-size limit")
 

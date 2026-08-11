@@ -1436,7 +1436,10 @@ ready work remains. With five total slots, two feasible GPU candidates, and
 any number of equal-graph-rank CPU candidates, it admits both GPU candidates
 and then three CPU candidates. A GPU candidate skipped because the GPU ceiling
 is full does not prevent a CPU candidate from using a total slot. The GPU
-ceiling is an upper bound, not a quota.
+ceiling is an upper bound, not a quota. When that ceiling is zero, the
+coordinator admits feasible CPU work and suspends for unavailable capacity
+only after GPU work is the sole remaining frontier and no Provider Call is
+active.
 
 Admission operates on Provider Call candidates rather than raw Tasks. Two
 compatible GPU Tasks may already form one fixed-batch candidate and therefore

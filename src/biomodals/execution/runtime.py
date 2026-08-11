@@ -657,6 +657,7 @@ class ExecutionRuntime:
 
         selected: list[ProviderCallCandidate] = []
         remaining_gpu_slots = available_gpu_slots
+        blocked_gpu_work = False
         for depth, unblocking_span in sorted(node_keys_by_rank, reverse=True):
             node_keys = node_keys_by_rank[(depth, unblocking_span)]
             for uses_gpu in (True, False):
@@ -680,11 +681,7 @@ class ExecutionRuntime:
                                 )
                             )
                         if blocked:
-                            self._suspend_for_unavailable_gpu_capacity(
-                                execution_run_id,
-                                now=now,
-                            )
-                            return ()
+                            blocked_gpu_work = True
                     continue
                 lookahead = max(1, resource_slots * 4)
                 with self._synchronize():
@@ -721,6 +718,16 @@ class ExecutionRuntime:
                     remaining_gpu_slots -= len(admitted)
                 if len(selected) == available_total_slots:
                     return tuple(selected)
+        if not selected and blocked_gpu_work:
+            with self._synchronize():
+                active_calls = self.repository.active_provider_call_counts(
+                    execution_run_id
+                ).total
+            if active_calls == 0:
+                self._suspend_for_unavailable_gpu_capacity(
+                    execution_run_id,
+                    now=now,
+                )
         return tuple(selected)
 
     def _suspend_for_unavailable_gpu_capacity(

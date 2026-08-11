@@ -43,6 +43,7 @@ from biomodals.execution.scheduler import (
 from biomodals.helper.app_execution import ExecutionRunStore, ExecutionVolumeSync
 
 from .provider_call_helpers import (
+    CPU_BINDING,
     GPU_BINDING,
     RUN_ID,
     create_repository,
@@ -100,6 +101,26 @@ def _candidate(task_index: int = 0) -> ProviderCallCandidate:
         depth=0,
         unblocking_span=0,
         max_tasks_per_call=1,
+    )
+
+
+def _fixed_descriptor(
+    node,
+    task,
+    rank: NodeAdmissionRank,
+    *,
+    binding: ProviderBinding = GPU_BINDING,
+) -> TaskDispatchDescriptor:
+    return TaskDispatchDescriptor(
+        node_key=node.node_key,
+        node_ordinal=node.ordinal,
+        task_key=task.task_key,
+        task_ordinal=task.ordinal,
+        binding=binding,
+        compatibility_key=binding.function_name,
+        max_tasks_per_call=1,
+        depth=rank.depth,
+        unblocking_span=rank.unblocking_span,
     )
 
 
@@ -304,23 +325,10 @@ def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
         transaction=_transaction(connection),
     )
 
-    def descriptor(node, task, rank: NodeAdmissionRank):
-        return TaskDispatchDescriptor(
-            node_key=node.node_key,
-            node_ordinal=node.ordinal,
-            task_key=task.task_key,
-            task_ordinal=task.ordinal,
-            binding=GPU_BINDING,
-            compatibility_key="af3",
-            max_tasks_per_call=1,
-            depth=rank.depth,
-            unblocking_span=rank.unblocking_span,
-        )
-
     candidates = runtime.fixed_call_candidates(
         RUN_ID,
         required_node_keys={"inference"},
-        describe_task=descriptor,
+        describe_task=_fixed_descriptor,
         available_total_slots=2,
         available_gpu_slots=1,
         now=110,
@@ -347,17 +355,7 @@ def test_zero_gpu_capacity_suspends_missing_gpu_work() -> None:
     candidates = runtime.fixed_call_candidates(
         RUN_ID,
         required_node_keys={"inference"},
-        describe_task=lambda node, task, rank: TaskDispatchDescriptor(
-            node_key=node.node_key,
-            node_ordinal=node.ordinal,
-            task_key=task.task_key,
-            task_ordinal=task.ordinal,
-            binding=GPU_BINDING,
-            compatibility_key="af3",
-            max_tasks_per_call=1,
-            depth=rank.depth,
-            unblocking_span=rank.unblocking_span,
-        ),
+        describe_task=_fixed_descriptor,
         available_total_slots=1,
         available_gpu_slots=0,
         now=110,
@@ -367,6 +365,36 @@ def test_zero_gpu_capacity_suspends_missing_gpu_work() -> None:
     assert candidates == ()
     assert run.status == RunStatus.SUSPENDED
     assert run.status_reason == RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE
+
+
+def test_zero_gpu_capacity_still_admits_cpu_work() -> None:
+    repository = create_repository(
+        task_count=2,
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
+    )
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=lambda: None,
+    )
+
+    candidates = runtime.fixed_call_candidates(
+        RUN_ID,
+        required_node_keys={"inference"},
+        describe_task=lambda node, task, rank: _fixed_descriptor(
+            node,
+            task,
+            rank,
+            binding=GPU_BINDING if task.task_key == "seed-0" else CPU_BINDING,
+        ),
+        available_total_slots=1,
+        available_gpu_slots=0,
+        now=110,
+    )
+
+    assert [candidate.task_keys for candidate in candidates] == [("seed-1",)]
+    assert repository.get_run(RUN_ID).status == RunStatus.RUNNING
 
 
 def test_fixed_candidate_policy_is_prepared_once_then_admitted_in_windows() -> None:
@@ -384,17 +412,7 @@ def test_fixed_candidate_policy_is_prepared_once_then_admitted_in_windows() -> N
 
     def descriptor(node, task, rank: NodeAdmissionRank):
         described.append(task.task_key)
-        return TaskDispatchDescriptor(
-            node_key=node.node_key,
-            node_ordinal=node.ordinal,
-            task_key=task.task_key,
-            task_ordinal=task.ordinal,
-            binding=GPU_BINDING,
-            compatibility_key="af3",
-            max_tasks_per_call=1,
-            depth=rank.depth,
-            unblocking_span=rank.unblocking_span,
-        )
+        return _fixed_descriptor(node, task, rank)
 
     first = runtime.fixed_call_candidates(
         RUN_ID,

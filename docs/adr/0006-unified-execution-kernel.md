@@ -555,8 +555,11 @@ each Task's sequence ordinal; batches retain the first constituent Task's
 ordinal. These values are operational, excluded from scientific fingerprints,
 and reused after coordinator recovery. If a GPU candidate cannot fit the
 remaining GPU slots, selection continues to CPU candidates rather than
-leaving total slots idle. The kernel adds no active-image heuristic, fairness
-cursor, priority weights, preemption, or scheduler plugin surface.
+leaving total slots idle. A zero GPU ceiling therefore admits any feasible CPU
+work first and suspends for unavailable capacity only when GPU work is the sole
+remaining frontier and no Provider Call is active. The kernel adds no
+active-image heuristic, fairness cursor, priority weights, preemption, or
+scheduler plugin surface.
 
 The drive-cycle refill behavior was amended on 2026-08-09. Coordinator-local
 Tasks are run and reconciled to a fixed point before remote admission. When a

@@ -28,6 +28,7 @@ from biomodals.helper.app_execution import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
+    execution_lineage_root,
     load_execution_launch,
     persist_execution_launch,
     stage_execution_launch,
@@ -68,6 +69,19 @@ class FakeVolume:
                 path.write_bytes(source.read())
 
         yield Batch()
+
+
+def test_execution_lineage_root_follows_all_successors(tmp_path: Path) -> None:
+    """Successor restarts retain the original root's scientific seed identity."""
+    volume = FakeVolume(tmp_path)
+    root = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    first = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    second = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    stage_execution_launch(volume, root, None)
+    stage_execution_launch(volume, first, root)
+    stage_execution_launch(volume, second, first)
+
+    assert execution_lineage_root(volume, second) == root
 
 
 def test_app_execution_store_uses_the_reserved_run_namespace(

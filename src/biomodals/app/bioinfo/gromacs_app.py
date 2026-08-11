@@ -44,7 +44,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    execution_lineage_root,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
@@ -1071,7 +1074,11 @@ def submit_gromacs_task(
         raise ValueError("max_parallel_analysis must be positive")
     execution_run_id = uuid4()
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    seed_run_id = predecessor_execution_run_id or execution_run_id
+    seed_run_id = (
+        execution_run_id
+        if predecessor_execution_run_id is None
+        else execution_lineage_root(CONF.output_volume, predecessor_execution_run_id)
+    )
     request = GromacsExecutionRequest(
         run_name=run_name,
         pdb_content=pdb_str,

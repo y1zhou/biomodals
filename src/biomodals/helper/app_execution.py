@@ -178,6 +178,28 @@ def load_execution_launch(
     return parsed
 
 
+def execution_lineage_root(
+    output_volume: Any,
+    execution_run_id: UUID,
+) -> UUID:
+    """Follow staged predecessor identities to the root Execution Run."""
+    current = execution_run_id
+    seen: set[UUID] = set()
+    while current not in seen:
+        seen.add(current)
+        content = _LAUNCH_FILE.load_from_volume(output_volume, current)
+        if content == b"root":
+            return current
+        try:
+            predecessor = UUID(content.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("Execution launch predecessor is invalid") from error
+        if str(predecessor).encode() != content:
+            raise ValueError("Execution launch predecessor is not canonical")
+        current = predecessor
+    raise ValueError("Execution launch lineage contains a cycle")
+
+
 def _execution_launch_bytes(predecessor_execution_run_id: UUID | None) -> bytes:
     return (
         b"root"

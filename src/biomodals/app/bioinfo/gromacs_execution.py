@@ -106,9 +106,9 @@ def execution_plan(
     pdb_sha256: str,
     simulation_time_ns: int,
     run_pdbfixer: bool,
-    ld_seed: int = -1,
-    gen_seed: int = -1,
-    genion_seed: int = 0,
+    ld_seed: int,
+    gen_seed: int,
+    genion_seed: int,
     gromacs_version: str = GROMACS_SCIENTIFIC_VERSION,
     execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION,
 ) -> ExecutionPlan:

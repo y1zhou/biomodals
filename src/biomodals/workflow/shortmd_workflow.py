@@ -25,6 +25,7 @@ from biomodals.app.bioinfo import gromacs_app
 from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
 from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_execution import execution_lineage_root
 from biomodals.helper.app_run import volume_app_output
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
@@ -855,11 +856,21 @@ def submit_shortmd_workflow(
     input_pdbs = discover_pdb_inputs(input_path)
     resolved_run_id = sanitize_filename(run_id or input_path.name)
     execution_run_id = uuid4()
-    seed_run_id = predecessor_execution_run_id or execution_run_id
+    seed_run_id = (
+        execution_run_id
+        if predecessor_execution_run_id is None
+        else execution_lineage_root(
+            orchestrator.OUT_VOLUME,
+            predecessor_execution_run_id,
+        )
+    )
+    physical_run_namespace = sanitize_filename(
+        f"{resolved_run_id}-{seed_run_id.hex[:12]}"
+    )
     workflow = build_shortmd_workflow(
         input_pdbs=input_pdbs,
         random_seed_identity=str(seed_run_id),
-        run_namespace=resolved_run_id,
+        run_namespace=physical_run_namespace,
         replicates=replicates,
         simulation_time_ns=simulation_time_ns,
         run_pdbfixer=run_pdbfixer,

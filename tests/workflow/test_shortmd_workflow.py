@@ -850,14 +850,16 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
 
     assert calls["prepare"]["workflow"].name == "shortmd"
     definition = calls["prepare"]["workflow"].validate()
-    prep_node = definition.nodes["prep-shortmd-run-alpha"].node
-    replicate_node = definition.nodes["replicate-shortmd-run-alpha-r001"].node
-    analysis_node = definition.nodes["analysis-shortmd-run-alpha-r001"].node
+    suffix = str(calls["coordinator"]["execution_run_id"]).replace("-", "")[:12]
+    run_name = f"shortmd-run-{suffix}-alpha"
+    prep_node = definition.nodes[f"prep-{run_name}"].node
+    replicate_node = definition.nodes[f"replicate-{run_name}-r001"].node
+    analysis_node = definition.nodes[f"analysis-{run_name}-r001"].node
 
-    assert prep_node.run_name == "shortmd-run-alpha"
-    assert replicate_node.source_run_name == "shortmd-run-alpha"
-    assert replicate_node.replicate_run_name == "shortmd-run-alpha-r001"
-    assert analysis_node.replicate_run_name == "shortmd-run-alpha-r001"
+    assert prep_node.run_name == run_name
+    assert replicate_node.source_run_name == run_name
+    assert replicate_node.replicate_run_name == f"{run_name}-r001"
+    assert analysis_node.replicate_run_name == f"{run_name}-r001"
     assert {"prep_cpu_function", "prep_gpu_function"}.isdisjoint(prep_node.__dict__)
     assert {
         "production_cpu_function",
@@ -1021,6 +1023,11 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
         "execution_coordinator_handle",
         lambda **kwargs: calls.setdefault("coordinator", kwargs) and FakeCoordinator(),
     )
+    monkeypatch.setattr(
+        shortmd_workflow,
+        "execution_lineage_root",
+        lambda _volume, _run_id: UUID(predecessor),
+    )
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
     assert raw_f is not None
 
@@ -1047,6 +1054,7 @@ def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    execution_run_id = UUID("11111111-2222-3333-4444-555555555555")
     input_dir = tmp_path / "pdbs"
     input_dir.mkdir()
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
@@ -1060,6 +1068,7 @@ def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
         "ExecutionCoordinator",
         UnexpectedExecutionCoordinator,
     )
+    monkeypatch.setattr(shortmd_workflow, "uuid4", lambda: execution_run_id)
 
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
     assert raw_f is not None
@@ -1071,17 +1080,16 @@ def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     )
 
     stdout = capsys.readouterr().out
+    run_name = "shortmd-run-111111112222-alpha"
     assert "[workflow] DAG graph: node_id [execution; class] <- dependency" in stdout
+    assert f"[workflow]   prep-{run_name} [provider; ShortMDPrepNode] <- -" in stdout
     assert (
-        "[workflow]   prep-shortmd-run-alpha [provider; ShortMDPrepNode] <- -" in stdout
+        f"[workflow]   clone-{run_name}-r001 "
+        f"[provider; ShortMDCloneNode] <- prep-{run_name}" in stdout
     )
     assert (
-        "[workflow]   clone-shortmd-run-alpha-r001 "
-        "[provider; ShortMDCloneNode] <- prep-shortmd-run-alpha" in stdout
-    )
-    assert (
-        "[workflow]   analysis-shortmd-run-alpha-r001 "
-        "[provider; ShortMDAnalysisNode] <- replicate-shortmd-run-alpha-r001" in stdout
+        f"[workflow]   analysis-{run_name}-r001 "
+        f"[provider; ShortMDAnalysisNode] <- replicate-{run_name}-r001" in stdout
     )
     assert "shortmd_workflow.ShortMDPrepNode" not in stdout
     assert "Submitting ShortMD workflow" not in stdout
@@ -1091,6 +1099,7 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    execution_run_id = UUID("11111111-2222-3333-4444-555555555555")
     input_dir = tmp_path / "pdbs"
     input_dir.mkdir()
     input_dir.joinpath("alpha.pdb").write_text("ATOM\n", encoding="utf-8")
@@ -1115,6 +1124,7 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
         "ExecutionCoordinator",
         FakeExecutionCoordinator,
     )
+    monkeypatch.setattr(shortmd_workflow, "uuid4", lambda: execution_run_id)
 
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
     assert raw_f is not None
@@ -1127,13 +1137,12 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
     )
 
     definition = calls["prepare"]["workflow"].validate()
-    clear_node = definition.nodes["clear-shortmd-run-alpha"].node
-    clone_node = definition.nodes["clone-shortmd-run-alpha-r001"].node
+    run_name = "shortmd-run-111111112222-alpha"
+    clear_node = definition.nodes[f"clear-{run_name}"].node
+    clone_node = definition.nodes[f"clone-{run_name}-r001"].node
 
     assert isinstance(clear_node, ShortMDClearNode)
-    assert definition.dependencies["prep-shortmd-run-alpha"] == {
-        "clear-shortmd-run-alpha"
-    }
+    assert definition.dependencies[f"prep-{run_name}"] == {f"clear-{run_name}"}
     assert clone_node.overwrite_clone is True
     assert "clone_function" not in clone_node.__dict__
     assert "force" not in calls["prepare"]

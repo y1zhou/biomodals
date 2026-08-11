@@ -744,9 +744,9 @@ class GromacsExecutionCoordinator:
                 "run_name": job.run_name,
                 "simulation_time_ns": options.simulation_time_ns,
                 "run_pdbfixer": options.run_pdbfixer,
-                "ld_seed": int(scientific_payload["ld_seed"]),
-                "gen_seed": int(scientific_payload["gen_seed"]),
-                "genion_seed": int(scientific_payload["genion_seed"]),
+                "ld_seed": _persisted_seed(scientific_payload, "ld_seed"),
+                "gen_seed": _persisted_seed(scientific_payload, "gen_seed"),
+                "genion_seed": _persisted_seed(scientific_payload, "genion_seed"),
             }
         return modal_invocation(
             operation,
@@ -802,6 +802,13 @@ class GromacsExecutionCoordinator:
                 LOGGER.exception("Could not clean intermediates for job %s", job.job_id)
                 continue
             self.store.mark_intermediates_cleaned(job.job_id, now=now)
+
+
+def _persisted_seed(scientific_payload: Mapping[Any, object], key: str) -> int:
+    value = scientific_payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"GROMACS plan {key} is invalid")
+    return value
 
 
 def _result_envelope(result: Any) -> dict[str, object]:

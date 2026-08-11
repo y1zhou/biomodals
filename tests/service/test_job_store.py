@@ -335,7 +335,7 @@ def test_job_list_loads_execution_overviews_in_one_batch(
     assert len(calls[0]) == 2
 
 
-def test_cancellation_audit_does_not_mirror_execution_state(tmp_path: Path) -> None:
+def test_cancellation_audit_and_execution_intent_are_atomic(tmp_path: Path) -> None:
     store, alice, _bob = make_store(tmp_path)
     admitted = admit(store, alice, key="one")
     assert admitted.job.execution_run_id is not None
@@ -344,9 +344,9 @@ def test_cancellation_audit_does_not_mirror_execution_state(tmp_path: Path) -> N
     with store.execution_repository() as repository:
         run = repository.get_run(admitted.job.execution_run_id)
 
-    assert requested.state == JobState.QUEUED
+    assert requested.state == JobState.CANCEL_REQUESTED
     assert requested.cancel_requested_at == 150
-    assert run.status == RunStatus.PENDING
+    assert run.status == RunStatus.CANCEL_REQUESTED
 
     fail_run(store, admitted.job.execution_run_id)
     with pytest.raises(JobNotCancellableError):

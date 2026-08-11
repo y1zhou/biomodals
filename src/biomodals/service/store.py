@@ -1783,6 +1783,7 @@ class ServiceStore:
                 )
             if run.status.is_terminal:
                 raise JobNotCancellableError(f"Job is already {run.status.value}")
+            repository.request_run_cancellation(run.execution_run_id, now=now)
             conn.execute(
                 """
                 UPDATE jobs

@@ -104,6 +104,7 @@ def test_discover_pdb_inputs_rejects_empty_directory(tmp_path: Path) -> None:
 def test_build_shortmd_workflow_models_production_analysis_dependencies() -> None:
     workflow = build_shortmd_workflow(
         input_pdbs=[("alpha.pdb", b"ATOM\n"), ("beta.pdb", b"ATOM\n")],
+        random_seed_identity="run-1",
         replicates=2,
         simulation_time_ns=2,
         cpu_only=True,
@@ -192,6 +193,7 @@ def test_build_shortmd_workflow_models_production_analysis_dependencies() -> Non
 def test_build_shortmd_force_adds_tracked_cleanup_dependencies() -> None:
     workflow = build_shortmd_workflow(
         input_pdbs=[("alpha.pdb", b"ATOM\n")],
+        random_seed_identity="run-1",
         replicates=1,
         overwrite_existing=True,
     )
@@ -206,6 +208,7 @@ def test_shortmd_node_parallelism_is_not_scientific_identity() -> None:
     def fingerprint(max_parallel: int) -> str:
         workflow = build_shortmd_workflow(
             input_pdbs=[("alpha.pdb", b"ATOM\n")],
+            random_seed_identity="run-1",
             replicates=1,
             max_parallel=max_parallel,
         )
@@ -223,6 +226,7 @@ def test_shortmd_gromacs_version_changes_plan_identity(
     def fingerprint() -> str:
         workflow = build_shortmd_workflow(
             input_pdbs=[("alpha.pdb", b"ATOM\n")],
+            random_seed_identity="run-1",
             replicates=1,
         )
         return execution_plan(
@@ -244,6 +248,7 @@ def test_build_shortmd_workflow_rejects_duplicate_sanitized_stems() -> None:
     with pytest.raises(ValueError, match="Duplicate"):
         build_shortmd_workflow(
             input_pdbs=[("../a.pdb", b"A\n"), ("a.pdb", b"B\n")],
+            random_seed_identity="run-1",
             replicates=1,
         )
 

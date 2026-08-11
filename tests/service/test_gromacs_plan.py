@@ -24,6 +24,9 @@ def test_preparation_fans_out_and_production_analysis_joins_production() -> None
         pdb_sha256="abc123",
         simulation_time_ns=5,
         run_pdbfixer=False,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
     )
     assert {
         node.node_key: tuple(item.node_key for item in node.dependencies)
@@ -47,6 +50,9 @@ def test_every_planned_operation_has_public_stage_metadata(
         pdb_sha256="abc123",
         simulation_time_ns=5,
         run_pdbfixer=False,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
     )
 
     for operation_name in plan.node_keys[:-1]:
@@ -89,6 +95,9 @@ def test_execution_plan_preserves_parallel_gromacs_dag() -> None:
         pdb_sha256="abc123",
         simulation_time_ns=20,
         run_pdbfixer=True,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
     )
 
     assert plan.workload_name == "gromacs"
@@ -131,6 +140,9 @@ def test_execution_plan_fingerprint_excludes_workload_run_name() -> None:
         pdb_sha256="abc123",
         simulation_time_ns=5,
         run_pdbfixer=False,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
     )
     second = execution_plan(
         cpu_only=True,
@@ -138,6 +150,9 @@ def test_execution_plan_fingerprint_excludes_workload_run_name() -> None:
         pdb_sha256="abc123",
         simulation_time_ns=5,
         run_pdbfixer=False,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
     )
 
     assert first.workload_plan_fingerprint == second.workload_plan_fingerprint

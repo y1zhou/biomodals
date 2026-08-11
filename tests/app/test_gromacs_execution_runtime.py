@@ -128,9 +128,9 @@ def _request() -> GromacsExecutionRequest:
         cpu_only=False,
         num_threads=8,
         use_openmp_threads=False,
-        ld_seed=-1,
-        gen_seed=-1,
-        genion_seed=0,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
         max_active_provider_calls=3,
         max_active_gpu_provider_calls=1,
     )
@@ -208,6 +208,15 @@ def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
         ).execution_plan.workload_plan_fingerprint
         != fingerprint
     )
+
+
+def test_gromacs_request_rejects_unmaterialized_random_sentinels() -> None:
+    with pytest.raises(ValueError, match="random sentinels"):
+        replace(_request(), ld_seed=-1)
+    with pytest.raises(ValueError, match="random sentinels"):
+        replace(_request(), gen_seed=-1)
+    with pytest.raises(ValueError, match="random sentinels"):
+        replace(_request(), genion_seed=0)
 
 
 def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None:

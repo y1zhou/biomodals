@@ -31,25 +31,15 @@ EXECUTION_PLAN_SCHEMA_VERSION = "2"
 def concrete_gromacs_seed(
     seed: int,
     *,
-    scientific_identity: str,
+    run_identity: str,
     purpose: str,
     random_sentinel: int = -1,
 ) -> int:
-    """Resolve GROMACS' random sentinel to a stable scientific seed."""
+    """Resolve a random sentinel once from the persisted root Run identity."""
     if seed != random_sentinel:
         return seed
-    digest = sha256(f"{scientific_identity}:{purpose}".encode()).digest()
+    digest = sha256(f"{run_identity}:{purpose}".encode()).digest()
     return int.from_bytes(digest[:4], "big") % (2**31 - 1) + 1
-
-
-def gromacs_seed_identity(
-    *,
-    pdb_sha256: str,
-    simulation_time_ns: int,
-    run_pdbfixer: bool,
-) -> str:
-    """Return the stable identity used to materialize random seed sentinels."""
-    return f"{pdb_sha256}:{simulation_time_ns}:{int(run_pdbfixer)}"
 
 
 def preparation_execution_paths(run_name: str) -> tuple[str, ...]:
@@ -123,27 +113,10 @@ def execution_plan(
     execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION,
 ) -> ExecutionPlan:
     """Express the established service workflow as one immutable kernel plan."""
-    seed_identity = gromacs_seed_identity(
-        pdb_sha256=pdb_sha256,
-        simulation_time_ns=simulation_time_ns,
-        run_pdbfixer=run_pdbfixer,
-    )
-    ld_seed = concrete_gromacs_seed(
-        ld_seed,
-        scientific_identity=seed_identity,
-        purpose="ld-seed",
-    )
-    gen_seed = concrete_gromacs_seed(
-        gen_seed,
-        scientific_identity=seed_identity,
-        purpose="gen-seed",
-    )
-    genion_seed = concrete_gromacs_seed(
-        genion_seed,
-        scientific_identity=seed_identity,
-        purpose="genion-seed",
-        random_sentinel=0,
-    )
+    if ld_seed == -1 or gen_seed == -1 or genion_seed == 0:
+        raise ValueError(
+            "GROMACS random sentinels must be materialized before planning"
+        )
     operations = _operation_plan(cpu_only=cpu_only)
     analysis_nodes = (
         NVT_ANALYSIS,

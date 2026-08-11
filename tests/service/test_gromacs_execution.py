@@ -185,6 +185,9 @@ def _admit(store: ServiceStore, user_id: UUID) -> None:
         pdb_sha256="b" * 64,
         simulation_time_ns=5,
         run_pdbfixer=False,
+        ld_seed=11,
+        gen_seed=12,
+        genion_seed=13,
     )
     store.admit_job(
         owner_user_id=user_id,

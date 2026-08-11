@@ -20,9 +20,7 @@ from biomodals.app.bioinfo.gromacs_execution import (
     NVT_ANALYSIS,
     PREPARE_RESULT,
     PRODUCTION_ANALYSIS,
-    concrete_gromacs_seed,
     execution_plan,
-    gromacs_seed_identity,
     modal_invocation,
     operation_provider_binding,
     operation_task_plan,
@@ -88,44 +86,13 @@ class GromacsExecutionRequest:
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
-        seed_identity = gromacs_seed_identity(
-            pdb_sha256=sha256(self.pdb_content).hexdigest(),
-            simulation_time_ns=self.simulation_time_ns,
-            run_pdbfixer=self.run_pdbfixer,
-        )
-        object.__setattr__(
-            self,
-            "ld_seed",
-            concrete_gromacs_seed(
-                self.ld_seed,
-                scientific_identity=seed_identity,
-                purpose="ld-seed",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "gen_seed",
-            concrete_gromacs_seed(
-                self.gen_seed,
-                scientific_identity=seed_identity,
-                purpose="gen-seed",
-            ),
-        )
-        object.__setattr__(
-            self,
-            "genion_seed",
-            concrete_gromacs_seed(
-                self.genion_seed,
-                scientific_identity=seed_identity,
-                purpose="genion-seed",
-                random_sentinel=0,
-            ),
-        )
         require_safe_filename_component(self.run_name, field_name="run_name")
         if not self.pdb_content:
             raise ValueError("pdb_content cannot be empty")
         if self.simulation_time_ns < 1 or self.num_threads < 1:
             raise ValueError("simulation time and thread count must be positive")
+        if self.ld_seed == -1 or self.gen_seed == -1 or self.genion_seed == 0:
+            raise ValueError("GROMACS random sentinels must be materialized")
         if self.max_active_provider_calls < 1:
             raise ValueError("max_active_provider_calls must be positive")
         if not self.gromacs_version or not self.execution_plan_version:
@@ -136,6 +103,8 @@ class GromacsExecutionRequest:
             <= self.max_active_provider_calls
         ):
             raise ValueError("GPU call limit must fit within the total call limit")
+        if not self.cpu_only and self.max_active_gpu_provider_calls < 1:
+            raise ValueError("GPU GROMACS Runs require at least one GPU call slot")
 
     @property
     def execution_plan(self):

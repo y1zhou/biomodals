@@ -17,7 +17,10 @@ from uuid import UUID, uuid4
 
 import modal
 
-from biomodals.app.bioinfo.gromacs_execution import preparation_execution_paths
+from biomodals.app.bioinfo.gromacs_execution import (
+    concrete_gromacs_seed,
+    preparation_execution_paths,
+)
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
@@ -1066,6 +1069,9 @@ def submit_gromacs_task(
     analysis_limit = 2 if max_parallel_analysis is None else max_parallel_analysis
     if analysis_limit < 1:
         raise ValueError("max_parallel_analysis must be positive")
+    execution_run_id = uuid4()
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    seed_run_id = predecessor_execution_run_id or execution_run_id
     request = GromacsExecutionRequest(
         run_name=run_name,
         pdb_content=pdb_str,
@@ -1074,19 +1080,30 @@ def submit_gromacs_task(
         cpu_only=cpu_only,
         num_threads=num_threads,
         use_openmp_threads=use_openmp_threads,
-        ld_seed=ld_seed,
-        gen_seed=gen_seed,
-        genion_seed=genion_seed,
+        ld_seed=concrete_gromacs_seed(
+            ld_seed,
+            run_identity=str(seed_run_id),
+            purpose="ld-seed",
+        ),
+        gen_seed=concrete_gromacs_seed(
+            gen_seed,
+            run_identity=str(seed_run_id),
+            purpose="gen-seed",
+        ),
+        genion_seed=concrete_gromacs_seed(
+            genion_seed,
+            run_identity=str(seed_run_id),
+            purpose="genion-seed",
+            random_sentinel=0,
+        ),
         max_active_provider_calls=min(analysis_limit, 2) + 1,
         max_active_gpu_provider_calls=0 if cpu_only else 1,
     )
-    execution_run_id = uuid4()
     deployment = DeploymentIdentity(
         deployment_environment,
         deployment_name,
         deployment_version,
     )
-    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     stage_execution_request(CONF.output_volume, execution_run_id, request)
     stage_execution_launch(
         CONF.output_volume,

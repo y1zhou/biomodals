@@ -22,7 +22,10 @@ from fastapi import (
     UploadFile,
 )
 
-from biomodals.app.bioinfo.gromacs_execution import execution_plan
+from biomodals.app.bioinfo.gromacs_execution import (
+    concrete_gromacs_seed,
+    execution_plan,
+)
 from biomodals.execution.modal import ModalSubmissionOutcomeUnknownError
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.auth import AuthenticatedSession
@@ -203,12 +206,29 @@ def create_router(
         new_job_id = uuid4()
         execution_run_id = uuid4()
         run_name = gromacs_run_name(normalized_name, new_job_id)
+        seed_run_id = str(execution_run_id)
         plan = execution_plan(
             cpu_only=options.cpu_only,
             workload_run_key=run_name,
             pdb_sha256=hashlib.sha256(pdb_content).hexdigest(),
             simulation_time_ns=options.simulation_time_ns,
             run_pdbfixer=options.run_pdbfixer,
+            ld_seed=concrete_gromacs_seed(
+                -1,
+                run_identity=seed_run_id,
+                purpose="ld-seed",
+            ),
+            gen_seed=concrete_gromacs_seed(
+                -1,
+                run_identity=seed_run_id,
+                purpose="gen-seed",
+            ),
+            genion_seed=concrete_gromacs_seed(
+                0,
+                run_identity=seed_run_id,
+                purpose="genion-seed",
+                random_sentinel=0,
+            ),
         )
         try:
             admission = store.admit_job(

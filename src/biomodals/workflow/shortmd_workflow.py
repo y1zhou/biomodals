@@ -673,6 +673,7 @@ def discover_pdb_inputs(input_dir: str | Path) -> list[tuple[str, bytes]]:
 def build_shortmd_workflow(
     *,
     input_pdbs: list[tuple[str, bytes]],
+    random_seed_identity: str,
     run_namespace: str | None = None,
     replicates: int = 50,
     simulation_time_ns: int = 2,
@@ -699,15 +700,6 @@ def build_shortmd_workflow(
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else None
     )
-    seed_identity = hashlib.sha256(
-        b"".join(
-            len(file_name.encode()).to_bytes(8, "big")
-            + file_name.encode()
-            + len(pdb_content).to_bytes(8, "big")
-            + pdb_content
-            for file_name, pdb_content in input_pdbs
-        )
-    ).hexdigest()
     gromacs = ShortMDGromacsSettings(
         simulation_time_ns=simulation_time_ns,
         run_pdbfixer=run_pdbfixer,
@@ -716,17 +708,17 @@ def build_shortmd_workflow(
         use_openmp_threads=use_openmp_threads,
         ld_seed=concrete_gromacs_seed(
             ld_seed,
-            scientific_identity=seed_identity,
+            run_identity=random_seed_identity,
             purpose="ld-seed",
         ),
         gen_seed=concrete_gromacs_seed(
             gen_seed,
-            scientific_identity=seed_identity,
+            run_identity=random_seed_identity,
             purpose="gen-seed",
         ),
         genion_seed=concrete_gromacs_seed(
             genion_seed,
-            scientific_identity=seed_identity,
+            run_identity=random_seed_identity,
             purpose="genion-seed",
             random_sentinel=0,
         ),
@@ -840,9 +832,9 @@ def submit_shortmd_workflow(
         cpu_only: Whether to run GROMACS preparation and production on CPU only.
         num_threads: Number of CPU threads to pass to GROMACS.
         use_openmp_threads: Whether to use OpenMP threading in GROMACS.
-        ld_seed: Langevin seed. -1 derives a stable seed from the workflow input.
-        gen_seed: Velocity seed. -1 derives a stable seed from the workflow input.
-        genion_seed: Random seed for ion placement during preparation.
+        ld_seed: Langevin seed. -1 samples once for a new root Run.
+        gen_seed: Velocity seed. -1 samples once for a new root Run.
+        genion_seed: Ion-placement seed. 0 samples once for a new root Run.
         force: Replace existing ShortMD-managed app outputs before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
@@ -862,8 +854,11 @@ def submit_shortmd_workflow(
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
     resolved_run_id = sanitize_filename(run_id or input_path.name)
+    execution_run_id = uuid4()
+    seed_run_id = predecessor_execution_run_id or execution_run_id
     workflow = build_shortmd_workflow(
         input_pdbs=input_pdbs,
+        random_seed_identity=str(seed_run_id),
         run_namespace=resolved_run_id,
         replicates=replicates,
         simulation_time_ns=simulation_time_ns,
@@ -881,7 +876,6 @@ def submit_shortmd_workflow(
         print_workflow_dag(workflow.validate())
         return
 
-    execution_run_id = uuid4()
     deployment = DeploymentIdentity(
         environment=(
             deployment_environment if use_deployed_coordinator else "development"

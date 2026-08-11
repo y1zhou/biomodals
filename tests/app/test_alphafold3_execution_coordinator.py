@@ -367,7 +367,7 @@ def test_restart_rejects_a_gpu_limit_above_the_total_limit() -> None:
     """Operational overrides retain the kernel's GPU-subset invariant."""
     request = _request()
 
-    with pytest.raises(ValueError, match="cannot exceed"):
+    with pytest.raises(ValueError, match="provider-call limits"):
         _restart_request(
             request,
             predecessor_max_active_provider_calls=2,

@@ -172,11 +172,10 @@ def _parse_execution_launch(content: bytes) -> UUID | None:
     if content == b"root":
         return None
     try:
-        predecessor = content.decode("ascii")
-        parsed = UUID(predecessor)
+        parsed = UUID(content.decode("ascii"))
     except (UnicodeDecodeError, ValueError) as error:
         raise ValueError("Execution launch predecessor is invalid") from error
-    if str(parsed) != predecessor:
+    if str(parsed).encode() != content:
         raise ValueError("Execution launch predecessor is not canonical")
     return parsed
 

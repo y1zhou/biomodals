@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO, RawIOBase
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO
 
 import polars as pl
 
@@ -28,14 +28,10 @@ MAX_ARCHIVE_SELECTED_MEMBERS = 10_000
 _ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
 
 
-class _Readable(Protocol):
-    def read(self, size: int = -1) -> bytes: ...
-
-
 class _BoundedArchiveReader(RawIOBase):
     """Count every decompressed tar byte, including metadata and padding."""
 
-    def __init__(self, stream: _Readable) -> None:
+    def __init__(self, stream: BinaryIO) -> None:
         super().__init__()
         self._stream = stream
         self._bytes_read = 0

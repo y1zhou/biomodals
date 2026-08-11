@@ -148,10 +148,6 @@ def _restart_request(
         if max_active_gpu_provider_calls is None
         else max_active_gpu_provider_calls
     )
-    if gpu > total:
-        raise ValueError(
-            "max_active_gpu_provider_calls cannot exceed max_active_provider_calls"
-        )
     return AlphaFold3ExecutionRequest.prepare(
         request.config,
         search_msa=request.search_msa,

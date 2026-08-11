@@ -27,6 +27,7 @@ from biomodals.execution.modal import (
     ModalCallObservation,
     ModalCallObservationKind,
 )
+from biomodals.helper.app_execution import load_execution_launch
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import (
     AppOutput,
@@ -723,6 +724,7 @@ def test_generic_restart_prepares_successor_before_driving(
 
     store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
     assert store.execution.get_run(SUCCESSOR_ID).predecessor_execution_run_id == RUN_ID
+    assert load_execution_launch(tmp_path, SUCCESSOR_ID) == RUN_ID
     assert getattr(successor_coordinator, "_runtime", None) is None
     store.close()
 

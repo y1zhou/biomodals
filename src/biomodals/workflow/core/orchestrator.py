@@ -31,6 +31,7 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _shared_execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_execution import persist_execution_launch
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
     WORKFLOW_ORCHESTRATOR_VOLUME,
@@ -426,6 +427,11 @@ class ExecutionCoordinator:
                         "Target deployment changed the Workload Plan Fingerprint"
                     )
                 plan = self._persist_or_verify_plan(successor_plan)
+                persist_execution_launch(
+                    CONF.output_volume_mountpoint,
+                    successor_id,
+                    predecessor_execution_run_id,
+                )
                 self._persist_or_verify_successor(
                     predecessor=predecessor,
                     plan=plan,

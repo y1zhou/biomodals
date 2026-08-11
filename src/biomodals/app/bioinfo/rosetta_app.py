@@ -44,6 +44,7 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
+    deployed_function_handle,
     development_modal_call_driver,
     execution_coordinator_adapter,
     execution_coordinator_identity,
@@ -748,7 +749,12 @@ def submit_rosetta_task(
     local_out_dir = Path(out_dir).expanduser().resolve()
     local_out_dir.mkdir(parents=True, exist_ok=True)
     out_file = local_out_dir / f"{completed_request.workload_run_key}.tar.zst"
-    tarball_bytes = package_outputs_helper.remote(
+    package_function = (
+        deployed_function_handle(deployment, "package_outputs_helper")
+        if use_deployed_coordinator
+        else package_outputs_helper
+    )
+    tarball_bytes = package_function.remote(
         root=str(layout.run_root),
     )
     out_file.write_bytes(tarball_bytes)

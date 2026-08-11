@@ -42,6 +42,7 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
+    deployed_function_handle,
     development_modal_call_driver,
     execution_coordinator_adapter,
     execution_coordinator_identity,
@@ -900,8 +901,24 @@ def submit_boltzgen_task(
         deployment_version: Exact numeric Modal deployment version.
         restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
+    )
+
+    def entrypoint_function(source_function, function_name: str):
+        return (
+            deployed_function_handle(deployment, function_name)
+            if use_deployed_coordinator
+            else source_function
+        )
+
     if download_models:
-        boltzgen_download.remote(force=force_redownload)
+        entrypoint_function(
+            boltzgen_download,
+            "boltzgen_download",
+        ).remote(force=force_redownload)
         return
 
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
@@ -949,13 +966,16 @@ def submit_boltzgen_task(
 
         if not salvage_mode:
             print(f"🧬 Staging BoltzGen inputs for yaml: {input_yaml}")
-            prepare_boltzgen_run.remote(
+            entrypoint_function(
+                prepare_boltzgen_run,
+                "prepare_boltzgen_run",
+            ).remote(
                 yaml_content=yaml_content,
                 run_name=run_name,
                 additional_files=additional_files,
             )
         run_ids = tuple(
-            get_run_ids.remote(
+            entrypoint_function(get_run_ids, "get_run_ids").remote(
                 run_name=run_name,
                 num_parallel_runs=num_parallel_runs,
                 salvage_mode=salvage_mode,
@@ -1001,11 +1021,6 @@ def submit_boltzgen_task(
             max_active_gpu_provider_calls=num_parallel_runs,
         )
     execution_run_id = uuid4()
-    deployment = DeploymentIdentity(
-        deployment_environment,
-        deployment_name,
-        deployment_version,
-    )
     stage_execution_request(CONF.output_volume, execution_run_id, request)
     stage_execution_launch(
         CONF.output_volume,

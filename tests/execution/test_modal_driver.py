@@ -12,7 +12,7 @@ from uuid import UUID
 import modal
 import pytest
 
-from biomodals.execution import DeploymentIdentity
+from biomodals.execution import DeploymentIdentity, ProviderBinding
 from biomodals.execution.modal import (
     AsyncModalCallDriver,
     ModalCallDriver,
@@ -20,6 +20,7 @@ from biomodals.execution.modal import (
     ModalDeploymentUnavailableError,
     ModalSubmissionOutcomeUnknownError,
     deployed_execution_coordinator,
+    deployed_function_handle,
     development_modal_call_driver,
     execution_coordinator_adapter,
     execution_coordinator_handle,
@@ -172,6 +173,36 @@ def test_driver_resolves_exact_version_and_spawns_detached_call() -> None:
     ]
     assert function.hydrated
     assert call_id == "fc-123"
+
+
+def test_deployed_function_handle_uses_exact_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function = FakeFunction()
+    bindings = []
+
+    def resolve(_self, binding):
+        bindings.append(binding)
+        return function
+
+    monkeypatch.setattr(ModalCallDriver, "resolve", resolve)
+
+    resolved = deployed_function_handle(
+        DeploymentIdentity("main", "Rosetta", 7),
+        "package_outputs_helper",
+    )
+
+    assert resolved is function
+    assert bindings == [
+        ProviderBinding(
+            environment="main",
+            app_name="Rosetta",
+            app_version=7,
+            function_name="package_outputs_helper",
+            uses_gpu=False,
+            runtime_image_key="local-entrypoint",
+        )
+    ]
 
 
 def test_development_driver_resolves_only_declared_local_handles() -> None:

@@ -258,6 +258,23 @@ class ModalCallDriver:
         self._call_resolver(provider_call_handle_id).cancel()
 
 
+def deployed_function_handle(
+    deployment: DeploymentIdentity,
+    function_name: str,
+) -> Any:
+    """Resolve one exact deployed function for local-entrypoint helper calls."""
+    return ModalCallDriver().resolve(
+        ProviderBinding(
+            environment=deployment.environment,
+            app_name=deployment.deployment_name,
+            app_version=deployment.deployment_version,
+            function_name=function_name,
+            uses_gpu=False,
+            runtime_image_key="local-entrypoint",
+        )
+    )
+
+
 def development_modal_call_driver(
     function_handles: Mapping[str, Any],
     *,

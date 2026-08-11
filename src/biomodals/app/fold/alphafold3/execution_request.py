@@ -30,7 +30,7 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
 from biomodals.execution import ExecutionPlan
 from biomodals.helper.app_execution import ExecutionRequestFile
 
-EXECUTION_REQUEST_SCHEMA_VERSION = 2
+EXECUTION_REQUEST_SCHEMA_VERSION = 3
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"
 MAX_EXECUTION_REQUEST_BYTES = 64 * 1024 * 1024
 _REQUEST_FILE = ExecutionRequestFile(
@@ -52,6 +52,7 @@ class AlphaFold3ExecutionRequest:
     max_num_gpus: int
     max_active_provider_calls: int
     max_active_gpu_provider_calls: int
+    allow_large_inference: bool
     recycle: int
     sample: int
 
@@ -66,11 +67,14 @@ class AlphaFold3ExecutionRequest:
         max_num_gpus: int,
         max_active_provider_calls: int | None = None,
         max_active_gpu_provider_calls: int | None = None,
+        allow_large_inference: bool = False,
         recycle: int,
         sample: int,
     ) -> AlphaFold3ExecutionRequest:
         """Validate one local request and bind its existing invocation identity."""
         validated = validate_submitted_af3_input(config)
+        if not isinstance(allow_large_inference, bool):
+            raise TypeError("allow_large_inference must be a boolean")
         if not isinstance(search_msa, bool):
             raise TypeError("search_msa must be a boolean")
         if not isinstance(search_protein_templates, bool):
@@ -97,13 +101,18 @@ class AlphaFold3ExecutionRequest:
         ):
             raise ValueError("AlphaFold3 provider-call limits are invalid")
         validate_inference_parameters(recycle, sample)
-        validate_inference_workload(validated.modelSeeds, sample)
+        validate_inference_workload(
+            validated.modelSeeds,
+            sample,
+            allow_large_inference=allow_large_inference,
+        )
         invocation = prepare_invocation(
             validated,
             search_msa=search_msa,
             search_protein_templates=search_protein_templates,
             recycle=recycle,
             sample=sample,
+            allow_large_inference=allow_large_inference,
         )
         return cls(
             config=validated,
@@ -114,6 +123,7 @@ class AlphaFold3ExecutionRequest:
             max_num_gpus=max_num_gpus,
             max_active_provider_calls=total_call_limit,
             max_active_gpu_provider_calls=gpu_call_limit,
+            allow_large_inference=allow_large_inference,
             recycle=recycle,
             sample=sample,
         )
@@ -139,6 +149,7 @@ class AlphaFold3ExecutionRequest:
                 "max_num_gpus": self.max_num_gpus,
                 "max_active_provider_calls": self.max_active_provider_calls,
                 "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
+                "allow_large_inference": self.allow_large_inference,
                 "recycle": self.recycle,
                 "sample": self.sample,
             },
@@ -185,6 +196,7 @@ class AlphaFold3ExecutionRequest:
                 value,
                 "max_active_gpu_provider_calls",
             ),
+            allow_large_inference=_required_bool(value, "allow_large_inference"),
             recycle=_required_int(value, "recycle"),
             sample=_required_int(value, "sample"),
         )

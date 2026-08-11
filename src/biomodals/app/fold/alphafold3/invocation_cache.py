@@ -126,6 +126,7 @@ def prepare_invocation(
     search_protein_templates: bool,
     recycle: int,
     sample: int,
+    allow_large_inference: bool = False,
 ) -> PreparedInvocation:
     """Build the exact pre-enrichment invocation identity."""
     if not isinstance(search_msa, bool):
@@ -134,7 +135,11 @@ def prepare_invocation(
         raise TypeError("search_protein_templates must be a boolean")
     validate_inference_parameters(recycle, sample)
     validated = validate_submitted_af3_input(config)
-    validate_inference_workload(validated.modelSeeds, sample)
+    validate_inference_workload(
+        validated.modelSeeds,
+        sample,
+        allow_large_inference=allow_large_inference,
+    )
     identity: dict[str, object] = {
         "schema": INVOCATION_IDENTITY_SCHEMA,
         "submitted_input": build_inference_identity_view(validated),

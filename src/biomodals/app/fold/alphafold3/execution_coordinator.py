@@ -156,6 +156,7 @@ def _restart_request(
         max_num_gpus=request.max_num_gpus,
         max_active_provider_calls=total,
         max_active_gpu_provider_calls=gpu,
+        allow_large_inference=request.allow_large_inference,
         recycle=request.recycle,
         sample=request.sample,
     )

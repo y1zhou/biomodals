@@ -820,14 +820,16 @@ root.
 
 The submitted seed list must be non-empty. It is normalized to a sorted unique
 set before computation identity, reconciliation, or scheduling. One invocation
-may produce at most 1,000 seed/sample pairs after normalization. The
-accumulated summary may grow beyond that ceiling through multiple valid
-requests. Inference controls are bounded both before scheduling and again in
-the worker: model seeds are unsigned 32-bit integers, recycles are 0--100,
-diffusion samples are 1--100, and `max_num_gpus` is 1--100. Seed-cache
-inspection, seed claiming, and request publication independently repeat the
-seed, sample, and per-request workload checks before touching the output
-Volume.
+may produce at most 5,000 seed/sample pairs after normalization by default.
+`--allow-large-inference` emits a warning and permits a larger request while
+retaining every seed, sample, and worker bound. The accumulated summary may
+grow beyond the default ceiling through multiple valid requests. Inference
+controls are bounded both before scheduling and again in the worker: model
+seeds are unsigned 32-bit integers, recycles are 0--100, diffusion samples are
+1--100, and `max_num_gpus` is 1--100. Seed-cache inspection and seed claiming
+repeat the default workload check unless the explicit override accompanies the
+request. Result publication repeats the hard seed and sample bounds before
+touching the output Volume.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
 normalized seed list. It identifies one computational seed request, not a seed

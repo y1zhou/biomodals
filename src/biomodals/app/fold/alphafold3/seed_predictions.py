@@ -336,12 +336,17 @@ def inspect_seed_predictions(
     *,
     sample_count: int,
     reload_volume: bool = True,
+    allow_large_inference: bool = False,
 ) -> list[dict[str, object]]:
     """Inspect requested seed markers without walking output artifacts."""
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     selected_seeds = tuple(_validate_seed(seed) for seed in seeds)
-    validate_inference_workload(list(selected_seeds), selected_samples)
+    validate_inference_workload(
+        list(selected_seeds),
+        selected_samples,
+        allow_large_inference=allow_large_inference,
+    )
     if len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("seed inspection inputs must be unique")
     if reload_volume:
@@ -387,12 +392,17 @@ def claim_seed_predictions(
     sample_count: int,
     generation_ids: Mapping[int, str] | None = None,
     reload_volume: bool = True,
+    allow_large_inference: bool = False,
 ) -> SeedClaimPlan:
     """Reuse marked seeds and atomically claim every currently missing seed."""
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     selected_seeds = tuple(sorted(_validate_seed(seed) for seed in seeds))
-    validate_inference_workload(list(selected_seeds), selected_samples)
+    validate_inference_workload(
+        list(selected_seeds),
+        selected_samples,
+        allow_large_inference=allow_large_inference,
+    )
     if not selected_seeds or len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("claim inputs must be a non-empty unique seed set")
     selected_generations: dict[int, str] = {}

@@ -44,7 +44,12 @@ class FakeVolume:
         yield Batch()
 
 
-def _request(*, search_workers: int = 4, gpu_workers: int = 2):
+def _request(
+    *,
+    search_workers: int = 4,
+    gpu_workers: int = 2,
+    allow_large_inference: bool = False,
+):
     config = AF3Config(
         name="example",
         modelSeeds=[2, 1],
@@ -63,6 +68,7 @@ def _request(*, search_workers: int = 4, gpu_workers: int = 2):
         search_protein_templates=True,
         max_parallel_search_workers=search_workers,
         max_num_gpus=gpu_workers,
+        allow_large_inference=allow_large_inference,
         recycle=10,
         sample=5,
     )
@@ -70,13 +76,14 @@ def _request(*, search_workers: int = 4, gpu_workers: int = 2):
 
 def test_execution_request_round_trips_and_revalidates_identity() -> None:
     """Staged state re-derives rather than trusting its invocation record."""
-    request = _request()
+    request = _request(allow_large_inference=True)
 
     decoded = AlphaFold3ExecutionRequest.from_bytes(request.to_bytes())
 
     assert decoded.invocation == request.invocation
     assert decoded.execution_plan == request.execution_plan
     assert decoded.max_active_provider_calls == 4
+    assert decoded.allow_large_inference
 
 
 def test_operational_limits_do_not_change_the_scientific_plan() -> None:

@@ -872,9 +872,10 @@ IDs, letter-only polymer sequences, modification-code prefix rules, at most 20
 protein templates, and nonempty unsigned 32-bit model seeds. Inference workers
 repeat this preflight before launching upstream. A request is capped at 1,000
 model seeds, while the accumulated summary may exceed that total across
-requests. Recycles, diffusion samples, and GPU workers are bounded at 0--100,
-1--100, and 1--100 respectively; the inference worker repeats the recycle and
-sample checks.
+requests. The seed/sample fan-out is capped at 5,000 by default; an explicit
+large-inference override warns before allowing a larger request. Recycles,
+diffusion samples, and GPU workers are bounded at 0--100, 1--100, and 1--100
+respectively; the inference worker repeats the recycle and sample checks.
 
 After enrichment, the module validates and explicitly dumps the complete
 input, removes only `name` and `modelSeeds`, and represents every inline

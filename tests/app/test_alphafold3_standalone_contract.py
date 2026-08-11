@@ -370,7 +370,7 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     input_json = tmp_path / "input.json"
     conf = AF3Config(
         name="original",
-        modelSeeds=[11, 12],
+        modelSeeds=list(range(alphafold3_app.MAX_SEED_SAMPLE_PAIRS // 5)),
         sequences=[
             AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE")),
         ],
@@ -440,26 +440,31 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     assert submit_task_info is not None
     submit_task_raw_f = submit_task_info.raw_f
     assert submit_task_raw_f is not None
-    submit_task_raw_f(
-        input_json=str(input_json),
-        out_dir=str(tmp_path),
-        run_name="renamed",
-        search_msa=False,
-        max_num_gpus=4,
-        recycle=3,
-        sample=2,
-        use_deployed_coordinator=True,
-        deployment_environment="production",
-        deployment_name="AlphaFold3Prod",
-        deployment_version=7,
-    )
+    with pytest.warns(UserWarning, match="6,000 seed/sample predictions"):
+        submit_task_raw_f(
+            input_json=str(input_json),
+            out_dir=str(tmp_path),
+            run_name="renamed",
+            search_msa=False,
+            max_num_gpus=4,
+            allow_large_inference=True,
+            recycle=3,
+            sample=6,
+            use_deployed_coordinator=True,
+            deployment_environment="production",
+            deployment_name="AlphaFold3Prod",
+            deployment_version=7,
+        )
 
     request = captured["request"]
     assert request.config.name == "renamed"
-    assert request.config.modelSeeds == [11, 12]
+    assert request.config.modelSeeds == list(
+        range(alphafold3_app.MAX_SEED_SAMPLE_PAIRS // 5)
+    )
     assert request.max_num_gpus == 4
+    assert request.allow_large_inference
     assert request.recycle == 3
-    assert request.sample == 2
+    assert request.sample == 6
     assert captured["launch"] == (captured["execution_run_id"], None)
     assert captured["run_kwargs"] == {"development": False}
     deployment = captured["coordinator"]["deployment"]

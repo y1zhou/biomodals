@@ -152,7 +152,11 @@ def _validate_publication(spec: RequestPublication) -> RequestPublication:
         raise ValueError("submitted_seeds do not normalize to normalized_seeds")
     if spec.request_id != hash_sequences(run_id, list(normalized)):
         raise ValueError("request_id does not match run_id and normalized_seeds")
-    validate_inference_workload(list(normalized), spec.sample_count)
+    validate_inference_workload(
+        list(normalized),
+        spec.sample_count,
+        allow_large_inference=True,
+    )
     sanitize_af3_name(spec.display_name)
     return spec
 
@@ -720,7 +724,11 @@ def _validated_manifest_artifacts(
         or manifest.get("manifest_volume_path") != expected_manifest_path
     ):
         raise ValueError("Request manifest view identity is invalid")
-    validate_inference_workload(normalized_seeds, sample_count)
+    validate_inference_workload(
+        normalized_seeds,
+        sample_count,
+        allow_large_inference=True,
+    )
     if manifest.get("name_mapping") != {
         "canonical": canonical_name,
         "presentation": presentation_name,

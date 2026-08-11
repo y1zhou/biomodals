@@ -783,6 +783,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             sample_count=prepared.sample_count,
             generation_ids=generations,
             reload_volume=False,
+            allow_large_inference=self.request.allow_large_inference,
         )
         if plan.reused_seeds:
             with self.store.transaction():
@@ -893,6 +894,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 "claimed_seed_records": [
                     claimed[key].to_dict() for key in candidate.task_keys
                 ],
+                "allow_large_inference": self.request.allow_large_inference,
                 "execution_result_path": path.as_posix(),
             }
         if candidate.node_key == _INFERENCE_SUMMARY:
@@ -1110,6 +1112,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                     prepared.normalized_seeds,
                     sample_count=prepared.sample_count,
                     reload_volume=False,
+                    allow_large_inference=self.request.allow_large_inference,
                 )
                 self._seed_prediction_cache = dict(
                     zip(prepared.normalized_seeds, statuses, strict=True)
@@ -1396,6 +1399,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 self._enriched_config(),
                 recycle=self.request.recycle,
                 sample=self.request.sample,
+                allow_large_inference=self.request.allow_large_inference,
             )
         except _IncompletePrerequisiteError as error:
             self._prepared_inference_error = error

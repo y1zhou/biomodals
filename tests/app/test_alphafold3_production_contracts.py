@@ -39,6 +39,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    MAX_MODEL_SEEDS,
     PreparedInferenceRun,
     VolumeUpload,
     hash_sequences,
@@ -2100,7 +2101,6 @@ def test_seed_claims_reload_the_volume_once_per_reconciliation(
         ((-1,), 1, "32-bit unsigned"),
         ((2**32,), 1, "32-bit unsigned"),
         ((1,), 101, "between 1 and"),
-        (tuple(range(501)), 2, "modelSeeds × sample"),
     ],
 )
 def test_downstream_inference_boundaries_repeat_request_limits(
@@ -2154,6 +2154,29 @@ def test_downstream_inference_boundaries_repeat_request_limits(
                     display_name="bounded",
                 ),
             )
+
+
+@pytest.mark.parametrize("boundary", ["inspect", "claim"])
+def test_downstream_seed_boundaries_repeat_the_default_workload_limit(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    runtime = InferenceRuntime(
+        output_root=tmp_path,
+        volume=cast(Any, SimpleNamespace(reload=lambda: None, commit=lambda: None)),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        summary_maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+    )
+    seeds = tuple(range(MAX_MODEL_SEEDS))
+
+    with pytest.raises(ValueError, match="modelSeeds × sample"):
+        if boundary == "inspect":
+            inspect_seed_predictions(runtime, "a" * 64, seeds, sample_count=6)
+        else:
+            claim_seed_predictions(runtime, "a" * 64, seeds, sample_count=6)
 
 
 def test_staged_input_rederives_identity_and_preserves_inline_templates(
@@ -2768,7 +2791,6 @@ def test_request_manifest_requires_presentation_input_identity() -> None:
     ("normalized_seeds", "sample_count", "message"),
     [
         ([1], 101, "between 1 and 100"),
-        (list(range(501)), 2, "modelSeeds × sample"),
     ],
 )
 def test_request_manifest_workload_is_bounded_before_ranking_validation(

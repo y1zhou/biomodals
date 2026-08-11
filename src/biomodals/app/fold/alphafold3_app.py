@@ -38,6 +38,7 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 
 import os
 import uuid
+import warnings
 from pathlib import Path, PurePosixPath
 from uuid import UUID
 
@@ -57,9 +58,11 @@ from biomodals.app.fold.alphafold3.execution_request import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
+    MAX_SEED_SAMPLE_PAIRS,
     LoadedInferenceInput,
     load_staged_inference_input,
     materialize_local_input,
+    normalize_model_seeds,
     sanitize_af3_name,
 )
 from biomodals.app.fold.alphafold3.invocation_cache import (
@@ -556,6 +559,7 @@ def inspect_seed_prediction_cache(
     run_id: str,
     seeds: list[int],
     sample_count: int,
+    allow_large_inference: bool = False,
 ) -> list[dict[str, object]]:
     """Inspect seed markers without scanning prediction directories."""
     return inspect_seed_predictions(
@@ -563,6 +567,7 @@ def inspect_seed_prediction_cache(
         run_id,
         tuple(seeds),
         sample_count=sample_count,
+        allow_large_inference=allow_large_inference,
     )
 
 
@@ -581,6 +586,7 @@ def claim_seed_prediction_work(
     run_id: str,
     seeds: list[int],
     sample_count: int,
+    allow_large_inference: bool = False,
 ) -> dict[str, object]:
     """Reuse or atomically claim one request's currently incomplete seeds."""
     return claim_seed_predictions(
@@ -588,6 +594,7 @@ def claim_seed_prediction_work(
         run_id,
         tuple(seeds),
         sample_count=sample_count,
+        allow_large_inference=allow_large_inference,
     ).to_dict()
 
 
@@ -610,6 +617,7 @@ def run_inference_pipeline(
     request_id: str,
     staged_input_record: dict[str, object],
     claimed_seed_records: list[dict[str, object]],
+    allow_large_inference: bool = False,
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
@@ -631,6 +639,7 @@ def run_inference_pipeline(
             staged.recycle,
             staged.sample_count,
             claimed_seeds,
+            allow_large_inference=allow_large_inference,
         )
         return _coordinator_result(result, execution_result_path)
 
@@ -912,6 +921,7 @@ def submit_alphafold3_task(
     search_protein_templates: bool = True,
     max_parallel_search_workers: int = 4,
     max_num_gpus: int = 1,
+    allow_large_inference: bool = False,
     recycle: int = 10,
     sample: int = 5,
     use_deployed_coordinator: bool = False,
@@ -935,6 +945,8 @@ def submit_alphafold3_task(
             CPUs.
         max_num_gpus: Maximum number of disjoint seed workers to run during
             inference.
+        allow_large_inference: Continue after warning when the request exceeds
+            the default seed/sample prediction limit. Other limits still apply.
         recycle: Number of Pairformer recycles to use during inference.
         sample: Number of diffusion samples to generate per seed.
         use_deployed_coordinator: Target the exact deployed coordinator. The
@@ -950,12 +962,22 @@ def submit_alphafold3_task(
         run_name = conf.name
     sanitize_af3_name(run_name)
     conf.name = run_name
+    prediction_count = len(normalize_model_seeds(conf.modelSeeds)) * sample
+    if allow_large_inference and prediction_count > MAX_SEED_SAMPLE_PAIRS:
+        warnings.warn(
+            "AlphaFold3 request will create "
+            f"{prediction_count:,} seed/sample predictions, exceeding the "
+            f"default limit of {MAX_SEED_SAMPLE_PAIRS:,}; continuing because "
+            "--allow-large-inference was set.",
+            stacklevel=2,
+        )
     request = AlphaFold3ExecutionRequest.prepare(
         conf,
         search_msa=search_msa,
         search_protein_templates=search_protein_templates,
         max_parallel_search_workers=max_parallel_search_workers,
         max_num_gpus=max_num_gpus,
+        allow_large_inference=allow_large_inference,
         recycle=recycle,
         sample=sample,
     )

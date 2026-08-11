@@ -348,8 +348,16 @@ def test_seed_planning_is_cached_per_publication_epoch(
         prepare_calls += 1
         return original_prepare(*args, **kwargs)
 
-    def inspect(runtime, run_id, seeds, *, sample_count, reload_volume=True):
-        del runtime, run_id, sample_count, reload_volume
+    def inspect(
+        runtime,
+        run_id,
+        seeds,
+        *,
+        sample_count,
+        reload_volume=True,
+        allow_large_inference=False,
+    ):
+        del runtime, run_id, sample_count, reload_volume, allow_large_inference
         inspected = tuple(seeds)
         inspect_calls.append(inspected)
         return [{"status": "missing", "seed": seed} for seed in inspected]
@@ -514,8 +522,16 @@ def test_overlapping_seed_request_submits_only_the_missing_seed(
         lambda *args, **kwargs: SimpleNamespace(recycle=10),
     )
 
-    def inspect(runtime, run_id, seeds, *, sample_count, reload_volume=True):
-        del runtime, sample_count, reload_volume
+    def inspect(
+        runtime,
+        run_id,
+        seeds,
+        *,
+        sample_count,
+        reload_volume=True,
+        allow_large_inference=False,
+    ):
+        del runtime, sample_count, reload_volume, allow_large_inference
         return [
             (
                 {"status": "reused", "run_id": run_id, "seed": seed}
@@ -533,8 +549,9 @@ def test_overlapping_seed_request_submits_only_the_missing_seed(
         sample_count,
         generation_ids,
         reload_volume,
+        allow_large_inference=False,
     ):
-        del runtime, sample_count, reload_volume
+        del runtime, sample_count, reload_volume, allow_large_inference
         owned = tuple(
             ClaimedSeed(
                 seed=seed,

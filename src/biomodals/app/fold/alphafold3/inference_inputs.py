@@ -52,7 +52,7 @@ MAX_TOTAL_POLYMER_RESIDUES = 5_120
 MAX_MODEL_SEEDS = 1000
 MAX_NUM_RECYCLES = 100
 MAX_DIFFUSION_SAMPLES = 100
-MAX_SEED_SAMPLE_PAIRS = 1000
+MAX_SEED_SAMPLE_PAIRS = 5000
 MAX_INFERENCE_WORKERS = 100
 MAX_PROTEIN_TEMPLATES = 20
 _TEXT_SIZE_CHUNK_CHARS = 1024 * 1024
@@ -620,11 +620,18 @@ def validate_inference_worker_budget(max_num_gpus: int) -> int:
     return max_num_gpus
 
 
-def validate_inference_workload(seeds: list[int], sample_count: int) -> int:
+def validate_inference_workload(
+    seeds: list[int],
+    sample_count: int,
+    *,
+    allow_large_inference: bool = False,
+) -> int:
     """Bound the number of durable seed/sample prediction directories."""
+    if not isinstance(allow_large_inference, bool):
+        raise TypeError("allow_large_inference must be a boolean")
     validate_inference_parameters(0, sample_count)
     prediction_count = len(normalize_model_seeds(seeds)) * sample_count
-    if prediction_count > MAX_SEED_SAMPLE_PAIRS:
+    if prediction_count > MAX_SEED_SAMPLE_PAIRS and not allow_large_inference:
         raise ValueError(
             "modelSeeds × sample must not exceed "
             f"{MAX_SEED_SAMPLE_PAIRS}, got {prediction_count}"
@@ -670,11 +677,16 @@ def prepare_inference_run(
     *,
     recycle: int,
     sample: int,
+    allow_large_inference: bool = False,
 ) -> PreparedInferenceRun:
     """Build run/request identities and every required Volume upload."""
     validate_inference_parameters(recycle, sample)
     conf = validate_submitted_af3_input(enriched_config)
-    validate_inference_workload(conf.modelSeeds, sample)
+    validate_inference_workload(
+        conf.modelSeeds,
+        sample,
+        allow_large_inference=allow_large_inference,
+    )
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
     display_name = conf.name

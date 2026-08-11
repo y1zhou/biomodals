@@ -481,18 +481,18 @@ def test_inference_parameters_are_resource_bounded() -> None:
         validate_inference_parameters(1, 101)
     with pytest.raises(ValueError, match="between 1 and"):
         validate_inference_worker_budget(101)
+    seeds = list(range(MAX_MODEL_SEEDS))
+    assert validate_inference_workload(seeds, 5) == MAX_SEED_SAMPLE_PAIRS
+    with pytest.raises(ValueError, match="modelSeeds × sample"):
+        validate_inference_workload(seeds, 6)
     assert (
         validate_inference_workload(
-            list(range(MAX_SEED_SAMPLE_PAIRS // 5)),
-            5,
+            seeds,
+            6,
+            allow_large_inference=True,
         )
-        == MAX_SEED_SAMPLE_PAIRS
+        == 6_000
     )
-    with pytest.raises(ValueError, match="modelSeeds × sample"):
-        validate_inference_workload(
-            list(range(MAX_SEED_SAMPLE_PAIRS // 5 + 1)),
-            5,
-        )
 
 
 def test_seed_cap_applies_to_requests_not_accumulated_serialization() -> None:

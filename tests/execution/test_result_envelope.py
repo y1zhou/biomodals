@@ -129,6 +129,43 @@ def test_non_json_result_does_not_change_call_or_release_slot() -> None:
     )
 
 
+def test_oversized_result_envelope_does_not_release_call_slot() -> None:
+    repository = create_repository()
+    persist_fixed_policy(
+        repository,
+        ("seed-0",),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id,
+        provider_call_handle_id="fc-123",
+        now=111,
+    )
+
+    with pytest.raises(ValueError, match="byte limit"):
+        repository.record_provider_call_result(
+            claim.call.provider_call_id,
+            result_envelope={"content": "x" * (1024 * 1024)},
+            now=120,
+        )
+
+    assert (
+        repository.get_provider_call(claim.call.provider_call_id).status
+        == ProviderCallStatus.ATTACHED
+    )
+
+
 def test_conclusive_call_failure_fails_only_unfinished_owned_tasks() -> None:
     repository = create_repository(task_count=2)
     persist_fixed_policy(

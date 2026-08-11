@@ -296,7 +296,7 @@ def test_collection_publication_rejects_missing_unfiltered_artifact(
     artifact.write_bytes(b"data")
     fingerprints = {"run-a": "a" * 64}
     publication = Path("example/results/fingerprint.json")
-    write_collection_publication(
+    record = write_collection_publication(
         tmp_path,
         publication,
         {
@@ -313,6 +313,10 @@ def test_collection_publication_rejects_missing_unfiltered_artifact(
             ],
         },
     )
+
+    assert "artifacts" not in record
+    manifest = tmp_path / record["artifact_manifest_path"]
+    assert manifest.is_file()
 
     artifact.unlink()
     assert (

@@ -48,6 +48,8 @@ from biomodals.execution.scheduler import (
     terminal_run_outcome,
 )
 
+_MAX_RESULT_ENVELOPE_BYTES = 1024 * 1024
+
 EXECUTION_SCHEMA_VERSION = 5
 
 
@@ -228,12 +230,20 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE INDEX execution_dispatch_batches_run_node_mode_idx
+    ON execution_dispatch_batches(execution_run_id, node_key, mode)
+    """,
+    """
     CREATE INDEX execution_provider_calls_status_created_idx
     ON execution_provider_calls(execution_run_id, status, created_at)
     """,
     """
     CREATE INDEX execution_provider_calls_node_status_idx
     ON execution_provider_calls(execution_run_id, node_key, status)
+    """,
+    """
+    CREATE INDEX execution_provider_calls_batch_status_idx
+    ON execution_provider_calls(dispatch_batch_id, status)
     """,
     """
     CREATE TABLE execution_tasks (
@@ -2983,6 +2993,8 @@ class SqliteExecutionRepository:
         if result_envelope is None:
             raise ValueError("Provider Call success requires a Result Envelope")
         envelope_json = _dump_json(result_envelope)
+        if len(envelope_json.encode()) > _MAX_RESULT_ENVELOPE_BYTES:
+            raise ValueError("Provider Call Result Envelope exceeds its byte limit")
         call = self.get_provider_call(provider_call_id, include_task_keys=False)
         if call.status == ProviderCallStatus.SUCCEEDED:
             if call.result_envelope != result_envelope:

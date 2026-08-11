@@ -11,7 +11,7 @@ import orjson
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import file_size_sha256, replace_bytes_atomic
 
-COLLECTION_PUBLICATION_SCHEMA_VERSION = 1
+COLLECTION_PUBLICATION_SCHEMA_VERSION = 2
 TASK_PUBLICATION_SCHEMA_VERSION = 1
 _TASK_PUBLICATION_PATH = PurePosixPath(".biomodals") / "task.json"
 _FINAL_PDF_PATH = PurePosixPath("final_ranked_designs") / "results_overview.pdf"
@@ -120,6 +120,23 @@ def write_collection_publication(
 ) -> dict[str, object]:
     """Atomically publish the final collection record."""
     path = _contained_path(output_root, relative_path)
+    publication = dict(publication)
+    if publication.get("filtered") is False:
+        artifacts = publication.pop("artifacts", None)
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ValueError("Unfiltered BoltzGen results require artifact records")
+        manifest_relative = PurePosixPath(relative_path).with_suffix(".artifacts.json")
+        manifest_path = _contained_path(output_root, manifest_relative)
+        replace_bytes_atomic(
+            manifest_path,
+            orjson.dumps({"artifacts": artifacts}, option=orjson.OPT_SORT_KEYS),
+        )
+        manifest_size, manifest_sha256 = file_size_sha256(manifest_path)
+        publication.update({
+            "artifact_manifest_path": manifest_relative.as_posix(),
+            "artifact_manifest_size_bytes": manifest_size,
+            "artifact_manifest_sha256": manifest_sha256,
+        })
     record = {
         "schema_version": COLLECTION_PUBLICATION_SCHEMA_VERSION,
         "status": "complete",
@@ -167,7 +184,20 @@ def load_collection_publication(
         ):
             return None
     else:
-        artifacts = value.get("artifacts")
+        manifest_relative = value.get("artifact_manifest_path")
+        if not isinstance(manifest_relative, str):
+            return None
+        manifest_path = _contained_path(output_root, manifest_relative)
+        if not manifest_path.is_file() or file_size_sha256(manifest_path) != (
+            value.get("artifact_manifest_size_bytes"),
+            value.get("artifact_manifest_sha256"),
+        ):
+            return None
+        try:
+            manifest: Any = orjson.loads(manifest_path.read_bytes())
+        except (OSError, orjson.JSONDecodeError):
+            return None
+        artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
         if not isinstance(artifacts, list) or not artifacts:
             return None
         for artifact in artifacts:

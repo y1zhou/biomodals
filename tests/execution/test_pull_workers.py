@@ -295,6 +295,39 @@ def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:
     )
 
 
+def test_pull_worker_preclaim_uses_batch_and_call_indexes() -> None:
+    connection = sqlite3.connect(":memory:")
+    create_repository(connection=connection, task_count=3)
+
+    batch_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM execution_dispatch_batches
+        WHERE execution_run_id = ? AND node_key = ? AND mode = ?
+        """,
+        (str(RUN_ID), "inference", "pull_worker"),
+    ).fetchall()
+    calls_plan = connection.execute(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT COUNT(*)
+        FROM execution_provider_calls
+        WHERE dispatch_batch_id = ?
+            AND status NOT IN (?, ?, ?)
+        """,
+        ("batch", "succeeded", "failed", "cancelled"),
+    ).fetchall()
+
+    assert any(
+        "execution_dispatch_batches_run_node_mode_idx" in str(row[3])
+        for row in batch_plan
+    )
+    assert any(
+        "execution_provider_calls_batch_status_idx" in str(row[3]) for row in calls_plan
+    )
+
+
 def test_publication_recovery_omits_known_missing_pending_tasks() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(connection=connection, task_count=4)

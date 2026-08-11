@@ -4127,6 +4127,7 @@ def build_ppiflow_workflow(
                 enabled=enabled,
                 gentype=gentype,
                 stage=stage,
+                steps=steps_doc,
             ),
             "rosetta": app_scientific_version(rosetta_app.CONF),
         },
@@ -4174,22 +4175,64 @@ def _ppiflow_model_scientific_versions(
     enabled: dict[str, bool],
     gentype: str,
     stage: int | None,
+    steps: dict[str, Any],
 ) -> dict[str, str]:
-    uses_model = (stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep")) or (
-        stage in {None, 2} and _step_enabled(enabled, "PartialStep")
-    )
-    if not uses_model:
+    active_steps: list[tuple[str, bool]] = []
+    if stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep"):
+        active_steps.append(("PPIFlowStep", False))
+    if stage in {None, 2} and _step_enabled(enabled, "PartialStep"):
+        active_steps.append(("PartialStep", True))
+    if not active_steps:
         return {}
     try:
-        model_name = {
-            "binder": "binder.ckpt",
-            "antibody": "antibody.ckpt",
-            "nanobody": "nanobody.ckpt",
-        }[gentype]
-        file_id = ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[model_name]
+        expected_model = f"{gentype}.ckpt"
+        ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[expected_model]
     except KeyError as error:
         raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}") from error
-    return {f"ppiflow.model.{model_name}": file_id}
+    selected_models = {
+        _ppiflow_step_model_weights_name(
+            _step_cfg(steps, step_name),
+            partial=partial,
+        )
+        for step_name, partial in active_steps
+    }
+    if selected_models != {expected_model}:
+        raise ValueError(
+            f"PPIFlow gentype {gentype!r} disagrees with enabled step models: "
+            f"{sorted(selected_models)!r}"
+        )
+    return {
+        f"ppiflow.model.{model_name}": ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[model_name]
+        for model_name in selected_models
+    }
+
+
+def _ppiflow_step_model_weights_name(
+    config: dict[str, Any],
+    *,
+    partial: bool,
+) -> str:
+    raw_args = deepcopy(config.get("args", config))
+    if not isinstance(raw_args, dict):
+        raise ValueError("PPIFlow step args must be a mapping")
+    if partial:
+        raw_args.setdefault("complex_pdb", "/workflow-input/complex.pdb")
+        raw_args.setdefault("input_pdb", "/workflow-input/input.pdb")
+    app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
+    expected_types = (
+        (
+            ppiflow_app.SampleAntibodyNanobodyPartialConfig,
+            ppiflow_app.SampleBinderPartialConfig,
+        )
+        if partial
+        else (
+            ppiflow_app.SampleAntibodyNanobodyConfig,
+            ppiflow_app.SampleBinderConfig,
+        )
+    )
+    if not isinstance(app_args.args, expected_types):
+        raise ValueError("PPIFlow step uses the wrong operation mode")
+    return ppiflow_app.ppiflow_model_weights_name(app_args.args)
 
 
 def _add_stage1_nodes(

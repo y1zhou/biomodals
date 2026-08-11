@@ -98,6 +98,31 @@ steps:
 """.encode()
 
 
+def _binder_design_steps_yaml() -> bytes:
+    return b"""
+PPIFlowStep:
+  args:
+    name: demo
+    specified_hotspots: A1
+    input_pdb: /inputs/demo.pdb
+    binder_chain: B
+"""
+
+
+def _binder_design_and_partial_steps_yaml() -> bytes:
+    return (
+        _binder_design_steps_yaml()
+        + b"""
+PartialStep:
+  args:
+    name: demo
+    specified_hotspots: A1
+    fixed_positions: L1
+    start_t: 0.15
+"""
+    )
+
+
 def _upstream_structure_artifact(
     *,
     kind: ArtifactKind = ArtifactKind.STRUCTURES,
@@ -224,7 +249,7 @@ def test_ppiflow_plan_ignores_unused_model_identities(
     def fingerprint() -> str:
         workflow = build_ppiflow_workflow(
             task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
-            steps_yaml_bytes=b"PPIFlowStep: {}\n",
+            steps_yaml_bytes=_binder_design_steps_yaml(),
         )
         return execution_plan(
             workflow.validate(),
@@ -258,6 +283,41 @@ def test_ppiflow_disabled_plan_omits_model_identities() -> None:
         for key in workflow.validate().scientific_versions
         if key.startswith("ppiflow.model.")
     }
+
+
+def test_ppiflow_model_identity_matches_validated_step_arguments() -> None:
+    task_yaml = b"""
+task:
+  gentype: nanobody
+steps:
+  PPIFlowStep: true
+"""
+    steps_yaml = b"""
+PPIFlowStep:
+  args:
+    name: demo
+    specified_hotspots: A1
+    antigen_pdb: /inputs/antigen.pdb
+    antigen_chain: A
+    framework_pdb: /inputs/framework.pdb
+    heavy_chain: H
+"""
+
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=task_yaml,
+        steps_yaml_bytes=steps_yaml,
+    )
+
+    assert (
+        workflow.validate().scientific_versions["ppiflow.model.nanobody.ckpt"]
+        == ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["nanobody.ckpt"]
+    )
+
+    with pytest.raises(ValueError, match="disagrees"):
+        build_ppiflow_workflow(
+            task_yaml_bytes=task_yaml.replace(b"nanobody", b"antibody"),
+            steps_yaml_bytes=steps_yaml,
+        )
 
 
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
@@ -2863,7 +2923,7 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
   ReportStep: true
 """
         ),
-        steps_yaml_bytes=b"{}\n",
+        steps_yaml_bytes=_binder_design_and_partial_steps_yaml(),
     )
 
     definition = workflow.validate()
@@ -3051,7 +3111,7 @@ def test_ppiflow_candidate_manifest_edges_select_manifest_role() -> None:
   RankStep: true
 """
         ),
-        steps_yaml_bytes=b"{}\n",
+        steps_yaml_bytes=_binder_design_and_partial_steps_yaml(),
     )
 
     definition = workflow.validate()
@@ -3095,7 +3155,7 @@ def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> No
   RankStep: true
 """
         ),
-        steps_yaml_bytes=b"{}\n",
+        steps_yaml_bytes=_binder_design_and_partial_steps_yaml(),
     )
 
     definition = workflow.validate()
@@ -3228,7 +3288,7 @@ def test_ppiflow_app_version_changes_plan_identity(
     def fingerprint() -> str:
         workflow = build_ppiflow_workflow(
             task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
-            steps_yaml_bytes=b"PPIFlowStep: {}\n",
+            steps_yaml_bytes=_binder_design_steps_yaml(),
         )
         return execution_plan(
             workflow.validate(),
@@ -3341,7 +3401,12 @@ Stage2Input:
   path: existing/stage1-filtered
   manifest_path: manifests/candidate_manifest.parquet
 RosettaFixStep: {}
-PartialStep: {}
+PartialStep:
+  args:
+    name: demo
+    specified_hotspots: A1
+    fixed_positions: L1
+    start_t: 0.15
 MPNNStep_stage2: {}
 AF3scoreStep_stage2: {}
 FilterStep_stage2: {}

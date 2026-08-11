@@ -599,6 +599,7 @@ class ExecutionRuntime:
         ],
         available_total_slots: int,
         available_gpu_slots: int,
+        suspend_unavailable_gpu_capacity: bool = True,
         now: int,
     ) -> tuple[ProviderCallCandidate, ...]:
         """Describe unplanned Tasks once, then admit a bounded ready window."""
@@ -718,30 +719,47 @@ class ExecutionRuntime:
                     remaining_gpu_slots -= len(admitted)
                 if len(selected) == available_total_slots:
                     return tuple(selected)
-        if not selected and blocked_gpu_work:
-            with self._synchronize():
-                active_calls = self.repository.active_provider_call_counts(
-                    execution_run_id
-                ).total
-            if active_calls == 0:
-                self._suspend_for_unavailable_gpu_capacity(
-                    execution_run_id,
-                    now=now,
-                )
+        if not selected and blocked_gpu_work and suspend_unavailable_gpu_capacity:
+            self.suspend_for_unavailable_gpu_capacity(
+                execution_run_id,
+                required_node_keys=required_node_keys,
+                additional_gpu_work=True,
+                now=now,
+            )
         return tuple(selected)
 
-    def _suspend_for_unavailable_gpu_capacity(
+    def suspend_for_unavailable_gpu_capacity(
         self,
         execution_run_id: UUID,
         *,
+        required_node_keys: set[str],
+        additional_gpu_work: bool = False,
         now: int,
-    ) -> None:
-        """Suspend missing GPU work when the Run admits no GPU calls."""
+    ) -> bool:
+        """Suspend only when the remaining ready frontier requires a GPU."""
         with self._synchronize():
             with self._transaction():
                 run = self.repository.get_run(execution_run_id)
-                if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-                    return
+                if (
+                    run.status not in {RunStatus.PENDING, RunStatus.RUNNING}
+                    or run.max_active_gpu_provider_calls != 0
+                    or self.repository.active_provider_call_counts(
+                        execution_run_id
+                    ).total
+                ):
+                    return False
+                blocked_gpu_work = additional_gpu_work or bool(
+                    self.repository.list_ready_fixed_dispatch_descriptors(
+                        execution_run_id,
+                        required_node_keys,
+                        uses_gpu=True,
+                        depth=0,
+                        unblocking_span=0,
+                        limit_per_node=1,
+                    )
+                )
+                if not blocked_gpu_work:
+                    return False
                 self.repository.transition_run(
                     execution_run_id,
                     RunStatus.SUSPENDED,
@@ -753,6 +771,7 @@ class ExecutionRuntime:
                     now=now,
                 )
             self._checkpoint_state()
+            return True
 
     def persist_fixed_dispatch_policy(
         self,

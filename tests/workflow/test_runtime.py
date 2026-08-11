@@ -20,6 +20,7 @@ from biomodals.execution import (
     NodeStatus,
     ProviderCallStatus,
     RunStatus,
+    RunStatusReason,
     TaskStatus,
 )
 from biomodals.execution.modal import (
@@ -240,6 +241,7 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
 class PullFanoutNode(RemotePullTaskWorkflowNode):
     texts: tuple[str, ...]
     max_worker_calls: int = 2
+    uses_gpu: bool = field(default=False, metadata={"dag_hash": False})
     recoverable_publications: set[str] = field(
         default_factory=set,
         repr=False,
@@ -285,7 +287,7 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
     ) -> RemotePullWorkerCall:
         return RemotePullWorkerCall(
             function_name="run_pull_worker",
-            uses_gpu=False,
+            uses_gpu=self.uses_gpu,
             claim_capacity=2,
             max_worker_calls=self.max_worker_calls,
             kwargs={"node_id": context.node_id},
@@ -1283,6 +1285,59 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
     assert node.finalized_results == [
         (("candidate-0", "candidate-1", "candidate-2"), ()),
     ]
+
+
+def test_zero_gpu_capacity_admits_cpu_pull_work(tmp_path: Path) -> None:
+    workflow = Workflow("mixed-zero-gpu")
+    workflow.add_node(RemoteTextNode("gpu", "run_gpu", uses_gpu=True), id="gpu")
+    workflow.add_node(PullFanoutNode(("cpu",)), id="cpu-pull")
+    driver = PullModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "mixed-zero-gpu"
+    runtime._ensure_run(definition, "mixed-zero-gpu")
+
+    runtime.advance_once()
+
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert call.node_key == "cpu-pull"
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.RUNNING
+
+
+def test_zero_gpu_capacity_suspends_gpu_pull_work(tmp_path: Path) -> None:
+    workflow = Workflow("gpu-pull-zero-capacity")
+    workflow.add_node(
+        PullFanoutNode(("gpu",), uses_gpu=True),
+        id="gpu-pull",
+    )
+    driver = PullModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=driver,
+        max_calls=1,
+        max_gpu_calls=0,
+        pull_worker_coordinator="run-pool",
+    )
+    definition = workflow.validate()
+    runtime._definition = definition
+    runtime._workload_run_key = "gpu-pull-zero-capacity"
+    runtime._ensure_run(definition, "gpu-pull-zero-capacity")
+
+    runtime.advance_once()
+
+    run = runtime.store.execution.get_run(RUN_ID)
+    assert run.status == RunStatus.SUSPENDED
+    assert run.status_reason == RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE
+    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
 
 
 def test_terminal_pull_worker_recovers_publication_after_lost_callback(

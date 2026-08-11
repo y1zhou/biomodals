@@ -1467,6 +1467,7 @@ class WorkflowRuntime:
             describe_task=describe_task,
             available_total_slots=available_total_slots,
             available_gpu_slots=available_gpu_slots,
+            suspend_unavailable_gpu_capacity=False,
             now=self._now(),
         )
 
@@ -1478,14 +1479,22 @@ class WorkflowRuntime:
             )
             for descriptor in pull_descriptors
         ]
+        pull_candidates = form_pull_worker_candidates(tuple(pull_descriptors))
         selected = select_admissible_candidates(
-            (
-                *fixed_candidates,
-                *form_pull_worker_candidates(tuple(pull_descriptors)),
-            ),
+            (*fixed_candidates, *pull_candidates),
             available_total_slots=available_total_slots,
             available_gpu_slots=available_gpu_slots,
         )
+        if not selected:
+            self._provider.suspend_for_unavailable_gpu_capacity(
+                self.execution_run_id,
+                required_node_keys=required,
+                additional_gpu_work=any(
+                    candidate.binding.uses_gpu for candidate in pull_candidates
+                ),
+                now=self._now(),
+            )
+            return
         submissions = []
         for candidate in selected:
             node = definition.nodes[candidate.node_key].node

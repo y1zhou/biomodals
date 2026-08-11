@@ -87,6 +87,7 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
     archive_path.write_bytes(
         _tar_zst_bytes({
             "nested/design.pdb": b"ATOM\n",
+            "nested/design-2.pdb": b"ATOM 2\n",
             "scores/metrics.csv": b"score\n1\n",
             "notes.txt": b"skip\n",
         })
@@ -104,7 +105,8 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
     roots = {"source-volume": str(source_root)}
 
     assert staging.structure_files_from_artifact(artifact, None, roots) == [
-        ("upstream-structures__nested__design.pdb", b"ATOM\n")
+        ("upstream-structures__nested__design.pdb", b"ATOM\n"),
+        ("upstream-structures__nested__design-2.pdb", b"ATOM 2\n"),
     ]
     assert staging.csv_files_from_artifact(artifact, roots) == [
         ("scores/metrics.csv", b"score\n1\n")
@@ -119,9 +121,40 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
         None,
         roots,
     )
-    assert [record.artifact_file_path for record in records] == ["nested/design.pdb"]
-    assert records[0].size_bytes == len(b"ATOM\n")
-    assert records[0].content_sha256 == hashlib.sha256(b"ATOM\n").hexdigest()
+    assert [record.artifact_file_path for record in records] == [
+        "nested/design.pdb",
+        "nested/design-2.pdb",
+    ]
+    archive_bytes = archive_path.read_bytes()
+    assert {record.size_bytes for record in records} == {len(archive_bytes)}
+    assert {record.content_sha256 for record in records} == {
+        hashlib.sha256(archive_bytes).hexdigest()
+    }
+    assert records[0].member_size_bytes == len(b"ATOM\n")
+    assert records[0].member_content_sha256 == hashlib.sha256(b"ATOM\n").hexdigest()
+
+    rows = staging.stage2_input_manifest_rows(artifact, roots)
+    [(storage, size_bytes, digest)] = ppiflow_workflow._manifest_structure_storages(
+        pl.DataFrame(rows)
+    )
+    assert (storage.volume_name, storage.path) == (
+        artifact.storage.volume_name,
+        artifact.storage.path,
+    )
+    assert size_bytes == len(archive_bytes)
+    assert digest == hashlib.sha256(archive_bytes).hexdigest()
+
+
+def test_archive_reader_rejects_oversized_selected_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "outputs.tar.zst"
+    archive_path.write_bytes(_tar_zst_bytes({"design.pdb": b"ATOM\n"}))
+    monkeypatch.setattr(staging, "MAX_ARCHIVE_MEMBER_BYTES", 4)
+
+    with pytest.raises(ValueError, match="member is too large"):
+        staging.files_from_tar_zst_path(archive_path, suffixes=(".pdb",))
 
 
 def test_stage2_input_manifest_rows_scan_structure_directory(

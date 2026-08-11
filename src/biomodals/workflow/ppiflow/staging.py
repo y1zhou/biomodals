@@ -18,6 +18,10 @@ from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.ppiflow import manifests, tables
 
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
+MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_SELECTED_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_SELECTED_MEMBERS = 10_000
+_ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,8 @@ class SelectedStructureFile:
     size_bytes: int | None = None
     media_type: str | None = None
     content_sha256: str | None = None
+    member_size_bytes: int | None = None
+    member_content_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,20 +219,22 @@ def _selected_structure_file_records_from_tar_zst(
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[SelectedStructureFile]:
-    return _collect_tar_zst_members(
+    archive_size = archive_path.stat().st_size
+    archive_digest = _file_sha256(archive_path)
+    return _stream_tar_zst_member_records(
         archive_path,
         include=lambda member: matches_structure_pattern(member.name, patterns),
-        build=lambda member, data: SelectedStructureFile(
+        build=lambda member, member_digest: SelectedStructureFile(
             artifact_id=artifact.artifact_id,
             file_name=safe_selected_file_name(artifact.artifact_id, member.name),
             artifact_file_path=member.name,
             app_volume_path=artifact.storage.path,
             volume_name=artifact.storage.volume_name,
-            size_bytes=member.size,
+            size_bytes=archive_size,
             media_type=artifact.storage.media_type or ZSTD_MEDIA_TYPE,
-            content_sha256=hashlib.sha256(
-                _required_member_bytes(member, data)
-            ).hexdigest(),
+            content_sha256=archive_digest,
+            member_size_bytes=member.size,
+            member_content_sha256=member_digest,
         ),
     )
 
@@ -249,7 +257,10 @@ def stage2_input_manifest_rows(
 
     rows = []
     for index, structure in enumerate(
-        sorted(selected, key=lambda item: item.app_volume_path),
+        sorted(
+            selected,
+            key=lambda item: (item.app_volume_path, item.artifact_file_path),
+        ),
         start=1,
     ):
         rows.append(
@@ -274,7 +285,11 @@ def stage2_input_manifest_rows(
                         expected=True,
                     )
                 ],
-                summary={"file_name": structure.file_name},
+                summary={
+                    "file_name": structure.file_name,
+                    "archive_member_size_bytes": structure.member_size_bytes,
+                    "archive_member_content_sha256": (structure.member_content_sha256),
+                },
             )
         )
     return rows
@@ -559,6 +574,7 @@ def _collect_tar_zst_members[ArchiveItem](
     import zstandard as zstd
 
     selected: list[ArchiveItem] = []
+    selected_bytes = 0
     compressed_context = (
         BytesIO(source) if isinstance(source, bytes) else source.open("rb")
     )
@@ -568,14 +584,76 @@ def _collect_tar_zst_members[ArchiveItem](
             for member in tar:
                 if not member.isfile() or not include(member):
                     continue
+                _check_archive_selection_limits(
+                    selected_members=len(selected) + 1,
+                    selected_bytes=selected_bytes + member.size,
+                    member=member,
+                )
                 member_data = None
                 if read_data:
                     extracted = tar.extractfile(member)
                     if extracted is None:
                         continue
-                    member_data = extracted.read()
+                    member_data = extracted.read(member.size + 1)
+                    if len(member_data) != member.size:
+                        raise ValueError(
+                            f"Archive member size changed while reading: {member.name}"
+                        )
+                selected_bytes += member.size
                 selected.append(build(member, member_data))
     return selected
+
+
+def _stream_tar_zst_member_records[ArchiveItem](
+    source: Path,
+    *,
+    include: Callable[[tarfile.TarInfo], bool],
+    build: Callable[[tarfile.TarInfo, str], ArchiveItem],
+) -> list[ArchiveItem]:
+    import zstandard as zstd
+
+    selected: list[ArchiveItem] = []
+    selected_bytes = 0
+    with source.open("rb") as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+            for member in tar:
+                if not member.isfile() or not include(member):
+                    continue
+                _check_archive_selection_limits(
+                    selected_members=len(selected) + 1,
+                    selected_bytes=selected_bytes + member.size,
+                    member=member,
+                )
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                digest = hashlib.sha256()
+                bytes_read = 0
+                while chunk := extracted.read(_ARCHIVE_READ_CHUNK_BYTES):
+                    digest.update(chunk)
+                    bytes_read += len(chunk)
+                if bytes_read != member.size:
+                    raise ValueError(
+                        f"Archive member size changed while reading: {member.name}"
+                    )
+                selected_bytes += bytes_read
+                selected.append(build(member, digest.hexdigest()))
+    return selected
+
+
+def _check_archive_selection_limits(
+    *,
+    selected_members: int,
+    selected_bytes: int,
+    member: tarfile.TarInfo,
+) -> None:
+    if selected_members > MAX_ARCHIVE_SELECTED_MEMBERS:
+        raise ValueError("Archive contains too many selected files")
+    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+        raise ValueError(f"Archive member is too large: {member.name}")
+    if selected_bytes > MAX_ARCHIVE_SELECTED_BYTES:
+        raise ValueError("Selected archive files exceed the expanded-size limit")
 
 
 def _required_member_bytes(member: tarfile.TarInfo, data: bytes | None) -> bytes:

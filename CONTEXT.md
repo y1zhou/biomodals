@@ -52,7 +52,8 @@ summarize why its lifecycle changed. The initial reason vocabulary is:
 `coordinator_error`, `result_validation_unknown`,
 `submission_outcome_unknown`,
 `provider_outcome_unknown`, `cancellation_outcome_unknown`,
-`required_work_failed`, and `deployment_unavailable`.
+`required_work_failed`, `deployment_unavailable`, and
+`resource_capacity_unavailable`.
 _Avoid_: status-specific reason columns, free-text state machine, copied stack trace
 
 **Successor Execution Run**:
@@ -249,11 +250,11 @@ _Avoid_: fixed batch, Modal Queue, timeout lease
 
 **Pull-Worker Pool Size**:
 The derived target
-`ceil(nonterminal_node_tasks / claim_capacity)` for a pull-worker Node. New
-worker candidates equal that target minus the Node's existing nonterminal
-worker Provider Calls, bounded by the Run's total and GPU call slots. It is not
-a separate configured limit.
-_Avoid_: per-Node worker cap, adaptive autoscaler, idle timeout
+`min(max_worker_calls, ceil(nonterminal_node_tasks / claim_capacity))` for a
+pull-worker Node. New worker candidates equal that target minus the Node's
+existing nonterminal worker Provider Calls, bounded by the Run's total and GPU
+call slots.
+_Avoid_: adaptive autoscaler, idle timeout
 
 **Worker Assignment**:
 A durable SQLite record linking one Task to the Provider Call and worker claim
@@ -783,8 +784,9 @@ The reusable library that validates a workflow DAG, schedules workflow nodes, tr
 _Avoid_: engine
 
 **Runtime Diagnostics**:
-In-memory inspection data produced by the workflow runtime for the most recent run, including scheduler decisions and scheduled node waves.
-_Avoid_: public scheduler API, debug-only list
+An `ExecutionSnapshot` plus the durable Run, Node, Task, Provider Call, and
+workflow artifact records used to inspect execution state.
+_Avoid_: private scheduler API, debug-only in-memory history
 
 **Durable Node Completion**:
 The committed state in which a node's processed result, materialized files,

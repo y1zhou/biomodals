@@ -60,13 +60,17 @@ Validate before the first remote call and again before upstream consumption:
 ## Existing helpers and references
 
 Prefer existing `biomodals.helper` APIs (`run_command`, `package_outputs`,
-`warmup_directory`, `download_files`, `hash_string`, shared local-output helpers)
-over local variants. Do not extract trivial one-use helpers.
+`warmup_directory`, `download_files`, `hash_string`, shared local-output
+helpers) over local variants. For durable artifacts, reuse
+`biomodals.helper.artifacts` readers, bounded reads, hashes, and
+content-addressed publication. Do not extract trivial one-use helpers.
 
 Use these valid relative paths as examples:
 
-- [AlphaFold3](../../../../src/biomodals/app/fold/alphafold3_app.py) and
-  [Rosetta](../../../../src/biomodals/app/bioinfo/rosetta_app.py): conventional.
+- [AlphaFold3](../../../../src/biomodals/app/fold/alphafold3_app.py): advanced
+  coordinator-aware app with documented cache and run-layout deviations.
+- [Rosetta](../../../../src/biomodals/app/bioinfo/rosetta_app.py): kernel
+  pull-worker integration.
 - [RFdiffusion](../../../../src/biomodals/app/design/rfdiffusion_app.py): durable
   workflow `VolumePath` output.
 - [LigandMPNN](../../../../src/biomodals/app/design/ligandmpnn_app.py): small

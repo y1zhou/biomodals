@@ -1,8 +1,18 @@
 # Workflow runtime and PPIFlow decisions
 
+Status: accepted for the current pre-release workflow formats.
+
 ## Adopt the canonical App Run Layout without legacy path compatibility
 
-Biomodals apps moving to `AppRunLayout` will read and write only the canonical `inputs/`, `outputs/`, `logs/`, `failures/`, `metrics/`, and `.markers/` locations. RFdiffusion, Rosetta, FlowPacker workflow outputs, PPIFlow logs, and IgGM logs may require one-time migration or recomputation; the branch will not retain legacy cache probes or dual write formats because it has not yet merged and maintaining two durable layouts would complicate artifact recovery.
+Biomodals apps moving to `AppRunLayout` read and write only the canonical
+`inputs/`, `outputs/`, `logs/`, `failures/`, `metrics/`, and `.markers/`
+locations. RFdiffusion, Rosetta, FlowPacker workflow outputs, PPIFlow logs, and
+IgGM logs may require one-time migration or recomputation. The implementation
+does not retain legacy cache probes or dual-write formats.
+
+This publication-layout migration is a workflow decision, not a requirement of
+the unified execution kernel. Reconsidering downstream path compatibility does
+not require changing kernel scheduling or recovery semantics.
 
 ## Recover interrupted work through durable ownership
 

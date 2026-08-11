@@ -8,7 +8,9 @@
   `csv` or `pandas` parsing unless an upstream tool API specifically requires it.
 - Use `orjson` for non-Pydantic JSON serialization and deserialization. For
   Pydantic models, serialize with `model_dump_json()` and parse JSON bytes or
-  strings with `model_validate_json(...)`.
+  strings with `model_validate_json(...)`. Execution fingerprint encodings are
+  the narrow exception: preserve their fixed standard-library JSON encoding
+  because serialized bytes are part of durable identity.
 - When you have made significant edits and are ready to make commits:
   - CI runs `prek` against `.pre-commit-config.yaml`; run `prek run --files <changed files>` before making commits.
   - For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` before making commits.

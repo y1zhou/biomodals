@@ -18,6 +18,8 @@ Implemented:
 - AlphaFold3 search and inference adoption;
 - BoltzGen direct Task fan-out;
 - Rosetta pull-worker adoption and removal of its Modal Queue;
+- direct GROMACS, AF3Score, ENsiRNA, ABCFold2, Protenix, and OligoFormer
+  execution adoption;
 - remote per-run coordination and generic lifecycle commands for direct
   `biomodals app run` and `biomodals workflow run`;
 - fail-closed production app launch when an entrypoint has not yet adopted a
@@ -52,11 +54,14 @@ those operations and reports their results to the kernel.
 ## Success definition
 
 The refactor is complete when GROMACS service jobs, reusable workflows,
-PPIFlow candidate fan-out, AlphaFold3 search and inference, BoltzGen direct
-fan-out, and Rosetta work stealing all use the same execution-state vocabulary
-and scheduling primitives without changing their public behavior, scientific
-identities, scientific publication layouts, or cost-safety authority. Legacy
-execution-ledger and attempt-directory layouts are intentionally replaced.
+PPIFlow candidate fan-out, coordinated direct apps, AlphaFold3 search and
+inference, BoltzGen direct fan-out, and Rosetta work stealing all use the same
+execution-state vocabulary and scheduling primitives without changing their
+public behavior, scientific identities, or cost-safety authority. The separate
+[App Run Layout decision](../adr/workflow-runtime-and-ppiflow-decisions.md)
+changes selected workflow publication paths without making that change a
+kernel requirement. Legacy execution-ledger and attempt-directory layouts are
+intentionally replaced.
 
 In particular:
 
@@ -739,6 +744,8 @@ src/biomodals/execution/
   scheduler.py            # graph readiness, batching, and call limits
   modal.py                # Modal call lifecycle and remote coordination
   runtime.py              # caller-driven composition facade
+  coordinator.py          # reusable coordinator drive loop
+  pull_worker.py          # reusable pull-worker claim/complete loop
 ```
 
 The supported internal interface is centered on:

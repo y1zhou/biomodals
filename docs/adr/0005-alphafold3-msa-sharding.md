@@ -6,6 +6,12 @@ This record consolidates and supersedes ADRs 0005–0048 as they appeared in
 branch history. It is the authoritative architecture decision for the
 AlphaFold3 sharded-MSA integration.
 
+[ADR 0006](0006-unified-execution-kernel.md) owns generic Run, Node, Task,
+Provider Call, and scheduling semantics. This record owns AlphaFold3's
+scientific plans, caches, generation claims, markers, and publications.
+Generation claims elect a scientific publisher across Runs; they are not Task
+ownership and never authorize replacement work inside one Execution Run.
+
 ## Context
 
 The existing production app runs AlphaFold's full data pipeline in coarse
@@ -850,7 +856,7 @@ After a request manifest has been published, a deterministic immutable receipt
 binds this exact invocation to that manifest's path, byte size, and SHA-256.
 The manifest is always durable before its receipt. Receipt publication and
 loading enforce the same 64 MiB manifest ceiling, and manifest validation
-applies the seed/sample workload limit before expanding expected ranking rows.
+applies the hard seed and sample bounds before expanding expected ranking rows.
 
 An exact receipt hit is the earliest fast path: the local entrypoint validates
 the receipt and referenced manifest directly through the output Volume, skips
@@ -1019,7 +1025,9 @@ refresh the global summary for successful siblings but does not publish a
 successful request result or local archive.
 
 A later explicit invocation reuses valid raw searches, template results, and
-seed markers, then claims only missing work.
+seed markers, then creates a new Execution Run that claims only missing work.
+An explicit compatible Successor provides the corresponding restart path for a
+recorded Run.
 
 This preserves partial progress while requiring the caller to authorize another
 potentially costly attempt.

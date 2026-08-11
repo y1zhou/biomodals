@@ -10,7 +10,8 @@ semantics.
 ## Choose the execution boundary
 
 - Keep a simple app simple when it has one ordinary remote call and needs no
-  durable DAG, fan-out, recovery, or cross-process lifecycle.
+  durable DAG, fan-out, recovery, or cross-process lifecycle. That
+  uncoordinated path is development-only under the current CLI.
 - Use the kernel when an app durably schedules multiple Tasks or Provider Calls,
   needs result-driven recovery, or exposes a remotely recoverable direct CLI
   Run.
@@ -19,6 +20,8 @@ semantics.
   stages local inputs, targets an exact deployed version, and retrieves results.
 - Treat source-backed ephemeral execution as explicit development mode. Do not
   wrap the normal CLI client in another Modal App.
+- A normal deployed `biomodals app run` must declare a coordinator-aware Local
+  Entrypoint and expose a Deployment Coordinator Adapter.
 - When a service or workflow calls an app function, keep that call in the
   parent's Execution Run. Do not create a nested coordinator or SQLite ledger.
 
@@ -40,6 +43,14 @@ The host owns the SQLite location and transaction boundary, request files, and
 Volume synchronization. Reuse the existing execution runtime and app-execution
 helpers; do not add a workload-handler hierarchy, callback registry, provider
 plugin layer, or universal coordinator deployment.
+
+## Reuse the host lifecycle
+
+Use `ExecutionRequestFile` and `ExecutionRunStore` for run-scoped persistence,
+the existing execution and coordinator lifecycle classes for app integration,
+`drive_execution_run` for coordinator driving, and `drive_pull_worker` for
+pull-worker loops. Add workload policy through their existing hooks instead of
+copying the host loop.
 
 ## Schedule and recover safely
 

@@ -247,9 +247,9 @@ needed, and `finalize_remote_tasks()`.
 
 Use `RemotePullTaskWorkflowNode` only for large variable-duration Task sets that
 benefit from lock-free work stealing. Implement `prepare_pull_worker()` with a
-bounded claim capacity. Ready Tasks and durable Worker Assignments in SQLite
-are the queue; workers claim and complete them through idempotent coordinator
-methods and never open the database.
+bounded claim capacity and per-Node `max_worker_calls`. Ready Tasks and durable
+Worker Assignments in SQLite are the queue; workers claim and complete them
+through idempotent coordinator methods and never open the database.
 
 The runtime preclaims every Provider Call before invoking Modal, attaches the
 returned call ID durably, and recovers that exact call. Node implementations
@@ -306,9 +306,14 @@ execution_nodes
 execution_tasks
 execution_dispatch_batches
 execution_provider_calls
-execution_provider_call_tasks
+execution_task_claim_requests
 execution_worker_assignments
+execution_task_completion_requests
+execution_node_dependencies
 ```
+
+Task rows carry fixed-call and pull-worker Provider Call ownership. Claim and
+completion request rows make worker callbacks durably idempotent.
 
 Workflow-owned tables store artifacts, input/output links, and materialized
 Node and Task `AppRunResult` records:

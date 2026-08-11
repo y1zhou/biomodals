@@ -45,3 +45,11 @@ are generated in the downloaded archive instead of persisted in request views.
 
 This custom layout is confined to the AlphaFold3 supporting modules and is
 documented in `docs/adr/0005-alphafold3-msa-sharding.md`.
+
+## Generation claims
+
+AlphaFold3 may expire an old generation claim before electing a new scientific
+publisher. This is workload-level coordination across Execution Runs, not a
+kernel Task lease. It does not authorize retry or replacement inside one Run;
+only a new root Run or explicit compatible Successor may schedule missing work.
+Completion markers and validated publications remain the reuse authority.

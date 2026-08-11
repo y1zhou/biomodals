@@ -138,10 +138,9 @@ src/biomodals/service/
   modal_logs.py      call-filtered Modal CLI log access
   gromacs/
     archive.py       deterministic ZIP layout and validation
-    contracts.py     GROMACS request schema and stable request identity
+    contracts.py     request schema, stable identity and execution plan
     router.py        GROMACS submission route
-    plan.py          immutable execution DAG and deployed-function arguments
-    execution.py     caller-owned coordination and service projection
+    execution.py     execution plan adaptation and service projection
     results.py       Result publication, recovery and cache access
     modal.py         Modal calls plus Volume-backed result operations
 ```

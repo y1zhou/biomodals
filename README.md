@@ -20,12 +20,13 @@ BioModals supports three ways to run scientific work:
 | Offer a tool through the web interface | `biomodals api` and the frontend repository |
 
 The same execution kernel provides durable task state, dependency scheduling,
-Modal call tracking, cancellation, and recovery for all three paths.
+Modal call tracking, cancellation, and recovery for coordinated apps,
+workflows, and web Jobs.
 
 ## Architecture
 
-Direct apps, workflows, and web Jobs all use the same execution kernel. A
-workflow reaches it through `biomodals.workflow.core`; a direct app does not:
+Coordinated direct apps, workflows, and web Jobs use the same execution kernel.
+A workflow reaches it through `biomodals.workflow.core`; a direct app does not:
 
 ```mermaid
 ---

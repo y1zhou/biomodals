@@ -21,6 +21,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     NodeStatus,
     ProviderCallStatus,
+    ProviderCallSubmission,
     RunStatus,
     RunStatusReason,
     TaskStatus,
@@ -685,20 +686,26 @@ class GromacsExecutionCoordinator:
             ),
         )
         options = GromacsJobOptions.model_validate_json(job.parameters_json)
-        for candidate in selected:
-            submitted = await runtime.submit_fixed_batch(
-                execution_run_id,
-                candidate,
-                submission_token=(f"{execution_run_id}:{candidate.node_key}:operation"),
-                kwargs=self._operation_kwargs(
-                    job,
-                    candidate.node_key,
-                    options,
-                ),
-                now=self._now(),
-            )
-            if submitted is None:
-                return
+        submitted = await runtime.submit_provider_calls(
+            execution_run_id,
+            tuple(
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=(
+                        f"{execution_run_id}:{candidate.node_key}:operation"
+                    ),
+                    kwargs=self._operation_kwargs(
+                        job,
+                        candidate.node_key,
+                        options,
+                    ),
+                )
+                for candidate in selected
+            ),
+            now=self._now(),
+        )
+        if any(call is None for call in submitted):
+            return
 
     def _operation_kwargs(
         self,

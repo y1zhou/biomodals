@@ -1394,97 +1394,193 @@ class AsyncExecutionRuntime:
         provider_call_id_kwarg: str | None = None,
         now: int,
     ) -> ProviderCallRecord | None:
-        """Resolve, preclaim, checkpoint, spawn once, attach, and checkpoint."""
-        if candidate.max_tasks_per_call is None:
-            raise ValueError("fixed-batch candidate is missing max_tasks_per_call")
-        self.persist_fixed_dispatch_policy(
+        """Submit one fixed batch through the admission-set boundary."""
+        [submitted] = await self.submit_provider_calls(
             execution_run_id,
-            _fixed_descriptors_for_candidate(
-                self.repository,
-                execution_run_id,
-                candidate,
+            (
+                ProviderCallSubmission(
+                    candidate=candidate,
+                    submission_token=submission_token,
+                    args=args,
+                    kwargs={} if kwargs is None else kwargs,
+                    provider_call_id_kwarg=provider_call_id_kwarg,
+                ),
             ),
             now=now,
         )
-        function = await self._resolve_provider(
-            execution_run_id,
-            candidate.binding,
-            now=now,
+        return submitted
+
+    async def submit_provider_calls(
+        self,
+        execution_run_id: UUID,
+        submissions: tuple[ProviderCallSubmission, ...],
+        *,
+        now: int,
+    ) -> tuple[ProviderCallRecord | None, ...]:
+        """Submit one fixed-call admission set with batched durability."""
+        if not submissions:
+            return ()
+        for submission in submissions:
+            candidate = submission.candidate
+            if candidate.max_tasks_per_call is None:
+                raise ValueError("async runtime only submits fixed batches")
+            if submission.claim_capacity is not None:
+                raise ValueError("fixed-batch submission cannot set claim_capacity")
+            identity_kwarg = submission.provider_call_id_kwarg
+            if identity_kwarg is not None and (
+                not identity_kwarg or identity_kwarg in submission.kwargs
+            ):
+                raise ValueError("invalid provider call identity keyword")
+
+        descriptors = tuple(
+            descriptor
+            for submission in submissions
+            for descriptor in _fixed_descriptors_for_candidate(
+                self.repository,
+                execution_run_id,
+                submission.candidate,
+            )
         )
-        if function is None:
-            return None
-        preclaim = self.repository.preclaim_fixed_batch(
-            execution_run_id,
-            candidate.node_key,
-            candidate.task_keys,
-            submission_token=submission_token,
-            binding=candidate.binding,
-            compatibility_key=candidate.compatibility_key,
-            max_tasks_per_call=candidate.max_tasks_per_call,
-            now=now,
-        )
-        if preclaim is None:
-            return None
-        if not preclaim.spawn_authorized:
-            return preclaim.call
-        invocation_kwargs = {} if kwargs is None else dict(kwargs)
-        if provider_call_id_kwarg is not None:
-            if not provider_call_id_kwarg:
-                raise ValueError("provider_call_id_kwarg cannot be empty")
-            if provider_call_id_kwarg in invocation_kwargs:
-                raise ValueError(
-                    f"{provider_call_id_kwarg} is supplied by the execution runtime"
+        self.persist_fixed_dispatch_policy(execution_run_id, descriptors, now=now)
+
+        functions: dict[ProviderBinding, Any] = {}
+        for submission in submissions:
+            binding = submission.candidate.binding
+            if submission.function is not None:
+                functions.setdefault(binding, submission.function)
+            elif binding not in functions:
+                function = await self._resolve_provider(
+                    execution_run_id,
+                    binding,
+                    now=now,
                 )
-            invocation_kwargs[provider_call_id_kwarg] = str(
-                preclaim.call.provider_call_id
+                if function is None:
+                    return tuple(None for _ in submissions)
+                functions[binding] = function
+
+        preclaims = []
+        for submission in submissions:
+            candidate = submission.candidate
+            preclaims.append(
+                self.repository.preclaim_fixed_batch(
+                    execution_run_id,
+                    candidate.node_key,
+                    candidate.task_keys,
+                    submission_token=submission.submission_token,
+                    binding=candidate.binding,
+                    compatibility_key=candidate.compatibility_key,
+                    max_tasks_per_call=cast(int, candidate.max_tasks_per_call),
+                    now=now,
+                )
             )
-        self._checkpoint_state()
-        try:
-            handle_id = await self._modal.spawn(
-                function,
-                args=args,
-                kwargs=invocation_kwargs,
-            )
-        except ModalDefiniteSubmissionError as error:
-            self.repository.fail_provider_call(
-                preclaim.call.provider_call_id,
-                message=str(error),
-                now=now,
-            )
+        if any(
+            preclaim is not None and preclaim.spawn_authorized for preclaim in preclaims
+        ):
             self._checkpoint_state()
-            raise
-        except ModalSubmissionOutcomeUnknownError as error:
-            self.repository.mark_submission_outcome_unknown(
-                preclaim.call.provider_call_id,
-                message=str(error),
-                now=now,
-            )
-            self._checkpoint_state()
-            raise
-        try:
-            attached = self.repository.attach_provider_call(
-                preclaim.call.provider_call_id,
-                provider_call_handle_id=handle_id,
-                now=now,
-            )
-            self._checkpoint_state()
-        except Exception:
-            try:
-                await self._modal.cancel(handle_id)
-            finally:
-                call = self.repository.get_provider_call(
+
+        spawned: dict[UUID, str] = {}
+        errors: dict[UUID, Exception] = {}
+        for submission, preclaim in zip(submissions, preclaims, strict=True):
+            if preclaim is None or not preclaim.spawn_authorized:
+                continue
+            run = self.repository.get_run(execution_run_id)
+            if run.cancellation_is_durable:
+                self.repository.cancel_unsubmitted_provider_call(
                     preclaim.call.provider_call_id,
-                    include_task_keys=False,
+                    message="Run cancellation stopped submission",
+                    now=now,
                 )
-                if call.status == ProviderCallStatus.SUBMITTING:
-                    self.repository.mark_submission_outcome_unknown(
-                        call.provider_call_id,
-                        message="Modal call attachment was not durable",
-                        now=now,
+                continue
+            kwargs = dict(submission.kwargs)
+            if submission.provider_call_id_kwarg is not None:
+                kwargs[submission.provider_call_id_kwarg] = str(
+                    preclaim.call.provider_call_id
+                )
+            try:
+                spawned[preclaim.call.provider_call_id] = await self._modal.spawn(
+                    functions[submission.candidate.binding],
+                    args=submission.args,
+                    kwargs=kwargs,
+                )
+            except Exception as error:
+                errors[preclaim.call.provider_call_id] = error
+
+        authorized = tuple(
+            preclaim
+            for preclaim in preclaims
+            if preclaim is not None and preclaim.spawn_authorized
+        )
+        cancellation_requested = False
+        if authorized:
+            try:
+                for preclaim in authorized:
+                    provider_call_id = preclaim.call.provider_call_id
+                    current = self.repository.get_provider_call(
+                        provider_call_id,
+                        include_task_keys=False,
                     )
+                    if current.status.is_terminal:
+                        continue
+                    error = errors.get(provider_call_id)
+                    if isinstance(error, ModalDefiniteSubmissionError):
+                        self.repository.fail_provider_call(
+                            provider_call_id,
+                            message=str(error),
+                            now=now,
+                        )
+                    elif error is not None:
+                        self.repository.mark_submission_outcome_unknown(
+                            provider_call_id,
+                            message=str(error),
+                            now=now,
+                        )
+                    else:
+                        self.repository.attach_provider_call(
+                            provider_call_id,
+                            provider_call_handle_id=spawned[provider_call_id],
+                            now=now,
+                        )
+                cancellation_requested = self.repository.get_run(
+                    execution_run_id
+                ).cancellation_is_durable
                 self._checkpoint_state()
-            raise
-        return attached
+            except Exception:
+                for handle_id in spawned.values():
+                    try:
+                        await self._modal.cancel(handle_id)
+                    except Exception:
+                        LOGGER.warning(
+                            "Could not cancel unattached Modal call %s",
+                            handle_id,
+                            exc_info=True,
+                        )
+                for preclaim in authorized:
+                    call = self.repository.get_provider_call(
+                        preclaim.call.provider_call_id,
+                        include_task_keys=False,
+                    )
+                    if call.status == ProviderCallStatus.SUBMITTING:
+                        self.repository.mark_submission_outcome_unknown(
+                            call.provider_call_id,
+                            message="Modal call attachment was not durable",
+                            now=now,
+                        )
+                self._checkpoint_state()
+                raise
+
+        if cancellation_requested:
+            for provider_call_id in spawned:
+                await self.request_provider_call_cancellation(
+                    provider_call_id,
+                    now=now,
+                )
+
+        return tuple(
+            None
+            if preclaim is None
+            else self.repository.get_provider_call(preclaim.call.provider_call_id)
+            for preclaim in preclaims
+        )
 
     async def reconcile_provider_call(
         self,
@@ -1547,22 +1643,70 @@ class AsyncExecutionRuntime:
         encode_result: Callable[[Any], Any],
         now: int,
     ) -> tuple[tuple[ProviderCallRecord, ProviderCallRecord], ...]:
-        """Reconcile observable calls and expose unpublished successes."""
-        reconciled = []
-        for original in self.repository.list_provider_calls_requiring_reconciliation(
+        """Observe a call set, then persist its outcomes in one checkpoint."""
+        originals = self.repository.list_provider_calls_requiring_reconciliation(
             execution_run_id
-        ):
+        )
+        observations: dict[
+            UUID,
+            tuple[ModalCallObservation, Any | None],
+        ] = {}
+        for original in originals:
+            if (
+                original.status.is_terminal
+                or original.status == ProviderCallStatus.SUBMITTING
+                or original.provider_call_handle_id is None
+            ):
+                continue
+            observation = await self._modal.observe(original.provider_call_handle_id)
+            envelope = None
+            if observation.kind == ModalCallObservationKind.SUCCEEDED:
+                try:
+                    envelope = encode_result(observation.result)
+                except Exception as error:
+                    self.repository.mark_provider_call_state_unknown(
+                        original.provider_call_id,
+                        message=f"Could not create a Result Envelope: {error}",
+                        now=now,
+                    )
+                    self._checkpoint_state()
+                    raise
+            observations[original.provider_call_id] = (observation, envelope)
+
+        reconciled = []
+        needs_checkpoint = False
+        changed = False
+        for original in originals:
             updated = original
-            if not original.status.is_terminal:
-                updated = await self.reconcile_provider_call(
+            if original.status == ProviderCallStatus.SUBMITTING:
+                updated = self.repository.mark_submission_outcome_unknown(
                     original.provider_call_id,
-                    encode_result=encode_result,
+                    message="Recovered an abandoned submitting Provider Call",
+                    now=now,
+                )
+                needs_checkpoint = True
+            elif original.provider_call_id in observations:
+                observation, envelope = observations[original.provider_call_id]
+                updated = _record_provider_call_observation(
+                    self.repository,
+                    original.provider_call_id,
+                    observation,
+                    result_envelope=envelope,
                     result_already_satisfied=(
                         original.node_key not in required_node_keys
                     ),
                     now=now,
                 )
+                changed = changed or updated.status != original.status
+                needs_checkpoint = (
+                    needs_checkpoint
+                    or observation.kind != ModalCallObservationKind.RUNNING
+                )
             reconciled.append((original, updated))
+        if needs_checkpoint:
+            self._checkpoint_state()
+        elif changed:
+            self._commit_local_state()
         return tuple(reconciled)
 
     async def request_provider_call_cancellation(

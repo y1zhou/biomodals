@@ -25,7 +25,10 @@ from biomodals.app.bioinfo import gromacs_app
 from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
 from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import execution_lineage_root
+from biomodals.helper.app_execution import (
+    execution_lineage_root,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import volume_app_output
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
@@ -61,6 +64,7 @@ from biomodals.workflow.core.execution import app_scientific_version
 
 DEPENDENCY_APPS = ("gromacs",)
 _SCIENTIFIC_SCHEMA_VERSION = "2"
+_MAX_GROMACS_RUN_NAME_BYTES = 180
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -729,7 +733,7 @@ def build_shortmd_workflow(
 
     for file_name, pdb_content in input_pdbs:
         pdb_run_name = sanitize_filename(Path(file_name).stem)
-        run_name = (
+        run_name = _bounded_gromacs_run_name(
             f"{safe_run_namespace}-{pdb_run_name}"
             if safe_run_namespace is not None
             else pdb_run_name
@@ -796,6 +800,17 @@ def build_shortmd_workflow(
     return workflow
 
 
+def _bounded_gromacs_run_name(value: str) -> str:
+    """Keep generated GROMACS filenames within common component limits."""
+    encoded = value.encode()
+    if len(encoded) <= _MAX_GROMACS_RUN_NAME_BYTES:
+        return value
+    digest = hashlib.sha256(encoded).hexdigest()
+    prefix_bytes = _MAX_GROMACS_RUN_NAME_BYTES - len(digest) - 1
+    prefix = encoded[:prefix_bytes].decode(errors="ignore").rstrip("._-")
+    return f"{prefix}-{digest}" if prefix else digest
+
+
 @app.local_entrypoint()
 def submit_shortmd_workflow(
     input_dir: str,
@@ -858,15 +873,13 @@ def submit_shortmd_workflow(
     execution_run_id = uuid4()
     seed_run_id = (
         execution_run_id
-        if predecessor_execution_run_id is None
+        if predecessor_execution_run_id is None or dry_run
         else execution_lineage_root(
             orchestrator.OUT_VOLUME,
             predecessor_execution_run_id,
         )
     )
-    physical_run_namespace = sanitize_filename(
-        f"{resolved_run_id}-{seed_run_id.hex[:12]}"
-    )
+    physical_run_namespace = f"{resolved_run_id}-{seed_run_id.hex}"
     workflow = build_shortmd_workflow(
         input_pdbs=input_pdbs,
         random_seed_identity=str(seed_run_id),
@@ -886,6 +899,12 @@ def submit_shortmd_workflow(
     if dry_run:
         print_workflow_dag(workflow.validate())
         return
+
+    stage_execution_launch(
+        orchestrator.OUT_VOLUME,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
 
     deployment = DeploymentIdentity(
         environment=(

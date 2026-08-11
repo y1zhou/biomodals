@@ -4,6 +4,7 @@
 
 import hashlib
 import pickle
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -11,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.helper.app_execution import persist_execution_launch
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
@@ -72,6 +74,42 @@ class FakeFunctionCall:
         return self.result
 
 
+class FakeLaunchVolume:
+    """Filesystem-backed Volume boundary for local entrypoint tests."""
+
+    def __init__(self, root: Path) -> None:
+        """Bind the fake to a local directory."""
+        self.root = root
+
+    def read_file(self, path: str):
+        """Yield one staged file like Modal Volume.read_file."""
+        yield self.root.joinpath(path.lstrip("/")).read_bytes()
+
+    @contextmanager
+    def batch_upload(self, *, force: bool):
+        """Write a batch of staged files into the fake Volume."""
+        assert force
+        root = self.root
+
+        class Batch:
+            def put_file(self, source, destination: str) -> None:
+                path = root / destination.lstrip("/")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(source.read())
+
+        yield Batch()
+
+
+@pytest.fixture(autouse=True)
+def _fake_workflow_output_volume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FakeLaunchVolume:
+    volume = FakeLaunchVolume(tmp_path / "workflow-volume")
+    monkeypatch.setattr(shortmd_workflow.orchestrator, "OUT_VOLUME", volume)
+    return volume
+
+
 def test_shortmd_uses_gromacs_app_volume_metadata() -> None:
     assert shortmd_workflow.CONF.depends_on_apps == ("gromacs",)
     assert shortmd_workflow.CONF.tags == {"depends_on": "gromacs"}
@@ -99,6 +137,15 @@ def test_discover_pdb_inputs_globs_pdb_files(tmp_path: Path) -> None:
 def test_discover_pdb_inputs_rejects_empty_directory(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="No PDB files"):
         discover_pdb_inputs(tmp_path)
+
+
+def test_generated_gromacs_run_names_are_bounded_and_collision_resistant() -> None:
+    first = shortmd_workflow._bounded_gromacs_run_name("a" * 240 + "-one")
+    second = shortmd_workflow._bounded_gromacs_run_name("a" * 240 + "-two")
+
+    assert len(first.encode()) <= shortmd_workflow._MAX_GROMACS_RUN_NAME_BYTES
+    assert len(second.encode()) <= shortmd_workflow._MAX_GROMACS_RUN_NAME_BYTES
+    assert first != second
 
 
 def test_build_shortmd_workflow_models_production_analysis_dependencies() -> None:
@@ -850,7 +897,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
 
     assert calls["prepare"]["workflow"].name == "shortmd"
     definition = calls["prepare"]["workflow"].validate()
-    suffix = str(calls["coordinator"]["execution_run_id"]).replace("-", "")[:12]
+    suffix = str(calls["coordinator"]["execution_run_id"]).replace("-", "")
     run_name = f"shortmd-run-{suffix}-alpha"
     prep_node = definition.nodes[f"prep-{run_name}"].node
     replicate_node = definition.nodes[f"replicate-{run_name}-r001"].node
@@ -993,6 +1040,7 @@ def test_submit_shortmd_workflow_uses_exact_deployed_coordinator_without_handles
 def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    _fake_workflow_output_volume: FakeLaunchVolume,
 ) -> None:
     input_dir = tmp_path / "pdbs"
     input_dir.mkdir()
@@ -1023,10 +1071,10 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
         "execution_coordinator_handle",
         lambda **kwargs: calls.setdefault("coordinator", kwargs) and FakeCoordinator(),
     )
-    monkeypatch.setattr(
-        shortmd_workflow,
-        "execution_lineage_root",
-        lambda _volume, _run_id: UUID(predecessor),
+    persist_execution_launch(
+        _fake_workflow_output_volume.root,
+        UUID(predecessor),
+        None,
     )
     raw_f = shortmd_workflow.submit_shortmd_workflow.info.raw_f
     assert raw_f is not None
@@ -1047,6 +1095,10 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
     assert calls["prepare"]["workload_run_key"] == "shortmd-run"
     assert calls["prepare"]["workflow"].name == "shortmd"
     assert calls["drive"] == {"development_function_handles": None}
+    assert shortmd_workflow.execution_lineage_root(
+        _fake_workflow_output_volume,
+        calls["coordinator"]["execution_run_id"],
+    ) == UUID(predecessor)
 
 
 def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
@@ -1080,7 +1132,7 @@ def test_submit_shortmd_workflow_dry_run_prints_dag_without_orchestrator(
     )
 
     stdout = capsys.readouterr().out
-    run_name = "shortmd-run-111111112222-alpha"
+    run_name = "shortmd-run-11111111222233334444555555555555-alpha"
     assert "[workflow] DAG graph: node_id [execution; class] <- dependency" in stdout
     assert f"[workflow]   prep-{run_name} [provider; ShortMDPrepNode] <- -" in stdout
     assert (
@@ -1137,7 +1189,7 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
     )
 
     definition = calls["prepare"]["workflow"].validate()
-    run_name = "shortmd-run-111111112222-alpha"
+    run_name = "shortmd-run-11111111222233334444555555555555-alpha"
     clear_node = definition.nodes[f"clear-{run_name}"].node
     clone_node = definition.nodes[f"clone-{run_name}-r001"].node
 

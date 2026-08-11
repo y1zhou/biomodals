@@ -544,8 +544,8 @@ class WorkflowRuntime:
             raise
         now = self._now()
         published_staging: set[str] = set()
-        with self.store.synchronize():
-            try:
+        try:
+            with self.store.synchronize():
                 with self.store.transaction():
                     cancellation_is_durable = self.store.execution.get_run(
                         self.execution_run_id
@@ -639,17 +639,17 @@ class WorkflowRuntime:
                         capacity=capacity,
                         now=now,
                     )
-            except Exception:
-                self._discard_pull_completion_staging(*staged_publications.values())
-                raise
-            self._discard_pull_completion_staging(
-                *(
-                    staged
-                    for task_key, staged in staged_publications.items()
-                    if task_key not in published_staging
-                )
+        except Exception:
+            self._discard_pull_completion_staging(*staged_publications.values())
+            raise
+        self._discard_pull_completion_staging(
+            *(
+                staged
+                for task_key, staged in staged_publications.items()
+                if task_key not in published_staging
             )
-            self._checkpoint()
+        )
+        self._checkpoint()
         return claim
 
     def _discard_pull_completion_staging(

@@ -136,7 +136,7 @@ class AF3ScoreExecutionRequest:
                 "max_active_gpu_provider_calls",
                 gpu_limit,
             )
-        if total_limit < 1 or gpu_limit < 1 or gpu_limit > total_limit:
+        if total_limit < 1 or gpu_limit < 0 or gpu_limit > total_limit:
             raise ValueError("AF3Score provider-call limits are invalid")
         if not self.app_version or not self.model_identity:
             raise ValueError("AF3Score scientific versions cannot be empty")

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+import pytest
+
 from biomodals.app.fold import abcfold2_app
 from biomodals.app.fold.abcfold2_execution import (
     BOLTZ_ARCHIVE_NODE,
@@ -175,6 +177,17 @@ def test_operational_limits_do_not_change_scientific_identity() -> None:
         == changed.execution_plan.workload_plan_fingerprint
     )
     assert ABCFold2ExecutionRequest.from_bytes(changed.to_bytes()) == changed
+
+
+def test_request_allows_zero_but_rejects_negative_gpu_capacity() -> None:
+    assert _request(max_active_gpu_provider_calls=0).max_active_gpu_provider_calls == 0
+    with pytest.raises(ValueError, match="provider-call limits"):
+        _request(
+            download_models=False,
+            run_boltz=False,
+            run_chai=False,
+            max_active_gpu_provider_calls=-1,
+        )
 
 
 def test_disabled_models_are_absent_from_the_graph() -> None:

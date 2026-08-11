@@ -114,7 +114,7 @@ class ABCFold2ExecutionRequest:
             )
         if (
             self.max_active_provider_calls < 1
-            or (gpu_limit < 1 and (self.run_boltz or self.run_chai))
+            or gpu_limit < 0
             or gpu_limit > self.max_active_provider_calls
         ):
             raise ValueError("ABCFold2 provider-call limits are invalid")

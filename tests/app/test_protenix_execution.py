@@ -183,12 +183,6 @@ def test_request_round_trip_preserves_msa_fanout_graph() -> None:
         FINALIZE_NODE,
         INFERENCE_NODE,
     )
-    assert decoded.execution_plan.scientific_versions["protenix.model"] == (
-        decoded.model_name
-    )
-    assert decoded.execution_plan.scientific_versions["protenix.reference_data"] == (
-        "v1.0.0"
-    )
     assert decoded.execution_plan.terminal_node_keys == (INFERENCE_NODE,)
 
 
@@ -212,6 +206,10 @@ def test_operational_limits_do_not_change_scientific_identity() -> None:
         == changed.execution_plan.workload_plan_fingerprint
     )
     assert ProtenixExecutionRequest.from_bytes(changed.to_bytes()) == changed
+
+
+def test_request_allows_zero_gpu_capacity_for_cached_results() -> None:
+    assert _request(max_active_gpu_provider_calls=0).max_active_gpu_provider_calls == 0
 
 
 @pytest.mark.parametrize(

@@ -63,7 +63,7 @@ class BoltzGenExecutionRequest:
         if self.max_active_provider_calls < 1:
             raise ValueError("max_active_provider_calls must be positive")
         if not (
-            1 <= self.max_active_gpu_provider_calls <= self.max_active_provider_calls
+            0 <= self.max_active_gpu_provider_calls <= self.max_active_provider_calls
         ):
             raise ValueError(
                 "max_active_gpu_provider_calls must be between zero and "

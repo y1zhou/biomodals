@@ -195,6 +195,10 @@ def test_operational_provider_limits_round_trip_without_changing_science() -> No
     assert OligoformerExecutionRequest.from_bytes(changed.to_bytes()) == changed
 
 
+def test_request_allows_zero_gpu_capacity_for_cached_results() -> None:
+    assert _request(max_active_gpu_provider_calls=0).max_active_gpu_provider_calls == 0
+
+
 def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
     """Concurrent lifecycle calls cannot replace a runtime under its driver."""
     request = _request()

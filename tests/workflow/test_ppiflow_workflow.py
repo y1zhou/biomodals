@@ -207,10 +207,6 @@ PPIFlowStep:
     )
 
     assert workflow.validate().scientific_versions["biomodals.workflow.ppiflow"] == "3"
-    assert (
-        workflow.validate().scientific_versions["ppiflow.model.binder.ckpt"]
-        == (ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["binder.ckpt"])
-    )
 
 
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:

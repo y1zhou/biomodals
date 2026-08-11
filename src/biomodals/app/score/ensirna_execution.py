@@ -110,7 +110,7 @@ class EnsirnaExecutionRequest:
             )
         if (
             total_limit < 1
-            or self.max_active_gpu_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 0
             or self.max_active_gpu_provider_calls > total_limit
         ):
             raise ValueError("ENsiRNA provider-call limits are invalid")

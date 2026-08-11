@@ -91,6 +91,10 @@ def test_operational_limits_and_claim_owners_do_not_change_scientific_plan() -> 
     assert second.max_active_provider_calls == 1
 
 
+def test_request_allows_zero_gpu_capacity_for_cached_results() -> None:
+    assert _request(gpu_calls=0).max_active_gpu_provider_calls == 0
+
+
 def test_result_affecting_input_changes_scientific_plan() -> None:
     first = _request()
     second = _request(yaml_content=b"name: changed\n")

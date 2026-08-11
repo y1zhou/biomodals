@@ -181,6 +181,21 @@ def test_ensirna_concurrency_and_sharding_are_operational() -> None:
     assert EnsirnaExecutionRequest.from_bytes(changed.to_bytes()) == changed
 
 
+def test_ensirna_allows_zero_gpu_capacity_for_cached_results() -> None:
+    request = EnsirnaExecutionRequest(
+        run_name="design",
+        fasta_content=b">target\nACGU\n",
+        prepare_workers=1,
+        pdb_cores=1,
+        preprocess_shard_size=1024,
+        force_generation=None,
+        app_version="0288243",
+        max_active_gpu_provider_calls=0,
+    )
+
+    assert request.max_active_gpu_provider_calls == 0
+
+
 def test_ensirna_rejects_excess_pdb_processes() -> None:
     with pytest.raises(ValueError, match="must not exceed 64"):
         EnsirnaExecutionRequest(

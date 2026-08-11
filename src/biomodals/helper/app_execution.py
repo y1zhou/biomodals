@@ -195,6 +195,7 @@ class ExecutionRunStore:
         execution_run_id: UUID,
         *,
         lock: Any | None = None,
+        volume_io_lock: Any | None = None,
     ) -> None:
         """Bind storage only to the host Volume root and opaque Run ID."""
         self.volume_root = Path(volume_root)
@@ -202,6 +203,7 @@ class ExecutionRunStore:
         self._connection: sqlite3.Connection | None = None
         self._execution: SqliteExecutionRepository | None = None
         self._lock = RLock() if lock is None else lock
+        self.volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
         self._volume_sync_active = False
 
     @property
@@ -378,7 +380,9 @@ class ExecutionRuntimeLifecycle:
         self.predecessor_execution_run_id = predecessor_execution_run_id
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
-        self._volume_io_lock = volume_io_lock
+        self._volume_io_lock = (
+            store.volume_io_lock if volume_io_lock is None else volume_io_lock
+        )
         self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
         self._provider = ExecutionRuntime(
             store.execution,
@@ -485,6 +489,11 @@ class ExecutionRuntimeLifecycle:
             finally:
                 self._provider.repository = self.store.execution
 
+    def _with_volume_io(self, operation: Callable[..., Any], *args: Any) -> Any:
+        """Run only a mounted-file operation under the run-scoped Volume lock."""
+        with self._volume_io_lock:
+            return operation(*args)
+
     @contextmanager
     def _synchronize_kernel_state(self) -> Iterator[None]:
         """Order an optional output-Volume barrier before the SQLite writer."""
@@ -518,11 +527,21 @@ class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
         """Apply one standard workload-owned execution cycle."""
         self._provider.advance_once(
             self.execution_run_id,
-            recover_publications=self._recover_publications,
+            recover_publications=lambda: self._with_volume_io(
+                self._recover_publications
+            ),
             reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=self._decode_completed_calls,
-            start_ready_nodes=self._start_ready_nodes,
-            admit_remote_tasks=self._admit_remote_tasks,
+            decode_completed_calls=lambda: self._with_volume_io(
+                self._decode_completed_calls
+            ),
+            start_ready_nodes=lambda required: self._with_volume_io(
+                self._start_ready_nodes,
+                required,
+            ),
+            admit_remote_tasks=lambda required: self._with_volume_io(
+                self._admit_remote_tasks,
+                required,
+            ),
             now=self._now,
         )
 
@@ -608,32 +627,33 @@ class ExecutionCoordinatorLifecycle:
         ):
             raise ValueError("Target scientific versions cannot be empty")
         self._writer_lock = RLock()
+        self._volume_io_lock = RLock()
         self._drive_lock = Lock()
         self._runtime: Any | None = None
 
     def run(self) -> ExecutionOverview:
         """Load the staged request and drive one root Run."""
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 runtime = self._open_current_runtime(recover=False)
             return self._drive(runtime, resume=False)
 
     def drive_prepared(self) -> ExecutionOverview:
         """Drive a prepared root or Successor Run from immutable launch state."""
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
             return self._drive(runtime, resume=False)
 
     def cancel(self) -> ExecutionOverview:
         """Request cancellation and reconcile it to a terminal result."""
-        with self._writer_lock:
+        with self._volume_io_lock, self._writer_lock:
             runtime = self._open_current_runtime(recover=True)
         cancelled = runtime.cancel()
-        with self._writer_lock:
+        with self._volume_io_lock, self._writer_lock:
             self._verify_overview(cancelled)
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
                 overview = runtime.store.execution.overview(self.execution_run_id)
                 self._verify_overview(overview)
@@ -644,13 +664,13 @@ class ExecutionCoordinatorLifecycle:
     def resume(self) -> ExecutionOverview:
         """Resume this Run without retrying conclusive failures."""
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 runtime = self._open_current_runtime(recover=True)
             return self._drive(runtime, resume=True)
 
     def status(self) -> ExecutionOverview:
         """Read one verified overview without advancing work."""
-        with self._writer_lock:
+        with self._volume_io_lock, self._writer_lock:
             runtime = self._runtime
             if runtime is not None:
                 overview = runtime.store.execution.overview(self.execution_run_id)
@@ -681,6 +701,7 @@ class ExecutionCoordinatorLifecycle:
             self.volume_root,
             self.execution_run_id,
             lock=self._writer_lock,
+            volume_io_lock=self._volume_io_lock,
         )
 
     @contextmanager
@@ -698,6 +719,7 @@ class ExecutionCoordinatorLifecycle:
             self.volume_root,
             predecessor_execution_run_id,
             lock=self._writer_lock,
+            volume_io_lock=self._volume_io_lock,
         )
         if not store.ledger_path.is_file():
             raise ExecutionRunNotFoundError(str(predecessor_execution_run_id))

@@ -1818,6 +1818,7 @@ class ExecutionCoordinator:
     deployment_environment: str = modal.parameter()
     deployment_name: str = modal.parameter()
     deployment_version: int = modal.parameter()
+    development: bool = modal.parameter()
 
     @modal.enter()
     def enter(self) -> None:

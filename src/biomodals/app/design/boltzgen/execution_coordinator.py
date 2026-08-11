@@ -68,7 +68,7 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
     ) -> None:
         """Validate and persist a Successor request without driving it."""
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,

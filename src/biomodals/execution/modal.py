@@ -109,7 +109,9 @@ def deployed_execution_coordinator(
         environment_name=deployment.environment,
         version=deployment.deployment_version,
     )
-    return coordinator_class(**_coordinator_parameters(execution_run_id, deployment))
+    return coordinator_class(
+        **_coordinator_parameters(execution_run_id, deployment, development=False)
+    )
 
 
 def execution_coordinator_handle(
@@ -127,14 +129,19 @@ def execution_coordinator_handle(
             deployment=deployment,
             class_resolver=class_resolver,
         )
-    return local_coordinator(**_coordinator_parameters(execution_run_id, deployment))
+    return local_coordinator(
+        **_coordinator_parameters(execution_run_id, deployment, development=True)
+    )
 
 
 def execution_coordinator_identity(
     parameters: Any,
 ) -> tuple[UUID, DeploymentIdentity]:
     """Read the standard execution identity from Modal class parameters."""
-    return UUID(parameters.execution_run_id), DeploymentIdentity(
+    execution_run_id = UUID(parameters.execution_run_id)
+    if str(execution_run_id) != parameters.execution_run_id:
+        raise ValueError("Execution Run ID must use canonical UUID text")
+    return execution_run_id, DeploymentIdentity(
         environment=parameters.deployment_environment,
         deployment_name=parameters.deployment_name,
         deployment_version=parameters.deployment_version,
@@ -144,7 +151,7 @@ def execution_coordinator_identity(
 def initialize_execution_coordinator_host(host: Any) -> None:
     """Initialize one concurrent Modal coordinator container."""
     host._coordinator_adapter = None
-    host._development = None
+    host._development = bool(getattr(host, "development", False))
     host._coordinator_adapter_lock = Lock()
 
 
@@ -162,7 +169,8 @@ def execution_coordinator_adapter[T](
             if development is not None and selected_mode != development:
                 raise ValueError("Coordinator execution mode cannot change in place")
             return adapter
-        selected_mode = False if development is None else development
+        if development is not None and selected_mode != development:
+            raise ValueError("Coordinator execution mode does not match its identity")
         adapter = factory(selected_mode)
         host._coordinator_adapter = adapter
         host._development = selected_mode
@@ -172,12 +180,15 @@ def execution_coordinator_adapter[T](
 def _coordinator_parameters(
     execution_run_id: UUID,
     deployment: DeploymentIdentity,
+    *,
+    development: bool,
 ) -> dict[str, object]:
     return {
         "execution_run_id": str(execution_run_id),
         "deployment_environment": deployment.environment,
         "deployment_name": deployment.deployment_name,
         "deployment_version": deployment.deployment_version,
+        "development": development,
     }
 
 

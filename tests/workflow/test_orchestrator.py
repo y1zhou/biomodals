@@ -264,6 +264,7 @@ def _raw_coordinator(
     instance.deployment_environment = deployment_environment
     instance.deployment_name = deployment_name
     instance.deployment_version = deployment_version
+    instance.development = deployment_environment == "development"
     raw_cls.enter._get_raw_f()(instance)
     return raw_cls, instance
 
@@ -1424,6 +1425,7 @@ def test_coordinator_handle_resolves_the_exact_deployed_class_version() -> None:
         "deployment_environment": "main",
         "deployment_name": "DemoWorkflow",
         "deployment_version": 7,
+        "development": False,
     }
 
 

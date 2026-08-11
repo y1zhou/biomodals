@@ -95,6 +95,8 @@ class AF3ScoreExecutionRequest:
     max_batches: int
     app_version: str
     model_identity: str = DECLARED_MODEL_IDENTITY
+    max_active_provider_calls: int | None = None
+    max_active_gpu_provider_calls: int | None = None
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
@@ -122,6 +124,20 @@ class AF3ScoreExecutionRequest:
             raise ValueError("AF3Score staged input Run ID must be canonical")
         if self.prepare_workers < 1 or self.max_batches < 1:
             raise ValueError("AF3Score worker limits must be positive")
+        if self.max_active_provider_calls is None:
+            object.__setattr__(self, "max_active_provider_calls", self.max_batches)
+        if self.max_active_gpu_provider_calls is None:
+            object.__setattr__(
+                self,
+                "max_active_gpu_provider_calls",
+                self.max_batches,
+            )
+        if (
+            self.max_active_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 0
+            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+        ):
+            raise ValueError("AF3Score provider-call limits are invalid")
         if not self.app_version or not self.model_identity:
             raise ValueError("AF3Score scientific versions cannot be empty")
 
@@ -177,6 +193,8 @@ class AF3ScoreExecutionRequest:
                 "max_batches": self.max_batches,
                 "app_version": self.app_version,
                 "model_identity": self.model_identity,
+                "max_active_provider_calls": self.max_active_provider_calls,
+                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
                 "replace_claim_owner": self.replace_claim_owner,
             },
             option=orjson.OPT_SORT_KEYS,
@@ -289,8 +307,8 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
     def _initialize(self):
         return self._create_or_verify_run(
             plan=self._plan,
-            max_active_provider_calls=self.request.max_batches,
-            max_active_gpu_provider_calls=self.request.max_batches,
+            max_active_provider_calls=self.request.max_active_provider_calls,
+            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:
@@ -771,7 +789,7 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 "Candidate request and generic restart overrides are mutually exclusive"
             )
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,
@@ -783,12 +801,19 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
                     request = candidate_request or predecessor_request
                 self._require_successor_plan_match(predecessor, request)
                 if candidate_request is None:
-                    limit = max_active_gpu_provider_calls
-                    if limit is None:
-                        limit = max_active_provider_calls
-                    if limit is None:
-                        limit = predecessor.max_active_gpu_provider_calls
-                    request = replace(request, max_batches=limit)
+                    request = replace(
+                        request,
+                        max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
+                        ),
+                    )
                 register_output_claim_successor(
                     self.output_claims,
                     owner=str(self.execution_run_id),

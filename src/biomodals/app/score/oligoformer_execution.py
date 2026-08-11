@@ -99,6 +99,8 @@ class OligoformerExecutionRequest:
     app_version: str
     model_version: str
     reference_version: str | None
+    max_active_provider_calls: int | None = None
+    max_active_gpu_provider_calls: int = 1
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
@@ -117,6 +119,22 @@ class OligoformerExecutionRequest:
             raise ValueError("Full-human OligoFormer runs require a reference version")
         if self.top_n != -1 and self.top_n < 1:
             raise ValueError("top_n must be -1 or a positive integer")
+        if self.max_active_provider_calls is None:
+            object.__setattr__(
+                self,
+                "max_active_provider_calls",
+                max(
+                    2,
+                    self.off_target_process_slots,
+                    self.targetscan_rnaplfold_nodes,
+                ),
+            )
+        if (
+            self.max_active_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 0
+            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+        ):
+            raise ValueError("OligoFormer provider-call limits are invalid")
         if (
             self.off_target
             and not self.all_human
@@ -243,15 +261,6 @@ class OligoformerExecutionRequest:
             scientific_versions=scientific_versions,
         )
 
-    @property
-    def max_active_provider_calls(self) -> int:
-        """Return the largest configured container pool needed by any stage."""
-        return max(
-            2,
-            self.off_target_process_slots,
-            self.targetscan_rnaplfold_nodes,
-        )
-
     def to_bytes(self) -> bytes:
         """Encode the bounded request without Python pickles."""
         value = asdict(self)
@@ -355,7 +364,7 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
         return self._create_or_verify_run(
             plan=self.request.execution_plan,
             max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=1,
+            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
@@ -1156,9 +1165,8 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
             raise ValueError(
                 "Candidate request and generic restart overrides are mutually exclusive"
             )
-        del max_active_gpu_provider_calls
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,
@@ -1169,14 +1177,19 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 ) as (predecessor, predecessor_request, _):
                     request = candidate_request or predecessor_request
                 self._require_successor_plan_match(predecessor, request)
-                capacity = (
-                    request.max_active_provider_calls
-                    if max_active_provider_calls is None
-                    else max_active_provider_calls
-                )
-                if capacity != request.max_active_provider_calls:
-                    raise ValueError(
-                        "OligoFormer successor capacity is derived from its request"
+                if candidate_request is None:
+                    request = replace(
+                        request,
+                        max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
+                        ),
                     )
                 register_output_claim_successor(
                     self.output_claims,

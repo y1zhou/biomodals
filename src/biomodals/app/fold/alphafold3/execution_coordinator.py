@@ -81,7 +81,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 "Candidate request and generic restart overrides are mutually exclusive"
             )
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,

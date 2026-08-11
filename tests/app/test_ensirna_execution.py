@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+import pytest
+
 from biomodals.app.score import ensirna_app
 from biomodals.app.score.ensirna_execution import (
     CHUNKS_NODE,
@@ -168,12 +170,28 @@ def test_ensirna_concurrency_and_sharding_are_operational() -> None:
         force_generation=base.force_generation,
         app_version=base.app_version,
         replace_claim_owner="old-run",
+        max_active_provider_calls=12,
+        max_active_gpu_provider_calls=1,
     )
 
     assert (
         base.execution_plan.workload_plan_fingerprint
         == changed.execution_plan.workload_plan_fingerprint
     )
+    assert EnsirnaExecutionRequest.from_bytes(changed.to_bytes()) == changed
+
+
+def test_ensirna_rejects_excess_pdb_processes() -> None:
+    with pytest.raises(ValueError, match="must not exceed 64"):
+        EnsirnaExecutionRequest(
+            run_name="design",
+            fasta_content=b">target\nACGU\n",
+            prepare_workers=3,
+            pdb_cores=32,
+            preprocess_shard_size=1024,
+            force_generation=None,
+            app_version="0288243",
+        )
 
 
 def test_runtime_dispatches_the_staged_graph(

@@ -81,11 +81,18 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         # BoltzGen completes Tasks from validated Volume publications.
         self._provider.advance_once(
             self.execution_run_id,
-            recover_publications=self._recover_publications,
+            recover_publications=lambda: self._with_volume_io(
+                self._recover_publications
+            ),
             reconcile_provider_calls=self._reconcile_provider_calls,
             decode_completed_calls=lambda: None,
-            start_ready_nodes=lambda _required: self._start_ready_nodes(),
-            admit_remote_tasks=self._admit_remote_tasks,
+            start_ready_nodes=lambda _required: self._with_volume_io(
+                self._start_ready_nodes
+            ),
+            admit_remote_tasks=lambda required: self._with_volume_io(
+                self._admit_remote_tasks,
+                required,
+            ),
             now=self._now,
         )
 

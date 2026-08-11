@@ -175,6 +175,17 @@ def _stage_request_inputs(root: Path, request: AF3ScoreExecutionRequest) -> None
         directory.joinpath(name).write_bytes(INPUT_CONTENT[name])
 
 
+def test_provider_limits_round_trip_independently_of_batch_count() -> None:
+    request = replace(
+        _request(),
+        max_active_provider_calls=8,
+        max_active_gpu_provider_calls=1,
+    )
+
+    assert request.max_batches == 2
+    assert AF3ScoreExecutionRequest.from_bytes(request.to_bytes()) == request
+
+
 def _publish_input(root: Path, input_id: str, digest: str, key: str) -> Path:
     sample = root / input_id / COMPLETION_SAMPLE_SUBDIR
     sample.mkdir(parents=True)

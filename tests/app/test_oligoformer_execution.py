@@ -182,6 +182,19 @@ def test_request_round_trips_without_pickle() -> None:
     assert OligoformerExecutionRequest.from_bytes(request.to_bytes()) == request
 
 
+def test_operational_provider_limits_round_trip_without_changing_science() -> None:
+    base = _request()
+    changed = _request(
+        max_active_provider_calls=12,
+        max_active_gpu_provider_calls=1,
+    )
+
+    assert changed.execution_plan.workload_plan_fingerprint == (
+        base.execution_plan.workload_plan_fingerprint
+    )
+    assert OligoformerExecutionRequest.from_bytes(changed.to_bytes()) == changed
+
+
 def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
     """Concurrent lifecycle calls cannot replace a runtime under its driver."""
     request = _request()

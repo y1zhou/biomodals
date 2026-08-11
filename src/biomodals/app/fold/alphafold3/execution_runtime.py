@@ -201,13 +201,22 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         """Apply one AlphaFold3-specific scheduling and publication cycle."""
         self._provider.advance_once(
             self.execution_run_id,
-            recover_publications=self._recover_cycle_publications,
+            recover_publications=lambda: self._with_volume_io(
+                self._recover_cycle_publications
+            ),
             reconcile_provider_calls=self._reconcile_provider_calls,
             decode_completed_calls=lambda: None,
-            start_ready_nodes=lambda _required: self._start_ready_nodes(),
-            after_start_ready_nodes=self._run_local_tasks,
-            admit_remote_tasks=self._admit_remote_tasks,
-            reconcile_results=self._reconcile_nodes_and_run,
+            start_ready_nodes=lambda _required: self._with_volume_io(
+                self._start_ready_nodes
+            ),
+            after_start_ready_nodes=lambda: self._with_volume_io(self._run_local_tasks),
+            admit_remote_tasks=lambda required: self._with_volume_io(
+                self._admit_remote_tasks,
+                required,
+            ),
+            reconcile_results=lambda: self._with_volume_io(
+                self._reconcile_nodes_and_run
+            ),
             now=self._now,
         )
 

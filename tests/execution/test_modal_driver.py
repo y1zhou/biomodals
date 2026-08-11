@@ -74,6 +74,7 @@ def test_deployed_coordinator_uses_exact_class_version_and_run_parameters() -> N
         "deployment_environment": "production",
         "deployment_name": "ShortMDWorkflow",
         "deployment_version": 7,
+        "development": False,
     }
 
 
@@ -100,6 +101,7 @@ def test_coordinator_handle_uses_current_source_class_in_development() -> None:
         "deployment_environment": "development",
         "deployment_name": "Gromacs",
         "deployment_version": 3,
+        "development": True,
     }
 
 

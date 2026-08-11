@@ -165,6 +165,7 @@ def test_operational_limits_do_not_change_scientific_identity() -> None:
     base = _request()
     changed = _request(
         max_active_provider_calls=12,
+        max_active_gpu_provider_calls=1,
         force_redownload=True,
         replace_claim_owner="old-run",
     )
@@ -173,6 +174,7 @@ def test_operational_limits_do_not_change_scientific_identity() -> None:
         base.execution_plan.workload_plan_fingerprint
         == changed.execution_plan.workload_plan_fingerprint
     )
+    assert ABCFold2ExecutionRequest.from_bytes(changed.to_bytes()) == changed
 
 
 def test_disabled_models_are_absent_from_the_graph() -> None:

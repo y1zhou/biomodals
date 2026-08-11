@@ -96,6 +96,7 @@ class ProtenixExecutionRequest:
     score_only: bool
     max_active_provider_calls: int
     app_version: str
+    max_active_gpu_provider_calls: int = 1
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
@@ -106,8 +107,12 @@ class ProtenixExecutionRequest:
             self.run_name,
             field_name="Protenix run_name",
         )
-        if self.max_active_provider_calls < 1:
-            raise ValueError("Protenix provider-call limit must be positive")
+        if (
+            self.max_active_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 0
+            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+        ):
+            raise ValueError("Protenix provider-call limits are invalid")
         if not self.app_version:
             raise ValueError("Protenix app version cannot be empty")
 
@@ -191,6 +196,7 @@ class ProtenixExecutionRequest:
                 "extra_args": self.extra_args,
                 "score_only": self.score_only,
                 "max_active_provider_calls": self.max_active_provider_calls,
+                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
                 "app_version": self.app_version,
                 "replace_claim_owner": self.replace_claim_owner,
             },
@@ -284,7 +290,7 @@ class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
         return self._create_or_verify_run(
             plan=self.request.execution_plan,
             max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=1,
+            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:
@@ -736,9 +742,8 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
             raise ValueError(
                 "Candidate request and generic restart overrides are mutually exclusive"
             )
-        del max_active_gpu_provider_calls
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,
@@ -756,6 +761,11 @@ class ProtenixExecutionCoordinator(ExecutionCoordinatorLifecycle):
                             predecessor.max_active_provider_calls
                             if max_active_provider_calls is None
                             else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
                         ),
                     )
                 register_output_claim_successor(

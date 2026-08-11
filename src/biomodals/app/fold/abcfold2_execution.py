@@ -97,14 +97,25 @@ class ABCFold2ExecutionRequest:
     app_version: str
     boltz_version: str
     chai_version: str
+    max_active_gpu_provider_calls: int | None = None
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
         """Reject empty inputs and unusable coordinator capacity."""
         if not self.run_name or not self.yaml_content:
             raise ValueError("ABCFold2 run name and YAML cannot be empty")
-        if self.max_active_provider_calls < 1:
-            raise ValueError("ABCFold2 provider-call limit must be positive")
+        if self.max_active_gpu_provider_calls is None:
+            object.__setattr__(
+                self,
+                "max_active_gpu_provider_calls",
+                self.max_active_provider_calls,
+            )
+        if (
+            self.max_active_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 0
+            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+        ):
+            raise ValueError("ABCFold2 provider-call limits are invalid")
         if not self.app_version or not self.boltz_version or not self.chai_version:
             raise ValueError("ABCFold2 deployment versions cannot be empty")
 
@@ -175,6 +186,7 @@ class ABCFold2ExecutionRequest:
                 "run_boltz": self.run_boltz,
                 "run_chai": self.run_chai,
                 "max_active_provider_calls": self.max_active_provider_calls,
+                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
                 "app_version": self.app_version,
                 "boltz_version": self.boltz_version,
                 "chai_version": self.chai_version,
@@ -268,7 +280,7 @@ class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
         return self._create_or_verify_run(
             plan=self.request.execution_plan,
             max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=self.request.max_active_provider_calls,
+            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:
@@ -695,9 +707,8 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
             raise ValueError(
                 "Candidate request and generic restart overrides are mutually exclusive"
             )
-        del max_active_gpu_provider_calls
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,
@@ -715,6 +726,11 @@ class ABCFold2ExecutionCoordinator(ExecutionCoordinatorLifecycle):
                             predecessor.max_active_provider_calls
                             if max_active_provider_calls is None
                             else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
                         ),
                     )
                 register_output_claim_successor(

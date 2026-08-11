@@ -268,12 +268,24 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         """Apply one publication, recovery, and admission cycle."""
         self._provider.advance_once(
             self.execution_run_id,
-            recover_publications=self._recover_publications,
+            recover_publications=lambda: self._with_volume_io(
+                self._recover_publications
+            ),
             reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=self._decode_completed_calls,
-            start_ready_nodes=self._start_ready_nodes,
-            after_start_ready_nodes=self._complete_local_result,
-            admit_remote_tasks=self._admit_remote_tasks,
+            decode_completed_calls=lambda: self._with_volume_io(
+                self._decode_completed_calls
+            ),
+            start_ready_nodes=lambda required: self._with_volume_io(
+                self._start_ready_nodes,
+                required,
+            ),
+            after_start_ready_nodes=lambda: self._with_volume_io(
+                self._complete_local_result
+            ),
+            admit_remote_tasks=lambda required: self._with_volume_io(
+                self._admit_remote_tasks,
+                required,
+            ),
             now=self._now,
         )
 
@@ -773,7 +785,7 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
     ) -> None:
         """Validate and persist a Successor request without driving it."""
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,

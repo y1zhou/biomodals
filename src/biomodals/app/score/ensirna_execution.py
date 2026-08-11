@@ -84,6 +84,8 @@ class EnsirnaExecutionRequest:
     preprocess_shard_size: int
     force_generation: str | None
     app_version: str
+    max_active_provider_calls: int | None = None
+    max_active_gpu_provider_calls: int = 1
     replace_claim_owner: str | None = None
 
     def __post_init__(self) -> None:
@@ -96,6 +98,20 @@ class EnsirnaExecutionRequest:
             or self.preprocess_shard_size < 1
         ):
             raise ValueError("ENsiRNA worker settings must be positive")
+        if self.prepare_workers * self.pdb_cores > 64:
+            raise ValueError("prepare_workers * pdb_cores must not exceed 64")
+        if self.max_active_provider_calls is None:
+            object.__setattr__(
+                self,
+                "max_active_provider_calls",
+                self.prepare_workers,
+            )
+        if (
+            self.max_active_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 0
+            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+        ):
+            raise ValueError("ENsiRNA provider-call limits are invalid")
         if not self.app_version:
             raise ValueError("ENsiRNA app version cannot be empty")
 
@@ -150,6 +166,8 @@ class EnsirnaExecutionRequest:
                 "preprocess_shard_size": self.preprocess_shard_size,
                 "force_generation": self.force_generation,
                 "app_version": self.app_version,
+                "max_active_provider_calls": self.max_active_provider_calls,
+                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
                 "replace_claim_owner": self.replace_claim_owner,
             },
             option=orjson.OPT_SORT_KEYS,
@@ -253,8 +271,8 @@ class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
     def _initialize(self):
         return self._create_or_verify_run(
             plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.prepare_workers,
-            max_active_gpu_provider_calls=1,
+            max_active_provider_calls=self.request.max_active_provider_calls,
+            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:
@@ -626,13 +644,15 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         candidate_request: EnsirnaExecutionRequest | None = None,
     ) -> None:
         """Validate and persist a Successor request without driving it."""
-        del max_active_gpu_provider_calls
-        if candidate_request is not None and max_active_provider_calls is not None:
+        if candidate_request is not None and (
+            max_active_provider_calls is not None
+            or max_active_gpu_provider_calls is not None
+        ):
             raise ValueError(
                 "Candidate request and generic restart overrides are mutually exclusive"
             )
         with self._drive_lock:
-            with self._writer_lock:
+            with self._volume_io_lock, self._writer_lock:
                 self.output_volume.reload()
                 with self._open_successor_source(
                     predecessor_execution_run_id,
@@ -646,10 +666,15 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 if candidate_request is None:
                     request = replace(
                         request,
-                        prepare_workers=(
+                        max_active_provider_calls=(
                             predecessor.max_active_provider_calls
                             if max_active_provider_calls is None
                             else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
                         ),
                     )
                 register_output_claim_successor(

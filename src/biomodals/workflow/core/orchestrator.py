@@ -155,6 +155,7 @@ class ExecutionCoordinator:
     deployment_environment: str = modal.parameter()
     deployment_name: str = modal.parameter()
     deployment_version: int = modal.parameter()
+    development: bool = modal.parameter()
 
     @modal.enter()
     def enter(self) -> None:
@@ -734,6 +735,7 @@ class ExecutionCoordinator:
             deployment_environment=deployment.environment,
             deployment_name=deployment.deployment_name,
             deployment_version=deployment.deployment_version,
+            development=self.development,
         )
 
     def _verified_overview(self) -> ExecutionOverview:

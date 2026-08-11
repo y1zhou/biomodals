@@ -19,6 +19,8 @@ from biomodals.workflow.ppiflow import manifests, tables
 
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
 MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 100_000
 MAX_ARCHIVE_SELECTED_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_SELECTED_MEMBERS = 10_000
 _ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
@@ -575,6 +577,8 @@ def _collect_tar_zst_members[ArchiveItem](
 
     selected: list[ArchiveItem] = []
     selected_bytes = 0
+    member_count = 0
+    expanded_bytes = 0
     compressed_context = (
         BytesIO(source) if isinstance(source, bytes) else source.open("rb")
     )
@@ -582,6 +586,11 @@ def _collect_tar_zst_members[ArchiveItem](
         reader = zstd.ZstdDecompressor().stream_reader(compressed)
         with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
             for member in tar:
+                member_count, expanded_bytes = _check_archive_input_limits(
+                    member,
+                    member_count=member_count,
+                    expanded_bytes=expanded_bytes,
+                )
                 if not member.isfile() or not include(member):
                     continue
                 _check_archive_selection_limits(
@@ -614,10 +623,17 @@ def _stream_tar_zst_member_records[ArchiveItem](
 
     selected: list[ArchiveItem] = []
     selected_bytes = 0
+    member_count = 0
+    expanded_bytes = 0
     with source.open("rb") as compressed:
         reader = zstd.ZstdDecompressor().stream_reader(compressed)
         with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
             for member in tar:
+                member_count, expanded_bytes = _check_archive_input_limits(
+                    member,
+                    member_count=member_count,
+                    expanded_bytes=expanded_bytes,
+                )
                 if not member.isfile() or not include(member):
                     continue
                 _check_archive_selection_limits(
@@ -654,6 +670,25 @@ def _check_archive_selection_limits(
         raise ValueError(f"Archive member is too large: {member.name}")
     if selected_bytes > MAX_ARCHIVE_SELECTED_BYTES:
         raise ValueError("Selected archive files exceed the expanded-size limit")
+
+
+def _check_archive_input_limits(
+    member: tarfile.TarInfo,
+    *,
+    member_count: int,
+    expanded_bytes: int,
+) -> tuple[int, int]:
+    member_count += 1
+    if member_count > MAX_ARCHIVE_MEMBERS:
+        raise ValueError("Archive contains too many members")
+    if not member.isfile():
+        return member_count, expanded_bytes
+    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+        raise ValueError(f"Archive member is too large: {member.name}")
+    expanded_bytes += member.size
+    if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+        raise ValueError("Archive exceeds the expanded-size limit")
+    return member_count, expanded_bytes
 
 
 def _required_member_bytes(member: tarfile.TarInfo, data: bytes | None) -> bytes:

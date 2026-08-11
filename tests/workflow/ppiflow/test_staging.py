@@ -157,6 +157,20 @@ def test_archive_reader_rejects_oversized_selected_member(
         staging.files_from_tar_zst_path(archive_path, suffixes=(".pdb",))
 
 
+def test_archive_reader_rejects_oversized_ignored_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "outputs.tar.zst"
+    archive_path.write_bytes(
+        _tar_zst_bytes({"notes.txt": b"large", "design.pdb": b"ATOM"})
+    )
+    monkeypatch.setattr(staging, "MAX_ARCHIVE_MEMBER_BYTES", 4)
+
+    with pytest.raises(ValueError, match="member is too large"):
+        staging.files_from_tar_zst_path(archive_path, suffixes=(".pdb",))
+
+
 def test_stage2_input_manifest_rows_scan_structure_directory(
     tmp_path: Path,
 ) -> None:

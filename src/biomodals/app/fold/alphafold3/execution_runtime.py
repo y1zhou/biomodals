@@ -224,7 +224,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         return self._create_or_verify_run(
             plan=self.request.execution_plan,
             max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=self.request.max_num_gpus,
+            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:

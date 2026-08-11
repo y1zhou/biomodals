@@ -103,8 +103,6 @@ class GromacsExecutionRequest:
             <= self.max_active_provider_calls
         ):
             raise ValueError("GPU call limit must fit within the total call limit")
-        if not self.cpu_only and self.max_active_gpu_provider_calls < 1:
-            raise ValueError("GPU GROMACS Runs require at least one GPU call slot")
 
     @property
     def execution_plan(self):

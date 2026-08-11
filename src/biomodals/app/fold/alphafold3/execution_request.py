@@ -30,7 +30,7 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
 from biomodals.execution import ExecutionPlan
 from biomodals.helper.app_execution import ExecutionRequestFile
 
-EXECUTION_REQUEST_SCHEMA_VERSION = 1
+EXECUTION_REQUEST_SCHEMA_VERSION = 2
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"
 MAX_EXECUTION_REQUEST_BYTES = 64 * 1024 * 1024
 _REQUEST_FILE = ExecutionRequestFile(
@@ -50,6 +50,8 @@ class AlphaFold3ExecutionRequest:
     search_protein_templates: bool
     max_parallel_search_workers: int
     max_num_gpus: int
+    max_active_provider_calls: int
+    max_active_gpu_provider_calls: int
     recycle: int
     sample: int
 
@@ -62,6 +64,8 @@ class AlphaFold3ExecutionRequest:
         search_protein_templates: bool,
         max_parallel_search_workers: int,
         max_num_gpus: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
         recycle: int,
         sample: int,
     ) -> AlphaFold3ExecutionRequest:
@@ -73,6 +77,25 @@ class AlphaFold3ExecutionRequest:
             raise TypeError("search_protein_templates must be a boolean")
         validate_search_worker_budget(max_parallel_search_workers)
         validate_inference_worker_budget(max_num_gpus)
+        total_call_limit = (
+            max(max_parallel_search_workers, max_num_gpus)
+            if max_active_provider_calls is None
+            else max_active_provider_calls
+        )
+        gpu_call_limit = (
+            max_num_gpus
+            if max_active_gpu_provider_calls is None
+            else max_active_gpu_provider_calls
+        )
+        if (
+            isinstance(total_call_limit, bool)
+            or not isinstance(total_call_limit, int)
+            or total_call_limit < 1
+            or isinstance(gpu_call_limit, bool)
+            or not isinstance(gpu_call_limit, int)
+            or not 0 <= gpu_call_limit <= total_call_limit
+        ):
+            raise ValueError("AlphaFold3 provider-call limits are invalid")
         validate_inference_parameters(recycle, sample)
         validate_inference_workload(validated.modelSeeds, sample)
         invocation = prepare_invocation(
@@ -89,6 +112,8 @@ class AlphaFold3ExecutionRequest:
             search_protein_templates=search_protein_templates,
             max_parallel_search_workers=max_parallel_search_workers,
             max_num_gpus=max_num_gpus,
+            max_active_provider_calls=total_call_limit,
+            max_active_gpu_provider_calls=gpu_call_limit,
             recycle=recycle,
             sample=sample,
         )
@@ -97,11 +122,6 @@ class AlphaFold3ExecutionRequest:
     def execution_plan(self) -> ExecutionPlan:
         """Return the immutable scientific DAG persisted by the kernel."""
         return build_alphafold3_execution_plan(self.invocation)
-
-    @property
-    def max_active_provider_calls(self) -> int:
-        """Return the total call ceiling for the sequential CPU/GPU phases."""
-        return max(self.max_parallel_search_workers, self.max_num_gpus)
 
     def to_bytes(self) -> bytes:
         """Serialize trusted state without paths or local Python objects."""
@@ -117,6 +137,8 @@ class AlphaFold3ExecutionRequest:
                 "search_protein_templates": self.search_protein_templates,
                 "max_parallel_search_workers": self.max_parallel_search_workers,
                 "max_num_gpus": self.max_num_gpus,
+                "max_active_provider_calls": self.max_active_provider_calls,
+                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
                 "recycle": self.recycle,
                 "sample": self.sample,
             },
@@ -155,6 +177,14 @@ class AlphaFold3ExecutionRequest:
                 "max_parallel_search_workers",
             ),
             max_num_gpus=_required_int(value, "max_num_gpus"),
+            max_active_provider_calls=_required_int(
+                value,
+                "max_active_provider_calls",
+            ),
+            max_active_gpu_provider_calls=_required_int(
+                value,
+                "max_active_gpu_provider_calls",
+            ),
             recycle=_required_int(value, "recycle"),
             sample=_required_int(value, "sample"),
         )

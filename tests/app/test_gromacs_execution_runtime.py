@@ -219,6 +219,10 @@ def test_gromacs_request_rejects_unmaterialized_random_sentinels() -> None:
         replace(_request(), genion_seed=0)
 
 
+def test_gromacs_request_allows_zero_gpu_admission_for_cached_results() -> None:
+    assert replace(_request(), max_active_gpu_provider_calls=0).cpu_only is False
+
+
 def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None:
     request = _request()
     driver = CompletingDriver(tmp_path, request.run_name)

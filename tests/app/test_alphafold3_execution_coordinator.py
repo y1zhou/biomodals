@@ -83,7 +83,9 @@ class FakeRuntime:
                     plan=self.request.execution_plan,
                     deployment=self.deployment,
                     max_active_provider_calls=(self.request.max_active_provider_calls),
-                    max_active_gpu_provider_calls=self.request.max_num_gpus,
+                    max_active_gpu_provider_calls=(
+                        self.request.max_active_gpu_provider_calls
+                    ),
                     now=10,
                 )
             return self.store.execution.overview(self.execution_run_id)
@@ -146,7 +148,7 @@ def _persist_failed_predecessor(
             plan=request.execution_plan,
             deployment=DEPLOYMENT,
             max_active_provider_calls=request.max_active_provider_calls,
-            max_active_gpu_provider_calls=request.max_num_gpus,
+            max_active_gpu_provider_calls=request.max_active_gpu_provider_calls,
             now=1,
         )
         predecessor_store.execution.start_node(
@@ -373,3 +375,20 @@ def test_restart_rejects_a_gpu_limit_above_the_total_limit() -> None:
             max_active_provider_calls=1,
             max_active_gpu_provider_calls=2,
         )
+
+
+def test_restart_keeps_positive_batching_with_zero_gpu_admission() -> None:
+    """Cache-only restart limits do not become an invalid batching width."""
+    request = _request(max_num_gpus=2)
+
+    restarted = _restart_request(
+        request,
+        predecessor_max_active_provider_calls=2,
+        predecessor_max_active_gpu_provider_calls=2,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=0,
+    )
+
+    assert restarted.max_num_gpus == 2
+    assert restarted.max_active_provider_calls == 2
+    assert restarted.max_active_gpu_provider_calls == 0

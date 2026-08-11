@@ -156,8 +156,10 @@ def _restart_request(
         request.config,
         search_msa=request.search_msa,
         search_protein_templates=request.search_protein_templates,
-        max_parallel_search_workers=total,
-        max_num_gpus=gpu,
+        max_parallel_search_workers=request.max_parallel_search_workers,
+        max_num_gpus=request.max_num_gpus,
+        max_active_provider_calls=total,
+        max_active_gpu_provider_calls=gpu,
         recycle=request.recycle,
         sample=request.sample,
     )

@@ -667,6 +667,24 @@ class ExecutionRuntime:
                     else remaining_total_slots
                 )
                 if resource_slots <= 0:
+                    if uses_gpu and run.max_active_gpu_provider_calls == 0:
+                        with self._synchronize():
+                            blocked = (
+                                self.repository.list_ready_fixed_dispatch_descriptors(
+                                    execution_run_id,
+                                    node_keys,
+                                    uses_gpu=True,
+                                    depth=depth,
+                                    unblocking_span=unblocking_span,
+                                    limit_per_node=1,
+                                )
+                            )
+                        if blocked:
+                            self._suspend_for_unavailable_gpu_capacity(
+                                execution_run_id,
+                                now=now,
+                            )
+                            return ()
                     continue
                 lookahead = max(1, resource_slots * 4)
                 with self._synchronize():
@@ -704,6 +722,30 @@ class ExecutionRuntime:
                 if len(selected) == available_total_slots:
                     return tuple(selected)
         return tuple(selected)
+
+    def _suspend_for_unavailable_gpu_capacity(
+        self,
+        execution_run_id: UUID,
+        *,
+        now: int,
+    ) -> None:
+        """Suspend missing GPU work when the Run admits no GPU calls."""
+        with self._synchronize():
+            with self._transaction():
+                run = self.repository.get_run(execution_run_id)
+                if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+                    return
+                self.repository.transition_run(
+                    execution_run_id,
+                    RunStatus.SUSPENDED,
+                    reason=RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE,
+                    message=(
+                        "Required GPU work is missing while "
+                        "max_active_gpu_provider_calls is zero"
+                    ),
+                    now=now,
+                )
+            self._checkpoint_state()
 
     def persist_fixed_dispatch_policy(
         self,
@@ -1513,7 +1555,7 @@ class AsyncExecutionRuntime:
         cancellation_requested = False
         if authorized:
             try:
-                with self.repository.savepoint("async_attachment_set"):
+                with self.repository.savepoint():
                     for preclaim in authorized:
                         provider_call_id = preclaim.call.provider_call_id
                         current = self.repository.get_provider_call(
@@ -1555,7 +1597,7 @@ class AsyncExecutionRuntime:
                             handle_id,
                             exc_info=True,
                         )
-                with self.repository.savepoint("async_attachment_failure"):
+                with self.repository.savepoint():
                     for preclaim in authorized:
                         call = self.repository.get_provider_call(
                             preclaim.call.provider_call_id,

@@ -103,6 +103,7 @@ def test_run_reason_vocabulary_is_closed() -> None:
     assert tuple(RunStatusReason) == (
         RunStatusReason.COORDINATOR_ERROR,
         RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+        RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE,
         RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN,
         RunStatusReason.PROVIDER_OUTCOME_UNKNOWN,
         RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN,

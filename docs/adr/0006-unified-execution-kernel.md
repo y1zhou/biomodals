@@ -230,7 +230,8 @@ failure, suspension, or unknown-reason columns.
 
 The initial Run-reason vocabulary was accepted on 2026-07-29 and extended by
 the result-validation policy below. A `suspended` Run requires
-`coordinator_error` or `result_validation_unknown`. A `state_unknown` Run
+`coordinator_error`, `result_validation_unknown`, or
+`resource_capacity_unavailable`. A `state_unknown` Run
 requires one of `submission_outcome_unknown`, `provider_outcome_unknown`, or
 `cancellation_outcome_unknown`. A `failed` Run requires either
 `required_work_failed` or `deployment_unavailable`. Every other Run status

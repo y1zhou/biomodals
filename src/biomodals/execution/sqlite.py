@@ -110,6 +110,7 @@ _RUN_REASONS: Mapping[RunStatus, frozenset[RunStatusReason]] = {
     RunStatus.SUSPENDED: frozenset({
         RunStatusReason.COORDINATOR_ERROR,
         RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+        RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE,
     }),
     RunStatus.STATE_UNKNOWN: frozenset({
         RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN,
@@ -413,6 +414,7 @@ _SCHEMA_DROP_ORDER = (
     "execution_runs",
     "execution_schema",
 )
+_READY_NODE_QUERY_CHUNK_SIZE = 100
 
 
 class SqliteExecutionRepository:
@@ -425,19 +427,17 @@ class SqliteExecutionRepository:
         self._connection.execute("PRAGMA foreign_keys = ON")
 
     @contextmanager
-    def savepoint(self, name: str) -> Iterator[None]:
+    def savepoint(self) -> Iterator[None]:
         """Make one compound transition atomic without owning the transaction."""
-        if not name.isidentifier():
-            raise ValueError("savepoint name must be an identifier")
-        self._connection.execute(f"SAVEPOINT {name}")  # noqa: S608
+        self._connection.execute("SAVEPOINT execution_runtime")
         try:
             yield
         except BaseException:
-            self._connection.execute(f"ROLLBACK TO {name}")  # noqa: S608
-            self._connection.execute(f"RELEASE {name}")  # noqa: S608
+            self._connection.execute("ROLLBACK TO execution_runtime")
+            self._connection.execute("RELEASE execution_runtime")
             raise
         else:
-            self._connection.execute(f"RELEASE {name}")  # noqa: S608
+            self._connection.execute("RELEASE execution_runtime")
 
     def initialize_schema(self) -> None:
         """Create the current schema or reject another recorded version."""
@@ -3398,38 +3398,48 @@ class SqliteExecutionRepository:
         if not ordered_keys:
             return ()
         rows: list[sqlite3.Row] = []
-        for node_key in ordered_keys:
+        common_parameters: dict[str, object] = {
+            "execution_run_id": str(execution_run_id),
+            "node_status": NodeStatus.RUNNING.value,
+            "task_status": TaskStatus.PENDING.value,
+            "result_observation": AvailabilityStatus.MISSING.value,
+            "uses_gpu": int(uses_gpu),
+            "limit_per_node": limit_per_node,
+        }
+        for offset in range(0, len(ordered_keys), _READY_NODE_QUERY_CHUNK_SIZE):
+            chunk = ordered_keys[offset : offset + _READY_NODE_QUERY_CHUNK_SIZE]
+            parameters = dict(common_parameters)
+            selections = []
+            for index, node_key in enumerate(chunk):
+                parameter = f"node_{index}"
+                parameters[parameter] = node_key
+                selection = f"""
+                    SELECT * FROM (
+                        SELECT task.*, node.ordinal AS node_ordinal
+                        FROM execution_tasks AS task
+                        JOIN execution_nodes AS node
+                            ON node.execution_run_id = task.execution_run_id
+                            AND node.node_key = task.node_key
+                        WHERE task.execution_run_id = :execution_run_id
+                            AND task.node_key = :{parameter}
+                            AND node.status = :node_status
+                            AND node.discovery_complete = 1
+                            AND task.status = :task_status
+                            AND task.result_observation = :result_observation
+                            AND task.dispatch_policy_json IS NOT NULL
+                            AND json_extract(
+                                task.dispatch_policy_json,
+                                '$.binding.uses_gpu'
+                            ) = :uses_gpu
+                        ORDER BY task.ordinal
+                        LIMIT :limit_per_node
+                    )
+                    """  # noqa: S608 - parameter name is generated
+                selections.append(selection)
             rows.extend(
                 self._connection.execute(
-                    """
-                    SELECT task.*, node.ordinal AS node_ordinal
-                    FROM execution_tasks AS task
-                    JOIN execution_nodes AS node
-                        ON node.execution_run_id = task.execution_run_id
-                        AND node.node_key = task.node_key
-                    WHERE task.execution_run_id = ?
-                        AND task.node_key = ?
-                        AND node.status = ?
-                        AND node.discovery_complete = 1
-                        AND task.status = ?
-                        AND task.result_observation = ?
-                        AND task.dispatch_policy_json IS NOT NULL
-                        AND json_extract(
-                            task.dispatch_policy_json,
-                            '$.binding.uses_gpu'
-                        ) = ?
-                    ORDER BY task.ordinal
-                    LIMIT ?
-                    """,
-                    (
-                        str(execution_run_id),
-                        node_key,
-                        NodeStatus.RUNNING.value,
-                        TaskStatus.PENDING.value,
-                        AvailabilityStatus.MISSING.value,
-                        int(uses_gpu),
-                        limit_per_node,
-                    ),
+                    " UNION ALL ".join(selections),
+                    parameters,
                 ).fetchall()
             )
         rows.sort(key=lambda row: (row["node_ordinal"], row["ordinal"]))

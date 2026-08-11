@@ -41,6 +41,7 @@ class RunStatusReason(StrEnum):
 
     COORDINATOR_ERROR = "coordinator_error"
     RESULT_VALIDATION_UNKNOWN = "result_validation_unknown"
+    RESOURCE_CAPACITY_UNAVAILABLE = "resource_capacity_unavailable"
     SUBMISSION_OUTCOME_UNKNOWN = "submission_outcome_unknown"
     PROVIDER_OUTCOME_UNKNOWN = "provider_outcome_unknown"
     CANCELLATION_OUTCOME_UNKNOWN = "cancellation_outcome_unknown"

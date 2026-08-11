@@ -399,7 +399,7 @@ A repository transition atomically replaces or clears both fields with
 
 | Status | Required `status_reason` |
 | --- | --- |
-| `suspended` | `coordinator_error` or `result_validation_unknown` |
+| `suspended` | `coordinator_error`, `result_validation_unknown`, or `resource_capacity_unavailable` |
 | `state_unknown` | `submission_outcome_unknown`, `provider_outcome_unknown`, or `cancellation_outcome_unknown` |
 | `failed` | `required_work_failed` or `deployment_unavailable` |
 | Every other status | `NULL` |

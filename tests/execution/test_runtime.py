@@ -329,6 +329,46 @@ def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
     assert [candidate.task_keys for candidate in candidates] == [("seed-0",)]
 
 
+def test_zero_gpu_capacity_suspends_missing_gpu_work() -> None:
+    connection = sqlite3.connect(":memory:")
+    repository = create_repository(
+        connection=connection,
+        task_count=1,
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
+    )
+    runtime = ExecutionRuntime(
+        repository,
+        modal_driver=FakeModalDriver(),
+        checkpoint=connection.commit,
+        transaction=_transaction(connection),
+    )
+
+    candidates = runtime.fixed_call_candidates(
+        RUN_ID,
+        required_node_keys={"inference"},
+        describe_task=lambda node, task, rank: TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=GPU_BINDING,
+            compatibility_key="af3",
+            max_tasks_per_call=1,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
+        ),
+        available_total_slots=1,
+        available_gpu_slots=0,
+        now=110,
+    )
+
+    run = repository.get_run(RUN_ID)
+    assert candidates == ()
+    assert run.status == RunStatus.SUSPENDED
+    assert run.status_reason == RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE
+
+
 def test_fixed_candidate_policy_is_prepared_once_then_admitted_in_windows() -> None:
     repository = create_repository(
         task_count=100,

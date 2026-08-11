@@ -242,7 +242,7 @@ def test_ready_dispatch_window_bounds_each_eligible_node() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SqliteExecutionRepository(connection)
     repository.initialize_schema()
-    node_keys = tuple(f"node-{index}" for index in range(10))
+    node_keys = tuple(f"node-{index}" for index in range(250))
     repository.create_run(
         execution_run_id=RUN_ID,
         plan=ExecutionPlan(
@@ -250,8 +250,8 @@ def test_ready_dispatch_window_bounds_each_eligible_node() -> None:
             nodes=tuple(NodePlan(node_key=node_key) for node_key in node_keys),
         ),
         deployment=DeploymentIdentity("production", "fanout", 1),
-        max_active_provider_calls=10,
-        max_active_gpu_provider_calls=10,
+        max_active_provider_calls=250,
+        max_active_gpu_provider_calls=250,
         now=100,
     )
     descriptors = []
@@ -305,7 +305,7 @@ def test_ready_dispatch_window_bounds_each_eligible_node() -> None:
     assert [(item.node_key, item.task_key) for item in window] == [
         (node_key, "task") for node_key in node_keys
     ]
-    assert len(window_queries) == len(node_keys)
+    assert len(window_queries) == 3
 
 
 def test_pull_worker_policy_is_persisted_before_candidate_formation() -> None:

@@ -1801,7 +1801,9 @@ def run_ppiflow_partial_candidate(
         artifacts,
         candidate_structures,
     )
-    raw_args_template = _ppiflow_step_args(config, step_name=step_name)
+    raw_args_template = deepcopy(config.get("args", config))
+    if not isinstance(raw_args_template, dict):
+        raise ValueError(f"PPIFlow step {step_name!r} args must be a mapping")
     field_name = "complex_pdb" if "complex_pdb" in raw_args_template else "input_pdb"
     staged_path = (
         Path(PPI_FLOW_OUTPUT_MOUNTPOINT)
@@ -4182,37 +4184,39 @@ def _ppiflow_model_scientific_versions(
         return {}
     try:
         expected_model = f"{gentype}.ckpt"
-        ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[expected_model]
+        model_file_id = ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[expected_model]
     except KeyError as error:
         raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}") from error
     for step_name, partial in active_steps:
         selected_model = _ppiflow_step_model_weights_name(
             _step_cfg(steps, step_name),
             partial=partial,
+            fixed_positions_from_upstream=(
+                partial and _step_enabled(enabled, "RosettaFixStep")
+            ),
         )
         if selected_model != expected_model:
             raise ValueError(
                 f"PPIFlow gentype {gentype!r} disagrees with enabled step "
                 f"{step_name!r} model {selected_model!r}"
             )
-    return {
-        f"ppiflow.model.{expected_model}": ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[
-            expected_model
-        ]
-    }
+    return {f"ppiflow.model.{expected_model}": model_file_id}
 
 
 def _ppiflow_step_model_weights_name(
     config: dict[str, Any],
     *,
     partial: bool,
+    fixed_positions_from_upstream: bool = False,
 ) -> str:
-    raw_args = _ppiflow_step_args(config)
+    raw_args = deepcopy(config.get("args", config))
+    if not isinstance(raw_args, dict):
+        raise ValueError("PPIFlow step args must be a mapping")
     if partial:
         app_args = _validated_ppiflow_partial_args(
             raw_args,
             structure_path="/workflow-input/candidate.pdb",
-            fixed_positions="A1",
+            fixed_positions=("A1" if fixed_positions_from_upstream else None),
         )
     else:
         app_args = ppiflow_app.PPIFlowArgs.model_validate({"args": raw_args})
@@ -4232,25 +4236,13 @@ def _ppiflow_step_model_weights_name(
     return app_args.model_weights_name
 
 
-def _ppiflow_step_args(
-    config: dict[str, Any],
-    *,
-    step_name: str | None = None,
-) -> dict[str, Any]:
-    raw_args = deepcopy(config.get("args", config))
-    if not isinstance(raw_args, dict):
-        label = f" {step_name!r}" if step_name is not None else ""
-        raise ValueError(f"PPIFlow step{label} args must be a mapping")
-    return raw_args
-
-
 def _validated_ppiflow_partial_args(
     raw_args: dict[str, Any],
     *,
     structure_path: str,
     fixed_positions: str | None,
 ) -> ppiflow_app.PPIFlowArgs:
-    completed = deepcopy(raw_args)
+    completed = raw_args.copy()
     structure_field = "complex_pdb" if "complex_pdb" in completed else "input_pdb"
     completed[structure_field] = structure_path
     if "fixed_positions" not in completed and fixed_positions is not None:

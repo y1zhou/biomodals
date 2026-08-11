@@ -370,6 +370,22 @@ def test_partial_model_identity_uses_runtime_structure_mode(
     )
 
 
+def test_partial_step_requires_fixed_positions_without_producer() -> None:
+    with pytest.raises(ValueError, match="fixed_positions"):
+        build_ppiflow_workflow(
+            task_yaml_bytes=_task_yaml(enabled_steps="  PartialStep: true\n"),
+            steps_yaml_bytes=b"""
+PartialStep:
+  args:
+    name: demo
+    specified_hotspots: A1
+    input_pdb: /inputs/candidate.pdb
+    start_t: 0.15
+""",
+            stage=2,
+        )
+
+
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
 

@@ -124,19 +124,19 @@ class AF3ScoreExecutionRequest:
             raise ValueError("AF3Score staged input Run ID must be canonical")
         if self.prepare_workers < 1 or self.max_batches < 1:
             raise ValueError("AF3Score worker limits must be positive")
-        if self.max_active_provider_calls is None:
-            object.__setattr__(self, "max_active_provider_calls", self.max_batches)
-        if self.max_active_gpu_provider_calls is None:
+        total_limit = self.max_active_provider_calls
+        if total_limit is None:
+            total_limit = self.max_batches
+            object.__setattr__(self, "max_active_provider_calls", total_limit)
+        gpu_limit = self.max_active_gpu_provider_calls
+        if gpu_limit is None:
+            gpu_limit = self.max_batches
             object.__setattr__(
                 self,
                 "max_active_gpu_provider_calls",
-                self.max_batches,
+                gpu_limit,
             )
-        if (
-            self.max_active_provider_calls < 1
-            or self.max_active_gpu_provider_calls < 0
-            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
-        ):
+        if total_limit < 1 or gpu_limit < 0 or gpu_limit > total_limit:
             raise ValueError("AF3Score provider-call limits are invalid")
         if not self.app_version or not self.model_identity:
             raise ValueError("AF3Score scientific versions cannot be empty")

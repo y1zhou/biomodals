@@ -119,20 +119,22 @@ class OligoformerExecutionRequest:
             raise ValueError("Full-human OligoFormer runs require a reference version")
         if self.top_n != -1 and self.top_n < 1:
             raise ValueError("top_n must be -1 or a positive integer")
-        if self.max_active_provider_calls is None:
+        total_limit = self.max_active_provider_calls
+        if total_limit is None:
+            total_limit = max(
+                2,
+                self.off_target_process_slots,
+                self.targetscan_rnaplfold_nodes,
+            )
             object.__setattr__(
                 self,
                 "max_active_provider_calls",
-                max(
-                    2,
-                    self.off_target_process_slots,
-                    self.targetscan_rnaplfold_nodes,
-                ),
+                total_limit,
             )
         if (
-            self.max_active_provider_calls < 1
+            total_limit < 1
             or self.max_active_gpu_provider_calls < 0
-            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+            or self.max_active_gpu_provider_calls > total_limit
         ):
             raise ValueError("OligoFormer provider-call limits are invalid")
         if (

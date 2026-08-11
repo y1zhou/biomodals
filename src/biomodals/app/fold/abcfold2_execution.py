@@ -104,16 +104,18 @@ class ABCFold2ExecutionRequest:
         """Reject empty inputs and unusable coordinator capacity."""
         if not self.run_name or not self.yaml_content:
             raise ValueError("ABCFold2 run name and YAML cannot be empty")
-        if self.max_active_gpu_provider_calls is None:
+        gpu_limit = self.max_active_gpu_provider_calls
+        if gpu_limit is None:
+            gpu_limit = self.max_active_provider_calls
             object.__setattr__(
                 self,
                 "max_active_gpu_provider_calls",
-                self.max_active_provider_calls,
+                gpu_limit,
             )
         if (
             self.max_active_provider_calls < 1
-            or self.max_active_gpu_provider_calls < 0
-            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
+            or gpu_limit < 0
+            or gpu_limit > self.max_active_provider_calls
         ):
             raise ValueError("ABCFold2 provider-call limits are invalid")
         if not self.app_version or not self.boltz_version or not self.chai_version:

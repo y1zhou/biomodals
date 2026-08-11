@@ -74,6 +74,7 @@ class FakeGromacsAdapter:
         self.submissions: list[tuple[bytes, str, GromacsJobOptions]] = []
         self.submission_configurations: list[tuple[str, str, int]] = []
         self.cancellations: list[str] = []
+        self.cancel_failures_remaining = 0
         self.recovery_attempts: list[UUID] = []
         self.published_archives: set[UUID] = set()
         self.downloads = 0
@@ -173,6 +174,9 @@ class FakeGromacsAdapter:
 
     async def cancel(self, provider_call_handle_id: str) -> None:
         self.cancellations.append(provider_call_handle_id)
+        if self.cancel_failures_remaining:
+            self.cancel_failures_remaining -= 1
+            raise RuntimeError("provider cancellation unavailable")
 
     async def recover_archive(self, job) -> FinalArchive:
         self.recovery_attempts.append(job.job_id)
@@ -2626,6 +2630,38 @@ def test_reconciliation_replays_durable_cancellation(tmp_path: Path) -> None:
     assert adapter.cancellations == ["fc-2", "fc-3", "fc-4"]
 
 
+def test_reconciliation_retries_inconclusive_cancellation(tmp_path: Path) -> None:
+    client, auth, store, adapter = _service(tmp_path)
+    _activate(auth, "alice@example.com")
+    csrf_token = _login(client, "alice@example.com")
+    submitted = _submit(client, csrf_token, idempotency_key=str(uuid4()))
+    job_id = UUID(submitted.json()["job_id"])
+    _advance_gromacs(
+        store,
+        adapter,
+        job_id,
+        completed=("fc-1",),
+        now=1_799_999_999,
+    )
+    adapter.cancel_failures_remaining = 1
+
+    response = client.post(
+        f"/api/v1/jobs/{job_id}/cancel",
+        headers=_unsafe_headers(csrf_token),
+    )
+    asyncio.run(
+        GromacsExecutionCoordinator(
+            store,
+            adapter,
+            now=iter(range(1_800_000_001, 1_800_000_100)).__next__,
+        ).reconcile()
+    )
+
+    assert response.status_code == 202
+    assert response.json()["state"] == "state_unknown"
+    assert adapter.cancellations.count("fc-2") == 2
+
+
 def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     client, auth, store, adapter = _service(tmp_path)
     _activate(auth, "alice@example.com")
@@ -2662,14 +2698,7 @@ def test_cancel_is_a_posted_idempotent_state_transition(tmp_path: Path) -> None:
     assert first.json()["state"] == "cancel_requested"
     assert replay.status_code == 202
     assert replay.json()["state"] == "cancel_requested"
-    assert adapter.cancellations == [
-        "fc-2",
-        "fc-3",
-        "fc-4",
-        "fc-2",
-        "fc-3",
-        "fc-4",
-    ]
+    assert adapter.cancellations == 2 * ["fc-2", "fc-3", "fc-4"]
     assert old_delete_route.status_code == 405
 
     _advance_gromacs(

@@ -1643,6 +1643,8 @@ class ServiceStore:
         workload_clause = "" if workload is None else " AND workload = ?"
         parameters: tuple[str, ...] = (
             *(state.value for state in _RECONCILABLE_RUN_STATUSES),
+            RunStatus.STATE_UNKNOWN.value,
+            RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN.value,
             RunStatus.SUCCEEDED.value,
             RunStatus.PARTIAL.value,
             *((workload,) if workload is not None else ()),
@@ -1654,6 +1656,10 @@ class ServiceStore:
                 JOIN execution_runs USING (execution_run_id)
                 WHERE (
                     execution_runs.status IN ({placeholders})
+                    OR (
+                        execution_runs.status = ?
+                        AND execution_runs.status_reason = ?
+                    )
                     OR (
                         execution_runs.status IN (?, ?)
                         AND jobs.result_state IS NULL

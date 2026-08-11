@@ -1574,6 +1574,8 @@ class AsyncExecutionRuntime:
                     provider_call_id,
                     now=now,
                 )
+        if errors:
+            raise next(iter(errors.values()))
 
         return tuple(
             None

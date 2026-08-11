@@ -4123,10 +4123,11 @@ def build_ppiflow_workflow(
             "flowpacker": app_scientific_version(flowpacker_app.CONF),
             "ligandmpnn": app_scientific_version(ligandmpnn_app.CONF),
             "ppiflow": app_scientific_version(ppiflow_app.CONF),
-            **{
-                f"ppiflow.model.{name}": file_id
-                for name, file_id in ppiflow_app.PPI_FLOW_MODEL_FILE_IDS.items()
-            },
+            **_ppiflow_model_scientific_versions(
+                enabled=enabled,
+                gentype=gentype,
+                stage=stage,
+            ),
             "rosetta": app_scientific_version(rosetta_app.CONF),
         },
     )
@@ -4166,6 +4167,29 @@ def build_ppiflow_workflow(
         )
 
     return workflow
+
+
+def _ppiflow_model_scientific_versions(
+    *,
+    enabled: dict[str, bool],
+    gentype: str,
+    stage: int | None,
+) -> dict[str, str]:
+    uses_model = (stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep")) or (
+        stage in {None, 2} and _step_enabled(enabled, "PartialStep")
+    )
+    if not uses_model:
+        return {}
+    try:
+        model_name = {
+            "binder": "binder.ckpt",
+            "antibody": "antibody.ckpt",
+            "nanobody": "nanobody.ckpt",
+        }[gentype]
+        file_id = ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[model_name]
+    except KeyError as error:
+        raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}") from error
+    return {f"ppiflow.model.{model_name}": file_id}
 
 
 def _add_stage1_nodes(

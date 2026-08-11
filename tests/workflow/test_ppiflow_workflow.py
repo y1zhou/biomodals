@@ -211,6 +211,53 @@ PPIFlowStep:
         workflow.validate().scientific_versions["ppiflow.model.binder.ckpt"]
         == ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["binder.ckpt"]
     )
+    assert not {
+        key
+        for key in workflow.validate().scientific_versions
+        if key.startswith("ppiflow.model.") and key != "ppiflow.model.binder.ckpt"
+    }
+
+
+def test_ppiflow_plan_ignores_unused_model_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fingerprint() -> str:
+        workflow = build_ppiflow_workflow(
+            task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: true\n"),
+            steps_yaml_bytes=b"PPIFlowStep: {}\n",
+        )
+        return execution_plan(
+            workflow.validate(),
+            workload_run_key="run-1",
+        ).workload_plan_fingerprint
+
+    baseline = fingerprint()
+    monkeypatch.setitem(
+        ppiflow_app.PPI_FLOW_MODEL_FILE_IDS,
+        "monomer.ckpt",
+        "changed-unused-model",
+    )
+    assert fingerprint() == baseline
+
+    monkeypatch.setitem(
+        ppiflow_app.PPI_FLOW_MODEL_FILE_IDS,
+        "binder.ckpt",
+        "changed-selected-model",
+    )
+    assert fingerprint() != baseline
+
+
+def test_ppiflow_disabled_plan_omits_model_identities() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=_task_yaml(enabled_steps="  PPIFlowStep: false\n"),
+        steps_yaml_bytes=b"{}\n",
+    )
+
+    assert not {
+        key
+        for key in workflow.validate().scientific_versions
+        if key.startswith("ppiflow.model.")
+    }
 
 
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:

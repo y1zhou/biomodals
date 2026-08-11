@@ -3,7 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import sleep
@@ -725,8 +725,38 @@ def test_generic_restart_prepares_successor_before_driving(
     store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
     assert store.execution.get_run(SUCCESSOR_ID).predecessor_execution_run_id == RUN_ID
     assert load_execution_launch(tmp_path, SUCCESSOR_ID) == RUN_ID
+    successor_plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
     assert getattr(successor_coordinator, "_runtime", None) is None
     store.close()
+
+    launch_path = (
+        tmp_path / ".biomodals" / "execution" / "runs" / str(SUCCESSOR_ID) / "launch"
+    )
+    launch_path.unlink()
+    predecessor_store = WorkflowRunStore(tmp_path, RUN_ID)
+    predecessor = predecessor_store.execution.get_run(RUN_ID)
+    predecessor_store.close()
+    wrong_predecessor = replace(
+        predecessor,
+        execution_run_id=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+    )
+    with pytest.raises(ValueError, match="Persisted successor"):
+        successor_coordinator._persist_or_verify_successor(
+            predecessor=wrong_predecessor,
+            plan=successor_plan,
+            deployment=SUCCESSOR_DEPLOYMENT,
+            node_publications=(),
+            task_publications=(),
+        )
+    assert not launch_path.exists()
+    successor_coordinator._persist_or_verify_successor(
+        predecessor=predecessor,
+        plan=successor_plan,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        node_publications=(),
+        task_publications=(),
+    )
+    assert load_execution_launch(tmp_path, SUCCESSOR_ID) == RUN_ID
 
     result = raw_cls.drive_prepared._get_raw_f()(successor_coordinator)
 

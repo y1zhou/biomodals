@@ -427,11 +427,6 @@ class ExecutionCoordinator:
                         "Target deployment changed the Workload Plan Fingerprint"
                     )
                 plan = self._persist_or_verify_plan(successor_plan)
-                persist_execution_launch(
-                    CONF.output_volume_mountpoint,
-                    successor_id,
-                    predecessor_execution_run_id,
-                )
                 self._persist_or_verify_successor(
                     predecessor=predecessor,
                     plan=plan,
@@ -668,10 +663,25 @@ class ExecutionCoordinator:
         execution_run_id, _ = self._identity()
         store = self._run_store()
         try:
-            with store.transaction():
-                try:
-                    existing = store.execution.get_run(execution_run_id)
-                except ExecutionRunNotFoundError:
+            try:
+                existing = store.execution.get_run(execution_run_id)
+            except ExecutionRunNotFoundError:
+                existing = None
+            if existing is not None and (
+                existing.predecessor_execution_run_id != predecessor.execution_run_id
+                or existing.plan != predecessor.plan
+                or existing.deployment != deployment
+                or existing.max_active_provider_calls != plan.max_active_provider_calls
+                or existing.max_active_gpu_provider_calls != plan.effective_gpu_limit
+            ):
+                raise ValueError("Persisted successor does not match restart request")
+            persist_execution_launch(
+                CONF.output_volume_mountpoint,
+                execution_run_id,
+                predecessor.execution_run_id,
+            )
+            if existing is None:
+                with store.transaction():
                     existing = store.execution.create_run(
                         execution_run_id=execution_run_id,
                         predecessor_execution_run_id=(predecessor.execution_run_id),
@@ -697,19 +707,6 @@ class ExecutionCoordinator:
                             artifacts=publication.artifacts,
                             now=int(time.time()),
                         )
-                if (
-                    existing.predecessor_execution_run_id
-                    != predecessor.execution_run_id
-                    or existing.plan != predecessor.plan
-                    or existing.deployment != deployment
-                    or existing.max_active_provider_calls
-                    != plan.max_active_provider_calls
-                    or existing.max_active_gpu_provider_calls
-                    != plan.effective_gpu_limit
-                ):
-                    raise ValueError(
-                        "Persisted successor does not match restart request"
-                    )
         finally:
             store.close()
         OUT_VOLUME.commit()

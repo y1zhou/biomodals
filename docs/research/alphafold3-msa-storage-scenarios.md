@@ -1,6 +1,7 @@
 # AlphaFold 3 MSA database storage and staging scenarios
 
-Status: research and benchmark design, 2026-07-16
+Status: historical benchmark design; production storage is governed by
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
 
 Scope: storage, compression, sharding, staging, and reuse options for the
 AlphaFold 3 data pipeline in

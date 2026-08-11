@@ -1,6 +1,7 @@
 # AlphaFold 3 MSA database sharding for Biomodals
 
-Status: research and design recommendation
+Status: historical research superseded by
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
 Research date: 2026-07-14
 Target: `src/biomodals/app/fold/alphafold3_app.py`
 

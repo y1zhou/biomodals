@@ -7,7 +7,7 @@ import hashlib
 import tarfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from io import BytesIO
+from io import BytesIO, RawIOBase
 from pathlib import Path
 from typing import Protocol
 
@@ -32,12 +32,16 @@ class _Readable(Protocol):
     def read(self, size: int = -1) -> bytes: ...
 
 
-class _BoundedArchiveReader:
+class _BoundedArchiveReader(RawIOBase):
     """Count every decompressed tar byte, including metadata and padding."""
 
     def __init__(self, stream: _Readable) -> None:
+        super().__init__()
         self._stream = stream
         self._bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
 
     def read(self, size: int = -1) -> bytes:
         remaining_with_probe = MAX_ARCHIVE_DECOMPRESSED_BYTES - self._bytes_read + 1

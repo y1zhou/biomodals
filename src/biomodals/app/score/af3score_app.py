@@ -68,10 +68,10 @@ from biomodals.helper.app_run import (
 )
 from biomodals.helper.artifacts import sha256_file
 from biomodals.helper.shell import (
-    copy_files,
     run_command,
     sanitize_filename,
 )
+from biomodals.helper.task_budget import bounded_map
 
 ##########################################
 # Modal configs
@@ -178,6 +178,21 @@ def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
 ##########################################
 # Inference functions
 ##########################################
+def _staged_input_dir(execution_run_id: str) -> Path:
+    """Return one canonical Execution Run's immutable input directory."""
+    parsed = UUID(execution_run_id)
+    if str(parsed) != execution_run_id:
+        raise ValueError("AF3Score staged input Run ID must be canonical")
+    return (
+        Path(CONF.output_volume_mountpoint)
+        / ".biomodals"
+        / "execution"
+        / "runs"
+        / execution_run_id
+        / "inputs"
+    )
+
+
 @app.function(
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
@@ -186,6 +201,7 @@ def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
 )
 def af3score_prepare(
     run_name: str,
+    staged_input_execution_run_id: str,
     input_files: list[str],
     input_digests: dict[str, str],
     publication_key: str,
@@ -195,7 +211,7 @@ def af3score_prepare(
     """Prepare AF3Score batches from staged inputs."""
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
-    staged_dir = layout.inputs_dir.resolve()
+    staged_dir = _staged_input_dir(staged_input_execution_run_id)
     if not staged_dir.exists():
         raise FileNotFoundError(f"Staged input directory not found: {staged_dir}")
 
@@ -206,6 +222,15 @@ def af3score_prepare(
     input_names = [path.name for path in all_files]
     total_files = len(all_files)
     print(f"💊 [PREP] Processing {total_files} files in '{layout.run_root}'")
+
+    def validate_input(path: Path) -> None:
+        expected_digest = input_digests.get(path.stem)
+        if expected_digest is None:
+            raise ValueError(f"Missing AF3Score input digest for '{path.name}'")
+        if sha256_file(path) != expected_digest:
+            raise ValueError(f"Staged AF3Score input digest changed: {path.name}")
+
+    bounded_map(all_files, validate_input, max_parallel=min(prepare_workers, 16))
 
     pending_files: list[Path] = []
     skipped = 0
@@ -236,31 +261,29 @@ def af3score_prepare(
         )
 
     prepare_root = layout.prep_dir
-    pending_input_dir = prepare_root / "pending_inputs"
     batch_dir = prepare_root / "input_batch"
     if prepare_root.exists():
         shutil.rmtree(prepare_root)
-    pending_input_dir.mkdir(parents=True, exist_ok=True)
 
-    copy_files({
-        source_path: pending_input_dir / source_path.name
-        for source_path in pending_files
-    })
-    # Adjust CPU and GPU resources
-    n_batches = min(max(1, num_jobs), len(pending_files))
-    num_jobs_per_batch = max(1, (len(pending_files) + n_batches - 1) // n_batches)
-    n_cpu = min(max(1, prepare_workers), num_jobs_per_batch)
-    run_command([
-        sys.executable,
-        str(CONF.git_clone_dir / "01_prepare_get_json.py"),
-        f"--input_dir={pending_input_dir}",
-        f"--output_dir_cif={prepare_root / 'single_chain_cif'}",
-        f"--save_csv={prepare_root / 'single_seq.csv'}",
-        f"--output_dir_json={prepare_root / 'json'}",
-        f"--batch_dir={batch_dir}",
-        f"--num_jobs={n_batches}",
-        f"--num_workers={n_cpu}",
-    ])
+    with TemporaryDirectory(prefix="af3score_pending_") as pending_temp:
+        pending_input_dir = Path(pending_temp)
+        for source_path in pending_files:
+            pending_input_dir.joinpath(source_path.name).symlink_to(source_path)
+        # Adjust CPU and GPU resources
+        n_batches = min(max(1, num_jobs), len(pending_files))
+        num_jobs_per_batch = max(1, (len(pending_files) + n_batches - 1) // n_batches)
+        n_cpu = min(max(1, prepare_workers), num_jobs_per_batch)
+        run_command([
+            sys.executable,
+            str(CONF.git_clone_dir / "01_prepare_get_json.py"),
+            f"--input_dir={pending_input_dir}",
+            f"--output_dir_cif={prepare_root / 'single_chain_cif'}",
+            f"--save_csv={prepare_root / 'single_seq.csv'}",
+            f"--output_dir_json={prepare_root / 'json'}",
+            f"--batch_dir={batch_dir}",
+            f"--num_jobs={n_batches}",
+            f"--num_workers={n_cpu}",
+        ])
 
     chunk_specs: list[ChunkSpec] = []
     batch_json_root = batch_dir / "json"
@@ -388,6 +411,7 @@ def af3score_run(
 )
 def af3score_postprocess(
     run_name: str,
+    staged_input_execution_run_id: str,
     input_files: list[str],
     input_digests: dict[str, str],
     publication_key: str,
@@ -395,6 +419,7 @@ def af3score_postprocess(
     """Validate records and collect metrics for all inputs."""
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
+    staged_input_dir = _staged_input_dir(staged_input_execution_run_id)
     for path in (layout.outputs_dir, layout.failures_dir):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -444,7 +469,7 @@ def af3score_postprocess(
         run_command([
             sys.executable,
             str(CONF.git_clone_dir / "04_get_metrics.py"),
-            f"--input_pdb_dir={layout.inputs_dir}",
+            f"--input_pdb_dir={staged_input_dir}",
             f"--af3score_output_dir={metrics_view_dir}",
             f"--save_metric_csv={out_csv_path}",
             f"--num_workers={max(1, min(16, len(completed_output_dirs)))}",

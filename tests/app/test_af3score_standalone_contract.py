@@ -6,6 +6,7 @@ import ast
 import importlib.util
 import inspect
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -93,9 +94,20 @@ def test_af3score_prepare_reports_app_run_layout_paths(
         ),
     )
 
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    staged_inputs = (
+        tmp_path
+        / ".biomodals"
+        / "execution"
+        / "runs"
+        / str(execution_run_id)
+        / "inputs"
+    )
+    staged_inputs.mkdir(parents=True)
+    input_content = b"ATOM\n"
+    staged_inputs.joinpath("target.pdb").write_bytes(input_content)
+    input_digest = sha256(input_content).hexdigest()
     run_root = tmp_path / "demo"
-    run_root.joinpath("inputs").mkdir(parents=True)
-    run_root.joinpath("inputs", "target.pdb").write_text("ATOM\n", encoding="utf-8")
     sample_dir = (
         run_root / "outputs" / "target" / af3score_app.APP_INFO.completion_sample_subdir
     )
@@ -106,13 +118,14 @@ def test_af3score_prepare_reports_app_run_layout_paths(
         run_root / "outputs",
         "target",
         publication_key="request-key",
-        input_sha256="a" * 64,
+        input_sha256=input_digest,
     )
 
     result = af3score_app.af3score_prepare.get_raw_f()(
         run_name="demo",
+        staged_input_execution_run_id=str(execution_run_id),
         input_files=["target.pdb"],
-        input_digests={"target": "a" * 64},
+        input_digests={"target": input_digest},
         publication_key="request-key",
         num_jobs=1,
         prepare_workers=1,
@@ -123,6 +136,106 @@ def test_af3score_prepare_reports_app_run_layout_paths(
     assert result.output_dir == str(run_root / "outputs")
     assert result.failed_dir == str(run_root / "outputs" / "failed_records")
     assert output_volume.reload_count == 1
+
+
+def test_af3score_prepare_uses_staged_inputs_without_copying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_volume = FakeOutputVolume()
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    staged_inputs = (
+        tmp_path
+        / ".biomodals"
+        / "execution"
+        / "runs"
+        / str(execution_run_id)
+        / "inputs"
+    )
+    staged_inputs.mkdir(parents=True)
+    input_content = b"ATOM\n"
+    staged_input = staged_inputs / "target.pdb"
+    staged_input.write_bytes(input_content)
+    monkeypatch.setattr(
+        af3score_app,
+        "CONF",
+        SimpleNamespace(
+            git_clone_dir=tmp_path / "AF3Score",
+            output_volume=output_volume,
+            output_volume_mountpoint=str(tmp_path),
+        ),
+    )
+
+    def fake_run_command(command):
+        input_dir = Path(
+            next(arg for arg in command if arg.startswith("--input_dir=")).split(
+                "=", maxsplit=1
+            )[1]
+        )
+        pending_input = input_dir / "target.pdb"
+        assert pending_input.is_symlink()
+        assert pending_input.resolve() == staged_input
+        batch_root = Path(
+            next(arg for arg in command if arg.startswith("--batch_dir=")).split(
+                "=", maxsplit=1
+            )[1]
+        )
+        (batch_root / "json" / "batch_0").mkdir(parents=True)
+        (batch_root / "json" / "batch_0" / "target.json").write_text("{}")
+        (batch_root / "pdb" / "batch_0").mkdir(parents=True)
+        return []
+
+    monkeypatch.setattr(af3score_app, "run_command", fake_run_command)
+
+    result = af3score_app.af3score_prepare.get_raw_f()(
+        run_name="demo",
+        staged_input_execution_run_id=str(execution_run_id),
+        input_files=["target.pdb"],
+        input_digests={"target": sha256(input_content).hexdigest()},
+        publication_key="request-key",
+        num_jobs=1,
+        prepare_workers=1,
+    )
+
+    assert result.pending == 1
+    assert len(result.chunk_specs) == 1
+    assert not tmp_path.joinpath("demo", "inputs").exists()
+
+
+def test_af3score_prepare_rejects_changed_staged_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    staged_inputs = (
+        tmp_path
+        / ".biomodals"
+        / "execution"
+        / "runs"
+        / str(execution_run_id)
+        / "inputs"
+    )
+    staged_inputs.mkdir(parents=True)
+    staged_inputs.joinpath("target.pdb").write_bytes(b"CHANGED\n")
+    monkeypatch.setattr(
+        af3score_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeOutputVolume(),
+            output_volume_mountpoint=str(tmp_path),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="digest changed: target.pdb"):
+        af3score_app.af3score_prepare.get_raw_f()(
+            run_name="demo",
+            staged_input_execution_run_id=str(execution_run_id),
+            input_files=["target.pdb"],
+            input_digests={"target": sha256(b"ORIGINAL\n").hexdigest()},
+            publication_key="request-key",
+            num_jobs=1,
+            prepare_workers=1,
+        )
 
 
 def test_af3score_postprocess_uses_layout_and_run_root_metrics(
@@ -140,9 +253,19 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
         ),
     )
 
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    staged_inputs = (
+        tmp_path
+        / ".biomodals"
+        / "execution"
+        / "runs"
+        / str(execution_run_id)
+        / "inputs"
+    )
+    staged_inputs.mkdir(parents=True)
+    staged_inputs.joinpath("target.pdb").write_text("ATOM\n", encoding="utf-8")
     run_root = tmp_path / "demo"
-    run_root.joinpath("inputs").mkdir(parents=True)
-    run_root.joinpath("prepare").mkdir()
+    run_root.joinpath("prepare").mkdir(parents=True)
     sample_dir = (
         run_root / "outputs" / "target" / af3score_app.APP_INFO.completion_sample_subdir
     )
@@ -157,6 +280,8 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
     )
 
     def fake_run_command(cmd):
+        input_arg = next(arg for arg in cmd if arg.startswith("--input_pdb_dir="))
+        assert input_arg == f"--input_pdb_dir={staged_inputs}"
         save_arg = next(arg for arg in cmd if arg.startswith("--save_metric_csv="))
         Path(save_arg.split("=", maxsplit=1)[1]).write_text(
             "name,score\ntarget,1.0\n", encoding="utf-8"
@@ -167,6 +292,7 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
 
     result = af3score_app.af3score_postprocess.get_raw_f()(
         run_name="demo",
+        staged_input_execution_run_id=str(execution_run_id),
         input_files=["target.pdb"],
         input_digests={"target": "a" * 64},
         publication_key="request-key",

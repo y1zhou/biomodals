@@ -639,6 +639,9 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if node_key == PREPARE_NODE:
             return {
                 "run_name": self.request.run_name,
+                "staged_input_execution_run_id": (
+                    self.request.staged_input_execution_run_id
+                ),
                 "input_files": list(self.request.input_names),
                 "input_digests": self._input_digests,
                 "publication_key": self._publication_key,
@@ -648,6 +651,9 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if node_key == POSTPROCESS_NODE:
             return {
                 "run_name": self.request.run_name,
+                "staged_input_execution_run_id": (
+                    self.request.staged_input_execution_run_id
+                ),
                 "input_files": list(self.request.input_names),
                 "input_digests": self._input_digests,
                 "publication_key": self._publication_key,
@@ -682,39 +688,7 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
             owner=str(self.execution_run_id),
             replace_owner=self.request.replace_claim_owner,
         )
-        self._materialize_inputs()
         self._claim_acquired = True
-
-    def _materialize_inputs(self) -> None:
-        """Validate and publish this Run's private inputs after claim ownership."""
-        source_dir = (
-            self.output_root
-            / ".biomodals"
-            / "execution"
-            / "runs"
-            / self.request.staged_input_execution_run_id
-            / "inputs"
-        )
-        self.layout.inputs_dir.mkdir(parents=True, exist_ok=True)
-        for name, expected_digest in self.request.inputs:
-            source = source_dir / name
-            if source.is_symlink() or not source.is_file():
-                raise FileNotFoundError(f"Staged AF3Score input is missing: {source}")
-            destination = self.layout.inputs_dir / name
-            temporary = destination.with_name(
-                f".{destination.name}.{self.execution_run_id}.tmp"
-            )
-            digest = sha256()
-            try:
-                with source.open("rb") as reader, temporary.open("wb") as writer:
-                    while chunk := reader.read(1024 * 1024):
-                        digest.update(chunk)
-                        writer.write(chunk)
-                if digest.hexdigest() != expected_digest:
-                    raise ValueError(f"Staged AF3Score input digest changed: {name}")
-                temporary.replace(destination)
-            finally:
-                temporary.unlink(missing_ok=True)
 
 
 def _result_envelope(result: object) -> dict[str, object]:

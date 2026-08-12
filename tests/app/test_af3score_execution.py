@@ -462,47 +462,15 @@ def test_same_run_name_inputs_are_isolated_until_output_claim(
         output_claims=claims,
         output_root=tmp_path,
     )
-    shared_input = tmp_path / "scores" / "inputs" / "target.pdb"
+    shared_inputs = tmp_path / "scores" / "inputs"
 
-    assert not shared_input.exists()
     first._ensure_output_claim()
-    assert shared_input.read_bytes() == first_content
+    assert not shared_inputs.exists()
     with pytest.raises(RuntimeError, match="already claimed"):
         second._ensure_output_claim()
-    assert shared_input.read_bytes() == first_content
+    assert not shared_inputs.exists()
     first.close()
     second.close()
-
-
-def test_materialization_rejects_changed_staged_input(tmp_path: Path) -> None:
-    request = _request()
-    _stage_request_inputs(tmp_path, request)
-    staged_input = (
-        tmp_path
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / str(RUN_ID)
-        / "inputs"
-        / "a.pdb"
-    )
-    staged_input.write_bytes(b"CHANGED\n")
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=object(),
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-    )
-
-    with pytest.raises(ValueError, match="digest changed: a.pdb"):
-        runtime._ensure_output_claim()
-
-    assert not tmp_path.joinpath("scores", "inputs", "a.pdb").exists()
-    runtime.close()
 
 
 def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
@@ -534,6 +502,10 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
         "af3score_run",
         "af3score_postprocess",
     ]
+    prepare_kwargs = driver.spawns[0][1]
+    postprocess_kwargs = driver.spawns[-1][1]
+    assert prepare_kwargs["staged_input_execution_run_id"] == str(RUN_ID)
+    assert postprocess_kwargs["staged_input_execution_run_id"] == str(RUN_ID)
     batch_call = next(
         call for call in snapshot.provider_calls if call.node_key == BATCHES_NODE
     )

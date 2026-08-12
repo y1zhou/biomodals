@@ -12,6 +12,10 @@ from uuid import UUID
 import orjson
 
 from biomodals.app.fold.alphafold3.inference_inputs import DECLARED_MODEL_IDENTITY
+from biomodals.app.score.af3score_publications import (
+    _input_publication_ready,
+    _metrics_publication_ready,
+)
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -43,23 +47,11 @@ MAX_REQUEST_BYTES = 4 * 1024 * 1024
 PREPARE_NODE = "prepare"
 BATCHES_NODE = "score-batches"
 POSTPROCESS_NODE = "postprocess"
-METRICS_FILENAME = "af3score_metrics.csv"
-COMPLETION_SAMPLE_SUBDIR = "seed-10_sample-0"
-COMPLETION_REQUIRED_FILES = (
-    "summary_confidences.json",
-    "confidences.json",
-)
 _REQUEST_FILE = ExecutionRequestFile(
     "request.json",
     MAX_REQUEST_BYTES,
     "AF3Score execution request",
 )
-
-
-def _workload_module():
-    from biomodals.app.score import af3score_app
-
-    return af3score_app
 
 
 @dataclass(frozen=True)
@@ -333,7 +325,7 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                     for name in self.request.input_names
                 )
             elif node_key == POSTPROCESS_NODE:
-                available = _workload_module()._metrics_publication_ready(
+                available = _metrics_publication_ready(
                     self.layout.run_root,
                     self._publication_key,
                 )
@@ -364,7 +356,7 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         digest = self._input_digests.get(input_id)
         if digest is None:
             return False
-        return _workload_module()._input_publication_ready(
+        return _input_publication_ready(
             self.layout.outputs_dir,
             input_id,
             publication_key=self._publication_key,

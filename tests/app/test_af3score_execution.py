@@ -11,12 +11,9 @@ from uuid import UUID
 
 import pytest
 
-from biomodals.app.score import af3score_app
+from biomodals.app.score import af3score_app, af3score_publications
 from biomodals.app.score.af3score_execution import (
     BATCHES_NODE,
-    COMPLETION_REQUIRED_FILES,
-    COMPLETION_SAMPLE_SUBDIR,
-    METRICS_FILENAME,
     POSTPROCESS_NODE,
     PREPARE_NODE,
     AF3ScoreExecutionCoordinator,
@@ -25,6 +22,11 @@ from biomodals.app.score.af3score_execution import (
     ChunkSpec,
     TaskSpec,
     persist_execution_request,
+)
+from biomodals.app.score.af3score_publications import (
+    COMPLETION_REQUIRED_FILES,
+    COMPLETION_SAMPLE_SUBDIR,
+    METRICS_FILENAME,
 )
 from biomodals.execution import (
     DeploymentIdentity,
@@ -127,7 +129,7 @@ class CompletingDriver:
                 sample.mkdir(parents=True, exist_ok=True)
                 for required in COMPLETION_REQUIRED_FILES:
                     (sample / required).write_text("{}")
-                af3score_app._write_input_publication(
+                af3score_publications._write_input_publication(
                     self.root / "outputs",
                     path.stem,
                     publication_key=str(kwargs["publication_key"]),
@@ -139,7 +141,7 @@ class CompletingDriver:
         self.root.mkdir(parents=True, exist_ok=True)
         metrics = self.root / METRICS_FILENAME
         metrics.write_text("name,score\na,1\n")
-        af3score_app._write_metrics_publication(
+        af3score_publications._write_metrics_publication(
             self.root,
             str(kwargs["publication_key"]),
             metrics,
@@ -200,7 +202,7 @@ def _publish_input(root: Path, input_id: str, digest: str, key: str) -> Path:
     sample.mkdir(parents=True)
     for required in COMPLETION_REQUIRED_FILES:
         sample.joinpath(required).write_text("{}")
-    af3score_app._write_input_publication(
+    af3score_publications._write_input_publication(
         root,
         input_id,
         publication_key=key,
@@ -235,9 +237,9 @@ def test_af3score_rejects_dot_segment_input_ids(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="PDB filenames"):
         replace(_request(), inputs=(("...pdb", "a" * 64),))
     with pytest.raises(ValueError, match="safe path component"):
-        af3score_app._input_publication_path(tmp_path, "..")
+        af3score_publications._input_publication_path(tmp_path, "..")
     with pytest.raises(ValueError, match="safe path component"):
-        af3score_app._input_output_records(tmp_path, "..")
+        af3score_publications._input_output_records(tmp_path, "..")
 
     unsafe = tmp_path / "...pdb"
     unsafe.write_text("ATOM\n", encoding="utf-8")
@@ -253,7 +255,7 @@ def test_input_publication_binds_and_invalidates_output_content(
     digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
     sample = _publish_input(tmp_path, "a", digest, "plan")
 
-    assert af3score_app._input_publication_ready(
+    assert af3score_publications._input_publication_ready(
         tmp_path,
         "a",
         publication_key="plan",
@@ -262,15 +264,15 @@ def test_input_publication_binds_and_invalidates_output_content(
 
     sample.joinpath(COMPLETION_REQUIRED_FILES[0]).write_text('{"changed":true}')
 
-    assert not af3score_app._input_publication_ready(
+    assert not af3score_publications._input_publication_ready(
         tmp_path,
         "a",
         publication_key="plan",
         input_sha256=digest,
     )
-    assert af3score_app._invalidate_input_publications(tmp_path, ("a",))
-    assert not af3score_app._input_publication_path(tmp_path, "a").exists()
-    assert not af3score_app._invalidate_input_publications(tmp_path, ("a",))
+    assert af3score_publications._invalidate_input_publications(tmp_path, ("a",))
+    assert not af3score_publications._input_publication_path(tmp_path, "a").exists()
+    assert not af3score_publications._invalidate_input_publications(tmp_path, ("a",))
 
 
 def test_input_publication_propagates_transient_read_errors(
@@ -283,10 +285,10 @@ def test_input_publication_propagates_transient_read_errors(
     def unavailable(_path: Path) -> str:
         raise PermissionError("temporarily unavailable")
 
-    monkeypatch.setattr(af3score_app, "sha256_file", unavailable)
+    monkeypatch.setattr(af3score_publications, "sha256_file", unavailable)
 
     with pytest.raises(PermissionError, match="temporarily unavailable"):
-        af3score_app._input_publication_ready(
+        af3score_publications._input_publication_ready(
             tmp_path,
             "a",
             publication_key="plan",
@@ -333,7 +335,7 @@ def test_gpu_batch_invalidates_publication_before_compute(
     digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
     output_dir = output_root / "scores" / "outputs"
     _publish_input(output_dir, "a", digest, "plan")
-    marker = af3score_app._input_publication_path(output_dir, "a")
+    marker = af3score_publications._input_publication_path(output_dir, "a")
 
     def run_command(command, **_kwargs) -> None:
         assert not marker.exists()
@@ -367,7 +369,7 @@ def test_gpu_batch_invalidates_publication_before_compute(
     )
 
     assert events == ["reload", "commit", "prepare", "run", "commit"]
-    assert af3score_app._input_publication_ready(
+    assert af3score_publications._input_publication_ready(
         output_dir,
         "a",
         publication_key="plan",
@@ -649,7 +651,7 @@ def test_stale_input_outputs_do_not_satisfy_a_new_request(tmp_path: Path) -> Non
         sample.mkdir(parents=True)
         for required in COMPLETION_REQUIRED_FILES:
             sample.joinpath(required).write_text("{}")
-        af3score_app._write_input_publication(
+        af3score_publications._write_input_publication(
             outputs,
             input_id,
             publication_key="stale-plan",
@@ -686,7 +688,7 @@ def test_fingerprint_bound_metrics_satisfy_the_terminal_node(tmp_path: Path) -> 
     run_root.mkdir()
     metrics = run_root / METRICS_FILENAME
     metrics.write_text("name,score\na,1\n")
-    af3score_app._write_metrics_publication(
+    af3score_publications._write_metrics_publication(
         run_root,
         request.execution_plan.workload_plan_fingerprint,
         metrics,

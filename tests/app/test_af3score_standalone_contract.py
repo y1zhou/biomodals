@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from biomodals.app.score import af3score_app
+from biomodals.app.score import af3score_app, af3score_publications
 from biomodals.execution import RunStatus
 
 
@@ -24,6 +24,21 @@ class FakeOutputVolume:
 
     def reload(self) -> None:
         self.reload_count += 1
+
+
+def test_af3score_runtime_image_includes_execution_sources() -> None:
+    image = next(
+        value
+        for key, value in af3score_app.runtime_image.__dict__.items()
+        if key.startswith("_sync_original")
+    )
+
+    assert {
+        "biomodals.app.fold.alphafold3.inference_inputs",
+        "biomodals.app.fold.alphafold3.profiles",
+        "biomodals.app.score.af3score_execution",
+        "biomodals.app.score.af3score_publications",
+    } <= image._added_python_source_set
 
 
 def test_af3score_removed_the_volume_directory_scheduler_lock() -> None:
@@ -63,7 +78,7 @@ def test_af3score_prepare_reports_app_run_layout_paths(
     sample_dir.mkdir(parents=True)
     for file_name in af3score_app.APP_INFO.completion_required_files:
         sample_dir.joinpath(file_name).write_text("{}", encoding="utf-8")
-    af3score_app._write_input_publication(
+    af3score_publications._write_input_publication(
         run_root / "outputs",
         "target",
         publication_key="request-key",
@@ -110,7 +125,7 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
     sample_dir.mkdir(parents=True)
     for file_name in af3score_app.APP_INFO.completion_required_files:
         sample_dir.joinpath(file_name).write_text("{}", encoding="utf-8")
-    af3score_app._write_input_publication(
+    af3score_publications._write_input_publication(
         run_root / "outputs",
         "target",
         publication_key="request-key",
@@ -139,7 +154,7 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
         run_root / af3score_app.APP_INFO.metrics_filename
     )
     assert result["metrics_rows"] == 1
-    assert af3score_app._metrics_publication_ready(run_root, "request-key")
+    assert af3score_publications._metrics_publication_ready(run_root, "request-key")
     assert not run_root.joinpath("prepare").exists()
     assert output_volume.reload_count == 1
     assert output_volume.commit_count == 1
@@ -194,7 +209,7 @@ def test_af3score_run_binds_outputs_to_the_current_input(
         publication_key="request-key",
     )
 
-    assert af3score_app._input_publication_ready(
+    assert af3score_publications._input_publication_ready(
         run_root / "outputs",
         "target",
         publication_key="request-key",

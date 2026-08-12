@@ -15,20 +15,15 @@ import os
 import shutil
 import string
 import sys
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
 import modal
-import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.app.score.af3score_execution import (
-    COMPLETION_REQUIRED_FILES,
-    COMPLETION_SAMPLE_SUBDIR,
-    METRICS_FILENAME,
     AF3ScoreExecutionCoordinator,
     AF3ScoreExecutionRequest,
     ChunkSpec,
@@ -36,6 +31,15 @@ from biomodals.app.score.af3score_execution import (
     load_execution_request,
     stage_execution_inputs,
     stage_execution_request,
+)
+from biomodals.app.score.af3score_publications import (
+    COMPLETION_REQUIRED_FILES,
+    COMPLETION_SAMPLE_SUBDIR,
+    METRICS_FILENAME,
+    _input_publication_ready,
+    _invalidate_input_publications,
+    _write_input_publication,
+    _write_metrics_publication,
 )
 from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
@@ -62,7 +66,7 @@ from biomodals.helper.app_run import (
     AppRunLayout,
     volume_path_from_mount_path,
 )
-from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
+from biomodals.helper.artifacts import sha256_file
 from biomodals.helper.shell import (
     copy_files,
     run_command,
@@ -125,6 +129,12 @@ runtime_image = (
     .uv_pip_install(str(CONF.git_clone_dir), "biopython", "h5py", "pandas")
     .run_commands("build_data")
     .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.fold.alphafold3.inference_inputs",
+        "biomodals.app.fold.alphafold3.profiles",
+        "biomodals.app.score.af3score_execution",
+        "biomodals.app.score.af3score_publications",
+    )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 AF3SCORE_OUTPUT_CLAIMS = modal.Dict.from_name(
@@ -133,177 +143,6 @@ AF3SCORE_OUTPUT_CLAIMS = modal.Dict.from_name(
 )
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_af3score_task"})
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
-_METRICS_PUBLICATION_SCHEMA_VERSION = 1
-_INPUT_PUBLICATION_SCHEMA_VERSION = 2
-
-
-def _metrics_publication_path(run_root: str | Path) -> Path:
-    return Path(run_root) / ".biomodals" / "af3score-metrics.json"
-
-
-def _input_output_dir(output_dir: str | Path, input_id: str) -> Path:
-    if not input_id or Path(input_id).name != input_id or input_id in {".", ".."}:
-        raise ValueError("AF3Score input ID must be a safe path component")
-    return Path(output_dir) / input_id
-
-
-def _input_publication_path(output_dir: str | Path, input_id: str) -> Path:
-    return (
-        _input_output_dir(output_dir, input_id) / ".biomodals" / "af3score-input.json"
-    )
-
-
-def _input_output_records(
-    output_dir: str | Path,
-    input_id: str,
-) -> dict[str, dict[str, int | str]]:
-    sample_dir = _input_output_dir(output_dir, input_id)
-    sample_dir /= APP_INFO.completion_sample_subdir
-    records: dict[str, dict[str, int | str]] = {}
-    for filename in APP_INFO.completion_required_files:
-        path = sample_dir / filename
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError(f"AF3Score output is incomplete for '{input_id}'")
-        records[filename] = {
-            "size": path.stat().st_size,
-            "sha256": sha256_file(path),
-        }
-    return records
-
-
-def _write_input_publication(
-    output_dir: str | Path,
-    input_id: str,
-    *,
-    publication_key: str,
-    input_sha256: str,
-) -> None:
-    """Atomically bind one complete AF3Score output to its scientific input."""
-    outputs = _input_output_records(output_dir, input_id)
-    marker = _input_publication_path(output_dir, input_id)
-    replace_bytes_atomic(
-        marker,
-        orjson.dumps(
-            {
-                "schema_version": _INPUT_PUBLICATION_SCHEMA_VERSION,
-                "publication_key": publication_key,
-                "input_sha256": input_sha256,
-                "outputs": outputs,
-            },
-            option=orjson.OPT_SORT_KEYS,
-        ),
-    )
-
-
-def _input_publication_ready(
-    output_dir: str | Path,
-    input_id: str,
-    *,
-    publication_key: str,
-    input_sha256: str,
-) -> bool:
-    """Validate one scored output against the current scientific request."""
-    try:
-        marker = orjson.loads(
-            _input_publication_path(output_dir, input_id).read_bytes()
-        )
-    except (
-        FileNotFoundError,
-        IsADirectoryError,
-        NotADirectoryError,
-        orjson.JSONDecodeError,
-    ):
-        return False
-    if not (
-        isinstance(marker, dict)
-        and marker.get("schema_version") == _INPUT_PUBLICATION_SCHEMA_VERSION
-        and marker.get("publication_key") == publication_key
-        and marker.get("input_sha256") == input_sha256
-        and isinstance(marker.get("outputs"), dict)
-    ):
-        return False
-    try:
-        return marker["outputs"] == _input_output_records(output_dir, input_id)
-    except (FileNotFoundError, IsADirectoryError, NotADirectoryError, RuntimeError):
-        return False
-
-
-def _invalidate_input_publications(
-    output_dir: str | Path,
-    input_ids: Sequence[str],
-) -> bool:
-    """Remove batch markers before any corresponding output is rewritten."""
-    invalidated = False
-    for input_id in input_ids:
-        marker = _input_publication_path(output_dir, input_id)
-        try:
-            marker.unlink()
-        except FileNotFoundError:
-            continue
-        invalidated = True
-    return invalidated
-
-
-def _write_metrics_publication(
-    run_root: str | Path,
-    publication_key: str,
-    metrics_path: Path,
-) -> None:
-    """Atomically bind the metrics artifact to one scientific request."""
-    size = metrics_path.stat().st_size
-    if size < 1:
-        raise RuntimeError("AF3Score metrics publication is empty")
-    marker = _metrics_publication_path(run_root)
-    replace_bytes_atomic(
-        marker,
-        orjson.dumps(
-            {
-                "schema_version": _METRICS_PUBLICATION_SCHEMA_VERSION,
-                "publication_key": publication_key,
-                "metrics_filename": metrics_path.name,
-                "size": size,
-                "sha256": sha256_file(metrics_path),
-            },
-            option=orjson.OPT_SORT_KEYS,
-        ),
-    )
-
-
-def _metrics_publication_ready(
-    run_root: str | Path,
-    publication_key: str,
-) -> bool:
-    """Validate fingerprint-bound metrics without hiding unreadable state."""
-    marker_path = _metrics_publication_path(run_root)
-    try:
-        marker = orjson.loads(marker_path.read_bytes())
-    except (
-        FileNotFoundError,
-        IsADirectoryError,
-        NotADirectoryError,
-        orjson.JSONDecodeError,
-    ):
-        return False
-    if not (
-        isinstance(marker, dict)
-        and marker.get("schema_version") == _METRICS_PUBLICATION_SCHEMA_VERSION
-        and marker.get("publication_key") == publication_key
-        and marker.get("metrics_filename") == APP_INFO.metrics_filename
-        and isinstance(marker.get("size"), int)
-        and not isinstance(marker.get("size"), bool)
-        and marker["size"] > 0
-        and isinstance(marker.get("sha256"), str)
-    ):
-        return False
-    metrics = Path(run_root) / APP_INFO.metrics_filename
-    try:
-        return (
-            not metrics.is_symlink()
-            and metrics.stat().st_size == marker["size"]
-            and sha256_file(metrics) == marker["sha256"]
-        )
-    except (FileNotFoundError, NotADirectoryError):
-        return False
 
 
 ##########################################

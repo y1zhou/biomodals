@@ -11,7 +11,6 @@ from uuid import UUID
 
 import orjson
 
-from biomodals.app.fold.alphafold3.inference_inputs import DECLARED_MODEL_IDENTITY
 from biomodals.app.score.af3score_publications import (
     _input_publication_ready,
     _metrics_publication_ready,
@@ -44,6 +43,7 @@ from biomodals.helper.output_claim import (
 
 REQUEST_SCHEMA_VERSION = 3
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
+AF3SCORE_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 PREPARE_NODE = "prepare"
 BATCHES_NODE = "score-batches"
 POSTPROCESS_NODE = "postprocess"
@@ -86,7 +86,7 @@ class AF3ScoreExecutionRequest:
     prepare_workers: int
     max_batches: int
     app_version: str
-    model_identity: str = DECLARED_MODEL_IDENTITY
+    model_identity: str = AF3SCORE_MODEL_IDENTITY
     max_active_provider_calls: int | None = None
     max_active_gpu_provider_calls: int | None = None
     replace_claim_owner: str | None = None
@@ -754,7 +754,7 @@ class AF3ScoreExecutionCoordinator(ExecutionCoordinatorLifecycle):
             volume_root=volume_root,
             target_scientific_versions={
                 "af3score": app_version,
-                "alphafold3.model": DECLARED_MODEL_IDENTITY,
+                "alphafold3.model": AF3SCORE_MODEL_IDENTITY,
             },
         )
         self.output_volume = output_volume

@@ -2,6 +2,8 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+import ast
+import importlib.util
 import inspect
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,11 +36,33 @@ def test_af3score_runtime_image_includes_execution_sources() -> None:
     )
 
     assert {
-        "biomodals.app.fold.alphafold3.inference_inputs",
-        "biomodals.app.fold.alphafold3.profiles",
         "biomodals.app.score.af3score_execution",
         "biomodals.app.score.af3score_publications",
     } <= image._added_python_source_set
+    assert not any(
+        module.startswith("biomodals.app.fold.alphafold3")
+        for module in image._added_python_source_set
+    )
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        "biomodals.app.score.af3score_app",
+        "biomodals.app.score.af3score_execution",
+        "biomodals.app.score.af3score_publications",
+        "biomodals.execution.modal",
+    ),
+)
+def test_af3score_runtime_sources_support_python_311(module_name: str) -> None:
+    spec = importlib.util.find_spec(module_name)
+    assert spec is not None and spec.origin is not None
+    source_path = Path(spec.origin)
+    ast.parse(
+        source_path.read_text(encoding="utf-8"),
+        filename=str(source_path),
+        feature_version=(3, 11),
+    )
 
 
 def test_af3score_removed_the_volume_directory_scheduler_lock() -> None:

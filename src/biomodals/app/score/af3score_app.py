@@ -130,8 +130,6 @@ runtime_image = (
     .run_commands("build_data")
     .pipe(patch_image_for_helper)
     .add_local_python_source(
-        "biomodals.app.fold.alphafold3.inference_inputs",
-        "biomodals.app.fold.alphafold3.profiles",
         "biomodals.app.score.af3score_execution",
         "biomodals.app.score.af3score_publications",
     )

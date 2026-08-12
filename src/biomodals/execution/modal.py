@@ -6,12 +6,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Lock
-from typing import Any
+from typing import Any, TypeVar
 from uuid import UUID
 
 import modal
 
 from biomodals.execution.model import DeploymentIdentity, ProviderBinding
+
+_T = TypeVar("_T")
 
 
 class ModalDefiniteSubmissionError(RuntimeError):
@@ -155,12 +157,12 @@ def initialize_execution_coordinator_host(host: Any) -> None:
     host._coordinator_adapter_lock = Lock()
 
 
-def execution_coordinator_adapter[T](
+def execution_coordinator_adapter(  # noqa: UP047 - mounted in Python 3.10/3.11 apps
     host: Any,
     *,
     development: bool | None,
-    factory: Callable[[bool], T],
-) -> T:
+    factory: Callable[[bool], _T],
+) -> _T:
     """Return the one mode-pinned adapter owned by a coordinator container."""
     with host._coordinator_adapter_lock:
         adapter = host._coordinator_adapter

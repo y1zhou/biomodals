@@ -22,8 +22,9 @@ variables. `--targetscan-ref-shard-size` controls how many UTR records are put
 into each TargetScan reference-preparation shard; when omitted, Biomodals uses
 its internal preparation topology to derive the shard size. Candidate, context,
 RNAplfold, and PITA shard sizes can be tuned independently. The
-`--off-target-process-slots` run-wide budget bounds concurrent TargetScan and
-PITA subprocesses (default and maximum: 64); each branch receives half.
+`--off-target-process-slots` bounds local TargetScan and PITA subprocesses in
+each provider container (default and maximum: 64); each branch derives its
+local worker pool from half of that value.
 
 ## Outputs
 
@@ -4517,7 +4518,7 @@ def _prepare_pita_target_discovery_plan_for_spec(
 def _off_target_branch_slots(
     execution: OligoformerExecutionConfig,
 ) -> tuple[int, int]:
-    """Split the existing run-wide process budget between both CPU branches."""
+    """Split the local process budget between both CPU branches."""
     targetscan_slots = max(1, execution.off_target_process_slots // 2)
     return targetscan_slots, execution.off_target_process_slots - targetscan_slots
 
@@ -5863,7 +5864,8 @@ def submit_oligoformer_task(
         targetscan_threshold: TargetScan threshold used by off-target prediction.
         toxicity_threshold: Toxicity filter threshold.
         off_target_workers: Maximum PITA worker processes per container.
-        off_target_process_slots: Run-wide TargetScan and PITA process budget.
+        off_target_process_slots: Local TargetScan and PITA process budget per
+            provider container.
         off_target_prep_workers: Local workers used to prepare PITA candidates.
         pita_prepare_workers: PITA target-discovery workers per container.
         pita_prepare_utr_shard_size: UTR STAB rows per PITA discovery shard.

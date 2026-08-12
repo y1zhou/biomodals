@@ -459,6 +459,13 @@ job status." The frontend then retains the last known state, leaves manual
 Refresh available, and continues its normal polling cadence. Only the backend
 changes Job Status.
 
+Job list and detail views poll `queued`, `running`, `finalizing`,
+`cancel_requested`, and `blocked` Jobs every 60 seconds while the document is
+visible and every 5 minutes while it is hidden. Terminal Jobs and
+`state_unknown` Jobs do not poll periodically; the detail view still refreshes
+a `state_unknown` Job when the window regains focus, and manual Refresh remains
+available.
+
 ### Workload and Catalog registration
 
 Each executable API workload has one fixed descriptor owning its stable key,
@@ -699,8 +706,8 @@ Administrator role remains independent, but only an enabled Administrator
 satisfies the last-administrator safeguard. Job admission rechecks enabled
 status inside the same SQLite transaction that applies idempotency and Active
 Job Limits, including before returning a same-payload idempotent replay. A
-concurrent disable therefore prevents that request from claiming an
-unsubmitted Job's provider lease and initiating paid work.
+concurrent disable therefore prevents that request from advancing an
+unsubmitted Job into paid provider work.
 
 ### Admin Active Job capacity display
 

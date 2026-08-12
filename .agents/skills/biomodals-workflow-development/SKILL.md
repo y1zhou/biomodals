@@ -10,16 +10,16 @@ workflow schemas, and workflow-compatible app integration points.
 
 ## Core Workflow
 
-Before making non-trivial workflow changes, read
-`references/workflow-development.md` for the maintained standards and
-`docs/agents/workflow-development.md` for repo-level coordination notes.
+Before making non-trivial workflow changes, read the
+[maintained standards](references/workflow-development.md) and
+[repo coordination notes](../../../docs/agents/workflow-development.md).
 
-Use `src/biomodals/workflow/shortmd_workflow.py` as the primary end-to-end
-example for app-composed workflows. Use
-`src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for
-workflows that fan out one app's volume-backed outputs into another app's
+Use [ShortMD](../../../src/biomodals/workflow/shortmd_workflow.py) as the
+primary end-to-end example for app-composed workflows. Use
+[RFD-LigandMPNN](../../../src/biomodals/workflow/rfd_ligandmpnn_workflow.py)
+for workflows that fan out one app's volume-backed outputs into another app's
 workflow-compatible remote function. Use
-`src/biomodals/workflow/ppiflow_workflow.py` as the reference for
+[PPIFlow](../../../src/biomodals/workflow/ppiflow_workflow.py) for
 candidate-manifest joins, retained-candidate filtering, candidate-wide remote
 stage coordinators, and PPIFlow-specific stage wiring.
 

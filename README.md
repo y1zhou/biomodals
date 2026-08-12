@@ -174,7 +174,7 @@ Pass `--development` to run current app or workflow source through an
 ephemeral Modal app. Development runs are useful while editing code, but they
 do not provide durable cross-command recovery.
 
-An app entrypoint that has not yet adopted a deployment coordinator fails
+An app Local Entrypoint that has not yet adopted a deployment coordinator fails
 closed in normal mode. Use `--development` explicitly for that source-backed
 path.
 
@@ -213,12 +213,16 @@ biomodals run restart \
   --execution-run-id <predecessor-uuid> \
   --target-environment <target-environment> \
   --target-deployment-name <target-deployment-name> \
-  --target-deployment-version <target-version>
+  --target-deployment-version <target-version> \
+  --max-containers <new-total-limit> \
+  --max-gpu-containers <new-gpu-limit>
 ```
 
 Restart verifies that the result-affecting plan is unchanged. It reuses valid
-publications and schedules only conclusively missing work. Repeating the
-original launch without `--restart-from` creates a separate root run.
+publications and schedules only conclusively missing work. The two container
+options are optional operational overrides; omitting them preserves the
+predecessor's limits. Repeating the original launch without `--restart-from`
+creates a separate root run.
 
 Durable state follows the coordinator that owns the run:
 

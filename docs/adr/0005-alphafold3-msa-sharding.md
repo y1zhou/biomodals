@@ -543,7 +543,12 @@ With MSA search enabled, fields resolve independently:
 A non-empty field suppresses only the searches needed for that field. The app
 does not run unnecessary canonical searches merely to populate the cache.
 
-### Search worker topology
+### Historical search worker topology
+
+This section records the app-owned scheduling topology used when this ADR was
+accepted. Current runs express remote work as kernel Tasks and use the outer
+`--max-containers` and `--max-gpu-containers` options for Run-level admission;
+`max_parallel_search_workers` is no longer a public workload option.
 
 The entrypoint replaces `search_chains_in_parallel` and
 `max_parallel_data_pipelines` with:
@@ -836,11 +841,12 @@ may produce at most 5,000 seed/sample pairs after normalization by default.
 retaining every seed, sample, and worker bound. The accumulated summary may
 grow beyond the default ceiling through multiple valid requests. Inference
 controls are bounded both before scheduling and again in the worker: model
-seeds are unsigned 32-bit integers, recycles are 0--100, diffusion samples are
-1--100, and `max_num_gpus` is 1--100. Seed-cache inspection and seed claiming
-repeat the default workload check unless the explicit override accompanies the
-request. Result publication repeats the hard seed and sample bounds before
-touching the output Volume.
+seeds are unsigned 32-bit integers, recycles are 0--100, and diffusion samples
+are 1--100. Remote GPU admission uses the Run-level `--max-gpu-containers`
+ceiling; setting it to zero prevents GPU provider calls. Seed-cache inspection
+and seed claiming repeat the default workload check unless the explicit
+override accompanies the request. Result publication repeats the hard seed and
+sample bounds before touching the output Volume.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
 normalized seed list. It identifies one computational seed request, not a seed

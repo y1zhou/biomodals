@@ -214,8 +214,9 @@ Counts are scoped to this service's SQLite database. Global therefore means all
 Users and Tools admitted by one BioModals deployment, not a combined beta,
 production, or Modal-account total. Separate deployments that target the same
 Modal App do not coordinate admission. Pre-release examples set User, Tool,
-and Global defaults to one; provider-level limits or shared coordination remain
-outside this architecture.
+and Global defaults to one. Cross-Run provider-account limits and shared
+coordination remain outside this architecture; each Execution Run still has
+the total and GPU Provider Call ceilings described below.
 
 Each Execution Run captures an exact Deployment Identity and its operational
 dispatch policy: total and GPU Provider Call ceilings, fixed-batch or
@@ -665,10 +666,13 @@ The application factory reads these settings:
 | `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` | unset | Positive retention enables cleanup of published runs' intermediates |
 
 The Admin API stores editable runtime overrides for the Modal Environment,
-GROMACS App name, and Tool and Global limits in SQLite. Dotenv values are their
-host defaults. An explicit process variable has highest precedence and makes
-the corresponding Admin field read-only. Modal credentials remain process/file
-configuration only, and the API refuses to start unless both are present.
+GROMACS App name and deployment version, Tool active-Job limit and Job-log
+visibility, and Global active-Job limit in SQLite. Process and dotenv values
+provide host defaults for fields they control; workload descriptors provide
+the remaining defaults. An explicit process variable has highest precedence
+and makes the corresponding Admin field read-only. Modal credentials remain
+process/file configuration only, and the API refuses to start unless both are
+present.
 
 That full validation belongs specifically to `biomodals api serve`. Offline
 `biomodals api admin` account commands resolve the same configuration file,

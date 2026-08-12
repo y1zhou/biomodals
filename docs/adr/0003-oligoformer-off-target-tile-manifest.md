@@ -19,10 +19,11 @@ The off-target DAG uses these durable scientific Task boundaries:
 - one TargetScan Task for each candidate-batch by reference-shard tile.
 
 PITA and TargetScan Tasks are independent and may run concurrently when their
-dependencies are ready. The kernel applies the configured run-wide Provider
-Call limit and divides `off_target_process_slots` between their Nodes. RNAplfold
-uses its own configured Node ceiling. The efficacy Node is the only GPU
-Provider Call.
+dependencies are ready. The kernel applies the configured Run-level Provider
+Call limits. Inside each PITA or TargetScan provider container,
+`off_target_process_slots` determines the corresponding local process pool; it
+is not a second Run-wide container limit. RNAplfold uses its own configured Node
+ceiling. The efficacy Node is the only GPU Provider Call.
 
 The provider functions retain the workload-specific inner algorithms. A PITA
 candidate container prepares its target-discovery shards, processes them with a

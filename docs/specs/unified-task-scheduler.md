@@ -57,9 +57,11 @@ The refactor is complete when GROMACS service jobs, reusable workflows,
 PPIFlow candidate fan-out, coordinated direct apps, AlphaFold3 search and
 inference, BoltzGen direct fan-out, and Rosetta work stealing all use the same
 execution-state vocabulary and scheduling primitives without changing their
-public behavior, scientific identities, or cost-safety authority. The separate
-[App Run Layout decision](../adr/workflow-runtime-and-ppiflow-decisions.md)
-changes selected workflow publication paths without making that change a
+scientific identities or cost-safety authority. Public behavior remains stable
+except for changes explicitly accepted here, including the unified container
+limit CLI. The separate [App Run Layout
+decision](../adr/workflow-runtime-and-ppiflow-decisions.md) changes selected
+workflow publication paths without making that change a
 kernel requirement. Legacy execution-ledger and attempt-directory layouts are
 intentionally replaced.
 
@@ -832,7 +834,7 @@ the CLI spawn `drive_prepared`. This is a submission boundary, not a new Run
 status: preparation never admits Provider Calls. Direct apps stage immutable
 request and launch files. Workflows may also persist the pending Successor
 ledger and reusable publication rows so immediate cancellation can act on
-durable state. A workflow entrypoint's `--restart-from` option uses the same
+durable state. A workflow Local Entrypoint's `--restart-from` option uses the same
 two-input boundary through `prepare_restart_from` and `drive_prepared`; the
 combined workflow coordinator method is intentionally not exposed.
 

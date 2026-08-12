@@ -449,9 +449,10 @@ than by running workflow Python files directly. The run command is responsible
 for importing workflow modules through the catalog/package path so workflow node
 classes serialize with stable canonical module names before being submitted to
 the included `ExecutionCoordinator`. Coordinator-aware workflows resolve and
-pin an exact deployed version by default. Their user-facing flags mirror
-`biomodals app run`, including environment, deployment name/version, detach,
-timeout, `--restart-from`, and pass-through workflow flags after `--`.
+pin an exact deployed version by default. Their deployed-run flags mirror
+`biomodals app run`, including environment, deployment name/version,
+`--restart-from`, and pass-through workflow flags after `--`. The `--detach`,
+`--gpu`, and `--timeout` options apply only to explicit `--development` runs.
 
 Launches print Deployment Identity, Execution Run ID, and Coordinator
 FunctionCall ID. Use `biomodals run status|cancel|resume|restart` with the
@@ -465,14 +466,18 @@ call `print_workflow_dag(workflow.validate())`, and return before constructing
 or submitting the orchestrator. DAG graph output should stay compact and print
 Node IDs, execution boundary, workflow Node class qualnames, and dependencies
 without module-qualified class names.
-The command may accept workflow paths only when they resolve to package-qualified
-modules under the Biomodals workflow package. Reject ad hoc workflow files that
-cannot be imported by a stable package module path.
-Use Modal's module mode for workflow runs, for example
-`python -m modal run -m biomodals.workflow.shortmd_workflow::submit_shortmd_workflow`,
-so local and remote containers agree on workflow node class module names.
-Source-backed execution is explicit development mode and provides no
-cross-process recovery.
+The command may accept workflow paths only when they resolve to
+package-qualified modules under the Biomodals workflow package. Reject ad hoc
+workflow files that cannot be imported by a stable package module path. For a
+source-backed run, use:
+
+```text
+biomodals workflow run --development <workflow> -- <workflow-options>
+```
+
+The CLI selects Modal module mode so local and remote containers agree on
+Workflow Node class module names. Development mode provides no cross-process
+recovery.
 
 ## Workflow App Composition
 

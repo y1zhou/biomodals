@@ -1,4 +1,6 @@
-"""AlphaFold3 source repo: <https://github.com/google-deepmind/alphafold3>.
+"""AlphaFold3 upstream: <https://github.com/google-deepmind/alphafold3>.
+
+Biomodals runs its pinned fork: <https://github.com/y1zhou/alphafold3>.
 
 ## Additional notes
 
@@ -19,15 +21,15 @@ separate `AlphaFold3-msa-db-sharded` Volume before running searches.
 
 Inspect the database-build plan without submitting paid work:
 
-`uv run biomodals app run alphafold3::setup_sharded_databases`
+`uv run biomodals app run --development alphafold3::setup_sharded_databases`
 
 After reviewing that plan, build all missing profiles explicitly:
 
-`uv run biomodals app run alphafold3::setup_sharded_databases --submit`
+`uv run biomodals app run --development alphafold3::setup_sharded_databases -- --submit`
 
 Run prediction and download the request-scoped archive:
 
-`uv run biomodals app run alphafold3::submit_alphafold3_task --input-json input.json --out-dir outputs`
+`uv run biomodals app run alphafold3::submit_alphafold3_task -- --input-json input.json --out-dir outputs`
 
 See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general docs.
 

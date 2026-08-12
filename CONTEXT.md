@@ -10,8 +10,8 @@ Biomodals runs bioinformatics tools as Modal apps and composes them into reusabl
 
 **Execution Run**:
 One invocation of an immutable execution plan, whether started by an API Job,
-a workflow, or an app entrypoint. It has one opaque Execution Run ID that is
-independent of workload naming and scientific identity.
+a workflow, or an app Local Entrypoint. It has one opaque Execution Run ID that
+is independent of workload naming and scientific identity.
 _Avoid_: API Job, workflow definition
 
 **Execution Run ID**:
@@ -366,7 +366,8 @@ and reusable.
 _Avoid_: provider success, build claim, database status alone
 
 **Workflow Artifact**:
-A durable record of data produced or consumed by a workflow step, including its data category, storage location, and metadata needed by downstream steps.
+A durable record of data produced or consumed by a Workflow Node, including
+its data category, storage location, and metadata needed by downstream Nodes.
 _Avoid_: raw app output, untyped file path, loose tarball
 
 **Artifact Availability**:
@@ -544,10 +545,6 @@ _Avoid_: seed build claim, run-summary marker, inference request
 **Search Build Claim**:
 An atomic, generation-scoped coordination record granting one request ownership of producing one missing Raw Database MSA or publishing one sequence-root combined-MSA or template result. Claims follow the exclusive output path they protect; the validated publication, not the claim, is the reusable scientific evidence.
 _Avoid_: search identity, completion marker, database shard
-
-**Search Worker Budget**:
-The request-wide maximum number of active CPU search containers across database-MSA and protein-template phases. It bounds operational fanout independently of shard concurrency inside a database worker.
-_Avoid_: MSA-only worker limit, shard count, HMMER thread count, number of input chains
 
 **Search Identity**:
 A digest of the result-affecting inputs for one Raw Database MSA, stored beneath the full sequence hash. It includes semantic source/shard profile content, scientific search parameters, and pinned tool versions, but excludes build timestamps, thread counts, CPU allocation, and container layout.
@@ -748,9 +745,10 @@ Run-Level Provider Call Limits.
 _Avoid_: global Modal container limit, child app concurrency
 
 **App-Local Scheduler**:
-A tool-specific queue, worker pool, pod pool, or fan-out loop that directly
-coordinates an app's concurrent Tasks.
-_Avoid_: execution kernel, provider autoscaler
+A legacy tool-specific durable queue, pod pool, or remote fan-out loop that
+coordinated an app's Tasks before the execution kernel. In-container process
+and thread concurrency is instead a Worker Pool.
+_Avoid_: current execution design, Worker Pool, provider autoscaler
 
 **Run-Level Provider Call Limits**:
 The pair of coordinator-enforced `max_active_provider_calls` and
@@ -825,7 +823,10 @@ _Avoid_: temporary scratch, local cache
 - "step" can mean either a semantic workflow operation or one callable remote function. Resolved: use **Workflow Node** for the semantic DAG unit and **App Function** for a Modal remote callable.
 - "app node" can mean either a Modal deployment unit or a DAG vertex backed by that app. Resolved: use **App** for the deployment unit and **App-Backed Node** for the DAG vertex.
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.
-- "parallelism" can mean ready workflow nodes, child app calls, tool pods, or CPU workers. Resolved: use **Workflow Node Parallelism** for scheduler waves, **Run-Level Provider Call Limits** for coordinator-scoped remote-call limits, **Child App Call** for submitted app functions, **App-Local Scheduler** for tool-owned queues, and **Worker Pool** for local thread or process pools.
+- "parallelism" can mean ready Workflow Nodes, Provider Calls, or local CPU
+  workers. Resolved: use **Workflow Node Parallelism** for the adapter ceiling,
+  **Run-Level Provider Call Limits** for remote-call limits, and **Worker Pool**
+  for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
 - "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each durable coordinator may persist it separately and **Workload Publications** remain authoritative for scientific completion.
 - "job" can mean a user-facing service request or actual scheduled work. Resolved: a **Service Job** holds service metadata and refers one-way to an **Execution Run**; the execution kernel knows only the Run and its work.

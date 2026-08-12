@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Literal
 
 ALPHAFOLD3_REPOSITORY = "https://github.com/y1zhou/alphafold3"
-ALPHAFOLD3_COMMIT = "987ad1cb7d7028b6d35908cf63fe7d951d98d6b6"
+ALPHAFOLD3_COMMIT = "8f8abfedb88024c631f641e9f8a282e50afb7146"
 
 SOURCE_DB_VOLUME_NAME = "AlphaFold3-msa-db"
 SHARDED_DB_VOLUME_NAME = "AlphaFold3-msa-db-sharded"

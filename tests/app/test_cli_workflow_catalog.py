@@ -255,6 +255,15 @@ class _CoordinatedApp:
     execution_coordinator_entrypoints = frozenset({"submit_alphafold3_task"})
 
 
+@dataclass
+class _ImplicitCoordinatedApp:
+    name: str = "af3score"
+    module: str = "biomodals.app.score.af3score_app"
+    path: Path = Path("src/biomodals/app/score/af3score_app.py")
+    _entrypoint: str | None = None
+    execution_coordinator_entrypoints = frozenset({"submit_af3score_task"})
+
+
 def test_workflow_run_requires_entrypoint_for_multiple_local_entrypoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -667,6 +676,32 @@ def test_uncoordinated_app_requires_explicit_development_mode(
     assert result.exit_code == 1
     assert "does not expose a deployment coordinator" in result.output
     assert "--development" in result.output
+
+
+def test_development_limits_suggest_the_coordinator_entrypoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _ImplicitCoordinatedApp(),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "app",
+            "run",
+            "--development",
+            "--max-containers",
+            "40",
+            "af3score",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Run-level container options" in result.output
+    assert "explicitly selected" in result.output
+    assert "af3score::submit_af3score_task" in result.output
 
 
 def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(

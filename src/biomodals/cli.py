@@ -714,10 +714,22 @@ def run_modal_app(
         or max_containers is not None
         or max_gpu_containers is not None
     ):
-        console.print(
-            "[bold red]Error[/bold red] Deployment coordinator options require "
-            "a coordinator-aware app entrypoint"
-        )
+        if development:
+            entrypoints = sorted(getattr(app, "execution_coordinator_entrypoints", ()))
+            hint = (
+                f" Use '{app.name}::{entrypoints[0]}'." if len(entrypoints) == 1 else ""
+            )
+            message = (
+                "Run-level container options require an explicitly selected "
+                "coordinator-aware Local Entrypoint in --development mode."
+                f"{hint}"
+            )
+        else:
+            message = (
+                "Deployment coordinator options require a coordinator-aware "
+                "app entrypoint"
+            )
+        console.print(f"[bold red]Error[/bold red] {message}")
         raise typer.Exit(code=1)
 
     if modal_mode == "shell":

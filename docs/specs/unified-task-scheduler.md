@@ -1338,6 +1338,21 @@ batching, or workload-owned durable queue.
 
 ### Resource ownership
 
+The public launch interface is:
+
+```text
+biomodals app run --max-containers N --max-gpu-containers G <app> -- ...
+biomodals workflow run --max-containers N --max-gpu-containers G <workflow> -- ...
+```
+
+The CLI maps those optional per-Run ceilings to the kernel fields below.
+Workload entrypoints accept the mapped values for source-backed development
+and deployed local invocation, but app/workflow help treats them as outer CLI
+options. No workload may expose a second user-facing remote-container limit.
+Scientific cardinality, shard sizing, fixed-batch width, pull-worker claim
+capacity, and in-container process/thread counts remain workload policy. They
+may lower realized concurrency but cannot raise it above either Run ceiling.
+
 The first kernel has exactly two remote-admission limits inside one Execution
 Run:
 

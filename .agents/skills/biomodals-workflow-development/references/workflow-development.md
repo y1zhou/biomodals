@@ -404,10 +404,15 @@ workflow modules, perform floating deployed-app lookups, or own
 workflow-specific input staging. Domain-specific staging, DAG construction,
 and development function handles belong in top-level workflow scripts.
 
-Pass workflow Node parallelism as `max_parallel_nodes` and remote fan-out
-ceilings as `max_active_provider_calls` and
-`max_active_gpu_provider_calls`. Do not collapse these into one runtime field;
-a user-facing workflow flag may deliberately set both to the same value.
+Expose remote admission only through the outer
+`biomodals workflow run --max-containers N --max-gpu-containers G` options.
+Coordinator-aware Local Entrypoints accept the corresponding hidden values and
+map them to `max_active_provider_calls` and
+`max_active_gpu_provider_calls`. A workflow may initialize
+`max_parallel_nodes` from the total ceiling, but the runtime fields remain
+independent. Do not add workflow-specific remote-container flags. Scientific
+task counts, shard sizes, batching, and in-container workers remain workflow
+arguments and may lower actual concurrency below the Run limits.
 
 ## Runtime Diagnostics
 

@@ -30,6 +30,13 @@ semantics.
 The kernel owns durable Run, Node, Task, dispatch, Worker Assignment, Provider
 Call, Result Envelope, single-submission, and Run-level call-limit mechanics.
 
+Map the outer CLI's `max_containers` and `max_gpu_containers` values to the
+kernel's `max_active_provider_calls` and
+`max_active_gpu_provider_calls`. Use `resolve_provider_call_limits(...)` to
+apply workload defaults and validate the GPU-subset invariant. Do not expose
+the kernel field names or additional remote-container caps as app-specific CLI
+arguments.
+
 The app owns:
 
 - immutable scientific plan and Task construction;

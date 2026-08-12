@@ -24,6 +24,16 @@ scheduler inside the app.
 
 ## Set one run-wide budget
 
+Expose remote-container admission only through the outer
+`biomodals app run --max-containers N --max-gpu-containers G` options.
+Coordinator-aware Local Entrypoints accept the corresponding hidden
+`max_containers` and `max_gpu_containers` values so deployed and development
+runs share one path. Resolve app defaults once and persist them as
+`max_active_provider_calls` and `max_active_gpu_provider_calls`. Do not add an
+app-specific CLI flag for remote worker, pod, batch, search, or stage counts.
+Keep scientific cardinality, shard sizes, pull-worker claim capacity, and
+in-container process/thread counts as workload arguments.
+
 Account for nested concurrency across simultaneous branches:
 
 ```text

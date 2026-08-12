@@ -127,8 +127,11 @@ deployed and run independently.
 
 ```bash
 uv run biomodals app deploy <app-name> --env <environment>
-uv run biomodals app run <app-name> \
-  --environment <environment> -- <app-specific-options>
+uv run biomodals app run \
+  --environment <environment> \
+  --max-containers 40 \
+  --max-gpu-containers 10 \
+  <app-name> -- <app-specific-options>
 ```
 
 A **workflow** constructs a scientific DAG from one or more tools. Workflow
@@ -137,9 +140,18 @@ options.
 
 ```bash
 uv run biomodals workflow deploy <workflow-name> --env <environment>
-uv run biomodals workflow run <workflow-name> \
-  --environment <environment> -- <workflow-specific-options>
+uv run biomodals workflow run \
+  --environment <environment> \
+  --max-containers 40 \
+  --max-gpu-containers 10 \
+  <workflow-name> -- <workflow-specific-options>
 ```
+
+`--max-containers` bounds all active workload containers in one Run.
+`--max-gpu-containers` bounds the GPU-using subset and cannot exceed the total.
+These are per-Run ceilings, not service-wide quotas. Omit them to use the
+app or workflow defaults. Scientific task counts and worker processes inside a
+container remain app- or workflow-specific options after `--`.
 
 A workflow deployment includes the callable functions declared by its
 dependency apps. Those apps do not need separate deployments for that workflow.

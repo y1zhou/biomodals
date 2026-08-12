@@ -156,15 +156,18 @@ PPIFlow report generation stays a workflow-native transform that renders Markdow
 
 ## Enforce Run-level Provider Call limits in SQLite
 
-Workflow `max_parallel` sets the workflow adapter's
-`max_parallel_nodes` limit, not a Modal container limit. A workflow caller may
-also use that public value as the initial Provider Call ceiling, but Node
-parallelism and call admission remain independent runtime controls. The
-execution repository atomically enforces `max_active_provider_calls` and its
-GPU subset by counting nonterminal Provider Calls in one Execution Run.
-Candidate concurrency, AF3Score job count, Rosetta worker count, and BoltzGen
-parallel runs are caller-side inputs to kernel dispatch; they do not form
-separate durable schedulers, shared leases, or cross-run resource managers.
+The public workflow CLI exposes `--max-containers` and
+`--max-gpu-containers`. A workflow maps the total ceiling to its
+`max_parallel_nodes` adapter limit and to the Run's
+`max_active_provider_calls`; the GPU subset maps to
+`max_active_gpu_provider_calls`. Node parallelism and call admission remain
+independent runtime controls even when initialized from the same public value.
+The execution repository atomically enforces both call limits by counting
+nonterminal Provider Calls in one Execution Run. Candidate concurrency,
+AF3Score batching, Rosetta worker sizing, and other stage-local topology remain
+internal inputs to kernel dispatch; they may lower actual fan-out but cannot
+form separate durable schedulers, shared leases, or cross-run resource
+managers.
 
 ## Split PPIFlow workflow helpers into a submodule
 

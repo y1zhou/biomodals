@@ -540,6 +540,17 @@ from scientific fingerprints and conservatively bound in-flight remote calls,
 not actual Modal container packing or CPU, RAM, accelerator type, or GPU
 device count.
 
+The unified CLI resource interface was accepted on 2026-08-12. Coordinated
+app and workflow launches expose only `--max-containers` and
+`--max-gpu-containers` before the app or workflow name. The entrypoint maps
+them to the Run's total and GPU Provider Call limits. Workload-specific flags
+that previously capped remote containers are removed. Scientific task counts,
+shard sizes, batching policy, and in-container worker counts remain
+workload-owned arguments and may reduce actual concurrency below the Run-wide
+ceilings. The CLI names deliberately describe the user-visible Modal cost
+boundary; the kernel retains precise Provider Call terminology because one
+call may execute a bounded batch of Tasks.
+
 The admission-order policy was accepted on 2026-07-30. The coordinator uses a
 Snakemake-inspired greedy selection: every scheduling cycle fills as many
 currently feasible total and GPU Provider Call slots as ready work permits,

@@ -2,6 +2,11 @@
 
 Status: implemented.
 
+Historical note: the experiments below use the former
+`max_parallel_search_workers` and `max_num_gpus` names. Current launches use
+the run-wide `--max-containers` and `--max-gpu-containers` CLI options defined
+by ADR 0006; the measurements and scientific conclusions remain applicable.
+
 Scope: this document records the experiments that matured the sharding method
 and its integration into `src/biomodals/app/fold/alphafold3_app.py` and the
 production modules under `src/biomodals/app/fold/alphafold3/`.

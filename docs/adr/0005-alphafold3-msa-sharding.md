@@ -2,6 +2,11 @@
 
 Status: accepted.
 
+The scientific and cache decisions remain current. References below to
+`max_parallel_search_workers` and `max_num_gpus` describe the implementation
+at the time of this ADR and are not current CLI options. ADR 0006 now owns the
+unified `--max-containers` and `--max-gpu-containers` launch interface.
+
 This record consolidates and supersedes ADRs 0005–0048 as they appeared in
 branch history. It is the authoritative architecture decision for the
 AlphaFold3 sharded-MSA integration.

@@ -52,7 +52,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.artifacts import file_size_sha256
 from biomodals.helper.constant import MAX_TIMEOUT, MODEL_VOLUME
@@ -270,7 +273,7 @@ def prepare_boltzgen_run(
 @app.function(timeout=CONF.timeout, volumes=CONF.mounts(output_volume=True))
 def get_run_ids(
     run_name: str,
-    num_parallel_runs: int,
+    num_runs: int,
     salvage_mode: bool = False,
     focus_run_ids: str | None = None,
     ignore_run_ids: str | None = None,
@@ -287,7 +290,7 @@ def get_run_ids(
 
     if not salvage_mode:
         today: str = datetime.now(UTC).strftime("%Y%m%d")
-        return [f"{today}-{uuid4().hex}" for _ in range(num_parallel_runs)]
+        return [f"{today}-{uuid4().hex}" for _ in range(num_runs)]
 
     if not outdir.exists():
         raise RuntimeError(
@@ -835,7 +838,9 @@ def submit_boltzgen_task(
     input_yaml: str | None = None,
     out_dir: str | None = None,
     run_name: str | None = None,
-    num_parallel_runs: int = 1,
+    num_runs: int = 1,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     download_models: bool = False,
     force_redownload: bool = False,
     protocol: str = "nanobody-anything",
@@ -862,10 +867,10 @@ def submit_boltzgen_task(
             will be saved in a Modal volume only.
         run_name: Name for this BoltzGen run; defaults to yaml file stem. Can
             be used together with `salvage_mode` to continue previous runs.
-        num_parallel_runs: Number of parallel runs to submit. Due to the stochastic
-            nature of BoltzGen, running multiple parallel runs with the same
-            YAML input would generate different results. Also caps concurrent
-            BoltzGen child runs in salvage mode.
+        num_runs: Number of independent stochastic BoltzGen runs to submit.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         download_models: Whether to download model weights and skip running.
         force_redownload: Whether to force re-download of model weights even if they exist.
         protocol: Design protocol, one of: protein-anything, peptide-anything,
@@ -921,6 +926,12 @@ def submit_boltzgen_task(
         ).remote(force=force_redownload)
         return
 
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=num_runs,
+        default_max_gpu_containers=num_runs,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     predecessor_request = (
         None
@@ -977,7 +988,7 @@ def submit_boltzgen_task(
         run_ids = tuple(
             entrypoint_function(get_run_ids, "get_run_ids").remote(
                 run_name=run_name,
-                num_parallel_runs=num_parallel_runs,
+                num_runs=num_runs,
                 salvage_mode=salvage_mode,
                 focus_run_ids=focus_run_ids,
                 ignore_run_ids=ignore_run_ids,
@@ -994,8 +1005,8 @@ def submit_boltzgen_task(
             raise RuntimeError("BoltzGen request has no scientific input")
         request = replace(
             predecessor_request,
-            max_active_provider_calls=num_parallel_runs,
-            max_active_gpu_provider_calls=num_parallel_runs,
+            max_active_provider_calls=total_limit,
+            max_active_gpu_provider_calls=gpu_limit,
             replace_claim_owners=(),
         )
     else:
@@ -1017,8 +1028,8 @@ def submit_boltzgen_task(
             filter_rmsd_threshold=filter_rmsd_threshold,
             app_version=app_version,
             repo_commit_hash=repo_commit_hash,
-            max_active_provider_calls=num_parallel_runs,
-            max_active_gpu_provider_calls=num_parallel_runs,
+            max_active_provider_calls=total_limit,
+            max_active_gpu_provider_calls=gpu_limit,
         )
     execution_run_id = uuid4()
     stage_execution_request(CONF.output_volume, execution_run_id, request)

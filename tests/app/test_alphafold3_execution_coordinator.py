@@ -94,8 +94,8 @@ class FakeRuntime:
 def _request(
     *,
     sequence: str = "ACDE",
-    max_parallel_search_workers: int = 2,
-    max_num_gpus: int = 1,
+    max_containers: int = 2,
+    max_gpu_containers: int = 1,
 ) -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
         AF3Config(
@@ -109,8 +109,8 @@ def _request(
         ),
         search_msa=False,
         search_protein_templates=False,
-        max_parallel_search_workers=max_parallel_search_workers,
-        max_num_gpus=max_num_gpus,
+        max_active_provider_calls=max_containers,
+        max_active_gpu_provider_calls=max_gpu_containers,
         recycle=10,
         sample=1,
     )
@@ -298,8 +298,8 @@ def test_launch_restart_uses_candidate_operational_limits(
     predecessor_request = _request()
     _persist_failed_predecessor(tmp_path, predecessor_request)
     candidate_request = _request(
-        max_parallel_search_workers=4,
-        max_num_gpus=3,
+        max_containers=4,
+        max_gpu_containers=3,
     )
     coordinator = _coordinator(
         tmp_path,
@@ -379,7 +379,7 @@ def test_restart_rejects_a_gpu_limit_above_the_total_limit() -> None:
 
 def test_restart_keeps_positive_batching_with_zero_gpu_admission() -> None:
     """Cache-only restart limits do not become an invalid batching width."""
-    request = _request(max_num_gpus=2)
+    request = _request(max_gpu_containers=2)
 
     restarted = _restart_request(
         request,
@@ -389,6 +389,5 @@ def test_restart_keeps_positive_batching_with_zero_gpu_admission() -> None:
         max_active_gpu_provider_calls=0,
     )
 
-    assert restarted.max_num_gpus == 2
     assert restarted.max_active_provider_calls == 2
     assert restarted.max_active_gpu_provider_calls == 0

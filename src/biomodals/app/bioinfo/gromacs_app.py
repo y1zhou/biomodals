@@ -46,6 +46,7 @@ from biomodals.execution.modal import (
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_execution import (
     execution_lineage_root,
+    resolve_provider_call_limits,
     stage_execution_launch,
 )
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
@@ -1027,7 +1028,8 @@ def submit_gromacs_task(
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
-    max_parallel_analysis: int | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
     deployment_name: str = CONF.name,
@@ -1054,8 +1056,9 @@ def submit_gromacs_task(
         gen_seed: Random seed for initial velocity generation during
             equilibration. -1 derives a stable seed from the scientific input.
         genion_seed: Random seed for ion placement during system neutralization.
-        max_parallel_analysis: Maximum number of trajectory-analysis containers
-            to run at once.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         use_deployed_coordinator: Target the exact deployed coordinator. The
             Biomodals CLI supplies this for normal runs.
         deployment_environment: Modal Environment containing the coordinator.
@@ -1069,9 +1072,12 @@ def submit_gromacs_task(
     if run_name is None:
         run_name = pdb_path.stem
 
-    analysis_limit = 2 if max_parallel_analysis is None else max_parallel_analysis
-    if analysis_limit < 1:
-        raise ValueError("max_parallel_analysis must be positive")
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=3,
+        default_max_gpu_containers=0 if cpu_only else 1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     execution_run_id = uuid4()
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     seed_run_id = (
@@ -1103,8 +1109,8 @@ def submit_gromacs_task(
             purpose="genion-seed",
             random_sentinel=0,
         ),
-        max_active_provider_calls=min(analysis_limit, 2) + 1,
-        max_active_gpu_provider_calls=0 if cpu_only else 1,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
     )
     deployment = DeploymentIdentity(
         deployment_environment,

@@ -55,7 +55,10 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.io import require_safe_filename_component
@@ -519,7 +522,8 @@ def submit_rosetta_task(
     input_flags_file: str | None = None,
     input_csv: str | None = None,
     out_dir: str | None = None,
-    max_num_pods: int = 1,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     rosetta_search_path: str = str(ROSETTA_DIR),
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
@@ -558,12 +562,10 @@ def submit_rosetta_task(
             be saved to the Modal output volume and not downloaded locally. If
             provided, results will be saved to `out_dir` with the same filename as
             the input PDB file but with a `.tar.zst` extension.
-        max_num_pods: Maximum number of parallel pods to run. Only applicable when
-            `input_csv` is provided, because otherwise there's no point to spawn
-            multiple pods. Default is 1. Note that a maximum of 30 CPUs can be
-            allocated per pod. Also note that the parallelism is achieved by running
-            multiple Rosetta jobs, not by parallelizing a single Rosetta job, so
-            more threads for a single job will not speed up the runtime.
+        max_containers: Maximum active workload containers for this Run. Rosetta
+            may execute up to 30 independent jobs in each worker container.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit. Rosetta currently uses CPU containers only.
         rosetta_search_path: The additional search path for Rosetta to find
             Rosetta scripts and flags files.
         use_deployed_coordinator: Target the exact deployed coordinator. The
@@ -663,9 +665,15 @@ def submit_rosetta_task(
             tasks_df.write_parquet(buffer)
             batch.put_file(buffer, f"/{remote_input_root}/tasks.parquet")
 
+    total_limit, _gpu_limit = resolve_provider_call_limits(
+        default_max_containers=1,
+        default_max_gpu_containers=0,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     worker_count, claim_capacity = size_pull_worker_pool(
         tasks_df.height,
-        max_worker_calls=max(1, max_num_pods),
+        max_worker_calls=total_limit,
         max_parallel_per_worker=30,
     )
     app_version = CONF.version

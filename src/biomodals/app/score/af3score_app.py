@@ -54,7 +54,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import (
     AppRunLayout,
     volume_path_from_mount_path,
@@ -776,7 +779,8 @@ def submit_af3score_task(
     run_name: str,
     output_dir: str | None = None,
     prepare_workers: int = 8,
-    max_batches: int = 10,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     force: bool = True,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
@@ -794,10 +798,9 @@ def submit_af3score_task(
             not specified, the current working directory will be used.
         prepare_workers: Number of CPUs to use for processing input PDBs into
             AlphaFold3-style input files (JSON and each chain as CIF template).
-        max_batches: Maximum number of batches (GPU tasks) to run at the same
-            time. AF3Score internally batches inputs of similar lengths
-            together in the `01_prepare_get_json.py` script, so we don't need
-            to batch manually when uploading inputs.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         force: If True, skip the preflight check for an existing remote run.
         use_deployed_coordinator: Target the exact deployed coordinator. The
             Biomodals CLI supplies this for normal runs.
@@ -831,6 +834,12 @@ def submit_af3score_task(
             CONF.output_volume_name,
         )
         print(f"🧬 Uploading '{input_root}' to {remote_run_dir}")
+        total_limit, gpu_limit = resolve_provider_call_limits(
+            default_max_containers=10,
+            default_max_gpu_containers=10,
+            max_containers=max_containers,
+            max_gpu_containers=max_gpu_containers,
+        )
         execution_run_id = uuid4()
         request = AF3ScoreExecutionRequest(
             run_name=run_name,
@@ -839,7 +848,9 @@ def submit_af3score_task(
             ),
             staged_input_execution_run_id=str(execution_run_id),
             prepare_workers=prepare_workers,
-            max_batches=max_batches,
+            max_batches=max(1, gpu_limit),
+            max_active_provider_calls=total_limit,
+            max_active_gpu_provider_calls=gpu_limit,
             app_version=CONF.repo_commit_hash or CONF.version or "unknown",
         )
         request.to_bytes()

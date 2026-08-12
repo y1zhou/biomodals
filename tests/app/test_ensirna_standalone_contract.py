@@ -1452,7 +1452,8 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
         mrna_fasta=str(input_fasta),
         out_dir=str(tmp_path),
         run_name="demo",
-        prepare_workers=2,
+        max_containers=2,
+        max_gpu_containers=1,
         pdb_cores=3,
         preprocess_shard_size=17,
     )
@@ -1462,6 +1463,8 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     assert captured["launch"] == (execution_run_id, None)
     assert request.fasta_content == b">m\nAUGCUAGCUAGCUAGCUAGC\n"
     assert request.prepare_workers == 2
+    assert request.max_active_provider_calls == 2
+    assert request.max_active_gpu_provider_calls == 1
     assert request.pdb_cores == 3
     assert request.preprocess_shard_size == 17
     assert captured["run_kwargs"] == {"development": True}

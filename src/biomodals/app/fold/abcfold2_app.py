@@ -51,7 +51,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import (
     file_matches_sha256,
@@ -883,7 +886,8 @@ def submit_abcfold2_task(
     force_redownload: bool = False,
     run_boltz: bool = True,
     run_chai: bool = True,
-    max_parallel_children: int | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
     deployment_name: str = CONF.name,
@@ -910,8 +914,9 @@ def submit_abcfold2_task(
         force_redownload: Whether to force re-download of model weights.
         run_boltz: Whether to run Boltz inference.
         run_chai: Whether to run Chai inference.
-        max_parallel_children: Maximum number of child inference containers to
-            run at once in each ABCFold2 coordinator.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         use_deployed_coordinator: Target the exact deployed coordinator. The
             Biomodals CLI supplies this for normal runs.
         deployment_environment: Modal Environment containing the coordinator.
@@ -926,10 +931,11 @@ def submit_abcfold2_task(
     run_name = run_name or yaml_path.stem
     if not search_templates:
         run_name = f"{run_name}-no-tmpl"
-    capacity = (
-        _DEFAULT_MAX_ACTIVE_PROVIDER_CALLS
-        if max_parallel_children is None
-        else max_parallel_children
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=_DEFAULT_MAX_ACTIVE_PROVIDER_CALLS,
+        default_max_gpu_containers=_DEFAULT_MAX_ACTIVE_PROVIDER_CALLS,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
     )
     request = ABCFold2ExecutionRequest(
         run_name=run_name,
@@ -940,7 +946,8 @@ def submit_abcfold2_task(
         force_redownload=force_redownload,
         run_boltz=run_boltz,
         run_chai=run_chai,
-        max_active_provider_calls=capacity,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",
         boltz_version=BoltzConf.repo_commit_hash or BoltzConf.version or "unknown",
         chai_version=ChaiConf.repo_commit_hash or ChaiConf.version or "unknown",
@@ -998,7 +1005,6 @@ def submit_abcfold2_task(
     run_conf = run_config_from_overview(overview)
     local_out_dir.mkdir(parents=True, exist_ok=True)
     local_run_conf = run_conf.as_kwargs()
-    local_run_conf["max_parallel_children"] = max_parallel_children
     (local_out_dir / "run-config.json").write_bytes(
         orjson.dumps(local_run_conf, option=orjson.OPT_INDENT_2),
     )

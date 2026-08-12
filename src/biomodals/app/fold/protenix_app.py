@@ -63,7 +63,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.artifacts import (
     file_matches_sha256,
     read_volume_file_exact,
@@ -968,7 +971,8 @@ def submit_protenix_task(
     force_redownload: bool = False,
     extra_args: str | None = None,
     score_only: bool = False,
-    max_parallel_msa: int | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
     deployment_name: str = CONF.name,
@@ -1001,7 +1005,9 @@ def submit_protenix_task(
         extra_args: Additional CLI arguments passed to `protenix pred`.
         score_only: When True, score an existing PDB/CIF structure using
             ``protenixscore score`` instead of running prediction.
-        max_parallel_msa: Maximum number of MSA search containers to run at once.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         use_deployed_coordinator: Target the exact deployed coordinator. The
             Biomodals CLI supplies this for normal runs.
         deployment_environment: Modal Environment containing the coordinator.
@@ -1013,10 +1019,11 @@ def submit_protenix_task(
     if not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    capacity = (
-        _DEFAULT_MAX_ACTIVE_PROVIDER_CALLS
-        if max_parallel_msa is None
-        else max_parallel_msa
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=_DEFAULT_MAX_ACTIVE_PROVIDER_CALLS,
+        default_max_gpu_containers=1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
     )
     request = ProtenixExecutionRequest(
         run_name=sanitize_filename(run_name or input_path.stem),
@@ -1036,7 +1043,8 @@ def submit_protenix_task(
         force_redownload=force_redownload,
         extra_args=extra_args,
         score_only=score_only,
-        max_active_provider_calls=capacity,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",
     )
     if request.model_name not in APP_INFO.supported_models:

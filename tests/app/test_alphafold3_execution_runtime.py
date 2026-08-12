@@ -130,7 +130,7 @@ class UnavailableCallDriver(NoCallDriver):
 def _request(
     *,
     seeds: list[int] | None = None,
-    max_num_gpus: int = 1,
+    max_gpu_containers: int = 1,
     search_msa: bool = False,
 ) -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
@@ -148,8 +148,8 @@ def _request(
         ),
         search_msa=search_msa,
         search_protein_templates=True,
-        max_parallel_search_workers=2,
-        max_num_gpus=max_num_gpus,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=max_gpu_containers,
         recycle=10,
         sample=1,
     )
@@ -261,7 +261,7 @@ def test_seed_tasks_use_fixed_batches_without_duplicate_submission(
     driver = RecordingCallDriver()
     runtime = _runtime(
         tmp_path,
-        request=_request(seeds=[1, 2, 3], max_num_gpus=2),
+        request=_request(seeds=[1, 2, 3], max_gpu_containers=2),
         driver=driver,
     )
     monkeypatch.setattr(
@@ -384,7 +384,7 @@ def test_seed_claim_is_not_acquired_before_deployment_preflight(
     """An expired exact version cannot strand a scientific generation claim."""
     runtime = _runtime(
         tmp_path,
-        request=_request(seeds=[1, 2], max_num_gpus=2),
+        request=_request(seeds=[1, 2], max_gpu_containers=2),
         driver=UnavailableCallDriver(),
     )
     monkeypatch.setattr(
@@ -513,7 +513,7 @@ def test_overlapping_seed_request_submits_only_the_missing_seed(
     driver = RecordingCallDriver()
     runtime = _runtime(
         tmp_path,
-        request=_request(seeds=[1, 2], max_num_gpus=2),
+        request=_request(seeds=[1, 2], max_gpu_containers=2),
         driver=driver,
     )
     monkeypatch.setattr(

@@ -146,7 +146,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
@@ -919,8 +922,8 @@ def submit_alphafold3_task(
     run_name: str | None = None,
     search_msa: bool = True,
     search_protein_templates: bool = True,
-    max_parallel_search_workers: int = 4,
-    max_num_gpus: int = 1,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     allow_large_inference: bool = False,
     recycle: int = 10,
     sample: int = 5,
@@ -940,11 +943,9 @@ def submit_alphafold3_task(
         search_msa: Populate missing protein and RNA MSA fields.
         search_protein_templates: Populate missing protein templates after MSA
             resolution. Non-empty caller fields are always preserved.
-        max_parallel_search_workers: Request-wide cap for database and template
-            workers. Database workers internally use 16 shards by two HMMER
-            CPUs.
-        max_num_gpus: Maximum number of disjoint seed workers to run during
-            inference.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         allow_large_inference: Continue after warning when the request exceeds
             the default seed/sample prediction limit. Other limits still apply.
         recycle: Number of Pairformer recycles to use during inference.
@@ -971,12 +972,18 @@ def submit_alphafold3_task(
             "--allow-large-inference was set.",
             stacklevel=2,
         )
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=4,
+        default_max_gpu_containers=1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     request = AlphaFold3ExecutionRequest.prepare(
         conf,
         search_msa=search_msa,
         search_protein_templates=search_protein_templates,
-        max_parallel_search_workers=max_parallel_search_workers,
-        max_num_gpus=max_num_gpus,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
         allow_large_inference=allow_large_inference,
         recycle=recycle,
         sample=sample,

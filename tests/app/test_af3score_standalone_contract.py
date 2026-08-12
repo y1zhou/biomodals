@@ -283,7 +283,8 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
         input_dir=str(input_pdb),
         run_name="scores",
         output_dir=str(output_dir),
-        max_batches=2,
+        max_containers=3,
+        max_gpu_containers=2,
     )
 
     assert captured["run_id"] == execution_run_id
@@ -299,6 +300,8 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
     )
     assert captured["request"].staged_input_execution_run_id == str(execution_run_id)
     assert captured["request"].max_batches == 2
+    assert captured["request"].max_active_provider_calls == 3
+    assert captured["request"].max_active_gpu_provider_calls == 2
     assert captured["launch"] == (execution_run_id, None)
     assert captured["run_kwargs"] == {"development": True}
     assert output_dir.joinpath("scores_af3score_metrics.csv").is_file()

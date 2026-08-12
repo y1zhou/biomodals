@@ -239,11 +239,13 @@ def test_local_entrypoint_launches_one_execution_coordinator(
         input_file=str(input_path),
         out_dir=str(tmp_path / "results"),
         run_name="../demo",
-        max_parallel_msa=3,
+        max_containers=3,
+        max_gpu_containers=1,
     )
 
     assert captured["request"].run_name == "demo"
     assert captured["request"].max_active_provider_calls == 3
+    assert captured["request"].max_active_gpu_provider_calls == 1
     assert captured["launch"] == (execution_run_id, None)
     assert captured["run_kwargs"] == {"development": True}
     assert captured["data"] == b"tar"

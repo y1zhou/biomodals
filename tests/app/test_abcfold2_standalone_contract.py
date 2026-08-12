@@ -322,12 +322,14 @@ def test_local_entrypoint_launches_one_execution_coordinator(
         run_name="demo",
         run_boltz=True,
         run_chai=True,
-        max_parallel_children=3,
+        max_containers=3,
+        max_gpu_containers=2,
     )
 
     local = output_dir / "demo-no-tmpl"
     assert captured["launch"] == (execution_run_id, None)
     assert captured["request"].max_active_provider_calls == 3
+    assert captured["request"].max_active_gpu_provider_calls == 2
     assert captured["run_kwargs"] == {"development": True}
     assert (local / "run-config.json").is_file()
     assert (local / "boltz_models.tar.zst").read_bytes() == b"tar"

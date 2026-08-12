@@ -446,7 +446,8 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
             out_dir=str(tmp_path),
             run_name="renamed",
             search_msa=False,
-            max_num_gpus=4,
+            max_containers=8,
+            max_gpu_containers=4,
             allow_large_inference=True,
             recycle=3,
             sample=6,
@@ -461,7 +462,8 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     assert request.config.modelSeeds == list(
         range(alphafold3_app.MAX_SEED_SAMPLE_PAIRS // 5)
     )
-    assert request.max_num_gpus == 4
+    assert request.max_active_provider_calls == 8
+    assert request.max_active_gpu_provider_calls == 4
     assert request.allow_large_inference
     assert request.recycle == 3
     assert request.sample == 6
@@ -677,8 +679,8 @@ def test_coordinator_launch_restart_forwards_candidate_bytes() -> None:
         ),
         search_msa=False,
         search_protein_templates=False,
-        max_parallel_search_workers=2,
-        max_num_gpus=1,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=1,
         recycle=1,
         sample=1,
     )

@@ -63,7 +63,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import (
     read_volume_file_exact,
@@ -1970,7 +1973,8 @@ def submit_ensirna_task(
     mrna_fasta: str,
     out_dir: str | None = None,
     run_name: str | None = None,
-    prepare_workers: int = 4,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     pdb_cores: int = 1,
     preprocess_shard_size: int = APP_INFO.preprocess_shard_size,
     force: bool = False,
@@ -1988,10 +1992,11 @@ def submit_ensirna_task(
             will be saved in the current working directory.
         run_name: Optional run name for output files. Defaults to the mRNA FASTA
             filename stem.
-        prepare_workers: Maximum concurrent Modal containers used for Rosetta PDB
-            preparation chunks.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         pdb_cores: Local Rosetta worker processes per preparation container. The
-            product of this value and prepare_workers cannot exceed 64.
+            aggregate preparation CPU budget cannot exceed 64.
         preprocess_shard_size: Candidate records checkpointed per RNA-FM shard;
             completed preparation caches remain reusable across values.
         force: Rebuild prepared artifacts and rerun inference instead of using
@@ -2015,19 +2020,21 @@ def submit_ensirna_task(
         overwrite=force,
     )
 
-    if not 1 <= prepare_workers <= APP_INFO.max_prepare_jobs:
-        raise ValueError(
-            f"prepare_workers must be between 1 and {APP_INFO.max_prepare_jobs}"
-        )
     if not 1 <= pdb_cores <= APP_INFO.max_pdb_cores:
         raise ValueError(f"pdb_cores must be between 1 and {APP_INFO.max_pdb_cores}")
-    if prepare_workers * pdb_cores > APP_INFO.max_total_pdb_cores:
-        raise ValueError(
-            "prepare_workers * pdb_cores must not exceed "
-            f"{APP_INFO.max_total_pdb_cores}"
-        )
     if preprocess_shard_size < 1:
         raise ValueError("preprocess_shard_size must be at least 1")
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=4,
+        default_max_gpu_containers=1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
+    prepare_workers = min(
+        total_limit,
+        APP_INFO.max_prepare_jobs,
+        APP_INFO.max_total_pdb_cores // pdb_cores,
+    )
 
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     request = EnsirnaExecutionRequest(
@@ -2038,6 +2045,8 @@ def submit_ensirna_task(
         preprocess_shard_size=preprocess_shard_size,
         force_generation=uuid4().hex if force else None,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
     )
     execution_run_id = uuid4()
     deployment = DeploymentIdentity(

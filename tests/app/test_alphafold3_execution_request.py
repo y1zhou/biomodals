@@ -46,8 +46,8 @@ class FakeVolume:
 
 def _request(
     *,
-    search_workers: int = 4,
-    gpu_workers: int = 2,
+    max_containers: int = 4,
+    max_gpu_containers: int = 2,
     allow_large_inference: bool = False,
 ):
     config = AF3Config(
@@ -66,8 +66,8 @@ def _request(
         config,
         search_msa=True,
         search_protein_templates=True,
-        max_parallel_search_workers=search_workers,
-        max_num_gpus=gpu_workers,
+        max_active_provider_calls=max_containers,
+        max_active_gpu_provider_calls=max_gpu_containers,
         allow_large_inference=allow_large_inference,
         recycle=10,
         sample=5,
@@ -88,8 +88,8 @@ def test_execution_request_round_trips_and_revalidates_identity() -> None:
 
 def test_operational_limits_do_not_change_the_scientific_plan() -> None:
     """CPU and GPU call ceilings remain outside result compatibility."""
-    first = _request(search_workers=4, gpu_workers=2)
-    second = _request(search_workers=1, gpu_workers=1)
+    first = _request(max_containers=4, max_gpu_containers=2)
+    second = _request(max_containers=1, max_gpu_containers=1)
 
     assert (
         first.execution_plan.workload_plan_fingerprint
@@ -120,7 +120,7 @@ def test_execution_request_staging_is_immutable_and_remotely_revalidated(
     assert load_execution_request(tmp_path, RUN_ID) == request
 
     path = tmp_path.joinpath(*request_path.parts)
-    path.write_bytes(_request(search_workers=1).to_bytes())
+    path.write_bytes(_request(max_containers=1, max_gpu_containers=1).to_bytes())
     with pytest.raises(RuntimeError, match="conflicts"):
         stage_execution_request(volume, RUN_ID, request)
 

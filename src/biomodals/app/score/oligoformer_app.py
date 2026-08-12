@@ -132,7 +132,10 @@ from biomodals.execution.modal import (
     execution_coordinator_handle as _execution_coordinator_handle,
 )
 from biomodals.helper import hash_string, patch_image_for_helper
-from biomodals.helper.app_execution import stage_execution_launch
+from biomodals.helper.app_execution import (
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import sha256_bytes
 from biomodals.helper.artifacts import sha256_file as _hash_path
@@ -5808,32 +5811,28 @@ def submit_oligoformer_task(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    off_target_nodes: int = APP_INFO.default_off_target_nodes,
     off_target_workers: int = APP_INFO.default_off_target_workers_per_node,
     off_target_process_slots: int = APP_INFO.default_off_target_process_slots,
     off_target_prep_workers: int = APP_INFO.default_off_target_prep_workers,
-    pita_prepare_nodes: int = APP_INFO.default_pita_prepare_nodes,
     pita_prepare_workers: int = APP_INFO.default_pita_prepare_workers,
     pita_prepare_utr_shard_size: int = APP_INFO.default_pita_prepare_utr_shard_size,
     pita_row_shard_size: int = APP_INFO.default_pita_row_shard_size,
     pita_row_attempts: int = APP_INFO.default_pita_row_attempts,
-    targetscan_rnaplfold_nodes: int = APP_INFO.default_targetscan_rnaplfold_nodes,
     targetscan_rnaplfold_workers: int = APP_INFO.default_targetscan_rnaplfold_workers,
     targetscan_rnaplfold_shard_size: int = (
         APP_INFO.default_targetscan_rnaplfold_shard_size
     ),
-    targetscan_prepare_nodes: int = APP_INFO.default_targetscan_prepare_nodes,
     targetscan_ref_shard_size: int | None = None,
     targetscan_candidate_shard_size: int = (
         APP_INFO.default_targetscan_candidate_shard_size
     ),
-    targetscan_context_nodes: int = APP_INFO.default_targetscan_context_nodes,
     targetscan_context_workers: int = APP_INFO.default_targetscan_context_workers,
     targetscan_context_shard_size: int = (
         APP_INFO.default_targetscan_context_shard_size
     ),
     targetscan_context_attempts: int = APP_INFO.default_targetscan_context_attempts,
-    targetscan_merge_nodes: int = APP_INFO.default_targetscan_merge_nodes,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     force: bool = False,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
@@ -5863,28 +5862,25 @@ def submit_oligoformer_task(
         pita_threshold: PITA threshold used by off-target prediction.
         targetscan_threshold: TargetScan threshold used by off-target prediction.
         toxicity_threshold: Toxicity filter threshold.
-        off_target_nodes: Maximum PITA CPU containers per stage.
         off_target_workers: Maximum PITA worker processes per container.
         off_target_process_slots: Run-wide TargetScan and PITA process budget.
         off_target_prep_workers: Local workers used to prepare PITA candidates.
-        pita_prepare_nodes: Maximum PITA target-discovery CPU containers.
         pita_prepare_workers: PITA target-discovery workers per container.
         pita_prepare_utr_shard_size: UTR STAB rows per PITA discovery shard.
         pita_row_shard_size: Potential-target rows per PITA scoring shard.
         pita_row_attempts: Attempts for interrupted PITA discovery and row shards.
-        targetscan_rnaplfold_nodes: Maximum RNAplfold CPU containers.
         targetscan_rnaplfold_workers: RNAplfold workers per container.
         targetscan_rnaplfold_shard_size: UTR records per RNAplfold shard.
-        targetscan_prepare_nodes: Maximum TargetScan preparation containers.
         targetscan_ref_shard_size: Advanced TargetScan UTR records per
             reference-preparation shard. When omitted, the UTR reference is
-            distributed across targetscan_prepare_nodes shards.
+            distributed across the default preparation shards.
         targetscan_candidate_shard_size: siRNAs per TargetScan candidate shard.
-        targetscan_context_nodes: Maximum TargetScan context-score containers.
         targetscan_context_workers: Context-score workers per container.
         targetscan_context_shard_size: Target rows per context-score shard.
         targetscan_context_attempts: Attempts for TargetScan context scoring.
-        targetscan_merge_nodes: Maximum TargetScan merge containers.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         force: Rebuild cached intermediates and outputs.
         use_deployed_coordinator: Target the exact deployed coordinator. The
             Biomodals CLI supplies this for normal runs.
@@ -5898,6 +5894,16 @@ def submit_oligoformer_task(
         raise FileNotFoundError(f"mRNA FASTA not found: {input_path}")
     run_name = run_name or input_path.stem
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=max(
+            2,
+            off_target_process_slots,
+            APP_INFO.default_targetscan_rnaplfold_nodes,
+        ),
+        default_max_gpu_containers=1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     request = OligoformerExecutionRequest(
         run_name=run_name,
         mrna_fasta_bytes=input_path.read_bytes(),
@@ -5912,26 +5918,26 @@ def submit_oligoformer_task(
         pita_threshold=pita_threshold,
         targetscan_threshold=targetscan_threshold,
         toxicity_threshold=toxicity_threshold,
-        off_target_nodes=off_target_nodes,
+        off_target_nodes=APP_INFO.default_off_target_nodes,
         off_target_workers=off_target_workers,
         off_target_process_slots=off_target_process_slots,
         off_target_prep_workers=off_target_prep_workers,
-        pita_prepare_nodes=pita_prepare_nodes,
+        pita_prepare_nodes=APP_INFO.default_pita_prepare_nodes,
         pita_prepare_workers=pita_prepare_workers,
         pita_prepare_utr_shard_size=pita_prepare_utr_shard_size,
         pita_row_shard_size=pita_row_shard_size,
         pita_row_attempts=pita_row_attempts,
-        targetscan_rnaplfold_nodes=targetscan_rnaplfold_nodes,
+        targetscan_rnaplfold_nodes=APP_INFO.default_targetscan_rnaplfold_nodes,
         targetscan_rnaplfold_workers=targetscan_rnaplfold_workers,
         targetscan_rnaplfold_shard_size=targetscan_rnaplfold_shard_size,
-        targetscan_prepare_nodes=targetscan_prepare_nodes,
+        targetscan_prepare_nodes=APP_INFO.default_targetscan_prepare_nodes,
         targetscan_ref_shard_size=targetscan_ref_shard_size,
         targetscan_candidate_shard_size=targetscan_candidate_shard_size,
-        targetscan_context_nodes=targetscan_context_nodes,
+        targetscan_context_nodes=APP_INFO.default_targetscan_context_nodes,
         targetscan_context_workers=targetscan_context_workers,
         targetscan_context_shard_size=targetscan_context_shard_size,
         targetscan_context_attempts=targetscan_context_attempts,
-        targetscan_merge_nodes=targetscan_merge_nodes,
+        targetscan_merge_nodes=APP_INFO.default_targetscan_merge_nodes,
         force=force,
         force_generation=uuid4().hex if force else None,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",
@@ -5951,6 +5957,8 @@ def submit_oligoformer_task(
             if off_target and all_human
             else None
         ),
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
     )
 
     out_file = build_local_output_path(

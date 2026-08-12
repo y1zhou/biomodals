@@ -921,7 +921,8 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         maximum = 1
         if uses_gpu:
             seed_count = len(self._prepared_inference().normalized_seeds)
-            maximum = max(1, math.ceil(seed_count / self.request.max_num_gpus))
+            gpu_calls = max(1, self.request.max_active_gpu_provider_calls)
+            maximum = max(1, math.ceil(seed_count / gpu_calls))
         return (
             ProviderBinding(
                 environment=self.deployment.environment,

@@ -61,6 +61,7 @@ from biomodals.execution import (
 )
 from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.app_execution import resolve_provider_call_limits
 from biomodals.helper.app_run import (
     AppRunLayout,
     volume_app_output,
@@ -5189,8 +5190,8 @@ def submit_ppiflow_workflow(
     run_id: str | None = None,
     stage: int | None = None,
     wait: bool = True,
-    max_parallel: int = 16,
-    max_child_calls: int | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     dry_run: bool = False,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
@@ -5210,10 +5211,9 @@ def submit_ppiflow_workflow(
             only, or omit to build both stages.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
-        max_parallel: Maximum ready workflow Nodes and active Provider Calls.
-            Configured candidate concurrency may lower only the call limit.
-        max_child_calls: Compatibility cap applied to stage fan-out settings
-            and the Run-level active Provider Call limit.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         use_deployed_coordinator: Submit through an exact named deployment.
         deployment_environment: Modal Environment containing the deployment.
@@ -5230,14 +5230,18 @@ def submit_ppiflow_workflow(
     task_yaml_bytes = task_yaml_path.read_bytes()
     steps_yaml_bytes = steps_yaml_path.read_bytes()
     task_doc = _load_yaml_bytes(task_yaml_bytes)
-    if max_parallel < 1:
-        raise ValueError("max_parallel must be at least 1")
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=16,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     if dry_run:
         workflow = build_ppiflow_workflow(
             task_yaml_bytes=task_yaml_bytes,
             steps_yaml_bytes=steps_yaml_bytes,
             stage=stage,
-            max_child_calls=max_child_calls,
+            max_child_calls=total_limit,
         )
         print_workflow_dag(workflow.validate())
         return
@@ -5253,20 +5257,11 @@ def submit_ppiflow_workflow(
         steps_doc=steps_doc,
         stage=stage,
     )
-    provider_call_limit = min(
-        max_parallel,
-        ppiflow_coordinators.candidate_concurrency_from_config(
-            _task_section(task_doc),
-            steps_doc,
-        ),
-    )
-    if max_child_calls is not None:
-        provider_call_limit = min(provider_call_limit, max_child_calls)
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=yaml.safe_dump(task_doc).encode("utf-8"),
         steps_yaml_bytes=yaml.safe_dump(steps_doc).encode("utf-8"),
         stage=stage,
-        max_child_calls=max_child_calls,
+        max_child_calls=total_limit,
     )
 
     execution_run_id = uuid4()
@@ -5287,9 +5282,9 @@ def submit_ppiflow_workflow(
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
-        "max_parallel_nodes": max_parallel,
-        "max_active_provider_calls": provider_call_limit,
-        "max_active_gpu_provider_calls": provider_call_limit,
+        "max_parallel_nodes": total_limit,
+        "max_active_provider_calls": total_limit,
+        "max_active_gpu_provider_calls": gpu_limit,
         "strict_external_artifact_checks": True,
         "external_artifact_checker_function_name": ("check_ppiflow_external_artifact"),
     }

@@ -587,7 +587,8 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
         sc_num_samples=7,
         number_of_packs_per_design=5,
         wait=False,
-        max_parallel=3,
+        max_containers=3,
+        max_gpu_containers=2,
     )
 
     assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
@@ -605,7 +606,7 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
     assert calls["coordinator"]["deployment_version"] == 1
     assert calls["prepare"]["max_parallel_nodes"] == 3
     assert calls["prepare"]["max_active_provider_calls"] == 3
-    assert calls["prepare"]["max_active_gpu_provider_calls"] == 3
+    assert calls["prepare"]["max_active_gpu_provider_calls"] == 2
     assert "development_function_handles" not in calls["prepare"]
     assert set(calls["drive"]["development_function_handles"]) == {
         "rfdiffusion_infer",

@@ -2879,6 +2879,8 @@ PPIFlowStep:
         steps_yaml=str(steps_yaml),
         run_id="demo",
         wait=True,
+        max_containers=6,
+        max_gpu_containers=2,
     )
 
     assert "force" not in calls["staging"]
@@ -2887,9 +2889,9 @@ PPIFlowStep:
     assert calls["coordinator"]["deployment_environment"] == "development"
     assert calls["coordinator"]["deployment_name"] == ppiflow_workflow.CONF.name
     assert calls["coordinator"]["deployment_version"] == 1
-    assert calls["spawn"]["max_parallel_nodes"] == 16
-    assert calls["spawn"]["max_active_provider_calls"] == 4
-    assert calls["spawn"]["max_active_gpu_provider_calls"] == 4
+    assert calls["spawn"]["max_parallel_nodes"] == 6
+    assert calls["spawn"]["max_active_provider_calls"] == 6
+    assert calls["spawn"]["max_active_gpu_provider_calls"] == 2
     assert "force" not in calls["spawn"]
 
 

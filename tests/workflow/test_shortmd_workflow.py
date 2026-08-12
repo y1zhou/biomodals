@@ -892,7 +892,8 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         run_id="shortmd-run",
         replicates=1,
         wait=False,
-        max_parallel=3,
+        max_containers=3,
+        max_gpu_containers=2,
     )
 
     assert calls["prepare"]["workflow"].name == "shortmd"
@@ -920,7 +921,7 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert calls["coordinator"]["deployment_version"] == 1
     assert calls["prepare"]["max_parallel_nodes"] == 3
     assert calls["prepare"]["max_active_provider_calls"] == 3
-    assert calls["prepare"]["max_active_gpu_provider_calls"] == 3
+    assert calls["prepare"]["max_active_gpu_provider_calls"] == 2
     assert "development_function_handles" not in calls["prepare"]
     assert set(calls["drive"]["development_function_handles"]) == {
         "clear_shortmd_gromacs_run",

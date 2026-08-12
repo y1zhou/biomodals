@@ -27,6 +27,7 @@ from biomodals.execution import DeploymentIdentity
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_execution import (
     execution_lineage_root,
+    resolve_provider_call_limits,
     stage_execution_launch,
 )
 from biomodals.helper.app_run import volume_app_output
@@ -826,7 +827,8 @@ def submit_shortmd_workflow(
     genion_seed: int = 0,
     force: bool = False,
     wait: bool = True,
-    max_parallel: int = 16,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     dry_run: bool = False,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
@@ -854,7 +856,9 @@ def submit_shortmd_workflow(
         force: Replace existing ShortMD-managed app outputs before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
-        max_parallel: Maximum ready workflow Nodes and active Provider Calls.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
         use_deployed_coordinator: Submit through an exact named deployment.
         deployment_environment: Modal Environment containing the deployment.
@@ -865,8 +869,12 @@ def submit_shortmd_workflow(
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
     if predecessor_execution_run_id is not None and not use_deployed_coordinator:
         raise ValueError("restart_from requires an exact deployed workflow coordinator")
-    if max_parallel < 1:
-        raise ValueError("max_parallel must be at least 1")
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=16,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
     resolved_run_id = sanitize_filename(run_id or input_path.name)
@@ -893,7 +901,7 @@ def submit_shortmd_workflow(
         ld_seed=ld_seed,
         gen_seed=gen_seed,
         genion_seed=genion_seed,
-        max_parallel=max_parallel,
+        max_parallel=total_limit,
         overwrite_existing=force,
     )
     if dry_run:
@@ -923,9 +931,9 @@ def submit_shortmd_workflow(
     orchestrator_kwargs = {
         "workflow": workflow,
         "workload_run_key": resolved_run_id,
-        "max_parallel_nodes": max_parallel,
-        "max_active_provider_calls": max_parallel,
-        "max_active_gpu_provider_calls": max_parallel,
+        "max_parallel_nodes": total_limit,
+        "max_active_provider_calls": total_limit,
+        "max_active_gpu_provider_calls": gpu_limit,
         "strict_external_artifact_checks": True,
         "external_artifact_checker_function_name": ("check_shortmd_external_artifact"),
     }

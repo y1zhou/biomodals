@@ -25,7 +25,6 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     prepare_inference_run,
     serialize_af3_input,
     validate_inference_parameters,
-    validate_inference_worker_budget,
     validate_inference_workload,
     validate_upstream_af3_input,
 )
@@ -479,8 +478,6 @@ def test_inference_parameters_are_resource_bounded() -> None:
         validate_inference_parameters(101, 1)
     with pytest.raises(ValueError, match="between 1 and"):
         validate_inference_parameters(1, 101)
-    with pytest.raises(ValueError, match="between 1 and"):
-        validate_inference_worker_budget(101)
     seeds = list(range(MAX_MODEL_SEEDS))
     assert validate_inference_workload(seeds, 5) == MAX_SEED_SAMPLE_PAIRS
     with pytest.raises(ValueError, match="modelSeeds × sample"):

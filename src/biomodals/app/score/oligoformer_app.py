@@ -20,7 +20,7 @@ candidate.
 Advanced tuning is available through CLI flags rather than image environment
 variables. `--targetscan-ref-shard-size` controls how many UTR records are put
 into each TargetScan reference-preparation shard; when omitted, Biomodals uses
-`--targetscan-prepare-nodes` to derive the shard size. Candidate, context,
+its internal preparation topology to derive the shard size. Candidate, context,
 RNAplfold, and PITA shard sizes can be tuned independently. The
 `--off-target-process-slots` run-wide budget bounds concurrent TargetScan and
 PITA subprocesses (default and maximum: 64); each branch receives half.

@@ -53,7 +53,6 @@ MAX_MODEL_SEEDS = 1000
 MAX_NUM_RECYCLES = 100
 MAX_DIFFUSION_SAMPLES = 100
 MAX_SEED_SAMPLE_PAIRS = 5000
-MAX_INFERENCE_WORKERS = 100
 MAX_PROTEIN_TEMPLATES = 20
 _TEXT_SIZE_CHUNK_CHARS = 1024 * 1024
 
@@ -605,19 +604,6 @@ def validate_inference_parameters(recycle: int, sample: int) -> None:
         raise ValueError(
             f"sample must be an integer between 1 and {MAX_DIFFUSION_SAMPLES}"
         )
-
-
-def validate_inference_worker_budget(max_num_gpus: int) -> int:
-    """Validate the GPU-worker cap before any cost-incurring remote work."""
-    if (
-        isinstance(max_num_gpus, bool)
-        or not isinstance(max_num_gpus, int)
-        or not 1 <= max_num_gpus <= MAX_INFERENCE_WORKERS
-    ):
-        raise ValueError(
-            f"max_num_gpus must be an integer between 1 and {MAX_INFERENCE_WORKERS}"
-        )
-    return max_num_gpus
 
 
 def validate_inference_workload(

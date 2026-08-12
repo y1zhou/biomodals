@@ -124,6 +124,7 @@ download_image = (
         }
     )
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.abcfold2_execution")
 )
 
 runtime_image = (
@@ -161,6 +162,7 @@ runtime_image = (
     .apt_install("kalign")  # for Chai templates
     .workdir(APP_INFO.abcfold_dir)
     .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.fold.abcfold2_execution")
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

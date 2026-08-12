@@ -251,6 +251,10 @@ runtime_image = (
     )
     .add_local_dir(Path(__file__).parent / "gromacs", APP_INFO.gmx_scripts, copy=True)
     .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.gromacs_execution",
+        "biomodals.app.bioinfo.gromacs_execution_runtime",
+    )
 )
 
 biotite_image = (
@@ -259,6 +263,10 @@ biotite_image = (
     .apt_install("git", "build-essential")
     .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
     .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.gromacs_execution",
+        "biomodals.app.bioinfo.gromacs_execution_runtime",
+    )
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

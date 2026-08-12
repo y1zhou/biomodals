@@ -1657,6 +1657,7 @@ runtime_image = (
     .pipe(
         patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3", "modal"]
     )
+    .add_local_python_source("biomodals.app.score.oligoformer_execution")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 OLIGOFORMER_OUTPUT_CLAIMS = modal.Dict.from_name(

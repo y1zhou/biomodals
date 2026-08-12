@@ -1234,6 +1234,7 @@ runtime_image = (
     .uv_pip_install(*APP_INFO.torch_packages, index_url=APP_INFO.torch_index_url)
     .uv_pip_install(*APP_INFO.extra_pip_packages)
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
+    .add_local_python_source("biomodals.app.score.ensirna_execution")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ENSIRNA_OUTPUT_CLAIMS = modal.Dict.from_name(

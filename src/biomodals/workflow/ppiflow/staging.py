@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO, RawIOBase
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TypeVar
 
 import polars as pl
 
@@ -26,6 +26,7 @@ MAX_ARCHIVE_MEMBERS = 100_000
 MAX_ARCHIVE_SELECTED_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_SELECTED_MEMBERS = 10_000
 _ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
+_ArchiveItem = TypeVar("_ArchiveItem")
 
 
 class _BoundedArchiveReader(RawIOBase):
@@ -480,7 +481,7 @@ def rosetta_job_manifest_rows(
     flags_file: str | None = None,
 ) -> list[dict[str, object]]:
     """Build PPIFlow-owned Rosetta job manifest rows."""
-    rows = []
+    rows: list[dict[str, object]] = []
     for index, structure in enumerate(structures, start=1):
         input_pdb = f"inputs/{index}/{sanitize_filename(structure.candidate_id)}.pdb"
         output_dir = f"outputs/{index}"
@@ -591,16 +592,16 @@ def _first_candidate_structures(
     return by_id
 
 
-def _collect_tar_zst_members[ArchiveItem](
+def _collect_tar_zst_members(  # noqa: UP047 - imported by Python 3.11 task images
     source: Path | bytes,
     *,
     include: Callable[[tarfile.TarInfo], bool],
-    build: Callable[[tarfile.TarInfo, bytes | None], ArchiveItem],
+    build: Callable[[tarfile.TarInfo, bytes | None], _ArchiveItem],
     read_data: bool = True,
-) -> list[ArchiveItem]:
+) -> list[_ArchiveItem]:
     import zstandard as zstd
 
-    selected: list[ArchiveItem] = []
+    selected: list[_ArchiveItem] = []
     selected_bytes = 0
     member_count = 0
     expanded_bytes = 0
@@ -638,15 +639,15 @@ def _collect_tar_zst_members[ArchiveItem](
     return selected
 
 
-def _stream_tar_zst_member_records[ArchiveItem](
+def _stream_tar_zst_member_records(  # noqa: UP047 - Python 3.11 task images
     source: Path,
     *,
     include: Callable[[tarfile.TarInfo], bool],
-    build: Callable[[tarfile.TarInfo, str], ArchiveItem],
-) -> list[ArchiveItem]:
+    build: Callable[[tarfile.TarInfo, str], _ArchiveItem],
+) -> list[_ArchiveItem]:
     import zstandard as zstd
 
-    selected: list[ArchiveItem] = []
+    selected: list[_ArchiveItem] = []
     selected_bytes = 0
     member_count = 0
     expanded_bytes = 0

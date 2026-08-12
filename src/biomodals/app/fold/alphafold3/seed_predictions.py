@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 import orjson
 import polars as pl
@@ -70,7 +70,9 @@ _SUMMARY_ARTIFACT_FILENAMES = {
 }
 
 
-type PredictionExecutor = Callable[[Path, str, tuple[int, ...]], None]
+PredictionExecutor: TypeAlias = Callable[  # noqa: UP040 - Python 3.11 task images
+    [Path, str, tuple[int, ...]], None
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -980,11 +982,13 @@ def load_summary_entry(run_root: Path, run_id: str) -> SummaryEntry | None:
         or any(
             isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds
         )
-        or raw_seeds != sorted(set(raw_seeds))
     ):
         return None
+    included_seeds = cast(list[int], raw_seeds)
+    if included_seeds != sorted(set(included_seeds)):
+        return None
     best = _ranking_from_dict(marker.get("best"))
-    if best is None or best.seed not in raw_seeds:
+    if best is None or best.seed not in included_seeds:
         return None
     raw_artifacts = marker.get("artifacts")
     if not isinstance(raw_artifacts, dict):
@@ -997,7 +1001,7 @@ def load_summary_entry(run_root: Path, run_id: str) -> SummaryEntry | None:
         artifacts[role] = artifact
     return SummaryEntry(
         run_id=selected_run,
-        included_seeds=tuple(cast(list[int], raw_seeds)),
+        included_seeds=tuple(included_seeds),
         best=best,
         artifacts=artifacts,
         marker_sha256=sha256_bytes(marker_bytes),

@@ -12,7 +12,7 @@ import re
 import string
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import TypeAlias, cast
 
 import orjson
 from uniaf3.schema.alphafold3 import (
@@ -56,7 +56,7 @@ MAX_SEED_SAMPLE_PAIRS = 5000
 MAX_PROTEIN_TEMPLATES = 20
 _TEXT_SIZE_CHUNK_CHARS = 1024 * 1024
 
-type _AF3Entity = AF3Protein | AF3RNA | AF3DNA | AF3Ligand
+_AF3Entity: TypeAlias = AF3Protein | AF3RNA | AF3DNA | AF3Ligand  # noqa: UP040
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import TypeAlias, TypeVar
 from uuid import UUID
 
 from biomodals.execution.model import (
@@ -12,7 +13,10 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
 )
 
-type PullWorkerCompletion[Result] = tuple[WorkerAssignmentRecord, str, Result]
+_Result = TypeVar("_Result")
+PullWorkerCompletion: TypeAlias = (  # noqa: UP040 - Python 3.11 task images
+    tuple[WorkerAssignmentRecord, str, _Result]
+)
 
 
 @dataclass(frozen=True)
@@ -47,14 +51,14 @@ def size_pull_worker_pool(
     return worker_count, claim_capacity
 
 
-def drive_pull_worker[Result](
+def drive_pull_worker(  # noqa: UP047 - Python 3.11 task images
     *,
     provider_call_id: UUID,
     claim_capacity: int,
     claim: Callable[[str, int], PullTaskClaim],
-    execute: Callable[[WorkerAssignmentRecord], Result],
+    execute: Callable[[WorkerAssignmentRecord], _Result],
     complete_and_claim: Callable[
-        [tuple[PullWorkerCompletion[Result], ...], str, int],
+        [tuple[PullWorkerCompletion[_Result], ...], str, int],
         PullTaskClaim,
     ],
     checkpoint_batch: Callable[[], None] | None = None,

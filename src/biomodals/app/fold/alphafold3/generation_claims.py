@@ -9,13 +9,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import time
-from typing import Protocol, cast
+from typing import Protocol, TypeAlias, cast
 
 from biomodals.helper.artifacts import utc_now
 
 _TERMINAL_STATUSES = frozenset({"complete", "failed", "abandoned"})
 
-type ClaimOwnerAdapter = Callable[[str, object], dict[str, object]]
+ClaimOwnerAdapter: TypeAlias = Callable[  # noqa: UP040 - Python 3.11 task images
+    [str, object], dict[str, object]
+]
 
 
 class ClaimStore(Protocol):

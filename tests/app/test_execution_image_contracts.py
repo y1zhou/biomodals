@@ -106,6 +106,11 @@ def test_execution_images_include_app_owned_modules(
         ("biomodals.app.score.ensirna_execution", (3, 10)),
         ("biomodals.app.score.oligoformer_execution", (3, 10)),
         ("biomodals.workflow.ppiflow.staging", (3, 11)),
+        ("biomodals.execution.pull_worker", (3, 11)),
+        ("biomodals.app.fold.alphafold3.generation_claims", (3, 11)),
+        ("biomodals.app.fold.alphafold3.inference_inputs", (3, 11)),
+        ("biomodals.app.fold.alphafold3.search_pipeline", (3, 11)),
+        ("biomodals.app.fold.alphafold3.seed_predictions", (3, 11)),
     ),
 )
 def test_low_python_execution_sources_parse(

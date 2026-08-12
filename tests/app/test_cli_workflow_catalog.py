@@ -314,6 +314,8 @@ def test_workflow_dry_run_invokes_the_entrypoint_locally(
         "deployment_name": None,
         "deployment_version": 1,
         "restart_from": None,
+        "max_containers": None,
+        "max_gpu_containers": None,
     }
     assert calls["environment_name"] is None
 
@@ -372,6 +374,8 @@ def test_workflow_run_resolves_and_forwards_an_exact_deployment(
                 "deployment_name": "ShortMDWorkflow",
                 "deployment_version": 7,
                 "restart_from": None,
+                "max_containers": None,
+                "max_gpu_containers": None,
             },
             "program_name": (
                 "biomodals workflow run shortmd::submit_shortmd_workflow --"
@@ -379,6 +383,47 @@ def test_workflow_run_resolves_and_forwards_an_exact_deployment(
             "environment_name": "main",
         }
     ]
+
+
+def test_workflow_run_forwards_unified_container_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entrypoint_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _SingleEntrypointWorkflow(),
+    )
+    monkeypatch.setattr(
+        "biomodals.cli._deployment_name",
+        lambda _workflow: "ShortMDWorkflow",
+    )
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda *_args, **_kwargs: ['[{"version":"v7"}]'],
+    )
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "run",
+            "--max-containers",
+            "40",
+            "--max-gpu-containers",
+            "10",
+            "shortmd",
+            "--",
+            "/inputs",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert entrypoint_calls[0]["overrides"]["max_containers"] == 40
+    assert entrypoint_calls[0]["overrides"]["max_gpu_containers"] == 10
 
 
 def test_workflow_restart_forwards_only_the_explicit_predecessor(
@@ -668,11 +713,52 @@ def test_coordinated_app_run_resolves_and_forwards_an_exact_deployment(
                 "deployment_name": "AlphaFold3",
                 "deployment_version": 7,
                 "restart_from": None,
+                "max_containers": None,
+                "max_gpu_containers": None,
             },
             "program_name": ("biomodals app run alphafold3::submit_alphafold3_task --"),
             "environment_name": "production",
         }
     ]
+
+
+def test_coordinated_app_run_forwards_unified_container_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entrypoint_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "biomodals.cli._load_entry",
+        lambda *_args: _CoordinatedApp(),
+    )
+    monkeypatch.setattr("biomodals.cli._deployment_name", lambda _app: "AlphaFold3")
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda *_args, **_kwargs: ['[{"version":"v9"}]'],
+    )
+    monkeypatch.setattr(
+        "biomodals.cli.invoke_local_entrypoint",
+        lambda **kwargs: entrypoint_calls.append(kwargs),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "app",
+            "run",
+            "--max-containers",
+            "100",
+            "--max-gpu-containers",
+            "10",
+            "alphafold3::submit_alphafold3_task",
+            "--",
+            "--input-json",
+            "input.json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert entrypoint_calls[0]["overrides"]["max_containers"] == 100
+    assert entrypoint_calls[0]["overrides"]["max_gpu_containers"] == 10
 
 
 def test_coordinated_app_restart_forwards_only_the_explicit_predecessor(

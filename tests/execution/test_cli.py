@@ -189,9 +189,9 @@ def test_run_restart_creates_a_new_explicit_successor(
             "restart",
             *LOCATION_FLAGS,
             *TARGET_FLAGS,
-            "--max-active-provider-calls",
+            "--max-containers",
             "12",
-            "--max-active-gpu-provider-calls",
+            "--max-gpu-containers",
             "3",
         ],
     )

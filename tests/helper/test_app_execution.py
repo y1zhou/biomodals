@@ -31,6 +31,7 @@ from biomodals.helper.app_execution import (
     execution_lineage_root,
     load_execution_launch,
     persist_execution_launch,
+    resolve_provider_call_limits,
     stage_execution_launch,
 )
 
@@ -40,6 +41,39 @@ REQUEST_FILE = ExecutionRequestFile(
     32,
     "Example execution request",
 )
+
+
+def test_resolve_provider_call_limits_preserves_or_overrides_defaults() -> None:
+    """Unified limits preserve defaults and apply explicit overrides."""
+    assert resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=8,
+        max_containers=None,
+        max_gpu_containers=None,
+    ) == (16, 8)
+    assert resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=8,
+        max_containers=4,
+        max_gpu_containers=None,
+    ) == (4, 4)
+    assert resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=8,
+        max_containers=12,
+        max_gpu_containers=3,
+    ) == (12, 3)
+
+
+def test_resolve_provider_call_limits_rejects_gpu_limit_above_total() -> None:
+    """The GPU container ceiling cannot exceed the total ceiling."""
+    with pytest.raises(ValueError, match="max_gpu_containers"):
+        resolve_provider_call_limits(
+            default_max_containers=16,
+            default_max_gpu_containers=8,
+            max_containers=4,
+            max_gpu_containers=5,
+        )
 
 
 class FakeVolume:

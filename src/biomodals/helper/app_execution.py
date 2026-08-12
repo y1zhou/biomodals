@@ -32,6 +32,32 @@ from biomodals.helper.artifacts import VolumeHandle, read_volume_bytes
 LEDGER_FILENAME = "ledger.sqlite3"
 
 
+def resolve_provider_call_limits(
+    *,
+    default_max_containers: int,
+    default_max_gpu_containers: int,
+    max_containers: int | None,
+    max_gpu_containers: int | None,
+) -> tuple[int, int]:
+    """Resolve the two CLI container ceilings into kernel call limits."""
+    total = default_max_containers if max_containers is None else max_containers
+    gpu = (
+        min(default_max_gpu_containers, total)
+        if max_gpu_containers is None
+        else max_gpu_containers
+    )
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 1
+        or isinstance(gpu, bool)
+        or not isinstance(gpu, int)
+        or not 0 <= gpu <= total
+    ):
+        raise ValueError("max_gpu_containers must be between zero and max_containers")
+    return total, gpu
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionRequestFile:
     """Store one app's bounded immutable request bytes."""

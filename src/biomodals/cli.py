@@ -52,6 +52,8 @@ _COORDINATOR_CLI_PARAMETERS = frozenset({
     "deployment_name",
     "deployment_version",
     "restart_from",
+    "max_containers",
+    "max_gpu_containers",
 })
 _WORKFLOW_CLI_PARAMETERS = _COORDINATOR_CLI_PARAMETERS | {"dry_run"}
 
@@ -388,6 +390,39 @@ def _print_entrypoint_options_note(list_type: CatalogType) -> None:
     )
 
 
+def _validate_container_limit_options(
+    max_containers: int | None,
+    max_gpu_containers: int | None,
+) -> None:
+    """Reject an impossible GPU-subset ceiling at the outer CLI seam."""
+    if (
+        max_containers is not None
+        and max_gpu_containers is not None
+        and max_gpu_containers > max_containers
+    ):
+        console.print(
+            "[bold red]Error[/bold red] --max-gpu-containers cannot exceed "
+            "--max-containers"
+        )
+        raise typer.Exit(code=1)
+
+
+def _container_limit_entrypoint_flags(
+    flags: list[str] | None,
+    *,
+    max_containers: int | None,
+    max_gpu_containers: int | None,
+) -> list[str]:
+    """Forward outer resource ceilings to a source-backed entrypoint."""
+    result: list[str] = []
+    if max_containers is not None:
+        result.extend(("--max-containers", str(max_containers)))
+    if max_gpu_containers is not None:
+        result.extend(("--max-gpu-containers", str(max_gpu_containers)))
+    result.extend(flags or ())
+    return result
+
+
 def _show_entry_help(list_type: CatalogType, entry_name: str, *, verbose: bool) -> None:
     """Show help for a specific biomodals app or workflow."""
     catalog_entry = _load_entry(list_type, entry_name)
@@ -586,6 +621,22 @@ def run_modal_app(
             help="Create a Successor Run from this Execution Run UUID.",
         ),
     ] = None,
+    max_containers: Annotated[
+        int | None,
+        typer.Option(
+            "--max-containers",
+            min=1,
+            help="Maximum active workload Provider Calls for this Run.",
+        ),
+    ] = None,
+    max_gpu_containers: Annotated[
+        int | None,
+        typer.Option(
+            "--max-gpu-containers",
+            min=0,
+            help="Maximum active GPU Provider Calls within the total limit.",
+        ),
+    ] = None,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the modal run command."),
@@ -599,6 +650,15 @@ def run_modal_app(
 
     app = _load_entry("app", app_name_or_path)
     coordinated_entrypoint = _coordinated_app_entrypoint(app)
+    _validate_container_limit_options(max_containers, max_gpu_containers)
+    if modal_mode == "shell" and (
+        max_containers is not None or max_gpu_containers is not None
+    ):
+        console.print(
+            "[bold red]Error[/bold red] Container limits are unavailable for "
+            "an interactive shell"
+        )
+        raise typer.Exit(code=1)
     if (
         modal_mode != "shell"
         and app._entrypoint is not None
@@ -649,7 +709,10 @@ def run_modal_app(
         console.print(f"[bold red]Error[/bold red] {message}")
         raise typer.Exit(code=1)
     elif coordinated_entrypoint is None and (
-        version is not None or deployment_name is not None
+        version is not None
+        or deployment_name is not None
+        or max_containers is not None
+        or max_gpu_containers is not None
     ):
         console.print(
             "[bold red]Error[/bold red] Deployment coordinator options require "
@@ -682,18 +745,25 @@ def run_modal_app(
                 "deployment_name": resolved_deployment_name,
                 "deployment_version": resolved_version,
                 "restart_from": None if restart_from is None else str(restart_from),
+                "max_containers": max_containers,
+                "max_gpu_containers": max_gpu_containers,
             },
             program_name=(f"biomodals app run {app.name}::{coordinated_entrypoint} --"),
             environment_name=environment,
         )
         return
 
+    entrypoint_flags = _container_limit_entrypoint_flags(
+        flags,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     cmd = build_app_run_command(
         app_path=app.path,
         entrypoint=app._entrypoint,
         modal_mode=modal_mode,
         detach=detach,
-        flags=flags,
+        flags=entrypoint_flags,
     )
 
     # TODO: figure out a way to tag run names into the app.
@@ -970,24 +1040,25 @@ def restart_execution_run(
             help="Exact Modal deployment version for the Successor Run.",
         ),
     ],
-    max_active_provider_calls: Annotated[
+    max_containers: Annotated[
         int | None,
         typer.Option(
-            "--max-active-provider-calls",
+            "--max-containers",
             min=1,
             help="Override the predecessor's total active-call limit.",
         ),
     ] = None,
-    max_active_gpu_provider_calls: Annotated[
+    max_gpu_containers: Annotated[
         int | None,
         typer.Option(
-            "--max-active-gpu-provider-calls",
+            "--max-gpu-containers",
             min=0,
             help="Override the predecessor's active GPU-call limit.",
         ),
     ] = None,
 ) -> None:
     """Create a new Successor Run without mutating the predecessor."""
+    _validate_container_limit_options(max_containers, max_gpu_containers)
     successor_execution_run_id = uuid4()
     try:
         coordinator = _run_coordinator(
@@ -1001,8 +1072,8 @@ def restart_execution_run(
             predecessor_deployment_environment=environment,
             predecessor_deployment_name=deployment_name,
             predecessor_deployment_version=deployment_version,
-            max_active_provider_calls=max_active_provider_calls,
-            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            max_active_provider_calls=max_containers,
+            max_active_gpu_provider_calls=max_gpu_containers,
         )
         call = coordinator.drive_prepared.spawn()
     except KeyboardInterrupt:
@@ -1149,6 +1220,22 @@ def run_workflow(
             help="Create a Successor Run from this Execution Run UUID.",
         ),
     ] = None,
+    max_containers: Annotated[
+        int | None,
+        typer.Option(
+            "--max-containers",
+            min=1,
+            help="Maximum active workload Provider Calls for this Run.",
+        ),
+    ] = None,
+    max_gpu_containers: Annotated[
+        int | None,
+        typer.Option(
+            "--max-gpu-containers",
+            min=0,
+            help="Maximum active GPU Provider Calls within the total limit.",
+        ),
+    ] = None,
     flags: Annotated[
         list[str] | None,
         typer.Argument(help="Additional flags to pass to the workflow entrypoint."),
@@ -1163,6 +1250,15 @@ def run_workflow(
 
     workflow = _load_entry("workflow", workflow_name_or_path)
     entrypoint = _resolve_workflow_entrypoint(workflow)
+    _validate_container_limit_options(max_containers, max_gpu_containers)
+    if modal_mode == "shell" and (
+        max_containers is not None or max_gpu_containers is not None
+    ):
+        console.print(
+            "[bold red]Error[/bold red] Container limits are unavailable for "
+            "an interactive shell"
+        )
+        raise typer.Exit(code=1)
     if (
         modal_mode != "shell"
         and not development
@@ -1228,19 +1324,26 @@ def run_workflow(
                 "deployment_name": resolved_deployment_name if deployed else None,
                 "deployment_version": resolved_version if deployed else 1,
                 "restart_from": None if restart_from is None else str(restart_from),
+                "max_containers": max_containers,
+                "max_gpu_containers": max_gpu_containers,
             },
             program_name=f"biomodals workflow run {workflow.name}::{entrypoint} --",
             environment_name=environment if deployed else None,
         )
         return
 
+    entrypoint_flags = _container_limit_entrypoint_flags(
+        flags,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     cmd = build_workflow_run_command(
         workflow_module=workflow.module,
         entrypoint=entrypoint,
         modal_mode=modal_mode,
         detach=detach,
         dry_run=dry_run,
-        flags=flags,
+        flags=entrypoint_flags,
     )
 
     env = os.environ.copy()

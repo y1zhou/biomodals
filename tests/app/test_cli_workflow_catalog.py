@@ -580,13 +580,31 @@ def test_workflow_run_development_mode_skips_deployment_lookup(
 
     result = runner.invoke(
         app,
-        ["workflow", "run", "shortmd", "--development", "--", "/inputs"],
+        [
+            "workflow",
+            "run",
+            "--development",
+            "--max-containers",
+            "5",
+            "--max-gpu-containers",
+            "2",
+            "shortmd",
+            "--",
+            "/inputs",
+        ],
     )
 
     assert result.exit_code == 0
     assert len(commands) == 1
     assert "history" not in commands[0]
     assert "--use-deployed-coordinator" not in commands[0]
+    assert commands[0][-5:] == [
+        "--max-containers",
+        "5",
+        "--max-gpu-containers",
+        "2",
+        "/inputs",
+    ]
 
 
 def test_workflow_run_fails_closed_for_an_unavailable_version(
@@ -827,8 +845,12 @@ def test_coordinated_app_development_mode_skips_deployment_lookup(
         [
             "app",
             "run",
-            "alphafold3::submit_alphafold3_task",
             "--development",
+            "--max-containers",
+            "5",
+            "--max-gpu-containers",
+            "2",
+            "alphafold3::submit_alphafold3_task",
             "--",
             "--input-json",
             "input.json",
@@ -839,6 +861,14 @@ def test_coordinated_app_development_mode_skips_deployment_lookup(
     assert len(commands) == 1
     assert "history" not in commands[0]
     assert "--use-deployed-coordinator" not in commands[0]
+    assert commands[0][-6:] == [
+        "--max-containers",
+        "5",
+        "--max-gpu-containers",
+        "2",
+        "--input-json",
+        "input.json",
+    ]
 
 
 def test_app_run_without_entrypoint_renders_help_without_subprocess(

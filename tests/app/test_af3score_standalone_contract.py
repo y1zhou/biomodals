@@ -299,6 +299,7 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
         staged_input_execution_run_id=str(execution_run_id),
         input_files=["target.pdb"],
         input_digests={"target": "a" * 64},
+        completed_input_ids=["target"],
         publication_key="request-key",
     )
 

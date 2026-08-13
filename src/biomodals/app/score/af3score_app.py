@@ -37,6 +37,7 @@ from biomodals.app.score.af3score_publications import (
     COMPLETION_SAMPLE_SUBDIR,
     METRICS_FILENAME,
     _input_publication_ready,
+    _input_summary_publication_ready,
     _invalidate_input_publications,
     _write_input_publication,
     _write_metrics_publication,
@@ -418,6 +419,7 @@ def af3score_postprocess(
     staged_input_execution_run_id: str,
     input_files: list[str],
     input_digests: dict[str, str],
+    completed_input_ids: list[str],
     publication_key: str,
 ) -> dict[str, int | str]:
     """Validate records and collect metrics for all inputs."""
@@ -431,13 +433,19 @@ def af3score_postprocess(
     failed = 0
     completed_output_dirs: list[Path] = []
     out_dir = layout.outputs_dir
+    completed_ids = set(completed_input_ids)
+    requested_ids = {Path(name).stem for name in input_files}
+    if len(completed_ids) != len(completed_input_ids) or not completed_ids.issubset(
+        requested_ids
+    ):
+        raise ValueError("Completed AF3Score input IDs do not match the request")
     for input_name in input_files:
         input_id = Path(input_name).stem
         failed_record = layout.failures_dir / f"{input_id}.err"
         digest = input_digests.get(input_id)
         if digest is None:
             raise ValueError(f"Missing AF3Score input digest for '{input_name}'")
-        if _input_publication_ready(
+        if input_id in completed_ids and _input_summary_publication_ready(
             out_dir,
             input_id,
             publication_key=publication_key,

@@ -29,10 +29,12 @@ from biomodals.app.score.af3score_publications import (
     METRICS_FILENAME,
 )
 from biomodals.execution import (
+    AvailabilityStatus,
     DeploymentIdentity,
     NodeAggregationPolicy,
     NodeStatus,
     RunStatus,
+    TaskPlan,
     TaskStatus,
 )
 from biomodals.execution.modal import (
@@ -275,6 +277,65 @@ def test_input_publication_binds_and_invalidates_output_content(
     assert not af3score_publications._invalidate_input_publications(tmp_path, ("a",))
 
 
+def test_summary_publication_does_not_rehash_full_confidences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
+    sample = _publish_input(tmp_path, "a", digest, "plan")
+    original = af3score_publications.sha256_file
+    hashed: list[str] = []
+
+    def record_hash(path: Path) -> str:
+        hashed.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(af3score_publications, "sha256_file", record_hash)
+    sample.joinpath("confidences.json").write_text('{"changed":true}')
+
+    assert af3score_publications._input_summary_publication_ready(
+        tmp_path,
+        "a",
+        publication_key="plan",
+        input_sha256=digest,
+    )
+    assert hashed == ["summary_confidences.json"]
+
+
+def test_discovered_batch_tasks_skip_collection_wide_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=object(),
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        output_root=tmp_path,
+        now=lambda: 10,
+    )
+    repository = runtime._initialize()
+    repository.start_node(RUN_ID, BATCHES_NODE, now=10)
+    repository.discover_tasks(
+        RUN_ID,
+        BATCHES_NODE,
+        (TaskPlan(task_key="a", scientific_payload={}),),
+        now=10,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_output_complete",
+        lambda _input_id: pytest.fail("collection-wide probe should be skipped"),
+    )
+
+    assert runtime._node_observation(BATCHES_NODE) == AvailabilityStatus.MISSING
+    runtime.close()
+
+
 def test_input_publication_propagates_transient_read_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -506,6 +567,7 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     postprocess_kwargs = driver.spawns[-1][1]
     assert prepare_kwargs["staged_input_execution_run_id"] == str(RUN_ID)
     assert postprocess_kwargs["staged_input_execution_run_id"] == str(RUN_ID)
+    assert postprocess_kwargs["completed_input_ids"] == ["a", "b"]
     batch_call = next(
         call for call in snapshot.provider_calls if call.node_key == BATCHES_NODE
     )
@@ -543,6 +605,7 @@ def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
         task.status for task in snapshot.tasks if task.node_key == BATCHES_NODE
     ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED]
     assert [name for name, _kwargs in driver.spawns][-1] == "af3score_postprocess"
+    assert driver.spawns[-1][1]["completed_input_ids"] == ["a"]
     runtime.close()
 
 

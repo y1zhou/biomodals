@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import orjson
 
@@ -82,6 +83,28 @@ def _input_publication_ready(
     input_sha256: str,
 ) -> bool:
     """Validate one scored output against the current scientific request."""
+    marker = _input_publication_record(
+        output_dir,
+        input_id,
+        publication_key=publication_key,
+        input_sha256=input_sha256,
+    )
+    if marker is None:
+        return False
+    try:
+        return marker["outputs"] == _input_output_records(output_dir, input_id)
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError, RuntimeError):
+        return False
+
+
+def _input_publication_record(
+    output_dir: str | Path,
+    input_id: str,
+    *,
+    publication_key: str,
+    input_sha256: str,
+) -> dict[str, object] | None:
+    """Load one identity-matched AF3Score publication marker."""
     try:
         marker = orjson.loads(
             _input_publication_path(output_dir, input_id).read_bytes()
@@ -92,7 +115,7 @@ def _input_publication_ready(
         NotADirectoryError,
         orjson.JSONDecodeError,
     ):
-        return False
+        return None
     if not (
         isinstance(marker, dict)
         and marker.get("schema_version") == _INPUT_PUBLICATION_SCHEMA_VERSION
@@ -100,9 +123,39 @@ def _input_publication_ready(
         and marker.get("input_sha256") == input_sha256
         and isinstance(marker.get("outputs"), dict)
     ):
+        return None
+    return marker
+
+
+def _input_summary_publication_ready(
+    output_dir: str | Path,
+    input_id: str,
+    *,
+    publication_key: str,
+    input_sha256: str,
+) -> bool:
+    """Validate only the scored summary consumed by postprocessing."""
+    marker = _input_publication_record(
+        output_dir,
+        input_id,
+        publication_key=publication_key,
+        input_sha256=input_sha256,
+    )
+    if marker is None:
         return False
+    outputs = cast(dict[str, object], marker["outputs"])
+    expected = outputs.get("summary_confidences.json")
+    if not isinstance(expected, dict):
+        return False
+    path = (
+        _input_output_dir(output_dir, input_id)
+        / COMPLETION_SAMPLE_SUBDIR
+        / "summary_confidences.json"
+    )
     try:
-        return marker["outputs"] == _input_output_records(output_dir, input_id)
+        return path.stat().st_size == expected.get("size") and sha256_file(
+            path
+        ) == expected.get("sha256")
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError, RuntimeError):
         return False
 

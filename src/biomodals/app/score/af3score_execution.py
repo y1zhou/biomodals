@@ -22,10 +22,12 @@ from biomodals.execution import (
     NodeAggregationPolicy,
     NodeDependency,
     NodePlan,
+    NodeStatus,
     ProviderBinding,
     ProviderCallStatus,
     ProviderCallSubmission,
     TaskPlan,
+    TaskStatus,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_execution import (
@@ -320,7 +322,12 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
             if node_key == PREPARE_NODE:
                 available = False
             elif node_key == BATCHES_NODE:
-                available = all(
+                with self.store.synchronize():
+                    tasks_discovered = self.store.execution.get_node(
+                        self.execution_run_id,
+                        BATCHES_NODE,
+                    ).discovery_complete
+                available = not tasks_discovered and all(
                     self._output_complete(Path(name).stem)
                     for name in self.request.input_names
                 )
@@ -649,6 +656,25 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 "prepare_workers": self.request.prepare_workers,
             }
         if node_key == POSTPROCESS_NODE:
+            with self.store.synchronize():
+                repository = self.store.execution
+                batches = repository.get_node(
+                    self.execution_run_id,
+                    BATCHES_NODE,
+                )
+                batch_tasks = repository.list_tasks(
+                    self.execution_run_id,
+                    BATCHES_NODE,
+                )
+            completed_input_ids = (
+                [Path(name).stem for name in self.request.input_names]
+                if batches.status == NodeStatus.SUCCEEDED and not batch_tasks
+                else [
+                    task.task_key
+                    for task in batch_tasks
+                    if task.status == TaskStatus.SUCCEEDED
+                ]
+            )
             return {
                 "run_name": self.request.run_name,
                 "staged_input_execution_run_id": (
@@ -656,6 +682,7 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 ),
                 "input_files": list(self.request.input_names),
                 "input_digests": self._input_digests,
+                "completed_input_ids": completed_input_ids,
                 "publication_key": self._publication_key,
             }
         with self.store.synchronize():

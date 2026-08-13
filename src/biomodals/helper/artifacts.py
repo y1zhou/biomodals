@@ -5,14 +5,22 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sys
 import uuid
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
 from typing import Any, Protocol, cast
 
 import orjson
+
+if sys.version_info >= (3, 11):  # noqa: UP036 - mounted in Python 3.10 apps
+    from datetime import UTC
+else:
+    from datetime import timezone
+
+    UTC = timezone.utc  # noqa: UP017
 
 _JSON_OPTIONS = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")

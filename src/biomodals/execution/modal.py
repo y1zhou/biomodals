@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from threading import Lock
 from typing import Any, TypeVar
 from uuid import UUID
@@ -12,6 +12,11 @@ from uuid import UUID
 import modal
 
 from biomodals.execution.model import DeploymentIdentity, ProviderBinding
+
+if sys.version_info >= (3, 11):  # noqa: UP036 - mounted in Python 3.10 apps
+    from enum import StrEnum
+else:
+    from backports.strenum import StrEnum  # noqa: UP035,I001
 
 _T = TypeVar("_T")
 

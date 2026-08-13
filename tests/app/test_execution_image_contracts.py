@@ -4,7 +4,10 @@
 
 import ast
 import importlib.util
+import sys
+from enum import StrEnum
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -125,3 +128,39 @@ def test_low_python_execution_sources_parse(
         filename=str(source_path),
         feature_version=feature_version,
     )
+
+
+def test_python310_shared_runtime_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backports = ModuleType("backports")
+    backports.__dict__["__path__"] = []
+    strenum = ModuleType("backports.strenum")
+    strenum.__dict__["StrEnum"] = StrEnum
+    backports.__dict__["strenum"] = strenum
+    monkeypatch.setitem(sys.modules, "backports", backports)
+    monkeypatch.setitem(sys.modules, "backports.strenum", strenum)
+    monkeypatch.setattr(sys, "version_info", (3, 10))
+
+    loaded = {}
+    for module_name in (
+        "biomodals.execution.model",
+        "biomodals.execution.modal",
+        "biomodals.helper.artifacts",
+    ):
+        source_spec = importlib.util.find_spec(module_name)
+        assert source_spec is not None and source_spec.origin is not None
+        test_name = f"_python310_{module_name.replace('.', '_')}"
+        spec = importlib.util.spec_from_file_location(test_name, source_spec.origin)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, test_name, module)
+        spec.loader.exec_module(module)
+        loaded[module_name] = module
+
+    assert loaded["biomodals.execution.model"].RunStatus.SUCCEEDED == "succeeded"
+    assert (
+        loaded["biomodals.execution.modal"].ModalCallObservationKind.SUCCEEDED
+        == "succeeded"
+    )
+    assert loaded["biomodals.helper.artifacts"].utc_now().endswith("+00:00")

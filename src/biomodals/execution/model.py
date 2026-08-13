@@ -2,14 +2,19 @@
 
 import json
 import math
+import sys
 from collections import deque
 from dataclasses import dataclass, field
-from enum import StrEnum
 from hashlib import sha256
 from typing import Any
 from uuid import UUID
 
 import orjson
+
+if sys.version_info >= (3, 11):  # noqa: UP036 - mounted in Python 3.10 apps
+    from enum import StrEnum
+else:
+    from backports.strenum import StrEnum  # noqa: UP035,I001
 
 
 class RunStatus(StrEnum):

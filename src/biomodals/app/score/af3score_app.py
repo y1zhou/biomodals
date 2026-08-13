@@ -103,6 +103,7 @@ class AppInfo:
 # Image and app definitions
 ##########################################
 APP_INFO = AppInfo()
+_COORDINATOR_TIMEOUT_SECONDS = 24 * 60 * 60
 runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
@@ -513,7 +514,7 @@ def af3score_postprocess(
 @app.cls(
     cpu=(0.125, 4.125),
     memory=(1024, 16384),
-    timeout=CONF.timeout,
+    timeout=_COORDINATOR_TIMEOUT_SECONDS,
     max_containers=1,
     scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     volumes=CONF.mounts(output_volume=True),

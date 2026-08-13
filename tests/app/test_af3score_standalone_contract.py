@@ -477,6 +477,11 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
     assert output_dir.joinpath("scores_af3score_metrics.csv").is_file()
 
 
+def test_af3score_coordinator_can_outlive_worker_timeout() -> None:
+    assert af3score_app._COORDINATOR_TIMEOUT_SECONDS == 24 * 60 * 60
+    assert af3score_app._COORDINATOR_TIMEOUT_SECONDS > af3score_app.CONF.timeout
+
+
 def test_af3score_entrypoint_validates_request_before_upload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

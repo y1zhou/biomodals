@@ -182,7 +182,9 @@ def test_af3score_prepare_uses_staged_inputs_without_copying(
         )
         (batch_root / "json" / "batch_0").mkdir(parents=True)
         (batch_root / "json" / "batch_0" / "target.json").write_text("{}")
-        (batch_root / "pdb" / "batch_0").mkdir(parents=True)
+        batch_pdb_dir = batch_root / "pdb" / "batch_0"
+        batch_pdb_dir.mkdir(parents=True)
+        batch_pdb_dir.joinpath("target.pdb").symlink_to(pending_input)
         return []
 
     monkeypatch.setattr(af3score_app, "run_command", fake_run_command)
@@ -200,6 +202,8 @@ def test_af3score_prepare_uses_staged_inputs_without_copying(
     assert result.pending == 1
     assert len(result.chunk_specs) == 1
     assert not tmp_path.joinpath("demo", "inputs").exists()
+    batch_pdb = Path(result.chunk_specs[0].batch_pdb_dir) / "target.pdb"
+    assert batch_pdb.resolve(strict=True) == staged_input
 
 
 def test_af3score_prepare_rejects_changed_staged_input(

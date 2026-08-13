@@ -284,6 +284,10 @@ def af3score_prepare(
             f"--num_jobs={n_batches}",
             f"--num_workers={n_cpu}",
         ])
+        staged_inputs_by_name = {path.name: path for path in pending_files}
+        for batch_input in batch_dir.glob("pdb/*/*.pdb"):
+            batch_input.unlink()
+            batch_input.symlink_to(staged_inputs_by_name[batch_input.name])
 
     chunk_specs: list[ChunkSpec] = []
     batch_json_root = batch_dir / "json"

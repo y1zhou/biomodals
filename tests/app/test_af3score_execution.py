@@ -5,6 +5,7 @@
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
@@ -334,6 +335,97 @@ def test_discovered_batch_tasks_skip_collection_wide_probe(
 
     assert runtime._node_observation(BATCHES_NODE) == AvailabilityStatus.MISSING
     runtime.close()
+
+
+def test_undiscovered_batch_cache_is_validated_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=object(),
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        output_root=tmp_path,
+        now=lambda: 10,
+    )
+    runtime._initialize()
+    workers = Barrier(len(request.inputs))
+
+    def output_complete(_input_id: str) -> bool:
+        workers.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(runtime, "_output_complete", output_complete)
+
+    assert runtime._node_observation(BATCHES_NODE) == AvailabilityStatus.AVAILABLE
+    runtime.close()
+
+
+def test_postprocess_validates_summaries_in_parallel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "outputs-volume"
+    run_root = output_root / "scores"
+    for input_id in ("a", "b"):
+        (run_root / "outputs" / input_id).mkdir(parents=True)
+    workers = Barrier(2)
+
+    def publication_ready(
+        _root: Path,
+        _input_id: str,
+        *,
+        publication_key: str,
+        input_sha256: str,
+    ) -> bool:
+        assert publication_key == "plan"
+        assert input_sha256
+        workers.wait(timeout=5)
+        return True
+
+    def run_command(command: list[str], **_kwargs: object) -> None:
+        output_arg = next(
+            argument
+            for argument in command
+            if argument.startswith("--save_metric_csv=")
+        )
+        Path(output_arg.partition("=")[2]).write_text(
+            "name,score\na,1\nb,1\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        af3score_app,
+        "CONF",
+        SimpleNamespace(
+            output_volume=FakeVolume(),
+            output_volume_mountpoint=str(output_root),
+            git_clone_dir=tmp_path / "repo",
+        ),
+    )
+    monkeypatch.setattr(
+        af3score_app,
+        "_input_summary_publication_ready",
+        publication_ready,
+    )
+    monkeypatch.setattr(af3score_app, "run_command", run_command)
+
+    result = af3score_app.af3score_postprocess.get_raw_f()(
+        run_name="scores",
+        staged_input_execution_run_id=str(RUN_ID),
+        input_files=["a.pdb", "b.pdb"],
+        input_digests={"a": "a" * 64, "b": "b" * 64},
+        completed_input_ids=["a", "b"],
+        publication_key="plan",
+    )
+
+    assert result["processed"] == 2
+    assert result["failed"] == 0
 
 
 def test_input_publication_propagates_transient_read_errors(

@@ -104,6 +104,7 @@ class AppInfo:
 ##########################################
 APP_INFO = AppInfo()
 _COORDINATOR_TIMEOUT_SECONDS = 24 * 60 * 60
+_POSTPROCESS_VALIDATION_WORKERS = 16
 runtime_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
@@ -440,18 +441,35 @@ def af3score_postprocess(
         requested_ids
     ):
         raise ValueError("Completed AF3Score input IDs do not match the request")
+    validation_inputs: list[tuple[str, str]] = []
     for input_name in input_files:
         input_id = Path(input_name).stem
-        failed_record = layout.failures_dir / f"{input_id}.err"
         digest = input_digests.get(input_id)
         if digest is None:
             raise ValueError(f"Missing AF3Score input digest for '{input_name}'")
-        if input_id in completed_ids and _input_summary_publication_ready(
+        validation_inputs.append((input_id, digest))
+
+    def publication_ready(item: tuple[str, str]) -> bool:
+        input_id, digest = item
+        return input_id in completed_ids and _input_summary_publication_ready(
             out_dir,
             input_id,
             publication_key=publication_key,
             input_sha256=digest,
-        ):
+        )
+
+    publication_statuses = bounded_map(
+        validation_inputs,
+        publication_ready,
+        max_parallel=_POSTPROCESS_VALIDATION_WORKERS,
+    )
+    for (input_id, _digest), is_ready in zip(
+        validation_inputs,
+        publication_statuses,
+        strict=True,
+    ):
+        failed_record = layout.failures_dir / f"{input_id}.err"
+        if is_ready:
             if failed_record.exists():
                 failed_record.unlink()
             processed += 1

@@ -42,6 +42,7 @@ from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
 )
+from biomodals.helper.task_budget import bounded_map
 
 REQUEST_SCHEMA_VERSION = 3
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
@@ -49,6 +50,7 @@ AF3SCORE_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 PREPARE_NODE = "prepare"
 BATCHES_NODE = "score-batches"
 POSTPROCESS_NODE = "postprocess"
+_CACHE_VALIDATION_WORKERS = 8
 _REQUEST_FILE = ExecutionRequestFile(
     "request.json",
     MAX_REQUEST_BYTES,
@@ -328,8 +330,11 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                         BATCHES_NODE,
                     ).discovery_complete
                 available = not tasks_discovered and all(
-                    self._output_complete(Path(name).stem)
-                    for name in self.request.input_names
+                    bounded_map(
+                        self.request.input_names,
+                        lambda name: self._output_complete(Path(name).stem),
+                        max_parallel=_CACHE_VALIDATION_WORKERS,
+                    )
                 )
             elif node_key == POSTPROCESS_NODE:
                 available = _metrics_publication_ready(

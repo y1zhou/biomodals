@@ -156,10 +156,12 @@ excluded.
 
 PPIFlow also validates every configured mutable model file against a
 code-owned SHA-256 before admitting GPU work. The lightweight validation Node
-runs once per Execution Run and is not copied from a predecessor, so every
-Successor rechecks the mounted model bytes. Downstream Nodes depend on this
-validation publication; the expected digests remain part of the workflow's
-scientific identity.
+runs once per Execution Run and is not copied from a predecessor. A Successor
+that schedules PPIFlow GPU work therefore rechecks the mounted model bytes;
+one satisfied entirely by reusable terminal publications may prune validation
+because it consumes no model. GPU functions reload the model Volume before
+using it. Downstream Nodes depend on the validation publication, and the
+expected digests remain part of the workflow's scientific identity.
 
 ## Use one-row-per-candidate PPIFlow manifests
 

@@ -1030,6 +1030,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
                 "unrelated": "unrelated",
             },
             "publication_key": "request-key",
+            "staged_input_key": "a" * 64,
             "candidates": [
                 {
                     "candidate_id": candidate_id,
@@ -1093,18 +1094,22 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
         "AF3scoreStep_stage1",
         {"run_name": "af3-run"},
     )
-    postprocess_call = postprocess_node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id="stage1-af3score",
-            task_key="node",
-            work_dir=tmp_path / "post-result",
-            cache_dir=tmp_path / "post-cache",
-            inputs={"af3score_plan": [plan_artifact]},
-        )
+    postprocess_context = NodeRunContext(
+        execution_run_id=RUN_ID,
+        workload_run_key="run-1",
+        node_id="stage1-af3score",
+        task_key="node",
+        work_dir=tmp_path / "post-result",
+        cache_dir=tmp_path / "post-cache",
+        inputs={"af3score_plan": [plan_artifact]},
+    )
+    postprocess_tasks = postprocess_node.discover_remote_tasks(postprocess_context)
+    postprocess_call = postprocess_node.prepare_remote_task_batch(
+        postprocess_context,
+        postprocess_tasks,
     )
     assert postprocess_call.function_name == "postprocess_ppiflow_af3score_stage"
+    assert postprocess_call.kwargs["task_keys"] == ["candidate-a", "candidate-b"]
 
 
 def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
@@ -1150,7 +1155,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
             ),
         )
     ]
-    staged, physical_run_name, publication_key = (
+    staged, physical_run_name, publication_key, staged_input_key = (
         ppiflow_workflow._stage_af3score_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
@@ -1160,7 +1165,14 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
 
     assert [record["input_name"] for record in staged] == ["candidate_a.pdb"]
     assert physical_run_name == f"execution-a-{publication_key}"
-    first_input = af3_root / physical_run_name / "inputs" / "candidate_a.pdb"
+    first_input = (
+        af3_root
+        / ".biomodals"
+        / "af3score"
+        / "staged-inputs"
+        / staged_input_key
+        / "candidate_a.pdb"
+    )
     assert first_input.read_text(encoding="utf-8") == "ATOM\n"
     assert commits == [True]
 
@@ -1169,7 +1181,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
         "DECLARED_MODEL_IDENTITY",
         "AlphaFold3/af3.bin:v2",
     )
-    _staged, model_run_name, model_key = (
+    _staged, model_run_name, model_key, _model_staged_key = (
         ppiflow_workflow._stage_af3score_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
@@ -1180,7 +1192,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     assert model_run_name != physical_run_name
 
     (long_dir / "candidate_a.pdb").write_text("CHANGED\n", encoding="utf-8")
-    _staged, changed_run_name, changed_key = (
+    _staged, changed_run_name, changed_key, changed_staged_key = (
         ppiflow_workflow._stage_af3score_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
@@ -1191,9 +1203,14 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     assert changed_key != publication_key
     assert changed_run_name != physical_run_name
     assert first_input.read_text(encoding="utf-8") == "ATOM\n"
-    assert (af3_root / changed_run_name / "inputs" / "candidate_a.pdb").read_text(
-        encoding="utf-8"
-    ) == "CHANGED\n"
+    assert (
+        af3_root
+        / ".biomodals"
+        / "af3score"
+        / "staged-inputs"
+        / changed_staged_key
+        / "candidate_a.pdb"
+    ).read_text(encoding="utf-8") == "CHANGED\n"
     assert commits == [True, True, True]
 
 
@@ -1225,6 +1242,7 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
             ],
             "ppiflow-af3score-request-key",
             "request-key",
+            "a" * 64,
         ),
     )
     monkeypatch.setattr(
@@ -1248,7 +1266,7 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
     result = ppiflow_workflow.prepare_ppiflow_af3score_stage.get_raw_f()(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[],
-        config={"num_jobs": 2},
+        config={"_max_gpu_containers": 2},
         step_name="AF3scoreStep_stage1",
         execution_run_name="af3-run",
     )
@@ -1265,22 +1283,112 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
     }
     assert {candidate["chunk"]["task_count"] for candidate in plan["candidates"]} == {2}
     assert plan["run_name"] == "ppiflow-af3score-request-key"
+    assert plan["staged_input_key"] == "a" * 64
 
 
 def test_af3score_step_reports_partial_for_mixed_scores(tmp_path: Path) -> None:
-    af3score_stage = _FakeModalFunction(
-        "fc-af3score-stage",
-        AppRunResult(status=AppRunStatus.PARTIAL),
-    )
     node = ppiflow_workflow.AF3ScoreNode(
         "AF3scoreStep_stage1",
         {"run_name": "af3-run"},
     )
 
-    del tmp_path
-    result = node.process_remote_result(af3score_stage.result, {})
+    result = node.finalize_remote_tasks(
+        NodeRunContext(
+            execution_run_id=RUN_ID,
+            workload_run_key="run-1",
+            node_id="stage1-af3score",
+            task_key="node",
+            work_dir=tmp_path / "result",
+            cache_dir=tmp_path / "cache",
+            inputs={},
+        ),
+        {"candidate-a": AppRunResult(status=AppRunStatus.SUCCEEDED)},
+        {"candidate-b": "failed"},
+    )
 
     assert result.status == AppRunStatus.PARTIAL
+
+
+def test_af3score_postprocess_returns_per_candidate_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    af3_root = tmp_path / "af3score"
+    metrics_path = af3_root / "run" / "af3score_metrics.csv"
+    metrics_path.parent.mkdir(parents=True)
+    metrics_path.write_text("name,score\na,1\n", encoding="utf-8")
+    plan_path = workflow_root / "af3score-plan.json"
+    plan_path.write_bytes(
+        orjson.dumps({
+            "run_name": "run",
+            "staged_input_key": "a" * 64,
+            "input_files": ["a.pdb", "b.pdb"],
+            "input_digests": {"a": "a" * 64, "b": "b" * 64},
+            "publication_key": "request-key",
+            "candidates": [
+                {
+                    "candidate_id": candidate_id,
+                    "input_name": f"{candidate_id}.pdb",
+                    "scientific_payload": {"candidate_id": candidate_id},
+                }
+                for candidate_id in ("a", "b")
+            ],
+        })
+    )
+    plan_artifact = WorkflowArtifact(
+        artifact_id="af3score-plan",
+        producing_node_id="prepare",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="workflow-volume",
+            path=plan_path.name,
+        ),
+    )
+    postprocess = _FakeModalFunction(
+        "fc-postprocess",
+        {
+            "metrics_csv": str(metrics_path),
+            "failed_dir": str(af3_root / "run" / "failed_records"),
+            "failed_input_ids": ["b"],
+            "metrics_rows": 1,
+            "failed": 1,
+        },
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "AF3SCORE_OUTPUT_MOUNTPOINT",
+        str(af3_root),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow,
+        "AF3SCORE_OUTPUT_VOLUME",
+        SimpleNamespace(reload=lambda: None),
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.af3score_app,
+        "af3score_postprocess",
+        postprocess,
+    )
+    monkeypatch.setattr(
+        ppiflow_workflow.af3score_app,
+        "_input_summary_publication_ready",
+        lambda _root, input_id, **_kwargs: input_id == "a",
+    )
+
+    result = ppiflow_workflow.postprocess_ppiflow_af3score_stage.get_raw_f()(
+        plan_artifacts=[plan_artifact],
+        task_keys=["a", "b"],
+        step_name="AF3scoreStep_stage1",
+        run_id="run-1",
+        node_id="stage1-af3score",
+    )
+
+    assert postprocess.kwargs["staged_input_key"] == "a" * 64
+    assert postprocess.kwargs["completed_input_ids"] == ["a"]
+    assert result["a"]["status"] == AppRunStatus.SUCCEEDED
+    assert len(result["a"]["outputs"]) == 2
+    assert result["b"]["status"] == AppRunStatus.FAILED
 
 
 def test_af3score_batch_reports_partial_for_mixed_tasks(tmp_path: Path) -> None:
@@ -1489,11 +1597,11 @@ def test_rosetta_worker_policy_uses_current_config_for_reused_plan(
 
     predecessor = ppiflow_workflow.RosettaWorkerNode(
         "RosettaRelaxStep",
-        {"max_num_pods": 4},
+        {"_max_containers": 4},
     ).prepare_pull_worker(context)
     successor = ppiflow_workflow.RosettaWorkerNode(
         "RosettaRelaxStep",
-        {"max_num_pods": 1},
+        {"_max_containers": 1},
     ).prepare_pull_worker(context)
 
     assert (
@@ -3258,7 +3366,7 @@ def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> No
     )
 
 
-def test_ppiflow_candidate_concurrency_is_copied_to_node_configs() -> None:
+def test_ppiflow_ignores_obsolete_workload_concurrency_keys() -> None:
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=b"""
 task:
@@ -3280,10 +3388,12 @@ AF3scoreStep_stage1: {}
     assert (
         definition.nodes["stage1-ligandmpnn"].node.config["candidate_concurrency"] == 2
     )
-    assert definition.nodes["stage1-af3score"].node.config["candidate_concurrency"] == 3
+    assert (
+        "candidate_concurrency" not in definition.nodes["stage1-af3score"].node.config
+    )
 
 
-def test_ppiflow_max_child_calls_caps_stage_fanout_configs() -> None:
+def test_ppiflow_propagates_run_container_limits() -> None:
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=b"""
 task:
@@ -3302,17 +3412,35 @@ AF3scoreStep_stage1:
 RosettaFixStep:
   max_num_pods: 7
 """,
-        max_child_calls=2,
+        max_containers=3,
+        max_gpu_containers=2,
     )
 
     definition = workflow.validate()
 
-    assert (
-        definition.nodes["stage1-ligandmpnn"].node.config["candidate_concurrency"] == 2
-    )
-    assert definition.nodes["stage1-af3score"].node.config["num_jobs"] == 2
-    assert definition.nodes["stage1-af3score"].node.config["max_child_calls"] == 2
-    assert definition.nodes["stage2-rosetta-fix"].node.config["max_num_pods"] == 2
+    for node_id in (
+        "stage1-ligandmpnn",
+        "stage1-af3score",
+        "stage2-rosetta-fix",
+    ):
+        config = definition.nodes[node_id].node.config
+        assert config["_max_containers"] == 3
+        assert config["_max_gpu_containers"] == 2
+
+
+def test_ppiflow_rejects_zero_gpu_capacity_for_gpu_path() -> None:
+    with pytest.raises(ValueError, match="GPU Nodes"):
+        build_ppiflow_workflow(
+            task_yaml_bytes=b"""
+task:
+  gentype: binder
+steps:
+  AF3scoreStep_stage1: true
+""",
+            steps_yaml_bytes=b"AF3scoreStep_stage1: {}\n",
+            max_containers=4,
+            max_gpu_containers=0,
+        )
 
 
 def test_ppiflow_operational_fanout_does_not_change_scientific_dag_hash() -> None:
@@ -3326,7 +3454,7 @@ steps:
   RosettaFixStep: true
 """
 
-    def workflow_hash(max_child_calls: int, *, max_structures: int = 5) -> str:
+    def workflow_hash(max_containers: int, *, max_structures: int = 5) -> str:
         return hashing.dag_hash(
             build_ppiflow_workflow(
                 task_yaml_bytes=task_yaml,
@@ -3340,7 +3468,8 @@ AF3scoreStep_stage1:
 RosettaFixStep:
   max_num_pods: 5
 """.encode(),
-                max_child_calls=max_child_calls,
+                max_containers=max_containers,
+                max_gpu_containers=min(2, max_containers),
             ).validate()
         )
 

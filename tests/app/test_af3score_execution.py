@@ -705,6 +705,37 @@ def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
     runtime.close()
 
 
+def test_postprocess_includes_warm_and_newly_scored_inputs(tmp_path: Path) -> None:
+    request = _request()
+    _stage_request_inputs(tmp_path, request)
+    warm_digest = request.input_digests["b"]
+    _publish_input(
+        tmp_path / request.run_name / "outputs",
+        "b",
+        warm_digest,
+        request.execution_plan.workload_plan_fingerprint,
+    )
+    driver = CompletingDriver(tmp_path, request)
+    runtime = AF3ScoreExecutionRuntime(
+        request=request,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        store=ExecutionRunStore(tmp_path, RUN_ID),
+        modal_driver=driver,
+        output_volume=FakeVolume(),
+        output_claims=FakeClaims(),
+        output_root=tmp_path,
+        poll_interval_seconds=0,
+        now=lambda: 10,
+    )
+
+    overview = runtime.run()
+
+    assert overview.run.status == RunStatus.SUCCEEDED
+    assert driver.spawns[-1][1]["completed_input_ids"] == ["a", "b"]
+    runtime.close()
+
+
 def test_restart_rejects_target_scientific_version_drift(tmp_path: Path) -> None:
     request = _request()
     _stage_request_inputs(tmp_path, request)

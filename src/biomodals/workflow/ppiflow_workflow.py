@@ -52,6 +52,10 @@ from biomodals.app.fold.alphafold3.search_pipeline import (
     resolve_msa_and_templates,
 )
 from biomodals.app.score import af3score_app, dockq_app
+from biomodals.app.score.af3score_execution import (
+    af3score_staged_input_key,
+    materialize_af3score_staged_inputs,
+)
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -103,7 +107,6 @@ from biomodals.workflow.core.artifact_availability import (
     check_external_artifact_status,
 )
 from biomodals.workflow.core.execution import app_scientific_version
-from biomodals.workflow.ppiflow import coordinators as ppiflow_coordinators
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
@@ -1054,7 +1057,7 @@ def _stage_af3score_candidate_inputs(
     execution_run_name: str,
     patterns: Sequence[str] | None = None,
     max_files: int | None = None,
-) -> tuple[list[dict[str, object]], str, str]:
+) -> tuple[list[dict[str, object]], str, str, str]:
     """Stage candidate-keyed PDBs and retain their scientific identities."""
     _reload_ppiflow_source_volumes()
     selected = ppiflow_staging.select_structure_files_from_artifacts(
@@ -1101,15 +1104,19 @@ def _stage_af3score_candidate_inputs(
         )
     ).hexdigest()
     physical_run_name = f"{sanitize_filename(execution_run_name)}-{publication_key}"
-    layout = AppRunLayout.from_run_root(
-        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / physical_run_name
+    staged_input_key = af3score_staged_input_key(
+        tuple((pdb_name, digest) for _candidate, pdb_name, digest in planned)
     )
-    if layout.inputs_dir.exists():
-        shutil.rmtree(layout.inputs_dir)
-    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
+    materialize_af3score_staged_inputs(
+        AF3SCORE_OUTPUT_MOUNTPOINT,
+        staged_input_key,
+        tuple(
+            (pdb_name, candidate.data, digest)
+            for candidate, pdb_name, digest in planned
+        ),
+    )
     staged: list[dict[str, object]] = []
     for candidate, pdb_name, digest in planned:
-        (layout.inputs_dir / pdb_name).write_bytes(candidate.data)
         staged.append({
             "candidate_id": candidate.candidate_id,
             "input_name": pdb_name,
@@ -1120,7 +1127,7 @@ def _stage_af3score_candidate_inputs(
             },
         })
     AF3SCORE_OUTPUT_VOLUME.commit()
-    return staged, physical_run_name, publication_key
+    return staged, physical_run_name, publication_key, staged_input_key
 
 
 def _rosetta_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
@@ -1182,18 +1189,12 @@ def _rosetta_worker_policy(
     num_jobs: int,
     config: Mapping[str, object],
 ) -> tuple[int, int, int]:
-    """Preserve Rosetta's pod cap while deriving pull-worker microbatches."""
+    """Derive Rosetta pull workers from the Run's total container ceiling."""
     if num_jobs < 1:
         raise ValueError("Rosetta requires at least one Task")
-    max_num_pods = max(1, _config_int(config, "max_num_pods", 1))
-    if config.get("max_child_calls") is not None:
-        max_num_pods = min(
-            max_num_pods,
-            _config_int(config, "max_child_calls", 1),
-        )
     worker_count, claim_capacity = size_pull_worker_pool(
         num_jobs,
-        max_worker_calls=max_num_pods,
+        max_worker_calls=_config_int(config, "_max_containers", 16),
         max_parallel_per_worker=30,
     )
     return worker_count, claim_capacity, claim_capacity
@@ -1408,12 +1409,14 @@ def prepare_ppiflow_af3score_stage(
     execution_run_name: str,
 ) -> AppRunResult:
     """Stage AF3Score candidates and publish its finite GPU Task plan."""
-    staged, physical_run_name, publication_key = _stage_af3score_candidate_inputs(
-        artifacts=artifacts,
-        candidate_manifests=candidate_manifests,
-        execution_run_name=execution_run_name,
-        patterns=_patterns_from_config(config, default=("*.pdb",)),
-        max_files=_optional_config_int(config, "max_structures"),
+    staged, physical_run_name, publication_key, staged_input_key = (
+        _stage_af3score_candidate_inputs(
+            artifacts=artifacts,
+            candidate_manifests=candidate_manifests,
+            execution_run_name=execution_run_name,
+            patterns=_patterns_from_config(config, default=("*.pdb",)),
+            max_files=_optional_config_int(config, "max_structures"),
+        )
     )
     input_names = [str(record["input_name"]) for record in staged]
     if not input_names:
@@ -1426,18 +1429,11 @@ def prepare_ppiflow_af3score_stage(
     }
     task_spec = af3score_app.af3score_prepare.get_raw_f()(
         run_name=physical_run_name,
+        staged_input_key=staged_input_key,
         input_files=input_names,
         input_digests=input_digests,
         publication_key=publication_key,
-        num_jobs=_config_int(
-            config,
-            "num_jobs",
-            _config_int(
-                config,
-                "max_batches",
-                _config_int(config, "max_child_calls", 10),
-            ),
-        ),
+        num_jobs=_config_int(config, "_max_gpu_containers", 16),
         prepare_workers=_config_int(config, "prepare_workers", 8),
     )
     chunks_by_input: dict[str, dict[str, str]] = {}
@@ -1483,6 +1479,7 @@ def prepare_ppiflow_af3score_stage(
                 "input_files": input_names,
                 "input_digests": input_digests,
                 "publication_key": publication_key,
+                "staged_input_key": staged_input_key,
                 "run_name": physical_run_name,
             })
         ],
@@ -1573,10 +1570,11 @@ def run_ppiflow_af3score_batch(
 def postprocess_ppiflow_af3score_stage(
     *,
     plan_artifacts: list[WorkflowArtifact],
+    task_keys: list[str],
     step_name: str,
     run_id: str,
     node_id: str,
-) -> AppRunResult:
+) -> dict[str, dict[str, object]]:
     """Postprocess a kernel-completed AF3Score Task collection."""
     plan = _read_af3score_plan_artifacts(plan_artifacts)
     run_name = str(plan["run_name"])
@@ -1584,30 +1582,58 @@ def postprocess_ppiflow_af3score_stage(
     candidates = plan["candidates"]
     input_digests = plan.get("input_digests")
     publication_key = plan.get("publication_key")
+    staged_input_key = plan.get("staged_input_key")
     if (
         not isinstance(input_files, list)
         or not isinstance(candidates, list)
         or not isinstance(input_digests, dict)
         or not isinstance(publication_key, str)
+        or not isinstance(staged_input_key, str)
     ):
         raise TypeError("AF3Score task plan contains invalid candidate data")
+    candidate_by_id: dict[str, Mapping[str, object]] = {}
+    for raw_candidate in candidates:
+        if not isinstance(raw_candidate, Mapping):
+            raise TypeError("AF3Score candidate plan entries must be objects")
+        candidate = cast(Mapping[str, object], raw_candidate)
+        candidate_by_id[str(candidate["candidate_id"])] = candidate
+    normalized_input_digests = {
+        str(key): str(value) for key, value in input_digests.items()
+    }
+    if len(task_keys) != len(set(task_keys)) or not set(task_keys).issubset(
+        candidate_by_id
+    ):
+        raise ValueError("AF3Score postprocess Task keys do not match its plan")
+    AF3SCORE_OUTPUT_VOLUME.reload()
+    completed_input_ids = [
+        Path(str(candidate["input_name"])).stem
+        for candidate in candidate_by_id.values()
+        if af3score_app._input_summary_publication_ready(
+            AppRunLayout.from_run_root(
+                Path(AF3SCORE_OUTPUT_MOUNTPOINT) / run_name
+            ).outputs_dir,
+            Path(str(candidate["input_name"])).stem,
+            publication_key=publication_key,
+            input_sha256=str(
+                normalized_input_digests[Path(str(candidate["input_name"])).stem]
+            ),
+        )
+    ]
     metrics = af3score_app.af3score_postprocess.get_raw_f()(
         run_name=run_name,
+        staged_input_key=staged_input_key,
         input_files=[str(value) for value in input_files],
-        input_digests={str(key): str(value) for key, value in input_digests.items()},
+        input_digests=normalized_input_digests,
+        completed_input_ids=completed_input_ids,
         publication_key=publication_key,
     )
     metrics_csv = str(metrics["metrics_csv"])
-    failed_ids = {path.stem for path in Path(str(metrics["failed_dir"])).glob("*.err")}
+    failed_input_ids = {str(value) for value in metrics["failed_input_ids"]}
     status = ppiflow_tables.score_table_status(
         requested_count=len(input_files),
         usable_rows=int(metrics.get("metrics_rows", 0)),
         failed_count=int(metrics.get("failed", 0)),
     )
-    if status == AppRunStatus.PARTIAL:
-        # Candidate failures remain explicit in the manifest. The terminal
-        # postprocessor itself succeeded once it published the usable subset.
-        status = AppRunStatus.SUCCEEDED
     manifest_output = _write_candidate_manifest_output(
         run_id=run_id,
         node_id=node_id,
@@ -1620,14 +1646,16 @@ def postprocess_ppiflow_af3score_stage(
                 operation_mode="af3score",
                 candidate_status=(
                     AppRunStatus.FAILED.value
-                    if Path(str(candidate_payload["input_name"])).stem in failed_ids
+                    if Path(str(candidate_payload["input_name"])).stem
+                    in failed_input_ids
                     else AppRunStatus.SUCCEEDED.value
                 ),
                 source_path=str(candidate_payload["input_name"]),
                 derived_path=metrics_csv,
                 files=(
                     []
-                    if Path(str(candidate_payload["input_name"])).stem in failed_ids
+                    if Path(str(candidate_payload["input_name"])).stem
+                    in failed_input_ids
                     else [
                         ppiflow_manifests.candidate_file_record(
                             role="scores",
@@ -1647,7 +1675,7 @@ def postprocess_ppiflow_af3score_stage(
             for candidate_payload in (cast(Mapping[str, object], candidate),)
         ],
     )
-    return AppRunResult(
+    aggregate = AppRunResult(
         status=status,
         outputs=[
             AppOutput(
@@ -1667,6 +1695,29 @@ def postprocess_ppiflow_af3score_stage(
             manifest_output,
         ],
     )
+    successful_task_keys = [
+        task_key
+        for task_key in task_keys
+        if Path(str(candidate_by_id[task_key]["input_name"])).stem
+        not in failed_input_ids
+    ]
+    first_success = successful_task_keys[0] if successful_task_keys else None
+    return {
+        task_key: AppRunResult(
+            status=(
+                AppRunStatus.FAILED
+                if task_key not in successful_task_keys
+                else AppRunStatus.SUCCEEDED
+            ),
+            outputs=(aggregate.outputs if task_key == first_success else []),
+            warnings=(
+                [f"AF3Score output is incomplete for {task_key!r}"]
+                if task_key not in successful_task_keys
+                else []
+            ),
+        ).model_dump(mode="json")
+        for task_key in task_keys
+    }
 
 
 @app.function(
@@ -2241,6 +2292,8 @@ _OPERATIONAL_CONFIG_KEYS = (
     "max_num_pods",
     "num_jobs",
     "prepare_workers",
+    "_max_containers",
+    "_max_gpu_containers",
 )
 _INPUT_DIGESTS_KEY = "_biomodals_input_sha256"
 
@@ -2651,24 +2704,103 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 
 
 @dataclass
-class AF3ScoreNode(_ConfiguredAppStepNode):
-    """Postprocess kernel-completed AF3Score candidate Tasks."""
+class AF3ScoreNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+    """Postprocess AF3Score candidates while preserving partial outcomes."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        """Prepare one CPU postprocessing call after all GPU batches finish."""
+    aggregation_policy = NodeAggregationPolicy.ALLOW_PARTIAL
+
+    def _plan(self, context: NodeRunContext) -> dict[str, object]:
+        return _read_af3score_plan_artifacts(context.inputs.get("af3score_plan") or [])
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[RemoteWorkflowTask, ...]:
+        """Discover one postprocessing outcome per requested candidate."""
+        candidates = self._plan(context).get("candidates")
+        if not isinstance(candidates, list):
+            raise TypeError("AF3Score task plan candidates must be a list")
+        tasks = []
+        for raw_candidate in candidates:
+            if not isinstance(raw_candidate, Mapping):
+                raise TypeError("AF3Score candidate plan entries must be objects")
+            candidate = cast(Mapping[str, object], raw_candidate)
+            tasks.append(
+                RemoteWorkflowTask(
+                    task_key=str(candidate["candidate_id"]),
+                    scientific_payload=cast(
+                        Mapping[str, object], candidate["scientific_payload"]
+                    ),
+                )
+            )
+        return tuple(tasks)
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: RemoteWorkflowTask,
+    ) -> RemoteNodeCall:
+        """Describe the shared CPU postprocessor for one candidate."""
+        return self.prepare_remote_task_batch(context, (task,))
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[RemoteWorkflowTask, ...],
+    ) -> RemoteNodeCall:
+        """Prepare one CPU call that postprocesses every admitted candidate."""
+        if not tasks:
+            raise ValueError("AF3Score postprocess batch cannot be empty")
         plan_artifacts = context.inputs.get("af3score_plan") or []
-        if not plan_artifacts:
-            raise ValueError(f"{self.step_name} requires an AF3Score task plan")
+        candidate_count = len(self.discover_remote_tasks(context))
         return RemoteNodeCall(
             function_name="postprocess_ppiflow_af3score_stage",
             uses_gpu=False,
             kwargs={
                 "plan_artifacts": plan_artifacts,
+                "task_keys": [task.task_key for task in tasks],
                 "step_name": self.step_name,
                 "run_id": context.workload_run_key,
                 "node_id": context.node_id,
             },
             runtime_image_key="af3score-cpu",
+            compatibility_key=context.node_id,
+            max_tasks_per_call=candidate_count,
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        """Decode per-candidate postprocessing outcomes."""
+        del metadata
+        if not isinstance(result, Mapping):
+            raise TypeError("AF3Score postprocess result must be an object")
+        result_by_task = cast(Mapping[str, object], result)
+        return {
+            task_key: AppRunResult.model_validate(result_by_task[task_key])
+            for task_key in task_keys
+        }
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Publish the aggregate status after retaining usable task outputs."""
+        del context
+        return AppRunResult(
+            status=(
+                AppRunStatus.PARTIAL
+                if errors and results
+                else AppRunStatus.FAILED
+                if errors
+                else AppRunStatus.SUCCEEDED
+            ),
+            warnings=[f"{key}: {errors[key]}" for key in sorted(errors)],
         )
 
 
@@ -4087,30 +4219,33 @@ def build_ppiflow_workflow(
     task_yaml_bytes: bytes,
     steps_yaml_bytes: bytes,
     stage: int | None = None,
-    max_child_calls: int | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
 ) -> Workflow:
     """Build a PPIFlow workflow DAG from upstream-style YAML files."""
     if stage not in {None, 1, 2}:
         raise ValueError("stage must be omitted, 1, or 2")
     task_doc = _load_yaml_bytes(task_yaml_bytes)
     steps_doc = _load_yaml_bytes(steps_yaml_bytes)
-    if max_child_calls is not None:
-        if max_child_calls < 1:
-            raise ValueError("max_child_calls must be at least 1")
-        steps_doc = _steps_doc_with_child_budget(steps_doc, max_child_calls)
-    task = _task_section(task_doc)
-    if max_child_calls is not None:
-        task = dict(task)
-        task["candidate_concurrency"] = min(
-            int(task.get("candidate_concurrency", max_child_calls)),
-            max_child_calls,
+    if max_containers is not None:
+        if max_containers < 1:
+            raise ValueError("max_containers must be at least 1")
+        if max_gpu_containers is None:
+            max_gpu_containers = max_containers
+        if not 0 <= max_gpu_containers <= max_containers:
+            raise ValueError(
+                "max_gpu_containers must be between zero and max_containers"
+            )
+        steps_doc = _steps_doc_with_run_limits(
+            steps_doc,
+            max_containers=max_containers,
+            max_gpu_containers=max_gpu_containers,
         )
+    task = _task_section(task_doc)
     enabled = _enabled_section(task_doc)
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
-    candidate_concurrency = ppiflow_coordinators.candidate_concurrency_from_config(
-        task,
-        steps_doc,
-    )
+    if max_gpu_containers == 0 and _ppiflow_requires_gpu(task_doc, stage):
+        raise ValueError("PPIFlow GPU Nodes require max_gpu_containers >= 1")
     workflow = Workflow(
         "ppiflow-v2",
         scientific_versions={
@@ -4144,7 +4279,6 @@ def build_ppiflow_workflow(
             gentype=gentype,
             report_table_inputs=report_table_inputs,
             report_partial_sources=report_partial_sources,
-            candidate_concurrency=candidate_concurrency,
         )
 
     if stage in {None, 2}:
@@ -4163,7 +4297,6 @@ def build_ppiflow_workflow(
             upstream_allows_partial=stage1_allows_partial,
             report_table_inputs=report_table_inputs,
             report_partial_sources=report_partial_sources,
-            candidate_concurrency=candidate_concurrency,
         )
 
     return workflow
@@ -4259,16 +4392,11 @@ def _add_stage1_nodes(
     gentype: str,
     report_table_inputs: dict[str, Any],
     report_partial_sources: list[Any],
-    candidate_concurrency: int,
 ):
     tail = None
     partial_tail = None
     if _step_enabled(enabled, "PPIFlowStep"):
-        design_config = _step_cfg_with_candidate_concurrency(
-            steps,
-            "PPIFlowStep",
-            candidate_concurrency,
-        )
+        design_config = _step_cfg(steps, "PPIFlowStep")
         runtime_config, scientific_config = _ppiflow_design_configs(design_config)
         tail = workflow.add_node(
             PPIFlowDesignNode(
@@ -4291,11 +4419,7 @@ def _add_stage1_nodes(
         tail = workflow.add_node(
             LigandMPNNNode(
                 step_name,
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    step_name,
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, step_name),
             ),
             id=node_id,
             inputs=_structure_inputs(tail),
@@ -4309,11 +4433,7 @@ def _add_stage1_nodes(
         tail = workflow.add_node(
             FlowPackerNode(
                 "FlowpackerStep_stage1",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "FlowpackerStep_stage1",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "FlowpackerStep_stage1"),
             ),
             id="stage1-flowpacker",
             inputs=_structure_inputs(tail),
@@ -4327,11 +4447,7 @@ def _add_stage1_nodes(
             workflow=workflow,
             node_id="stage1-af3score",
             step_name="AF3scoreStep_stage1",
-            config=_step_cfg_with_candidate_concurrency(
-                steps,
-                "AF3scoreStep_stage1",
-                candidate_concurrency,
-            ),
+            config=_step_cfg(steps, "AF3scoreStep_stage1"),
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -4343,11 +4459,7 @@ def _add_stage1_nodes(
         tail = workflow.add_node(
             FilterStructuresNode(
                 "FilterStep_stage1",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "FilterStep_stage1",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "FilterStep_stage1"),
             ),
             id="stage1-filter",
             inputs=inputs,
@@ -4392,6 +4504,7 @@ def _add_af3score_nodes(
             "af3score_plan": prepare.outputs(kind=ArtifactKind.TABLE),
         },
         depends_on=[batches],
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
         accept_partial_from=[batches],
     )
 
@@ -4442,7 +4555,6 @@ def _add_stage2_nodes(
     upstream_allows_partial: bool,
     report_table_inputs: dict[str, Any],
     report_partial_sources: list[Any],
-    candidate_concurrency: int,
 ) -> None:
     tail = upstream
     partial_tail = upstream if upstream_allows_partial else None
@@ -4452,11 +4564,7 @@ def _add_stage2_nodes(
             node_id="stage2-rosetta-fix",
             step_name="RosettaFixStep",
             finalizer_class=RosettaFixNode,
-            config=_step_cfg_with_candidate_concurrency(
-                steps,
-                "RosettaFixStep",
-                candidate_concurrency,
-            ),
+            config=_step_cfg(steps, "RosettaFixStep"),
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -4480,11 +4588,7 @@ def _add_stage2_nodes(
         tail = workflow.add_node(
             PPIFlowPartialNode(
                 "PartialStep",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "PartialStep",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "PartialStep"),
             ),
             id="stage2-partial-ppiflow",
             inputs=_structure_inputs(tail),
@@ -4505,11 +4609,7 @@ def _add_stage2_nodes(
         tail = workflow.add_node(
             LigandMPNNNode(
                 step_name,
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    step_name,
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, step_name),
             ),
             id=node_id,
             inputs=_structure_inputs(tail),
@@ -4524,11 +4624,7 @@ def _add_stage2_nodes(
         tail = workflow.add_node(
             FlowPackerNode(
                 "FlowpackerStep_stage2",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "FlowpackerStep_stage2",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "FlowpackerStep_stage2"),
             ),
             id="stage2-flowpacker",
             inputs=_structure_inputs(tail),
@@ -4542,11 +4638,7 @@ def _add_stage2_nodes(
             workflow=workflow,
             node_id="stage2-af3score",
             step_name="AF3scoreStep_stage2",
-            config=_step_cfg_with_candidate_concurrency(
-                steps,
-                "AF3scoreStep_stage2",
-                candidate_concurrency,
-            ),
+            config=_step_cfg(steps, "AF3scoreStep_stage2"),
             inputs=_structure_inputs(tail),
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -4559,11 +4651,7 @@ def _add_stage2_nodes(
         filtered = workflow.add_node(
             FilterStructuresNode(
                 "FilterStep_stage2",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "FilterStep_stage2",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "FilterStep_stage2"),
             ),
             id="stage2-filter",
             inputs=inputs,
@@ -4577,11 +4665,7 @@ def _add_stage2_nodes(
         refold = workflow.add_node(
             ReFoldNode(
                 "ReFoldStep",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "ReFoldStep",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "ReFoldStep"),
             ),
             id="stage2-alphafold3-refold",
             inputs=_structure_inputs(filtered),
@@ -4598,11 +4682,7 @@ def _add_stage2_nodes(
         dockq = workflow.add_node(
             DockQNode(
                 "DockQStep",
-                _step_cfg_with_candidate_concurrency(
-                    steps,
-                    "DockQStep",
-                    candidate_concurrency,
-                ),
+                _step_cfg(steps, "DockQStep"),
             ),
             id="stage2-dockq",
             inputs=inputs,
@@ -4619,11 +4699,7 @@ def _add_stage2_nodes(
             node_id="stage2-rosetta-relax",
             step_name="RosettaRelaxStep",
             finalizer_class=RosettaRelaxNode,
-            config=_step_cfg_with_candidate_concurrency(
-                steps,
-                "RosettaRelaxStep",
-                candidate_concurrency,
-            ),
+            config=_step_cfg(steps, "RosettaRelaxStep"),
             inputs=inputs,
             accept_partial_from=_partial_sources(partial_tail),
         )
@@ -5054,31 +5130,22 @@ def _ppiflow_design_configs(
     return runtime_config, scientific_config
 
 
-def _step_cfg_with_candidate_concurrency(
-    steps: dict[str, Any],
-    step_name: str,
-    candidate_concurrency: int,
+def _steps_doc_with_run_limits(
+    steps_doc: dict[str, Any],
+    *,
+    max_containers: int,
+    max_gpu_containers: int,
 ) -> dict[str, Any]:
-    cfg = dict(_step_cfg(steps, step_name))
-    cfg.setdefault("candidate_concurrency", candidate_concurrency)
-    return cfg
-
-
-def _steps_doc_with_child_budget(
-    steps_doc: dict[str, Any], max_child_calls: int
-) -> dict[str, Any]:
-    capped: dict[str, Any] = {}
+    configured: dict[str, Any] = {}
     for step_name, raw_cfg in steps_doc.items():
         if not isinstance(raw_cfg, dict):
-            capped[step_name] = raw_cfg
+            configured[step_name] = raw_cfg
             continue
         cfg = dict(raw_cfg)
-        cfg["max_child_calls"] = max_child_calls
-        for key in ("candidate_concurrency", "num_jobs", "max_batches", "max_num_pods"):
-            if key in cfg and cfg[key] is not None:
-                cfg[key] = min(int(cfg[key]), max_child_calls)
-        capped[step_name] = cfg
-    return capped
+        cfg["_max_containers"] = max_containers
+        cfg["_max_gpu_containers"] = max_gpu_containers
+        configured[step_name] = cfg
+    return configured
 
 
 def _ppiflow_input_fields(args: object) -> tuple[str, ...]:
@@ -5105,6 +5172,32 @@ def _active_ppiflow_app_steps(
     if stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep"):
         active_steps.append("PPIFlowStep")
     return tuple(active_steps)
+
+
+def _ppiflow_requires_gpu(task_doc: dict[str, Any], stage: int | None) -> bool:
+    """Return whether the selected workflow path contains a GPU Node."""
+    enabled = _enabled_section(task_doc)
+    stage1_gpu_steps = {
+        "PPIFlowStep",
+        "MPNNStep_stage1",
+        "AbMPNNStep_stage1",
+        "FlowpackerStep_stage1",
+        "AF3scoreStep_stage1",
+    }
+    stage2_gpu_steps = {
+        "PartialStep",
+        "MPNNStep_stage2",
+        "AbMPNNStep_stage2",
+        "FlowpackerStep_stage2",
+        "AF3scoreStep_stage2",
+        "ReFoldStep",
+    }
+    selected = set()
+    if stage in {None, 1}:
+        selected.update(stage1_gpu_steps)
+    if stage in {None, 2}:
+        selected.update(stage2_gpu_steps)
+    return any(_step_enabled(enabled, step_name) for step_name in selected)
 
 
 def _stage_ppiflow_app_inputs(
@@ -5236,12 +5329,18 @@ def submit_ppiflow_workflow(
         max_containers=max_containers,
         max_gpu_containers=max_gpu_containers,
     )
+    if gpu_limit == 0 and _ppiflow_requires_gpu(task_doc, stage):
+        raise ValueError(
+            "This PPIFlow path requires GPU work; --max-gpu-containers must "
+            "be at least 1"
+        )
     if dry_run:
         workflow = build_ppiflow_workflow(
             task_yaml_bytes=task_yaml_bytes,
             steps_yaml_bytes=steps_yaml_bytes,
             stage=stage,
-            max_child_calls=total_limit,
+            max_containers=total_limit,
+            max_gpu_containers=gpu_limit,
         )
         print_workflow_dag(workflow.validate())
         return
@@ -5261,7 +5360,8 @@ def submit_ppiflow_workflow(
         task_yaml_bytes=yaml.safe_dump(task_doc).encode("utf-8"),
         steps_yaml_bytes=yaml.safe_dump(steps_doc).encode("utf-8"),
         stage=stage,
-        max_child_calls=total_limit,
+        max_containers=total_limit,
+        max_gpu_containers=gpu_limit,
     )
 
     execution_run_id = uuid4()

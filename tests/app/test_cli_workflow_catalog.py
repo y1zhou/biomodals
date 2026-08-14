@@ -277,6 +277,20 @@ def test_workflow_run_requires_entrypoint_for_multiple_local_entrypoints(
     assert "::second" in result.output
 
 
+def test_app_run_requires_entrypoint_for_multiple_local_entrypoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("biomodals.cli._load_entry", lambda *_args: _FakeWorkflow())
+
+    result = runner.invoke(app, ["app", "run", "ambiguous"])
+
+    assert result.exit_code == 1
+    assert "App 'ambiguous' contains multiple local entrypoints" in result.output
+    assert "::<entrypoint>" in result.output
+    assert "ambiguous::first" in result.output
+    assert "ambiguous::second" in result.output
+
+
 def test_workflow_dry_run_invokes_the_entrypoint_locally(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -637,6 +651,48 @@ def test_workflow_run_fails_closed_for_an_unavailable_version(
     output = strip_ansi(result.output)
     assert "version 4 is" in output
     assert "not available" in output
+
+
+@pytest.mark.parametrize(
+    ("command", "catalog_entry", "deploy_command"),
+    (
+        (
+            [
+                "app",
+                "run",
+                "alphafold3::submit_alphafold3_task",
+                "--",
+                "--input-json",
+                "input.json",
+            ],
+            _CoordinatedApp(),
+            "biomodals app deploy alphafold3",
+        ),
+        (
+            ["workflow", "run", "shortmd", "--", "/inputs"],
+            _SingleEntrypointWorkflow(),
+            "biomodals workflow deploy shortmd",
+        ),
+    ),
+)
+def test_run_explains_how_to_handle_a_missing_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+    catalog_entry: object,
+    deploy_command: str,
+) -> None:
+    monkeypatch.setattr("biomodals.cli._load_entry", lambda *_args: catalog_entry)
+    monkeypatch.setattr("biomodals.cli._deployment_name", lambda _entry: "Missing")
+    monkeypatch.setattr(
+        "biomodals.cli.run_command",
+        lambda *_args, **_kwargs: ["[]"],
+    )
+
+    result = runner.invoke(app, command)
+
+    assert result.exit_code == 1
+    assert "--development" in result.output
+    assert deploy_command in result.output
 
 
 def test_app_run_uses_inherited_output_streams(

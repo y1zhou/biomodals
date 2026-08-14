@@ -649,6 +649,20 @@ def run_modal_app(
     import os
 
     app = _load_entry("app", app_name_or_path)
+    if modal_mode != "shell" and app._entrypoint is None:
+        local_entrypoints = [
+            app[index].name for index in getattr(app, "_local_entrypoint_idx", ())
+        ]
+        if len(local_entrypoints) > 1:
+            choices = ", ".join(
+                f"{app.name}::{entrypoint}" for entrypoint in local_entrypoints
+            )
+            console.print(
+                f"[bold red]Error[/bold red] App '{app.name}' contains multiple "
+                "local entrypoints. Choose one by appending '::<entrypoint>': "
+                f"{choices}"
+            )
+            raise typer.Exit(code=1)
     coordinated_entrypoint = _coordinated_app_entrypoint(app)
     _validate_container_limit_options(max_containers, max_gpu_containers)
     if modal_mode == "shell" and (
@@ -698,7 +712,9 @@ def run_modal_app(
         except (ImportError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             console.print(
                 "[bold red]Error[/bold red] Could not resolve exact app "
-                f"deployment: {exc}"
+                f"deployment: {exc}\nRun with --development to use current "
+                "source, or deploy the app first with "
+                f"'biomodals app deploy {app.name}'."
             )
             raise typer.Exit(code=1) from exc
     elif restart_from is not None:
@@ -1304,7 +1320,9 @@ def run_workflow(
         except (ImportError, OSError, subprocess.CalledProcessError, ValueError) as exc:
             console.print(
                 "[bold red]Error[/bold red] Could not resolve exact workflow "
-                f"deployment: {exc}"
+                f"deployment: {exc}\nRun with --development to use current "
+                "source, or deploy the workflow first with "
+                f"'biomodals workflow deploy {workflow.name}'."
             )
             raise typer.Exit(code=1) from exc
 

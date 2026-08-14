@@ -141,8 +141,9 @@ def resolve_workflow_entrypoint(
     if len(local_entrypoints) > 1:
         choices = ", ".join(f"{workflow_name}::{name}" for name in local_entrypoints)
         raise ValueError(
-            f"Workflow '{workflow_name}' contains multiple local entrypoints; "
-            f"choose one explicitly: {choices}"
+            f"Workflow '{workflow_name}' contains multiple local entrypoints. "
+            "Choose one by appending '::<entrypoint>': "
+            f"{choices}"
         )
     raise ValueError(f"Workflow '{workflow_name}' does not define a local entrypoint.")
 

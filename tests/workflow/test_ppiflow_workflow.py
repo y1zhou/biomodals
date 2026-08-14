@@ -3586,21 +3586,6 @@ steps:
         assert config["_max_gpu_containers"] == 2
 
 
-def test_ppiflow_rejects_zero_gpu_capacity_for_gpu_path() -> None:
-    with pytest.raises(ValueError, match="GPU Nodes"):
-        build_ppiflow_workflow(
-            task_yaml_bytes=b"""
-task:
-  gentype: binder
-steps:
-  AF3scoreStep_stage1: true
-""",
-            steps_yaml_bytes=b"AF3scoreStep_stage1: {}\n",
-            max_containers=4,
-            max_gpu_containers=0,
-        )
-
-
 def test_ppiflow_operational_fanout_does_not_change_scientific_dag_hash() -> None:
     task_yaml = b"""
 task:
@@ -3730,6 +3715,30 @@ RosettaFixStep: {}
         definition.nodes["stage2-existing-input"].node,
         RemoteWorkflowNode,
     )
+
+
+def test_ppiflow_stage2_null_config_uses_task_input_fallback() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=b"""
+task:
+  gentype: binder
+  stage2_input:
+    volume_name: source-volume
+    path: existing/stage1-filtered
+steps:
+  RosettaFixStep: true
+""",
+        steps_yaml_bytes=b"""
+Stage2Input: null
+RosettaFixStep: {}
+""",
+        stage=2,
+        max_containers=3,
+        max_gpu_containers=2,
+    )
+
+    node = workflow.validate().nodes["stage2-existing-input"].node
+    assert node.config["path"] == "existing/stage1-filtered"
 
 
 def test_ppiflow_stage2_only_manifest_feeds_downstream_nodes() -> None:

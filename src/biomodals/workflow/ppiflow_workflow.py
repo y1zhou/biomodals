@@ -67,6 +67,7 @@ from biomodals.workflow.core import (
     republish_workflow_artifact,
 )
 from biomodals.workflow.core.execution import app_scientific_version
+from biomodals.workflow.ppiflow import analysis_runtime, rosetta_runtime
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
@@ -78,26 +79,6 @@ from biomodals.workflow.ppiflow.af3score_runtime import (
 )
 from biomodals.workflow.ppiflow.af3score_runtime import (
     run_ppiflow_af3score_batch as _run_ppiflow_af3score_batch,
-)
-from biomodals.workflow.ppiflow.analysis_runtime import (
-    _stage2_manifest_storage_from_config,
-    _streamed_volume_file_record,
-    _volume_path_from_stage_config,
-)
-from biomodals.workflow.ppiflow.analysis_runtime import (
-    check_ppiflow_external_artifact as _check_ppiflow_external_artifact,
-)
-from biomodals.workflow.ppiflow.analysis_runtime import (
-    derive_ppiflow_fixed_positions as _derive_ppiflow_fixed_positions,
-)
-from biomodals.workflow.ppiflow.analysis_runtime import (
-    filter_ppiflow_artifacts as _filter_ppiflow_artifacts,
-)
-from biomodals.workflow.ppiflow.analysis_runtime import (
-    normalize_ppiflow_stage2_input as _normalize_ppiflow_stage2_input,
-)
-from biomodals.workflow.ppiflow.analysis_runtime import (
-    rank_ppiflow_artifacts as _rank_ppiflow_artifacts,
 )
 from biomodals.workflow.ppiflow.dockq_runtime import (
     run_ppiflow_dockq_stage as _run_ppiflow_dockq_stage,
@@ -122,22 +103,6 @@ from biomodals.workflow.ppiflow.ppiflow_runtime import (
 )
 from biomodals.workflow.ppiflow.refold_runtime import (
     run_ppiflow_refold_candidate as _run_ppiflow_refold_candidate,
-)
-from biomodals.workflow.ppiflow.rosetta_runtime import (
-    _load_rosetta_plan,
-    _resolve_rosetta_config_text,
-    _rosetta_task_outcomes_artifact,
-    _rosetta_task_receipt,
-    _rosetta_worker_policy,
-)
-from biomodals.workflow.ppiflow.rosetta_runtime import (
-    finalize_ppiflow_rosetta_stage as _finalize_ppiflow_rosetta_stage,
-)
-from biomodals.workflow.ppiflow.rosetta_runtime import (
-    prepare_ppiflow_rosetta_stage as _prepare_ppiflow_rosetta_stage,
-)
-from biomodals.workflow.ppiflow.rosetta_runtime import (
-    run_ppiflow_rosetta_worker as _run_ppiflow_rosetta_worker,
 )
 from biomodals.workflow.ppiflow.runtime_support import (
     file_sha256 as _file_sha256,
@@ -349,7 +314,7 @@ check_ppiflow_external_artifact = app.function(
     memory=(512, 4096),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_check_ppiflow_external_artifact)
+)(analysis_runtime.check_ppiflow_external_artifact)
 
 
 normalize_ppiflow_stage2_input = app.function(
@@ -358,7 +323,7 @@ normalize_ppiflow_stage2_input = app.function(
     memory=(512, 4096),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_normalize_ppiflow_stage2_input)
+)(analysis_runtime.normalize_ppiflow_stage2_input)
 
 
 filter_ppiflow_artifacts = app.function(
@@ -367,7 +332,7 @@ filter_ppiflow_artifacts = app.function(
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_filter_ppiflow_artifacts)
+)(analysis_runtime.filter_ppiflow_artifacts)
 
 
 derive_ppiflow_fixed_positions = app.function(
@@ -376,7 +341,7 @@ derive_ppiflow_fixed_positions = app.function(
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_derive_ppiflow_fixed_positions)
+)(analysis_runtime.derive_ppiflow_fixed_positions)
 
 
 rank_ppiflow_artifacts = app.function(
@@ -385,7 +350,7 @@ rank_ppiflow_artifacts = app.function(
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_rank_ppiflow_artifacts)
+)(analysis_runtime.rank_ppiflow_artifacts)
 
 
 prepare_ppiflow_rosetta_stage = app.function(
@@ -394,7 +359,7 @@ prepare_ppiflow_rosetta_stage = app.function(
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_prepare_ppiflow_rosetta_stage)
+)(rosetta_runtime.prepare_ppiflow_rosetta_stage)
 
 
 def _read_af3score_plan_artifacts(
@@ -476,7 +441,7 @@ run_ppiflow_rosetta_worker = app.function(
     memory=(1024, 43008),
     timeout=CONF.timeout,
     volumes=ROSETTA_TASK_VOLUME_MOUNTS,
-)(_run_ppiflow_rosetta_worker)
+)(rosetta_runtime.run_ppiflow_rosetta_worker)
 
 
 finalize_ppiflow_rosetta_stage = app.function(
@@ -485,7 +450,7 @@ finalize_ppiflow_rosetta_stage = app.function(
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)(_finalize_ppiflow_rosetta_stage)
+)(rosetta_runtime.finalize_ppiflow_rosetta_stage)
 
 
 _OBSOLETE_CONFIG_KEYS = (
@@ -1063,7 +1028,9 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
         artifacts = context.inputs.get("rosetta_plan") or []
         if len(artifacts) != 1:
             raise ValueError(f"Expected one Rosetta task plan, found {len(artifacts)}")
-        return _load_rosetta_plan(context.resolve_workflow_artifact(artifacts[0]))
+        return rosetta_runtime._load_rosetta_plan(
+            context.resolve_workflow_artifact(artifacts[0])
+        )
 
     def discover_remote_tasks(
         self,
@@ -1097,9 +1064,11 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
     ) -> RemotePullWorkerCall:
         """Bind the derived worker pool to the workflow's Rosetta function."""
         plan = self._plan(context)
-        worker_count, claim_capacity, max_parallel = _rosetta_worker_policy(
-            len(cast(list[object], plan["tasks"])),
-            self.config,
+        worker_count, claim_capacity, max_parallel = (
+            rosetta_runtime._rosetta_worker_policy(
+                len(cast(list[object], plan["tasks"])),
+                self.config,
+            )
         )
         return RemotePullWorkerCall(
             function_name="run_ppiflow_rosetta_worker",
@@ -1167,7 +1136,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
             return None
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
-            outputs=[_rosetta_task_receipt(spec, expected_fingerprint)],
+            outputs=[rosetta_runtime._rosetta_task_receipt(spec, expected_fingerprint)],
             metrics={"candidate_id": spec.candidate_id or spec.task_key},
         )
 
@@ -1188,7 +1157,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
         )
         return AppRunResult(
             status=status,
-            outputs=[_rosetta_task_outcomes_artifact(results, errors)],
+            outputs=[rosetta_runtime._rosetta_task_outcomes_artifact(results, errors)],
             warnings=[f"{task_key}: {errors[task_key]}" for task_key in sorted(errors)],
             metrics={
                 "successful_candidates": len(results),
@@ -1753,7 +1722,9 @@ def _inline_rosetta_config_files(steps_doc: dict[str, Any]) -> dict[str, Any]:
         for field_name in ("rosetta_script", "flags_file"):
             value = cfg.get(field_name)
             if isinstance(value, str):
-                cfg[field_name] = _resolve_rosetta_config_text(value, field_name)
+                cfg[field_name] = rosetta_runtime._resolve_rosetta_config_text(
+                    value, field_name
+                )
     return staged_steps
 
 
@@ -1816,8 +1787,6 @@ def build_ppiflow_workflow(
         max_gpu_containers=max_gpu_containers,
     )
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
-    if max_gpu_containers == 0 and _ppiflow_requires_gpu(task_doc, stage):
-        raise ValueError("PPIFlow GPU Nodes require max_gpu_containers >= 1")
     model_versions = _ppiflow_model_scientific_versions(
         enabled=enabled,
         gentype=gentype,
@@ -2361,7 +2330,9 @@ def _stage2_input_node(
     if raw_path is None:
         raise ValueError("Stage2Input requires a 'path' value")
     volume_name = str(raw_cfg.get("volume_name", PPI_FLOW_OUTPUT_VOLUME_NAME))
-    storage = _volume_path_from_stage_config(str(raw_path), volume_name=volume_name)
+    storage = analysis_runtime._volume_path_from_stage_config(
+        str(raw_path), volume_name=volume_name
+    )
     return ExistingStructuresNode(
         "Stage2Input",
         storage,
@@ -2376,7 +2347,7 @@ def _client_volume_file_record(storage: VolumePath) -> dict[str, object]:
     volume = PPI_FLOW_SOURCE_VOLUMES.get(storage.volume_name)
     if volume is None:
         raise ValueError(f"Unknown Stage2Input volume {storage.volume_name!r}")
-    return _streamed_volume_file_record(
+    return analysis_runtime._streamed_volume_file_record(
         volume_name=storage.volume_name,
         path=storage.path,
         chunks=volume.read_file(storage.path),
@@ -2478,18 +2449,18 @@ def _bind_stage2_input_identity(
     raw_path = config.get("path")
     if raw_path is None:
         raise ValueError("Stage2Input requires a 'path' value")
-    storage = _volume_path_from_stage_config(
+    storage = analysis_runtime._volume_path_from_stage_config(
         str(raw_path),
         volume_name=str(config.get("volume_name", PPI_FLOW_OUTPUT_VOLUME_NAME)),
     )
-    manifest_storage = _stage2_manifest_storage_from_config(
+    manifest_storage = analysis_runtime._stage2_manifest_storage_from_config(
         config,
         default_volume_name=storage.volume_name,
     )
     snapshot: dict[str, object] = {}
     if manifest_storage is not None:
         manifest_bytes, frame = _read_client_manifest(manifest_storage)
-        snapshot["manifest"] = _streamed_volume_file_record(
+        snapshot["manifest"] = analysis_runtime._streamed_volume_file_record(
             volume_name=manifest_storage.volume_name,
             path=manifest_storage.path,
             chunks=(manifest_bytes,),
@@ -2595,9 +2566,13 @@ def _steps_doc_with_run_limits(
     max_gpu_containers: int,
 ) -> dict[str, Any]:
     configured: dict[str, Any] = {}
-    step_names = dict.fromkeys((*steps_doc, *enabled_steps))
+    enabled = tuple(enabled_steps)
+    step_names = dict.fromkeys((*steps_doc, *enabled))
     for step_name in step_names:
         raw_cfg = steps_doc.get(step_name)
+        if step_name not in enabled:
+            configured[step_name] = raw_cfg
+            continue
         if raw_cfg is None:
             raw_cfg = {}
         if not isinstance(raw_cfg, dict):
@@ -2638,32 +2613,6 @@ def _active_ppiflow_app_steps(
     if stage in {None, 1} and _step_enabled(enabled, "PPIFlowStep"):
         active_steps.append("PPIFlowStep")
     return tuple(active_steps)
-
-
-def _ppiflow_requires_gpu(task_doc: dict[str, Any], stage: int | None) -> bool:
-    """Return whether the selected workflow path contains a GPU Node."""
-    enabled = _enabled_section(task_doc)
-    stage1_gpu_steps = {
-        "PPIFlowStep",
-        "MPNNStep_stage1",
-        "AbMPNNStep_stage1",
-        "FlowpackerStep_stage1",
-        "AF3scoreStep_stage1",
-    }
-    stage2_gpu_steps = {
-        "PartialStep",
-        "MPNNStep_stage2",
-        "AbMPNNStep_stage2",
-        "FlowpackerStep_stage2",
-        "AF3scoreStep_stage2",
-        "ReFoldStep",
-    }
-    selected = set()
-    if stage in {None, 1}:
-        selected.update(stage1_gpu_steps)
-    if stage in {None, 2}:
-        selected.update(stage2_gpu_steps)
-    return any(_step_enabled(enabled, step_name) for step_name in selected)
 
 
 def _stage_ppiflow_app_inputs(
@@ -2795,11 +2744,6 @@ def submit_ppiflow_workflow(
         max_containers=max_containers,
         max_gpu_containers=max_gpu_containers,
     )
-    if gpu_limit == 0 and _ppiflow_requires_gpu(task_doc, stage):
-        raise ValueError(
-            "This PPIFlow path requires GPU work; --max-gpu-containers must "
-            "be at least 1"
-        )
     if dry_run:
         workflow = build_ppiflow_workflow(
             task_yaml_bytes=task_yaml_bytes,

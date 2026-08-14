@@ -19,6 +19,7 @@ from biomodals.app.fold import (
     protenix_app,
 )
 from biomodals.app.score import af3score_app, ensirna_app, oligoformer_app
+from biomodals.workflow import ppiflow_workflow
 
 
 def _source_modules(image) -> set[str]:
@@ -93,6 +94,13 @@ def _source_modules(image) -> set[str]:
             oligoformer_app.runtime_image,
             {"biomodals.app.score.oligoformer_execution"},
         ),
+        (
+            ppiflow_workflow.ligandmpnn_task_image,
+            {
+                "biomodals.app.design.ligandmpnn_app",
+                "biomodals.workflow.ppiflow",
+            },
+        ),
     ),
 )
 def test_execution_images_include_app_owned_modules(
@@ -114,6 +122,12 @@ def test_execution_images_include_app_owned_modules(
         ("biomodals.app.fold.alphafold3.inference_inputs", (3, 11)),
         ("biomodals.app.fold.alphafold3.search_pipeline", (3, 11)),
         ("biomodals.app.fold.alphafold3.seed_predictions", (3, 11)),
+        ("biomodals.app.design.ligandmpnn_app", (3, 11)),
+        ("biomodals.workflow.ppiflow.ligandmpnn_runtime", (3, 11)),
+        ("biomodals.workflow.ppiflow.manifests", (3, 11)),
+        ("biomodals.workflow.ppiflow.runtime_context", (3, 11)),
+        ("biomodals.workflow.ppiflow.runtime_support", (3, 11)),
+        ("biomodals.workflow.ppiflow.tables", (3, 11)),
     ),
 )
 def test_low_python_execution_sources_parse(

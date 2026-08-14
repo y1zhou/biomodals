@@ -18,6 +18,9 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow.ppiflow import manifests, staging, tables
+from biomodals.workflow.ppiflow.model_validation import (
+    reload_ppiflow_model_volume,
+)
 from biomodals.workflow.ppiflow.runtime_context import (
     PPI_FLOW_OUTPUT_MOUNTPOINT,
     PPI_FLOW_OUTPUT_VOLUME_NAME,
@@ -56,6 +59,7 @@ def run_ppiflow_design_stage(
 ) -> AppRunResult:
     """Run initial PPIFlow design and publish candidate identities."""
     reload_source_volumes()
+    reload_ppiflow_model_volume()
     result = AppRunResult.model_validate(
         ppiflow_app.ppiflow_run_workflow.get_raw_f()(
             args=args,
@@ -97,6 +101,7 @@ def run_ppiflow_partial_candidate(
 ) -> AppRunResult:
     """Run one kernel-owned PPIFlow partial-design candidate."""
     reload_source_volumes()
+    reload_ppiflow_model_volume()
     selected = staging.select_structure_files_from_artifacts(
         artifacts,
         SOURCE_VOLUME_ROOTS,

@@ -148,6 +148,7 @@ def run_ppiflow_af3score_batch(
         batch_pdb_dir=batch_pdb_dir,
         input_digests=input_digests,
         publication_key=publication_key,
+        input_ids=[Path(input_name).stem for input_name in input_names],
     )
     layout = AppRunLayout.from_run_root(
         Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)

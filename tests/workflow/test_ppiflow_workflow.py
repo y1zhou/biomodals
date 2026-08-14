@@ -183,6 +183,12 @@ def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Pat
     ):
         if hasattr(module, "reload_source_volumes"):
             monkeypatch.setattr(module, "reload_source_volumes", lambda: None)
+        if hasattr(module, "reload_ppiflow_model_volume"):
+            monkeypatch.setattr(
+                module,
+                "reload_ppiflow_model_volume",
+                lambda: None,
+            )
         if hasattr(module, "_reload_ppiflow_source_volumes"):
             monkeypatch.setattr(
                 module,
@@ -496,10 +502,18 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
         source,
         "run_ppiflow_rosetta_worker",
     )
+    rosetta_binding = _function_binding(source, "run_ppiflow_rosetta_worker")
+    assert "cpu=(0.125, 30.125)" in rosetta_binding
+    assert "memory=(1024, 43008)" in rosetta_binding
     assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
         source,
         "finalize_ppiflow_rosetta_stage",
     )
+    ligandmpnn_image = source.split("ligandmpnn_task_image =", 1)[1].split(
+        "flowpacker_task_image =",
+        1,
+    )[0]
+    assert "polars==1.43.0" in ligandmpnn_image
 
 
 def test_ppiflow_app_step_preparation_does_not_submit_provider_call(
@@ -739,6 +753,12 @@ def test_design_stage_publishes_digest_bearing_candidate_manifest(
     monkeypatch,
 ) -> None:
     _, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    model_reloads = []
+    monkeypatch.setattr(
+        ppiflow_runtime,
+        "reload_ppiflow_model_volume",
+        lambda: model_reloads.append(True),
+    )
     output_root = tmp_path / "ppiflow-output"
     output_root.mkdir()
     monkeypatch.setattr(
@@ -822,6 +842,7 @@ def test_design_stage_publishes_digest_bearing_candidate_manifest(
         for row in manifest.iter_rows(named=True)
         for file_record in row["files"]
     )
+    assert model_reloads == [True]
 
 
 def test_ligandmpnn_candidate_runs_science_in_kernel_owned_call(
@@ -922,6 +943,12 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
     monkeypatch,
 ) -> None:
     source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
+    model_reloads = []
+    monkeypatch.setattr(
+        ppiflow_runtime,
+        "reload_ppiflow_model_volume",
+        lambda: model_reloads.append(True),
+    )
     structure_dir = source_root / "upstream" / "results"
     structure_dir.mkdir(parents=True)
     structure_bytes = b"ATOM\n"
@@ -1037,6 +1064,7 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
         result.outputs[0].metadata["files"][0]["content_sha256"]
         == (file_record["content_sha256"])
     )
+    assert model_reloads == [True]
 
 
 def test_supplied_invalid_candidate_manifest_fails_closed(
@@ -1178,6 +1206,12 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert batch_call.kwargs["input_digests"] == {
         "candidate-a": "candidate-a",
         "candidate-b": "candidate-b",
+    }
+    repair_call = batch_node.prepare_remote_task_batch(batch_context, tasks[:1])
+    assert repair_call.kwargs["task_keys"] == ["candidate-a"]
+    assert repair_call.kwargs["input_names"] == ["candidate-a.pdb"]
+    assert repair_call.kwargs["input_digests"] == {
+        "candidate-a": "candidate-a",
     }
 
     postprocess_node = ppiflow_workflow.AF3ScoreNode(
@@ -3323,6 +3357,7 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         "stage2-dockq",
     }
     assert definition.nodes["stage2-rank"].partial_dependencies == {
+        "stage2-af3score",
         "stage2-alphafold3-refold",
         "stage2-rosetta-relax",
     }
@@ -3525,6 +3560,27 @@ RosettaFixStep: {}
         "stage1-af3score",
         "stage2-rosetta-fix",
     ):
+        config = definition.nodes[node_id].node.config
+        assert config["_max_containers"] == 3
+        assert config["_max_gpu_containers"] == 2
+
+
+def test_ppiflow_propagates_limits_to_omitted_and_null_step_configs() -> None:
+    workflow = build_ppiflow_workflow(
+        task_yaml_bytes=b"""
+task:
+  gentype: binder
+steps:
+  MPNNStep_stage1: true
+  AF3scoreStep_stage1: true
+""",
+        steps_yaml_bytes=b"AF3scoreStep_stage1: null\n",
+        max_containers=3,
+        max_gpu_containers=2,
+    )
+
+    definition = workflow.validate()
+    for node_id in ("stage1-ligandmpnn", "stage1-af3score"):
         config = definition.nodes[node_id].node.config
         assert config["_max_containers"] == 3
         assert config["_max_gpu_containers"] == 2

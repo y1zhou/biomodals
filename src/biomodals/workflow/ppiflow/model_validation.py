@@ -5,6 +5,7 @@ from pathlib import Path
 import orjson
 
 from biomodals.helper.artifacts import sha256_file
+from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -20,6 +21,7 @@ def validate_ppiflow_model(
     expected_sha256: str,
 ) -> AppRunResult:
     """Hash one mounted checkpoint and reject unexpected model bytes."""
+    reload_ppiflow_model_volume()
     path = Path(model_path)
     if not path.is_file():
         raise FileNotFoundError(f"PPIFlow model checkpoint not found: {path}")
@@ -46,3 +48,8 @@ def validate_ppiflow_model(
             )
         ],
     )
+
+
+def reload_ppiflow_model_volume() -> None:
+    """Refresh the shared model Volume before validation or inference."""
+    MODEL_VOLUME.reload()

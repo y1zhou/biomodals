@@ -481,21 +481,36 @@ def test_gpu_batch_invalidates_publication_before_compute(
     batch_pdb = tmp_path / "batch-pdb"
     batch_json.mkdir()
     batch_pdb.mkdir()
-    batch_json.joinpath("a.json").write_text("{}")
+    for input_id in ("a", "b"):
+        batch_json.joinpath(f"{input_id}.json").write_text("{}")
+        batch_pdb.joinpath(f"{input_id}.pdb").write_text("ATOM\n")
     digest = sha256(INPUT_CONTENT["a.pdb"]).hexdigest()
     output_dir = output_root / "scores" / "outputs"
     _publish_input(output_dir, "a", digest, "plan")
+    _publish_input(output_dir, "b", digest, "plan")
     marker = af3score_publications._input_publication_path(output_dir, "a")
+    sibling_marker = af3score_publications._input_publication_path(output_dir, "b")
 
     def run_command(command, **_kwargs) -> None:
         assert not marker.exists()
+        assert sibling_marker.exists()
         if str(command[1]).endswith("run_af3score.py"):
             events.append("run")
+            json_dir = Path(
+                next(
+                    str(arg).split("=", 1)[1]
+                    for arg in command
+                    if str(arg).startswith("--batch_json_dir=")
+                )
+            )
+            assert [path.name for path in json_dir.iterdir()] == ["a.json"]
             sample = output_dir / "a" / COMPLETION_SAMPLE_SUBDIR
             for required in COMPLETION_REQUIRED_FILES:
                 sample.joinpath(required).write_text('{"new":true}')
         else:
             events.append("prepare")
+            pdb_dir = Path(str(command[2]).split("=", 1)[1])
+            assert [path.name for path in pdb_dir.iterdir()] == ["a.pdb"]
 
     monkeypatch.setattr(
         af3score_app,
@@ -514,14 +529,21 @@ def test_gpu_batch_invalidates_publication_before_compute(
         batch_name="batch_0",
         batch_json_dir=str(batch_json),
         batch_pdb_dir=str(batch_pdb),
-        input_digests={"a": digest},
+        input_digests={"a": digest, "b": digest},
         publication_key="plan",
+        input_ids=["a"],
     )
 
     assert events == ["reload", "commit", "prepare", "run", "commit"]
     assert af3score_publications._input_publication_ready(
         output_dir,
         "a",
+        publication_key="plan",
+        input_sha256=digest,
+    )
+    assert af3score_publications._input_publication_ready(
+        output_dir,
+        "b",
         publication_key="plan",
         input_sha256=digest,
     )

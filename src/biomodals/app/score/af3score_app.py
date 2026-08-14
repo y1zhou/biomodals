@@ -328,6 +328,7 @@ def af3score_run(
     batch_pdb_dir: str,
     input_digests: dict[str, str],
     publication_key: str,
+    input_ids: list[str] | None = None,
 ) -> None:
     """Run one AF3Score batch."""
     CONF.output_volume.reload()
@@ -335,21 +336,50 @@ def af3score_run(
     af3_weights = Path(CONF.model_volume_mountpoint) / APP_INFO.af3_weights
     if not af3_weights.exists():
         raise FileNotFoundError(f"AlphaFold3 model weights not found: {af3_weights}")
-    input_ids = tuple(
+    batch_input_ids = tuple(
         path.stem
         for path in sorted(Path(batch_json_dir).glob("*.json"))
         if path.is_file()
     )
-    for input_id in input_ids:
+    selected_input_ids = batch_input_ids if input_ids is None else tuple(input_ids)
+    if not selected_input_ids or len(selected_input_ids) != len(
+        set(selected_input_ids)
+    ):
+        raise ValueError("AF3Score input IDs must be nonempty and unique")
+    if not set(selected_input_ids).issubset(batch_input_ids):
+        raise ValueError("AF3Score selected inputs are not in the prepared batch")
+    for input_id in selected_input_ids:
         if input_id not in input_digests:
             raise ValueError(f"Missing AF3Score input digest for '{input_id}'")
     out_dir = layout.outputs_dir
-    if _invalidate_input_publications(out_dir, input_ids):
+    if _invalidate_input_publications(out_dir, selected_input_ids):
         # The coordinator observes these files while this GPU call is active.
         CONF.output_volume.commit()
 
     with TemporaryDirectory(prefix=f"af3score_gpu_{batch_name}_") as temp_dir:
         batch_gpu_root = Path(temp_dir)
+        if selected_input_ids != batch_input_ids:
+            for source_dir, target_name, suffix in (
+                (Path(batch_json_dir), "json", ".json"),
+                (Path(batch_pdb_dir), "pdb", ".pdb"),
+            ):
+                target_dir = batch_gpu_root / target_name
+                target_dir.mkdir()
+                sources = {
+                    path.stem: path
+                    for path in source_dir.glob(f"*{suffix}")
+                    if path.is_file()
+                }
+                for input_id in selected_input_ids:
+                    try:
+                        source = sources[input_id]
+                    except KeyError as error:
+                        raise FileNotFoundError(
+                            f"AF3Score prepared input is missing: {input_id}{suffix}"
+                        ) from error
+                    target_dir.joinpath(source.name).symlink_to(source.resolve())
+            batch_json_dir = str(batch_gpu_root / "json")
+            batch_pdb_dir = str(batch_gpu_root / "pdb")
         batch_h5_dir = batch_gpu_root / "jax"
         batch_h5_dir.mkdir(parents=True, exist_ok=True)
 
@@ -391,7 +421,7 @@ def af3score_run(
             output_mode="capture",
             log_file=out_dir / f"{batch_name}.log",
         )
-        for input_id in input_ids:
+        for input_id in selected_input_ids:
             try:
                 _write_input_publication(
                     out_dir,

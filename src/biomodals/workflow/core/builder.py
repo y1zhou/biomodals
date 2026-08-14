@@ -43,6 +43,7 @@ class WorkflowNodeSpec:
     node: WorkflowNode
     aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL
     allow_empty_result: bool = False
+    reuse_predecessor_publication: bool = True
     inputs: dict[str, ArtifactSelector] = field(default_factory=dict)
     control_dependencies: set[str] = field(default_factory=set)
     partial_dependencies: set[str] = field(default_factory=set)
@@ -82,6 +83,7 @@ class Workflow:
         accept_partial_from: list[NodeHandle | str] | None = None,
         aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL,
         allow_empty_result: bool = False,
+        reuse_predecessor_publication: bool = True,
     ) -> NodeHandle:
         """Add one node to the workflow and return its handle."""
         node_id = sanitize_filename(id)
@@ -101,6 +103,7 @@ class Workflow:
             node=node,
             aggregation_policy=aggregation_policy,
             allow_empty_result=allow_empty_result,
+            reuse_predecessor_publication=reuse_predecessor_publication,
             inputs=inputs or {},
             control_dependencies=control_dependencies,
             partial_dependencies=partial_dependencies,

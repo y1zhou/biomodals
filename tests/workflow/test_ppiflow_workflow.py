@@ -234,13 +234,19 @@ PPIFlowStep:
     assert workflow.validate().scientific_versions["biomodals.workflow.ppiflow"] == "3"
     assert (
         workflow.validate().scientific_versions["ppiflow.model.binder.ckpt"]
-        == ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["binder.ckpt"]
+        == ppiflow_app.PPI_FLOW_MODEL_SHA256["binder.ckpt"]
     )
     assert not {
         key
         for key in workflow.validate().scientific_versions
         if key.startswith("ppiflow.model.") and key != "ppiflow.model.binder.ckpt"
     }
+    definition = workflow.validate()
+    validation = definition.nodes["ppiflow-model-validation"]
+    assert validation.reuse_predecessor_publication is False
+    assert (
+        "ppiflow-model-validation" in definition.dependencies["stage1-ppiflow-design"]
+    )
 
 
 def test_ppiflow_plan_ignores_unused_model_identities(
@@ -258,14 +264,14 @@ def test_ppiflow_plan_ignores_unused_model_identities(
 
     baseline = fingerprint()
     monkeypatch.setitem(
-        ppiflow_app.PPI_FLOW_MODEL_FILE_IDS,
+        ppiflow_app.PPI_FLOW_MODEL_SHA256,
         "monomer.ckpt",
         "changed-unused-model",
     )
     assert fingerprint() == baseline
 
     monkeypatch.setitem(
-        ppiflow_app.PPI_FLOW_MODEL_FILE_IDS,
+        ppiflow_app.PPI_FLOW_MODEL_SHA256,
         "binder.ckpt",
         "changed-selected-model",
     )
@@ -310,7 +316,7 @@ PPIFlowStep:
 
     assert (
         workflow.validate().scientific_versions["ppiflow.model.nanobody.ckpt"]
-        == ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["nanobody.ckpt"]
+        == ppiflow_app.PPI_FLOW_MODEL_SHA256["nanobody.ckpt"]
     )
 
     with pytest.raises(ValueError, match="disagrees"):
@@ -334,7 +340,7 @@ def test_checked_in_ppiflow_workflow_builds() -> None:
 
     assert (
         workflow.validate().scientific_versions["ppiflow.model.nanobody.ckpt"]
-        == ppiflow_app.PPI_FLOW_MODEL_FILE_IDS["nanobody.ckpt"]
+        == ppiflow_app.PPI_FLOW_MODEL_SHA256["nanobody.ckpt"]
     )
 
 
@@ -2821,8 +2827,8 @@ PPIFlowStep:
     stdout = strip_ansi(capsys.readouterr().out)
     assert "[workflow] DAG graph: node_id [execution; class] <- dependency" in stdout
     assert (
-        "[workflow]   stage1-ppiflow-design [provider; PPIFlowDesignNode] <- -"
-        in stdout
+        "[workflow]   stage1-ppiflow-design [provider; PPIFlowDesignNode] "
+        "<- ppiflow-model-validation" in stdout
     )
     assert "ppiflow_workflow.PPIFlowDesignNode" not in stdout
     assert "Submitting PPIFlow workflow" not in stdout
@@ -3105,6 +3111,7 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     definition = workflow.validate()
 
     assert list(definition.nodes) == [
+        "ppiflow-model-validation",
         "stage1-ppiflow-design",
         "stage1-ligandmpnn",
         "stage1-flowpacker",
@@ -3134,6 +3141,7 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
     assert [
         type(definition.nodes[node_id].node).__name__ for node_id in definition.nodes
     ] == [
+        "PPIFlowModelValidationNode",
         "PPIFlowDesignNode",
         "LigandMPNNNode",
         "FlowPackerNode",
@@ -3181,7 +3189,8 @@ def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
         == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
     )
     assert definition.dependencies["stage2-partial-ppiflow"] == {
-        "stage2-fixed-positions"
+        "ppiflow-model-validation",
+        "stage2-fixed-positions",
     }
     assert (
         definition.nodes["stage1-ligandmpnn"].aggregation_policy

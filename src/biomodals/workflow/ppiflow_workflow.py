@@ -110,6 +110,9 @@ from biomodals.workflow.core.execution import app_scientific_version
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
+from biomodals.workflow.ppiflow.model_validation import (
+    validate_ppiflow_model as _validate_ppiflow_model,
+)
 
 PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
     "outputs/*.pdb",
@@ -169,6 +172,13 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
 app = include_dependency_apps(app, CONF.depends_on_apps)
+validate_ppiflow_model = app.function(
+    image=runtime_image,
+    cpu=1.0,
+    memory=1024,
+    timeout=CONF.timeout,
+    volumes=ppiflow_app.CONF.mounts(model_volume=True),
+)(_validate_ppiflow_model)
 PPI_FLOW_OUTPUT_VOLUME = ppiflow_app.CONF.output_volume
 PPI_FLOW_OUTPUT_VOLUME_NAME = ppiflow_app.CONF.output_volume_name
 PPI_FLOW_OUTPUT_MOUNTPOINT = ppiflow_app.CONF.output_volume_mountpoint
@@ -2329,6 +2339,29 @@ class _ConfiguredAppStepNode(AppBackedNode):
         return artifacts
 
 
+@dataclass(frozen=True)
+class PPIFlowModelValidationNode(RemoteWorkflowNode):
+    """Validate the selected mutable checkpoint before GPU admission."""
+
+    model_name: str
+    expected_sha256: str
+
+    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+        """Prepare one CPU checkpoint hash for this Execution Run."""
+        del context
+        return RemoteNodeCall(
+            function_name="validate_ppiflow_model",
+            uses_gpu=False,
+            kwargs={
+                "model_path": str(
+                    Path(ppiflow_app.CONF.model_volume_mountpoint) / self.model_name
+                ),
+                "expected_sha256": self.expected_sha256,
+            },
+            runtime_image_key="ppiflow-model-validation",
+        )
+
+
 @dataclass
 class PPIFlowDesignNode(_ConfiguredAppStepNode):
     """Initial PPIFlow design step with candidate-manifest publication."""
@@ -4246,6 +4279,12 @@ def build_ppiflow_workflow(
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
     if max_gpu_containers == 0 and _ppiflow_requires_gpu(task_doc, stage):
         raise ValueError("PPIFlow GPU Nodes require max_gpu_containers >= 1")
+    model_versions = _ppiflow_model_scientific_versions(
+        enabled=enabled,
+        gentype=gentype,
+        stage=stage,
+        steps=steps_doc,
+    )
     workflow = Workflow(
         "ppiflow-v2",
         scientific_versions={
@@ -4257,17 +4296,21 @@ def build_ppiflow_workflow(
             "flowpacker": app_scientific_version(flowpacker_app.CONF),
             "ligandmpnn": app_scientific_version(ligandmpnn_app.CONF),
             "ppiflow": app_scientific_version(ppiflow_app.CONF),
-            **_ppiflow_model_scientific_versions(
-                enabled=enabled,
-                gentype=gentype,
-                stage=stage,
-                steps=steps_doc,
-            ),
+            **model_versions,
             "rosetta": app_scientific_version(rosetta_app.CONF),
         },
     )
     report_table_inputs: dict[str, Any] = {}
     report_partial_sources: list[Any] = []
+    model_validation = None
+    if model_versions:
+        version_key, expected_sha256 = next(iter(model_versions.items()))
+        model_name = version_key.removeprefix("ppiflow.model.")
+        model_validation = workflow.add_node(
+            PPIFlowModelValidationNode(model_name, expected_sha256),
+            id="ppiflow-model-validation",
+            reuse_predecessor_publication=False,
+        )
 
     stage1_tail = None
     stage1_allows_partial = False
@@ -4279,6 +4322,7 @@ def build_ppiflow_workflow(
             gentype=gentype,
             report_table_inputs=report_table_inputs,
             report_partial_sources=report_partial_sources,
+            model_validation=model_validation,
         )
 
     if stage in {None, 2}:
@@ -4297,6 +4341,7 @@ def build_ppiflow_workflow(
             upstream_allows_partial=stage1_allows_partial,
             report_table_inputs=report_table_inputs,
             report_partial_sources=report_partial_sources,
+            model_validation=model_validation,
         )
 
     return workflow
@@ -4318,7 +4363,7 @@ def _ppiflow_model_scientific_versions(
         return {}
     try:
         expected_model = f"{gentype}.ckpt"
-        model_file_id = ppiflow_app.PPI_FLOW_MODEL_FILE_IDS[expected_model]
+        model_sha256 = ppiflow_app.PPI_FLOW_MODEL_SHA256[expected_model]
     except KeyError as error:
         raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}") from error
     for step_name, partial in active_steps:
@@ -4334,7 +4379,7 @@ def _ppiflow_model_scientific_versions(
                 f"PPIFlow gentype {gentype!r} disagrees with enabled step "
                 f"{step_name!r} model {selected_model!r}"
             )
-    return {f"ppiflow.model.{expected_model}": model_file_id}
+    return {f"ppiflow.model.{expected_model}": model_sha256}
 
 
 def _ppiflow_step_model_weights_name(
@@ -4392,6 +4437,7 @@ def _add_stage1_nodes(
     gentype: str,
     report_table_inputs: dict[str, Any],
     report_partial_sources: list[Any],
+    model_validation: Any,
 ):
     tail = None
     partial_tail = None
@@ -4405,6 +4451,7 @@ def _add_stage1_nodes(
                 scientific_config,
             ),
             id="stage1-ppiflow-design",
+            depends_on=([model_validation] if model_validation is not None else None),
         )
 
     mpnn_step = None
@@ -4555,6 +4602,7 @@ def _add_stage2_nodes(
     upstream_allows_partial: bool,
     report_table_inputs: dict[str, Any],
     report_partial_sources: list[Any],
+    model_validation: Any,
 ) -> None:
     tail = upstream
     partial_tail = upstream if upstream_allows_partial else None
@@ -4594,6 +4642,7 @@ def _add_stage2_nodes(
             inputs=_structure_inputs(tail),
             aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
             accept_partial_from=_partial_sources(partial_tail),
+            depends_on=([model_validation] if model_validation is not None else None),
         )
         partial_tail = tail
 
@@ -5390,6 +5439,7 @@ def submit_ppiflow_workflow(
     }
     if not use_deployed_coordinator:
         orchestrator_kwargs["development_function_handles"] = {
+            "validate_ppiflow_model": validate_ppiflow_model,
             "run_ppiflow_design_stage": run_ppiflow_design_stage,
             "run_ppiflow_partial_candidate": run_ppiflow_partial_candidate,
             "run_ppiflow_ligandmpnn_candidate": run_ppiflow_ligandmpnn_candidate,

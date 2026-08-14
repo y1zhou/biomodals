@@ -584,8 +584,9 @@ class ExecutionCoordinator:
                     "Predecessor Deployment Identity does not match Execution Run"
                 )
             plan = _decode_plan(store.read_workflow_plan())
+            definition = plan.workflow.validate()
             persisted_plan = execution_plan(
-                plan.workflow.validate(),
+                definition,
                 workload_run_key=plan.workload_run_key,
             )
             if persisted_plan != predecessor.plan:
@@ -595,6 +596,8 @@ class ExecutionCoordinator:
             node_publications = []
             task_publications = []
             for node in store.execution.list_nodes(predecessor_execution_run_id):
+                if not definition.nodes[node.node_key].reuse_predecessor_publication:
+                    continue
                 if node.status == NodeStatus.SUCCEEDED:
                     result = store.artifacts.load_node_result(node.node_key)
                     if result is not None:

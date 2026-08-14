@@ -573,6 +573,11 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     )
     workflow = Workflow("demo")
     workflow.add_node(TextNode("complete"), id="write")
+    workflow.add_node(
+        TextNode("refresh"),
+        id="refresh",
+        reuse_predecessor_publication=False,
+    )
     _run_root(
         raw_cls,
         predecessor_coordinator,
@@ -611,18 +616,22 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
     successor = store.execution.get_run(SUCCESSOR_ID)
     node = store.execution.get_node(SUCCESSOR_ID, "write")
+    refreshed = store.execution.get_node(SUCCESSOR_ID, "refresh")
     publication = store.artifacts.load_node_output_artifacts("write")
+    refreshed_publication = store.artifacts.load_node_output_artifacts("refresh")
     assert successor.predecessor_execution_run_id == RUN_ID
     assert successor.deployment == SUCCESSOR_DEPLOYMENT
     assert successor.status == RunStatus.SUCCEEDED
     assert node.status == NodeStatus.SUCCEEDED
     assert node.result_provenance == ResultProvenance.CACHE
+    assert refreshed.status == NodeStatus.SUCCEEDED
     assert str(RUN_ID) in publication[0].storage.path
+    assert str(SUCCESSOR_ID) in refreshed_publication[0].storage.path
     assert (
         store.connection.execute(
             "SELECT COUNT(*) FROM workflow_node_results"
         ).fetchone()[0]
-        == 1
+        == 2
     )
     store.close()
 

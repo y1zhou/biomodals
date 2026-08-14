@@ -283,6 +283,12 @@ PPI_FLOW_MODEL_FILE_IDS = {
     "monomer.ckpt": "1Oo9nbSH3MwT8KIriij5clmnTFrhDJEn5",
     "nanobody.ckpt": "1aEwzmdlSN9tiIOl5TgM_muHjfFPLue8a",
 }
+PPI_FLOW_MODEL_SHA256 = {
+    "antibody.ckpt": "ff31eabd6c8215bcb35dff9345e47f46598df541c6d1398e0e03d297de3b8390",
+    "binder.ckpt": "20f686225a19e1964b72a684d23f3bbcb3187171251571c578a0e1015f3489dc",
+    "monomer.ckpt": "05d0284ca4d19af2aed603d88e79e21bce3f49d430100432bd2274d35083f784",
+    "nanobody.ckpt": "5a7cc669bab6482b1951a36a719ea5683c2ae4e736958532b4a14caa97c2f4a6",
+}
 
 
 @app.function(

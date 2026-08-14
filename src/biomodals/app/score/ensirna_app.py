@@ -1233,6 +1233,7 @@ runtime_image = (
     .uv_pip_install(*APP_INFO.pip_packages)
     .uv_pip_install(*APP_INFO.torch_packages, index_url=APP_INFO.torch_index_url)
     .uv_pip_install(*APP_INFO.extra_pip_packages)
+    # ENsiRNA requires Python 3.10; install only the shared modules it imports.
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
     .add_local_python_source("biomodals.app.score.ensirna_execution")
 )

@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import os
-import shlex
-import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from tempfile import TemporaryDirectory
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -20,58 +16,29 @@ import modal
 import orjson
 import polars as pl
 import yaml
-from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 from biomodals.app.bioinfo import rosetta_app
 from biomodals.app.bioinfo.rosetta.execution_contracts import (
     RosettaTaskSpec,
-    execute_rosetta_task,
     validate_task_publication_from_volume,
 )
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
 from biomodals.app.fold import alphafold3_app, flowpacker_app
 from biomodals.app.fold.alphafold3.inference_inputs import (
     DECLARED_MODEL_IDENTITY,
-    prepare_inference_run,
-)
-from biomodals.app.fold.alphafold3.inference_pipeline import (
-    coordinate_seed_predictions,
-)
-from biomodals.app.fold.alphafold3.modal_adapters import (
-    InProcessInferenceExecutor,
-    stage_inference_run,
-)
-from biomodals.app.fold.alphafold3.request_results import (
-    RequestPublication,
-    create_request_archive,
-    load_request_manifest,
-    request_archive_member_for_role,
-    request_manifest_from_result,
-)
-from biomodals.app.fold.alphafold3.search_pipeline import (
-    resolve_msa_and_templates,
 )
 from biomodals.app.score import af3score_app, dockq_app
-from biomodals.app.score.af3score_execution import (
-    af3score_staged_input_key,
-    materialize_af3score_staged_inputs,
-)
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     NodeAggregationPolicy,
-    PullTaskClaim,
-    WorkerAssignmentRecord,
 )
-from biomodals.execution.pull_worker import drive_pull_worker, size_pull_worker_pool
+from biomodals.execution.pull_worker import size_pull_worker_pool
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_execution import resolve_provider_call_limits
 from biomodals.helper.app_run import (
-    AppRunLayout,
-    volume_app_output,
     volume_path_from_mount_path,
 )
-from biomodals.helper.artifacts import publish_content_addressed_file
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
@@ -80,13 +47,11 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
-    ArtifactFile,
     ArtifactKind,
     InlineBytes,
     VolumePath,
     WorkflowArtifact,
 )
-from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.core import (
     AppBackedNode,
     NodeRunContext,
@@ -102,16 +67,81 @@ from biomodals.workflow.core import (
     print_workflow_dag,
     republish_workflow_artifact,
 )
-from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailability,
-    check_external_artifact_status,
-)
 from biomodals.workflow.core.execution import app_scientific_version
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
 from biomodals.workflow.ppiflow import tables as ppiflow_tables
+from biomodals.workflow.ppiflow.af3score_runtime import (
+    postprocess_ppiflow_af3score_stage as _postprocess_ppiflow_af3score_stage,
+)
+from biomodals.workflow.ppiflow.af3score_runtime import (
+    prepare_ppiflow_af3score_stage as _prepare_ppiflow_af3score_stage,
+)
+from biomodals.workflow.ppiflow.af3score_runtime import (
+    run_ppiflow_af3score_batch as _run_ppiflow_af3score_batch,
+)
+from biomodals.workflow.ppiflow.analysis_runtime import (
+    check_ppiflow_external_artifact as _check_ppiflow_external_artifact,
+)
+from biomodals.workflow.ppiflow.analysis_runtime import (
+    derive_ppiflow_fixed_positions as _derive_ppiflow_fixed_positions,
+)
+from biomodals.workflow.ppiflow.analysis_runtime import (
+    filter_ppiflow_artifacts as _filter_ppiflow_artifacts,
+)
+from biomodals.workflow.ppiflow.analysis_runtime import (
+    normalize_ppiflow_stage2_input as _normalize_ppiflow_stage2_input,
+)
+from biomodals.workflow.ppiflow.analysis_runtime import (
+    rank_ppiflow_artifacts as _rank_ppiflow_artifacts,
+)
+from biomodals.workflow.ppiflow.dockq_runtime import (
+    run_ppiflow_dockq_stage as _run_ppiflow_dockq_stage,
+)
+from biomodals.workflow.ppiflow.flowpacker_runtime import (
+    run_ppiflow_flowpacker_stage as _run_ppiflow_flowpacker_stage,
+)
+from biomodals.workflow.ppiflow.ligandmpnn_runtime import (
+    run_ppiflow_ligandmpnn_candidate as _run_ppiflow_ligandmpnn_candidate,
+)
 from biomodals.workflow.ppiflow.model_validation import (
     validate_ppiflow_model as _validate_ppiflow_model,
+)
+from biomodals.workflow.ppiflow.ppiflow_runtime import (
+    run_ppiflow_design_stage as _run_ppiflow_design_stage,
+)
+from biomodals.workflow.ppiflow.ppiflow_runtime import (
+    run_ppiflow_partial_candidate as _run_ppiflow_partial_candidate,
+)
+from biomodals.workflow.ppiflow.ppiflow_runtime import (
+    validated_partial_args as _validated_ppiflow_partial_args,
+)
+from biomodals.workflow.ppiflow.refold_runtime import (
+    run_ppiflow_refold_candidate as _run_ppiflow_refold_candidate,
+)
+from biomodals.workflow.ppiflow.rosetta_runtime import (
+    finalize_ppiflow_rosetta_stage as _finalize_ppiflow_rosetta_stage,
+)
+from biomodals.workflow.ppiflow.rosetta_runtime import (
+    prepare_ppiflow_rosetta_stage as _prepare_ppiflow_rosetta_stage,
+)
+from biomodals.workflow.ppiflow.rosetta_runtime import (
+    run_ppiflow_rosetta_worker as _run_ppiflow_rosetta_worker,
+)
+from biomodals.workflow.ppiflow.runtime_support import (
+    config_int as _config_int,
+)
+from biomodals.workflow.ppiflow.runtime_support import (
+    file_sha256 as _file_sha256,
+)
+from biomodals.workflow.ppiflow.runtime_support import (
+    optional_config_int as _optional_config_int,
+)
+from biomodals.workflow.ppiflow.runtime_support import (
+    patterns_from_config as _patterns_from_config,
+)
+from biomodals.workflow.ppiflow.runtime_support import (
+    result_with_output_kind as _result_with_output_kind,
 )
 
 PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS = (
@@ -148,25 +178,42 @@ runtime_image = (
     .debian_slim(python_version=CONF.python_version)
     .env(CONF.default_env)
     .pipe(patch_image_for_helper, include_workflow_modules=True)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.rosetta",
+        "biomodals.workflow.ppiflow",
+    )
 )
 ppiflow_task_image = ppiflow_app.runtime_image.add_local_python_source(
-    "biomodals.workflow"
+    "biomodals.app.design.ppiflow_app",
+    "biomodals.workflow.ppiflow",
 )
 ligandmpnn_task_image = ligandmpnn_app.runtime_image.add_local_python_source(
-    "biomodals.workflow"
+    "biomodals.app.design.ligandmpnn_app",
+    "biomodals.workflow.ppiflow",
 )
 flowpacker_task_image = flowpacker_app.runtime_image.add_local_python_source(
-    "biomodals.workflow"
+    "biomodals.app.fold.flowpacker_app",
+    "biomodals.workflow.ppiflow",
 )
 rosetta_task_image = rosetta_app.runtime_image.add_local_python_source(
-    "biomodals.workflow"
+    "biomodals.workflow.ppiflow"
 )
-dockq_task_image = dockq_app.runtime_image.add_local_python_source("biomodals.workflow")
+dockq_task_image = dockq_app.runtime_image.add_local_python_source(
+    "biomodals.app.score.dockq_app",
+    "biomodals.workflow.ppiflow",
+)
 af3score_task_image = af3score_app.runtime_image.add_local_python_source(
-    "biomodals.workflow"
+    "biomodals.app.fold.alphafold3.inference_inputs",
+    "biomodals.app.fold.alphafold3.profiles",
+    "biomodals.app.score.af3score_app",
+    "biomodals.app.score.af3score_execution",
+    "biomodals.app.score.af3score_publications",
+    "biomodals.workflow.ppiflow",
 )
 alphafold3_task_image = alphafold3_app.runtime_image.add_local_python_source(
-    "biomodals.workflow"
+    "biomodals.app.fold.alphafold3",
+    "biomodals.app.fold.alphafold3_app",
+    "biomodals.workflow.ppiflow",
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
@@ -259,909 +306,78 @@ ALPHAFOLD3_TASK_VOLUME_MOUNTS = {
 ROSETTA_TASK_VOLUME_MOUNTS = rosetta_app.CONF.mounts(output_volume=True)
 
 
-def _reload_ppiflow_source_volumes() -> None:
-    PPI_FLOW_OUTPUT_VOLUME.reload()
-    FLOWPACKER_OUTPUT_VOLUME.reload()
-    AF3SCORE_OUTPUT_VOLUME.reload()
-    ALPHAFOLD3_OUTPUT_VOLUME.reload()
-    ROSETTA_OUTPUT_VOLUME.reload()
-    WORKFLOW_OUTPUT_VOLUME.reload()
-
-
-@app.function(
+run_ppiflow_design_stage = app.function(
     image=ppiflow_task_image,
     gpu=ppiflow_app.CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_design_stage(
-    *,
-    args: ppiflow_app.PPIFlowArgs,
-    run_name: str,
-    run_id: str,
-    node_id: str,
-    step_name: str,
-) -> AppRunResult:
-    """Run initial PPIFlow design and publish candidate identities."""
-    _reload_ppiflow_source_volumes()
-    result = AppRunResult.model_validate(
-        ppiflow_app.ppiflow_run_workflow.get_raw_f()(
-            args=args,
-            run_name=run_name,
-        )
-    )
-    adapted = _result_with_output_kind(
-        result,
-        ArtifactKind.STRUCTURES,
-        {
-            "step_name": step_name,
-            "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
-        },
-    )
-    rows = _initial_ppiflow_candidate_rows(adapted, step_name=step_name)
-    return adapted.model_copy(
-        update={
-            "outputs": [
-                *adapted.outputs,
-                _write_candidate_manifest_output(
-                    run_id=run_id,
-                    node_id=node_id,
-                    step_name=step_name,
-                    rows=rows,
-                ),
-            ]
-        }
-    )
+)(_run_ppiflow_design_stage)
 
 
-@app.function(
+run_ppiflow_flowpacker_stage = app.function(
     image=flowpacker_task_image,
     gpu=flowpacker_app.CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
     volumes=FLOWPACKER_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_flowpacker_stage(
-    *,
-    artifacts: list[WorkflowArtifact],
-    config: dict[str, object],
-    run_name: str,
-) -> AppRunResult:
-    """Select PPIFlow structures and invoke the FlowPacker app."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=_patterns_from_config(config),
-        max_files=_optional_config_int(config, "max_structures"),
-    )
-    kwargs = {
-        key: config[key]
-        for key in (
-            "model_name",
-            "use_confidence",
-            "n_samples",
-            "num_steps",
-            "sample_coeff",
-            "use_gt_masks",
-            "inpaint",
-            "save_traj",
-            "seed",
-        )
-        if key in config
-    }
-    return AppRunResult.model_validate(
-        flowpacker_app.run_flowpacker_workflow.get_raw_f()(
-            input_files=selected,
-            run_name=run_name,
-            **kwargs,
-        )
-    )
+)(_run_ppiflow_flowpacker_stage)
 
 
-@app.function(
+run_ppiflow_dockq_stage = app.function(
     image=dockq_task_image,
     cpu=(0.125, 16.125),
     memory=(512, 16384),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def run_ppiflow_dockq_stage(
-    *,
-    reference_artifacts: list[WorkflowArtifact],
-    model_artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
-    config: dict[str, object],
-    run_name: str,
-) -> AppRunResult:
-    """Select and pair candidate structures before invoking DockQ."""
-    _reload_ppiflow_source_volumes()
-    references_selected = ppiflow_staging.select_structure_files_from_artifacts(
-        reference_artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=_patterns_from_config(config),
-        max_files=_optional_config_int(config, "max_structures"),
-    )
-    manifest = _candidate_manifest_frame_from_inputs(
-        candidate_manifests or [],
-        references_selected,
-        step_name="DockQInput",
-    )
-    references = ppiflow_staging.candidate_structure_files_from_selected(
-        references_selected,
-        manifest_frame=manifest,
-    )
-    models = []
-    for artifact in model_artifacts:
-        candidate_id = artifact.metadata.get("candidate_id")
-        if not isinstance(candidate_id, str) or not candidate_id:
-            raise ValueError(
-                f"DockQ model artifact {artifact.artifact_id!r} has no "
-                "canonical candidate_id"
-            )
-        best_model_member = artifact.metadata.get("request_best_model_archive_member")
-        if best_model_member is not None and (
-            not isinstance(best_model_member, str) or not best_model_member
-        ):
-            raise ValueError(
-                f"DockQ model artifact {artifact.artifact_id!r} has an invalid "
-                "request-ranked AlphaFold3 model member"
-            )
-        model_patterns = (
-            (best_model_member,)
-            if isinstance(best_model_member, str) and best_model_member
-            else _patterns_from_config(config)
-        )
-        selected = ppiflow_staging.select_structure_files_from_artifacts(
-            [artifact],
-            PPI_FLOW_SOURCE_VOLUME_ROOTS,
-            patterns=model_patterns,
-        )
-        if best_model_member is not None and len(selected) != 1:
-            raise ValueError(
-                f"DockQ model artifact {artifact.artifact_id!r} did not contain "
-                "exactly one request-ranked AlphaFold3 model"
-            )
-        models.extend(
-            ppiflow_staging.CandidateStructureFile(
-                candidate_id=candidate_id,
-                file_name=file_name,
-                data=data,
-                source_path=file_name,
-            )
-            for file_name, data in selected
-        )
-    models.sort(key=lambda item: item.file_name)
-    if (max_models := _optional_config_int(config, "max_models")) is not None:
-        models = models[:max_models]
-    pairs = ppiflow_staging.prepare_dockq_pairs_by_candidate(
-        references=references,
-        models=models,
-        mapping=config.get("mapping"),
-    )
-    if not pairs:
-        raise ValueError("DockQ did not find any candidate pairs")
-    dockq_args = config.get("dockq_args", "--short")
-    if isinstance(dockq_args, str):
-        dockq_args = shlex.split(dockq_args)
-    return AppRunResult.model_validate(
-        dockq_app.run_dockq_workflow.get_raw_f()(
-            pairs=pairs,
-            run_name=run_name,
-            dockq_args=dockq_args,
-        )
-    )
+)(_run_ppiflow_dockq_stage)
 
 
-@app.function(
+check_ppiflow_external_artifact = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 4096),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def check_ppiflow_external_artifact(
-    artifact: WorkflowArtifact,
-) -> ArtifactAvailability:
-    """Validate app-owned artifacts referenced by the PPIFlow workflow."""
-    _reload_ppiflow_source_volumes()
-    return check_external_artifact_status(
-        artifact,
-        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
-        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-    )
+)(_check_ppiflow_external_artifact)
 
 
-@app.function(
+normalize_ppiflow_stage2_input = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 4096),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def normalize_ppiflow_stage2_input(
-    *,
-    storage: VolumePath,
-    config: dict[str, object],
-    run_id: str,
-    node_id: str,
-    step_name: str,
-) -> AppRunResult:
-    """Normalize Stage2Input structures into a workflow-owned manifest."""
-    _reload_ppiflow_source_volumes()
-    _validate_stage2_input_snapshot(storage=storage, config=config)
-    structure_artifact = WorkflowArtifact(
-        artifact_id=f"{sanitize_filename(node_id)}-stage2-input-structures",
-        producing_node_id=node_id,
-        kind=ArtifactKind.STRUCTURES,
-        storage=storage,
-        metadata={
-            "step_name": step_name,
-            "run_name": config.get("run_name", run_id),
-        },
-    )
-    output_dir = (
-        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
-        / "ppiflow"
-        / sanitize_filename(run_id)
-        / sanitize_filename(node_id)
-        / "stage2_input"
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
-
-    manifest_storage = _stage2_manifest_storage_from_config(
-        config,
-        default_volume_name=storage.volume_name,
-    )
-    if manifest_storage is not None:
-        frame = ppiflow_manifests.read_manifest_volume_path(
-            storage=manifest_storage,
-            volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        )
-        ppiflow_manifests.write_manifest(frame.to_dicts(), manifest_path)
-        row_count = frame.height
-    else:
-        rows = ppiflow_staging.stage2_input_manifest_rows(
-            structure_artifact,
-            PPI_FLOW_SOURCE_VOLUME_ROOTS,
-            patterns=_patterns_from_config(config),
-            stage_name=step_name,
-        )
-        ppiflow_manifests.write_manifest(rows, manifest_path)
-        row_count = len(rows)
-
-    structure_path = storage.at_mountpoint(
-        PPI_FLOW_SOURCE_VOLUME_ROOTS[storage.volume_name]
-    )
-    if structure_path.is_file():
-        structure_files = [structure_path.name]
-    else:
-        manifest_frame = ppiflow_manifests.read_manifest(manifest_path)
-        structure_files = sorted({
-            str(file_record["path"])
-            for row in manifest_frame.iter_rows(named=True)
-            for file_record in row["files"]
-            if file_record.get("path")
-        })
-
-    WORKFLOW_OUTPUT_VOLUME.commit()
-    structure_metadata = {
-        "step_name": step_name,
-        "run_name": config.get("run_name", run_id),
-        "structure_count": row_count,
-        "files": structure_files,
-    }
-    patterns = _patterns_from_config(config)
-    if patterns is not None:
-        structure_metadata["structure_patterns"] = patterns
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            AppOutput(
-                name="stage2_input_structures",
-                kind=ArtifactKind.STRUCTURES,
-                storage=storage,
-                metadata=structure_metadata,
-            ),
-            ppiflow_manifests.manifest_artifact_output(
-                manifest_path=manifest_path,
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                stage_name=step_name,
-                row_count=row_count,
-            ),
-        ],
-    )
+)(_normalize_ppiflow_stage2_input)
 
 
-@app.function(
+filter_ppiflow_artifacts = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def filter_ppiflow_artifacts(
-    *,
-    structures: list[WorkflowArtifact],
-    scores: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
-    config: dict[str, object],
-    run_id: str,
-    node_id: str,
-    step_name: str,
-) -> AppRunResult:
-    """Filter structure artifacts using an AF3Score-compatible CSV."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        structures,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-    )
-    score_files = [
-        score_file
-        for artifact in scores
-        for score_file in ppiflow_staging.csv_files_from_artifact(
-            artifact,
-            PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        )
-    ]
-    if not score_files:
-        raise FileNotFoundError(f"{step_name} did not find a score CSV")
-    preferred_name = str(config.get("score_csv") or "af3score_metrics.csv")
-    _, score_bytes = next(
-        (
-            score_file
-            for score_file in score_files
-            if Path(score_file[0]).name == preferred_name
-        ),
-        score_files[0],
-    )
-    score_frame = pl.read_csv(BytesIO(score_bytes), infer_schema_length=0)
-    filename_col = str(config.get("filename_col") or "description")
-    if filename_col not in score_frame.columns:
-        for fallback in ("filename", "pdb", "name"):
-            if fallback in score_frame.columns:
-                filename_col = fallback
-                break
-        else:
-            raise ValueError(
-                f"{step_name} score CSV is missing candidate column {filename_col!r}"
-            )
-
-    raw_filters = config.get("filters")
-    if raw_filters is None and config.get("score_column") is not None:
-        raw_filters = {
-            str(config["score_column"]): (
-                f"{config.get('operator', '>=')} {config.get('threshold', 0)}"
-            )
-        }
-    if raw_filters is None:
-        raw_filters = {"iptm": "> 0.7" if "stage1" in step_name.lower() else "> 0.8"}
-    if not isinstance(raw_filters, Mapping) or not raw_filters:
-        raise ValueError(f"{step_name} filters must be a non-empty mapping")
-
-    manifest_frame = _candidate_manifest_frame_from_inputs(
-        candidate_manifests or [],
-        selected,
-        step_name=step_name,
-    )
-    retained_manifest, retained_scores, audit_frame = ppiflow_tables.filter_candidates(
-        manifest_frame=manifest_frame,
-        score_frame=score_frame,
-        filters=raw_filters,
-        filename_col=filename_col,
-        stage_name=step_name,
-    )
-    structures_by_key = {}
-    for name, data in selected:
-        key = ppiflow_tables.candidate_key(name)
-        if key in structures_by_key:
-            raise ValueError(f"Duplicate PPIFlow candidate identity: {key!r}")
-        structures_by_key[key] = (name, data)
-    retained = []
-    for row in retained_scores.iter_rows(named=True):
-        key = ppiflow_tables.candidate_key(str(row.get(filename_col) or ""))
-        structure = structures_by_key.get(key)
-        if structure is not None:
-            retained.append(structure)
-    if not retained:
-        raise ValueError(f"{step_name} filters rejected every available structure")
-
-    output_dir = (
-        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
-        / "ppiflow"
-        / sanitize_filename(run_id)
-        / sanitize_filename(node_id)
-        / "filtered"
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    structures_dir = output_dir / "structures"
-    structures_dir.mkdir(parents=True)
-    for file_name, file_bytes in retained:
-        (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
-    filtered_csv = output_dir / "filtered_scores.csv"
-    retained_scores.write_csv(filtered_csv)
-    audit_csv = output_dir / "filter_audit.csv"
-    audit_frame.write_csv(audit_csv)
-    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
-    ppiflow_manifests.write_manifest(retained_manifest.to_dicts(), manifest_path)
-    WORKFLOW_OUTPUT_VOLUME.commit()
-    metadata = {
-        "step_name": step_name,
-        "input_count": len(selected),
-        "retained_count": len(retained),
-        "files": [name for name, _ in retained],
-        "structure_patterns": ("*.pdb", "*.cif"),
-    }
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            volume_app_output(
-                name="filtered_structures",
-                kind=ArtifactKind.STRUCTURES,
-                remote_path=str(structures_dir),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                metadata=metadata,
-            ),
-            volume_app_output(
-                name="filtered_scores",
-                kind=ArtifactKind.TABLE,
-                remote_path=str(filtered_csv),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                media_type="text/csv",
-                metadata={"step_name": step_name, "rows": retained_scores.height},
-            ),
-            ppiflow_manifests.manifest_artifact_output(
-                manifest_path=manifest_path,
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                stage_name=step_name,
-                row_count=retained_manifest.height,
-                name="retained_candidate_manifest",
-            ),
-            volume_app_output(
-                name="filter_audit",
-                kind=ArtifactKind.TABLE,
-                remote_path=str(audit_csv),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                media_type="text/csv",
-                metadata={"step_name": step_name, "rows": audit_frame.height},
-            ),
-        ],
-    )
+)(_filter_ppiflow_artifacts)
 
 
-@app.function(
+derive_ppiflow_fixed_positions = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def derive_ppiflow_fixed_positions(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
-    config: dict[str, object],
-    run_id: str,
-    node_id: str,
-    step_name: str,
-) -> AppRunResult:
-    """Derive per-structure fixed positions from Rosetta residue energies."""
-    _reload_ppiflow_source_volumes()
-    structures = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-    )
-    explicit = str(config.get("fixed_positions") or "").strip()
-    fixed_by_structure: dict[str, str] = {}
-    if explicit:
-        fixed_by_structure = {
-            ppiflow_tables.candidate_key(name): explicit for name, _ in structures
-        }
-    else:
-        energy_threshold = float(config.get("energy_threshold", -5))
-        gentype = str(config.get("gentype") or "binder")
-        expected_chains = {
-            "binder": {"interface_energy_A_B": "A"},
-            "nanobody": {"interface_energy_A_C": "A"},
-            "antibody": {
-                "interface_energy_A_C": "A",
-                "interface_energy_B_C": "B",
-            },
-        }.get(gentype)
-        if expected_chains is None:
-            raise ValueError(f"Unsupported PPIFlow gentype: {gentype!r}")
-        energies: dict[str, dict[str, dict[int, float]]] = {}
-        energy_files = [
-            csv_file
-            for artifact in artifacts
-            for csv_file in ppiflow_staging.csv_files_from_artifact(
-                artifact,
-                PPI_FLOW_SOURCE_VOLUME_ROOTS,
-            )
-            if Path(csv_file[0]).name == "residue_energy.csv"
-        ]
-        if not energy_files:
-            raise FileNotFoundError(
-                f"{step_name} did not find Rosetta residue_energy.csv outputs"
-            )
-        for csv_name, csv_bytes in energy_files:
-            chain = next(
-                (
-                    chain
-                    for directory, chain in expected_chains.items()
-                    if directory in Path(csv_name).parts
-                ),
-                None,
-            )
-            if chain is None:
-                continue
-            frame = pl.read_csv(BytesIO(csv_bytes), infer_schema_length=0)
-            if "binder_energy" not in frame.columns:
-                raise ValueError(f"{csv_name} is missing binder_energy")
-            for row in frame.iter_rows(named=True):
-                pdb_name = str(row.get("pdbname") or row.get("pdbpath") or "")
-                structure_name = Path(pdb_name).stem
-                parts = structure_name.rsplit("_", 1)
-                if len(parts) == 2 and parts[1].isdigit():
-                    structure_name = parts[0]
-                try:
-                    binder_energy = ast.literal_eval(str(row["binder_energy"]))
-                except (SyntaxError, ValueError) as exc:
-                    raise ValueError(
-                        f"Could not parse binder_energy for {pdb_name!r}"
-                    ) from exc
-                if not isinstance(binder_energy, Mapping):
-                    raise ValueError(f"binder_energy for {pdb_name!r} is not a mapping")
-                chain_energies = energies.setdefault(
-                    structure_name.lower(), {}
-                ).setdefault(chain, {})
-                for residue, energy in binder_energy.items():
-                    residue_id = int(residue)
-                    energy_value = float(energy)
-                    chain_energies[residue_id] = min(
-                        chain_energies.get(residue_id, energy_value), energy_value
-                    )
-        for structure_name, chain_energies in energies.items():
-            positions = [
-                f"{chain}{residue}"
-                for chain in sorted(chain_energies)
-                for residue, energy in sorted(chain_energies[chain].items())
-                if energy < energy_threshold
-            ]
-            fixed_by_structure[structure_name] = ",".join(positions) or "NONE"
-
-    rows = [
-        {
-            "filename": name,
-            "fixed_positions": fixed_by_structure.get(
-                ppiflow_tables.candidate_key(name), "NONE"
-            ),
-        }
-        for name, _ in structures
-    ]
-    output_dir = (
-        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
-        / "ppiflow"
-        / sanitize_filename(run_id)
-        / sanitize_filename(node_id)
-        / "fixed_positions"
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    structures_dir = output_dir / "structures"
-    structures_dir.mkdir(parents=True)
-    for file_name, file_bytes in structures:
-        (structures_dir / sanitize_filename(file_name)).write_bytes(file_bytes)
-    positions_csv = output_dir / "fixed_positions.csv"
-    pl.DataFrame(rows).write_csv(positions_csv)
-    manifest_frame = _candidate_manifest_frame_from_inputs(
-        candidate_manifests or [],
-        structures,
-        step_name=step_name,
-    )
-    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
-    ppiflow_manifests.write_manifest(manifest_frame.to_dicts(), manifest_path)
-    WORKFLOW_OUTPUT_VOLUME.commit()
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            volume_app_output(
-                name="fixed_position_structures",
-                kind=ArtifactKind.STRUCTURES,
-                remote_path=str(structures_dir),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                metadata={
-                    "step_name": step_name,
-                    "fixed_positions": rows[0]["fixed_positions"] if rows else "NONE",
-                    "fixed_positions_by_structure": fixed_by_structure,
-                    "structure_patterns": ("*.pdb", "*.cif"),
-                },
-            ),
-            volume_app_output(
-                name="fixed_positions",
-                kind=ArtifactKind.TABLE,
-                remote_path=str(positions_csv),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                media_type="text/csv",
-                metadata={"step_name": step_name, "rows": len(rows)},
-            ),
-            ppiflow_manifests.manifest_artifact_output(
-                manifest_path=manifest_path,
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                stage_name=step_name,
-                row_count=manifest_frame.height,
-            ),
-        ],
-    )
+)(_derive_ppiflow_fixed_positions)
 
 
-@app.function(
+rank_ppiflow_artifacts = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def rank_ppiflow_artifacts(
-    *,
-    structures: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact],
-    score_artifacts: list[WorkflowArtifact],
-    config: dict[str, object],
-    run_id: str,
-    node_id: str,
-    step_name: str,
-) -> AppRunResult:
-    """Merge available score tables and rank final PPIFlow structures."""
-    _reload_ppiflow_source_volumes()
-    selected_structures = ppiflow_staging.select_structure_files_from_artifacts(
-        structures,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-    )
-    csv_frames = [
-        (name, pl.read_csv(BytesIO(data), infer_schema_length=0))
-        for artifact in [*structures, *score_artifacts]
-        for name, data in ppiflow_staging.csv_files_from_artifact(
-            artifact,
-            PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        )
-    ]
-    score_frames = [frame for _, frame in csv_frames]
-    if not score_frames:
-        raise ValueError(f"{step_name} did not find any supported score tables")
-
-    manifest_frame = _candidate_manifest_frame_from_inputs(
-        candidate_manifests,
-        selected_structures,
-        step_name=step_name,
-    )
-    candidate_structures = ppiflow_staging.candidate_structure_files_from_selected(
-        selected_structures,
-        manifest_frame=manifest_frame,
-    )
-    structure_by_key = {}
-    candidate_ids_by_filename = {}
-    for structure in candidate_structures:
-        if structure.candidate_id in structure_by_key:
-            raise ValueError(
-                f"Duplicate PPIFlow candidate identity: {structure.candidate_id!r}"
-            )
-        structure_by_key[structure.candidate_id] = (
-            structure.file_name,
-            structure.data,
-        )
-        candidate_ids_by_filename[structure.file_name] = structure.candidate_id
-    raw_dockq_threshold = config.get("dockq_threshold", 0.49)
-    if not isinstance(raw_dockq_threshold, str | int | float):
-        raise TypeError("dockq_threshold must be a string or number")
-    ranked = ppiflow_tables.ranked_design_rows(
-        structures=selected_structures,
-        score_frames=score_frames,
-        gentype=str(config.get("gentype") or "binder"),
-        dockq_threshold=float(raw_dockq_threshold),
-        candidate_ids_by_filename=candidate_ids_by_filename,
-    )
-    output_dir = (
-        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
-        / "ppiflow"
-        / sanitize_filename(run_id)
-        / sanitize_filename(node_id)
-        / "ranked"
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    structures_dir = output_dir / "structures"
-    structures_dir.mkdir(parents=True)
-    ranked_structure_files = []
-    for row in ranked:
-        file_name, file_bytes = structure_by_key[str(row["design"])]
-        output_path = structures_dir / sanitize_filename(file_name)
-        output_path.write_bytes(file_bytes)
-        ranked_structure_files.append(
-            ArtifactFile(
-                path=output_path.name,
-                role="structure",
-                media_type=(
-                    "chemical/x-pdb"
-                    if output_path.suffix.lower() == ".pdb"
-                    else "chemical/x-mmcif"
-                ),
-                size_bytes=len(file_bytes),
-                content_sha256=hashlib.sha256(file_bytes).hexdigest(),
-            )
-        )
-    ranked_csv = output_dir / str(config.get("output_csv_name") or "ranked_designs.csv")
-    if ranked:
-        pl.DataFrame(ranked).write_csv(ranked_csv)
-        warnings = []
-    else:
-        pl.DataFrame(
-            schema={
-                "design": pl.String,
-                "filename": pl.String,
-                "rank_score": pl.Float64,
-                "dockq": pl.Float64,
-                "iptm": pl.Float64,
-                "interface_score": pl.Float64,
-            }
-        ).write_csv(ranked_csv)
-        warnings = [f"{step_name} found no structures with usable ranking metrics"]
-    WORKFLOW_OUTPUT_VOLUME.commit()
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            volume_app_output(
-                name="ranked_structures",
-                kind=ArtifactKind.STRUCTURES,
-                remote_path=str(structures_dir),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                metadata={
-                    "step_name": step_name,
-                    "structure_count": len(ranked),
-                    "structure_patterns": ("*.pdb", "*.cif"),
-                },
-                files=ranked_structure_files,
-            ),
-            volume_app_output(
-                name="ranked_designs",
-                kind=ArtifactKind.TABLE,
-                remote_path=str(ranked_csv),
-                mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-                volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-                media_type="text/csv",
-                metadata={"step_name": step_name, "rows": len(ranked)},
-                files=[
-                    ArtifactFile(
-                        path=ranked_csv.name,
-                        role="ranked_designs",
-                        media_type="text/csv",
-                        size_bytes=ranked_csv.stat().st_size,
-                        content_sha256=_file_sha256(ranked_csv),
-                    )
-                ],
-            ),
-        ],
-        warnings=warnings,
-    )
-
-
-def _stage_af3score_candidate_inputs(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
-    execution_run_name: str,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> tuple[list[dict[str, object]], str, str, str]:
-    """Stage candidate-keyed PDBs and retain their scientific identities."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts=artifacts,
-        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=patterns,
-        max_files=max_files,
-    )
-    candidates = ppiflow_staging.candidate_structure_files_from_selected(
-        selected,
-        manifest_frame=_candidate_manifest_frame_from_inputs(
-            candidate_manifests or [],
-            selected,
-            step_name="AF3ScoreInput",
-        ),
-    )
-    planned: list[tuple[ppiflow_staging.CandidateStructureFile, str, str]] = []
-    input_names: set[str] = set()
-    for candidate in candidates:
-        pdb_name = f"{sanitize_filename(candidate.candidate_id)}.pdb"
-        if pdb_name in input_names:
-            raise ValueError(f"Duplicate AF3Score staged input name: {pdb_name}")
-        input_names.add(pdb_name)
-        planned.append((
-            candidate,
-            pdb_name,
-            hashlib.sha256(candidate.data).hexdigest(),
-        ))
-    input_digests = {
-        Path(pdb_name).stem: digest for _candidate, pdb_name, digest in planned
-    }
-    publication_key = hashlib.sha256(
-        orjson.dumps(
-            {
-                "inputs": input_digests,
-                "af3score": (
-                    af3score_app.CONF.repo_commit_hash
-                    or af3score_app.CONF.version
-                    or "unknown"
-                ),
-                "model": DECLARED_MODEL_IDENTITY,
-            },
-            option=orjson.OPT_SORT_KEYS,
-        )
-    ).hexdigest()
-    physical_run_name = f"{sanitize_filename(execution_run_name)}-{publication_key}"
-    staged_input_key = af3score_staged_input_key(
-        tuple((pdb_name, digest) for _candidate, pdb_name, digest in planned)
-    )
-    materialize_af3score_staged_inputs(
-        AF3SCORE_OUTPUT_MOUNTPOINT,
-        staged_input_key,
-        tuple(
-            (pdb_name, candidate.data, digest)
-            for candidate, pdb_name, digest in planned
-        ),
-    )
-    staged: list[dict[str, object]] = []
-    for candidate, pdb_name, digest in planned:
-        staged.append({
-            "candidate_id": candidate.candidate_id,
-            "input_name": pdb_name,
-            "scientific_payload": {
-                "candidate_id": candidate.candidate_id,
-                "content_sha256": digest,
-                "source_path": candidate.source_path,
-            },
-        })
-    AF3SCORE_OUTPUT_VOLUME.commit()
-    return staged, physical_run_name, publication_key, staged_input_key
-
-
-def _rosetta_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
-    """Serialize one immutable PPIFlow Rosetta Task plan."""
-    tasks = plan.get("tasks")
-    if not isinstance(tasks, list):
-        raise TypeError("Rosetta plan Tasks must be a list")
-    return AppOutput(
-        name="rosetta_task_plan",
-        kind=ArtifactKind.TABLE,
-        storage=InlineBytes(
-            data=orjson.dumps(
-                plan,
-                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
-            ),
-            filename="rosetta_task_plan.json",
-            media_type="application/json",
-        ),
-        metadata={
-            "task_count": len(tasks),
-            "run_name": str(plan["run_name"]),
-            "run_id": str(plan["run_id"]),
-        },
-    )
+)(_rank_ppiflow_artifacts)
 
 
 def _load_rosetta_plan(path: Path) -> dict[str, object]:
@@ -1181,20 +397,6 @@ def _load_rosetta_plan(path: Path) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _read_rosetta_plan_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
-) -> dict[str, object]:
-    """Load the single Rosetta plan from a materialized workflow artifact."""
-    if len(artifacts) != 1:
-        raise ValueError(f"Expected one Rosetta task plan, found {len(artifacts)}")
-    return _load_rosetta_plan(
-        ppiflow_staging.artifact_mount_path(
-            artifacts[0],
-            PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        )
-    )
-
-
 def _rosetta_worker_policy(
     num_jobs: int,
     config: Mapping[str, object],
@@ -1210,181 +412,13 @@ def _rosetta_worker_policy(
     return worker_count, claim_capacity, claim_capacity
 
 
-@app.function(
+prepare_ppiflow_rosetta_stage = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def prepare_ppiflow_rosetta_stage(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
-    config: dict[str, object],
-    step_name: str,
-    run_name: str,
-    run_id: str,
-    node_id: str,
-) -> AppRunResult:
-    """Stage Rosetta inputs and publish a finite pull-worker Task plan."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts=artifacts,
-        volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=None,
-        max_files=_optional_config_int(config, "max_structures"),
-    )
-    candidate_structures = ppiflow_staging.candidate_structure_files_from_selected(
-        selected,
-        manifest_frame=_candidate_manifest_frame_from_inputs(
-            candidate_manifests or [],
-            selected,
-            step_name="RosettaInput",
-        ),
-    )
-    if not candidate_structures:
-        raise ValueError(f"{step_name} requires at least one Rosetta input")
-    safe_run_name = sanitize_filename(run_name)
-    safe_run_id = sanitize_filename(f"{run_id}-{node_id}")
-    layout = AppRunLayout.from_run_root(
-        Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{safe_run_name}-{safe_run_id}"
-    )
-    layout.inputs_dir.mkdir(parents=True, exist_ok=True)
-    rosetta_script = config.get("rosetta_script")
-    if rosetta_script is not None and not isinstance(rosetta_script, str):
-        raise TypeError("rosetta_script must be text")
-    script_content = (
-        None
-        if not rosetta_script
-        else _resolve_rosetta_config_text(rosetta_script, "rosetta_script")
-    )
-    remote_script = None
-    if script_content is not None:
-        remote_script = "inputs/_script/workflow.xml"
-        script_path = layout.run_root / remote_script
-        script_path.parent.mkdir(parents=True, exist_ok=True)
-        script_path.write_text(script_content, encoding="utf-8")
-    flags_file = config.get("flags_file")
-    if flags_file is not None and not isinstance(flags_file, str):
-        raise TypeError("flags_file must be text")
-    flags_content = (
-        None
-        if not flags_file
-        else _resolve_rosetta_config_text(flags_file, "flags_file")
-    )
-    remote_flags = None
-    if flags_content is not None:
-        remote_flags = "inputs/_flags/workflow.flags"
-        flags_path = layout.run_root / remote_flags
-        flags_path.parent.mkdir(parents=True, exist_ok=True)
-        flags_path.write_text(flags_content, encoding="utf-8")
-
-    rosetta_rows = ppiflow_staging.rosetta_job_manifest_rows(
-        candidate_structures,
-        rosetta_binary=str(config.get("rosetta_binary", "relax")),
-        rosetta_script=remote_script,
-        flags_file=remote_flags,
-    )
-    task_specs = []
-    for row, structure in zip(rosetta_rows, candidate_structures, strict=True):
-        remote_pdb = str(row["pdb"])
-        pdb_path = layout.run_root / remote_pdb
-        pdb_path.parent.mkdir(parents=True, exist_ok=True)
-        pdb_path.write_bytes(structure.data)
-        task_specs.append(
-            RosettaTaskSpec(
-                task_key=str(row["candidate_id"]),
-                index=_config_int(row, "index", 0),
-                binary=str(row["binary"]),
-                pdb=remote_pdb,
-                rosetta_script=remote_script,
-                flags_file=remote_flags,
-                output_dir=str(row["expected_output_dir"]),
-                worker_log=str(row["worker_log"]),
-                expected_files=(str(row["expected_score_file"]),),
-                input_sha256=hashlib.sha256(structure.data).hexdigest(),
-                script_sha256=(
-                    None
-                    if script_content is None
-                    else hashlib.sha256(script_content.encode()).hexdigest()
-                ),
-                flags_sha256=(
-                    None
-                    if flags_content is None
-                    else hashlib.sha256(flags_content.encode()).hexdigest()
-                ),
-                candidate_id=str(row["candidate_id"]),
-            )
-        )
-    job_manifest = ppiflow_staging.write_rosetta_job_manifest(
-        rosetta_rows,
-        layout.run_root / "rosetta_job_manifest.csv",
-    )
-    plan: dict[str, object] = {
-        "schema_version": _ROSETTA_PLAN_SCHEMA_VERSION,
-        "run_name": safe_run_name,
-        "run_id": safe_run_id,
-        "run_root": str(layout.run_root),
-        "job_manifest": str(job_manifest),
-        "num_jobs": len(task_specs),
-        "tasks": [task.to_dict() for task in task_specs],
-    }
-    ROSETTA_OUTPUT_VOLUME.commit()
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[_rosetta_plan_artifact(plan)],
-        metrics={
-            "staged_candidates": len(task_specs),
-        },
-    )
-
-
-def _af3score_task_spec_value(task_spec: object, name: str) -> object:
-    """Read one field from AF3Score's dataclass or a serialized test double."""
-    if isinstance(task_spec, Mapping):
-        return cast(Mapping[str, object], task_spec)[name]
-    return getattr(task_spec, name)
-
-
-def _af3score_chunk_payload(chunk: object) -> dict[str, str]:
-    """Normalize one AF3Score chunk without exposing its dataclass to the ledger."""
-    if isinstance(chunk, Mapping):
-        payload = cast(Mapping[str, object], chunk)
-        return {
-            "batch_json_dir": str(payload["batch_json_dir"]),
-            "batch_name": str(payload["batch_name"]),
-            "batch_pdb_dir": str(payload["batch_pdb_dir"]),
-        }
-    chunk_spec = cast(af3score_app.ChunkSpec, chunk)
-    return {
-        "batch_json_dir": str(chunk_spec.batch_json_dir),
-        "batch_name": str(chunk_spec.batch_name),
-        "batch_pdb_dir": str(chunk_spec.batch_pdb_dir),
-    }
-
-
-def _af3score_plan_artifact(plan: Mapping[str, object]) -> AppOutput:
-    """Serialize one operational AF3Score plan for downstream Task discovery."""
-    candidates = plan["candidates"]
-    if not isinstance(candidates, Sequence):
-        raise TypeError("AF3Score plan candidates must be a sequence")
-    return AppOutput(
-        name="af3score_task_plan",
-        kind=ArtifactKind.TABLE,
-        storage=InlineBytes(
-            data=orjson.dumps(
-                plan,
-                option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
-            ),
-            filename="af3score_task_plan.json",
-            media_type="application/json",
-        ),
-        metadata={
-            "candidate_count": len(candidates),
-            "run_name": str(plan["run_name"]),
-        },
-    )
+)(_prepare_ppiflow_rosetta_stage)
 
 
 def _read_af3score_plan_artifacts(
@@ -1403,557 +437,61 @@ def _read_af3score_plan_artifacts(
     return value
 
 
-@app.function(
+prepare_ppiflow_af3score_stage = app.function(
     image=af3score_task_image,
     cpu=(0.125, 16.125),
     memory=(1024, 32768),
     timeout=CONF.timeout,
     volumes=AF3SCORE_TASK_VOLUME_MOUNTS,
-)
-def prepare_ppiflow_af3score_stage(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
-    config: dict[str, object],
-    step_name: str,
-    execution_run_name: str,
-) -> AppRunResult:
-    """Stage AF3Score candidates and publish its finite GPU Task plan."""
-    staged, physical_run_name, publication_key, staged_input_key = (
-        _stage_af3score_candidate_inputs(
-            artifacts=artifacts,
-            candidate_manifests=candidate_manifests,
-            execution_run_name=execution_run_name,
-            patterns=_patterns_from_config(config, default=("*.pdb",)),
-            max_files=_optional_config_int(config, "max_structures"),
-        )
-    )
-    input_names = [str(record["input_name"]) for record in staged]
-    if not input_names:
-        raise ValueError(f"{step_name} requires at least one AF3Score input")
-    input_digests = {
-        Path(str(record["input_name"])).stem: str(
-            cast(Mapping[str, object], record["scientific_payload"])["content_sha256"]
-        )
-        for record in staged
-    }
-    task_spec = af3score_app.af3score_prepare.get_raw_f()(
-        run_name=physical_run_name,
-        staged_input_key=staged_input_key,
-        input_files=input_names,
-        input_digests=input_digests,
-        publication_key=publication_key,
-        num_jobs=_config_int(config, "_max_gpu_containers", 16),
-        prepare_workers=_config_int(config, "prepare_workers", 8),
-    )
-    chunks_by_input: dict[str, dict[str, str]] = {}
-    raw_chunks = _af3score_task_spec_value(task_spec, "chunk_specs")
-    if not isinstance(raw_chunks, Sequence):
-        raise TypeError("AF3Score chunk_specs must be a sequence")
-    for raw_chunk in raw_chunks:
-        chunk = _af3score_chunk_payload(raw_chunk)
-        for path in sorted(Path(chunk["batch_pdb_dir"]).glob("*.pdb")):
-            if path.name in chunks_by_input:
-                raise ValueError(f"AF3Score input {path.name!r} appears in two batches")
-            chunks_by_input[path.name] = chunk
-    pending_value = _af3score_task_spec_value(task_spec, "pending")
-    if not isinstance(pending_value, int):
-        raise TypeError("AF3Score pending Task count must be an integer")
-    pending = pending_value
-    if len(chunks_by_input) != pending:
-        raise ValueError(
-            "AF3Score prepared Task count does not match its batch directories: "
-            f"{pending} pending, {len(chunks_by_input)} mapped"
-        )
-    candidates = [
-        record | {"chunk": chunks_by_input.get(str(record["input_name"]))}
-        for record in staged
-    ]
-    chunk_sizes: dict[str, int] = {}
-    for candidate in candidates:
-        chunk = candidate["chunk"]
-        if isinstance(chunk, Mapping):
-            chunk_payload = cast(Mapping[str, object], chunk)
-            batch_name = str(chunk_payload["batch_name"])
-            chunk_sizes[batch_name] = chunk_sizes.get(batch_name, 0) + 1
-    for candidate in candidates:
-        chunk = candidate["chunk"]
-        if isinstance(chunk, dict):
-            chunk_payload = cast(dict[str, object], chunk)
-            chunk_payload["task_count"] = chunk_sizes[str(chunk_payload["batch_name"])]
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            _af3score_plan_artifact({
-                "candidates": candidates,
-                "input_files": input_names,
-                "input_digests": input_digests,
-                "publication_key": publication_key,
-                "staged_input_key": staged_input_key,
-                "run_name": physical_run_name,
-            })
-        ],
-    )
+)(_prepare_ppiflow_af3score_stage)
 
 
-@app.function(
+run_ppiflow_af3score_batch = app.function(
     image=af3score_task_image,
     gpu=af3score_app.CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
     volumes=AF3SCORE_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_af3score_batch(
-    *,
-    run_name: str,
-    batch_name: str,
-    batch_json_dir: str,
-    batch_pdb_dir: str,
-    task_keys: list[str],
-    input_names: list[str],
-    input_digests: dict[str, str],
-    publication_key: str,
-) -> dict[str, dict[str, object]]:
-    """Run one AF3Score GPU batch and report each owned scientific Task."""
-    if len(task_keys) != len(input_names) or not task_keys:
-        raise ValueError(
-            "AF3Score batch Task keys and inputs must be nonempty and align"
-        )
-    af3score_app.af3score_run.get_raw_f()(
-        run_name=run_name,
-        batch_name=batch_name,
-        batch_json_dir=batch_json_dir,
-        batch_pdb_dir=batch_pdb_dir,
-        input_digests=input_digests,
-        publication_key=publication_key,
-    )
-    layout = AppRunLayout.from_run_root(
-        Path(AF3SCORE_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
-    )
-    results: dict[str, dict[str, object]] = {}
-    for task_key, input_name in zip(task_keys, input_names, strict=True):
-        input_id = Path(input_name).stem
-        complete = af3score_app._input_publication_ready(
-            layout.outputs_dir,
-            input_id,
-            publication_key=publication_key,
-            input_sha256=input_digests[input_id],
-        )
-        result = (
-            AppRunResult(
-                status=AppRunStatus.SUCCEEDED,
-                outputs=[
-                    AppOutput(
-                        name=f"af3score_{sanitize_filename(task_key)}",
-                        kind=ArtifactKind.SCORES,
-                        storage=volume_path_from_mount_path(
-                            str(layout.outputs_dir / input_id),
-                            AF3SCORE_OUTPUT_MOUNTPOINT,
-                            AF3SCORE_OUTPUT_VOLUME_NAME,
-                        ),
-                        metadata={
-                            "candidate_id": task_key,
-                            "input_name": input_name,
-                            "run_name": run_name,
-                        },
-                    )
-                ],
-            )
-            if complete
-            else AppRunResult(
-                status=AppRunStatus.FAILED,
-                warnings=[f"AF3Score output is incomplete for {task_key!r}"],
-            )
-        )
-        results[task_key] = result.model_dump(mode="json")
-    return results
+)(_run_ppiflow_af3score_batch)
 
 
-@app.function(
+postprocess_ppiflow_af3score_stage = app.function(
     image=af3score_task_image,
     cpu=(0.125, 16.125),
     memory=(1024, 16384),
     timeout=CONF.timeout,
     volumes=AF3SCORE_TASK_VOLUME_MOUNTS,
-)
-def postprocess_ppiflow_af3score_stage(
-    *,
-    plan_artifacts: list[WorkflowArtifact],
-    task_keys: list[str],
-    step_name: str,
-    run_id: str,
-    node_id: str,
-) -> dict[str, dict[str, object]]:
-    """Postprocess a kernel-completed AF3Score Task collection."""
-    plan = _read_af3score_plan_artifacts(plan_artifacts)
-    run_name = str(plan["run_name"])
-    input_files = plan["input_files"]
-    candidates = plan["candidates"]
-    input_digests = plan.get("input_digests")
-    publication_key = plan.get("publication_key")
-    staged_input_key = plan.get("staged_input_key")
-    if (
-        not isinstance(input_files, list)
-        or not isinstance(candidates, list)
-        or not isinstance(input_digests, dict)
-        or not isinstance(publication_key, str)
-        or not isinstance(staged_input_key, str)
-    ):
-        raise TypeError("AF3Score task plan contains invalid candidate data")
-    candidate_by_id: dict[str, Mapping[str, object]] = {}
-    for raw_candidate in candidates:
-        if not isinstance(raw_candidate, Mapping):
-            raise TypeError("AF3Score candidate plan entries must be objects")
-        candidate = cast(Mapping[str, object], raw_candidate)
-        candidate_by_id[str(candidate["candidate_id"])] = candidate
-    normalized_input_digests = {
-        str(key): str(value) for key, value in input_digests.items()
-    }
-    if len(task_keys) != len(set(task_keys)) or not set(task_keys).issubset(
-        candidate_by_id
-    ):
-        raise ValueError("AF3Score postprocess Task keys do not match its plan")
-    AF3SCORE_OUTPUT_VOLUME.reload()
-    completed_input_ids = [
-        Path(str(candidate["input_name"])).stem
-        for candidate in candidate_by_id.values()
-        if af3score_app._input_summary_publication_ready(
-            AppRunLayout.from_run_root(
-                Path(AF3SCORE_OUTPUT_MOUNTPOINT) / run_name
-            ).outputs_dir,
-            Path(str(candidate["input_name"])).stem,
-            publication_key=publication_key,
-            input_sha256=str(
-                normalized_input_digests[Path(str(candidate["input_name"])).stem]
-            ),
-        )
-    ]
-    metrics = af3score_app.af3score_postprocess.get_raw_f()(
-        run_name=run_name,
-        staged_input_key=staged_input_key,
-        input_files=[str(value) for value in input_files],
-        input_digests=normalized_input_digests,
-        completed_input_ids=completed_input_ids,
-        publication_key=publication_key,
-    )
-    metrics_csv = str(metrics["metrics_csv"])
-    failed_input_ids = {str(value) for value in metrics["failed_input_ids"]}
-    status = ppiflow_tables.score_table_status(
-        requested_count=len(input_files),
-        usable_rows=int(metrics.get("metrics_rows", 0)),
-        failed_count=int(metrics.get("failed", 0)),
-    )
-    manifest_output = _write_candidate_manifest_output(
-        run_id=run_id,
-        node_id=node_id,
-        step_name=step_name,
-        rows=[
-            ppiflow_manifests.candidate_manifest_row(
-                candidate_id=str(candidate_payload["candidate_id"]),
-                stage_name=step_name,
-                stage_role="score",
-                operation_mode="af3score",
-                candidate_status=(
-                    AppRunStatus.FAILED.value
-                    if Path(str(candidate_payload["input_name"])).stem
-                    in failed_input_ids
-                    else AppRunStatus.SUCCEEDED.value
-                ),
-                source_path=str(candidate_payload["input_name"]),
-                derived_path=metrics_csv,
-                files=(
-                    []
-                    if Path(str(candidate_payload["input_name"])).stem
-                    in failed_input_ids
-                    else [
-                        ppiflow_manifests.candidate_file_record(
-                            role="scores",
-                            volume_name=AF3SCORE_OUTPUT_VOLUME_NAME,
-                            app_volume_path=volume_path_from_mount_path(
-                                metrics_csv,
-                                AF3SCORE_OUTPUT_MOUNTPOINT,
-                                AF3SCORE_OUTPUT_VOLUME_NAME,
-                            ).path,
-                        )
-                    ]
-                ),
-                summary=metrics,
-            )
-            for candidate in candidates
-            if isinstance(candidate, Mapping)
-            for candidate_payload in (cast(Mapping[str, object], candidate),)
-        ],
-    )
-    aggregate = AppRunResult(
-        status=status,
-        outputs=[
-            AppOutput(
-                name="af3score_metrics",
-                kind=ArtifactKind.SCORES,
-                storage=volume_path_from_mount_path(
-                    metrics_csv,
-                    AF3SCORE_OUTPUT_MOUNTPOINT,
-                    AF3SCORE_OUTPUT_VOLUME_NAME,
-                ),
-                metadata={
-                    "step_name": step_name,
-                    "run_name": run_name,
-                }
-                | dict(metrics),
-            ),
-            manifest_output,
-        ],
-    )
-    successful_task_keys = [
-        task_key
-        for task_key in task_keys
-        if Path(str(candidate_by_id[task_key]["input_name"])).stem
-        not in failed_input_ids
-    ]
-    first_success = successful_task_keys[0] if successful_task_keys else None
-    return {
-        task_key: AppRunResult(
-            status=(
-                AppRunStatus.FAILED
-                if task_key not in successful_task_keys
-                else AppRunStatus.SUCCEEDED
-            ),
-            outputs=(aggregate.outputs if task_key == first_success else []),
-            warnings=(
-                [f"AF3Score output is incomplete for {task_key!r}"]
-                if task_key not in successful_task_keys
-                else []
-            ),
-        ).model_dump(mode="json")
-        for task_key in task_keys
-    }
+)(_postprocess_ppiflow_af3score_stage)
 
 
-@app.function(
+run_ppiflow_ligandmpnn_candidate = app.function(
     image=ligandmpnn_task_image,
     gpu=ligandmpnn_app.CONF.gpu,
     memory=(1024, 65536),
     timeout=CONF.timeout,
     volumes=LIGANDMPNN_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_ligandmpnn_candidate(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
-    candidate_id: str,
-    config: dict[str, object],
-    step_name: str,
-    run_name: str,
-    script_mode: str,
-    cli_args: dict[str, str | int | float | bool],
-) -> AppRunResult:
-    """Run LigandMPNN for one kernel-owned PPIFlow candidate."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=_patterns_from_config(config),
-        max_files=_optional_config_int(config, "max_structures"),
-    )
-    selected_structures = [
-        asdict(structure)
-        for structure in ppiflow_staging.candidate_structure_files_from_selected(
-            selected,
-            manifest_frame=_candidate_manifest_frame_from_inputs(
-                candidate_manifests or [],
-                selected,
-                step_name=step_name,
-            ),
-        )
-    ]
-    matches = [
-        structure
-        for structure in selected_structures
-        if structure["candidate_id"] == candidate_id
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"LigandMPNN candidate {candidate_id!r} resolved to "
-            f"{len(matches)} structures"
-        )
-    structure = matches[0]
-    result = AppRunResult.model_validate(
-        ligandmpnn_app.ligandmpnn_run.get_raw_f()(
-            run_name=sanitize_filename(f"{run_name}-{candidate_id}"),
-            script_mode=script_mode,
-            struct_bytes=_bytes_payload(structure["data"], "structure data"),
-            seeds=_parse_seed_values(config.get("seeds", [0])),
-            cli_args=cli_args,
-            bias_aa_per_residue_bytes=config.get("bias_aa_per_residue_bytes"),
-            omit_aa_per_residue_bytes=config.get("omit_aa_per_residue_bytes"),
-        )
-    )
-    outputs = _ligandmpnn_stage_outputs(
-        result,
-        candidate_id=candidate_id,
-        step_name=step_name,
-        selected_structure=str(structure["file_name"]),
-    )
-    candidate_files = _inline_output_file_records([
-        output for output in outputs if output.kind == ArtifactKind.STRUCTURES
-    ])
-    return result.model_copy(
-        update={
-            "outputs": [
-                output.model_copy(
-                    update={
-                        "metadata": dict(output.metadata)
-                        | {"candidate_files": candidate_files}
-                    }
-                )
-                if output.kind == ArtifactKind.STRUCTURES
-                else output
-                for output in outputs
-            ]
-        }
-    )
+)(_run_ppiflow_ligandmpnn_candidate)
 
 
-@app.function(
+run_ppiflow_partial_candidate = app.function(
     image=ppiflow_task_image,
     gpu=ppiflow_app.CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_partial_candidate(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
-    candidate_id: str,
-    config: dict[str, object],
-    step_name: str,
-    run_name: str,
-) -> AppRunResult:
-    """Run one kernel-owned PPIFlow partial-design candidate."""
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=_patterns_from_config(config),
-        max_files=_optional_config_int(config, "max_structures"),
-    )
-    candidate_structures = ppiflow_staging.candidate_structure_files_from_selected(
-        selected,
-        manifest_frame=_candidate_manifest_frame_from_inputs(
-            candidate_manifests or [],
-            selected,
-            step_name=step_name,
-        ),
-    )
-    matches = [
-        structure
-        for structure in candidate_structures
-        if structure.candidate_id == candidate_id
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"PPIFlow partial candidate {candidate_id!r} resolved to "
-            f"{len(matches)} structures"
-        )
-    structure = matches[0]
-    fixed_positions_by_candidate = _fixed_positions_by_candidate(
-        artifacts,
-        candidate_structures,
-    )
-    raw_args_template = deepcopy(config.get("args", config))
-    if not isinstance(raw_args_template, dict):
-        raise ValueError(f"PPIFlow step {step_name!r} args must be a mapping")
-    field_name = "complex_pdb" if "complex_pdb" in raw_args_template else "input_pdb"
-    staged_path = (
-        Path(PPI_FLOW_OUTPUT_MOUNTPOINT)
-        / sanitize_filename(run_name)
-        / sanitize_filename(step_name)
-        / sanitize_filename(candidate_id)
-        / sanitize_filename(field_name)
-        / sanitize_filename(structure.file_name)
-    )
-    staged_path.parent.mkdir(parents=True, exist_ok=True)
-    staged_path.write_bytes(structure.data)
-    PPI_FLOW_OUTPUT_VOLUME.commit()
-
-    app_args = _validated_ppiflow_partial_args(
-        raw_args_template,
-        structure_path=str(staged_path),
-        fixed_positions=fixed_positions_by_candidate.get(candidate_id),
-    )
-    result = AppRunResult.model_validate(
-        ppiflow_app.ppiflow_run_workflow.get_raw_f()(
-            args=app_args,
-            run_name=sanitize_filename(f"{run_name}-{candidate_id}"),
-        )
-    )
-    return _ppiflow_candidate_result(
-        result,
-        candidate_id=candidate_id,
-        step_name=step_name,
-        source_structure=structure.file_name,
-    )
+)(_run_ppiflow_partial_candidate)
 
 
-@app.function(
+run_ppiflow_refold_candidate = app.function(
     image=alphafold3_task_image,
     gpu=alphafold3_app.CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 131072),
     timeout=CONF.timeout,
     volumes=ALPHAFOLD3_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_refold_candidate(
-    *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
-    candidate_id: str,
-    config: dict[str, object],
-    step_name: str,
-    run_name: str,
-) -> AppRunResult:
-    """Run AlphaFold3 refolding for one kernel-owned candidate Task."""
-    # TODO: tune CPU/memory/timeout/GPU once ReFold candidate-stage telemetry exists.
-    # TODO: sometimes PDB and score files mismatch in length; investigate
-    _reload_ppiflow_source_volumes()
-    selected = ppiflow_staging.select_structure_files_from_artifacts(
-        artifacts,
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        patterns=_patterns_from_config(config, default=("*.pdb",)),
-        max_files=_optional_config_int(config, "max_structures"),
-    )
-    structures = ppiflow_staging.candidate_structure_files_from_selected(
-        selected,
-        manifest_frame=_candidate_manifest_frame_from_inputs(
-            candidate_manifests or [],
-            selected,
-            step_name=step_name,
-        ),
-    )
-    matches = [
-        structure for structure in structures if structure.candidate_id == candidate_id
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"ReFold candidate {candidate_id!r} resolved to {len(matches)} structures"
-        )
-    structure = matches[0]
-    candidate_run_name = sanitize_filename(f"{run_name}-{candidate_id}")
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=_run_one_refold_candidate(
-            structure_name=structure.file_name,
-            structure_bytes=structure.data,
-            candidate_id=candidate_id,
-            run_name=candidate_run_name,
-            step_name=step_name,
-            config=config,
-        ),
-        metrics={"candidate_id": candidate_id},
-    )
+)(_run_ppiflow_refold_candidate)
 
 
 def _rosetta_task_receipt(
@@ -1981,87 +519,11 @@ def _rosetta_task_receipt(
     )
 
 
-@app.function(
+run_ppiflow_rosetta_worker = app.function(
     image=rosetta_task_image,
-    cpu=(0.125, 30.125),
-    memory=(1024, 43008),
     timeout=CONF.timeout,
     volumes=ROSETTA_TASK_VOLUME_MOUNTS,
-)
-def run_ppiflow_rosetta_worker(
-    coordinator,
-    provider_call_id: str,
-    run_name: str,
-    run_id: str,
-    claim_capacity: int,
-    max_parallel: int,
-) -> dict[str, int]:
-    """Pull Rosetta Tasks from the workflow coordinator until none remain."""
-    from biomodals.helper.shell import run_command
-
-    layout = AppRunLayout.from_run_root(
-        Path(ROSETTA_OUTPUT_MOUNTPOINT) / f"{run_name}-{run_id}"
-    )
-
-    def claim(request_id: str, capacity: int):
-        return coordinator.claim_tasks.remote(
-            provider_call_id,
-            request_id,
-            capacity,
-        )
-
-    def execute(assignment: WorkerAssignmentRecord) -> AppRunResult:
-        payload = assignment.execution_payload
-        if not isinstance(payload, Mapping):
-            raise TypeError("Rosetta worker Task payload must be an object")
-        task = RosettaTaskSpec.from_dict(payload.get("task"))
-        try:
-            execute_rosetta_task(
-                run_root=layout.run_root,
-                task=task,
-                task_fingerprint=assignment.task_fingerprint,
-                run_command=run_command,
-            )
-        except Exception as error:  # noqa: BLE001
-            return AppRunResult(
-                status=AppRunStatus.FAILED,
-                warnings=[str(error) or type(error).__name__],
-                metrics={"candidate_id": task.candidate_id or task.task_key},
-            )
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[_rosetta_task_receipt(task, assignment.task_fingerprint)],
-            metrics={"candidate_id": task.candidate_id or task.task_key},
-        )
-
-    def complete_and_claim(
-        completions: tuple[
-            tuple[WorkerAssignmentRecord, str, AppRunResult],
-            ...,
-        ],
-        request_id: str,
-        capacity: int,
-    ) -> PullTaskClaim:
-        return coordinator.complete_tasks_and_claim.remote(
-            provider_call_id,
-            tuple(
-                (assignment.task_key, completion_request_id, result)
-                for assignment, completion_request_id, result in completions
-            ),
-            request_id,
-            capacity,
-        )
-
-    summary = drive_pull_worker(
-        provider_call_id=UUID(provider_call_id),
-        claim_capacity=claim_capacity,
-        claim=claim,
-        execute=execute,
-        complete_and_claim=complete_and_claim,
-        checkpoint_batch=ROSETTA_OUTPUT_VOLUME.commit,
-        max_parallel=max_parallel,
-    )
-    return asdict(summary)
+)(_run_ppiflow_rosetta_worker)
 
 
 def _rosetta_task_outcomes_artifact(
@@ -2089,218 +551,23 @@ def _rosetta_task_outcomes_artifact(
     )
 
 
-def _read_rosetta_task_outcomes(
-    artifacts: Sequence[WorkflowArtifact],
-) -> tuple[set[str], dict[str, str]]:
-    """Load one materialized Rosetta pull-Task outcome summary."""
-    if len(artifacts) != 1:
-        raise ValueError(
-            f"Expected one Rosetta Task outcome artifact, found {len(artifacts)}"
-        )
-    path = ppiflow_staging.artifact_mount_path(
-        artifacts[0],
-        PPI_FLOW_SOURCE_VOLUME_ROOTS,
-    )
-    value = orjson.loads(path.read_bytes())
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != _ROSETTA_PLAN_SCHEMA_VERSION
-        or not isinstance(value.get("succeeded"), list)
-        or not isinstance(value.get("errors"), dict)
-    ):
-        raise ValueError("PPIFlow Rosetta Task outcomes are invalid")
-    succeeded = {str(task_key) for task_key in value["succeeded"]}
-    errors = {
-        str(task_key): str(message) for task_key, message in value["errors"].items()
-    }
-    if succeeded & errors.keys():
-        raise ValueError("Rosetta Task outcomes contain conflicting statuses")
-    return succeeded, errors
-
-
-@app.function(
+finalize_ppiflow_rosetta_stage = app.function(
     image=runtime_image,
     cpu=0.125,
     memory=(512, 8192),
     timeout=CONF.timeout,
     volumes=PPI_FLOW_SOURCE_VOLUME_MOUNTS,
-)
-def finalize_ppiflow_rosetta_stage(
-    *,
-    plan_artifacts: list[WorkflowArtifact],
-    outcome_artifacts: list[WorkflowArtifact],
-    config: dict[str, object],
-    step_name: str,
-    run_id: str,
-    node_id: str,
-) -> AppRunResult:
-    """Validate Rosetta publications and emit the existing stage artifacts."""
-    _reload_ppiflow_source_volumes()
-    plan = _read_rosetta_plan_artifacts(plan_artifacts)
-    succeeded_tasks, task_errors = _read_rosetta_task_outcomes(outcome_artifacts)
-    task_specs = tuple(
-        RosettaTaskSpec.from_dict(task) for task in cast(list[object], plan["tasks"])
-    )
-    worker_count, _claim_capacity, _max_parallel = _rosetta_worker_policy(
-        len(task_specs),
-        config,
-    )
-    expected_task_keys = {task.task_key for task in task_specs}
-    if succeeded_tasks | task_errors.keys() != expected_task_keys:
-        raise ValueError("Rosetta Task outcomes do not match the staged plan")
-
-    run_root = Path(str(plan["run_root"]))
-    job_manifest = Path(str(plan["job_manifest"]))
-    row_frame = pl.read_csv(job_manifest, infer_schema_length=0)
-    rows = []
-    successful_candidates = 0
-    warnings = []
-    for row in row_frame.iter_rows(named=True):
-        candidate_id = str(row["candidate_id"])
-        expected_score = run_root / str(row["expected_score_file"])
-        log_path = run_root / str(row["worker_log"])
-        success = candidate_id in succeeded_tasks and expected_score.is_file()
-        status = AppRunStatus.SUCCEEDED if success else AppRunStatus.FAILED
-        error = task_errors.get(candidate_id)
-        if error is None and not success:
-            error = (
-                "Rosetta Task reported success without its expected score file"
-                if candidate_id in succeeded_tasks
-                else "Rosetta Task did not publish a result"
-            )
-        if success:
-            successful_candidates += 1
-        elif error is not None:
-            warnings.append(f"{candidate_id}: {error}")
-        candidate_files = []
-        if success:
-            output_dir = run_root / str(row["expected_output_dir"])
-            for path in sorted(output_dir.rglob("*")):
-                if not path.is_file():
-                    continue
-                candidate_files.append(
-                    ppiflow_manifests.candidate_file_record(
-                        role=(
-                            "structure"
-                            if path.suffix.lower() in {".pdb", ".cif"}
-                            else "score"
-                        ),
-                        volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
-                        app_volume_path=path.relative_to(
-                            ROSETTA_OUTPUT_MOUNTPOINT
-                        ).as_posix(),
-                        path=path.relative_to(output_dir).as_posix(),
-                        size_bytes=path.stat().st_size,
-                        content_sha256=_file_sha256(path),
-                    )
-                )
-        if log_path.is_file():
-            candidate_files.append(
-                ppiflow_manifests.candidate_file_record(
-                    role="worker_log",
-                    volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
-                    app_volume_path=log_path.relative_to(
-                        ROSETTA_OUTPUT_MOUNTPOINT
-                    ).as_posix(),
-                    path=log_path.relative_to(run_root).as_posix(),
-                    size_bytes=log_path.stat().st_size,
-                    content_sha256=_file_sha256(log_path),
-                    expected=False,
-                )
-            )
-        rows.append(
-            ppiflow_manifests.candidate_manifest_row(
-                candidate_id=candidate_id,
-                stage_name=step_name,
-                stage_role="rosetta",
-                operation_mode=str(config.get("rosetta_binary", "relax")),
-                candidate_status=status.value,
-                source_path=str(row["pdb"]),
-                derived_path=str(row["expected_output_dir"]),
-                error=error,
-                files=candidate_files,
-                summary={
-                    "index": row["index"],
-                    "num_pods": worker_count,
-                },
-            )
-        )
-
-    rosetta_files = [
-        ArtifactFile(
-            path=path.relative_to(run_root).as_posix(),
-            role=("structure" if path.suffix.lower() in {".pdb", ".cif"} else "result"),
-            size_bytes=path.stat().st_size,
-            content_sha256=_file_sha256(path),
-        )
-        for path in sorted(run_root.rglob("*"))
-        if path.is_file()
-    ]
-    manifest_output = _write_candidate_manifest_output(
-        run_id=run_id,
-        node_id=node_id,
-        step_name=step_name,
-        rows=rows,
-    )
-    result_status = (
-        AppRunStatus.SUCCEEDED if successful_candidates else AppRunStatus.FAILED
-    )
-    return AppRunResult(
-        status=result_status,
-        outputs=[
-            volume_app_output(
-                name="rosetta_outputs",
-                kind=ArtifactKind.STRUCTURES,
-                remote_path=str(plan["run_root"]),
-                mount_root=ROSETTA_OUTPUT_MOUNTPOINT,
-                volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
-                metadata={
-                    "step_name": step_name,
-                    "run_name": str(plan["run_name"]),
-                    "run_id": str(plan["run_id"]),
-                    "num_jobs": _config_int(plan, "num_jobs", 0),
-                    "num_pods": worker_count,
-                    "structure_patterns": APP_RUN_OUTPUT_STRUCTURE_PATTERNS,
-                },
-                files=rosetta_files,
-            ),
-            volume_app_output(
-                name="rosetta_job_manifest",
-                kind=ArtifactKind.TABLE,
-                remote_path=str(plan["job_manifest"]),
-                mount_root=ROSETTA_OUTPUT_MOUNTPOINT,
-                volume_name=ROSETTA_OUTPUT_VOLUME_NAME,
-                media_type="text/csv",
-                metadata={
-                    "step_name": step_name,
-                    "rows": _config_int(plan, "num_jobs", 0),
-                },
-                files=[
-                    ArtifactFile(
-                        path=job_manifest.name,
-                        role="job_manifest",
-                        media_type="text/csv",
-                        size_bytes=job_manifest.stat().st_size,
-                        content_sha256=_file_sha256(job_manifest),
-                    )
-                ],
-            ),
-            manifest_output,
-        ],
-        warnings=warnings,
-        metrics={
-            "successful_candidates": successful_candidates,
-            "failed_candidates": len(rows) - successful_candidates,
-        },
-    )
+)(_finalize_ppiflow_rosetta_stage)
 
 
-_OPERATIONAL_CONFIG_KEYS = (
+_OBSOLETE_CONFIG_KEYS = (
     "candidate_concurrency",
     "max_child_calls",
     "max_batches",
     "max_num_pods",
     "num_jobs",
+)
+_OPERATIONAL_CONFIG_KEYS = (
     "prepare_workers",
     "_max_containers",
     "_max_gpu_containers",
@@ -3367,193 +1634,6 @@ class ReportNode(WorkflowNativeNode):
         )
 
 
-def _result_with_output_kind(
-    result: AppRunResult,
-    kind: ArtifactKind,
-    metadata: Mapping[str, object],
-) -> AppRunResult:
-    outputs = [
-        output.model_copy(
-            update={
-                "kind": kind,
-                "metadata": dict(output.metadata) | dict(metadata),
-            }
-        )
-        for output in result.outputs
-    ]
-    return result.model_copy(update={"outputs": outputs})
-
-
-def _ligandmpnn_stage_outputs(
-    result: AppRunResult,
-    *,
-    candidate_id: str,
-    step_name: str,
-    selected_structure: str,
-) -> list[AppOutput]:
-    adapted = _result_with_output_kind(
-        result,
-        ArtifactKind.STRUCTURES,
-        {
-            "candidate_id": candidate_id,
-            "step_name": step_name,
-            "selected_structure": selected_structure,
-        },
-    )
-    sequence_rows = []
-    for output in adapted.outputs:
-        if not isinstance(output.storage, InlineBytes):
-            continue
-        if output.storage.media_type != ZSTD_MEDIA_TYPE:
-            continue
-        sequence_rows.extend(
-            ppiflow_tables.mpnn_sequence_rows_from_fasta_files(
-                ppiflow_staging.files_from_tar_zst_bytes(
-                    output.storage.data,
-                    suffixes=(".fa", ".faa", ".fasta"),
-                ),
-                stage_name=step_name,
-                parent_candidate_id=candidate_id,
-            )
-        )
-    sequence_output = _inline_csv_table_output(
-        name="mpnn_seqs",
-        filename=f"{sanitize_filename(candidate_id)}_mpnn_seqs.csv",
-        rows=sequence_rows,
-        metadata={"candidate_id": candidate_id, "step_name": step_name},
-    )
-    return [*adapted.outputs, *([sequence_output] if sequence_output else [])]
-
-
-def _inline_output_file_records(
-    outputs: Sequence[AppOutput],
-) -> list[dict[str, object]]:
-    """Describe inline candidate outputs with one durable content digest."""
-    return [
-        ppiflow_manifests.candidate_file_record(
-            role=(
-                "structure"
-                if output.kind == ArtifactKind.STRUCTURES
-                else output.kind.value
-            ),
-            path=output.storage.filename,
-            media_type=output.storage.media_type,
-            size_bytes=len(output.storage.data),
-            content_sha256=hashlib.sha256(output.storage.data).hexdigest(),
-        )
-        for output in outputs
-        if isinstance(output.storage, InlineBytes)
-    ]
-
-
-def _inline_csv_table_output(
-    *,
-    name: str,
-    filename: str,
-    rows: Sequence[Mapping[str, object]],
-    metadata: Mapping[str, object],
-) -> AppOutput | None:
-    if not rows:
-        return None
-    csv_text = pl.DataFrame([dict(row) for row in rows]).write_csv()
-    return AppOutput(
-        name=name,
-        kind=ArtifactKind.TABLE,
-        storage=InlineBytes(
-            data=csv_text.encode("utf-8"),
-            filename=filename,
-            media_type="text/csv",
-        ),
-        metadata={"rows": len(rows)} | dict(metadata),
-    )
-
-
-def _initial_ppiflow_candidate_rows(
-    result: AppRunResult,
-    *,
-    step_name: str,
-) -> list[dict[str, object]]:
-    """Describe initial PPIFlow structures with stable content identities."""
-    rows = []
-    for output in result.outputs:
-        if output.kind != ArtifactKind.STRUCTURES or not isinstance(
-            output.storage, VolumePath
-        ):
-            continue
-        artifact = WorkflowArtifact(
-            artifact_id=sanitize_filename(output.name),
-            producing_node_id=step_name,
-            kind=ArtifactKind.STRUCTURES,
-            storage=output.storage,
-            metadata=output.metadata,
-        )
-        for structure in ppiflow_staging.selected_structure_file_records_from_artifact(
-            artifact,
-            PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
-            PPI_FLOW_SOURCE_VOLUME_ROOTS,
-        ):
-            candidate_id = ppiflow_manifests.initial_candidate_id(
-                stage_name=step_name,
-                source_artifact_id=structure.artifact_id,
-                source_path=structure.app_volume_path,
-                basename=structure.file_name,
-            )
-            rows.append(
-                ppiflow_manifests.candidate_manifest_row(
-                    candidate_id=candidate_id,
-                    stage_name=step_name,
-                    stage_role="initial_design",
-                    operation_mode="ppiflow",
-                    candidate_status=AppRunStatus.SUCCEEDED.value,
-                    source_artifact_id=structure.artifact_id,
-                    source_path=structure.app_volume_path,
-                    derived_path=structure.app_volume_path,
-                    files=[
-                        ppiflow_manifests.candidate_file_record(
-                            role="structure",
-                            volume_name=structure.volume_name,
-                            app_volume_path=structure.app_volume_path,
-                            path=structure.artifact_file_path,
-                            media_type=structure.media_type,
-                            size_bytes=structure.size_bytes,
-                            content_sha256=structure.content_sha256,
-                        )
-                    ],
-                )
-            )
-    if not rows:
-        raise FileNotFoundError("PPIFlow design produced no structure candidates")
-    return sorted(rows, key=lambda row: str(row["candidate_id"]))
-
-
-def _write_candidate_manifest_output(
-    *,
-    run_id: str,
-    node_id: str,
-    step_name: str,
-    rows: Sequence[Mapping[str, object]],
-) -> AppOutput:
-    output_dir = (
-        Path(WORKFLOW_OUTPUT_MOUNTPOINT)
-        / "ppiflow"
-        / sanitize_filename(run_id)
-        / sanitize_filename(node_id)
-        / ppiflow_manifests.MANIFEST_OUTPUT_NAME
-    )
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    manifest_path = output_dir / ppiflow_manifests.MANIFEST_FILENAME
-    ppiflow_manifests.write_manifest(rows, manifest_path)
-    WORKFLOW_OUTPUT_VOLUME.commit()
-    return ppiflow_manifests.manifest_artifact_output(
-        manifest_path=manifest_path,
-        mount_root=WORKFLOW_OUTPUT_MOUNTPOINT,
-        volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
-        stage_name=step_name,
-        row_count=len(rows),
-    )
-
-
 def _candidate_rows_for_task_discovery(
     context: NodeRunContext,
     *,
@@ -3738,390 +1818,6 @@ def _task_result_structure_files(
     return records
 
 
-def _ppiflow_candidate_result(
-    result: AppRunResult,
-    *,
-    candidate_id: str,
-    step_name: str,
-    source_structure: str,
-) -> AppRunResult:
-    """Annotate one PPIFlow app result with candidate-keyed structure files."""
-    outputs = []
-    structure_count = 0
-    for output in result.outputs:
-        if (
-            not isinstance(output.storage, VolumePath)
-            or output.storage.volume_name != PPI_FLOW_OUTPUT_VOLUME_NAME
-        ):
-            outputs.append(output)
-            continue
-        root = output.storage.at_mountpoint(PPI_FLOW_OUTPUT_MOUNTPOINT)
-        structure_paths = (
-            [root]
-            if root.is_file() and root.suffix.lower() in {".pdb", ".cif"}
-            else sorted(
-                path
-                for path in root.rglob("*")
-                if path.is_file() and path.suffix.lower() in {".pdb", ".cif"}
-            )
-        )
-        candidate_files = [
-            ppiflow_manifests.candidate_file_record(
-                role="structure",
-                volume_name=PPI_FLOW_OUTPUT_VOLUME_NAME,
-                app_volume_path=path.relative_to(PPI_FLOW_OUTPUT_MOUNTPOINT).as_posix(),
-                path=(
-                    path.name if root.is_file() else path.relative_to(root).as_posix()
-                ),
-                media_type=(
-                    "chemical/x-pdb"
-                    if path.suffix.lower() == ".pdb"
-                    else "chemical/x-mmcif"
-                ),
-                size_bytes=path.stat().st_size,
-                content_sha256=_file_sha256(path),
-            )
-            for path in structure_paths
-        ]
-        structure_count += len(candidate_files)
-        outputs.append(
-            output.model_copy(
-                update={
-                    "kind": ArtifactKind.STRUCTURES,
-                    "metadata": dict(output.metadata)
-                    | {
-                        "candidate_id": candidate_id,
-                        "candidate_files": candidate_files,
-                        "files": [
-                            ArtifactFile.model_validate(file_record).model_dump(
-                                exclude_defaults=True,
-                                exclude_none=True,
-                            )
-                            for file_record in candidate_files
-                        ],
-                        "source_structure": source_structure,
-                        "step_name": step_name,
-                        "structure_patterns": PPI_FLOW_OUTPUT_STRUCTURE_PATTERNS,
-                    },
-                }
-            )
-        )
-    if structure_count == 0:
-        raise FileNotFoundError(
-            f"PPIFlow candidate {candidate_id!r} produced no structure files"
-        )
-    return result.model_copy(update={"outputs": outputs})
-
-
-def _file_sha256(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
-def _run_one_refold_candidate(
-    *,
-    structure_name: str,
-    structure_bytes: bytes,
-    candidate_id: str,
-    run_name: str,
-    step_name: str,
-    config: Mapping[str, object],
-) -> list[AppOutput]:
-    conf = _af3_config_for_refold(
-        structure_name=structure_name,
-        structure_bytes=structure_bytes,
-        run_name=run_name,
-        config=config,
-    )
-    if bool(config.get("search_msa", False)):
-        raise ValueError(
-            "PPIFlow ReFold does not yet support AlphaFold3 MSA search; "
-            "provide an af3_config_json with populated fields or leave "
-            "search_msa disabled"
-        )
-    enriched = resolve_msa_and_templates(
-        conf,
-        cast(Any, None),
-        search_msa=False,
-        search_protein_templates=False,
-    )
-    prepared = prepare_inference_run(
-        enriched,
-        recycle=_config_int(config, "recycle", 10),
-        sample=_config_int(config, "sample", 5),
-    )
-    publication = RequestPublication.from_prepared(prepared)
-    manifest = load_request_manifest(
-        alphafold3_app.CONF.output_volume,
-        publication,
-    )
-    if manifest is None:
-        stage_inference_run(
-            alphafold3_app.CONF.output_volume,
-            prepared,
-        )
-        executor = InProcessInferenceExecutor(
-            claim_function=alphafold3_app.claim_seed_prediction_work.get_raw_f(),
-            inspect_function=alphafold3_app.inspect_seed_prediction_cache.get_raw_f(),
-            worker_function=alphafold3_app.run_inference_pipeline.get_raw_f(),
-            summary_function=alphafold3_app.finalize_inference_summary.get_raw_f(),
-            request_function=alphafold3_app.finalize_inference_request.get_raw_f(),
-        )
-        result = coordinate_seed_predictions(
-            prepared,
-            executor,
-            num_containers=1,
-            active_wait_timeout_seconds=MAX_TIMEOUT + 900,
-        )
-        manifest = request_manifest_from_result(result)
-    with TemporaryDirectory(prefix="biomodals-ppiflow-refold-") as temp_dir:
-        archive_path = create_request_archive(
-            alphafold3_app.CONF.output_volume,
-            manifest,
-            output_dir=temp_dir,
-            display_name=run_name,
-        )
-        publication_root = (
-            Path(ALPHAFOLD3_OUTPUT_MOUNTPOINT)
-            / "ppiflow"
-            / "refold"
-            / sanitize_filename(run_name)
-        )
-        published_archive, archive_size, archive_sha256 = (
-            publish_content_addressed_file(archive_path, publication_root)
-        )
-        archive_file = ArtifactFile(
-            path=published_archive.name,
-            media_type=ZSTD_MEDIA_TYPE,
-            size_bytes=archive_size,
-            content_sha256=archive_sha256,
-        )
-        json_files = ppiflow_staging.files_from_tar_zst_path(
-            published_archive,
-            suffixes=(".json",),
-        )
-    ALPHAFOLD3_OUTPUT_VOLUME.commit()
-    best_model_member = request_archive_member_for_role(
-        manifest,
-        role="request_best_model",
-        display_name=run_name,
-    )
-    best_summary_member = request_archive_member_for_role(
-        manifest,
-        role="request_best_summary_confidences",
-        display_name=run_name,
-    )
-    best_summary_files = [item for item in json_files if item[0] == best_summary_member]
-    if len(best_summary_files) != 1:
-        raise ValueError(
-            f"AlphaFold3 request archive requires member {best_summary_member!r}; "
-            f"found {len(best_summary_files)}"
-        )
-    metric_rows = ppiflow_tables.refold_metric_rows_from_json_files(
-        best_summary_files,
-        candidate_id=candidate_id,
-        stage_name=step_name,
-    )
-    metrics_output = _inline_csv_table_output(
-        name=f"refold_quality_metrics_{sanitize_filename(candidate_id)}",
-        filename=f"{sanitize_filename(candidate_id)}_refold_quality_metrics.csv",
-        rows=metric_rows,
-        metadata={
-            "candidate_id": candidate_id,
-            "step_name": step_name,
-            "source_structure": structure_name,
-        },
-    )
-    outputs = [
-        AppOutput(
-            name=f"alphafold3_refolded_structures_{sanitize_filename(candidate_id)}",
-            kind=ArtifactKind.STRUCTURES,
-            storage=volume_path_from_mount_path(
-                str(published_archive),
-                ALPHAFOLD3_OUTPUT_MOUNTPOINT,
-                ALPHAFOLD3_OUTPUT_VOLUME_NAME,
-                ZSTD_MEDIA_TYPE,
-            ),
-            metadata={
-                "step_name": step_name,
-                "run_name": run_name,
-                "candidate_id": candidate_id,
-                "source_structure": structure_name,
-                "archive_format": "tar.zst",
-                "structure_patterns": (best_model_member,),
-                "request_best_model_archive_member": best_model_member,
-                "candidate_files": [
-                    ppiflow_manifests.candidate_file_record(
-                        role="structure",
-                        volume_name=ALPHAFOLD3_OUTPUT_VOLUME_NAME,
-                        app_volume_path=published_archive.relative_to(
-                            ALPHAFOLD3_OUTPUT_MOUNTPOINT
-                        ).as_posix(),
-                        path=published_archive.name,
-                        media_type=ZSTD_MEDIA_TYPE,
-                        size_bytes=archive_size,
-                        content_sha256=archive_sha256,
-                    )
-                ],
-                "files": [
-                    archive_file.model_dump(
-                        exclude_defaults=True,
-                        exclude_none=True,
-                    )
-                ],
-            },
-        )
-    ]
-    if metrics_output is not None:
-        outputs.append(metrics_output)
-    return outputs
-
-
-def _bytes_payload(value: object, label: str) -> bytes:
-    if not isinstance(value, bytes):
-        raise TypeError(f"{label} must be bytes")
-    return value
-
-
-def _candidate_manifest_frame_from_inputs(
-    candidate_manifests: Sequence[WorkflowArtifact],
-    selected_structures: Sequence[tuple[str, bytes]],
-    *,
-    step_name: str,
-) -> pl.DataFrame:
-    if candidate_manifests:
-        frames = _read_candidate_manifest_artifacts(candidate_manifests)
-        frame = pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
-        if frame.is_empty():
-            raise ValueError("Supplied candidate manifests produced no usable rows")
-        return frame
-
-    rows = [
-        ppiflow_manifests.candidate_manifest_row(
-            candidate_id=ppiflow_tables.candidate_key(name),
-            stage_name=step_name,
-            stage_role="structure_selection",
-            operation_mode="legacy_structure_keys",
-            candidate_status=AppRunStatus.SUCCEEDED.value,
-            source_path=name,
-            derived_path=name,
-            files=[
-                ppiflow_manifests.candidate_file_record(
-                    role="structure",
-                    path=name,
-                    size_bytes=len(data),
-                    content_sha256=hashlib.sha256(data).hexdigest(),
-                )
-            ],
-        )
-        for name, data in selected_structures
-    ]
-    return pl.DataFrame(rows)
-
-
-def _read_candidate_manifest_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
-) -> list[pl.DataFrame]:
-    frames = []
-    for artifact in artifacts:
-        if artifact.kind != ArtifactKind.TABLE:
-            raise ValueError(
-                f"Candidate manifest {artifact.artifact_id!r} is not a table"
-            )
-        try:
-            frames.append(
-                ppiflow_manifests.read_manifest_volume_path(
-                    storage=artifact.storage,
-                    volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
-                )
-            )
-        except (FileNotFoundError, ValueError, pl.exceptions.PolarsError) as error:
-            raise ValueError(
-                f"Could not read candidate manifest {artifact.artifact_id!r}: {error}"
-            ) from error
-    return frames
-
-
-def _fixed_positions_by_candidate(
-    artifacts: Sequence[WorkflowArtifact],
-    selected_structures: Sequence[ppiflow_staging.CandidateStructureFile],
-) -> dict[str, str]:
-    lookup: dict[str, str] = {}
-    for artifact in artifacts:
-        raw_mapping = artifact.metadata.get("fixed_positions_by_structure")
-        if isinstance(raw_mapping, Mapping):
-            lookup.update({
-                str(candidate_key): str(fixed_positions)
-                for candidate_key, fixed_positions in raw_mapping.items()
-                if fixed_positions
-            })
-        fixed_positions = artifact.metadata.get("fixed_positions")
-        if fixed_positions:
-            for structure in selected_structures:
-                lookup.setdefault(structure.candidate_id, str(fixed_positions))
-
-    by_candidate = {}
-    for structure in selected_structures:
-        keys = {
-            structure.candidate_id,
-            ppiflow_tables.candidate_key(structure.file_name),
-        }
-        if structure.source_path:
-            keys.add(ppiflow_tables.candidate_key(structure.source_path))
-        for key in keys:
-            if key in lookup:
-                by_candidate[structure.candidate_id] = lookup[key]
-                break
-    return by_candidate
-
-
-def _parse_seed_values(value: object) -> list[int]:
-    if isinstance(value, str):
-        seeds = [int(part.strip()) for part in value.split(",") if part.strip()]
-    elif isinstance(value, int):
-        seeds = [value]
-    elif isinstance(value, Sequence):
-        seeds = [int(seed) for seed in value]
-    else:
-        raise TypeError("seeds must be an integer, comma-separated string, or sequence")
-    if not seeds:
-        raise ValueError("seeds must contain at least one integer")
-    return seeds
-
-
-def _config_int(config: Mapping[str, object], key: str, default: int) -> int:
-    value = config.get(key)
-    if value is None:
-        return default
-    if isinstance(value, int | float | str):
-        return int(value)
-    raise TypeError(f"{key} must be an integer")
-
-
-def _optional_config_int(
-    config: Mapping[str, object],
-    key: str,
-) -> int | None:
-    if config.get(key) is None:
-        return None
-    return _config_int(config, key, 0)
-
-
-def _patterns_from_config(
-    config: Mapping[str, object],
-    *,
-    default: Sequence[str] | None = None,
-) -> tuple[str, ...] | None:
-    raw_patterns = config.get("structure_patterns") or config.get("patterns")
-    if raw_patterns is None:
-        return tuple(default) if default is not None else None
-    if isinstance(raw_patterns, str):
-        return tuple(
-            pattern.strip() for pattern in raw_patterns.split(",") if pattern.strip()
-        )
-    return tuple(str(pattern) for pattern in raw_patterns)
-
-
 def _resolve_rosetta_config_text(value: str, field_name: str) -> str:
     config_path = Path(value).expanduser()
     has_newline = "\n" in value
@@ -4180,73 +1876,6 @@ def _ligandmpnn_cli_kwargs(
     return kwargs
 
 
-def _af3_config_for_refold(
-    *,
-    structure_name: str,
-    structure_bytes: bytes,
-    run_name: str,
-    config: Mapping[str, object],
-) -> AF3Config:
-    if config.get("af3_config_json") is not None:
-        conf = AF3Config.model_validate_json(str(config["af3_config_json"]))
-        conf.name = run_name
-        return conf
-
-    residue_map = {
-        "ALA": "A",
-        "ARG": "R",
-        "ASN": "N",
-        "ASP": "D",
-        "CYS": "C",
-        "GLN": "Q",
-        "GLU": "E",
-        "GLY": "G",
-        "HIS": "H",
-        "ILE": "I",
-        "LEU": "L",
-        "LYS": "K",
-        "MET": "M",
-        "PHE": "F",
-        "PRO": "P",
-        "SER": "S",
-        "THR": "T",
-        "TRP": "W",
-        "TYR": "Y",
-        "VAL": "V",
-    }
-    chains: dict[str, list[str]] = {}
-    seen: set[tuple[str, str]] = set()
-    for line in structure_bytes.decode("utf-8", errors="ignore").splitlines():
-        if not line.startswith("ATOM") or line[12:16].strip() != "CA":
-            continue
-        chain_id = line[21].strip() or "A"
-        residue_id = line[22:27].strip()
-        residue_key = (chain_id, residue_id)
-        if residue_key in seen:
-            continue
-        seen.add(residue_key)
-        residue_name = line[17:20].strip().upper()
-        chains.setdefault(chain_id, []).append(residue_map.get(residue_name, "X"))
-    if not chains:
-        raise ValueError(f"Could not derive AlphaFold3 sequence from {structure_name}")
-
-    return AF3Config(
-        name=run_name,
-        modelSeeds=[
-            int(seed) for seed in _parse_seed_values(config.get("model_seeds", [1]))
-        ],
-        sequences=[
-            AF3SequenceEntry(
-                protein=AF3Protein(
-                    id=chain_id,
-                    sequence="".join(sequence),
-                )
-            )
-            for chain_id, sequence in sorted(chains.items())
-        ],
-    )
-
-
 def build_ppiflow_workflow(
     *,
     task_yaml_bytes: bytes,
@@ -4260,20 +1889,19 @@ def build_ppiflow_workflow(
         raise ValueError("stage must be omitted, 1, or 2")
     task_doc = _load_yaml_bytes(task_yaml_bytes)
     steps_doc = _load_yaml_bytes(steps_yaml_bytes)
-    if max_containers is not None:
-        if max_containers < 1:
-            raise ValueError("max_containers must be at least 1")
-        if max_gpu_containers is None:
-            max_gpu_containers = max_containers
-        if not 0 <= max_gpu_containers <= max_containers:
-            raise ValueError(
-                "max_gpu_containers must be between zero and max_containers"
-            )
-        steps_doc = _steps_doc_with_run_limits(
-            steps_doc,
-            max_containers=max_containers,
-            max_gpu_containers=max_gpu_containers,
-        )
+    max_containers = 16 if max_containers is None else max_containers
+    max_gpu_containers = (
+        max_containers if max_gpu_containers is None else max_gpu_containers
+    )
+    if max_containers < 1:
+        raise ValueError("max_containers must be at least 1")
+    if not 0 <= max_gpu_containers <= max_containers:
+        raise ValueError("max_gpu_containers must be between zero and max_containers")
+    steps_doc = _steps_doc_with_run_limits(
+        steps_doc,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     task = _task_section(task_doc)
     enabled = _enabled_section(task_doc)
     gentype = str(task.get("gentype") or task.get("design_mode") or "binder")
@@ -4413,20 +2041,6 @@ def _ppiflow_step_model_weights_name(
     if not isinstance(app_args.args, expected_types):
         raise ValueError("PPIFlow step uses the wrong operation mode")
     return app_args.model_weights_name
-
-
-def _validated_ppiflow_partial_args(
-    raw_args: dict[str, Any],
-    *,
-    structure_path: str,
-    fixed_positions: str | None,
-) -> ppiflow_app.PPIFlowArgs:
-    completed = raw_args.copy()
-    structure_field = "complex_pdb" if "complex_pdb" in completed else "input_pdb"
-    completed[structure_field] = structure_path
-    if "fixed_positions" not in completed and fixed_positions is not None:
-        completed["fixed_positions"] = fixed_positions
-    return ppiflow_app.PPIFlowArgs.model_validate({"args": completed})
 
 
 def _add_stage1_nodes(
@@ -4876,21 +2490,6 @@ def _client_volume_file_record(storage: VolumePath) -> dict[str, object]:
     )
 
 
-def _mounted_volume_file_record(storage: VolumePath) -> dict[str, object]:
-    root = PPI_FLOW_SOURCE_VOLUME_ROOTS.get(storage.volume_name)
-    if root is None:
-        raise ValueError(f"Unknown Stage2Input volume {storage.volume_name!r}")
-    path = storage.at_mountpoint(root)
-    if not path.is_file():
-        raise FileNotFoundError(f"Stage2Input file was not found: {storage}")
-    with path.open("rb") as handle:
-        return _streamed_volume_file_record(
-            volume_name=storage.volume_name,
-            path=storage.path,
-            chunks=iter(lambda: handle.read(1024 * 1024), b""),
-        )
-
-
 def _manifest_structure_storages(
     frame: pl.DataFrame,
 ) -> list[tuple[VolumePath, int, str]]:
@@ -5038,61 +2637,6 @@ def _bind_stage2_input_identity(
     return bound
 
 
-def _validate_stage2_input_snapshot(
-    *, storage: VolumePath, config: Mapping[str, object]
-) -> None:
-    snapshot = config.get(_STAGE2_INPUT_SNAPSHOT_KEY)
-    if not isinstance(snapshot, Mapping):
-        raise ValueError("Stage2Input is missing its content snapshot")
-    manifest = snapshot.get("manifest")
-    if manifest is not None:
-        if not isinstance(manifest, Mapping):
-            raise ValueError("Stage2Input manifest snapshot is invalid")
-        manifest = cast(Mapping[str, object], manifest)
-        manifest_storage = VolumePath(
-            volume_name=str(manifest["volume_name"]),
-            path=str(manifest["path"]),
-        )
-        if _mounted_volume_file_record(manifest_storage) != dict(manifest):
-            raise ValueError("Stage2Input manifest changed after submission")
-    raw_structures = snapshot.get("structures")
-    if not isinstance(raw_structures, list) or not raw_structures:
-        raise ValueError("Stage2Input snapshot contains no structures")
-    if any(not isinstance(record, Mapping) for record in raw_structures):
-        raise ValueError("Stage2Input structure snapshot is invalid")
-    expected_records = [
-        dict(cast(Mapping[str, object], record)) for record in raw_structures
-    ]
-    actual_records = [
-        _mounted_volume_file_record(
-            VolumePath(
-                volume_name=str(record["volume_name"]),
-                path=str(record["path"]),
-            )
-        )
-        for record in expected_records
-    ]
-    if actual_records != expected_records:
-        raise ValueError("Stage2Input structures changed after submission")
-
-    if manifest is None:
-        root = storage.at_mountpoint(PPI_FLOW_SOURCE_VOLUME_ROOTS[storage.volume_name])
-        if root.is_file():
-            current_paths = [storage.path]
-        else:
-            patterns = _patterns_from_config(config)
-            current_paths = sorted(
-                str(PurePosixPath(storage.path) / path.relative_to(root).as_posix())
-                for path in root.rglob("*")
-                if path.is_file()
-                and ppiflow_staging.matches_structure_pattern(
-                    path.relative_to(root).as_posix(), patterns
-                )
-            )
-        if current_paths != [str(record["path"]) for record in expected_records]:
-            raise ValueError("Stage2Input structure set changed after submission")
-
-
 def _stage2_manifest_storage_from_config(
     config: Mapping[str, object],
     *,
@@ -5190,7 +2734,11 @@ def _steps_doc_with_run_limits(
         if not isinstance(raw_cfg, dict):
             configured[step_name] = raw_cfg
             continue
-        cfg = dict(raw_cfg)
+        cfg = {
+            key: value
+            for key, value in raw_cfg.items()
+            if key not in _OBSOLETE_CONFIG_KEYS
+        }
         cfg["_max_containers"] = max_containers
         cfg["_max_gpu_containers"] = max_gpu_containers
         configured[step_name] = cfg

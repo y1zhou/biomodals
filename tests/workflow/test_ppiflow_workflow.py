@@ -45,6 +45,18 @@ from biomodals.workflow.core import (
     hashing,
 )
 from biomodals.workflow.core.execution import execution_plan
+from biomodals.workflow.ppiflow import (
+    af3score_runtime,
+    analysis_runtime,
+    dockq_runtime,
+    flowpacker_runtime,
+    ligandmpnn_runtime,
+    ppiflow_runtime,
+    refold_runtime,
+    rosetta_runtime,
+    runtime_context,
+    runtime_support,
+)
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow_workflow import (
     CONF,
@@ -148,8 +160,9 @@ def _manifest_ancestor_chain(definition, node_id: str) -> list[str]:
     return chain
 
 
-def _decorator_block(source: str, function_name: str) -> str:
-    return source.split(f"def {function_name}", 1)[0].rsplit("@app.function", 1)[-1]
+def _function_binding(source: str, function_name: str) -> str:
+    binding = source.split(f"{function_name} = app.function(", 1)[1]
+    return binding.split("\n\n", 1)[0]
 
 
 def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
@@ -157,13 +170,46 @@ def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Pat
     workflow_root = tmp_path / "workflow"
     source_root.mkdir()
     workflow_root.mkdir()
-    monkeypatch.setattr(
-        ppiflow_workflow, "_reload_ppiflow_source_volumes", lambda: None
-    )
+    roots = {"source-volume": str(source_root), "workflow-volume": str(workflow_root)}
+    for module in (
+        af3score_runtime,
+        analysis_runtime,
+        dockq_runtime,
+        flowpacker_runtime,
+        ligandmpnn_runtime,
+        ppiflow_runtime,
+        refold_runtime,
+        rosetta_runtime,
+    ):
+        if hasattr(module, "reload_source_volumes"):
+            monkeypatch.setattr(module, "reload_source_volumes", lambda: None)
+        if hasattr(module, "_reload_ppiflow_source_volumes"):
+            monkeypatch.setattr(
+                module,
+                "_reload_ppiflow_source_volumes",
+                lambda: None,
+            )
+        if hasattr(module, "SOURCE_VOLUME_ROOTS"):
+            monkeypatch.setattr(module, "SOURCE_VOLUME_ROOTS", roots)
+        if hasattr(module, "PPI_FLOW_SOURCE_VOLUME_ROOTS"):
+            monkeypatch.setattr(module, "PPI_FLOW_SOURCE_VOLUME_ROOTS", roots)
     monkeypatch.setattr(
         ppiflow_workflow,
         "PPI_FLOW_SOURCE_VOLUME_ROOTS",
-        {"source-volume": str(source_root), "workflow-volume": str(workflow_root)},
+        roots,
+    )
+    monkeypatch.setattr(runtime_context, "SOURCE_VOLUME_ROOTS", roots)
+    monkeypatch.setattr(runtime_support, "SOURCE_VOLUME_ROOTS", roots)
+    monkeypatch.setattr(
+        analysis_runtime, "WORKFLOW_OUTPUT_MOUNTPOINT", str(workflow_root)
+    )
+    monkeypatch.setattr(
+        analysis_runtime, "WORKFLOW_OUTPUT_VOLUME_NAME", "workflow-volume"
+    )
+    monkeypatch.setattr(
+        analysis_runtime,
+        "WORKFLOW_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: None),
     )
     monkeypatch.setattr(
         ppiflow_workflow, "WORKFLOW_OUTPUT_MOUNTPOINT", str(workflow_root)
@@ -176,6 +222,17 @@ def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Pat
         "WORKFLOW_OUTPUT_VOLUME",
         SimpleNamespace(commit=lambda: None),
     )
+    monkeypatch.setattr(
+        runtime_support, "WORKFLOW_OUTPUT_MOUNTPOINT", str(workflow_root)
+    )
+    monkeypatch.setattr(
+        runtime_support, "WORKFLOW_OUTPUT_VOLUME_NAME", "workflow-volume"
+    )
+    monkeypatch.setattr(
+        runtime_support,
+        "WORKFLOW_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: None),
+    )
     return source_root, workflow_root
 
 
@@ -185,12 +242,12 @@ def _mounted_stage2_snapshot(
 ) -> dict[str, object]:
     snapshot: dict[str, object] = {
         "structures": [
-            ppiflow_workflow._mounted_volume_file_record(storage)
+            analysis_runtime._mounted_volume_file_record(storage)
             for storage in storages
         ]
     }
     if manifest is not None:
-        snapshot["manifest"] = ppiflow_workflow._mounted_volume_file_record(manifest)
+        snapshot["manifest"] = analysis_runtime._mounted_volume_file_record(manifest)
     return snapshot
 
 
@@ -395,51 +452,51 @@ PartialStep:
 def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
     source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
 
-    assert "ALPHAFOLD3_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "ALPHAFOLD3_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_refold_candidate",
     )
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_dockq_stage",
     )
-    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_partial_candidate",
     )
-    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_design_stage",
     )
-    assert "LIGANDMPNN_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "LIGANDMPNN_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_ligandmpnn_candidate",
     )
-    assert "FLOWPACKER_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "FLOWPACKER_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_flowpacker_stage",
     )
-    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "prepare_ppiflow_af3score_stage",
     )
-    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_af3score_batch",
     )
-    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "postprocess_ppiflow_af3score_stage",
     )
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
         source,
         "prepare_ppiflow_rosetta_stage",
     )
-    assert "ROSETTA_TASK_VOLUME_MOUNTS" in _decorator_block(
+    assert "ROSETTA_TASK_VOLUME_MOUNTS" in _function_binding(
         source,
         "run_ppiflow_rosetta_worker",
     )
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _decorator_block(
+    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
         source,
         "finalize_ppiflow_rosetta_stage",
     )
@@ -611,8 +668,8 @@ def test_flowpacker_stage_executes_batch_in_tracked_provider_call(
         AppRunResult(status=AppRunStatus.SUCCEEDED),
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
-        "_reload_ppiflow_source_volumes",
+        flowpacker_runtime,
+        "reload_source_volumes",
         lambda: None,
     )
     monkeypatch.setattr(
@@ -690,10 +747,23 @@ def test_design_stage_publishes_digest_bearing_candidate_manifest(
         str(output_root),
     )
     monkeypatch.setattr(
+        ppiflow_runtime,
+        "PPI_FLOW_OUTPUT_MOUNTPOINT",
+        str(output_root),
+    )
+    monkeypatch.setattr(
         ppiflow_workflow,
         "PPI_FLOW_SOURCE_VOLUME_ROOTS",
         {
             **ppiflow_workflow.PPI_FLOW_SOURCE_VOLUME_ROOTS,
+            ppiflow_app.CONF.output_volume_name: str(output_root),
+        },
+    )
+    monkeypatch.setattr(
+        ppiflow_runtime,
+        "SOURCE_VOLUME_ROOTS",
+        {
+            **ppiflow_runtime.SOURCE_VOLUME_ROOTS,
             ppiflow_app.CONF.output_volume_name: str(output_root),
         },
     )
@@ -886,8 +956,18 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
         str(output_root),
     )
     monkeypatch.setattr(
+        ppiflow_runtime,
+        "PPI_FLOW_OUTPUT_MOUNTPOINT",
+        str(output_root),
+    )
+    monkeypatch.setattr(
         ppiflow_workflow,
         "PPI_FLOW_OUTPUT_VOLUME",
+        SimpleNamespace(commit=lambda: None),
+    )
+    monkeypatch.setitem(
+        ppiflow_runtime.SOURCE_VOLUMES,
+        ppiflow_runtime.PPI_FLOW_OUTPUT_VOLUME_NAME,
         SimpleNamespace(commit=lambda: None),
     )
 
@@ -977,7 +1057,7 @@ def test_supplied_invalid_candidate_manifest_fails_closed(
     )
 
     with pytest.raises(ValueError, match="broken-manifest"):
-        ppiflow_workflow._candidate_manifest_frame_from_inputs(
+        runtime_support.candidate_manifest_frame_from_inputs(
             [artifact],
             [("legacy.pdb", b"ATOM\n")],
             step_name="FilterStep_stage2",
@@ -990,7 +1070,11 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
 ) -> None:
     prepare_node = ppiflow_workflow.AF3ScorePrepareNode(
         "AF3scoreStep_stage1",
-        {"run_name": "af3-run", "num_jobs": 4, "prepare_workers": 2},
+        {
+            "run_name": "af3-run",
+            "_max_gpu_containers": 4,
+            "prepare_workers": 2,
+        },
     )
 
     submission = prepare_node.prepare_remote(
@@ -1018,7 +1102,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
     assert submission.kwargs["execution_run_name"] == (
         f"ppiflow-af3score-{RUN_ID}-stage1-af3score-prepare"
     )
-    assert submission.kwargs["config"]["num_jobs"] == 4
+    assert submission.kwargs["config"]["_max_gpu_containers"] == 4
     assert submission.kwargs["config"]["prepare_workers"] == 2
 
     plan_path = tmp_path / "af3score_task_plan.json"
@@ -1135,18 +1219,16 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     af3_root = tmp_path / "af3"
     commits = []
 
+    monkeypatch.setattr(af3score_runtime, "reload_source_volumes", lambda: None)
     monkeypatch.setattr(
-        ppiflow_workflow, "_reload_ppiflow_source_volumes", lambda: None
-    )
-    monkeypatch.setattr(
-        ppiflow_workflow,
-        "PPI_FLOW_SOURCE_VOLUME_ROOTS",
+        af3score_runtime,
+        "SOURCE_VOLUME_ROOTS",
         {"source-volume": str(source_root)},
     )
-    monkeypatch.setattr(ppiflow_workflow, "AF3SCORE_OUTPUT_MOUNTPOINT", str(af3_root))
-    monkeypatch.setattr(
-        ppiflow_workflow,
-        "AF3SCORE_OUTPUT_VOLUME",
+    monkeypatch.setattr(af3score_runtime, "AF3SCORE_OUTPUT_MOUNTPOINT", str(af3_root))
+    monkeypatch.setitem(
+        af3score_runtime.SOURCE_VOLUMES,
+        af3score_runtime.AF3SCORE_OUTPUT_VOLUME_NAME,
         SimpleNamespace(commit=lambda: commits.append(True)),
     )
 
@@ -1162,7 +1244,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
         )
     ]
     staged, physical_run_name, publication_key, staged_input_key = (
-        ppiflow_workflow._stage_af3score_candidate_inputs(
+        af3score_runtime._stage_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
             execution_run_name="execution-a",
@@ -1183,12 +1265,12 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     assert commits == [True]
 
     monkeypatch.setattr(
-        ppiflow_workflow,
+        af3score_runtime,
         "DECLARED_MODEL_IDENTITY",
         "AlphaFold3/af3.bin:v2",
     )
     _staged, model_run_name, model_key, _model_staged_key = (
-        ppiflow_workflow._stage_af3score_candidate_inputs(
+        af3score_runtime._stage_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
             execution_run_name="execution-model-v2",
@@ -1199,7 +1281,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
 
     (long_dir / "candidate_a.pdb").write_text("CHANGED\n", encoding="utf-8")
     _staged, changed_run_name, changed_key, changed_staged_key = (
-        ppiflow_workflow._stage_af3score_candidate_inputs(
+        af3score_runtime._stage_candidate_inputs(
             artifacts=artifacts,
             candidate_manifests=None,
             execution_run_name="execution-b",
@@ -1232,8 +1314,8 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
             encoding="utf-8",
         )
     monkeypatch.setattr(
-        ppiflow_workflow,
-        "_stage_af3score_candidate_inputs",
+        af3score_runtime,
+        "_stage_candidate_inputs",
         lambda **_kwargs: (
             [
                 {
@@ -1362,13 +1444,13 @@ def test_af3score_postprocess_returns_per_candidate_outcomes(
         },
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        af3score_runtime,
         "AF3SCORE_OUTPUT_MOUNTPOINT",
         str(af3_root),
     )
-    monkeypatch.setattr(
-        ppiflow_workflow,
-        "AF3SCORE_OUTPUT_VOLUME",
+    monkeypatch.setitem(
+        af3score_runtime.SOURCE_VOLUMES,
+        af3score_runtime.AF3SCORE_OUTPUT_VOLUME_NAME,
         SimpleNamespace(reload=lambda: None),
     )
     monkeypatch.setattr(
@@ -1479,7 +1561,7 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
     )
     prepare_node = ppiflow_workflow.RosettaPrepareNode(
         "RosettaRelaxStep",
-        {"run_name": "rosetta-run", "rosetta_binary": "relax", "max_num_pods": 1},
+        {"run_name": "rosetta-run", "rosetta_binary": "relax"},
     )
     prepare_call = prepare_node.prepare_remote(
         NodeRunContext(
@@ -1634,13 +1716,17 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     rosetta_root = tmp_path / "rosetta"
     commits = []
     monkeypatch.setattr(
-        ppiflow_workflow,
+        rosetta_runtime,
         "ROSETTA_OUTPUT_MOUNTPOINT",
         str(rosetta_root),
     )
-    monkeypatch.setattr(ppiflow_workflow, "ROSETTA_OUTPUT_VOLUME_NAME", "rosetta-vol")
     monkeypatch.setattr(
-        ppiflow_workflow,
+        rosetta_runtime,
+        "ROSETTA_OUTPUT_VOLUME_NAME",
+        "rosetta-vol",
+    )
+    monkeypatch.setattr(
+        rosetta_runtime,
         "ROSETTA_OUTPUT_VOLUME",
         SimpleNamespace(commit=lambda: commits.append(True)),
     )
@@ -1655,7 +1741,7 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     result = ppiflow_workflow.prepare_ppiflow_rosetta_stage.get_raw_f()(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[],
-        config={"rosetta_binary": "relax", "max_num_pods": 2},
+        config={"rosetta_binary": "relax"},
         step_name="RosettaRelaxStep",
         run_name="rosetta-run",
         run_id="run-1",
@@ -1736,12 +1822,12 @@ def test_rosetta_worker_claims_executes_and_checkpoints_microbatch(
     )
     commits = []
     monkeypatch.setattr(
-        ppiflow_workflow,
+        rosetta_runtime,
         "ROSETTA_OUTPUT_MOUNTPOINT",
         str(tmp_path),
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        rosetta_runtime,
         "ROSETTA_OUTPUT_VOLUME",
         SimpleNamespace(commit=lambda: commits.append(True)),
     )
@@ -1869,13 +1955,17 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         ),
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        rosetta_runtime,
         "ROSETTA_OUTPUT_MOUNTPOINT",
         str(rosetta_root),
     )
-    monkeypatch.setattr(ppiflow_workflow, "ROSETTA_OUTPUT_VOLUME_NAME", "rosetta-vol")
     monkeypatch.setattr(
-        ppiflow_workflow,
+        rosetta_runtime,
+        "ROSETTA_OUTPUT_VOLUME_NAME",
+        "rosetta-vol",
+    )
+    monkeypatch.setattr(
+        rosetta_runtime,
         "ROSETTA_OUTPUT_VOLUME",
         SimpleNamespace(reload=lambda: None),
     )
@@ -1883,7 +1973,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
     result = ppiflow_workflow.finalize_ppiflow_rosetta_stage.get_raw_f()(
         plan_artifacts=[plan_artifact],
         outcome_artifacts=[outcomes_artifact],
-        config={"rosetta_binary": "relax", "max_num_pods": 1},
+        config={"rosetta_binary": "relax"},
         step_name="RosettaRelaxStep",
         run_id="run-1",
         node_id="stage2-rosetta-relax",
@@ -1982,22 +2072,19 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
 
 
 def test_refold_uses_alphafold3_helpers_from_their_owning_modules() -> None:
-    assert ppiflow_workflow.AF3Config is AF3Config
+    assert refold_runtime.AF3Config is AF3Config
     assert (
-        ppiflow_workflow.prepare_inference_run is inference_inputs.prepare_inference_run
+        refold_runtime.prepare_inference_run is inference_inputs.prepare_inference_run
     )
-    assert ppiflow_workflow.stage_inference_run is modal_adapters.stage_inference_run
-    assert ppiflow_workflow.RequestPublication is request_results.RequestPublication
+    assert refold_runtime.stage_inference_run is modal_adapters.stage_inference_run
+    assert refold_runtime.RequestPublication is request_results.RequestPublication
+    assert refold_runtime.load_request_manifest is request_results.load_request_manifest
     assert (
-        ppiflow_workflow.load_request_manifest is request_results.load_request_manifest
-    )
-    assert (
-        ppiflow_workflow.request_manifest_from_result
+        refold_runtime.request_manifest_from_result
         is request_results.request_manifest_from_result
     )
     assert (
-        ppiflow_workflow.create_request_archive
-        is request_results.create_request_archive
+        refold_runtime.create_request_archive is request_results.create_request_archive
     )
 
 
@@ -2024,27 +2111,27 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
         display_name="Workload Z",
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
-        "_af3_config_for_refold",
+        refold_runtime,
+        "_af3_config",
         lambda **_kwargs: object(),
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        refold_runtime,
         "resolve_msa_and_templates",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        refold_runtime,
         "prepare_inference_run",
         lambda *_args, **_kwargs: prepared,
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        refold_runtime,
         "load_request_manifest",
         lambda *_args, **_kwargs: {"status": "complete"},
     )
     monkeypatch.setattr(
-        ppiflow_workflow,
+        refold_runtime,
         "request_archive_member_for_role",
         lambda _manifest, *, role, display_name: {
             "request_best_model": best_model,
@@ -2057,7 +2144,7 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
         path.write_bytes(archive_bytes)
         return path
 
-    monkeypatch.setattr(ppiflow_workflow, "create_request_archive", create_archive)
+    monkeypatch.setattr(refold_runtime, "create_request_archive", create_archive)
     output_root = tmp_path / "alphafold3-output"
     commit_count = 0
 
@@ -2066,18 +2153,15 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
         commit_count += 1
 
     monkeypatch.setattr(
-        ppiflow_workflow, "ALPHAFOLD3_OUTPUT_MOUNTPOINT", str(output_root)
+        refold_runtime, "ALPHAFOLD3_OUTPUT_MOUNTPOINT", str(output_root)
     )
     monkeypatch.setattr(
-        ppiflow_workflow, "ALPHAFOLD3_OUTPUT_VOLUME_NAME", "AlphaFold3-outputs"
-    )
-    monkeypatch.setattr(
-        ppiflow_workflow,
-        "ALPHAFOLD3_OUTPUT_VOLUME",
-        SimpleNamespace(commit=commit),
+        refold_runtime,
+        "SOURCE_VOLUMES",
+        {"AlphaFold3-outputs": SimpleNamespace(commit=commit)},
     )
 
-    outputs = ppiflow_workflow._run_one_refold_candidate(
+    outputs = refold_runtime._run_candidate(
         structure_name="candidate.pdb",
         structure_bytes=b"ATOM\n",
         candidate_id="candidate-a",
@@ -2152,7 +2236,7 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
 
 
 def test_refold_builds_af3_config_without_app_reexports() -> None:
-    config = ppiflow_workflow._af3_config_for_refold(
+    config = refold_runtime._af3_config(
         structure_name="candidate.pdb",
         structure_bytes=(
             b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000"
@@ -2282,12 +2366,12 @@ def test_dockq_stage_rejects_unpaired_structure_counts(
         ],
     ])
     monkeypatch.setattr(
-        ppiflow_workflow,
-        "_reload_ppiflow_source_volumes",
+        dockq_runtime,
+        "reload_source_volumes",
         lambda: None,
     )
     monkeypatch.setattr(
-        ppiflow_workflow.ppiflow_staging,
+        dockq_runtime.staging,
         "select_structure_files_from_artifacts",
         lambda *args, **kwargs: next(selected),
     )
@@ -2321,17 +2405,17 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
         return next(selected)
 
     monkeypatch.setattr(
-        ppiflow_workflow,
-        "_reload_ppiflow_source_volumes",
+        dockq_runtime,
+        "reload_source_volumes",
         lambda: None,
     )
     monkeypatch.setattr(
-        ppiflow_workflow.ppiflow_staging,
+        dockq_runtime.staging,
         "select_structure_files_from_artifacts",
         select_structures,
     )
     monkeypatch.setattr(
-        ppiflow_workflow.dockq_app,
+        dockq_runtime.dockq_app,
         "run_dockq_workflow",
         dockq,
     )
@@ -3384,22 +3468,35 @@ task:
 steps:
   MPNNStep_stage1: true
   AF3scoreStep_stage1: true
+  RosettaFixStep: true
 """,
         steps_yaml_bytes=b"""
 MPNNStep_stage1:
   candidate_concurrency: 2
-AF3scoreStep_stage1: {}
+  max_child_calls: 2
+AF3scoreStep_stage1:
+  max_batches: 2
+  num_jobs: 2
+RosettaFixStep:
+  max_num_pods: 2
 """,
     )
 
     definition = workflow.validate()
 
-    assert (
-        definition.nodes["stage1-ligandmpnn"].node.config["candidate_concurrency"] == 2
-    )
-    assert (
-        "candidate_concurrency" not in definition.nodes["stage1-af3score"].node.config
-    )
+    obsolete = {
+        "candidate_concurrency",
+        "max_child_calls",
+        "max_batches",
+        "max_num_pods",
+        "num_jobs",
+    }
+    for node_id in (
+        "stage1-ligandmpnn",
+        "stage1-af3score",
+        "stage2-rosetta-fix",
+    ):
+        assert obsolete.isdisjoint(definition.nodes[node_id].node.config)
 
 
 def test_ppiflow_propagates_run_container_limits() -> None:
@@ -3407,19 +3504,15 @@ def test_ppiflow_propagates_run_container_limits() -> None:
         task_yaml_bytes=b"""
 task:
   gentype: binder
-  candidate_concurrency: 5
 steps:
   MPNNStep_stage1: true
   AF3scoreStep_stage1: true
   RosettaFixStep: true
 """,
         steps_yaml_bytes=b"""
-MPNNStep_stage1:
-  candidate_concurrency: 4
-AF3scoreStep_stage1:
-  num_jobs: 6
-RosettaFixStep:
-  max_num_pods: 7
+MPNNStep_stage1: {}
+AF3scoreStep_stage1: {}
+RosettaFixStep: {}
 """,
         max_containers=3,
         max_gpu_containers=2,
@@ -3456,7 +3549,6 @@ def test_ppiflow_operational_fanout_does_not_change_scientific_dag_hash() -> Non
     task_yaml = b"""
 task:
   gentype: binder
-  candidate_concurrency: 8
 steps:
   MPNNStep_stage1: true
   AF3scoreStep_stage1: true
@@ -3469,13 +3561,10 @@ steps:
                 task_yaml_bytes=task_yaml,
                 steps_yaml_bytes=f"""
 MPNNStep_stage1:
-  candidate_concurrency: 6
   max_structures: {max_structures}
 AF3scoreStep_stage1:
-  num_jobs: 7
   prepare_workers: 4
-RosettaFixStep:
-  max_num_pods: 5
+RosettaFixStep: {{}}
 """.encode(),
                 max_containers=max_containers,
                 max_gpu_containers=min(2, max_containers),

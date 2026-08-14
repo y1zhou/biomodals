@@ -365,18 +365,12 @@ def af3score_run(
             ):
                 target_dir = batch_gpu_root / target_name
                 target_dir.mkdir()
-                sources = {
-                    path.stem: path
-                    for path in source_dir.glob(f"*{suffix}")
-                    if path.is_file()
-                }
                 for input_id in selected_input_ids:
-                    try:
-                        source = sources[input_id]
-                    except KeyError as error:
+                    source = source_dir / f"{input_id}{suffix}"
+                    if not source.is_file():
                         raise FileNotFoundError(
-                            f"AF3Score prepared input is missing: {input_id}{suffix}"
-                        ) from error
+                            f"AF3Score prepared input is missing: {source.name}"
+                        )
                     target_dir.joinpath(source.name).symlink_to(source.resolve())
             batch_json_dir = str(batch_gpu_root / "json")
             batch_pdb_dir = str(batch_gpu_root / "pdb")

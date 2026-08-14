@@ -394,7 +394,12 @@ def _validate_container_limit_options(
     max_containers: int | None,
     max_gpu_containers: int | None,
 ) -> None:
-    """Reject an impossible GPU-subset ceiling at the outer CLI seam."""
+    """Reject invalid explicit GPU ceilings at the outer CLI seam."""
+    if max_gpu_containers is not None and max_gpu_containers < 1:
+        console.print(
+            "[bold red]Error[/bold red] --max-gpu-containers must be at least 1"
+        )
+        raise typer.Exit(code=1)
     if (
         max_containers is not None
         and max_gpu_containers is not None
@@ -633,7 +638,7 @@ def run_modal_app(
         int | None,
         typer.Option(
             "--max-gpu-containers",
-            min=0,
+            min=1,
             help="Maximum active GPU Provider Calls within the total limit.",
         ),
     ] = None,
@@ -1080,7 +1085,7 @@ def restart_execution_run(
         int | None,
         typer.Option(
             "--max-gpu-containers",
-            min=0,
+            min=1,
             help="Override the predecessor's active GPU-call limit.",
         ),
     ] = None,
@@ -1260,7 +1265,7 @@ def run_workflow(
         int | None,
         typer.Option(
             "--max-gpu-containers",
-            min=0,
+            min=1,
             help="Maximum active GPU Provider Calls within the total limit.",
         ),
     ] = None,

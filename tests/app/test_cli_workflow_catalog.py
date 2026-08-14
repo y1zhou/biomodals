@@ -17,6 +17,17 @@ from biomodals.helper.styling import strip_ansi
 runner = CliRunner()
 
 
+@pytest.mark.parametrize("namespace", ["app", "workflow"])
+def test_run_rejects_an_explicit_zero_gpu_container_limit(namespace: str) -> None:
+    result = runner.invoke(
+        app,
+        [namespace, "run", "--max-gpu-containers", "0", "placeholder"],
+    )
+
+    assert result.exit_code == 2
+    assert "x>=1" in strip_ansi(result.output)
+
+
 def test_cli_loads_workflow_namespace_names() -> None:
     workflow = _load_entry("workflow", "ppiflow")
 

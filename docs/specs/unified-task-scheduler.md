@@ -1469,9 +1469,9 @@ is full does not prevent a CPU candidate from using a total slot. The GPU
 ceiling is an upper bound, not a quota. When that ceiling is zero, the
 coordinator admits feasible CPU work and suspends for unavailable capacity
 only after GPU work is the sole remaining frontier and no Provider Call is
-active. Workload frontends that know before submission that a Run contains GPU
-work reject a zero GPU ceiling instead of constructing a Run that cannot
-finish. CPU-only Runs may use a zero GPU ceiling.
+active. The unified CLI accepts only positive values when
+`--max-gpu-containers` is supplied. CPU-only Runs may still use a zero GPU
+ceiling through workload defaults when the CLI option is omitted.
 
 Admission operates on Provider Call candidates rather than raw Tasks. Two
 compatible GPU Tasks may already form one fixed-batch candidate and therefore

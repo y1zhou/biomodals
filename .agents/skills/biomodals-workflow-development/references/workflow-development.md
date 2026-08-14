@@ -419,8 +419,10 @@ do not expose another remote concurrency setting. PPIFlow AF3Score uses the GPU
 ceiling to form length-balanced batches. PPIFlow Rosetta sizes its pull-worker
 pool from the total ceiling because those workers are CPU-only.
 
-Reject a zero GPU ceiling before submission when the workflow can determine
-that its DAG contains GPU work. CPU-only workflows may use a zero GPU ceiling.
+The unified CLI accepts only positive explicit `--max-gpu-containers` values.
+CPU-only workflows may use a zero GPU ceiling through their defaults when the
+option is omitted. Do not duplicate this outer CLI validation in workflow
+entrypoints.
 
 ## Runtime Diagnostics
 

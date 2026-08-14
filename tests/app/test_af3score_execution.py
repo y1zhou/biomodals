@@ -22,6 +22,8 @@ from biomodals.app.score.af3score_execution import (
     AF3ScoreExecutionRuntime,
     ChunkSpec,
     TaskSpec,
+    af3score_staged_input_directory,
+    af3score_staged_input_key,
     persist_execution_request,
 )
 from biomodals.app.score.af3score_publications import (
@@ -153,51 +155,42 @@ class CompletingDriver:
 
 
 def _request() -> AF3ScoreExecutionRequest:
+    inputs = tuple(
+        (name, sha256(content).hexdigest()) for name, content in INPUT_CONTENT.items()
+    )
     return AF3ScoreExecutionRequest(
         run_name="scores",
-        inputs=tuple(
-            (name, sha256(content).hexdigest())
-            for name, content in INPUT_CONTENT.items()
-        ),
-        staged_input_execution_run_id=str(RUN_ID),
+        inputs=inputs,
+        staged_input_key=af3score_staged_input_key(inputs),
         prepare_workers=4,
-        max_batches=2,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
         app_version="b0764aa",
     )
 
 
 def _stage_request_inputs(root: Path, request: AF3ScoreExecutionRequest) -> None:
-    directory = (
-        root
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / request.staged_input_execution_run_id
-        / "inputs"
+    directory = root.joinpath(
+        *af3score_staged_input_directory(request.staged_input_key).parts
     )
     directory.mkdir(parents=True)
     for name in request.input_names:
         directory.joinpath(name).write_bytes(INPUT_CONTENT[name])
 
 
-def test_provider_limits_round_trip_independently_of_batch_count() -> None:
+def test_provider_limits_round_trip() -> None:
     request = replace(
         _request(),
         max_active_provider_calls=8,
         max_active_gpu_provider_calls=1,
     )
 
-    assert request.max_batches == 2
     assert AF3ScoreExecutionRequest.from_bytes(request.to_bytes()) == request
 
 
-def test_request_allows_zero_gpu_capacity_for_cached_results() -> None:
-    request = replace(
-        _request(),
-        max_active_gpu_provider_calls=0,
-    )
-
-    assert request.max_active_gpu_provider_calls == 0
+def test_request_rejects_zero_gpu_capacity() -> None:
+    with pytest.raises(ValueError, match="provider-call limits"):
+        replace(_request(), max_active_gpu_provider_calls=0)
 
 
 def _publish_input(root: Path, input_id: str, digest: str, key: str) -> Path:
@@ -228,6 +221,7 @@ def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
     assert decoded.execution_plan.terminal_node_keys == (POSTPROCESS_NODE,)
     batches, postprocess = decoded.execution_plan.nodes[1:]
     assert batches.aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
+    assert postprocess.aggregation_policy == NodeAggregationPolicy.ALLOW_PARTIAL
     assert postprocess.dependencies[0].node_key == BATCHES_NODE
     assert postprocess.dependencies[0].accept_partial
     assert decoded.execution_plan.scientific_payload["inputs"] == [
@@ -417,7 +411,10 @@ def test_postprocess_validates_summaries_in_parallel(
 
     result = af3score_app.af3score_postprocess.get_raw_f()(
         run_name="scores",
-        staged_input_execution_run_id=str(RUN_ID),
+        staged_input_key=af3score_staged_input_key((
+            ("a.pdb", "a" * 64),
+            ("b.pdb", "b" * 64),
+        )),
         input_files=["a.pdb", "b.pdb"],
         input_digests={"a": "a" * 64, "b": "b" * 64},
         completed_input_ids=["a", "b"],
@@ -531,20 +528,23 @@ def test_gpu_batch_invalidates_publication_before_compute(
 
 
 def test_af3score_operational_limits_do_not_change_scientific_identity() -> None:
+    inputs = (("a.pdb", "a" * 64),)
     base = AF3ScoreExecutionRequest(
         run_name="scores",
-        inputs=(("a.pdb", "a" * 64),),
-        staged_input_execution_run_id=str(RUN_ID),
+        inputs=inputs,
+        staged_input_key=af3score_staged_input_key(inputs),
         prepare_workers=4,
-        max_batches=2,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
         app_version="b0764aa",
     )
     changed = AF3ScoreExecutionRequest(
         run_name="scores",
         inputs=base.inputs,
-        staged_input_execution_run_id=str(OTHER_RUN_ID),
+        staged_input_key=base.staged_input_key,
         prepare_workers=8,
-        max_batches=6,
+        max_active_provider_calls=6,
+        max_active_gpu_provider_calls=6,
         app_version=base.app_version,
         replace_claim_owner="old-run",
     )
@@ -569,34 +569,34 @@ def test_same_run_name_inputs_are_isolated_until_output_claim(
     first_content = b"ATOM FIRST\n"
     second_content = b"ATOM SECOND\n"
 
-    def request(execution_run_id: UUID, content: bytes) -> AF3ScoreExecutionRequest:
+    def request(content: bytes) -> AF3ScoreExecutionRequest:
+        inputs = (("target.pdb", sha256(content).hexdigest()),)
         return AF3ScoreExecutionRequest(
             run_name="scores",
-            inputs=(("target.pdb", sha256(content).hexdigest()),),
-            staged_input_execution_run_id=str(execution_run_id),
+            inputs=inputs,
+            staged_input_key=af3score_staged_input_key(inputs),
             prepare_workers=1,
-            max_batches=1,
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=1,
             app_version="b0764aa",
         )
 
-    def stage(execution_run_id: UUID, content: bytes) -> None:
-        path = (
-            tmp_path
-            / ".biomodals"
-            / "execution"
-            / "runs"
-            / str(execution_run_id)
-            / "inputs"
-            / "target.pdb"
+    def stage(content: bytes) -> None:
+        staged_key = af3score_staged_input_key((
+            ("target.pdb", sha256(content).hexdigest()),
+        ))
+        path = tmp_path.joinpath(
+            *af3score_staged_input_directory(staged_key).parts,
+            "target.pdb",
         )
         path.parent.mkdir(parents=True)
         path.write_bytes(content)
 
-    stage(RUN_ID, first_content)
-    stage(OTHER_RUN_ID, second_content)
+    stage(first_content)
+    stage(second_content)
     claims = FakeClaims()
     first = AF3ScoreExecutionRuntime(
-        request=request(RUN_ID, first_content),
+        request=request(first_content),
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
@@ -606,7 +606,7 @@ def test_same_run_name_inputs_are_isolated_until_output_claim(
         output_root=tmp_path,
     )
     second = AF3ScoreExecutionRuntime(
-        request=request(OTHER_RUN_ID, second_content),
+        request=request(second_content),
         execution_run_id=OTHER_RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, OTHER_RUN_ID),
@@ -657,8 +657,8 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     ]
     prepare_kwargs = driver.spawns[0][1]
     postprocess_kwargs = driver.spawns[-1][1]
-    assert prepare_kwargs["staged_input_execution_run_id"] == str(RUN_ID)
-    assert postprocess_kwargs["staged_input_execution_run_id"] == str(RUN_ID)
+    assert prepare_kwargs["staged_input_key"] == request.staged_input_key
+    assert postprocess_kwargs["staged_input_key"] == request.staged_input_key
     assert postprocess_kwargs["completed_input_ids"] == ["a", "b"]
     batch_call = next(
         call for call in snapshot.provider_calls if call.node_key == BATCHES_NODE
@@ -690,9 +690,13 @@ def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
     overview = runtime.run()
     snapshot = runtime.store.execution.snapshot(RUN_ID)
 
-    assert overview.run.status == RunStatus.SUCCEEDED
+    assert overview.run.status == RunStatus.PARTIAL
     batches = next(node for node in snapshot.nodes if node.node_key == BATCHES_NODE)
     assert batches.status == NodeStatus.PARTIAL
+    postprocess = next(
+        node for node in snapshot.nodes if node.node_key == POSTPROCESS_NODE
+    )
+    assert postprocess.status == NodeStatus.PARTIAL
     assert [
         task.status for task in snapshot.tasks if task.node_key == BATCHES_NODE
     ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED]
@@ -820,6 +824,13 @@ def test_fingerprint_bound_metrics_satisfy_the_terminal_node(tmp_path: Path) -> 
         request.execution_plan.workload_plan_fingerprint,
         metrics,
     )
+    for name, digest in request.inputs:
+        _publish_input(
+            run_root / "outputs",
+            Path(name).stem,
+            digest,
+            request.execution_plan.workload_plan_fingerprint,
+        )
     driver = CompletingDriver(tmp_path, request)
     claims = FakeClaims()
     runtime = AF3ScoreExecutionRuntime(

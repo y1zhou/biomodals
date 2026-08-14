@@ -28,6 +28,8 @@ from biomodals.app.score.af3score_execution import (
     AF3ScoreExecutionRequest,
     ChunkSpec,
     TaskSpec,
+    af3score_staged_input_directory,
+    af3score_staged_input_key,
     load_execution_request,
     stage_execution_inputs,
     stage_execution_request,
@@ -181,18 +183,10 @@ def _collect_input_files(input_root: Path, stage_dir: Path) -> list[Path]:
 ##########################################
 # Inference functions
 ##########################################
-def _staged_input_dir(execution_run_id: str) -> Path:
-    """Return one canonical Execution Run's immutable input directory."""
-    parsed = UUID(execution_run_id)
-    if str(parsed) != execution_run_id:
-        raise ValueError("AF3Score staged input Run ID must be canonical")
-    return (
-        Path(CONF.output_volume_mountpoint)
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / execution_run_id
-        / "inputs"
+def _staged_input_dir(staged_input_key: str) -> Path:
+    """Return one content-addressed immutable input directory."""
+    return Path(CONF.output_volume_mountpoint).joinpath(
+        *af3score_staged_input_directory(staged_input_key).parts
     )
 
 
@@ -204,7 +198,7 @@ def _staged_input_dir(execution_run_id: str) -> Path:
 )
 def af3score_prepare(
     run_name: str,
-    staged_input_execution_run_id: str,
+    staged_input_key: str,
     input_files: list[str],
     input_digests: dict[str, str],
     publication_key: str,
@@ -214,7 +208,7 @@ def af3score_prepare(
     """Prepare AF3Score batches from staged inputs."""
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
-    staged_dir = _staged_input_dir(staged_input_execution_run_id)
+    staged_dir = _staged_input_dir(staged_input_key)
     if not staged_dir.exists():
         raise FileNotFoundError(f"Staged input directory not found: {staged_dir}")
 
@@ -418,21 +412,22 @@ def af3score_run(
 )
 def af3score_postprocess(
     run_name: str,
-    staged_input_execution_run_id: str,
+    staged_input_key: str,
     input_files: list[str],
     input_digests: dict[str, str],
     completed_input_ids: list[str],
     publication_key: str,
-) -> dict[str, int | str]:
+) -> dict[str, object]:
     """Validate records and collect metrics for all inputs."""
     CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
-    staged_input_dir = _staged_input_dir(staged_input_execution_run_id)
+    staged_input_dir = _staged_input_dir(staged_input_key)
     for path in (layout.outputs_dir, layout.failures_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     processed = 0
     failed = 0
+    failed_input_ids: list[str] = []
     completed_output_dirs: list[Path] = []
     out_dir = layout.outputs_dir
     completed_ids = set(completed_input_ids)
@@ -479,6 +474,7 @@ def af3score_postprocess(
                 f"Missing AF3 output files for sample '{input_id}'"
             )
             failed += 1
+            failed_input_ids.append(input_id)
 
     out_csv_path = layout.run_root / APP_INFO.metrics_filename
     if not completed_output_dirs:
@@ -520,6 +516,7 @@ def af3score_postprocess(
         "total": len(input_files),
         "processed": processed,
         "failed": failed,
+        "failed_input_ids": failed_input_ids,
         "metrics_csv_exists": int(out_csv_path.exists()),
         "metrics_csv": str(out_csv_path),
         "metrics_rows": metrics_rows,
@@ -734,14 +731,13 @@ def submit_af3score_task(
             max_gpu_containers=max_gpu_containers,
         )
         execution_run_id = uuid4()
+        inputs = tuple((path.name, sha256_file(path.resolve())) for path in all_files)
+        staged_input_key = af3score_staged_input_key(inputs)
         request = AF3ScoreExecutionRequest(
             run_name=run_name,
-            inputs=tuple(
-                (path.name, sha256_file(path.resolve())) for path in all_files
-            ),
-            staged_input_execution_run_id=str(execution_run_id),
+            inputs=inputs,
+            staged_input_key=staged_input_key,
             prepare_workers=prepare_workers,
-            max_batches=max(1, gpu_limit),
             max_active_provider_calls=total_limit,
             max_active_gpu_provider_calls=gpu_limit,
             app_version=CONF.repo_commit_hash or CONF.version or "unknown",
@@ -754,7 +750,7 @@ def submit_af3score_task(
         )
         stage_execution_inputs(
             CONF.output_volume,
-            execution_run_id,
+            staged_input_key,
             tuple(all_files),
         )
         stage_execution_request(CONF.output_volume, execution_run_id, request)
@@ -783,7 +779,7 @@ def submit_af3score_task(
         )
         print(f"Coordinator FunctionCall ID: {call.object_id}")
         overview = call.get()
-        if overview.run.status != RunStatus.SUCCEEDED:
+        if overview.run.status not in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}:
             diagnostic = overview.run.status_message or (
                 overview.run.status_reason.value
                 if overview.run.status_reason is not None
@@ -808,6 +804,8 @@ def submit_af3score_task(
                     "[METRICS]" if str(key).startswith("metrics_") else "[POSTPROCESS]"
                 )
                 print(f"🧬 {prefix} {key}: {value}")
+        else:
+            result = {}
 
         local_out_dir = (
             Path.cwd()
@@ -823,3 +821,13 @@ def submit_af3score_task(
             ):
                 stream.write(chunk)
         print(f"🧬 Local metrics CSV: {local_metrics_csv}")
+        if overview.run.status == RunStatus.PARTIAL:
+            failed_ids = result.get("failed_input_ids", [])
+            if isinstance(failed_ids, list):
+                print(
+                    "🧬 Failed AF3Score candidates: "
+                    + ", ".join(str(value) for value in failed_ids)
+                )
+            raise RuntimeError(
+                "AF3Score completed partially; usable metrics were downloaded"
+            )

@@ -22,12 +22,10 @@ from biomodals.execution import (
     NodeAggregationPolicy,
     NodeDependency,
     NodePlan,
-    NodeStatus,
     ProviderBinding,
     ProviderCallStatus,
     ProviderCallSubmission,
     TaskPlan,
-    TaskStatus,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_execution import (
@@ -37,6 +35,7 @@ from biomodals.helper.app_execution import (
     StandardExecutionRuntimeLifecycle,
 )
 from biomodals.helper.app_run import AppRunLayout
+from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.output_claim import (
     acquire_output_claim,
@@ -44,7 +43,7 @@ from biomodals.helper.output_claim import (
 )
 from biomodals.helper.task_budget import bounded_map
 
-REQUEST_SCHEMA_VERSION = 3
+REQUEST_SCHEMA_VERSION = 4
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 AF3SCORE_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 PREPARE_NODE = "prepare"
@@ -56,6 +55,7 @@ _REQUEST_FILE = ExecutionRequestFile(
     MAX_REQUEST_BYTES,
     "AF3Score execution request",
 )
+_STAGED_INPUT_ROOT = PurePosixPath(".biomodals/af3score/staged-inputs")
 
 
 @dataclass(frozen=True)
@@ -86,9 +86,8 @@ class AF3ScoreExecutionRequest:
 
     run_name: str
     inputs: tuple[tuple[str, str], ...]
-    staged_input_execution_run_id: str
+    staged_input_key: str
     prepare_workers: int
-    max_batches: int
     app_version: str
     model_identity: str = AF3SCORE_MODEL_IDENTITY
     max_active_provider_calls: int | None = None
@@ -112,27 +111,23 @@ class AF3ScoreExecutionRequest:
                 raise ValueError("AF3Score input names must be PDB filenames")
             if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
                 raise ValueError("AF3Score input digests must be lowercase SHA-256")
-        try:
-            staged_run_id = UUID(self.staged_input_execution_run_id)
-        except (TypeError, ValueError) as error:
-            raise ValueError("AF3Score staged input Run ID must be a UUID") from error
-        if str(staged_run_id) != self.staged_input_execution_run_id:
-            raise ValueError("AF3Score staged input Run ID must be canonical")
-        if self.prepare_workers < 1 or self.max_batches < 1:
-            raise ValueError("AF3Score worker limits must be positive")
+        if self.staged_input_key != af3score_staged_input_key(self.inputs):
+            raise ValueError("AF3Score staged input key does not match its inputs")
+        if self.prepare_workers < 1:
+            raise ValueError("AF3Score preparation workers must be positive")
         total_limit = self.max_active_provider_calls
         if total_limit is None:
-            total_limit = self.max_batches
+            total_limit = 10
             object.__setattr__(self, "max_active_provider_calls", total_limit)
         gpu_limit = self.max_active_gpu_provider_calls
         if gpu_limit is None:
-            gpu_limit = self.max_batches
+            gpu_limit = min(10, total_limit)
             object.__setattr__(
                 self,
                 "max_active_gpu_provider_calls",
                 gpu_limit,
             )
-        if total_limit < 1 or gpu_limit < 0 or gpu_limit > total_limit:
+        if total_limit < 1 or gpu_limit < 1 or gpu_limit > total_limit:
             raise ValueError("AF3Score provider-call limits are invalid")
         if not self.app_version or not self.model_identity:
             raise ValueError("AF3Score scientific versions cannot be empty")
@@ -163,6 +158,7 @@ class AF3ScoreExecutionRequest:
                 NodePlan(
                     POSTPROCESS_NODE,
                     dependencies=(NodeDependency(BATCHES_NODE, accept_partial=True),),
+                    aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
                 ),
             ),
             scientific_payload={
@@ -184,9 +180,8 @@ class AF3ScoreExecutionRequest:
                 "schema_version": REQUEST_SCHEMA_VERSION,
                 "run_name": self.run_name,
                 "inputs": [list(item) for item in self.inputs],
-                "staged_input_execution_run_id": self.staged_input_execution_run_id,
+                "staged_input_key": self.staged_input_key,
                 "prepare_workers": self.prepare_workers,
-                "max_batches": self.max_batches,
                 "app_version": self.app_version,
                 "model_identity": self.model_identity,
                 "max_active_provider_calls": self.max_active_provider_calls,
@@ -226,14 +221,54 @@ def stage_execution_request(
     return _REQUEST_FILE.stage(output_volume, execution_run_id, request.to_bytes())
 
 
+def af3score_staged_input_key(inputs: tuple[tuple[str, str], ...]) -> str:
+    """Return the content address for one immutable AF3Score input set."""
+    return sha256(
+        orjson.dumps(
+            sorted(inputs),
+            option=orjson.OPT_SORT_KEYS,
+        )
+    ).hexdigest()
+
+
+def af3score_staged_input_directory(staged_input_key: str) -> PurePosixPath:
+    """Return the app-owned Volume directory for a staged input set."""
+    if len(staged_input_key) != 64 or any(
+        character not in "0123456789abcdef" for character in staged_input_key
+    ):
+        raise ValueError("AF3Score staged input key must be a lowercase SHA-256")
+    return _STAGED_INPUT_ROOT / staged_input_key
+
+
+def materialize_af3score_staged_inputs(
+    volume_root: str | Path,
+    staged_input_key: str,
+    inputs: tuple[tuple[str, bytes, str], ...],
+) -> Path:
+    """Materialize immutable staged inputs from an already-mounted Volume."""
+    directory = Path(volume_root).joinpath(
+        *af3score_staged_input_directory(staged_input_key).parts
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, content, expected_digest in inputs:
+        require_safe_filename_component(name, field_name="AF3Score input name")
+        if sha256(content).hexdigest() != expected_digest:
+            raise ValueError(f"AF3Score staged input digest is invalid: {name}")
+        target = directory / name
+        if target.is_file() and sha256_file(target) == expected_digest:
+            continue
+        replace_bytes_atomic(target, content)
+    return directory
+
+
 def stage_execution_inputs(
     output_volume: Any,
-    execution_run_id: UUID,
+    staged_input_key: str,
     input_files: tuple[Path, ...],
 ) -> PurePosixPath:
-    """Stage root inputs below the immutable Execution Run namespace."""
-    directory = _REQUEST_FILE.path(execution_run_id).parent / "inputs"
-    with output_volume.batch_upload(force=False) as batch:
+    """Upload one immutable content-addressed AF3Score input set."""
+    directory = af3score_staged_input_directory(staged_input_key)
+    with output_volume.batch_upload(force=True) as batch:
         for path in input_files:
             batch.put_file(path, f"/{directory}/{path.name}")
     return directory
@@ -340,6 +375,12 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 available = _metrics_publication_ready(
                     self.layout.run_root,
                     self._publication_key,
+                ) and all(
+                    bounded_map(
+                        self.request.input_names,
+                        lambda name: self._output_complete(Path(name).stem),
+                        max_parallel=_CACHE_VALIDATION_WORKERS,
+                    )
                 )
             else:
                 raise ValueError(f"Unknown AF3Score Node {node_key!r}")
@@ -355,6 +396,19 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if node_key == BATCHES_NODE:
             try:
                 available = self._output_complete(task_key)
+            except OSError:
+                return AvailabilityStatus.UNKNOWN
+            return (
+                AvailabilityStatus.AVAILABLE
+                if available
+                else AvailabilityStatus.MISSING
+            )
+        if node_key == POSTPROCESS_NODE:
+            try:
+                available = _metrics_publication_ready(
+                    self.layout.run_root,
+                    self._publication_key,
+                ) and self._output_complete(task_key)
             except OSError:
                 return AvailabilityStatus.UNKNOWN
             return (
@@ -444,11 +498,15 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 ),
             )
         if node_key == POSTPROCESS_NODE:
-            return (
+            return tuple(
                 TaskPlan(
-                    task_key="postprocess",
-                    scientific_payload={"inputs": list(self.request.input_names)},
-                ),
+                    task_key=Path(name).stem,
+                    scientific_payload={
+                        "input_id": Path(name).stem,
+                        "sha256": digest,
+                    },
+                )
+                for name, digest in self.request.inputs
             )
         if node_key != BATCHES_NODE:
             raise ValueError(f"Unknown AF3Score Node {node_key!r}")
@@ -589,6 +647,8 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
             if node.node_key == BATCHES_NODE:
                 compatibility = task.execution_payload["chunk"]["batch_name"]
                 batch_size = chunk_sizes[compatibility]
+            elif node.node_key == POSTPROCESS_NODE:
+                batch_size = len(self.request.inputs)
             return TaskDispatchDescriptor(
                 node_key=node.node_key,
                 node_ordinal=node.ordinal,
@@ -651,40 +711,22 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if node_key == PREPARE_NODE:
             return {
                 "run_name": self.request.run_name,
-                "staged_input_execution_run_id": (
-                    self.request.staged_input_execution_run_id
-                ),
+                "staged_input_key": self.request.staged_input_key,
                 "input_files": list(self.request.input_names),
                 "input_digests": self._input_digests,
                 "publication_key": self._publication_key,
-                "num_jobs": self.request.max_batches,
+                "num_jobs": self.request.max_active_gpu_provider_calls,
                 "prepare_workers": self.request.prepare_workers,
             }
         if node_key == POSTPROCESS_NODE:
-            with self.store.synchronize():
-                repository = self.store.execution
-                batches = repository.get_node(
-                    self.execution_run_id,
-                    BATCHES_NODE,
-                )
-                batch_tasks = repository.list_tasks(
-                    self.execution_run_id,
-                    BATCHES_NODE,
-                )
-            completed_input_ids = (
-                [Path(name).stem for name in self.request.input_names]
-                if batches.status == NodeStatus.SUCCEEDED and not batch_tasks
-                else [
-                    task.task_key
-                    for task in batch_tasks
-                    if task.status == TaskStatus.SUCCEEDED
-                ]
-            )
+            completed_input_ids = [
+                Path(name).stem
+                for name in self.request.input_names
+                if self._output_complete(Path(name).stem)
+            ]
             return {
                 "run_name": self.request.run_name,
-                "staged_input_execution_run_id": (
-                    self.request.staged_input_execution_run_id
-                ),
+                "staged_input_key": self.request.staged_input_key,
                 "input_files": list(self.request.input_names),
                 "input_digests": self._input_digests,
                 "completed_input_ids": completed_input_ids,

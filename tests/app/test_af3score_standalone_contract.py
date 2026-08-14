@@ -14,6 +14,10 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.score import af3score_app, af3score_publications
+from biomodals.app.score.af3score_execution import (
+    af3score_staged_input_directory,
+    af3score_staged_input_key,
+)
 from biomodals.execution import RunStatus
 
 
@@ -27,6 +31,16 @@ class FakeOutputVolume:
 
     def reload(self) -> None:
         self.reload_count += 1
+
+
+def _stage_input(root: Path, name: str, content: bytes) -> tuple[str, Path]:
+    inputs = ((name, sha256(content).hexdigest()),)
+    staged_input_key = af3score_staged_input_key(inputs)
+    directory = root.joinpath(*af3score_staged_input_directory(staged_input_key).parts)
+    directory.mkdir(parents=True)
+    path = directory / name
+    path.write_bytes(content)
+    return staged_input_key, path
 
 
 def test_af3score_runtime_image_includes_execution_sources() -> None:
@@ -94,18 +108,10 @@ def test_af3score_prepare_reports_app_run_layout_paths(
         ),
     )
 
-    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-    staged_inputs = (
-        tmp_path
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / str(execution_run_id)
-        / "inputs"
-    )
-    staged_inputs.mkdir(parents=True)
     input_content = b"ATOM\n"
-    staged_inputs.joinpath("target.pdb").write_bytes(input_content)
+    staged_input_key, _staged_input = _stage_input(
+        tmp_path, "target.pdb", input_content
+    )
     input_digest = sha256(input_content).hexdigest()
     run_root = tmp_path / "demo"
     sample_dir = (
@@ -123,7 +129,7 @@ def test_af3score_prepare_reports_app_run_layout_paths(
 
     result = af3score_app.af3score_prepare.get_raw_f()(
         run_name="demo",
-        staged_input_execution_run_id=str(execution_run_id),
+        staged_input_key=staged_input_key,
         input_files=["target.pdb"],
         input_digests={"target": input_digest},
         publication_key="request-key",
@@ -143,19 +149,8 @@ def test_af3score_prepare_uses_staged_inputs_without_copying(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output_volume = FakeOutputVolume()
-    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-    staged_inputs = (
-        tmp_path
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / str(execution_run_id)
-        / "inputs"
-    )
-    staged_inputs.mkdir(parents=True)
     input_content = b"ATOM\n"
-    staged_input = staged_inputs / "target.pdb"
-    staged_input.write_bytes(input_content)
+    staged_input_key, staged_input = _stage_input(tmp_path, "target.pdb", input_content)
     monkeypatch.setattr(
         af3score_app,
         "CONF",
@@ -191,7 +186,7 @@ def test_af3score_prepare_uses_staged_inputs_without_copying(
 
     result = af3score_app.af3score_prepare.get_raw_f()(
         run_name="demo",
-        staged_input_execution_run_id=str(execution_run_id),
+        staged_input_key=staged_input_key,
         input_files=["target.pdb"],
         input_digests={"target": sha256(input_content).hexdigest()},
         publication_key="request-key",
@@ -210,17 +205,7 @@ def test_af3score_prepare_rejects_changed_staged_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-    staged_inputs = (
-        tmp_path
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / str(execution_run_id)
-        / "inputs"
-    )
-    staged_inputs.mkdir(parents=True)
-    staged_inputs.joinpath("target.pdb").write_bytes(b"CHANGED\n")
+    staged_input_key, _staged_input = _stage_input(tmp_path, "target.pdb", b"CHANGED\n")
     monkeypatch.setattr(
         af3score_app,
         "CONF",
@@ -233,7 +218,7 @@ def test_af3score_prepare_rejects_changed_staged_input(
     with pytest.raises(ValueError, match="digest changed: target.pdb"):
         af3score_app.af3score_prepare.get_raw_f()(
             run_name="demo",
-            staged_input_execution_run_id=str(execution_run_id),
+            staged_input_key=staged_input_key,
             input_files=["target.pdb"],
             input_digests={"target": sha256(b"ORIGINAL\n").hexdigest()},
             publication_key="request-key",
@@ -257,17 +242,8 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
         ),
     )
 
-    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-    staged_inputs = (
-        tmp_path
-        / ".biomodals"
-        / "execution"
-        / "runs"
-        / str(execution_run_id)
-        / "inputs"
-    )
-    staged_inputs.mkdir(parents=True)
-    staged_inputs.joinpath("target.pdb").write_text("ATOM\n", encoding="utf-8")
+    staged_input_key, staged_input = _stage_input(tmp_path, "target.pdb", b"ATOM\n")
+    staged_inputs = staged_input.parent
     run_root = tmp_path / "demo"
     run_root.joinpath("prepare").mkdir(parents=True)
     sample_dir = (
@@ -296,7 +272,7 @@ def test_af3score_postprocess_uses_layout_and_run_root_metrics(
 
     result = af3score_app.af3score_postprocess.get_raw_f()(
         run_name="demo",
-        staged_input_execution_run_id=str(execution_run_id),
+        staged_input_key=staged_input_key,
         input_files=["target.pdb"],
         input_digests={"target": "a" * 64},
         completed_input_ids=["target"],
@@ -458,18 +434,18 @@ def test_af3score_local_entrypoint_launches_one_execution_coordinator(
     )
 
     assert captured["run_id"] == execution_run_id
-    assert captured["force"] is False
+    assert captured["force"] is True
     uploaded_name, uploaded_content, uploaded_destination = captured["upload"]
     assert uploaded_name == input_pdb.name
     assert uploaded_content == input_pdb.read_bytes()
-    assert uploaded_destination == (
-        f"/.biomodals/execution/runs/{execution_run_id}/inputs/input.pdb"
-    )
     assert captured["request"].inputs == (
         ("input.pdb", captured["request"].inputs[0][1]),
     )
-    assert captured["request"].staged_input_execution_run_id == str(execution_run_id)
-    assert captured["request"].max_batches == 2
+    staged_input_key = captured["request"].staged_input_key
+    assert staged_input_key == af3score_staged_input_key(captured["request"].inputs)
+    assert uploaded_destination == (
+        f"/.biomodals/af3score/staged-inputs/{staged_input_key}/input.pdb"
+    )
     assert captured["request"].max_active_provider_calls == 3
     assert captured["request"].max_active_gpu_provider_calls == 2
     assert captured["launch"] == (execution_run_id, None)

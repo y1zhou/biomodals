@@ -14,6 +14,10 @@ Before making non-trivial workflow changes, read the
 [maintained standards](references/workflow-development.md) and
 [repo coordination notes](../../../docs/agents/workflow-development.md).
 
+When a workflow image, coordinator image, or included app image runs below the
+repository's Python minimum, also read
+[Python runtime compatibility](../../../docs/agents/python-runtime-compatibility.md).
+
 Use [ShortMD](../../../src/biomodals/workflow/shortmd_workflow.py) as the
 primary end-to-end example for app-composed workflows. Use
 [RFD-LigandMPNN](../../../src/biomodals/workflow/rfd_ligandmpnn_workflow.py)

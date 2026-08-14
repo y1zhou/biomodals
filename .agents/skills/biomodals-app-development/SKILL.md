@@ -11,6 +11,9 @@ description: Biomodals Modal app development standards. Use when Codex is creati
    deviations.
 2. Read `references/quick-app.md` for every app change.
 3. Load only what the app needs:
+   - [Python runtime compatibility](../../../docs/agents/python-runtime-compatibility.md):
+     any Modal image runs below the repository's Python minimum or imports
+     Biomodals source built for a different Python version.
    - `references/multi-module.md`: multiple stages/backends obscure composition.
    - `references/execution-kernel.md`: durable multi-call scheduling, remote
      coordinators, restart, or service/workflow-owned child calls.

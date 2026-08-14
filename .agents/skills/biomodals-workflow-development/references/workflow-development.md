@@ -11,8 +11,8 @@ workflows that select files from one app's volume-backed output and fan those
 files out into another app's workflow-compatible function. Do not use
 `src/biomodals/workflow/ppiflow_workflow.py` as a generic starter template, but
 use it as the reference for candidate-manifest joins, retained-candidate
-filtering, candidate-wide remote stage coordinators, and PPIFlow-specific stage
-wiring.
+filtering, candidate-wide Tasks, focused task-image runtimes, and
+PPIFlow-specific stage wiring.
 
 Treat [ADR 0006](../../../../docs/adr/0006-unified-execution-kernel.md) and the
 [scheduler specification](../../../../docs/specs/unified-task-scheduler.md) as
@@ -414,6 +414,11 @@ independent. Do not add workflow-specific remote-container flags. Scientific
 task counts, shard sizes, batching, and in-container workers remain workflow
 arguments and may lower actual concurrency below the Run limits.
 
+Derive any performance-motivated batch count from the applicable Run ceiling;
+do not expose another remote concurrency setting. PPIFlow AF3Score uses the GPU
+ceiling to form length-balanced batches. PPIFlow Rosetta sizes its pull-worker
+pool from the total ceiling because those workers are CPU-only.
+
 ## Runtime Diagnostics
 
 Use `ExecutionSnapshot` and the durable execution, Provider Call, and workflow
@@ -552,6 +557,12 @@ If a workflow-native adapter needs a remote Modal boundary, define a top-level
 Node's `RemoteNodeCall`. Do not try to make ordinary node methods remote Modal
 methods; node methods are plain Python methods unless the node itself is a Modal
 `@app.cls`, which is not the generic workflow-node model.
+
+For a large or mixed-Python workflow, keep the Modal binding and resource
+declaration in the discoverable workflow module while placing the bound
+implementation in a focused sibling package. Add only that implementation's
+app and workflow import closure to its task image. Keep DAG construction and
+Node classes in the public workflow module.
 
 Keep workflow-specific file cloning, cleanup, and adapter logic in workflow
 scripts, not in app modules, when the standalone app does not require that

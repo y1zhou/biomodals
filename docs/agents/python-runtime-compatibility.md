@@ -22,6 +22,12 @@ Before editing remote code:
    `.add_local_python_source(...)`. A successful local import does not prove
    that the remote image contains the module.
 
+For a mixed-version workflow, put each remote implementation in a focused
+module that parses under its task image, then bind it in the discoverable
+workflow composition root with `app.function(...)(implementation)`. Include
+that focused module and its exact app dependencies in the task image instead
+of mounting the entire workflow package closure.
+
 Keep this analysis image-specific. An app may legitimately use Python 3.10
 while its coordinator or containing workflow uses Python 3.13.
 

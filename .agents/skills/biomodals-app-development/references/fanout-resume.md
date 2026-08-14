@@ -34,6 +34,12 @@ app-specific CLI flag for remote worker, pod, batch, search, or stage counts.
 Keep scientific cardinality, shard sizes, pull-worker claim capacity, and
 in-container process/thread counts as workload arguments.
 
+Use scheduler-managed replenishment by default. A workload may pre-form
+balanced Tasks only for a demonstrated scientific or material performance
+reason. AF3Score length-balances inputs into at most the GPU call ceiling, and
+AlphaFold3 balances seeds the same way; neither exposes another concurrency
+flag.
+
 Account for nested concurrency across simultaneous branches:
 
 ```text

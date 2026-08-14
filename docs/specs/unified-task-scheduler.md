@@ -1355,6 +1355,12 @@ Scientific cardinality, shard sizing, fixed-batch width, pull-worker claim
 capacity, and in-container process/thread counts remain workload policy. They
 may lower realized concurrency but cannot raise it above either Run ceiling.
 
+AF3Score derives at most `max-gpu-containers` length-balanced GPU batch Tasks;
+AlphaFold3 balances seed work across at most that many GPU Provider Calls.
+These are workload-owned dispatch shapes justified by measured imbalance, not
+additional admission ceilings. New exceptions require a scientific or material
+performance reason. Other fan-out relies on kernel admission and replenishment.
+
 The first kernel has exactly two remote-admission limits inside one Execution
 Run:
 
@@ -1790,7 +1796,7 @@ remain available for validation by a newly created Execution Run.
 | Scheduling | Graph rank before resource class; GPU before CPU within a rank; stable image cohorts before encounter order; no active-image or slot-reservation heuristic |
 | Service | API/OpenAPI unchanged unless intentionally versioned; admission, timeline, logs, cancel, cache staging, ZIP contents |
 | Workflow | DAG hashes, scheduler waves, terminal pruning, artifact selection/materialization, coordinator resume, and successor restart behavior |
-| PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, and successor publication reuse |
+| PPIFlow | Candidate identity, manifests, attrition, joins, partial outcomes, per-Run model-digest validation, and successor publication reuse |
 | AlphaFold3 | Search/run/request identities, claims, publications, seed batching/reuse, summaries, archive hashes |
 | CLI | App and workflow discovery/help, version resolution and overrides, deployed versus development launch, representative dry tests |
 

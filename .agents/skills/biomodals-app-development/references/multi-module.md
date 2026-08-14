@@ -47,6 +47,12 @@ image inclusion.
 Prefer decorators in `_app.py`. Otherwise include, import, and re-export sibling
 functions there; give Modal functions/classes unique names across included apps.
 
+When the composition root uses a newer Python than a task image, keep the task
+implementation in a focused old-runtime-compatible module and bind it in the
+root with `app.function(...)(implementation)`. Include only that module's
+import closure in the task image; verify it with the repository's image
+contract tests.
+
 ## Boundary checks
 
 - Keep `Path`, files, Modal handles, queues, and volumes out of plans; cross

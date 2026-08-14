@@ -44,6 +44,21 @@ Local entrypoints may normalize a human-provided run name once and report the ca
 
 Batch app adapters will return succeeded only when every requested candidate succeeds, partial when successful and failed candidates are mixed, and failed when none succeed. Partial results retain successful outputs, failure records, and logs, but remain terminal non-success so downstream scientific steps never consume an incomplete candidate or score set implicitly.
 
+AF3Score preserves this contract across standalone and PPIFlow runs. Its
+postprocess stage accepts warm and newly computed successes, emits metrics for
+the usable subset, and retains per-candidate failures. A workflow may consume
+that partial publication only through an explicit partial dependency. The
+standalone CLI downloads useful metrics and reports failures before returning
+a nonzero exit status.
+
+## Key AF3Score staging by scientific input
+
+Standalone and PPIFlow AF3Score runs use the same staging helper. Its opaque
+staged-input key is derived from normalized candidate identities and content
+digests; the human run name remains display metadata. Reusing a scientifically
+meaningful run name with different files therefore cannot collide with stale
+staging from an earlier run.
+
 ## Keep PPIFlow interface-energy analysis workflow-owned
 
 PPIFlow-specific Rosetta interface-energy analysis stays in the workflow for now. The workflow owns Rosetta script generation, expected `residue_energy.csv` discovery, fixed-position derivation, and candidate identity preservation for this stage. The generic Rosetta app remains a command runner instead of growing a PPIFlow-specific workflow-compatible API until that contract proves reusable outside PPIFlow.
@@ -62,9 +77,10 @@ structure or relying on sorted file order.
 The workflow coordinator submits expensive PPIFlow work through the execution
 kernel. Candidate-oriented stages use one Task per candidate, and each tracked
 provider container invokes the established app function body directly rather
-than submitting an untracked nested Modal call. Batch-oriented stages may
-retain one Task when their scientific contract is genuinely batch-wide. The
-workflow still owns candidate manifests and publication validation.
+than submitting an untracked nested Modal call. AF3Score is the measured
+exception: preparation forms length-balanced batch Tasks and the kernel tracks
+each batch Provider Call. The workflow still owns candidate manifests and
+publication validation.
 
 ## Require ReFold quality metrics
 
@@ -138,6 +154,13 @@ identity through the workflow hash hook, so a Successor cannot reuse a
 predecessor under changed scoring science. Operational concurrency remains
 excluded.
 
+PPIFlow also validates every configured mutable model file against a
+code-owned SHA-256 before admitting GPU work. The lightweight validation Node
+runs once per Execution Run and is not copied from a predecessor, so every
+Successor rechecks the mounted model bytes. Downstream Nodes depend on this
+validation publication; the expected digests remain part of the workflow's
+scientific identity.
+
 ## Use one-row-per-candidate PPIFlow manifests
 
 PPIFlow candidate manifests store one Parquet row per candidate with a nested list of file records. Candidate-level joins, filtering, ranking, and reporting are the common operations, and file-level availability checks can expand the nested file list when needed.
@@ -163,15 +186,20 @@ The public workflow CLI exposes `--max-containers` and
 `max_active_gpu_provider_calls`. Node parallelism and call admission remain
 independent runtime controls even when initialized from the same public value.
 The execution repository atomically enforces both call limits by counting
-nonterminal Provider Calls in one Execution Run. Candidate concurrency,
-AF3Score batching, Rosetta worker sizing, and other stage-local topology remain
-internal inputs to kernel dispatch; they may lower actual fan-out but cannot
-form separate durable schedulers, shared leases, or cross-run resource
-managers.
+nonterminal Provider Calls in one Execution Run. Obsolete per-stage container,
+pod, child-call, job, and batch limits are ignored. AF3Score derives its
+length-balanced batch count from the GPU ceiling; Rosetta derives its worker
+pool from the total ceiling. These internal topologies may lower actual fan-out
+but cannot form separate durable schedulers, shared leases, or cross-run
+resource managers.
 
 ## Split PPIFlow workflow helpers into a submodule
 
-PPIFlow-local manifest, table, staging, and coordinator helpers live under a `biomodals.workflow.ppiflow` submodule, while `ppiflow_workflow.py` remains the public workflow module discovered by the CLI and catalog. This keeps the top-level workflow module focused on DAG assembly and node contracts instead of absorbing all candidate-manifest and stage-coordinator mechanics.
+PPIFlow-local manifests, tables, staging, and focused remote task
+implementations live under `biomodals.workflow.ppiflow`, while
+`ppiflow_workflow.py` remains the public workflow module discovered by the CLI
+and catalog. This keeps the top-level module focused on DAG assembly, Node
+contracts, Modal bindings, and image/resource declarations.
 
 ## Keep PPIFlow node classes in the workflow module
 
@@ -195,7 +223,11 @@ execution-state migration.
 
 ## Keep PPIFlow Modal bindings in the workflow module
 
-PPIFlow Modal decorators, app registration, and app-bound remote helper functions stay in `ppiflow_workflow.py`. The `biomodals.workflow.ppiflow` submodule provides pure or near-pure helper logic for manifests, tables, staging, and coordinator mechanics so importing helper modules does not create hidden Modal app registration side effects and helper tests can run without Modal bindings.
+PPIFlow Modal bindings, app registration, images, mounts, and resource settings
+stay in `ppiflow_workflow.py`. Each binding wraps a focused implementation from
+`biomodals.workflow.ppiflow`; those modules contain no decorators or hidden app
+registration. This gives each task image a narrow, Python-compatible import
+closure while keeping the public workflow topology in one composition root.
 
 ## Use stage-specific PPIFlow provider wrappers
 

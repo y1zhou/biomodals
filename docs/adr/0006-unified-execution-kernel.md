@@ -551,6 +551,13 @@ ceilings. The CLI names deliberately describe the user-visible Modal cost
 boundary; the kernel retains precise Provider Call terminology because one
 call may execute a bounded batch of Tasks.
 
+AF3Score and AlphaFold3 are the accepted dispatch-shaping cases. AF3Score uses
+the GPU Provider Call ceiling as the maximum number of length-balanced GPU
+batches, while AlphaFold3 balances requested seeds across no more than that
+many GPU calls. Neither workload exposes a second remote concurrency limit.
+Future workload-owned batching needs a demonstrated scientific or material
+performance reason; ordinary fan-out uses scheduler-managed replenishment.
+
 The admission-order policy was accepted on 2026-07-30. The coordinator uses a
 Snakemake-inspired greedy selection: every scheduling cycle fills as many
 currently feasible total and GPU Provider Call slots as ready work permits,

@@ -151,7 +151,9 @@ uv run biomodals workflow run \
 `--max-gpu-containers` bounds the GPU-using subset and cannot exceed the total.
 These are per-Run ceilings, not service-wide quotas. Omit them to use the
 app or workflow defaults. Scientific task counts and worker processes inside a
-container remain app- or workflow-specific options after `--`.
+container remain app- or workflow-specific options after `--`. Workloads may
+derive balanced batches from these ceilings, but do not expose a second remote
+container or batch limit.
 
 A workflow deployment includes the callable functions declared by its
 dependency apps. Those apps do not need separate deployments for that workflow.

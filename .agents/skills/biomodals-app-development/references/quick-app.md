@@ -50,6 +50,8 @@ Validate before the first remote call and again before upstream consumption:
 - Use `AppRunLayout`. Return primitive payloads and string paths. Workflow
   functions return `AppRunResult` with `VolumePath`; reserve compressed
   `InlineBytes` for small rerunnable archives. Keep entrypoints CLI-only.
+- Key reusable staged inputs by normalized scientific content and digests, not
+  by a user-facing run name. Keep the run name as display metadata.
 - For short jobs, send bytes, work in a temporary directory, and
   `package_outputs(...)`. Use staged caches for resumable work.
 - Derive a safe default run name, build local paths with

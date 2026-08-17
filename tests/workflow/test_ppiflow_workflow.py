@@ -513,7 +513,7 @@ def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
         "flowpacker_task_image =",
         1,
     )[0]
-    assert "polars==1.43.0" in ligandmpnn_image
+    assert "polars==1.42.0" in ligandmpnn_image
 
 
 def test_ppiflow_app_step_preparation_does_not_submit_provider_call(
@@ -3726,6 +3726,7 @@ task:
     volume_name: source-volume
     path: existing/stage1-filtered
 steps:
+  Stage2Input: true
   RosettaFixStep: true
 """,
         steps_yaml_bytes=b"""

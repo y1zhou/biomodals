@@ -34,3 +34,19 @@ jobs:
         run: uv lock --check
       - name: Run tests
         run: uv run --frozen pytest -q
+      - name: Verify Python 3.11 task-image imports
+        run: >-
+          PYTHONPATH=src uv run --no-project --python 3.11
+          --with 'modal>=1.5.1'
+          --with 'orjson>=3.11.8'
+          --with 'pydantic>=2.12.5'
+          --with 'polars==1.42.0'
+          --with 'niquests>=3.18.4'
+          --with 'python-dotenv>=1.2.1'
+          --with 'pyyaml>=6.0.3'
+          --with 'rich>=14.2.0'
+          --with 'tqdm>=4.67.3'
+          --with 'typer>=0.20.0'
+          python -c
+          'import biomodals.app.design.ligandmpnn_app;
+          import biomodals.workflow.ppiflow.ligandmpnn_runtime'

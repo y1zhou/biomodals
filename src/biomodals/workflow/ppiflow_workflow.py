@@ -159,7 +159,7 @@ ppiflow_task_image = ppiflow_app.runtime_image.add_local_python_source(
     "biomodals.workflow.ppiflow",
 )
 ligandmpnn_task_image = ligandmpnn_app.runtime_image.uv_pip_install(
-    "polars==1.43.0"
+    "polars==1.42.0"
 ).add_local_python_source(
     "biomodals.app.design.ligandmpnn_app",
     "biomodals.workflow.ppiflow",
@@ -2565,14 +2565,11 @@ def _steps_doc_with_run_limits(
     max_containers: int,
     max_gpu_containers: int,
 ) -> dict[str, Any]:
-    configured: dict[str, Any] = {}
-    enabled = tuple(enabled_steps)
-    step_names = dict.fromkeys((*steps_doc, *enabled))
-    for step_name in step_names:
-        raw_cfg = steps_doc.get(step_name)
-        if step_name not in enabled:
-            configured[step_name] = raw_cfg
+    configured = dict(steps_doc)
+    for step_name in enabled_steps:
+        if step_name == "Stage2Input":
             continue
+        raw_cfg = steps_doc.get(step_name)
         if raw_cfg is None:
             raw_cfg = {}
         if not isinstance(raw_cfg, dict):

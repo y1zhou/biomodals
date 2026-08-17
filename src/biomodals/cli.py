@@ -395,11 +395,6 @@ def _validate_container_limit_options(
     max_gpu_containers: int | None,
 ) -> None:
     """Reject invalid explicit GPU ceilings at the outer CLI seam."""
-    if max_gpu_containers is not None and max_gpu_containers < 1:
-        console.print(
-            "[bold red]Error[/bold red] --max-gpu-containers must be at least 1"
-        )
-        raise typer.Exit(code=1)
     if (
         max_containers is not None
         and max_gpu_containers is not None
@@ -410,6 +405,31 @@ def _validate_container_limit_options(
             "--max-containers"
         )
         raise typer.Exit(code=1)
+
+
+def _reject_outer_cli_flags(
+    flags: list[str] | None,
+    *,
+    parameters: frozenset[str],
+    command_name: CatalogType,
+) -> None:
+    """Reject outer CLI options repeated after the entrypoint separator."""
+    outer_flags = {f"--{parameter.replace('_', '-')}" for parameter in parameters}
+    invalid = next(
+        (
+            flag.partition("=")[0]
+            for flag in flags or ()
+            if flag.partition("=")[0] in outer_flags
+        ),
+        None,
+    )
+    if invalid is None:
+        return
+    console.print(
+        f"[bold red]Error[/bold red] {invalid} is a BioModals {command_name} "
+        "option. Do not pass it after '--'; use the outer run options instead."
+    )
+    raise typer.Exit(code=1)
 
 
 def _container_limit_entrypoint_flags(
@@ -653,6 +673,11 @@ def run_modal_app(
     """
     import os
 
+    _reject_outer_cli_flags(
+        flags,
+        parameters=_COORDINATOR_CLI_PARAMETERS,
+        command_name="app",
+    )
     app = _load_entry("app", app_name_or_path)
     if modal_mode != "shell" and app._entrypoint is None:
         local_entrypoints = [
@@ -1281,6 +1306,11 @@ def run_workflow(
     """
     import os
 
+    _reject_outer_cli_flags(
+        flags,
+        parameters=_WORKFLOW_CLI_PARAMETERS,
+        command_name="workflow",
+    )
     workflow = _load_entry("workflow", workflow_name_or_path)
     entrypoint = _resolve_workflow_entrypoint(workflow)
     _validate_container_limit_options(max_containers, max_gpu_containers)

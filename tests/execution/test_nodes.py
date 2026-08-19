@@ -64,6 +64,13 @@ def test_remote_task_node_declares_data_without_modal_submission() -> None:
             uses_gpu=False,
             max_tasks_per_call=0,
         )
+    with pytest.raises(ValueError, match="identity keyword"):
+        ProviderCallSpec(
+            function_name="run_candidate",
+            uses_gpu=False,
+            kwargs={"claim_owner": "duplicate"},
+            provider_call_id_kwarg="claim_owner",
+        )
 
 
 def test_node_context_resolves_workflow_artifact(tmp_path: Path) -> None:

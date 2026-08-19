@@ -70,6 +70,7 @@ class ProviderCallSpec:
     runtime_image_key: str | None = None
     compatibility_key: str | None = None
     max_tasks_per_call: int = 1
+    provider_call_id_kwarg: str | None = None
 
     def __post_init__(self) -> None:
         """Reject an incomplete provider target before Task discovery."""
@@ -77,6 +78,11 @@ class ProviderCallSpec:
             raise ValueError("Provider operation name cannot be empty")
         if self.max_tasks_per_call < 1:
             raise ValueError("max_tasks_per_call must be positive")
+        if self.provider_call_id_kwarg is not None and (
+            not self.provider_call_id_kwarg
+            or self.provider_call_id_kwarg in self.kwargs
+        ):
+            raise ValueError("invalid provider call identity keyword")
 
 
 @dataclass(frozen=True)

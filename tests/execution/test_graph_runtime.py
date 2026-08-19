@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 from threading import Event
@@ -238,6 +238,20 @@ class RefreshingRemoteFanoutNode(RemoteFanoutNode):
 
     def refresh_result_storage(self) -> None:
         self.refreshes += 1
+
+
+@dataclass
+class CallIdentityRemoteFanoutNode(RemoteFanoutNode):
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
+        invocation = super().prepare_remote_task(context, task)
+        return replace(
+            invocation,
+            provider_call_id_kwarg="claim_owner",
+        )
 
 
 @dataclass
@@ -522,6 +536,16 @@ class FanoutModalDriver(FakeModalDriver):
             ProviderCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
+
+
+class CallIdentityModalDriver(FanoutModalDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claim_owners: list[str] = []
+
+    def spawn(self, function, *, args, kwargs):
+        self.claim_owners.append(str(kwargs["claim_owner"]))
+        return super().spawn(function, args=args, kwargs=kwargs)
 
 
 class PullModalDriver(FakeModalDriver):
@@ -1394,6 +1418,30 @@ def test_remote_task_admission_reuses_persisted_dispatch_policy(
         "candidate-2",
         "candidate-3",
     ]
+    runtime.close()
+
+
+def test_remote_task_call_can_receive_its_durable_identity(
+    tmp_path: Path,
+) -> None:
+    graph = ExecutionGraph("claim-owner")
+    graph.add_node(
+        CallIdentityRemoteFanoutNode(("alpha",)),
+        id="fanout",
+    )
+    driver = CallIdentityModalDriver()
+    runtime = _runtime(
+        tmp_path,
+        graph,
+        driver=driver,
+        max_gpu_calls=0,
+    )
+
+    runtime._initialize("claim-owner")
+    runtime.advance_once()
+
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert driver.claim_owners == [str(call.provider_call_id)]
     runtime.close()
 
 

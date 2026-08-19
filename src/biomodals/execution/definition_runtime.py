@@ -1704,6 +1704,7 @@ class ExecutionGraphRuntime:
                     submission_token=candidate.candidate_key,
                     args=invocation.args,
                     kwargs=invocation.kwargs,
+                    provider_call_id_kwarg=invocation.provider_call_id_kwarg,
                 )
             )
         self._provider.submit_provider_calls(
@@ -2622,6 +2623,7 @@ def _execution_payload(invocation: ProviderCallSpec | None) -> dict[str, object]
         "function_name": invocation.function_name,
         "metadata": invocation.metadata,
         "mode": "remote",
+        "provider_call_id_kwarg": invocation.provider_call_id_kwarg,
         "runtime_image_key": invocation.runtime_image_key,
         "uses_gpu": invocation.uses_gpu,
     }

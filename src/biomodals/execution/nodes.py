@@ -112,6 +112,10 @@ class ExecutionNode(Protocol):
 class ResultNode:
     """Shared publication hooks for one-result Execution Nodes."""
 
+    def refresh_artifact_storage_before_result(self) -> bool:
+        """Return whether decoding reads provider-published artifact storage."""
+        return False
+
     def recover_result_publication(
         self,
         context: NodeRunContext,
@@ -185,6 +189,10 @@ class TaskDefinition:
 
 class TaskProviderNode:
     """Base class for Nodes that discover finite provider-backed Tasks."""
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        """Return whether decoding reads provider-published artifact storage."""
+        return False
 
     def discover_remote_tasks(
         self,

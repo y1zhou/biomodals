@@ -1101,6 +1101,9 @@ class ExecutionGraphRuntime:
             if not isinstance(node, ProviderNode):
                 self._fail_task(node_id, "Provider result belongs to a local Node")
                 return
+            refreshed = node.refresh_artifact_storage_before_result()
+            if refreshed:
+                self._reload_volume()
             try:
                 raw_result = self._raw_result(envelope)
                 metadata = _remote_metadata(task.execution_payload)
@@ -1110,7 +1113,7 @@ class ExecutionGraphRuntime:
             except Exception as error:
                 self._fail_task(node_id, f"Could not decode provider result: {error}")
                 return
-            if self._uses_artifact_volume(result):
+            if self._uses_artifact_volume(result) and not refreshed:
                 self._reload_volume()
             self._publish_result(node_id, result)
 
@@ -1133,6 +1136,9 @@ class ExecutionGraphRuntime:
         unfinished = tuple(task for task in tasks if not task.status.is_terminal)
         if not unfinished:
             return
+        refreshed = node.refresh_artifact_storage_before_result()
+        if refreshed:
+            self._reload_volume()
         try:
             task_definitions = tuple(
                 TaskDefinition(
@@ -1171,7 +1177,9 @@ class ExecutionGraphRuntime:
                     f"Could not decode provider result: {error}",
                 )
             return
-        if any(self._uses_artifact_volume(result) for result in results.values()):
+        if not refreshed and any(
+            self._uses_artifact_volume(result) for result in results.values()
+        ):
             self._reload_volume()
         for task in unfinished:
             self._publish_task_result(

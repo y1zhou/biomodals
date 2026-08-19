@@ -473,6 +473,9 @@ class _ABCFold2SeedNode(TaskProviderNode):
     model_name: str
     publications: ABCFold2Publications
 
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
@@ -577,6 +580,9 @@ class _ABCFold2SeedNode(TaskProviderNode):
 class _ABCFold2ArchiveNode(ProviderNode):
     model_name: str
     publications: ABCFold2Publications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
 
     def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         run_config = _run_config_from_context(context)

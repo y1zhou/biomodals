@@ -131,6 +131,26 @@ class RemoteTextNode(ProviderNode):
 
 
 @dataclass
+class RefreshingRemoteTextNode(RemoteTextNode):
+    events: list[str] = field(
+        default_factory=list,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def process_remote_result(
+        self,
+        result,
+        metadata,
+    ) -> AppRunResult:
+        self.events.append("decode")
+        return super().process_remote_result(result, metadata)
+
+
+@dataclass
 class RemoteFanoutNode(TaskProviderNode):
     texts: tuple[str, ...]
     prepare_calls: list[str] = field(
@@ -901,6 +921,37 @@ def test_inline_provider_result_does_not_reload_the_artifact_volume(
     runtime.advance_once()
 
     assert events == ["observe", "publish"]
+    runtime.close()
+
+
+def test_provider_node_can_refresh_artifact_storage_before_decoding(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    node = RefreshingRemoteTextNode("hello", "remote_text")
+    workflow = ExecutionGraph("remote-refresh")
+    workflow.add_node(node, id="remote")
+    volume = FakeVolume()
+    runtime = _runtime(
+        tmp_path,
+        workflow,
+        driver=FakeModalDriver(),
+        volume=volume,
+    )
+    runtime._initialize("remote-refresh")
+    runtime.advance_once()
+    original_reload = runtime._storage_sync.reload
+
+    def reload() -> None:
+        node.events.append("reload")
+        original_reload()
+
+    monkeypatch.setattr(runtime._storage_sync, "reload", reload)
+
+    runtime.advance_once()
+
+    assert node.events == ["reload", "decode"]
+    assert volume.reloads == 1
     runtime.close()
 
 

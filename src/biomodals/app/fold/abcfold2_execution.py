@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -15,21 +15,38 @@ import orjson
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionArtifact,
+    ExecutionGraph,
     ExecutionOverview,
     ExecutionPlan,
+    ExecutionPlanMetadata,
     NodeDependency,
     NodePlan,
-    ProviderBinding,
     ProviderCallStatus,
-    TaskPlan,
+    republish_execution_artifact,
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    OutputClaimExecutionCoordinatorLifecycle,
-    StandardExecutionRuntimeLifecycle,
+    OutputClaimExecutionDefinitionCoordinatorLifecycle,
+    load_execution_provider_result,
 )
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
+)
 from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    InlineBytes,
+    VolumePath,
+)
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -243,330 +260,398 @@ def load_execution_request(
     )
 
 
-class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
-    """Drive one ABCFold2 request through parallel per-seed Tasks."""
+class ABCFold2Publications:
+    """Validate ABCFold2's established seed and archive publications."""
 
     def __init__(
         self,
         *,
         request: ABCFold2ExecutionRequest,
         execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
+        output_root: str | Path,
+        output_volume_name: str,
         output_claims: Any,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
     ) -> None:
-        """Bind the kernel writer to ABCFold2's established run layout."""
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-        )
+        """Bind one Run to its ABCFold2 publication namespace."""
+        self.request = request
+        self.execution_run_id = execution_run_id
+        self.output_root = Path(output_root)
+        self.output_volume_name = output_volume_name
         self.output_claims = output_claims
-        self._claimed_models: set[str] = set()
 
-    def _recover_publications(self) -> None:
-        self._provider.recover_publications(
-            self.execution_run_id,
-            observe_node=self._node_observation,
-            observe_task=lambda node_key, task: (
-                None
-                if node_key in {PREPARE_NODE, BOLTZ_DOWNLOAD_NODE, CHAI_DOWNLOAD_NODE}
-                else self._task_observation(node_key, task.task_key)
-            ),
-            now=self._now(),
-        )
-
-    def _node_observation(self, node_key: str) -> AvailabilityStatus:
-        if node_key in {PREPARE_NODE, BOLTZ_DOWNLOAD_NODE, CHAI_DOWNLOAD_NODE}:
-            return AvailabilityStatus.MISSING
-        run_conf = self._try_run_config()
-        if run_conf is None:
-            return AvailabilityStatus.MISSING
-        app = _workload_module()
-        try:
-            if node_key == BOLTZ_SEEDS_NODE:
-                publication_key = self._model_publication_key("boltz", run_conf)
-                available = all(
-                    app._seed_ready(
-                        run_conf.workdir,
-                        "boltz",
-                        seed,
-                        publication_key,
-                    )
-                    for seed in run_conf.seeds
-                )
-            elif node_key == CHAI_SEEDS_NODE:
-                publication_key = self._model_publication_key("chai", run_conf)
-                available = all(
-                    app._seed_ready(
-                        run_conf.workdir,
-                        "chai",
-                        seed,
-                        publication_key,
-                    )
-                    for seed in run_conf.seeds
-                )
-            elif node_key == BOLTZ_ARCHIVE_NODE:
-                available = app._archive_ready(
-                    run_conf.workdir,
-                    "boltz",
-                    self._model_publication_key("boltz", run_conf),
-                )
-            elif node_key == CHAI_ARCHIVE_NODE:
-                available = app._archive_ready(
-                    run_conf.workdir,
-                    "chai",
-                    self._model_publication_key("chai", run_conf),
-                )
-            else:
-                raise ValueError(f"Unknown ABCFold2 Node {node_key!r}")
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _task_observation(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> AvailabilityStatus:
-        if node_key in {BOLTZ_SEEDS_NODE, CHAI_SEEDS_NODE}:
-            run_conf = self._try_run_config()
-            if run_conf is None:
-                return AvailabilityStatus.MISSING
-            model_name = "boltz" if node_key == BOLTZ_SEEDS_NODE else "chai"
-            try:
-                available = _workload_module()._seed_ready(
-                    run_conf.workdir,
-                    model_name,
-                    int(task_key),
-                    self._model_publication_key(model_name, run_conf),
-                )
-            except OSError:
-                return AvailabilityStatus.UNKNOWN
-            return (
-                AvailabilityStatus.AVAILABLE
-                if available
-                else AvailabilityStatus.MISSING
-            )
-        return self._node_observation(node_key)
-
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            now=self._now(),
-        )
-        succeeded_nodes = {
-            updated.node_key
-            for original, updated in reconciled
-            if not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-        }
-        if succeeded_nodes - {BOLTZ_DOWNLOAD_NODE, CHAI_DOWNLOAD_NODE}:
-            self._reload_output()
-
-    def _decode_completed_calls(self) -> None:
-        self._provider.decode_completed_calls(
-            self.execution_run_id,
-            observe_task=lambda node_key, task, envelope: (
-                self._completed_task_observation(
-                    node_key,
-                    task.task_key,
-                    envelope,
-                )
-            ),
-            missing_message="ABCFold2 returned without a valid publication",
-            now=self._now(),
-        )
-
-    def _completed_task_observation(
-        self,
-        node_key: str,
-        task_key: str,
-        envelope: object,
-    ) -> AvailabilityStatus:
-        if not isinstance(envelope, dict):
-            return AvailabilityStatus.MISSING
-        if node_key in {BOLTZ_DOWNLOAD_NODE, CHAI_DOWNLOAD_NODE}:
-            return (
-                AvailabilityStatus.AVAILABLE
-                if envelope.get("kind") == "none"
-                else AvailabilityStatus.MISSING
-            )
-        if node_key == PREPARE_NODE:
-            try:
-                _run_config_from_envelope(envelope)
-            except (TypeError, ValueError):
-                return AvailabilityStatus.MISSING
-            return AvailabilityStatus.AVAILABLE
-        expected_kind = (
-            "path" if node_key in {BOLTZ_SEEDS_NODE, CHAI_SEEDS_NODE} else "archive"
-        )
-        if envelope.get("kind") != expected_kind:
-            return AvailabilityStatus.MISSING
-        return self._task_observation(node_key, task_key)
-
-    def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.start_ready_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            task_plans=self._task_plans,
-            observe_task=lambda node_key, task: (
-                AvailabilityStatus.MISSING
-                if node_key in {PREPARE_NODE, BOLTZ_DOWNLOAD_NODE, CHAI_DOWNLOAD_NODE}
-                else self._task_observation(node_key, task.task_key)
-            ),
-            now=self._now(),
-        )
-
-    def _task_plans(self, node_key: str) -> tuple[TaskPlan, ...]:
-        if node_key == PREPARE_NODE:
-            return (
-                TaskPlan(
-                    "prepare",
-                    {"yaml_sha256": sha256(self.request.yaml_content).hexdigest()},
-                ),
-            )
-        if node_key == BOLTZ_DOWNLOAD_NODE:
-            return (TaskPlan("boltz-models", {"version": self.request.boltz_version}),)
-        if node_key == CHAI_DOWNLOAD_NODE:
-            return (TaskPlan("chai-models", {"version": self.request.chai_version}),)
-        run_conf = self._run_config()
-        if node_key in {BOLTZ_SEEDS_NODE, CHAI_SEEDS_NODE}:
-            return tuple(
-                TaskPlan(
-                    str(seed),
-                    {"run_id": run_conf.run_id, "seed": seed},
-                )
-                for seed in run_conf.seeds
-            )
-        if node_key == BOLTZ_ARCHIVE_NODE:
-            return (TaskPlan("boltz-archive", {"run_id": run_conf.run_id}),)
-        if node_key == CHAI_ARCHIVE_NODE:
-            return (TaskPlan("chai-archive", {"run_id": run_conf.run_id}),)
-        raise ValueError(f"Unknown ABCFold2 Node {node_key!r}")
-
-    def _try_run_config(self) -> ABCFold2RunConfig | None:
-        try:
-            return self._run_config()
-        except (LookupError, TypeError, ValueError):
-            return None
-
-    def _run_config(self) -> ABCFold2RunConfig:
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                PREPARE_NODE,
-            )
-        if call is None:
-            raise LookupError("ABCFold2 preparation result is unavailable")
-        return _run_config_from_envelope(call.result_envelope)
-
-    def _binding(self, node_key: str) -> ProviderBinding:
-        function_name = {
-            PREPARE_NODE: "prepare_abcfold2",
-            BOLTZ_DOWNLOAD_NODE: "download_boltz_models",
-            CHAI_DOWNLOAD_NODE: "download_chai_models",
-            BOLTZ_SEEDS_NODE: "run_abcfold2_boltz",
-            BOLTZ_ARCHIVE_NODE: "collect_abcfold2_boltz_data",
-            CHAI_SEEDS_NODE: "run_abcfold2_chai",
-            CHAI_ARCHIVE_NODE: "collect_abcfold2_chai_data",
-        }[node_key]
-        uses_gpu = node_key in {BOLTZ_SEEDS_NODE, CHAI_SEEDS_NODE}
-        return ProviderBinding(
-            environment=self.deployment.environment,
-            app_name=self.deployment.deployment_name,
-            app_version=self.deployment.deployment_version,
-            function_name=function_name,
-            uses_gpu=uses_gpu,
-            runtime_image_key=(
-                f"abcfold2-{node_key}" if not uses_gpu else "abcfold2-gpu"
-            ),
-        )
-
-    def _invocation_kwargs(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> dict[str, object]:
-        if node_key == PREPARE_NODE:
-            return {
-                "yaml_str": self.request.yaml_content,
-                "search_templates": self.request.search_templates,
-                "msa_chains": self.request.msa_chains,
-            }
-        if node_key in {BOLTZ_DOWNLOAD_NODE, CHAI_DOWNLOAD_NODE}:
-            return {"force": self.request.force_redownload}
-        run_conf = self._run_config()
-        if node_key in {BOLTZ_SEEDS_NODE, CHAI_SEEDS_NODE}:
-            model_name = "boltz" if node_key == BOLTZ_SEEDS_NODE else "chai"
-            return {
-                "seed": int(task_key),
-                **run_conf.as_kwargs(),
-                "publication_key": self._model_publication_key(
-                    model_name,
-                    run_conf,
-                ),
-            }
-        if node_key in {BOLTZ_ARCHIVE_NODE, CHAI_ARCHIVE_NODE}:
-            model_name = "boltz" if node_key == BOLTZ_ARCHIVE_NODE else "chai"
-            return {
-                "run_conf": run_conf.as_kwargs(),
-                "publication_key": self._model_publication_key(
-                    model_name,
-                    run_conf,
-                ),
-            }
-        raise ValueError(f"Unknown ABCFold2 Node {node_key!r}")
-
-    def _ensure_publication_claim(self, node_key: str, _task_key: str) -> None:
-        model_name = {
-            BOLTZ_SEEDS_NODE: "boltz",
-            BOLTZ_ARCHIVE_NODE: "boltz",
-            CHAI_SEEDS_NODE: "chai",
-            CHAI_ARCHIVE_NODE: "chai",
-        }.get(node_key)
-        if model_name is None or model_name in self._claimed_models:
-            return
-        run_conf = self._run_config()
-        publication_key = self._model_publication_key(model_name, run_conf)
+    def claim(self, model_name: str, run_config: ABCFold2RunConfig) -> str:
+        """Claim one model publication before admitting its provider call."""
+        publication_key = self.publication_key(model_name, run_config)
         acquire_output_claim(
             self.output_claims,
             claim_key=f"abcfold2-{model_name}:{publication_key}",
             owner=str(self.execution_run_id),
             replace_owner=self.request.replace_claim_owner,
         )
-        self._claimed_models.add(model_name)
+        return publication_key
 
     @staticmethod
-    def _model_publication_key(
-        model_name: str,
-        run_conf: ABCFold2RunConfig,
-    ) -> str:
+    def publication_key(model_name: str, run_config: ABCFold2RunConfig) -> str:
+        """Return the established model publication identity."""
         return _workload_module()._model_publication_key(
             model_name,
-            run_conf.as_kwargs(),
+            run_config.as_kwargs(),
+        )
+
+    def seed_result(
+        self,
+        model_name: str,
+        seed: int,
+        run_config: ABCFold2RunConfig,
+    ) -> AppRunResult | None:
+        """Reconstruct one exact seed result from its workload marker."""
+        publication_key = self.publication_key(model_name, run_config)
+        app = _workload_module()
+        if not app._seed_ready(
+            run_config.workdir,
+            model_name,
+            seed,
+            publication_key,
+        ):
+            return None
+        result_dir = (
+            Path(run_config.workdir)
+            / f"{model_name}_models"
+            / (
+                f"boltz_results_seed-{seed}"
+                if model_name == "boltz"
+                else f"chai_seed-{seed}"
+            )
+        )
+        marker = orjson.loads(
+            (
+                Path(run_config.workdir)
+                / ".biomodals"
+                / f"{model_name}-seed-{seed}.json"
+            ).read_bytes()
+        )
+        raw_files = marker.get("artifacts") if isinstance(marker, dict) else None
+        if not isinstance(raw_files, list):
+            return None
+        files = [
+            ArtifactFile(
+                path=str(file["path"]),
+                size_bytes=int(file["size"]),
+                content_sha256=str(file["sha256"]),
+            )
+            for file in raw_files
+            if isinstance(file, dict)
+        ]
+        if len(files) != len(raw_files):
+            return None
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name=f"{model_name}-seed-{seed}",
+                    kind=ArtifactKind.DIRECTORY,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=result_dir.relative_to(self.output_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [
+                            file.model_dump(mode="json", exclude_none=True)
+                            for file in files
+                        ],
+                        "model": model_name,
+                        "seed": str(seed),
+                    },
+                )
+            ],
+        )
+
+    def archive_result(
+        self,
+        model_name: str,
+        run_config: ABCFold2RunConfig,
+    ) -> AppRunResult | None:
+        """Reconstruct one exact archive result from its workload marker."""
+        app = _workload_module()
+        publication_key = self.publication_key(model_name, run_config)
+        if not app._archive_ready(
+            run_config.workdir,
+            model_name,
+            publication_key,
+        ):
+            return None
+        path = Path(run_config.workdir) / f"{model_name}_models.tar.zst"
+        marker = orjson.loads(
+            (
+                Path(run_config.workdir) / ".biomodals" / f"{model_name}-archive.json"
+            ).read_bytes()
+        )
+        if not isinstance(marker, dict):
+            return None
+        file = ArtifactFile(
+            path=path.name,
+            size_bytes=marker.get("size"),
+            content_sha256=marker.get("sha256"),
+        )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name=f"{model_name}-archive",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=path.relative_to(self.output_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [file.model_dump(mode="json", exclude_none=True)],
+                        "model": model_name,
+                    },
+                )
+            ],
         )
 
 
-def _run_config_from_envelope(envelope: object) -> ABCFold2RunConfig:
-    if not isinstance(envelope, dict) or envelope.get("kind") != "run-config":
-        raise TypeError("ABCFold2 run-config envelope is invalid")
-    value = envelope.get("run_config")
+@dataclass
+class _ABCFold2PrepareNode(ProviderNode):
+    request: ABCFold2ExecutionRequest
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return ProviderCallSpec(
+            function_name="prepare_abcfold2",
+            uses_gpu=False,
+            runtime_image_key="abcfold2-prepare",
+            kwargs={
+                "yaml_str": self.request.yaml_content,
+                "search_templates": self.request.search_templates,
+                "msa_chains": self.request.msa_chains,
+            },
+        )
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        run_config = _run_config_from_value(result)
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="run-config",
+                    kind=ArtifactKind.TABLE,
+                    storage=InlineBytes(
+                        data=orjson.dumps(
+                            run_config.as_kwargs(),
+                            option=orjson.OPT_SORT_KEYS,
+                        ),
+                        filename="run-config.json",
+                        media_type="application/json",
+                    ),
+                )
+            ],
+        )
+
+
+@dataclass
+class _ABCFold2DownloadNode(ProviderNode):
+    function_name: str
+    force: bool
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return ProviderCallSpec(
+            function_name=self.function_name,
+            uses_gpu=False,
+            runtime_image_key=f"abcfold2-{self.function_name}",
+            kwargs={"force": self.force},
+        )
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        if result is not None:
+            raise ValueError("ABCFold2 model download returned an unexpected value")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+@dataclass
+class _ABCFold2SeedNode(TaskProviderNode):
+    model_name: str
+    publications: ABCFold2Publications
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[TaskDefinition, ...]:
+        run_config = _run_config_from_context(context)
+        return tuple(
+            TaskDefinition(
+                task_key=str(seed),
+                scientific_payload={"run_id": run_config.run_id, "seed": seed},
+            )
+            for seed in run_config.seeds
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
+        run_config = _run_config_from_context(context)
+        publication_key = self.publications.claim(self.model_name, run_config)
+        return ProviderCallSpec(
+            function_name=f"run_abcfold2_{self.model_name}",
+            uses_gpu=True,
+            runtime_image_key="abcfold2-gpu",
+            kwargs={
+                "seed": int(task.task_key),
+                **run_config.as_kwargs(),
+                "publication_key": publication_key,
+            },
+            metadata={"run_config": run_config.as_kwargs()},
+        )
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        if not isinstance(result, str):
+            raise ValueError("ABCFold2 seed worker returned no output path")
+        run_config = _run_config_from_value(metadata.get("run_config"))
+        publication = self.publications.seed_result(
+            self.model_name,
+            int(task_key),
+            run_config,
+        )
+        if publication is None:
+            raise FileNotFoundError("ABCFold2 seed publication is unavailable")
+        return publication
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del expected_fingerprint
+        return self.publications.seed_result(
+            self.model_name,
+            int(task.task_key),
+            _run_config_from_context(context),
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del expected_fingerprint, result, artifacts
+        try:
+            available = self.recover_remote_task_result(context, task, "") is not None
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        if errors:
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[
+                    "; ".join(f"{key}: {value}" for key, value in errors.items())
+                ],
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                republish_execution_artifact(
+                    _single_input_artifact(context, "run_config")
+                ),
+                *(output for result in results.values() for output in result.outputs),
+            ],
+        )
+
+
+@dataclass
+class _ABCFold2ArchiveNode(ProviderNode):
+    model_name: str
+    publications: ABCFold2Publications
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        run_config = _run_config_from_context(context)
+        return ProviderCallSpec(
+            function_name=f"collect_abcfold2_{self.model_name}_data",
+            uses_gpu=False,
+            runtime_image_key=f"abcfold2-collect-{self.model_name}",
+            kwargs={
+                "run_conf": run_config.as_kwargs(),
+                "publication_key": self.publications.claim(
+                    self.model_name,
+                    run_config,
+                ),
+            },
+            metadata={"run_config": run_config.as_kwargs()},
+        )
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        if not isinstance(result, dict) or "archive_path" not in result:
+            raise ValueError("ABCFold2 archive worker returned invalid metadata")
+        run_config = _run_config_from_value(metadata.get("run_config"))
+        publication = self.publications.archive_result(self.model_name, run_config)
+        if publication is None:
+            raise FileNotFoundError("ABCFold2 archive publication is unavailable")
+        return publication
+
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        try:
+            run_config = _run_config_from_context(context)
+        except ValueError:
+            return None
+        return self.publications.archive_result(
+            self.model_name,
+            run_config,
+        )
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        try:
+            available = self.recover_result_publication(context) is not None
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+
+def _run_config_from_value(value: object) -> ABCFold2RunConfig:
     if not isinstance(value, dict):
         raise TypeError("ABCFold2 run config is invalid")
+    value = cast(dict[str, object], value)
     run_id = value.get("run_id")
     workdir = value.get("workdir")
     seeds = value.get("seeds")
@@ -607,33 +692,40 @@ def _run_config_from_envelope(envelope: object) -> ABCFold2RunConfig:
     )
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Encode only bounded run configuration or publication metadata."""
-    if result is None:
-        return {"kind": "none"}
-    if isinstance(result, str):
-        return {"kind": "path", "path": result}
-    if isinstance(result, dict):
-        if "archive_path" in result:
-            return {
-                "kind": "archive",
-                "archive": orjson.loads(orjson.dumps(result)),
-            }
-        return {
-            "kind": "run-config",
-            "run_config": orjson.loads(orjson.dumps(result)),
-        }
-    return {"kind": "invalid"}
+def _run_config_from_context(context: NodeRunContext) -> ABCFold2RunConfig:
+    artifact = _single_input_artifact(context, "run_config")
+    return _run_config_from_value(
+        orjson.loads(context.resolve_artifact(artifact).read_bytes())
+    )
 
 
-def run_config_from_overview(overview: ExecutionOverview) -> ABCFold2RunConfig:
+def _single_input_artifact(
+    context: NodeRunContext,
+    name: str,
+) -> ExecutionArtifact:
+    artifacts = context.inputs.get(name) or []
+    if len(artifacts) != 1:
+        raise ValueError(f"ABCFold2 Node requires exactly one {name}")
+    return artifacts[0]
+
+
+def run_config_from_overview(
+    overview: ExecutionOverview,
+    output_volume: Any,
+) -> ABCFold2RunConfig:
     """Return the validated preparation result from a completed overview."""
     for call in overview.representative_provider_calls:
         if (
             call.node_key == PREPARE_NODE
             and call.status == ProviderCallStatus.SUCCEEDED
         ):
-            return _run_config_from_envelope(call.result_envelope)
+            return _run_config_from_value(
+                load_execution_provider_result(
+                    output_volume,
+                    execution_run_id=overview.run.execution_run_id,
+                    envelope=call.result_envelope,
+                )
+            )
     raise LookupError("ABCFold2 preparation result is unavailable")
 
 
@@ -644,7 +736,60 @@ def _workload_module():
     return abcfold2_app
 
 
-class ABCFold2ExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
+def abcfold2_execution_graph(
+    request: ABCFold2ExecutionRequest,
+    publications: ABCFold2Publications,
+) -> ExecutionGraph:
+    """Build ABCFold2's established parallel model branches."""
+    graph = ExecutionGraph(
+        "abcfold2",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="abcfold2",
+            scientific_payload=request.execution_plan.scientific_payload,
+            scientific_versions=dict(request.execution_plan.scientific_versions),
+        ),
+    )
+    prepare = graph.add_node(
+        _ABCFold2PrepareNode(request),
+        id=PREPARE_NODE,
+    )
+    boltz_download = None
+    chai_download = None
+    if request.download_models:
+        boltz_download = graph.add_node(
+            _ABCFold2DownloadNode("download_boltz_models", request.force_redownload),
+            id=BOLTZ_DOWNLOAD_NODE,
+        )
+        chai_download = graph.add_node(
+            _ABCFold2DownloadNode("download_chai_models", request.force_redownload),
+            id=CHAI_DOWNLOAD_NODE,
+        )
+
+    def add_model_branch(model_name: str, download: Any) -> None:
+        seeds = graph.add_node(
+            _ABCFold2SeedNode(model_name, publications),
+            id=f"run-{model_name}-seeds",
+            inputs={
+                "run_config": prepare.outputs(kind=ArtifactKind.TABLE),
+            },
+            depends_on=[] if download is None else [download],
+        )
+        graph.add_node(
+            _ABCFold2ArchiveNode(model_name, publications),
+            id=f"collect-{model_name}",
+            inputs={
+                "run_config": seeds.outputs(kind=ArtifactKind.TABLE),
+            },
+        )
+
+    if request.run_boltz:
+        add_model_branch("boltz", boltz_download)
+    if request.run_chai:
+        add_model_branch("chai", chai_download)
+    return graph
+
+
+class ABCFold2ExecutionCoordinator(OutputClaimExecutionDefinitionCoordinatorLifecycle):
     """Bind one run-scoped writer to ABCFold2 publications."""
 
     _request_loader = staticmethod(load_execution_request)
@@ -657,6 +802,7 @@ class ABCFold2ExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
+        output_volume_name: str,
         output_claims: Any,
         provider_driver: Any,
         app_version: str,
@@ -669,31 +815,34 @@ class ABCFold2ExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            output_claims=output_claims,
+            provider_driver=provider_driver,
+            graph_builder=self._graph,
             target_scientific_versions={
                 "abcfold2": app_version,
                 "boltz": boltz_version,
                 "chai": chai_version,
             },
+            poll_interval_seconds=poll_interval_seconds,
         )
-        self.output_volume = output_volume
+        self.output_volume_name = output_volume_name
         self.output_claims = output_claims
-        self.provider_driver = provider_driver
-        self.poll_interval_seconds = poll_interval_seconds
 
-    def _create_runtime(
+    def _graph(
         self,
         request: ABCFold2ExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> ABCFold2ExecutionRuntime:
-        return ABCFold2ExecutionRuntime(
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        del predecessor_execution_run_id
+        return abcfold2_execution_graph(
             request=request,
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            output_claims=self.output_claims,
-            poll_interval_seconds=self.poll_interval_seconds,
+            publications=ABCFold2Publications(
+                request=request,
+                execution_run_id=self.execution_run_id,
+                output_root=self.volume_root,
+                output_volume_name=self.output_volume_name,
+                output_claims=self.output_claims,
+            ),
         )

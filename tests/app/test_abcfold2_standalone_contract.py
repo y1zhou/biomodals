@@ -293,7 +293,7 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     monkeypatch.setattr(
         abcfold2_app,
         "run_config_from_overview",
-        lambda _snapshot: ABCFold2RunConfig(
+        lambda _snapshot, _volume: ABCFold2RunConfig(
             run_id="abcdef-no-tmpl",
             workdir="/abcfold2-output/ab/abcdef-no-tmpl",
             seeds=(1,),

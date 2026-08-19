@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D107
 
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import sleep
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
 
+import orjson
 import pytest
 
 from biomodals.execution import (
@@ -32,6 +34,7 @@ from biomodals.execution.modal import (
     ExecutionVolumeSync,
     execution_lineage_root,
     load_execution_launch,
+    load_execution_provider_result,
     persist_execution_launch,
     resolve_provider_call_limits,
     stage_execution_launch,
@@ -167,6 +170,37 @@ class FakeVolume:
                 path.write_bytes(source.read())
 
         yield Batch()
+
+
+def test_load_execution_provider_result_verifies_bounded_content(
+    tmp_path: Path,
+) -> None:
+    """Provider-result reads retain their path, size, and digest boundary."""
+    content = orjson.dumps({"run_id": "example"})
+    relative = "provider-results/example.json"
+    path = tmp_path / "workflow-runs" / str(RUN_ID) / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    envelope = {
+        "result_file": {
+            "path": relative,
+            "size_bytes": len(content),
+            "sha256": sha256(content).hexdigest(),
+        }
+    }
+
+    assert load_execution_provider_result(
+        FakeVolume(tmp_path),
+        execution_run_id=RUN_ID,
+        envelope=envelope,
+    ) == {"run_id": "example"}
+    envelope["result_file"]["path"] = "../outside.json"
+    with pytest.raises(ValueError, match="contained"):
+        load_execution_provider_result(
+            FakeVolume(tmp_path),
+            execution_run_id=RUN_ID,
+            envelope=envelope,
+        )
 
 
 def test_execution_lineage_root_follows_all_successors(tmp_path: Path) -> None:

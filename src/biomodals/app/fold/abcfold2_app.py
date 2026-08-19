@@ -837,6 +837,7 @@ class ExecutionCoordinator:
                 deployment=deployment,
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
+                output_volume_name=CONF.output_volume_name,
                 output_claims=ABCFOLD2_OUTPUT_CLAIMS,
                 provider_driver=_coordinator_modal_driver(development=selected_mode),
                 app_version=CONF.repo_commit_hash or CONF.version or "unknown",
@@ -972,7 +973,7 @@ def submit_abcfold2_task(
         workload_name=CONF.name,
     )
 
-    run_conf = run_config_from_overview(overview)
+    run_conf = run_config_from_overview(overview, CONF.output_volume)
     local_out_dir.mkdir(parents=True, exist_ok=True)
     local_run_conf = run_conf.as_kwargs()
     (local_out_dir / "run-config.json").write_bytes(

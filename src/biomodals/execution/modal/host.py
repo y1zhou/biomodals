@@ -9,8 +9,10 @@ from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Lock, RLock
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
+
+import orjson
 
 from biomodals.execution import (
     DeploymentIdentity,
@@ -41,6 +43,7 @@ from biomodals.helper.artifacts import (
     VolumeHandle,
     read_bounded_file_bytes,
     read_volume_bytes,
+    read_volume_file_exact,
     replace_bytes_atomic,
 )
 from biomodals.helper.output_claim import register_output_claim_successor
@@ -236,6 +239,45 @@ def submit_staged_execution_run(
             f"{overview.run.status.value}: {diagnostic}"
         )
     return overview
+
+
+def load_execution_provider_result(
+    output_volume: Any,
+    *,
+    execution_run_id: UUID,
+    envelope: object,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> object:
+    """Read one content-bound provider result through the Volume client."""
+    if not isinstance(envelope, Mapping):
+        raise ValueError("Execution Result Envelope must be an object")
+    envelope = cast(Mapping[str, object], envelope)
+    reference = envelope.get("result_file")
+    if not isinstance(reference, Mapping):
+        raise ValueError("Execution Result Envelope has no result file")
+    reference = cast(Mapping[str, object], reference)
+    relative_path = reference.get("path")
+    if not isinstance(relative_path, str):
+        raise ValueError("Execution Result Envelope path is invalid")
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
+        raise ValueError("Execution Result Envelope path must be contained")
+    size_bytes = reference.get("size_bytes")
+    if (
+        isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or not 0 < size_bytes <= max_bytes
+    ):
+        raise ValueError("Execution Result Envelope exceeds its byte limit")
+    content = read_volume_file_exact(
+        output_volume,
+        (PurePosixPath("workflow-runs") / str(execution_run_id) / relative).as_posix(),
+        size_bytes=size_bytes,
+        content_sha256=reference.get("sha256"),
+    )
+    return orjson.loads(content)
 
 
 def persist_execution_launch(
@@ -1076,4 +1118,33 @@ class ExecutionDefinitionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
             store=store,
             volume_io_lock=self._volume_io_lock,
             poll_interval_seconds=self.poll_interval_seconds,
+        )
+
+
+class OutputClaimExecutionDefinitionCoordinatorLifecycle(
+    ExecutionDefinitionCoordinatorLifecycle
+):
+    """Host an Execution Definition with successor output-claim lineage."""
+
+    def __init__(self, *, output_claims: Any, **kwargs: Any) -> None:
+        """Bind the shared claim store beside the graph host resources."""
+        super().__init__(**kwargs)
+        self.output_claims = output_claims
+
+    def _prepare_successor_request(
+        self,
+        request: Any,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_store: ExecutionRunStore,
+    ) -> Any:
+        del predecessor_store
+        register_output_claim_successor(
+            self.output_claims,
+            owner=str(self.execution_run_id),
+            predecessor=str(predecessor_execution_run_id),
+        )
+        return replace(
+            request,
+            replace_claim_owner=str(predecessor_execution_run_id),
         )

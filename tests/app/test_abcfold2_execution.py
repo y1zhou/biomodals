@@ -18,15 +18,18 @@ from biomodals.app.fold.abcfold2_execution import (
     CHAI_DOWNLOAD_NODE,
     CHAI_SEEDS_NODE,
     PREPARE_NODE,
+    ABCFold2ExecutionCoordinator,
     ABCFold2ExecutionRequest,
-    ABCFold2ExecutionRuntime,
+    ABCFold2Publications,
+    abcfold2_execution_graph,
+    persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "ABCFold2", 7)
@@ -38,6 +41,9 @@ class FakeVolume:
 
     def reload(self) -> None:
         pass
+
+
+OUTPUT_VOLUME_NAME = "ABCFold2-outputs"
 
 
 class FakeClaims:
@@ -145,6 +151,28 @@ def _request(**changes) -> ABCFold2ExecutionRequest:
     return ABCFold2ExecutionRequest(**values)
 
 
+def _coordinator(
+    tmp_path: Path,
+    request: ABCFold2ExecutionRequest,
+    driver: CompletingDriver,
+    claims: FakeClaims,
+) -> ABCFold2ExecutionCoordinator:
+    persist_execution_request(tmp_path, RUN_ID, request)
+    return ABCFold2ExecutionCoordinator(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        output_claims=claims,
+        provider_driver=driver,
+        app_version=request.app_version,
+        boltz_version=request.boltz_version,
+        chai_version=request.chai_version,
+        poll_interval_seconds=0,
+    )
+
+
 def test_request_round_trip_preserves_parallel_model_branches() -> None:
     request = _request()
 
@@ -163,6 +191,28 @@ def test_request_round_trip_preserves_parallel_model_branches() -> None:
     assert decoded.execution_plan.terminal_node_keys == (
         BOLTZ_ARCHIVE_NODE,
         CHAI_ARCHIVE_NODE,
+    )
+
+
+def test_definition_preserves_exact_execution_plan(tmp_path: Path) -> None:
+    request = _request()
+    graph = abcfold2_execution_graph(
+        request,
+        ABCFold2Publications(
+            request=request,
+            execution_run_id=RUN_ID,
+            output_root=tmp_path,
+            output_volume_name=OUTPUT_VOLUME_NAME,
+            output_claims=FakeClaims(),
+        ),
+    )
+
+    assert (
+        execution_plan(
+            graph.validate(),
+            workload_run_key=request.run_name,
+        )
+        == request.execution_plan
     )
 
 
@@ -243,19 +293,9 @@ def test_runtime_dispatches_each_seed_without_nested_calls(
     )
     driver = CompletingDriver(tmp_path)
     claims = FakeClaims()
-    runtime = ABCFold2ExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=volume,
-        output_claims=claims,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, claims)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert [name for name, _kwargs in driver.spawns] == [
@@ -268,4 +308,4 @@ def test_runtime_dispatches_each_seed_without_nested_calls(
         "collect_abcfold2_chai_data",
     ]
     assert set(claims.values.values()) == {str(RUN_ID)}
-    runtime.close()
+    coordinator.close()

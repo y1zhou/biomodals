@@ -129,7 +129,7 @@ def _coordinator(
         deployment=deployment,
         volume_root=tmp_path,
         output_volume=volume,
-        modal_driver=object(),
+        provider_driver=object(),
         app_version=app_version,
         repo_commit_hash=repo_commit_hash,
         poll_interval_seconds=0,

@@ -1944,7 +1944,7 @@ class ExecutionCoordinator:
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
                 output_claims=ENSIRNA_OUTPUT_CLAIMS,
-                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                provider_driver=_coordinator_modal_driver(development=selected_mode),
                 app_version=CONF.repo_commit_hash or CONF.version or "unknown",
             ),
         )

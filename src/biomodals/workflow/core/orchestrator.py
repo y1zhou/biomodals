@@ -501,7 +501,7 @@ class ExecutionCoordinator:
                 or self._development_function_handles is not None
             ):
                 runtime.configure_provider_boundary(
-                    modal_driver=self._modal_driver(),
+                    provider_driver=self._modal_driver(),
                     external_artifact_checker=external_checker,
                 )
             return runtime
@@ -517,7 +517,7 @@ class ExecutionCoordinator:
             volume_root=Path(CONF.output_volume_mountpoint),
             workflow_volume_name=OUT_VOLUME_NAME,
             workflow_volume=OUT_VOLUME,
-            modal_driver=driver,
+            provider_driver=driver,
             max_parallel_nodes=plan.max_parallel_nodes,
             max_active_provider_calls=plan.max_active_provider_calls,
             max_active_gpu_provider_calls=plan.effective_gpu_limit,

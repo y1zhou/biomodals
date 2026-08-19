@@ -6,16 +6,9 @@ import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import UUID
 
-from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
-    ModalDefiniteSubmissionError,
-    ModalDeploymentUnavailableError,
-    ModalSubmissionOutcomeUnknownError,
-)
 from biomodals.execution.model import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -34,6 +27,15 @@ from biomodals.execution.model import (
     TaskPlan,
     TaskStatus,
 )
+from biomodals.execution.provider import (
+    AsyncProviderDriver,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    ProviderDefiniteSubmissionError,
+    ProviderDeploymentUnavailableError,
+    ProviderDriver,
+    ProviderSubmissionOutcomeUnknownError,
+)
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
     ProviderCallCandidate,
@@ -49,51 +51,6 @@ from biomodals.execution.scheduler import (
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
 LOGGER = logging.getLogger(__name__)
-
-
-class ModalDriver(Protocol):
-    """Synchronous Modal operations required by the execution runtime."""
-
-    def resolve(self, binding: ProviderBinding) -> Any:
-        """Resolve one exact deployed function."""
-        ...
-
-    def spawn(
-        self,
-        function: Any,
-        *,
-        args: tuple[Any, ...],
-        kwargs: Mapping[str, Any],
-    ) -> str:
-        """Submit one function invocation."""
-        ...
-
-    def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
-        """Observe one retained provider call."""
-        ...
-
-    def cancel(self, provider_call_handle_id: str) -> None:
-        """Request provider-call cancellation."""
-        ...
-
-
-class _AsyncModalDriver(Protocol):
-    async def resolve(self, binding: ProviderBinding) -> Any: ...
-
-    async def spawn(
-        self,
-        function: Any,
-        *,
-        args: tuple[Any, ...],
-        kwargs: Mapping[str, Any],
-    ) -> str: ...
-
-    async def observe(
-        self,
-        provider_call_handle_id: str,
-    ) -> ModalCallObservation: ...
-
-    async def cancel(self, provider_call_handle_id: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -131,28 +88,28 @@ def _required_node_keys_for_run(
 def _record_provider_call_observation(
     repository: SqliteExecutionRepository,
     provider_call_id: UUID,
-    observation: ModalCallObservation,
+    observation: ProviderCallObservation,
     *,
     result_envelope: Any,
     result_already_satisfied: bool,
     now: int,
 ) -> ProviderCallRecord:
     """Apply the provider-neutral transition shared by sync and async hosts."""
-    if observation.kind == ModalCallObservationKind.RUNNING:
+    if observation.kind == ProviderCallObservationKind.RUNNING:
         return repository.mark_provider_call_running(provider_call_id, now=now)
-    if observation.kind == ModalCallObservationKind.SUCCEEDED:
+    if observation.kind == ProviderCallObservationKind.SUCCEEDED:
         return repository.record_provider_call_result(
             provider_call_id,
             result_envelope=result_envelope,
             now=now,
         )
-    if observation.kind == ModalCallObservationKind.FAILED:
+    if observation.kind == ProviderCallObservationKind.FAILED:
         return repository.fail_provider_call(
             provider_call_id,
-            message=observation.message or "Modal function failed",
+            message=observation.message or "Provider operation failed",
             now=now,
         )
-    if observation.kind == ModalCallObservationKind.CANCELLED:
+    if observation.kind == ProviderCallObservationKind.CANCELLED:
         if result_already_satisfied:
             return repository.cancel_pruned_provider_call(
                 provider_call_id,
@@ -160,31 +117,31 @@ def _record_provider_call_observation(
             )
         return repository.cancel_provider_call(
             provider_call_id,
-            message=observation.message or "Modal function was cancelled",
+            message=observation.message or "Provider operation was cancelled",
             now=now,
         )
     return repository.mark_provider_call_state_unknown(
         provider_call_id,
-        message=observation.message or "Modal call state was inconclusive",
+        message=observation.message or "Provider Call state was inconclusive",
         now=now,
     )
 
 
 class ExecutionRuntime:
-    """Coordinate repository checkpoints with exactly one Modal side effect."""
+    """Coordinate repository checkpoints with one provider side effect."""
 
     def __init__(
         self,
         repository: SqliteExecutionRepository,
         *,
-        modal_driver: ModalDriver,
+        provider_driver: ProviderDriver,
         checkpoint: Callable[[], SqliteExecutionRepository | None],
         transaction: Callable[[], AbstractContextManager[object]] = nullcontext,
         synchronize: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> None:
-        """Bind host-owned state, Modal operations, and its durability boundary."""
+        """Bind host-owned state, provider operations, and durability."""
         self.repository = repository
-        self._modal = modal_driver
+        self._driver = provider_driver
         self._checkpoint = checkpoint
         self._transaction = transaction
         self._synchronize = synchronize
@@ -963,14 +920,14 @@ class ExecutionRuntime:
             if identity_kwarg is not None:
                 invocation_kwargs[identity_kwarg] = str(preclaim.call.provider_call_id)
             try:
-                spawned[preclaim.call.provider_call_id] = self._modal.spawn(
+                spawned[preclaim.call.provider_call_id] = self._driver.spawn(
                     function,
                     args=submission.args,
                     kwargs=invocation_kwargs,
                 )
             except (
-                ModalDefiniteSubmissionError,
-                ModalSubmissionOutcomeUnknownError,
+                ProviderDefiniteSubmissionError,
+                ProviderSubmissionOutcomeUnknownError,
             ) as error:
                 errors[preclaim.call.provider_call_id] = error
             except Exception as error:
@@ -995,7 +952,7 @@ class ExecutionRuntime:
                             if current.status.is_terminal:
                                 continue
                             error = errors.get(provider_call_id)
-                            if isinstance(error, ModalDefiniteSubmissionError):
+                            if isinstance(error, ProviderDefiniteSubmissionError):
                                 self.repository.fail_provider_call(
                                     provider_call_id,
                                     message=str(error),
@@ -1003,7 +960,7 @@ class ExecutionRuntime:
                                 )
                             elif isinstance(
                                 error,
-                                ModalSubmissionOutcomeUnknownError,
+                                ProviderSubmissionOutcomeUnknownError,
                             ):
                                 self.repository.mark_submission_outcome_unknown(
                                     provider_call_id,
@@ -1014,7 +971,7 @@ class ExecutionRuntime:
                                 self.repository.mark_submission_outcome_unknown(
                                     provider_call_id,
                                     message=(
-                                        f"Unexpected Modal submission error: {error}"
+                                        f"Unexpected provider submission error: {error}"
                                     ),
                                     now=now,
                                 )
@@ -1030,10 +987,10 @@ class ExecutionRuntime:
             except Exception:
                 for handle_id in spawned.values():
                     try:
-                        self._modal.cancel(handle_id)
+                        self._driver.cancel(handle_id)
                     except Exception:
                         LOGGER.warning(
-                            "Could not cancel unattached Modal call %s",
+                            "Could not cancel unattached Provider Call %s",
                             handle_id,
                             exc_info=True,
                         )
@@ -1047,7 +1004,7 @@ class ExecutionRuntime:
                             if call.status == ProviderCallStatus.SUBMITTING:
                                 self.repository.mark_submission_outcome_unknown(
                                     call.provider_call_id,
-                                    message="Modal call attachment was not durable",
+                                    message="Provider Call attachment was not durable",
                                     now=now,
                                 )
                     self._checkpoint_state()
@@ -1129,7 +1086,7 @@ class ExecutionRuntime:
                         execution_run_id
                     )
                 )
-            observations: dict[UUID, tuple[ModalCallObservation, Any]] = {}
+            observations: dict[UUID, tuple[ProviderCallObservation, Any]] = {}
             preparation_errors: dict[UUID, Exception] = {}
             abandoned_submissions: set[UUID] = set()
             for call in originals:
@@ -1140,9 +1097,9 @@ class ExecutionRuntime:
                     continue
                 if call.provider_call_handle_id is None:
                     continue
-                observation = self._modal.observe(call.provider_call_handle_id)
+                observation = self._driver.observe(call.provider_call_handle_id)
                 prepared_result = None
-                if observation.kind == ModalCallObservationKind.SUCCEEDED:
+                if observation.kind == ProviderCallObservationKind.SUCCEEDED:
                     try:
                         prepared_result = encode_result(observation.result)
                     except Exception as error:
@@ -1172,9 +1129,9 @@ class ExecutionRuntime:
                     (observed := observations.get(call.provider_call_id)) is not None
                     and observed[0].kind
                     in {
-                        ModalCallObservationKind.SUCCEEDED,
-                        ModalCallObservationKind.FAILED,
-                        ModalCallObservationKind.CANCELLED,
+                        ProviderCallObservationKind.SUCCEEDED,
+                        ProviderCallObservationKind.FAILED,
+                        ProviderCallObservationKind.CANCELLED,
                     }
                 )
             )
@@ -1258,7 +1215,7 @@ class ExecutionRuntime:
                                     finalize_result(prepared_result)
                                     if finalize_result is not None
                                     and observation.kind
-                                    == ModalCallObservationKind.SUCCEEDED
+                                    == ProviderCallObservationKind.SUCCEEDED
                                     else prepared_result
                                 )
                             except Exception as error:
@@ -1280,7 +1237,7 @@ class ExecutionRuntime:
                                     now=now,
                                 )
                         checkpoint_needed = checkpoint_needed or (
-                            observation.kind != ModalCallObservationKind.RUNNING
+                            observation.kind != ProviderCallObservationKind.RUNNING
                         )
                         reconciled.append((original, updated))
 
@@ -1335,13 +1292,13 @@ class ExecutionRuntime:
                 self._checkpoint_state()
             return updated
         try:
-            self._modal.cancel(call.provider_call_handle_id)
+            self._driver.cancel(call.provider_call_handle_id)
         except Exception as error:
             with self._synchronize():
                 with self._transaction():
                     updated = self.repository.mark_provider_cancellation_unknown(
                         provider_call_id,
-                        message=f"Modal cancellation was inconclusive: {error}",
+                        message=f"Provider cancellation was inconclusive: {error}",
                         now=now,
                     )
                 self._checkpoint_state()
@@ -1380,8 +1337,8 @@ class ExecutionRuntime:
     ) -> Any | None:
         """Fail closed once no attached call still needs reconciliation."""
         try:
-            return self._modal.resolve(binding)
-        except ModalDeploymentUnavailableError as error:
+            return self._driver.resolve(binding)
+        except ProviderDeploymentUnavailableError as error:
             with self._synchronize():
                 run = self.repository.get_run(execution_run_id)
                 if (
@@ -1415,13 +1372,13 @@ class AsyncExecutionRuntime:
         self,
         repository: SqliteExecutionRepository,
         *,
-        modal_driver: _AsyncModalDriver,
+        provider_driver: AsyncProviderDriver,
         checkpoint: Callable[[], SqliteExecutionRepository | None],
         commit_local: Callable[[], None] | None = None,
     ) -> None:
         """Bind an async provider boundary to host-owned durable state."""
         self.repository = repository
-        self._modal = modal_driver
+        self._driver = provider_driver
         self._checkpoint = checkpoint
         self._commit_local = commit_local
 
@@ -1564,7 +1521,7 @@ class AsyncExecutionRuntime:
                     preclaim.call.provider_call_id
                 )
             try:
-                spawned[preclaim.call.provider_call_id] = await self._modal.spawn(
+                spawned[preclaim.call.provider_call_id] = await self._driver.spawn(
                     functions[submission.candidate.binding],
                     args=submission.args,
                     kwargs=kwargs,
@@ -1590,7 +1547,7 @@ class AsyncExecutionRuntime:
                         if current.status.is_terminal:
                             continue
                         error = errors.get(provider_call_id)
-                        if isinstance(error, ModalDefiniteSubmissionError):
+                        if isinstance(error, ProviderDefiniteSubmissionError):
                             self.repository.fail_provider_call(
                                 provider_call_id,
                                 message=str(error),
@@ -1615,10 +1572,10 @@ class AsyncExecutionRuntime:
             except Exception:
                 for handle_id in spawned.values():
                     try:
-                        await self._modal.cancel(handle_id)
+                        await self._driver.cancel(handle_id)
                     except Exception:
                         LOGGER.warning(
-                            "Could not cancel unattached Modal call %s",
+                            "Could not cancel unattached Provider Call %s",
                             handle_id,
                             exc_info=True,
                         )
@@ -1631,7 +1588,7 @@ class AsyncExecutionRuntime:
                         if call.status != ProviderCallStatus.SUBMITTING:
                             continue
                         error = errors.get(call.provider_call_id)
-                        if isinstance(error, ModalDefiniteSubmissionError):
+                        if isinstance(error, ProviderDefiniteSubmissionError):
                             self.repository.fail_provider_call(
                                 call.provider_call_id,
                                 message=str(error),
@@ -1640,7 +1597,7 @@ class AsyncExecutionRuntime:
                         else:
                             self.repository.mark_submission_outcome_unknown(
                                 call.provider_call_id,
-                                message="Modal call attachment was not durable",
+                                message="Provider Call attachment was not durable",
                                 now=now,
                             )
                 self._checkpoint_state()
@@ -1688,9 +1645,9 @@ class AsyncExecutionRuntime:
         if call.provider_call_handle_id is None:
             return call
 
-        observation = await self._modal.observe(call.provider_call_handle_id)
+        observation = await self._driver.observe(call.provider_call_handle_id)
         envelope = None
-        if observation.kind == ModalCallObservationKind.SUCCEEDED:
+        if observation.kind == ProviderCallObservationKind.SUCCEEDED:
             try:
                 envelope = encode_result(observation.result)
             except Exception as error:
@@ -1709,7 +1666,7 @@ class AsyncExecutionRuntime:
             result_already_satisfied=result_already_satisfied,
             now=now,
         )
-        if observation.kind != ModalCallObservationKind.RUNNING:
+        if observation.kind != ProviderCallObservationKind.RUNNING:
             self._checkpoint_state()
         elif updated.status != call.status:
             self._commit_local_state()
@@ -1729,7 +1686,7 @@ class AsyncExecutionRuntime:
         )
         observations: dict[
             UUID,
-            tuple[ModalCallObservation, Any | None],
+            tuple[ProviderCallObservation, Any | None],
         ] = {}
         for original in originals:
             if (
@@ -1738,9 +1695,9 @@ class AsyncExecutionRuntime:
                 or original.provider_call_handle_id is None
             ):
                 continue
-            observation = await self._modal.observe(original.provider_call_handle_id)
+            observation = await self._driver.observe(original.provider_call_handle_id)
             envelope = None
-            if observation.kind == ModalCallObservationKind.SUCCEEDED:
+            if observation.kind == ProviderCallObservationKind.SUCCEEDED:
                 try:
                     envelope = encode_result(observation.result)
                 except Exception as error:
@@ -1780,7 +1737,7 @@ class AsyncExecutionRuntime:
                 changed = changed or updated.status != original.status
                 needs_checkpoint = (
                     needs_checkpoint
-                    or observation.kind != ModalCallObservationKind.RUNNING
+                    or observation.kind != ProviderCallObservationKind.RUNNING
                 )
             reconciled.append((original, updated))
         if needs_checkpoint:
@@ -1811,11 +1768,11 @@ class AsyncExecutionRuntime:
             self._checkpoint_state()
             return updated
         try:
-            await self._modal.cancel(call.provider_call_handle_id)
+            await self._driver.cancel(call.provider_call_handle_id)
         except Exception as error:
             updated = self.repository.mark_provider_cancellation_unknown(
                 provider_call_id,
-                message=f"Modal cancellation was inconclusive: {error}",
+                message=f"Provider cancellation was inconclusive: {error}",
                 now=now,
             )
             self._checkpoint_state()
@@ -1850,8 +1807,8 @@ class AsyncExecutionRuntime:
     ) -> Any | None:
         """Fail closed once no attached call still needs reconciliation."""
         try:
-            return await self._modal.resolve(binding)
-        except ModalDeploymentUnavailableError as error:
+            return await self._driver.resolve(binding)
+        except ProviderDeploymentUnavailableError as error:
             run = self.repository.get_run(execution_run_id)
             if (
                 not run.cancellation_is_durable

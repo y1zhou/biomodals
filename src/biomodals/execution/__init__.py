@@ -31,6 +31,15 @@ from biomodals.execution.model import (
     WorkerAssignmentRecord,
     WorkStatusReason,
 )
+from biomodals.execution.provider import (
+    AsyncProviderDriver,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    ProviderDefiniteSubmissionError,
+    ProviderDeploymentUnavailableError,
+    ProviderDriver,
+    ProviderSubmissionOutcomeUnknownError,
+)
 from biomodals.execution.runtime import (
     AsyncExecutionRuntime,
     ExecutionRuntime,
@@ -54,6 +63,7 @@ from biomodals.execution.sqlite import (
 __all__ = [
     "ActiveProviderCallCounts",
     "AvailabilityStatus",
+    "AsyncProviderDriver",
     "AsyncExecutionRuntime",
     "COORDINATOR_SCALEDOWN_WINDOW_SECONDS",
     "DeploymentIdentity",
@@ -71,8 +81,14 @@ __all__ = [
     "NodePlan",
     "NodeStatus",
     "ProviderCallStatus",
+    "ProviderCallObservation",
+    "ProviderCallObservationKind",
     "ProviderCallSubmission",
     "ProviderBinding",
+    "ProviderDefiniteSubmissionError",
+    "ProviderDeploymentUnavailableError",
+    "ProviderDriver",
+    "ProviderSubmissionOutcomeUnknownError",
     "ProviderCallRecord",
     "PullTaskClaim",
     "ResultProvenance",

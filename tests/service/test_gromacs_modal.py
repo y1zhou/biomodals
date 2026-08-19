@@ -23,7 +23,7 @@ import pytest
 
 from biomodals.app.bioinfo.gromacs_execution import REQUIRED_FUNCTIONS, execution_plan
 from biomodals.execution import ProviderBinding
-from biomodals.execution.modal import ModalCallObservationKind
+from biomodals.execution.modal import ProviderCallObservationKind
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
 from biomodals.service.gromacs.contracts import artifact_request_sha256
@@ -514,7 +514,7 @@ def test_adapter_drives_one_exact_kernel_call() -> None:
         )
         observation = await adapter.observe(call_id)
         await adapter.cancel(call_id)
-        assert observation.kind == ModalCallObservationKind.SUCCEEDED
+        assert observation.kind == ProviderCallObservationKind.SUCCEEDED
 
     asyncio.run(exercise())
 

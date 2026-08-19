@@ -11,8 +11,8 @@ from biomodals.execution import (
     WorkStatusReason,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.execution.runtime import ExecutionRuntime
 
@@ -28,7 +28,9 @@ class CancelDriver:
     def __init__(self) -> None:
         self.cancelled: list[str] = []
         self.cancel_error: Exception | None = None
-        self.observation = ModalCallObservation(ModalCallObservationKind.CANCELLED)
+        self.observation = ProviderCallObservation(
+            ProviderCallObservationKind.CANCELLED
+        )
 
     def resolve(self, binding):
         raise AssertionError("cancellation never resolves a new function")
@@ -83,7 +85,7 @@ def test_cancel_request_waits_for_attached_call_confirmation() -> None:
     driver = CancelDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -263,7 +265,7 @@ def test_ambiguous_cancellation_preserves_task_and_call_slots() -> None:
     driver.cancel_error = RuntimeError("cancel response lost")
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -358,7 +360,7 @@ def test_result_pruning_waits_for_conclusive_provider_cancellation() -> None:
     driver = CancelDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -408,7 +410,7 @@ def test_result_pruning_without_an_attached_handle_preserves_unknown_ownership()
     assert claim is not None
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=CancelDriver(),
+        provider_driver=CancelDriver(),
         checkpoint=lambda: None,
     )
 

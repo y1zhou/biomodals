@@ -234,7 +234,7 @@ class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         store: ExecutionRunStore,
-        modal_driver: Any,
+        provider_driver: Any,
         output_volume: Any,
         output_claims: Any,
         predecessor_execution_run_id: UUID | None = None,
@@ -247,7 +247,7 @@ class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             store=store,
-            modal_driver=modal_driver,
+            provider_driver=provider_driver,
             output_volume=output_volume,
             predecessor_execution_run_id=predecessor_execution_run_id,
             poll_interval_seconds=poll_interval_seconds,
@@ -619,7 +619,7 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         volume_root: str | Path,
         output_volume: Any,
         output_claims: Any,
-        modal_driver: Any,
+        provider_driver: Any,
         app_version: str,
         poll_interval_seconds: float = 1.0,
     ) -> None:
@@ -632,7 +632,7 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         )
         self.output_volume = output_volume
         self.output_claims = output_claims
-        self.modal_driver = modal_driver
+        self.provider_driver = provider_driver
         self.poll_interval_seconds = poll_interval_seconds
 
     def prepare_restart(
@@ -705,7 +705,7 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             predecessor_execution_run_id=predecessor_execution_run_id,
             deployment=self.deployment,
             store=self._run_store(),
-            modal_driver=self.modal_driver,
+            provider_driver=self.provider_driver,
             output_volume=self.output_volume,
             output_claims=self.output_claims,
             poll_interval_seconds=self.poll_interval_seconds,

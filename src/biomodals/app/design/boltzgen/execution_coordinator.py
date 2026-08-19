@@ -38,7 +38,7 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
-        modal_driver: Any,
+        provider_driver: Any,
         app_version: str,
         repo_commit_hash: str,
         poll_interval_seconds: float = 1.0,
@@ -54,7 +54,7 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
             },
         )
         self.output_volume = output_volume
-        self.modal_driver = modal_driver
+        self.provider_driver = provider_driver
         self.poll_interval_seconds = poll_interval_seconds
 
     def prepare_restart(
@@ -116,7 +116,7 @@ class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):
             predecessor_execution_run_id=predecessor_execution_run_id,
             deployment=self.deployment,
             store=self._run_store(),
-            modal_driver=self.modal_driver,
+            provider_driver=self.provider_driver,
             output_volume=self.output_volume,
             output_root=self.volume_root,
             poll_interval_seconds=self.poll_interval_seconds,

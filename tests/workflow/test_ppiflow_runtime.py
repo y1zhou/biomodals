@@ -17,8 +17,8 @@ from biomodals.execution import (
     TaskStatus,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.helper.app_run import volume_app_output
 from biomodals.schema import (
@@ -164,8 +164,8 @@ class FakeModalDriver:
     def observe(self, provider_call_handle_id):
         candidate_id = provider_call_handle_id.removeprefix("fc-")
         self.events.append(f"observe:{candidate_id}")
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
 
@@ -228,7 +228,7 @@ def test_ppiflow_candidates_are_independent_kernel_tasks(
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         workflow_volume_name="Workflow-outputs",
-        modal_driver=driver,
+        provider_driver=driver,
         max_active_provider_calls=2,
         max_active_gpu_provider_calls=2,
         now=iter(range(100, 1000)).__next__,
@@ -314,7 +314,7 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         workflow_volume_name="Workflow-outputs",
-        modal_driver=driver,
+        provider_driver=driver,
         max_active_provider_calls=1,
         max_active_gpu_provider_calls=0,
         pull_worker_coordinator="run-pool",
@@ -424,7 +424,7 @@ def test_ppiflow_rosetta_recovers_committed_task_after_lost_callback(
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         workflow_volume_name="Workflow-outputs",
-        modal_driver=RosettaPullModalDriver(),
+        provider_driver=RosettaPullModalDriver(),
         max_active_provider_calls=1,
         max_active_gpu_provider_calls=0,
         pull_worker_coordinator="run-pool",

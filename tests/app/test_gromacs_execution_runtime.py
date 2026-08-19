@@ -18,8 +18,8 @@ from biomodals.app.bioinfo.gromacs_execution_runtime import (
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.helper.app_execution import ExecutionRunStore
 
@@ -74,8 +74,8 @@ class CompletingDriver:
     def observe(self, provider_call_handle_id: str):
         function, kwargs = self.calls[provider_call_handle_id]
         self._publish(function.function_name, kwargs)
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=str(self.root),
         )
 
@@ -149,7 +149,7 @@ def _runtime(
         predecessor_execution_run_id=predecessor_execution_run_id,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, execution_run_id),
-        modal_driver=CompletingDriver(tmp_path, request.run_name),
+        provider_driver=CompletingDriver(tmp_path, request.run_name),
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -231,7 +231,7 @@ def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -268,7 +268,7 @@ def test_same_run_name_rejects_outputs_from_changed_science(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=first_driver,
+        provider_driver=first_driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -285,7 +285,7 @@ def test_same_run_name_rejects_outputs_from_changed_science(
         execution_run_id=SECOND_RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
-        modal_driver=changed_driver,
+        provider_driver=changed_driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -312,7 +312,7 @@ def test_same_science_reuses_published_run_name(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=CompletingDriver(tmp_path, request.run_name),
+        provider_driver=CompletingDriver(tmp_path, request.run_name),
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -327,7 +327,7 @@ def test_same_science_reuses_published_run_name(
         execution_run_id=THIRD_RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, THIRD_RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -359,7 +359,7 @@ def test_prepare_publication_requires_downstream_inputs(tmp_path: Path) -> None:
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -422,7 +422,7 @@ def test_successor_repairs_missing_terminal_output(
         predecessor_execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -453,7 +453,7 @@ def test_successor_replaces_digest_invalid_preparation_output(
         predecessor_execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -477,7 +477,7 @@ def test_concurrent_same_name_roots_elect_one_output_owner(tmp_path: Path) -> No
             execution_run_id=execution_run_id,
             deployment=DEPLOYMENT,
             store=ExecutionRunStore(tmp_path, execution_run_id),
-            modal_driver=CompletingDriver(tmp_path, request.run_name),
+            provider_driver=CompletingDriver(tmp_path, request.run_name),
             output_volume=FakeVolume(),
             output_claims=claims,
             output_root=tmp_path,

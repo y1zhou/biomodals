@@ -26,7 +26,7 @@ from biomodals.app.bioinfo.gromacs_execution import (
     concrete_gromacs_seed,
     execution_plan,
 )
-from biomodals.execution.modal import ModalSubmissionOutcomeUnknownError
+from biomodals.execution.modal import ProviderSubmissionOutcomeUnknownError
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.gromacs.contracts import (
@@ -277,7 +277,7 @@ def create_router(
                 lifecycle_locks=lifecycle_locks,
             )
             await coordinator.advance(admission.job.job_id)
-        except ModalSubmissionOutcomeUnknownError:
+        except ProviderSubmissionOutcomeUnknownError:
             LOGGER.warning(
                 "event=submission_outcome_unknown job_id=%s workload=gromacs "
                 "request_id=%s",

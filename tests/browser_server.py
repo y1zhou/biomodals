@@ -15,8 +15,8 @@ from pathlib import Path
 import orjson
 
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
@@ -115,9 +115,9 @@ class _FakeGromacsAdapter:
     async def observe(
         self,
         provider_call_handle_id: str,
-    ) -> ModalCallObservation:
+    ) -> ProviderCallObservation:
         if provider_call_handle_id in self.cancelled:
-            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+            return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
         started, submitted_operation = self.calls[provider_call_handle_id]
         duration = (
             EQUILIBRATION_ANALYSIS_SECONDS
@@ -126,11 +126,11 @@ class _FakeGromacsAdapter:
             else STAGE_SECONDS
         )
         if time.monotonic() - started >= duration:
-            return ModalCallObservation(
-                ModalCallObservationKind.SUCCEEDED,
+            return ProviderCallObservation(
+                ProviderCallObservationKind.SUCCEEDED,
                 result=f"/outputs/{submitted_operation}",
             )
-        return ModalCallObservation(ModalCallObservationKind.RUNNING)
+        return ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     async def cancel(self, provider_call_handle_id: str) -> None:
         self.cancelled.add(provider_call_handle_id)

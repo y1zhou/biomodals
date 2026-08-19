@@ -5733,7 +5733,7 @@ class ExecutionCoordinator:
                 output_volume=CONF.output_volume,
                 model_volume=MODEL_VOLUME,
                 output_claims=OLIGOFORMER_OUTPUT_CLAIMS,
-                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                provider_driver=_coordinator_modal_driver(development=selected_mode),
                 app_version=CONF.repo_commit_hash or CONF.version or "unknown",
                 model_version=_hash_bytes(
                     orjson.dumps(

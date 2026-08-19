@@ -1000,7 +1000,7 @@ class ExecutionCoordinator:
                 deployment=deployment,
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
-                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                provider_driver=_coordinator_modal_driver(development=selected_mode),
             ),
         )
 

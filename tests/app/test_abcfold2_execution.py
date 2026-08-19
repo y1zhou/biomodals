@@ -22,7 +22,10 @@ from biomodals.app.fold.abcfold2_execution import (
     ABCFold2ExecutionRuntime,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
-from biomodals.execution.modal import ModalCallObservation, ModalCallObservationKind
+from biomodals.execution.modal import (
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+)
 from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -69,8 +72,8 @@ class CompletingDriver:
 
     def observe(self, provider_call_handle_id: str):
         function, kwargs = self.calls[provider_call_handle_id]
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=self._publish(function.function_name, kwargs),
         )
 
@@ -245,7 +248,7 @@ def test_runtime_dispatches_each_seed_without_nested_calls(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=volume,
         output_claims=claims,
         poll_interval_seconds=0,

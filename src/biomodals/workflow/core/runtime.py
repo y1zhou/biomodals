@@ -42,7 +42,7 @@ from biomodals.execution import (
     resume_execution_run,
 )
 from biomodals.execution.modal import ModalCallDriver
-from biomodals.execution.runtime import ModalDriver
+from biomodals.execution.provider import ProviderDriver
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
     PullWorkerDispatchDescriptor,
@@ -116,7 +116,7 @@ class WorkflowRuntime:
         volume_root: str | Path,
         workflow_volume_name: str,
         workflow_volume: VolumeHandle | None = None,
-        modal_driver: ModalDriver | None = None,
+        provider_driver: ProviderDriver | None = None,
         max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
@@ -167,7 +167,7 @@ class WorkflowRuntime:
         )
         self._provider = ExecutionRuntime(
             self.store.execution,
-            modal_driver=modal_driver or ModalCallDriver(),
+            provider_driver=provider_driver or ModalCallDriver(),
             checkpoint=self._checkpoint,
             transaction=self.store.transaction,
             synchronize=self._synchronize_kernel_state,
@@ -178,11 +178,11 @@ class WorkflowRuntime:
     def configure_provider_boundary(
         self,
         *,
-        modal_driver: ModalCallDriver,
+        provider_driver: ModalCallDriver,
         external_artifact_checker: ExternalArtifactChecker | None,
     ) -> None:
         """Install driver-only dependencies unavailable to callback-first opens."""
-        self._provider._modal = modal_driver
+        self._provider._modal = provider_driver
         self.external_artifact_checker = external_artifact_checker
 
     def run(

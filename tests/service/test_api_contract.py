@@ -27,10 +27,10 @@ from biomodals.execution import (
     TaskPlan,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
-    ModalDefiniteSubmissionError,
-    ModalSubmissionOutcomeUnknownError,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    ProviderDefiniteSubmissionError,
+    ProviderSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.service.api import create_app
@@ -85,7 +85,7 @@ class FakeGromacsAdapter:
         self.preflight_failures_remaining = 0
         self.preflight_started: asyncio.Event | None = None
         self.preflight_release: asyncio.Event | None = None
-        self.call_observations: dict[str, ModalCallObservation] = {}
+        self.call_observations: dict[str, ProviderCallObservation] = {}
         self.log_requests: list[
             tuple[
                 UUID,
@@ -134,10 +134,10 @@ class FakeGromacsAdapter:
         ))
         if self.unknown_failures_remaining:
             self.unknown_failures_remaining -= 1
-            raise ModalSubmissionOutcomeUnknownError("provider outcome unknown")
+            raise ProviderSubmissionOutcomeUnknownError("provider outcome unknown")
         if self.failures_remaining:
             self.failures_remaining -= 1
-            raise ModalDefiniteSubmissionError("provider rejected submission")
+            raise ProviderDefiniteSubmissionError("provider rejected submission")
         call_id = f"fc-{len(self.submissions)}"
         self._execution_calls[call_id] = function
         return call_id
@@ -145,30 +145,30 @@ class FakeGromacsAdapter:
     async def observe(self, provider_call_handle_id):
         return self.call_observations.get(
             provider_call_handle_id,
-            ModalCallObservation(ModalCallObservationKind.RUNNING),
+            ProviderCallObservation(ProviderCallObservationKind.RUNNING),
         )
 
     def complete_calls(self, *provider_call_handle_ids: str) -> None:
         """Make subsequent observations return one valid GROMACS result."""
         for handle_id in provider_call_handle_ids:
-            self.call_observations[handle_id] = ModalCallObservation(
-                ModalCallObservationKind.SUCCEEDED,
+            self.call_observations[handle_id] = ProviderCallObservation(
+                ProviderCallObservationKind.SUCCEEDED,
                 result=f"/outputs/{handle_id}",
             )
 
     def fail_calls(self, *provider_call_handle_ids: str) -> None:
         """Make subsequent observations return a conclusive failure."""
         for handle_id in provider_call_handle_ids:
-            self.call_observations[handle_id] = ModalCallObservation(
-                ModalCallObservationKind.FAILED,
+            self.call_observations[handle_id] = ProviderCallObservation(
+                ProviderCallObservationKind.FAILED,
                 message="test provider failure",
             )
 
     def cancel_calls(self, *provider_call_handle_ids: str) -> None:
         """Make subsequent observations return conclusive cancellation."""
         for handle_id in provider_call_handle_ids:
-            self.call_observations[handle_id] = ModalCallObservation(
-                ModalCallObservationKind.CANCELLED,
+            self.call_observations[handle_id] = ProviderCallObservation(
+                ProviderCallObservationKind.CANCELLED,
                 message="test provider cancellation",
             )
 

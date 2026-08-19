@@ -40,7 +40,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
-        modal_driver: Any,
+        provider_driver: Any,
         search_runtime: SearchRuntime,
         template_runtime: TemplateRuntime,
         inference_runtime: InferenceRuntime,
@@ -57,7 +57,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
             },
         )
         self.output_volume = output_volume
-        self.modal_driver = modal_driver
+        self.provider_driver = provider_driver
         self.search_runtime = search_runtime
         self.template_runtime = template_runtime
         self.inference_runtime = inference_runtime
@@ -118,7 +118,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionCoordinatorLifecycle):
             predecessor_execution_run_id=predecessor_execution_run_id,
             deployment=self.deployment,
             store=self._run_store(),
-            modal_driver=self.modal_driver,
+            provider_driver=self.provider_driver,
             output_volume=self.output_volume,
             search_runtime=self.search_runtime,
             template_runtime=self.template_runtime,

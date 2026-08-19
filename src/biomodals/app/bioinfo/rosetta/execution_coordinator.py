@@ -38,7 +38,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
-        modal_driver: Any,
+        provider_driver: Any,
         pull_worker_coordinator: Any,
         app_version: str,
         poll_interval_seconds: float = 1.0,
@@ -52,7 +52,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         )
         self.output_volume = output_volume
         self._volume_io_lock = RLock()
-        self.modal_driver = modal_driver
+        self.provider_driver = provider_driver
         self.pull_worker_coordinator = pull_worker_coordinator
         self.poll_interval_seconds = poll_interval_seconds
 
@@ -168,7 +168,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             predecessor_execution_run_id=predecessor_execution_run_id,
             deployment=self.deployment,
             store=self._run_store(),
-            modal_driver=self.modal_driver,
+            provider_driver=self.provider_driver,
             output_volume=self.output_volume,
             output_root=self.volume_root,
             pull_worker_coordinator=self.pull_worker_coordinator,

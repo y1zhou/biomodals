@@ -1753,7 +1753,7 @@ class ServiceStore:
     @contextmanager
     def async_execution_runtime(
         self,
-        modal_driver: Any,
+        provider_driver: Any,
     ) -> Iterator[AsyncExecutionRuntime]:
         """Open one API-hosted runtime with commit as its durability boundary."""
         conn = sqlite3.connect(self.path, timeout=5, isolation_level="DEFERRED")
@@ -1763,7 +1763,7 @@ class ServiceStore:
         try:
             yield AsyncExecutionRuntime(
                 SqliteExecutionRepository(conn),
-                modal_driver=modal_driver,
+                provider_driver=provider_driver,
                 checkpoint=conn.commit,
                 commit_local=conn.commit,
             )

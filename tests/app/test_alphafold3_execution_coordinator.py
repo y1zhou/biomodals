@@ -128,7 +128,7 @@ def _coordinator(
         deployment=deployment,
         volume_root=tmp_path,
         output_volume=volume,
-        modal_driver=object(),
+        provider_driver=object(),
         search_runtime=cast(Any, object()),
         template_runtime=cast(Any, object()),
         inference_runtime=cast(Any, object()),

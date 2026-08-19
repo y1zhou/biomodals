@@ -410,7 +410,7 @@ class ExecutionRuntimeLifecycle:
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         store: ExecutionRunStore,
-        modal_driver: Any,
+        provider_driver: Any,
         output_volume: Any,
         predecessor_execution_run_id: UUID | None,
         poll_interval_seconds: float,
@@ -432,7 +432,7 @@ class ExecutionRuntimeLifecycle:
         self._volume_sync = ExecutionVolumeSync(volume=output_volume, store=store)
         self._provider = ExecutionRuntime(
             store.execution,
-            modal_driver=modal_driver,
+            provider_driver=provider_driver,
             checkpoint=self._checkpoint,
             transaction=store.transaction,
             synchronize=self._synchronize_kernel_state,

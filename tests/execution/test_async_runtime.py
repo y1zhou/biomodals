@@ -9,9 +9,9 @@ import pytest
 
 from biomodals.execution import ProviderCallStatus, RunStatus, RunStatusReason
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
-    ModalDeploymentUnavailableError,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    ProviderDeploymentUnavailableError,
 )
 from biomodals.execution.runtime import AsyncExecutionRuntime, ProviderCallSubmission
 from biomodals.execution.scheduler import ProviderCallCandidate
@@ -34,7 +34,7 @@ class AsyncFakeModalDriver:
         self.resolve_count = 0
         self.spawn_count = 0
         self.cancelled: list[str] = []
-        self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
+        self.observation = ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     async def resolve(self, binding):
         self.resolve_count += 1
@@ -94,7 +94,7 @@ def test_async_runtime_submits_one_admission_set() -> None:
         checkpoints: list[int] = []
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: checkpoints.append(driver.spawn_count),
         )
 
@@ -128,7 +128,7 @@ def test_async_runtime_preserves_preclaim_and_result_envelope_boundaries() -> No
         checkpoints: list[int] = []
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: checkpoints.append(driver.spawn_count),
         )
 
@@ -152,8 +152,8 @@ def test_async_runtime_preserves_preclaim_and_result_envelope_boundaries() -> No
         assert driver.spawn_count == 1
         assert checkpoints == [0, 1]
 
-        driver.observation = ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        driver.observation = ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result={"path": "/outputs/seed-0"},
         )
         completed = await runtime.reconcile_provider_call(
@@ -183,7 +183,7 @@ def test_async_running_poll_commits_only_the_first_state_transition() -> None:
         local_commits: list[ProviderCallStatus] = []
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: None,
             commit_local=lambda: local_commits.append(
                 repository.list_provider_calls(RUN_ID)[0].status
@@ -227,7 +227,7 @@ def test_async_runtime_requests_cancellation_without_inventing_completion() -> N
         driver = AsyncFakeModalDriver()
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: None,
         )
         call = await runtime.submit_fixed_batch(
@@ -264,7 +264,7 @@ def test_async_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
         checkpoints: list[ProviderCallStatus] = []
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: checkpoints.append(
                 repository.list_provider_calls(RUN_ID)[0].status
             ),
@@ -308,7 +308,7 @@ def test_async_attachment_set_rolls_back_before_classifying_unknown(
         driver = AsyncFakeModalDriver()
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: None,
         )
         original_attach = repository.attach_provider_call
@@ -363,11 +363,11 @@ def test_async_runtime_fails_a_missing_exact_deployment_before_preclaim() -> Non
 
         class UnavailableDriver(AsyncFakeModalDriver):
             async def resolve(self, binding):
-                raise ModalDeploymentUnavailableError("version expired")
+                raise ProviderDeploymentUnavailableError("version expired")
 
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=UnavailableDriver(),
+            provider_driver=UnavailableDriver(),
             checkpoint=lambda: None,
         )
 
@@ -402,12 +402,12 @@ def test_async_unavailable_deployment_does_not_override_cancellation() -> None:
 
             async def resolve(self, binding):
                 await self.runtime.cancel_run(RUN_ID, now=109)
-                raise ModalDeploymentUnavailableError("version expired")
+                raise ProviderDeploymentUnavailableError("version expired")
 
         driver = CancellingUnavailableDriver()
         runtime = AsyncExecutionRuntime(
             repository,
-            modal_driver=driver,
+            provider_driver=driver,
             checkpoint=lambda: None,
         )
         driver.runtime = runtime

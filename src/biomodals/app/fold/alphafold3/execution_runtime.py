@@ -96,8 +96,8 @@ from biomodals.execution import (
     result_probe_frontier,
 )
 from biomodals.execution.modal import (
-    ModalDefiniteSubmissionError,
-    ModalSubmissionOutcomeUnknownError,
+    ProviderDefiniteSubmissionError,
+    ProviderSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.scheduler import (
     ProviderCallCandidate,
@@ -157,7 +157,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         store: ExecutionRunStore,
-        modal_driver: Any,
+        provider_driver: Any,
         output_volume: Any,
         search_runtime: SearchRuntime,
         template_runtime: TemplateRuntime,
@@ -172,7 +172,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             store=store,
-            modal_driver=modal_driver,
+            provider_driver=provider_driver,
             output_volume=output_volume,
             predecessor_execution_run_id=predecessor_execution_run_id,
             poll_interval_seconds=poll_interval_seconds,
@@ -751,8 +751,8 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 now=self._now(),
             )
         except (
-            ModalDefiniteSubmissionError,
-            ModalSubmissionOutcomeUnknownError,
+            ProviderDefiniteSubmissionError,
+            ProviderSubmissionOutcomeUnknownError,
         ):
             return
 

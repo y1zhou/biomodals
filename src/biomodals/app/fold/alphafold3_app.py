@@ -836,7 +836,7 @@ class ExecutionCoordinator:
                 deployment=deployment,
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
-                modal_driver=_coordinator_modal_driver(development=selected_mode),
+                provider_driver=_coordinator_modal_driver(development=selected_mode),
                 search_runtime=_msa_search_runtime(
                     maximum_age_seconds=CONF.timeout + 900,
                     wait_timeout_seconds=max(60, CONF.timeout - 60),

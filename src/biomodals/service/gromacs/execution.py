@@ -27,8 +27,8 @@ from biomodals.execution import (
     result_probe_frontier,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalDefiniteSubmissionError,
+    ProviderCallObservation,
+    ProviderDefiniteSubmissionError,
 )
 from biomodals.execution.scheduler import (
     TaskDispatchDescriptor,
@@ -67,7 +67,7 @@ class GromacsExecutionAdapter(Protocol):
     ) -> str:
         """Spawn one detached function call."""
 
-    async def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
+    async def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
         """Observe one attached function call."""
 
     async def cancel(self, provider_call_handle_id: str) -> None:
@@ -158,7 +158,7 @@ class GromacsExecutionCoordinator:
         """Advance one Job and suspend unexpected coordinator failures."""
         try:
             await self._advance(job_id)
-        except ModalDefiniteSubmissionError:
+        except ProviderDefiniteSubmissionError:
             raise
         except Exception as exc:
             self._suspend_after_coordinator_error(job_id, exc)
@@ -248,7 +248,7 @@ class GromacsExecutionCoordinator:
                             job,
                             required=required,
                         )
-                    except ModalDefiniteSubmissionError:
+                    except ProviderDefiniteSubmissionError:
                         self._reconcile_running_nodes(runtime, execution_run_id)
                         runtime.repository.skip_unreachable_nodes(
                             execution_run_id,

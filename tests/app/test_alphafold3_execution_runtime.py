@@ -35,9 +35,9 @@ from biomodals.execution import (
     RunStatus,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
-    ModalDeploymentUnavailableError,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    ProviderDeploymentUnavailableError,
 )
 from biomodals.helper.app_execution import ExecutionRunStore
 
@@ -100,7 +100,7 @@ class NoCallDriver:
 class RecordingCallDriver:
     def __init__(self) -> None:
         self.spawns: list[dict[str, object]] = []
-        self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
+        self.observation = ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     def resolve(self, binding):
         return binding
@@ -124,7 +124,7 @@ class RecordingCallDriver:
 
 class UnavailableCallDriver(NoCallDriver):
     def resolve(self, binding):
-        raise ModalDeploymentUnavailableError(f"{binding} is unavailable")
+        raise ProviderDeploymentUnavailableError(f"{binding} is unavailable")
 
 
 def _request(
@@ -171,7 +171,7 @@ def _runtime(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver or NoCallDriver(),
+        provider_driver=driver or NoCallDriver(),
         output_volume=output,
         search_runtime=SearchRuntime(
             sharded_volume=cast(Any, sharded),
@@ -322,8 +322,8 @@ def test_provider_success_refreshes_output_once(
     output = cast(FakeVolume, runtime.output_volume)
     commits = output.commits
     reloads = output.reloads
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"execution_result": {"path": "seed-result.json"}},
     )
 

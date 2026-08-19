@@ -16,8 +16,8 @@ from biomodals.execution import (
     RunStatusReason,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.service.auth import AuthService
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
@@ -64,8 +64,8 @@ class FakeGromacsExecutionAdapter:
 
     async def observe(self, provider_call_handle_id):
         function_name = self._calls[provider_call_handle_id]
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=f"/outputs/{function_name}",
         )
 

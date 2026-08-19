@@ -9,7 +9,7 @@ import modal
 
 from biomodals.app.bioinfo.gromacs_execution import REQUIRED_FUNCTIONS
 from biomodals.execution import ProviderBinding
-from biomodals.execution.modal import AsyncModalCallDriver, ModalCallObservation
+from biomodals.execution.modal import AsyncModalCallDriver, ProviderCallObservation
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.gromacs.results import (
     ArchiveNotReadyError,
@@ -62,7 +62,7 @@ class ModalGromacsAdapter:
         """Spawn one kernel-preclaimed deployed function."""
         return await self.execution.spawn(function, args=args, kwargs=kwargs)
 
-    async def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
+    async def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
         """Observe one kernel-attached deployed function call."""
         return await self.execution.observe(provider_call_handle_id)
 

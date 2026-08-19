@@ -125,7 +125,7 @@ def test_required_closure_uses_recorded_node_observations() -> None:
     repository = _repository()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=cast(Any, object()),
+        provider_driver=cast(Any, object()),
         checkpoint=lambda: None,
     )
 

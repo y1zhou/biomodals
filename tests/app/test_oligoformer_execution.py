@@ -29,7 +29,10 @@ from biomodals.app.score.oligoformer_execution import (
     OligoformerExecutionRuntime,
 )
 from biomodals.execution import AvailabilityStatus, DeploymentIdentity, RunStatus
-from biomodals.execution.modal import ModalCallObservation, ModalCallObservationKind
+from biomodals.execution.modal import (
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+)
 from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -121,7 +124,9 @@ class CompletingDriver:
                 reference_identity=self.plan.reference_identity,
             )
             result = {"result_path": str(path), "size_bytes": 7}
-        return ModalCallObservation(ModalCallObservationKind.SUCCEEDED, result=result)
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED, result=result
+        )
 
     def cancel(self, provider_call_handle_id: str) -> None:
         pass
@@ -209,7 +214,7 @@ def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
         output_volume=FakeVolume(),
         model_volume=FakeVolume(),
         output_claims=FakeClaims(),
-        modal_driver=cast(Any, object()),
+        provider_driver=cast(Any, object()),
         app_version=request.app_version,
         model_version=request.model_version,
         reference_version=cast(str, request.reference_version),
@@ -235,7 +240,7 @@ def test_target_reference_version_is_required_only_when_used(tmp_path: Path) -> 
         output_volume=FakeVolume(),
         model_volume=FakeVolume(),
         output_claims=FakeClaims(),
-        modal_driver=cast(Any, object()),
+        provider_driver=cast(Any, object()),
         app_version=request.app_version,
         model_version=request.model_version,
         reference_version="new-reference-source",
@@ -303,7 +308,7 @@ def test_cached_terminal_publication_completes_without_a_run_plan(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=volume,
         model_volume=volume,
         output_claims=FakeClaims(),
@@ -343,7 +348,7 @@ def test_cached_terminal_publication_rejects_changed_model(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=CompletingDriver({}, None),
+        provider_driver=CompletingDriver({}, None),
         output_volume=volume,
         model_volume=volume,
         output_claims=FakeClaims(),
@@ -469,7 +474,7 @@ def test_runtime_drives_efficacy_only_run_through_deployed_functions(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=volume,
         model_volume=volume,
         output_claims=FakeClaims(),
@@ -589,7 +594,7 @@ def test_runtime_dispatches_off_target_scientific_tiles(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=volume,
         model_volume=volume,
         output_claims=FakeClaims(),

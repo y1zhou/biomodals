@@ -426,7 +426,7 @@ def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:
             self._now = lambda: 10
             self._provider = ExecutionRuntime(
                 store.execution,
-                modal_driver=cast(Any, object()),
+                provider_driver=cast(Any, object()),
                 checkpoint=lambda: store.execution,
                 transaction=store.transaction,
             )

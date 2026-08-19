@@ -16,9 +16,9 @@ from biomodals.execution import DeploymentIdentity, ProviderBinding
 from biomodals.execution.modal import (
     AsyncModalCallDriver,
     ModalCallDriver,
-    ModalCallObservationKind,
-    ModalDeploymentUnavailableError,
-    ModalSubmissionOutcomeUnknownError,
+    ProviderCallObservationKind,
+    ProviderDeploymentUnavailableError,
+    ProviderSubmissionOutcomeUnknownError,
     deployed_execution_coordinator,
     deployed_function_handle,
     development_modal_call_driver,
@@ -225,7 +225,7 @@ def test_driver_classifies_ambiguous_spawn_failure() -> None:
     function = FailingFunction()
     driver = ModalCallDriver(function_resolver=lambda *args, **kwargs: function)
 
-    with pytest.raises(ModalSubmissionOutcomeUnknownError):
+    with pytest.raises(ProviderSubmissionOutcomeUnknownError):
         driver.spawn(
             driver.resolve(GPU_BINDING),
             args=(),
@@ -244,7 +244,7 @@ def test_driver_classifies_an_unavailable_exact_version() -> None:
         function_resolver=lambda *args, **kwargs: MissingFunction()
     )
 
-    with pytest.raises(ModalDeploymentUnavailableError, match="v23"):
+    with pytest.raises(ProviderDeploymentUnavailableError, match="v23"):
         driver.resolve(GPU_BINDING)
 
 
@@ -262,10 +262,10 @@ def test_driver_observes_timeout_as_running_and_retained_result_as_success() -> 
     call = Call()
     driver = ModalCallDriver(call_resolver=lambda call_id: call)
 
-    assert driver.observe("fc-123").kind == ModalCallObservationKind.RUNNING
+    assert driver.observe("fc-123").kind == ProviderCallObservationKind.RUNNING
     call.ready = True
     observation = driver.observe("fc-123")
-    assert observation.kind == ModalCallObservationKind.SUCCEEDED
+    assert observation.kind == ProviderCallObservationKind.SUCCEEDED
     assert observation.result == {"done": True}
 
 
@@ -320,7 +320,7 @@ def test_async_driver_uses_exact_deployment_and_retained_call_handle() -> None:
         ]
         assert function.hydrated
         assert call_id == "fc-async"
-        assert observation.kind == ModalCallObservationKind.SUCCEEDED
+        assert observation.kind == ProviderCallObservationKind.SUCCEEDED
         assert observation.result == {"done": True}
 
     asyncio.run(scenario())

@@ -41,8 +41,8 @@ from biomodals.execution import (
     TaskStatus,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.helper.app_execution import ExecutionRunStore
 
@@ -101,8 +101,8 @@ class CompletingDriver:
     def observe(self, provider_call_handle_id: str):
         function, kwargs = self.calls[provider_call_handle_id]
         result = self._publish(function.function_name, kwargs)
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=result,
         )
 
@@ -307,7 +307,7 @@ def test_discovered_batch_tasks_skip_collection_wide_probe(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=object(),
+        provider_driver=object(),
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -341,7 +341,7 @@ def test_undiscovered_batch_cache_is_validated_in_parallel(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=object(),
+        provider_driver=object(),
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -622,7 +622,7 @@ def test_same_run_name_inputs_are_isolated_until_output_claim(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=object(),
+        provider_driver=object(),
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -632,7 +632,7 @@ def test_same_run_name_inputs_are_isolated_until_output_claim(
         execution_run_id=OTHER_RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, OTHER_RUN_ID),
-        modal_driver=object(),
+        provider_driver=object(),
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -660,7 +660,7 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -701,7 +701,7 @@ def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -743,7 +743,7 @@ def test_postprocess_includes_warm_and_newly_scored_inputs(tmp_path: Path) -> No
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -767,7 +767,7 @@ def test_restart_rejects_target_scientific_version_drift(tmp_path: Path) -> None
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=CompletingDriver(tmp_path, request),
+        provider_driver=CompletingDriver(tmp_path, request),
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -782,7 +782,7 @@ def test_restart_rejects_target_scientific_version_drift(tmp_path: Path) -> None
         volume_root=tmp_path,
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
-        modal_driver=object(),
+        provider_driver=object(),
         app_version="changed-version",
     )
 
@@ -806,7 +806,7 @@ def test_unbound_metrics_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,
@@ -847,7 +847,7 @@ def test_stale_input_outputs_do_not_satisfy_a_new_request(tmp_path: Path) -> Non
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=FakeClaims(),
         output_root=tmp_path,
@@ -891,7 +891,7 @@ def test_fingerprint_bound_metrics_satisfy_the_terminal_node(tmp_path: Path) -> 
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_claims=claims,
         output_root=tmp_path,

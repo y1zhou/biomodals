@@ -24,8 +24,8 @@ from biomodals.execution import (
     TaskStatus,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.schema import (
     AppOutput,
@@ -364,8 +364,8 @@ class FakeModalDriver:
 
     def observe(self, provider_call_handle_id):
         self.events.append(f"observe:{provider_call_handle_id}")
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
 
@@ -377,8 +377,8 @@ class CancellingModalDriver(FakeModalDriver):
     def observe(self, provider_call_handle_id):
         self.events.append(f"observe:{provider_call_handle_id}")
         if provider_call_handle_id in self.cancelled:
-            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
-        return ModalCallObservation(ModalCallObservationKind.RUNNING)
+            return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
+        return ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
 
 class SelectivelyCompletingModalDriver(FakeModalDriver):
@@ -389,9 +389,9 @@ class SelectivelyCompletingModalDriver(FakeModalDriver):
     def observe(self, provider_call_handle_id):
         self.events.append(f"observe:{provider_call_handle_id}")
         if provider_call_handle_id not in self.completed:
-            return ModalCallObservation(ModalCallObservationKind.RUNNING)
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+            return ProviderCallObservation(ProviderCallObservationKind.RUNNING)
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
 
@@ -400,8 +400,8 @@ class StateUnknownUntilCancelledModalDriver(CancellingModalDriver):
     def observe(self, provider_call_handle_id):
         self.events.append(f"observe:{provider_call_handle_id}")
         if provider_call_handle_id in self.cancelled:
-            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
-        return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
+            return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
+        return ProviderCallObservation(ProviderCallObservationKind.STATE_UNKNOWN)
 
 
 class FanoutModalDriver(FakeModalDriver):
@@ -420,12 +420,12 @@ class FanoutModalDriver(FakeModalDriver):
         task_key = provider_call_handle_id.removeprefix("fc-")
         self.events.append(f"observe:{task_key}")
         if task_key in self.failing_tasks:
-            return ModalCallObservation(
-                ModalCallObservationKind.FAILED,
+            return ProviderCallObservation(
+                ProviderCallObservationKind.FAILED,
                 message=f"{task_key} failed",
             )
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
 
@@ -530,7 +530,7 @@ def _runtime(
         volume_root=tmp_path,
         workflow_volume_name="Workflow-outputs",
         workflow_volume=volume,
-        modal_driver=driver,
+        provider_driver=driver,
         max_parallel_nodes=max_parallel_nodes,
         max_active_provider_calls=max_calls,
         max_active_gpu_provider_calls=max_gpu_calls,

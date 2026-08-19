@@ -24,8 +24,8 @@ from biomodals.execution import (
     RunStatusReason,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.helper.app_execution import load_execution_launch
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
@@ -227,15 +227,15 @@ class FanoutDriver:
         )
         return call_id
 
-    def observe(self, provider_call_handle_id: str) -> ModalCallObservation:
+    def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
         task_key = provider_call_handle_id.removeprefix("fc-")
         if task_key in self.failing_tasks:
-            return ModalCallObservation(
-                ModalCallObservationKind.FAILED,
+            return ProviderCallObservation(
+                ProviderCallObservationKind.FAILED,
                 message=f"{task_key} failed",
             )
-        return ModalCallObservation(
-            ModalCallObservationKind.SUCCEEDED,
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
             result=self.results[provider_call_handle_id],
         )
 
@@ -463,7 +463,7 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
         development_function_handles={"compute": handle},
     )
 
-    driver = cast(Any, calls["modal_driver"])
+    driver = cast(Any, calls["provider_driver"])
     resolved = driver.resolve(
         ProviderBinding("development", "DemoWorkflow", 1, "compute", False)
     )
@@ -1186,10 +1186,10 @@ def test_existing_runtime_installs_strict_checker_before_drive(
         def configure_provider_boundary(
             self,
             *,
-            modal_driver: object,
+            provider_driver: object,
             external_artifact_checker: object,
         ) -> None:
-            del modal_driver
+            del provider_driver
             self.external_artifact_checker = external_artifact_checker
 
     runtime = FakeRuntime()

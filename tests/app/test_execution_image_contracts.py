@@ -174,7 +174,7 @@ def test_python310_shared_runtime_fallbacks(
 
     assert loaded["biomodals.execution.model"].RunStatus.SUCCEEDED == "succeeded"
     assert (
-        loaded["biomodals.execution.modal"].ModalCallObservationKind.SUCCEEDED
+        loaded["biomodals.execution.modal"].ProviderCallObservationKind.SUCCEEDED
         == "succeeded"
     )
     assert loaded["biomodals.helper.artifacts"].utc_now().endswith("+00:00")

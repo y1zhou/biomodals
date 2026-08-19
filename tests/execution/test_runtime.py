@@ -28,11 +28,11 @@ from biomodals.execution import (
 )
 from biomodals.execution.coordinator import drive_execution_run
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
-    ModalDefiniteSubmissionError,
-    ModalDeploymentUnavailableError,
-    ModalSubmissionOutcomeUnknownError,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    ProviderDefiniteSubmissionError,
+    ProviderDeploymentUnavailableError,
+    ProviderSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.runtime import ExecutionRuntime, ProviderCallSubmission
 from biomodals.execution.scheduler import (
@@ -66,7 +66,7 @@ class FakeModalDriver:
         self.spawn_kwargs: list[dict[str, object]] = []
         self.resolve_error: Exception | None = None
         self.spawn_error: Exception | None = None
-        self.observation = ModalCallObservation(ModalCallObservationKind.RUNNING)
+        self.observation = ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     def resolve(self, binding):
         self.resolve_count += 1
@@ -228,7 +228,7 @@ def test_runtime_creates_or_verifies_one_run_identity() -> None:
     repository.initialize_schema()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=connection.commit,
         transaction=_transaction(connection),
     )
@@ -272,7 +272,7 @@ def test_runtime_owns_result_frontier_recovery() -> None:
     repository = create_repository(connection=connection, task_count=1)
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=connection.commit,
         transaction=_transaction(connection),
     )
@@ -292,7 +292,7 @@ def test_publication_recovery_does_not_reprobe_persisted_unowned_misses() -> Non
     repository = create_repository(task_count=3)
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: None,
     )
     observed_tasks: list[str] = []
@@ -320,7 +320,7 @@ def test_runtime_builds_and_limits_fixed_call_candidates() -> None:
     )
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=connection.commit,
         transaction=_transaction(connection),
     )
@@ -347,7 +347,7 @@ def test_zero_gpu_capacity_suspends_missing_gpu_work() -> None:
     )
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=connection.commit,
         transaction=_transaction(connection),
     )
@@ -375,7 +375,7 @@ def test_zero_gpu_capacity_still_admits_cpu_work() -> None:
     )
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: None,
     )
 
@@ -405,7 +405,7 @@ def test_fixed_candidate_policy_is_prepared_once_then_admitted_in_windows() -> N
     )
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: None,
     )
     described: list[str] = []
@@ -469,7 +469,7 @@ def test_preclaim_checkpoint_precedes_spawn_and_replay_never_spawns_twice() -> N
     checkpoints: list[int] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append(driver.spawn_count),
     )
 
@@ -511,7 +511,7 @@ def test_admission_set_batches_resolution_and_volume_checkpoints() -> None:
     checkpoints: list[int] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append(driver.spawn_count),
     )
 
@@ -579,7 +579,7 @@ def test_modal_operations_never_hold_the_repository_writer() -> None:
     driver = LockCheckingDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: (
             pytest.fail("checkpoint escaped the writer") if not writer_active else None
         ),
@@ -625,7 +625,7 @@ def test_provider_result_finalization_holds_the_repository_writer() -> None:
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
         synchronize=synchronize,
     )
@@ -639,8 +639,8 @@ def test_provider_result_finalization_holds_the_repository_writer() -> None:
         ),
         now=110,
     )
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"answer": 42},
     )
 
@@ -674,7 +674,7 @@ def test_provider_result_finalization_failure_retains_unknown_ownership() -> Non
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
     (submitted,) = runtime.submit_provider_calls(
@@ -688,8 +688,8 @@ def test_provider_result_finalization_failure_retains_unknown_ownership() -> Non
         now=110,
     )
     assert submitted is not None
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"answer": 42},
     )
     prepared = object()
@@ -734,7 +734,7 @@ def test_later_result_failure_preserves_earlier_envelope(
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=connection.commit,
         transaction=_transaction(connection),
     )
@@ -750,8 +750,8 @@ def test_later_result_failure_preserves_earlier_envelope(
         now=110,
     )
     assert all(call is not None for call in submitted)
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"answer": 42},
     )
     encoded = 0
@@ -803,7 +803,7 @@ def test_cancellation_during_spawn_cancels_the_attached_call() -> None:
     driver = CancellingDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -834,12 +834,12 @@ def test_definite_spawn_rejection_after_cancellation_keeps_task_cancelled() -> N
         def spawn(self, function, *, args, kwargs):
             self.spawn_count += 1
             runtime.cancel_run(RUN_ID, now=111)
-            raise ModalDefiniteSubmissionError("rejected")
+            raise ProviderDefiniteSubmissionError("rejected")
 
     driver = CancellingRejectDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -880,7 +880,7 @@ def test_terminal_call_set_uses_one_volume_checkpoint() -> None:
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
     runtime.submit_provider_calls(
@@ -895,8 +895,8 @@ def test_terminal_call_set_uses_one_volume_checkpoint() -> None:
         now=110,
     )
     checkpoints.clear()
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"path": "/outputs/result"},
     )
 
@@ -937,7 +937,7 @@ def test_checkpoint_may_replace_a_volume_backed_repository(tmp_path) -> None:
 
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=checkpoint,
     )
 
@@ -970,7 +970,7 @@ def test_resolution_failure_happens_before_durable_preclaim() -> None:
 
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=BrokenResolver(),
+        provider_driver=BrokenResolver(),
         checkpoint=lambda: None,
     )
 
@@ -1008,7 +1008,7 @@ def test_publication_recovery_reopens_repository_after_concurrent_checkpoint(
 
     runtime = ExecutionRuntime(
         store.execution,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=checkpoint,
         transaction=store.transaction,
         synchronize=store.synchronize,
@@ -1044,11 +1044,11 @@ def test_unavailable_exact_deployment_fails_without_a_preclaim() -> None:
 
     class UnavailableResolver(FakeModalDriver):
         def resolve(self, binding):
-            raise ModalDeploymentUnavailableError("version 23 is unavailable")
+            raise ProviderDeploymentUnavailableError("version 23 is unavailable")
 
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=UnavailableResolver(),
+        provider_driver=UnavailableResolver(),
         checkpoint=lambda: None,
     )
 
@@ -1083,12 +1083,12 @@ def test_unavailable_deployment_does_not_override_cancellation() -> None:
 
         def resolve(self, binding):
             self.runtime.cancel_run(RUN_ID, now=109)
-            raise ModalDeploymentUnavailableError("version 23 is unavailable")
+            raise ProviderDeploymentUnavailableError("version 23 is unavailable")
 
     driver = CancellingUnavailableResolver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
     driver.runtime = runtime
@@ -1120,7 +1120,7 @@ def test_unavailable_deployment_first_drains_attached_calls() -> None:
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
     first = _submit_fixed(
@@ -1131,7 +1131,9 @@ def test_unavailable_deployment_first_drains_attached_calls() -> None:
     )
     assert first is not None
 
-    driver.resolve_error = ModalDeploymentUnavailableError("version 23 is unavailable")
+    driver.resolve_error = ProviderDeploymentUnavailableError(
+        "version 23 is unavailable"
+    )
     assert (
         _submit_fixed(
             runtime,
@@ -1178,7 +1180,7 @@ def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -
 
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=fail_checkpoint,
     )
 
@@ -1194,7 +1196,7 @@ def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -
     assert driver.spawn_count == 0
     recovery_runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
     recovered = _reconcile_one(
@@ -1211,11 +1213,11 @@ def test_failed_preclaim_checkpoint_never_reaches_spawn_and_recovers_unknown() -
     ("error", "expected_status"),
     [
         (
-            ModalDefiniteSubmissionError("rejected"),
+            ProviderDefiniteSubmissionError("rejected"),
             ProviderCallStatus.FAILED,
         ),
         (
-            ModalSubmissionOutcomeUnknownError("response lost"),
+            ProviderSubmissionOutcomeUnknownError("response lost"),
             ProviderCallStatus.OUTCOME_UNKNOWN,
         ),
         (
@@ -1239,7 +1241,7 @@ def test_spawn_failure_is_durably_classified_without_reauthorization(
     driver.spawn_error = error
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -1274,10 +1276,10 @@ def test_definite_submission_rejection_finishes_run_without_suspension() -> None
         compatibility_key="af3",
     )
     driver = FakeModalDriver()
-    driver.spawn_error = ModalDefiniteSubmissionError("rejected")
+    driver.spawn_error = ProviderDefiniteSubmissionError("rejected")
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -1336,7 +1338,7 @@ def test_cancellation_stops_the_rest_of_a_multi_call_admission_set() -> None:
     driver = BlockingDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=connection.commit,
         transaction=_transaction(connection),
         synchronize=lambda: writer,
@@ -1388,7 +1390,7 @@ def test_unattached_returned_call_is_cancelled_and_checkpointed_unknown(
     checkpoints: list[ProviderCallStatus] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append(
             repository.list_provider_calls(RUN_ID)[0].status
         ),
@@ -1437,7 +1439,7 @@ def test_batch_recovery_marks_abandoned_preclaim_outcome_unknown() -> None:
     checkpoints: list[ProviderCallStatus] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: checkpoints.append(
             repository.get_provider_call(preclaim.call.provider_call_id).status
         ),
@@ -1484,7 +1486,7 @@ def test_terminal_publication_recovery_runs_under_the_writer_lock() -> None:
 
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
         synchronize=synchronize,
     )
@@ -1495,8 +1497,8 @@ def test_terminal_publication_recovery_runs_under_the_writer_lock() -> None:
         now=110,
     )
     assert call is not None
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.FAILED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.FAILED,
         message="worker exited",
     )
     recovery_depths: list[int] = []
@@ -1526,7 +1528,7 @@ def test_durable_cancellation_skips_terminal_publication_recovery() -> None:
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
     call = _submit_fixed(
@@ -1537,8 +1539,8 @@ def test_durable_cancellation_skips_terminal_publication_recovery() -> None:
     )
     assert call is not None
     runtime.cancel_run(RUN_ID, now=111)
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"status": "succeeded"},
     )
     recovery_calls = []
@@ -1568,7 +1570,7 @@ def test_durable_cancellation_skips_cycle_publication_recovery() -> None:
     )
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: None,
     )
     assert (
@@ -1614,7 +1616,7 @@ def test_cycle_publication_recovery_runs_outside_the_writer_lock() -> None:
 
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: None,
         synchronize=synchronize,
     )
@@ -1648,7 +1650,7 @@ def test_cancellation_during_recovery_fences_observation(
     )
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: None,
     )
     assert (
@@ -1699,7 +1701,7 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
     call = _submit_fixed(
@@ -1710,8 +1712,8 @@ def test_recovery_collects_attached_call_once_then_replays_durable_envelope() ->
         now=110,
     )
     assert call is not None
-    driver.observation = ModalCallObservation(
-        ModalCallObservationKind.SUCCEEDED,
+    driver.observation = ProviderCallObservation(
+        ProviderCallObservationKind.SUCCEEDED,
         result={"path": "/outputs/seed-0"},
     )
 
@@ -1745,7 +1747,7 @@ def test_running_poll_does_not_cross_host_checkpoint() -> None:
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
     call = _submit_fixed(
@@ -1780,7 +1782,7 @@ def test_pull_worker_submission_receives_its_durable_call_identity() -> None:
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
 
@@ -1817,7 +1819,7 @@ def test_fixed_submission_can_receive_its_durable_call_identity() -> None:
     driver = FakeModalDriver()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: None,
     )
 
@@ -1851,7 +1853,7 @@ def test_pull_claim_and_completion_cross_checkpoint_before_return() -> None:
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=driver,
+        provider_driver=driver,
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
     call = _submit_pull_worker(
@@ -1898,7 +1900,7 @@ def test_concurrent_claim_requests_share_the_worker_capacity() -> None:
     writer = RLock()
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=connection.commit,
         transaction=_transaction(connection),
         synchronize=lambda: writer,
@@ -1961,7 +1963,7 @@ def test_pull_completion_microbatch_crosses_one_checkpoint() -> None:
     checkpoints: list[str] = []
     runtime = ExecutionRuntime(
         repository,
-        modal_driver=FakeModalDriver(),
+        provider_driver=FakeModalDriver(),
         checkpoint=lambda: checkpoints.append("checkpoint"),
     )
     call = _submit_pull_worker(

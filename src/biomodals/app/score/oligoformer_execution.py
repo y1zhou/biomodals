@@ -338,7 +338,7 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         store: ExecutionRunStore,
-        modal_driver: Any,
+        provider_driver: Any,
         output_volume: Any,
         model_volume: Any,
         output_claims: Any,
@@ -352,7 +352,7 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             store=store,
-            modal_driver=modal_driver,
+            provider_driver=provider_driver,
             output_volume=output_volume,
             predecessor_execution_run_id=predecessor_execution_run_id,
             poll_interval_seconds=poll_interval_seconds,
@@ -1126,7 +1126,7 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
         output_volume: Any,
         model_volume: Any,
         output_claims: Any,
-        modal_driver: Any,
+        provider_driver: Any,
         app_version: str,
         model_version: str,
         reference_version: str,
@@ -1146,7 +1146,7 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.output_volume = output_volume
         self.model_volume = model_volume
         self.output_claims = output_claims
-        self.modal_driver = modal_driver
+        self.provider_driver = provider_driver
         self.poll_interval_seconds = poll_interval_seconds
 
     def prepare_restart(
@@ -1218,7 +1218,7 @@ class OligoformerExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=self.execution_run_id,
             deployment=self.deployment,
             store=self._run_store(),
-            modal_driver=self.modal_driver,
+            provider_driver=self.provider_driver,
             output_volume=self.output_volume,
             model_volume=self.model_volume,
             output_claims=self.output_claims,

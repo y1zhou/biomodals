@@ -26,8 +26,8 @@ from biomodals.execution import (
     TaskStatus,
 )
 from biomodals.execution.modal import (
-    ModalCallObservation,
-    ModalCallObservationKind,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
 )
 from biomodals.helper.app_execution import ExecutionRunStore
 
@@ -70,20 +70,20 @@ class RecordingDriver:
 
     def observe(self, provider_call_handle_id: str):
         if provider_call_handle_id in self.cancelled:
-            return ModalCallObservation(ModalCallObservationKind.CANCELLED)
+            return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
         if self.state_unknown:
-            return ModalCallObservation(ModalCallObservationKind.STATE_UNKNOWN)
+            return ProviderCallObservation(ProviderCallObservationKind.STATE_UNKNOWN)
         if self.failed:
-            return ModalCallObservation(
-                ModalCallObservationKind.FAILED,
+            return ProviderCallObservation(
+                ProviderCallObservationKind.FAILED,
                 message="completion RPC connection lost",
             )
         if self.succeeded:
-            return ModalCallObservation(
-                ModalCallObservationKind.SUCCEEDED,
+            return ProviderCallObservation(
+                ProviderCallObservationKind.SUCCEEDED,
                 result={"claimed_tasks": 1, "claim_requests": 2},
             )
-        return ModalCallObservation(ModalCallObservationKind.RUNNING)
+        return ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     def cancel(self, provider_call_handle_id: str) -> None:
         self.cancelled.add(provider_call_handle_id)
@@ -127,7 +127,7 @@ def _runtime(
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         store=ExecutionRunStore(tmp_path, RUN_ID),
-        modal_driver=driver,
+        provider_driver=driver,
         output_volume=FakeVolume(),
         output_root=tmp_path,
         pull_worker_coordinator="coordinator",

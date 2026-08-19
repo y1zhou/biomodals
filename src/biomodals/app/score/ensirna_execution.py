@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -23,16 +23,13 @@ from biomodals.execution import (
     TaskPlan,
 )
 from biomodals.execution.modal import (
-    ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
+    OutputClaimExecutionCoordinatorLifecycle,
     StandardExecutionRuntimeLifecycle,
 )
 from biomodals.helper.artifacts import sha256_file
-from biomodals.helper.output_claim import (
-    acquire_output_claim,
-    register_output_claim_successor,
-)
+from biomodals.helper.output_claim import acquire_output_claim
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -598,7 +595,7 @@ def _workload_module():
     return ensirna_app
 
 
-class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
+class EnsirnaExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
     """Bind one run-scoped writer to ENsiRNA publications."""
 
     _request_loader = staticmethod(load_execution_request)
@@ -627,64 +624,6 @@ class EnsirnaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         self.output_claims = output_claims
         self.provider_driver = provider_driver
         self.poll_interval_seconds = poll_interval_seconds
-
-    def prepare_restart(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-        expected_workload_plan_fingerprint: str | None = None,
-        candidate_request: EnsirnaExecutionRequest | None = None,
-    ) -> None:
-        """Validate and persist a Successor request without driving it."""
-        if candidate_request is not None and (
-            max_active_provider_calls is not None
-            or max_active_gpu_provider_calls is not None
-        ):
-            raise ValueError(
-                "Candidate request and generic restart overrides are mutually exclusive"
-            )
-        with self._drive_lock:
-            with self._volume_io_lock, self._writer_lock:
-                self.output_volume.reload()
-                with self._open_successor_source(
-                    predecessor_execution_run_id,
-                    predecessor_deployment=predecessor_deployment,
-                    expected_workload_plan_fingerprint=(
-                        expected_workload_plan_fingerprint
-                    ),
-                ) as (predecessor, predecessor_request, _):
-                    request = candidate_request or predecessor_request
-                self._require_successor_plan_match(predecessor, request)
-                if candidate_request is None:
-                    request = replace(
-                        request,
-                        max_active_provider_calls=(
-                            predecessor.max_active_provider_calls
-                            if max_active_provider_calls is None
-                            else max_active_provider_calls
-                        ),
-                        max_active_gpu_provider_calls=(
-                            predecessor.max_active_gpu_provider_calls
-                            if max_active_gpu_provider_calls is None
-                            else max_active_gpu_provider_calls
-                        ),
-                    )
-                register_output_claim_successor(
-                    self.output_claims,
-                    owner=str(self.execution_run_id),
-                    predecessor=str(predecessor_execution_run_id),
-                )
-                request = replace(
-                    request,
-                    replace_claim_owner=str(predecessor_execution_run_id),
-                )
-                self._persist_successor_request(
-                    request,
-                    predecessor_execution_run_id,
-                )
 
     def _create_runtime(
         self,

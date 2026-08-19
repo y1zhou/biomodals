@@ -6,7 +6,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Lock, RLock
@@ -33,6 +33,7 @@ from biomodals.helper.artifacts import (
     read_volume_bytes,
     replace_bytes_atomic,
 )
+from biomodals.helper.output_claim import register_output_claim_successor
 
 LEDGER_FILENAME = "ledger.sqlite3"
 
@@ -741,6 +742,58 @@ class ExecutionCoordinatorLifecycle:
             self._verify_overview(overview)
             return overview
 
+    def prepare_restart(
+        self,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_deployment: DeploymentIdentity | None,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+        expected_workload_plan_fingerprint: str | None = None,
+        candidate_request: Any | None = None,
+    ) -> None:
+        """Validate and persist a Successor request without driving it."""
+        if candidate_request is not None and (
+            max_active_provider_calls is not None
+            or max_active_gpu_provider_calls is not None
+        ):
+            raise ValueError(
+                "Candidate request and generic restart overrides are mutually exclusive"
+            )
+        with self._drive_lock:
+            with self._volume_io_lock, self._writer_lock:
+                self.output_volume.reload()
+                with self._open_successor_source(
+                    predecessor_execution_run_id,
+                    predecessor_deployment=predecessor_deployment,
+                    expected_workload_plan_fingerprint=(
+                        expected_workload_plan_fingerprint
+                    ),
+                ) as (predecessor, predecessor_request, predecessor_store):
+                    request = candidate_request or replace(
+                        predecessor_request,
+                        max_active_provider_calls=(
+                            predecessor.max_active_provider_calls
+                            if max_active_provider_calls is None
+                            else max_active_provider_calls
+                        ),
+                        max_active_gpu_provider_calls=(
+                            predecessor.max_active_gpu_provider_calls
+                            if max_active_gpu_provider_calls is None
+                            else max_active_gpu_provider_calls
+                        ),
+                    )
+                    request = self._prepare_successor_request(
+                        request,
+                        predecessor_execution_run_id=predecessor_execution_run_id,
+                        predecessor_store=predecessor_store,
+                    )
+                self._require_successor_plan_match(predecessor, request)
+                self._persist_successor_request(
+                    request,
+                    predecessor_execution_run_id,
+                )
+
     def close(self) -> None:
         """Close coordinator-local state without cancelling Provider Calls."""
         with self._drive_lock:
@@ -889,6 +942,17 @@ class ExecutionCoordinatorLifecycle:
         del request, predecessor_execution_run_id
         raise NotImplementedError
 
+    def _prepare_successor_request(
+        self,
+        request: Any,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_store: ExecutionRunStore,
+    ) -> Any:
+        """Apply host-specific successor metadata before persistence."""
+        del predecessor_execution_run_id, predecessor_store
+        return request
+
     def _existing_predecessor(self) -> UUID | None:
         runtime = self._runtime
         if runtime is not None:
@@ -917,3 +981,27 @@ class ExecutionCoordinatorLifecycle:
         if runtime is not None:
             runtime.close()
             self._runtime = None
+
+
+class OutputClaimExecutionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
+    """Register Modal output-claim lineage for one Successor Run."""
+
+    output_claims: Any
+
+    def _prepare_successor_request(
+        self,
+        request: Any,
+        *,
+        predecessor_execution_run_id: UUID,
+        predecessor_store: ExecutionRunStore,
+    ) -> Any:
+        del predecessor_store
+        register_output_claim_successor(
+            self.output_claims,
+            owner=str(self.execution_run_id),
+            predecessor=str(predecessor_execution_run_id),
+        )
+        return replace(
+            request,
+            replace_claim_owner=str(predecessor_execution_run_id),
+        )

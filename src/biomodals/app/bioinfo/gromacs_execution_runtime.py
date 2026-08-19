@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from stat import S_ISREG
@@ -733,45 +733,6 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
             )
         self.output_claims = output_claims
         self.poll_interval_seconds = poll_interval_seconds
-
-    def prepare_restart(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        max_active_provider_calls: int | None = None,
-        max_active_gpu_provider_calls: int | None = None,
-        expected_workload_plan_fingerprint: str | None = None,
-    ) -> None:
-        """Validate and persist a Successor request without driving it."""
-        with self._drive_lock:
-            with self._volume_io_lock, self._writer_lock:
-                self.output_volume.reload()
-                with self._open_successor_source(
-                    predecessor_execution_run_id,
-                    predecessor_deployment=predecessor_deployment,
-                    expected_workload_plan_fingerprint=(
-                        expected_workload_plan_fingerprint
-                    ),
-                ) as (predecessor, predecessor_request, _):
-                    request = replace(
-                        predecessor_request,
-                        max_active_provider_calls=(
-                            predecessor.max_active_provider_calls
-                            if max_active_provider_calls is None
-                            else max_active_provider_calls
-                        ),
-                        max_active_gpu_provider_calls=(
-                            predecessor.max_active_gpu_provider_calls
-                            if max_active_gpu_provider_calls is None
-                            else max_active_gpu_provider_calls
-                        ),
-                    )
-                self._require_successor_plan_match(predecessor, request)
-                self._persist_successor_request(
-                    request,
-                    predecessor_execution_run_id,
-                )
 
     def _create_runtime(
         self,

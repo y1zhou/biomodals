@@ -2759,6 +2759,51 @@ class SqliteExecutionRepository:
         ).fetchall()
         return self._provider_calls_from_rows(rows)
 
+    def succeeded_provider_call(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        *,
+        task_key: str | None = None,
+    ) -> ProviderCallRecord | None:
+        """Load the first successful call for one Node or owned Task."""
+        parameters: tuple[object, ...] = (
+            str(execution_run_id),
+            node_key,
+            ProviderCallStatus.SUCCEEDED.value,
+        )
+        task_join = ""
+        task_filter = ""
+        if task_key is not None:
+            task_join = """
+                JOIN execution_tasks AS task
+                    ON task.execution_run_id = call.execution_run_id
+                    AND task.node_key = call.node_key
+                    AND (
+                        task.provider_call_id = call.provider_call_id
+                        OR task.worker_provider_call_id = call.provider_call_id
+                    )
+            """
+            task_filter = "AND task.task_key = ?"
+            parameters = (*parameters, task_key)
+        row = self._connection.execute(
+            f"""
+            SELECT call.*
+            FROM execution_provider_calls AS call
+            {task_join}
+            WHERE call.execution_run_id = ?
+                AND call.node_key = ?
+                AND call.status = ?
+                {task_filter}
+            ORDER BY call.created_at, call.rowid
+            LIMIT 1
+            """,  # noqa: S608 - clauses are closed internal literals
+            parameters,
+        ).fetchone()
+        if row is None:
+            return None
+        return self._provider_call_from_row(row, task_keys=())
+
     def list_provider_calls_requiring_reconciliation(
         self,
         execution_run_id: UUID,

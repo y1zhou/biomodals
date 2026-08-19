@@ -519,14 +519,13 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
 
     def _prepare_task_spec(self) -> TaskSpec:
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == PREPARE_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return self._task_spec(call.result_envelope)
-        raise RuntimeError("AF3Score preparation result is unavailable")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                PREPARE_NODE,
+            )
+        if call is None:
+            raise RuntimeError("AF3Score preparation result is unavailable")
+        return self._task_spec(call.result_envelope)
 
     def _task_spec(self, envelope: object) -> TaskSpec:
         if not isinstance(envelope, dict) or envelope.get("kind") != "prepare":

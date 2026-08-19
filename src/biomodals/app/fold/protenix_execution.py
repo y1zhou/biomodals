@@ -450,14 +450,13 @@ class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
 
     def _preparation_plan(self) -> ProtenixPreparationPlan:
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == PLAN_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return _preparation_plan_from_envelope(call.result_envelope)
-        raise LookupError("Protenix preparation plan is unavailable")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                PLAN_NODE,
+            )
+        if call is None:
+            raise LookupError("Protenix preparation plan is unavailable")
+        return _preparation_plan_from_envelope(call.result_envelope)
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

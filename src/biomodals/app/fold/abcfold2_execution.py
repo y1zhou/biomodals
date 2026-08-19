@@ -466,14 +466,13 @@ class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
 
     def _run_config(self) -> ABCFold2RunConfig:
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == PREPARE_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return _run_config_from_envelope(call.result_envelope)
-        raise LookupError("ABCFold2 preparation result is unavailable")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                PREPARE_NODE,
+            )
+        if call is None:
+            raise LookupError("ABCFold2 preparation result is unavailable")
+        return _run_config_from_envelope(call.result_envelope)
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

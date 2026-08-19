@@ -67,6 +67,63 @@ def test_call_attachment_running_and_success_require_durable_identity_and_result
     assert succeeded.completed_at == 120
 
 
+def test_successful_call_lookup_targets_node_or_owned_task() -> None:
+    repository = create_repository(
+        task_count=2,
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
+    )
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    calls = []
+    for index in range(2):
+        claim = repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            (f"seed-{index}",),
+            submission_token=f"batch-{index}",
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            now=110 + index,
+        )
+        assert claim is not None
+        repository.attach_provider_call(
+            claim.call.provider_call_id,
+            provider_call_handle_id=f"fc-{index}",
+            now=120 + index,
+        )
+        calls.append(
+            repository.record_provider_call_result(
+                claim.call.provider_call_id,
+                result_envelope={"seed": index},
+                now=130 + index,
+            )
+        )
+
+    first = repository.succeeded_provider_call(RUN_ID, "inference")
+    second = repository.succeeded_provider_call(
+        RUN_ID,
+        "inference",
+        task_key="seed-1",
+    )
+    assert first is not None
+    assert first.provider_call_id == calls[0].provider_call_id
+    assert second is not None
+    assert second.provider_call_id == calls[1].provider_call_id
+    assert (
+        repository.succeeded_provider_call(
+            RUN_ID,
+            "inference",
+            task_key="missing",
+        )
+        is None
+    )
+
+
 def test_attached_unknown_state_projects_to_run_and_can_be_reconciled() -> None:
     repository = _repository_with_policy()
     claim = repository.preclaim_fixed_batch(

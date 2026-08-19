@@ -660,48 +660,44 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
 
     def _run_plan(self):
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == PREPARE_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return _run_plan_from_envelope(call.result_envelope)
-        raise LookupError("OligoFormer run plan is unavailable")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                PREPARE_NODE,
+            )
+        if call is None:
+            raise LookupError("OligoFormer run plan is unavailable")
+        return _run_plan_from_envelope(call.result_envelope)
 
     def _reference_plan(self):
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == REFERENCE_PLAN_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return _reference_plan_from_envelope(call.result_envelope)
-        raise LookupError("OligoFormer reference plan is unavailable")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                REFERENCE_PLAN_NODE,
+            )
+        if call is None:
+            raise LookupError("OligoFormer reference plan is unavailable")
+        return _reference_plan_from_envelope(call.result_envelope)
 
     def _evidence_plan(self):
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == EVIDENCE_PLAN_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return _evidence_plan_from_envelope(call.result_envelope)
-        raise LookupError("OligoFormer evidence plan is unavailable")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                EVIDENCE_PLAN_NODE,
+            )
+        if call is None:
+            raise LookupError("OligoFormer evidence plan is unavailable")
+        return _evidence_plan_from_envelope(call.result_envelope)
 
     def _pita_reference(self, stem: str):
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == PITA_REFERENCE_NODE
-                and call.status == ProviderCallStatus.SUCCEEDED
-                and stem in call.task_keys
-            ):
-                return _pita_reference_from_envelope(call.result_envelope)
-        raise LookupError(f"OligoFormer PITA reference plan is unavailable: {stem}")
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                PITA_REFERENCE_NODE,
+                task_key=stem,
+            )
+        if call is None:
+            raise LookupError(f"OligoFormer PITA reference plan is unavailable: {stem}")
+        return _pita_reference_from_envelope(call.result_envelope)
 
     def _admit_remote_tasks(self, required: set[str]) -> None:
         with self.store.synchronize():

@@ -420,13 +420,12 @@ class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
 
     def _plan_from_node(self, node_key: str) -> EnsirnaPreparationPlan:
         with self.store.synchronize():
-            calls = self.store.execution.list_provider_calls(self.execution_run_id)
-        for call in calls:
-            if (
-                call.node_key == node_key
-                and call.status == ProviderCallStatus.SUCCEEDED
-            ):
-                return self._plan_from_envelope(call.result_envelope)
+            call = self.store.execution.succeeded_provider_call(
+                self.execution_run_id,
+                node_key,
+            )
+        if call is not None:
+            return self._plan_from_envelope(call.result_envelope)
         if node_key == PREPROCESS_NODE:
             cached = _workload_module()._cached_preparation_plan(
                 cache_key=self.cache_key,

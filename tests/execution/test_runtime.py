@@ -28,7 +28,6 @@ from biomodals.execution import (
 )
 from biomodals.execution.coordinator import drive_execution_run
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
@@ -42,6 +41,7 @@ from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
+from biomodals.execution.store import ExecutionRunStore
 
 from .provider_call_helpers import (
     CPU_BINDING,

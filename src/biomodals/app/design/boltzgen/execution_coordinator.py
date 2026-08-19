@@ -21,8 +21,8 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
-    ExecutionRunStore,
 )
+from biomodals.execution.store import ExecutionRunStore
 
 
 class BoltzGenExecutionCoordinator(ExecutionCoordinatorLifecycle):

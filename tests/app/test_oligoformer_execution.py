@@ -30,10 +30,10 @@ from biomodals.app.score.oligoformer_execution import (
 )
 from biomodals.execution import AvailabilityStatus, DeploymentIdentity, RunStatus
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
+from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "OligoFormer", 7)

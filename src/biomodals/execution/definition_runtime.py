@@ -49,8 +49,6 @@ from biomodals.execution.artifact_availability import (
 from biomodals.execution.artifacts import materialize_app_run_result
 from biomodals.execution.definition import ExecutionDefinition, ExecutionGraph
 from biomodals.execution.definition_plan import execution_plan, node_task_plan
-from biomodals.execution.modal import ExecutionVolumeSync, ModalCallDriver
-from biomodals.execution.modal.graph_store import GraphExecutionRunStore
 from biomodals.execution.nodes import (
     NodeRunContext,
     ProviderCallSpec,
@@ -60,7 +58,11 @@ from biomodals.execution.nodes import (
     TaskDefinition,
     TaskProviderNode,
 )
-from biomodals.execution.provider import ProviderDriver
+from biomodals.execution.provider import (
+    ProviderCallObservation,
+    ProviderDeploymentUnavailableError,
+    ProviderDriver,
+)
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
     PullWorkerDispatchDescriptor,
@@ -69,10 +71,41 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.artifacts import VolumeHandle
+from biomodals.execution.store import (
+    ExecutionStorageSync,
+    GraphExecutionRunStore,
+)
 from biomodals.schema import AppRunResult, AppRunStatus, ExecutionArtifact, VolumePath
 
 _TASK_KEY = "node"
+
+
+class _UnavailableProviderDriver:
+    """Reject provider work when a coordinator-only runtime has no driver."""
+
+    @staticmethod
+    def resolve(_binding: ProviderBinding) -> object:
+        raise ProviderDeploymentUnavailableError(
+            "No provider driver is configured for this Execution Run"
+        )
+
+    @staticmethod
+    def spawn(
+        _operation: object,
+        *,
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+    ) -> str:
+        del args, kwargs
+        raise RuntimeError("No provider driver is configured for this Execution Run")
+
+    @staticmethod
+    def observe(_provider_call_handle_id: str) -> ProviderCallObservation:
+        raise RuntimeError("No provider driver is configured for this Execution Run")
+
+    @staticmethod
+    def cancel(_provider_call_handle_id: str) -> None:
+        raise RuntimeError("No provider driver is configured for this Execution Run")
 
 
 def _task_storage_scope(task_key: str) -> str:
@@ -114,8 +147,8 @@ class ExecutionGraphRuntime:
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         artifact_volume_name: str,
-        artifact_volume: VolumeHandle | None = None,
         provider_driver: ProviderDriver | None = None,
+        storage_sync: ExecutionStorageSync | None = None,
         max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
@@ -160,13 +193,10 @@ class ExecutionGraphRuntime:
         self._now = now or (lambda: int(time.time()))
         self._volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
         self.store = store or GraphExecutionRunStore(self.volume_root, execution_run_id)
-        self._volume_sync = ExecutionVolumeSync(
-            volume=artifact_volume,
-            store=self.store,
-        )
+        self._storage_sync = storage_sync or self.store
         self._provider = ExecutionRuntime(
             self.store.execution,
-            provider_driver=provider_driver or cast(ProviderDriver, ModalCallDriver()),
+            provider_driver=provider_driver or _UnavailableProviderDriver(),
             checkpoint=self._checkpoint,
             transaction=self.store.transaction,
             synchronize=self._synchronize_kernel_state,
@@ -2274,7 +2304,7 @@ class ExecutionGraphRuntime:
     def _checkpoint(self) -> SqliteExecutionRepository:
         with self.store.synchronize():
             try:
-                self._volume_sync.commit()
+                self._storage_sync.commit()
             finally:
                 repository = self.store.execution
                 self._provider.repository = repository
@@ -2290,7 +2320,7 @@ class ExecutionGraphRuntime:
         """Refresh cross-container publications and reopen the shared ledger."""
         with self._volume_io_lock, self.store.synchronize():
             try:
-                self._volume_sync.reload()
+                self._storage_sync.reload()
             finally:
                 self._provider.repository = self.store.execution
 

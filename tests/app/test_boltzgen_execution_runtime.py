@@ -28,10 +28,10 @@ from biomodals.execution import (
     TaskPlan,
 )
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
+from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.artifacts import file_size_sha256
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")

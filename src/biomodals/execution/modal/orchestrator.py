@@ -19,6 +19,7 @@ from biomodals.execution import (
     ExecutionOverview,
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
+    GraphExecutionRunStore,
     NodeStatus,
     ProviderBinding,
     TaskStatus,
@@ -27,6 +28,7 @@ from biomodals.execution.definition import ExecutionGraph
 from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
+    ExecutionVolumeSync,
     ModalCallDriver,
     execution_coordinator_identity,
     persist_execution_launch,
@@ -34,7 +36,6 @@ from biomodals.execution.modal import (
 from biomodals.execution.modal import (
     execution_coordinator_handle as _shared_execution_coordinator_handle,
 )
-from biomodals.execution.modal.graph_store import GraphExecutionRunStore
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
@@ -510,14 +511,15 @@ class ExecutionCoordinator:
         if resolve_external_checker and plan.strict_external_artifact_checks:
             if external_checker is None:
                 raise RuntimeError("External artifact checker was not preflighted")
+        store = self._run_store()
         runtime = ExecutionGraphRuntime(
             graph=plan.graph,
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=Path(CONF.output_volume_mountpoint),
             artifact_volume_name=OUT_VOLUME_NAME,
-            artifact_volume=OUT_VOLUME,
             provider_driver=driver,
+            storage_sync=ExecutionVolumeSync(volume=OUT_VOLUME, store=store),
             max_parallel_nodes=plan.max_parallel_nodes,
             max_active_provider_calls=plan.max_active_provider_calls,
             max_active_gpu_provider_calls=plan.effective_gpu_limit,
@@ -528,7 +530,7 @@ class ExecutionCoordinator:
             ),
             external_artifact_checker=external_checker,
             pull_worker_coordinator=self._worker_coordinator_handle(),
-            store=self._run_store(),
+            store=store,
             volume_io_lock=self._volume_lock(),
         )
         self._runtime = runtime

@@ -41,10 +41,10 @@ from biomodals.execution import (
     TaskStatus,
 )
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
+from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OTHER_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")

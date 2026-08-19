@@ -29,13 +29,13 @@ from biomodals.execution.modal import (
     load_execution_launch,
     orchestrator,
 )
-from biomodals.execution.modal.graph_store import GraphExecutionRunStore
 from biomodals.execution.nodes import (
     NodeRunContext,
     ProviderCallSpec,
     TaskDefinition,
     TaskProviderNode,
 )
+from biomodals.execution.store import GraphExecutionRunStore
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import (
     AppOutput,
@@ -329,7 +329,8 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert init["deployment"] == DEPLOYMENT
     assert init["volume_root"] == tmp_path
     assert init["artifact_volume_name"] == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
-    assert init["artifact_volume"] is volume
+    storage_sync = init["storage_sync"]
+    assert storage_sync.volume is volume
     assert init["max_parallel_nodes"] == 4
     assert init["max_active_provider_calls"] == 9
     assert init["max_active_gpu_provider_calls"] == 3

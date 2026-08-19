@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
@@ -34,6 +33,7 @@ from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
+from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.artifacts import (
     VolumeHandle,
     read_bounded_file_bytes,
@@ -43,8 +43,6 @@ from biomodals.helper.artifacts import (
 from biomodals.helper.output_claim import register_output_claim_successor
 
 from .identity import execution_coordinator_handle
-
-LEDGER_FILENAME = "ledger.sqlite3"
 
 
 def resolve_provider_call_limits(
@@ -296,138 +294,6 @@ def _execution_launch_bytes(predecessor_execution_run_id: UUID | None) -> bytes:
     )
 
 
-class ExecutionRunStore:
-    """Own one Run's kernel connection and reserved state path."""
-
-    def __init__(
-        self,
-        volume_root: str | Path,
-        execution_run_id: UUID,
-        *,
-        lock: Any | None = None,
-        volume_io_lock: Any | None = None,
-    ) -> None:
-        """Bind storage only to the host Volume root and opaque Run ID."""
-        self.volume_root = Path(volume_root)
-        self.execution_run_id = execution_run_id
-        self._connection: sqlite3.Connection | None = None
-        self._execution: SqliteExecutionRepository | None = None
-        self._lock = RLock() if lock is None else lock
-        self.volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
-        self._volume_sync_active = False
-
-    @property
-    def state_root(self) -> Path:
-        """Return the reserved directory containing only execution state."""
-        return (
-            self.volume_root
-            / ".biomodals"
-            / "execution"
-            / "runs"
-            / str(self.execution_run_id)
-        )
-
-    @property
-    def ledger_path(self) -> Path:
-        """Return the per-Run App Run Ledger path."""
-        return self.state_root / LEDGER_FILENAME
-
-    @property
-    def connection(self) -> sqlite3.Connection:
-        """Return the active caller-owned SQLite connection."""
-        with self._lock:
-            return self._connect()
-
-    @property
-    def execution(self) -> SqliteExecutionRepository:
-        """Return the shared execution repository on the active connection."""
-        with self._lock:
-            self._connect()
-            if self._execution is None:
-                raise RuntimeError("Execution repository was not initialized")
-            return self._execution
-
-    @contextmanager
-    def transaction(self) -> Iterator[None]:
-        """Commit or roll back one caller-owned execution transaction."""
-        with self._lock:
-            connection = self._connect()
-            if connection.in_transaction:
-                raise RuntimeError("Nested execution transactions are unsupported")
-            try:
-                yield
-            except BaseException:
-                connection.rollback()
-                raise
-            else:
-                connection.commit()
-
-    @contextmanager
-    def synchronize(self) -> Iterator[None]:
-        """Serialize one compound repository and Volume state boundary."""
-        with self._lock:
-            yield
-
-    @contextmanager
-    def closed_for_volume_sync(self) -> Iterator[None]:
-        """Commit and close SQLite while the host synchronizes its Volume."""
-        with self._lock:
-            connection = self._connection
-            if connection is not None:
-                connection.commit()
-            self._close()
-            self._volume_sync_active = True
-            try:
-                yield
-            finally:
-                self._volume_sync_active = False
-
-    def close(self) -> None:
-        """Close the active connection without inventing an implicit commit."""
-        with self._lock:
-            self._close()
-
-    def commit(self) -> None:
-        """Commit coordinator-local SQLite changes without syncing its Volume."""
-        with self._lock:
-            self._connect().commit()
-
-    def _connect(self) -> sqlite3.Connection:
-        if self._volume_sync_active:
-            raise RuntimeError("Run store is closed for Volume synchronization")
-        if self._connection is not None:
-            return self._connection
-
-        self.state_root.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(
-            self.ledger_path,
-            check_same_thread=False,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        try:
-            execution = SqliteExecutionRepository(connection)
-            execution.initialize_schema()
-            self._initialize_additional_schema(connection)
-            connection.commit()
-        except BaseException:
-            connection.close()
-            raise
-        self._connection = connection
-        self._execution = execution
-        return connection
-
-    def _initialize_additional_schema(self, connection: sqlite3.Connection) -> None:
-        """Allow an adapter-owned store to share this transaction boundary."""
-
-    def _close(self) -> None:
-        connection = self._connection
-        self._connection = None
-        self._execution = None
-        if connection is not None:
-            connection.close()
-
-
 class ExecutionVolumeSync:
     """Close a Run store while synchronizing its backing Volume."""
 
@@ -446,14 +312,14 @@ class ExecutionVolumeSync:
         if self.volume is None:
             self.store.commit()
             return
-        with self.store.closed_for_volume_sync():
+        with self.store.closed_for_storage_sync():
             self.volume.commit()
 
     def reload(self) -> None:
         """Refresh the Volume view when a Volume is attached."""
         if self.volume is None:
             return
-        with self.store.closed_for_volume_sync():
+        with self.store.closed_for_storage_sync():
             self.volume.reload()
 
 

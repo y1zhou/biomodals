@@ -30,7 +30,6 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    ExecutionRunStore,
     OutputClaimExecutionCoordinatorLifecycle,
     StandardExecutionRuntimeLifecycle,
 )
@@ -39,6 +38,7 @@ from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
+from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.io import require_safe_filename_component

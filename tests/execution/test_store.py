@@ -13,7 +13,7 @@ from biomodals.execution import (
     ExecutionPlan,
     NodePlan,
 )
-from biomodals.execution.modal.graph_store import (
+from biomodals.execution.store import (
     GraphExecutionRunStore,
     UnsupportedGraphRunStoreError,
 )
@@ -108,7 +108,7 @@ def test_transaction_rolls_back_both_repository_views(tmp_path: Path) -> None:
     )
 
 
-def test_closing_for_volume_sync_reopens_repository_views(tmp_path: Path) -> None:
+def test_closing_for_storage_sync_reopens_repository_views(tmp_path: Path) -> None:
     store = GraphExecutionRunStore(tmp_path, RUN_ID)
     first_connection = store.connection
 
@@ -124,7 +124,7 @@ def test_closing_for_volume_sync_reopens_repository_views(tmp_path: Path) -> Non
             max_active_gpu_provider_calls=2,
             now=100,
         )
-    with store.closed_for_volume_sync():
+    with store.closed_for_storage_sync():
         with pytest.raises(sqlite3.ProgrammingError):
             first_connection.execute("SELECT 1")
 

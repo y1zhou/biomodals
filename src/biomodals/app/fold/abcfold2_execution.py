@@ -25,10 +25,10 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    ExecutionRunStore,
     OutputClaimExecutionCoordinatorLifecycle,
     StandardExecutionRuntimeLifecycle,
 )
+from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.output_claim import acquire_output_claim
 
 REQUEST_SCHEMA_VERSION = 1

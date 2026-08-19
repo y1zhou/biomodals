@@ -24,8 +24,8 @@ from biomodals.execution import (
     ProviderBinding,
     TaskPlan,
 )
-from biomodals.execution.modal import ExecutionRunStore
 from biomodals.execution.scheduler import TaskDispatchDescriptor
+from biomodals.execution.store import ExecutionRunStore
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")

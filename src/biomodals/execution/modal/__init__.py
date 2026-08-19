@@ -9,7 +9,6 @@ from biomodals.execution.modal.driver import (
 from biomodals.execution.modal.host import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
-    ExecutionRunStore,
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
     OutputClaimExecutionCoordinatorLifecycle,
@@ -41,7 +40,6 @@ __all__ = [
     "ModalCallDriver",
     "ExecutionCoordinatorLifecycle",
     "ExecutionRequestFile",
-    "ExecutionRunStore",
     "ExecutionRuntimeLifecycle",
     "ExecutionVolumeSync",
     "OutputClaimExecutionCoordinatorLifecycle",

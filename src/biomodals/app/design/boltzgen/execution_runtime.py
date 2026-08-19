@@ -33,10 +33,10 @@ from biomodals.execution import (
     result_probe_frontier,
 )
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     StandardExecutionRuntimeLifecycle,
 )
 from biomodals.execution.scheduler import ProviderCallCandidate
+from biomodals.execution.store import ExecutionRunStore
 
 
 @dataclass(frozen=True)

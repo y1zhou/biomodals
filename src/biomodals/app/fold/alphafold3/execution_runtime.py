@@ -98,7 +98,6 @@ from biomodals.execution import (
     result_probe_frontier,
 )
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     StandardExecutionRuntimeLifecycle,
 )
 from biomodals.execution.scheduler import (
@@ -106,6 +105,7 @@ from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
+from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.artifacts import (
     load_json_object,
     write_json_atomic,

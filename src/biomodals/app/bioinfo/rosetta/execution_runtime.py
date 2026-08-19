@@ -31,7 +31,6 @@ from biomodals.execution import (
     ready_node_keys,
 )
 from biomodals.execution.modal import (
-    ExecutionRunStore,
     ExecutionRuntimeLifecycle,
 )
 from biomodals.execution.scheduler import (
@@ -39,6 +38,7 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
+from biomodals.execution.store import ExecutionRunStore
 
 
 class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):

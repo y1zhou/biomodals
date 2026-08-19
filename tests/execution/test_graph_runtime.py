@@ -16,6 +16,7 @@ import pytest
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    GraphExecutionRunStore,
     NodeAggregationPolicy,
     NodeStatus,
     ProviderCallStatus,
@@ -26,6 +27,7 @@ from biomodals.execution import (
 from biomodals.execution.definition import ExecutionGraph
 from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
+    ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
@@ -523,18 +525,20 @@ def _runtime(
     max_gpu_calls: int = 4,
     pull_worker_coordinator: object | None = None,
 ) -> ExecutionGraphRuntime:
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
     return ExecutionGraphRuntime(
         graph=workflow,
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         artifact_volume_name="Workflow-outputs",
-        artifact_volume=volume,
         provider_driver=driver,
+        storage_sync=ExecutionVolumeSync(volume=volume, store=store),
         max_parallel_nodes=max_parallel_nodes,
         max_active_provider_calls=max_calls,
         max_active_gpu_provider_calls=max_gpu_calls,
         pull_worker_coordinator=pull_worker_coordinator,
+        store=store,
         now=iter(range(100, 1000)).__next__,
         poll_interval_seconds=0,
     )
@@ -752,7 +756,7 @@ def test_inline_provider_result_does_not_reload_the_artifact_volume(
     runtime.advance_once()
     events: list[str] = []
     original_observe = driver.observe
-    original_reload = runtime._volume_sync.reload
+    original_reload = runtime._storage_sync.reload
     original_publish = runtime._publish_provider_result
 
     def observe(provider_call_handle_id):
@@ -768,7 +772,7 @@ def test_inline_provider_result_does_not_reload_the_artifact_volume(
         original_publish(call)
 
     monkeypatch.setattr(driver, "observe", observe)
-    monkeypatch.setattr(runtime._volume_sync, "reload", reload)
+    monkeypatch.setattr(runtime._storage_sync, "reload", reload)
     monkeypatch.setattr(runtime, "_publish_provider_result", publish)
 
     runtime.advance_once()
@@ -813,7 +817,7 @@ def test_artifact_volume_log_reloads_before_publication(
     driver.results["fc-remote_text"] = result
     events: list[str] = []
     original_observe = driver.observe
-    original_reload = runtime._volume_sync.reload
+    original_reload = runtime._storage_sync.reload
     original_publish = runtime._publish_provider_result
 
     def observe(provider_call_handle_id):
@@ -829,7 +833,7 @@ def test_artifact_volume_log_reloads_before_publication(
         events.append("publish")
 
     monkeypatch.setattr(driver, "observe", observe)
-    monkeypatch.setattr(runtime._volume_sync, "reload", reload)
+    monkeypatch.setattr(runtime._storage_sync, "reload", reload)
     monkeypatch.setattr(runtime, "_publish_provider_result", publish)
 
     runtime.advance_once()

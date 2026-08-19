@@ -25,7 +25,6 @@ from biomodals.execution import (
 from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
-    ExecutionRunStore,
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
     execution_lineage_root,
@@ -35,6 +34,7 @@ from biomodals.execution.modal import (
     stage_execution_launch,
     submit_staged_execution_run,
 )
+from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 REQUEST_FILE = ExecutionRequestFile(
@@ -262,15 +262,15 @@ def test_app_execution_store_persists_the_shared_repository(tmp_path: Path) -> N
     reopened.close()
 
 
-def test_app_execution_store_closes_sqlite_during_volume_sync(
+def test_app_execution_store_closes_sqlite_during_storage_sync(
     tmp_path: Path,
 ) -> None:
     """A mounted SQLite file is never open while its Volume is synchronized."""
     store = ExecutionRunStore(tmp_path, RUN_ID)
     original = store.connection
 
-    with store.closed_for_volume_sync():
-        with pytest.raises(RuntimeError, match="closed for Volume synchronization"):
+    with store.closed_for_storage_sync():
+        with pytest.raises(RuntimeError, match="closed for storage synchronization"):
             _ = store.connection
 
     assert store.connection is not original

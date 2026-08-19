@@ -84,6 +84,12 @@ from biomodals.execution.sqlite import (
     SqliteExecutionRepository,
     UnsupportedExecutionSchemaVersionError,
 )
+from biomodals.execution.store import (
+    ExecutionRunStore,
+    ExecutionStorageSync,
+    GraphExecutionRunStore,
+    UnsupportedGraphRunStoreError,
+)
 from biomodals.schema import (
     ArtifactFile,
     ArtifactKind,
@@ -111,6 +117,8 @@ __all__ = [
     "ExecutionRunNotFoundError",
     "EXECUTION_SCHEMA_VERSION",
     "ExecutionRunRecord",
+    "ExecutionRunStore",
+    "ExecutionStorageSync",
     "ExecutionRuntime",
     "ExecutionTaskRecord",
     "ExternalArtifactChecker",
@@ -145,6 +153,7 @@ __all__ = [
     "TaskStatus",
     "WorkerAssignmentRecord",
     "ExecutionGraph",
+    "GraphExecutionRunStore",
     "ExecutionDefinition",
     "ExecutionArtifact",
     "CoordinatorNode",
@@ -162,4 +171,5 @@ __all__ = [
     "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",
+    "UnsupportedGraphRunStoreError",
 ]

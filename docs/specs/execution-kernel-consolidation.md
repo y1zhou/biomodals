@@ -2,7 +2,7 @@
 
 # Execution kernel consolidation
 
-Status: accepted on 2026-08-19; implementation pending.
+Status: accepted on 2026-08-19; implementation in progress.
 
 This plan amends [ADR 0006](../adr/0006-unified-execution-kernel.md) and the
 [unified scheduler specification](unified-task-scheduler.md). Where an older
@@ -124,6 +124,20 @@ operation bodies when that extraction is simple and behavior-preserving. Modal
 image definitions remain Modal-owned; future local execution will require its
 own OCI image and mount bindings rather than assuming a Modal Image can run
 locally unchanged.
+
+Provider-independent does not mean mathematically pure. An operation may read
+and write files, invoke subprocesses, and use devices exposed inside its
+container. It must receive paths and configuration explicitly, return the
+shared execution result contract, and leave provider object resolution and
+container lifecycle to its wrapper and provider integration.
+
+Provider support is declared per operation. An Execution Definition can run
+through a provider only when every remote operation selected by that graph has
+a provider binding and suitable packaging. Adding a local provider therefore
+does not make every existing app local automatically: already-explicit
+operations need only a local wrapper and OCI image, while operations coupled to
+Modal lifecycle or implicit mounts must first extract those concerns. The DAG,
+cache identity, scheduler policy, and scientific implementation remain shared.
 
 ## Workload interface
 

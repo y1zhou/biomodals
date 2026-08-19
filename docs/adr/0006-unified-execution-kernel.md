@@ -62,6 +62,14 @@ Each portable operation has three layers:
 3. provider-owned packaging that declares the image, resources, mounts,
    environment, Secrets, and durable call handle.
 
+The first layer is provider-independent, not mathematically pure. It may read
+and write files, invoke subprocesses, use GPUs exposed inside its container,
+and update workload-owned publications. Its inputs make filesystem roots,
+configuration, and scientific identity explicit, and its return value uses the
+shared execution result contract. It neither resolves provider objects nor
+controls container lifecycle. This is the portability test for an operation;
+extracting a function merely to move a decorator does not satisfy it.
+
 For Modal, layers two and three remain the decorated function and its Modal
 Image. A local provider would supply an equivalent wrapper and OCI image, then
 map provider calls to durable Docker or Podman container identities. The
@@ -83,6 +91,30 @@ Modal:
   still need separate local deployment definitions even when the scientific
   body is portable.
 
+Existing apps migrate operation by operation:
+
+1. characterize the decorated function's scientific behavior and publication
+   contract;
+2. move that behavior into one provider-independent operation body while the
+   Modal function becomes a thin wrapper;
+3. add local OCI packaging and a local wrapper that presents the same paths,
+   configuration, and result contract;
+4. bind that operation in the local composition root without changing its
+   `ExecutionDefinition`, DAG, cache identity, or scheduler policy.
+
+Provider support is therefore declared per operation. An app or workflow can
+run through a provider only when every remote operation in that execution
+definition has a binding and packaging for that provider. Apps may remain
+Modal-only without weakening the provider neutrality of the kernel or of
+already portable operation bodies.
+
+The local integration must implement durable container submission,
+observation, cancellation, log access, filesystem binding, and result
+collection. Those responsibilities belong to `biomodals.execution.local`;
+they are not added to app operation bodies. The existing execution repository
+continues to own scheduling and recovery state, while Docker or Podman owns
+the actual container identity and lifecycle.
+
 This is an incremental migration. An app may support Modal only while still
 using the provider-neutral kernel. Local support is added operation by
 operation when there is a real use case; the shared interfaces do not promise
@@ -93,9 +125,9 @@ coordinator and observe container identities after the launching CLI exits. A
 foreground subprocess alone can implement development execution, but it cannot
 satisfy the existing resume and restart contract.
 
-Implementation of this amendment is pending. Existing text remains as the
-history and safety rationale of the first extraction unless it conflicts with
-the consolidation plan.
+Implementation of this amendment is in progress. The local provider remains
+deferred. Existing text remains as the history and safety rationale of the
+first extraction unless it conflicts with the consolidation plan.
 
 Biomodals should introduce a Modal execution kernel under
 `biomodals.execution` for durable DAG and Task scheduling, Modal-call

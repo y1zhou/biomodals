@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -15,21 +15,36 @@ import orjson
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionArtifact,
+    ExecutionGraph,
     ExecutionPlan,
+    ExecutionPlanMetadata,
     NodeDependency,
     NodePlan,
-    ProviderBinding,
-    ProviderCallStatus,
-    TaskPlan,
+    inline_json_result,
+    republish_execution_artifact,
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    OutputClaimExecutionCoordinatorLifecycle,
-    StandardExecutionRuntimeLifecycle,
+    OutputClaimExecutionDefinitionCoordinatorLifecycle,
 )
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
+)
 from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    VolumePath,
+)
 
 REQUEST_SCHEMA_VERSION = 1
 PROTENIX_DATA_RELEASE = "v1.0.0"
@@ -132,7 +147,11 @@ class ProtenixExecutionRequest:
         if self.requires_preprocessing:
             nodes.extend((
                 NodePlan(PLAN_NODE),
-                NodePlan(MSA_NODE, dependencies=(NodeDependency(PLAN_NODE),)),
+                NodePlan(
+                    MSA_NODE,
+                    dependencies=(NodeDependency(PLAN_NODE),),
+                    allow_empty_result=True,
+                ),
                 NodePlan(
                     FINALIZE_NODE,
                     dependencies=(NodeDependency(MSA_NODE),),
@@ -250,276 +269,298 @@ def load_execution_request(
     )
 
 
-class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
-    """Drive one Protenix request through optional MSA fan-out."""
+class ProtenixPublications:
+    """Own Protenix cache refresh, claims, and result reconstruction."""
 
     def __init__(
         self,
         *,
         request: ProtenixExecutionRequest,
         execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
+        output_root: str | Path,
+        output_volume_name: str,
         msa_cache_volume: Any,
         output_claims: Any,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
     ) -> None:
-        """Bind the kernel writer to Protenix's cache and result volumes."""
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-        )
+        """Bind one Run to its result and MSA publication stores."""
+        self.request = request
+        self.execution_run_id = execution_run_id
+        self.output_root = Path(output_root)
+        self.output_volume_name = output_volume_name
         self.msa_cache_volume = msa_cache_volume
         self.output_claims = output_claims
-        self._claimed_publications: set[str] = set()
 
-    def _recover_publications(self) -> None:
-        self._provider.recover_publications(
-            self.execution_run_id,
-            observe_node=self._node_observation,
-            observe_task=lambda node_key, task: (
-                None
-                if node_key in {DOWNLOAD_NODE, PLAN_NODE}
-                else self._task_observation(node_key, task)
-            ),
-            now=self._now(),
+    def refresh_msa(self) -> None:
+        """Refresh provider-published preparation cache state once per batch."""
+        self.msa_cache_volume.reload()
+
+    def claim(self, key: str) -> None:
+        """Claim one content-addressed publication before provider admission."""
+        acquire_output_claim(
+            self.output_claims,
+            claim_key=key,
+            owner=str(self.execution_run_id),
+            replace_owner=self.request.replace_claim_owner,
         )
 
-    def _node_observation(self, node_key: str) -> AvailabilityStatus:
+    @staticmethod
+    def plan_result(plan: ProtenixPreparationPlan) -> AppRunResult:
+        """Publish a bounded preparation plan through execution storage."""
+        return inline_json_result(
+            name="preparation-plan",
+            value=asdict(plan),
+            filename="preparation-plan.json",
+        )
+
+    def result(self) -> AppRunResult | None:
+        """Reconstruct the exact Protenix result archive when present."""
         app = _workload_module()
-        try:
-            if node_key in {DOWNLOAD_NODE, PLAN_NODE}:
-                available = False
-            elif node_key == MSA_NODE:
-                plan = self._try_preparation_plan()
-                available = plan is not None and all(
-                    app._msa_task_ready(task) for task in plan.tasks
-                )
-            elif node_key == FINALIZE_NODE:
-                plan = self._try_preparation_plan()
-                available = plan is not None and app._prepared_ready(plan)
-            elif node_key == INFERENCE_NODE:
-                available = app._result_ready(
-                    self.request.result_key,
-                    self.request.run_name,
-                )
-            else:
-                raise ValueError(f"Unknown Protenix Node {node_key!r}")
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _task_observation(self, node_key: str, task: Any) -> AvailabilityStatus:
-        if node_key == MSA_NODE:
-            try:
-                spec = ProtenixMsaTaskSpec(**task.execution_payload["task"])
-                available = _workload_module()._msa_task_ready(spec)
-            except OSError:
-                return AvailabilityStatus.UNKNOWN
-            return (
-                AvailabilityStatus.AVAILABLE
-                if available
-                else AvailabilityStatus.MISSING
-            )
-        return self._node_observation(node_key)
-
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            now=self._now(),
-        )
-        succeeded_nodes = {
-            updated.node_key
-            for original, updated in reconciled
-            if not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-        }
-        if INFERENCE_NODE in succeeded_nodes:
-            self._reload_output()
-        if succeeded_nodes & {PLAN_NODE, MSA_NODE, FINALIZE_NODE}:
-            self.msa_cache_volume.reload()
-
-    def _decode_completed_calls(self) -> None:
-        self._provider.decode_completed_calls(
-            self.execution_run_id,
-            observe_task=self._completed_task_observation,
-            missing_message="Protenix returned without a valid publication",
-            now=self._now(),
-        )
-
-    def _completed_task_observation(
-        self,
-        node_key: str,
-        task: Any,
-        envelope: object,
-    ) -> AvailabilityStatus:
-        if not isinstance(envelope, dict):
-            return AvailabilityStatus.MISSING
-        if node_key in {DOWNLOAD_NODE, MSA_NODE}:
-            if envelope.get("kind") != "none":
-                return AvailabilityStatus.MISSING
-            return (
-                AvailabilityStatus.AVAILABLE
-                if node_key == DOWNLOAD_NODE
-                else self._task_observation(node_key, task)
-            )
-        if node_key == PLAN_NODE:
-            try:
-                _preparation_plan_from_envelope(envelope)
-            except (TypeError, ValueError):
-                return AvailabilityStatus.MISSING
-            return AvailabilityStatus.AVAILABLE
-        expected_kind = "prepared" if node_key == FINALIZE_NODE else "result"
-        if envelope.get("kind") != expected_kind:
-            return AvailabilityStatus.MISSING
-        return self._task_observation(node_key, task)
-
-    def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.start_ready_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            task_plans=self._task_plans,
-            observe_task=lambda node_key, task: (
-                AvailabilityStatus.MISSING
-                if node_key in {DOWNLOAD_NODE, PLAN_NODE}
-                else self._task_observation(node_key, task)
-            ),
-            now=self._now(),
-        )
-
-    def _task_plans(self, node_key: str) -> tuple[TaskPlan, ...]:
-        if node_key == DOWNLOAD_NODE:
-            return (
-                TaskPlan(
-                    "model-data",
-                    {"model_name": self.request.model_name},
-                ),
-            )
-        if node_key == PLAN_NODE:
-            return (
-                TaskPlan(
-                    "plan",
-                    {"input_sha256": sha256(self.request.input_content).hexdigest()},
-                ),
-            )
-        if node_key == MSA_NODE:
-            plan = self._preparation_plan()
-            return tuple(
-                TaskPlan(
-                    task.task_key,
-                    {"publication_key": task.publication_key},
-                    {"task": asdict(task)},
-                )
-                for task in plan.tasks
-            )
-        if node_key == FINALIZE_NODE:
-            plan = self._preparation_plan()
-            return (
-                TaskPlan(
-                    "finalize",
-                    {"preparation_key": plan.preparation_key},
-                ),
-            )
-        if node_key == INFERENCE_NODE:
-            return (
-                TaskPlan(
-                    "inference",
-                    {"result_key": self.request.result_key},
-                ),
-            )
-        raise ValueError(f"Unknown Protenix Node {node_key!r}")
-
-    def _try_preparation_plan(self) -> ProtenixPreparationPlan | None:
-        try:
-            return self._preparation_plan()
-        except (LookupError, TypeError, ValueError):
+        if not app._result_ready(self.request.result_key, self.request.run_name):
             return None
-
-    def _preparation_plan(self) -> ProtenixPreparationPlan:
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                PLAN_NODE,
-            )
-        if call is None:
-            raise LookupError("Protenix preparation plan is unavailable")
-        return _preparation_plan_from_envelope(call.result_envelope)
-
-    def _binding(self, node_key: str) -> ProviderBinding:
-        function_name = {
-            DOWNLOAD_NODE: "download_protenix_data",
-            PLAN_NODE: "plan_protenix_inputs",
-            MSA_NODE: "query_protenix_msa_server",
-            FINALIZE_NODE: "finalize_protenix_inputs",
-            INFERENCE_NODE: "run_protenix",
-        }[node_key]
-        return ProviderBinding(
-            environment=self.deployment.environment,
-            app_name=self.deployment.deployment_name,
-            app_version=self.deployment.deployment_version,
-            function_name=function_name,
-            uses_gpu=node_key == INFERENCE_NODE,
-            runtime_image_key=(
-                "protenix-gpu" if node_key == INFERENCE_NODE else "protenix-cpu"
-            ),
+        path = app._result_path(self.request.result_key, self.request.run_name)
+        marker = orjson.loads(
+            path.with_suffix(f"{path.suffix}.complete.json").read_bytes()
+        )
+        if not isinstance(marker, dict):
+            return None
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="protenix-result",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=path.relative_to(self.output_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [
+                            ArtifactFile(
+                                path=path.name,
+                                size_bytes=marker.get("size"),
+                                content_sha256=marker.get("sha256"),
+                            ).model_dump(mode="json", exclude_none=True)
+                        ]
+                    },
+                )
+            ],
         )
 
-    def _invocation_kwargs(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> dict[str, object]:
-        if node_key == DOWNLOAD_NODE:
-            return {
+
+@dataclass
+class _ProtenixDownloadNode(ProviderNode):
+    request: ProtenixExecutionRequest
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return ProviderCallSpec(
+            function_name="download_protenix_data",
+            uses_gpu=False,
+            runtime_image_key="protenix-cpu",
+            kwargs={
                 "model_name": self.request.model_name,
                 "force": self.request.force_redownload,
                 "include_templates": self.request.use_template,
-            }
-        if node_key == PLAN_NODE:
-            return {
+            },
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        if result is not None:
+            raise ValueError("Protenix data download returned an unexpected value")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+@dataclass
+class _ProtenixPlanNode(ProviderNode):
+    request: ProtenixExecutionRequest
+    publications: ProtenixPublications
+
+    def refresh_result_storage(self) -> None:
+        self.publications.refresh_msa()
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return ProviderCallSpec(
+            function_name="plan_protenix_inputs",
+            uses_gpu=False,
+            runtime_image_key="protenix-cpu",
+            kwargs={
                 "input_bytes": self.request.input_content,
                 "msa_server_mode": self.request.msa_server_mode,
                 "use_template": self.request.use_template,
                 "use_rna_msa": self.request.use_rna_msa,
-            }
-        if node_key == MSA_NODE:
-            with self.store.synchronize():
-                task = self.store.execution.get_task(
-                    self.execution_run_id,
-                    MSA_NODE,
-                    task_key,
-                )
-            return {"task": ProtenixMsaTaskSpec(**task.execution_payload["task"])}
-        if node_key == FINALIZE_NODE:
-            return {
-                "input_bytes": self.request.input_content,
-                "plan": self._preparation_plan(),
-            }
-        if node_key == INFERENCE_NODE:
-            prepared_path = (
-                self._preparation_plan().prepared_json_path
-                if self.request.requires_preprocessing
-                else None
+            },
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        return self.publications.plan_result(_preparation_plan_from_value(result))
+
+
+@dataclass
+class _ProtenixMsaNode(TaskProviderNode):
+    publications: ProtenixPublications
+
+    def refresh_result_storage(self) -> None:
+        self.publications.refresh_msa()
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        return tuple(
+            TaskDefinition(
+                task_key=task.task_key,
+                scientific_payload={"publication_key": task.publication_key},
+                execution_payload={"task": asdict(task)},
             )
-            return {
-                "input_bytes": (
-                    None
-                    if self.request.requires_preprocessing
-                    else self.request.input_content
-                ),
+            for task in _preparation_plan_from_context(context).tasks
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        del context
+        spec = _msa_task_from_definition(task)
+        self.publications.claim(f"protenix-msa:{spec.publication_key}")
+        return ProviderCallSpec(
+            function_name="query_protenix_msa_server",
+            uses_gpu=False,
+            runtime_image_key="protenix-cpu",
+            kwargs={"task": spec},
+            metadata={"task": asdict(spec)},
+        )
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del task_key
+        if result is not None or not _workload_module()._msa_task_ready(
+            _msa_task_from_value(metadata.get("task"))
+        ):
+            raise FileNotFoundError("Protenix MSA publication is unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _workload_module()._msa_task_ready(_msa_task_from_definition(task))
+            else None
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        try:
+            available = (
+                self.recover_remote_task_result(context, task, expected_fingerprint)
+                is not None
+            )
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del results
+        if errors:
+            return AppRunResult(
+                status=AppRunStatus.FAILED, warnings=list(errors.values())
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[republish_execution_artifact(context.single_input("plan"))],
+        )
+
+
+@dataclass
+class _ProtenixFinalizeNode(ProviderNode):
+    request: ProtenixExecutionRequest
+    publications: ProtenixPublications
+
+    def refresh_result_storage(self) -> None:
+        self.publications.refresh_msa()
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        plan = _preparation_plan_from_context(context)
+        return ProviderCallSpec(
+            function_name="finalize_protenix_inputs",
+            uses_gpu=False,
+            runtime_image_key="protenix-cpu",
+            kwargs={
+                "input_bytes": self.request.input_content,
+                "plan": plan,
+            },
+            metadata={"plan": asdict(plan)},
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        if not isinstance(result, dict):
+            raise ValueError("Protenix finalizer returned invalid metadata")
+        plan = _preparation_plan_from_value(metadata.get("plan"))
+        if not _workload_module()._prepared_ready(plan):
+            raise FileNotFoundError("Protenix prepared input is unavailable")
+        return self.publications.plan_result(plan)
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        if not context.inputs.get("plan"):
+            return None
+        plan = _preparation_plan_from_context(context)
+        return (
+            self.publications.plan_result(plan)
+            if _workload_module()._prepared_ready(plan)
+            else None
+        )
+
+
+@dataclass
+class _ProtenixInferenceNode(ProviderNode):
+    request: ProtenixExecutionRequest
+    publications: ProtenixPublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        self.publications.claim(f"protenix-result:{self.request.result_key}")
+        prepared_path = (
+            _preparation_plan_from_context(context).prepared_json_path
+            if self.request.requires_preprocessing
+            else None
+        )
+        return ProviderCallSpec(
+            function_name="run_protenix",
+            uses_gpu=True,
+            runtime_image_key="protenix-gpu",
+            kwargs={
+                "input_bytes": None if prepared_path else self.request.input_content,
                 "prepared_input_path": prepared_path,
                 "run_name": self.request.run_name,
                 "result_key": self.request.result_key,
@@ -541,40 +582,44 @@ class ProtenixExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 "use_fast_layernorm": self.request.use_fast_layernorm,
                 "extra_args": self.request.extra_args,
                 "score_only": self.request.score_only,
-            }
-        raise ValueError(f"Unknown Protenix Node {node_key!r}")
-
-    def _ensure_publication_claim(self, node_key: str, task_key: str) -> None:
-        if node_key == MSA_NODE:
-            with self.store.synchronize():
-                task = self.store.execution.get_task(
-                    self.execution_run_id,
-                    MSA_NODE,
-                    task_key,
-                )
-            publication_key = str(task.scientific_payload["publication_key"])
-            claim_key = f"protenix-msa:{publication_key}"
-        elif node_key == INFERENCE_NODE:
-            claim_key = f"protenix-result:{self.request.result_key}"
-        else:
-            return
-        if claim_key in self._claimed_publications:
-            return
-        acquire_output_claim(
-            self.output_claims,
-            claim_key=claim_key,
-            owner=str(self.execution_run_id),
-            replace_owner=self.request.replace_claim_owner,
+            },
         )
-        self._claimed_publications.add(claim_key)
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        if not isinstance(result, dict) or "result_path" not in result:
+            raise ValueError("Protenix inference returned invalid metadata")
+        publication = self.publications.result()
+        if publication is None:
+            raise FileNotFoundError("Protenix result publication is unavailable")
+        return publication
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        del context
+        return self.publications.result()
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, result, artifacts
+        try:
+            available = self.publications.result() is not None
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
 
 
-def _preparation_plan_from_envelope(envelope: object) -> ProtenixPreparationPlan:
-    if not isinstance(envelope, dict) or envelope.get("kind") != "plan":
-        raise TypeError("Protenix preparation-plan envelope is invalid")
-    value = envelope.get("plan")
-    if not isinstance(value, dict):
+def _preparation_plan_from_value(value: object) -> ProtenixPreparationPlan:
+    if not isinstance(value, Mapping):
         raise TypeError("Protenix preparation plan is invalid")
+    value = cast(Mapping[str, object], value)
     preparation_key = value.get("preparation_key")
     prepared_json_path = value.get("prepared_json_path")
     tasks = value.get("tasks")
@@ -584,34 +629,7 @@ def _preparation_plan_from_envelope(envelope: object) -> ProtenixPreparationPlan
         or not isinstance(tasks, list)
     ):
         raise TypeError("Protenix preparation plan has invalid fields")
-    parsed_tasks = []
-    for task in tasks:
-        if not isinstance(task, dict):
-            raise TypeError("Protenix MSA Task is invalid")
-        fields = (
-            task.get("task_key"),
-            task.get("input_name"),
-            task.get("query_command"),
-            task.get("input_json_path"),
-            task.get("output_dir"),
-            task.get("msa_server_mode"),
-            task.get("expected_json_path"),
-            task.get("publication_key"),
-        )
-        if not all(isinstance(field, str) for field in fields):
-            raise TypeError("Protenix MSA Task has invalid fields")
-        parsed_tasks.append(
-            ProtenixMsaTaskSpec(
-                task_key=cast(str, fields[0]),
-                input_name=cast(str, fields[1]),
-                query_command=cast(str, fields[2]),
-                input_json_path=cast(str, fields[3]),
-                output_dir=cast(str, fields[4]),
-                msa_server_mode=cast(str, fields[5]),
-                expected_json_path=cast(str, fields[6]),
-                publication_key=cast(str, fields[7]),
-            )
-        )
+    parsed_tasks = [_msa_task_from_value(task) for task in tasks]
     return ProtenixPreparationPlan(
         preparation_key=preparation_key,
         prepared_json_path=prepared_json_path,
@@ -619,16 +637,36 @@ def _preparation_plan_from_envelope(envelope: object) -> ProtenixPreparationPlan
     )
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Encode only bounded plans or publication metadata."""
-    if isinstance(result, ProtenixPreparationPlan):
-        return {"kind": "plan", "plan": asdict(result)}
-    if result is None:
-        return {"kind": "none"}
-    if isinstance(result, dict):
-        kind = "result" if "result_path" in result else "prepared"
-        return {"kind": kind, "publication": orjson.loads(orjson.dumps(result))}
-    return {"kind": "invalid"}
+def _preparation_plan_from_context(context: NodeRunContext) -> ProtenixPreparationPlan:
+    return _preparation_plan_from_value(orjson.loads(context.read_input_bytes("plan")))
+
+
+def _msa_task_from_value(value: object) -> ProtenixMsaTaskSpec:
+    if not isinstance(value, Mapping):
+        raise TypeError("Protenix MSA Task is invalid")
+    value = cast(Mapping[str, object], value)
+    fields = tuple(
+        value.get(name)
+        for name in (
+            "task_key",
+            "input_name",
+            "query_command",
+            "input_json_path",
+            "output_dir",
+            "msa_server_mode",
+            "expected_json_path",
+            "publication_key",
+        )
+    )
+    if not all(isinstance(field, str) for field in fields):
+        raise TypeError("Protenix MSA Task has invalid fields")
+    return ProtenixMsaTaskSpec(*cast(tuple[str, ...], fields))
+
+
+def _msa_task_from_definition(task: TaskDefinition) -> ProtenixMsaTaskSpec:
+    if not isinstance(task.execution_payload, Mapping):
+        raise TypeError("Protenix Task payload is invalid")
+    return _msa_task_from_value(task.execution_payload.get("task"))
 
 
 def _workload_module():
@@ -638,7 +676,48 @@ def _workload_module():
     return protenix_app
 
 
-class ProtenixExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
+def protenix_execution_graph(
+    request: ProtenixExecutionRequest,
+    publications: ProtenixPublications,
+) -> ExecutionGraph:
+    """Build Protenix's download, preprocessing, and inference graph."""
+    graph = ExecutionGraph(
+        "protenix",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="protenix",
+            scientific_payload=request.execution_plan.scientific_payload,
+            scientific_versions=dict(request.execution_plan.scientific_versions),
+        ),
+    )
+    graph.add_node(_ProtenixDownloadNode(request), id=DOWNLOAD_NODE)
+    inference_inputs = {}
+    if request.requires_preprocessing:
+        plan = graph.add_node(
+            _ProtenixPlanNode(request, publications),
+            id=PLAN_NODE,
+        )
+        msa = graph.add_node(
+            _ProtenixMsaNode(publications),
+            id=MSA_NODE,
+            inputs={"plan": plan.outputs(kind=ArtifactKind.TABLE)},
+            allow_empty_result=True,
+        )
+        finalized = graph.add_node(
+            _ProtenixFinalizeNode(request, publications),
+            id=FINALIZE_NODE,
+            inputs={"plan": msa.outputs(kind=ArtifactKind.TABLE)},
+        )
+        inference_inputs["plan"] = finalized.outputs(kind=ArtifactKind.TABLE)
+    graph.add_node(
+        _ProtenixInferenceNode(request, publications),
+        id=INFERENCE_NODE,
+        inputs=inference_inputs,
+        depends_on=[DOWNLOAD_NODE],
+    )
+    return graph
+
+
+class ProtenixExecutionCoordinator(OutputClaimExecutionDefinitionCoordinatorLifecycle):
     """Bind one run-scoped writer to Protenix publications."""
 
     _request_loader = staticmethod(load_execution_request)
@@ -651,6 +730,7 @@ class ProtenixExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
+        output_volume_name: str,
         msa_cache_volume: Any,
         output_claims: Any,
         provider_driver: Any,
@@ -662,29 +742,32 @@ class ProtenixExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            output_claims=output_claims,
+            provider_driver=provider_driver,
+            graph_builder=self._graph,
             target_scientific_versions={"protenix": app_version},
+            poll_interval_seconds=poll_interval_seconds,
         )
-        self.output_volume = output_volume
+        self.output_volume_name = output_volume_name
         self.msa_cache_volume = msa_cache_volume
         self.output_claims = output_claims
-        self.provider_driver = provider_driver
-        self.poll_interval_seconds = poll_interval_seconds
 
-    def _create_runtime(
+    def _graph(
         self,
         request: ProtenixExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> ProtenixExecutionRuntime:
-        return ProtenixExecutionRuntime(
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        del predecessor_execution_run_id
+        return protenix_execution_graph(
             request=request,
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            msa_cache_volume=self.msa_cache_volume,
-            output_claims=self.output_claims,
-            poll_interval_seconds=self.poll_interval_seconds,
+            publications=ProtenixPublications(
+                request=request,
+                execution_run_id=self.execution_run_id,
+                output_root=self.volume_root,
+                output_volume_name=self.output_volume_name,
+                msa_cache_volume=self.msa_cache_volume,
+                output_claims=self.output_claims,
+            ),
         )

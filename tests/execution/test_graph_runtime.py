@@ -233,6 +233,14 @@ class RemoteFanoutNode(TaskProviderNode):
 
 
 @dataclass
+class RefreshingRemoteFanoutNode(RemoteFanoutNode):
+    refreshes: int = field(default=0, metadata={"dag_hash": False})
+
+    def refresh_result_storage(self) -> None:
+        self.refreshes += 1
+
+
+@dataclass
 class RecoverableRemoteFanoutNode(RemoteFanoutNode):
     recoverable_publications: set[str] = field(
         default_factory=set,
@@ -952,6 +960,21 @@ def test_provider_node_can_refresh_artifact_storage_before_decoding(
 
     assert node.events == ["reload", "decode"]
     assert volume.reloads == 1
+    runtime.close()
+
+
+def test_task_node_refreshes_result_storage_once_per_completed_batch(
+    tmp_path: Path,
+) -> None:
+    node = RefreshingRemoteFanoutNode(("first", "second"))
+    workflow = ExecutionGraph("remote-task-refresh")
+    workflow.add_node(node, id="remote")
+    runtime = _runtime(tmp_path, workflow, driver=FanoutModalDriver())
+
+    result = runtime.run(workload_run_key="remote-task-refresh")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert node.refreshes == 1
     runtime.close()
 
 

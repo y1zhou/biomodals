@@ -18,20 +18,24 @@ from biomodals.app.fold.protenix_execution import (
     INFERENCE_NODE,
     MSA_NODE,
     PLAN_NODE,
+    ProtenixExecutionCoordinator,
     ProtenixExecutionRequest,
-    ProtenixExecutionRuntime,
     ProtenixMsaTaskSpec,
     ProtenixPreparationPlan,
+    ProtenixPublications,
+    persist_execution_request,
+    protenix_execution_graph,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "Protenix", 7)
+OUTPUT_VOLUME_NAME = "Protenix-outputs"
 
 
 class FakeVolume:
@@ -173,7 +177,29 @@ def _request(**changes) -> ProtenixExecutionRequest:
     return ProtenixExecutionRequest(**values)
 
 
-def test_request_round_trip_preserves_msa_fanout_graph() -> None:
+def _coordinator(
+    tmp_path: Path,
+    request: ProtenixExecutionRequest,
+    driver: CompletingDriver,
+    claims: FakeClaims,
+) -> ProtenixExecutionCoordinator:
+    persist_execution_request(tmp_path, RUN_ID, request)
+    volume = FakeVolume()
+    return ProtenixExecutionCoordinator(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=volume,
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        msa_cache_volume=volume,
+        output_claims=claims,
+        provider_driver=driver,
+        app_version=request.app_version,
+        poll_interval_seconds=0,
+    )
+
+
+def test_request_round_trip_preserves_msa_fanout_graph(tmp_path: Path) -> None:
     request = _request()
 
     decoded = ProtenixExecutionRequest.from_bytes(request.to_bytes())
@@ -193,6 +219,21 @@ def test_request_round_trip_preserves_msa_fanout_graph() -> None:
         "v1.0.0"
     )
     assert decoded.execution_plan.terminal_node_keys == (INFERENCE_NODE,)
+    graph = protenix_execution_graph(
+        request,
+        ProtenixPublications(
+            request=request,
+            execution_run_id=RUN_ID,
+            output_root=tmp_path,
+            output_volume_name=OUTPUT_VOLUME_NAME,
+            msa_cache_volume=FakeVolume(),
+            output_claims=FakeClaims(),
+        ),
+    )
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
+    )
 
 
 def test_score_only_skips_prediction_preprocessing() -> None:
@@ -248,20 +289,9 @@ def test_runtime_dispatches_each_msa_input_as_a_task(
     )
     driver = CompletingDriver(tmp_path)
     claims = FakeClaims()
-    runtime = ProtenixExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=volume,
-        msa_cache_volume=volume,
-        output_claims=claims,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, claims)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert [name for name, _kwargs in driver.spawns] == [
@@ -273,4 +303,4 @@ def test_runtime_dispatches_each_msa_input_as_a_task(
         "run_protenix",
     ]
     assert set(claims.values.values()) == {str(RUN_ID)}
-    runtime.close()
+    coordinator.close()

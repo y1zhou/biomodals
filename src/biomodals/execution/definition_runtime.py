@@ -939,12 +939,19 @@ class ExecutionGraphRuntime:
             recover_terminal_publications=self._recover_terminal_task_publications,
             now=self._now(),
         )
+        refreshed_nodes: set[str] = set()
         for _, call in reconciled:
             if (
                 call.status != ProviderCallStatus.SUCCEEDED
                 or call.node_key not in required
             ):
                 continue
+            if call.node_key not in refreshed_nodes:
+                node = self._require_definition().nodes[call.node_key].node
+                if isinstance(node, (ResultNode, TaskProviderNode)):
+                    with self._volume_io_lock:
+                        node.refresh_result_storage()
+                refreshed_nodes.add(call.node_key)
             self._publish_provider_result(call)
 
     def _recover_terminal_task_publications(

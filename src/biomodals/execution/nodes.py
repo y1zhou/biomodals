@@ -116,6 +116,9 @@ class ResultNode:
         """Return whether decoding reads provider-published artifact storage."""
         return False
 
+    def refresh_result_storage(self) -> None:
+        """Refresh workload-owned storage before decoding completed results."""
+
     def recover_result_publication(
         self,
         context: NodeRunContext,
@@ -193,6 +196,9 @@ class TaskProviderNode:
     def refresh_artifact_storage_before_result(self) -> bool:
         """Return whether decoding reads provider-published artifact storage."""
         return False
+
+    def refresh_result_storage(self) -> None:
+        """Refresh workload-owned storage before decoding completed results."""
 
     def discover_remote_tasks(
         self,

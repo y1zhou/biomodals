@@ -1,4 +1,4 @@
-"""Modal coordinator for app- and workflow-owned executable graphs."""
+"""Modal coordinator for app- and execution-owned executable graphs."""
 
 import os
 import pickle
@@ -23,6 +23,9 @@ from biomodals.execution import (
     ProviderBinding,
     TaskStatus,
 )
+from biomodals.execution.definition import ExecutionGraph
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ModalCallDriver,
     execution_coordinator_identity,
@@ -31,17 +34,14 @@ from biomodals.execution.modal import (
 from biomodals.execution.modal import (
     execution_coordinator_handle as _shared_execution_coordinator_handle,
 )
+from biomodals.execution.modal.graph_store import GraphExecutionRunStore
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
     WORKFLOW_ORCHESTRATOR_VOLUME,
     WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
 )
-from biomodals.schema import AppRunResult, WorkflowArtifact
-from biomodals.execution.graph import Workflow
-from biomodals.execution.graph_plan import execution_plan
-from biomodals.execution.graph_runtime import WorkflowRuntime
-from biomodals.execution.modal.graph_store import WorkflowRunStore
+from biomodals.schema import AppRunResult, ExecutionArtifact
 
 CONF = AppConfig(
     tags={"group": "workflow"},
@@ -65,10 +65,10 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
 
 @dataclass(frozen=True)
-class WorkflowCoordinatorPlan:
-    """Trusted workflow definition and operational settings needed for recovery."""
+class ExecutionCoordinatorPlan:
+    """Trusted executable graph and operational settings needed for recovery."""
 
-    workflow: Workflow
+    graph: ExecutionGraph
     workload_run_key: str
     max_active_provider_calls: int = 32
     max_active_gpu_provider_calls: int | None = None
@@ -78,8 +78,8 @@ class WorkflowCoordinatorPlan:
 
     def __post_init__(self) -> None:
         """Reject settings that cannot form a kernel Execution Run."""
-        if not isinstance(self.workflow, Workflow):
-            raise TypeError("workflow must be a Workflow object")
+        if not isinstance(self.graph, ExecutionGraph):
+            raise TypeError("graph must be an ExecutionGraph object")
         if not self.workload_run_key:
             raise ValueError("workload_run_key cannot be empty")
         if self.max_active_provider_calls < 1:
@@ -110,7 +110,7 @@ class WorkflowCoordinatorPlan:
     def identity(self) -> tuple[object, ...]:
         """Return fields that must not change within one Execution Run."""
         plan = execution_plan(
-            self.workflow.validate(),
+            self.graph.validate(),
             workload_run_key=self.workload_run_key,
         )
         return (
@@ -128,7 +128,7 @@ class WorkflowCoordinatorPlan:
 class _NodePublication:
     node_key: str
     result: AppRunResult
-    artifacts: tuple[WorkflowArtifact, ...]
+    artifacts: tuple[ExecutionArtifact, ...]
 
 
 @dataclass(frozen=True)
@@ -137,7 +137,7 @@ class _TaskPublication:
     task_key: str
     task_fingerprint: str
     result: AppRunResult
-    artifacts: tuple[WorkflowArtifact, ...]
+    artifacts: tuple[ExecutionArtifact, ...]
 
 
 @app.cls(
@@ -150,7 +150,7 @@ class _TaskPublication:
 )
 @modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
 class ExecutionCoordinator:
-    """Run-scoped, single-writer coordinator included in each workflow app."""
+    """Run-scoped, single-writer coordinator for one executable graph."""
 
     execution_run_id: str = modal.parameter()
     deployment_environment: str = modal.parameter()
@@ -172,7 +172,7 @@ class ExecutionCoordinator:
     @modal.method()
     def prepare_run(
         self,
-        workflow: Workflow,
+        graph: ExecutionGraph,
         workload_run_key: str,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
@@ -181,8 +181,8 @@ class ExecutionCoordinator:
         external_artifact_checker_function_name: str | None = None,
     ) -> None:
         """Persist and checkpoint a root Run before asynchronous driving."""
-        candidate = WorkflowCoordinatorPlan(
-            workflow=workflow,
+        candidate = ExecutionCoordinatorPlan(
+            graph=graph,
             workload_run_key=workload_run_key,
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
@@ -310,7 +310,7 @@ class ExecutionCoordinator:
         self,
         development_function_handles: Mapping[str, Any] | None = None,
     ) -> AppRunResult:
-        """Drive one previously prepared workflow Run."""
+        """Drive one previously prepared Execution Run."""
         if development_function_handles is not None:
             with self._lock():
                 self._development_function_handles = dict(development_function_handles)
@@ -331,7 +331,7 @@ class ExecutionCoordinator:
     def prepare_restart_from(
         self,
         predecessor_execution_run_id: str,
-        workflow: Workflow,
+        graph: ExecutionGraph,
         workload_run_key: str,
         max_active_provider_calls: int = 32,
         max_active_gpu_provider_calls: int | None = None,
@@ -340,8 +340,8 @@ class ExecutionCoordinator:
         external_artifact_checker_function_name: str | None = None,
     ) -> None:
         """Validate launch inputs and persist a linked Successor ledger."""
-        candidate = WorkflowCoordinatorPlan(
-            workflow=workflow,
+        candidate = ExecutionCoordinatorPlan(
+            graph=graph,
             workload_run_key=workload_run_key,
             max_active_provider_calls=max_active_provider_calls,
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
@@ -364,11 +364,11 @@ class ExecutionCoordinator:
         *,
         predecessor_execution_run_id: UUID,
         predecessor_deployment: DeploymentIdentity | None,
-        candidate: WorkflowCoordinatorPlan | None,
+        candidate: ExecutionCoordinatorPlan | None,
         max_active_provider_calls: int | None,
         max_active_gpu_provider_calls: int | None,
     ) -> None:
-        """Validate and checkpoint a workflow Successor without driving it."""
+        """Validate and checkpoint a graph Successor without driving it."""
         successor_id, deployment = self._identity()
         if successor_id == predecessor_execution_run_id:
             raise ValueError("Successor Execution Run ID must be new")
@@ -404,7 +404,7 @@ class ExecutionCoordinator:
                             "Launch Workload Run Key does not match predecessor"
                         )
                     candidate_execution_plan = execution_plan(
-                        candidate.workflow.validate(),
+                        candidate.graph.validate(),
                         workload_run_key=candidate.workload_run_key,
                     )
                     if (
@@ -416,7 +416,7 @@ class ExecutionCoordinator:
                         )
                     successor_plan = candidate
                 successor_execution_plan = execution_plan(
-                    successor_plan.workflow.validate(),
+                    successor_plan.graph.validate(),
                     workload_run_key=successor_plan.workload_run_key,
                 )
                 if (
@@ -437,7 +437,7 @@ class ExecutionCoordinator:
 
     @modal.exit()
     def exit(self) -> None:
-        """Close local workflow state without cancelling child calls."""
+        """Close local execution state without cancelling child calls."""
         with self._drive_lock:
             with self._lock():
                 self._close_runtime()
@@ -461,36 +461,36 @@ class ExecutionCoordinator:
 
     def _persist_or_verify_plan(
         self,
-        candidate: WorkflowCoordinatorPlan,
-    ) -> WorkflowCoordinatorPlan:
+        candidate: ExecutionCoordinatorPlan,
+    ) -> ExecutionCoordinatorPlan:
         store = self._run_store()
         try:
-            if store.workflow_plan_path.exists():
-                plan = _decode_plan(store.read_workflow_plan())
+            if store.coordinator_plan_path.exists():
+                plan = _decode_plan(store.read_coordinator_plan())
                 if plan.identity != candidate.identity:
                     raise ValueError(
-                        "Workflow coordinator plan does not match Execution Run"
+                        "Execution coordinator plan does not match Execution Run"
                     )
                 return plan
-            store.write_workflow_plan(pickle.dumps(candidate))
+            store.write_coordinator_plan(pickle.dumps(candidate))
             return candidate
         finally:
             store.close()
 
-    def _load_plan(self) -> WorkflowCoordinatorPlan:
+    def _load_plan(self) -> ExecutionCoordinatorPlan:
         store = self._run_store()
         try:
-            return _decode_plan(store.read_workflow_plan())
+            return _decode_plan(store.read_coordinator_plan())
         finally:
             store.close()
 
     def _open_runtime(
         self,
-        plan: WorkflowCoordinatorPlan,
+        plan: ExecutionCoordinatorPlan,
         *,
         resolve_external_checker: bool,
         external_checker: Any | None = None,
-    ) -> WorkflowRuntime:
+    ) -> ExecutionGraphRuntime:
         runtime = getattr(self, "_runtime", None)
         if runtime is not None:
             if resolve_external_checker and plan.strict_external_artifact_checks:
@@ -510,13 +510,13 @@ class ExecutionCoordinator:
         if resolve_external_checker and plan.strict_external_artifact_checks:
             if external_checker is None:
                 raise RuntimeError("External artifact checker was not preflighted")
-        runtime = WorkflowRuntime(
-            workflow=plan.workflow,
+        runtime = ExecutionGraphRuntime(
+            graph=plan.graph,
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=Path(CONF.output_volume_mountpoint),
-            workflow_volume_name=OUT_VOLUME_NAME,
-            workflow_volume=OUT_VOLUME,
+            artifact_volume_name=OUT_VOLUME_NAME,
+            artifact_volume=OUT_VOLUME,
             provider_driver=driver,
             max_parallel_nodes=plan.max_parallel_nodes,
             max_active_provider_calls=plan.max_active_provider_calls,
@@ -536,14 +536,14 @@ class ExecutionCoordinator:
 
     def _resolve_external_checker(
         self,
-        plan: WorkflowCoordinatorPlan,
+        plan: ExecutionCoordinatorPlan,
     ) -> Any | None:
         """Resolve an optional remote checker without holding the SQLite writer."""
         if not plan.strict_external_artifact_checks:
             return None
         function_name = plan.external_artifact_checker_function_name
         if function_name is None:
-            raise RuntimeError("Persisted workflow plan has no artifact checker")
+            raise RuntimeError("Persisted coordinator plan has no artifact checker")
         _, deployment = self._identity()
         checker = self._modal_driver().resolve(
             ProviderBinding(
@@ -562,11 +562,11 @@ class ExecutionCoordinator:
         predecessor_deployment: DeploymentIdentity | None,
     ) -> tuple[
         ExecutionRunRecord,
-        WorkflowCoordinatorPlan,
+        ExecutionCoordinatorPlan,
         tuple[_NodePublication, ...],
         tuple[_TaskPublication, ...],
     ]:
-        store = WorkflowRunStore(
+        store = GraphExecutionRunStore(
             Path(CONF.output_volume_mountpoint),
             predecessor_execution_run_id,
         )
@@ -583,15 +583,15 @@ class ExecutionCoordinator:
                 raise ValueError(
                     "Predecessor Deployment Identity does not match Execution Run"
                 )
-            plan = _decode_plan(store.read_workflow_plan())
-            definition = plan.workflow.validate()
+            plan = _decode_plan(store.read_coordinator_plan())
+            definition = plan.graph.validate()
             persisted_plan = execution_plan(
                 definition,
                 workload_run_key=plan.workload_run_key,
             )
             if persisted_plan != predecessor.plan:
                 raise ValueError(
-                    "Predecessor workflow plan does not match its Execution Run"
+                    "Predecessor coordinator plan does not match its Execution Run"
                 )
             node_publications = []
             task_publications = []
@@ -658,7 +658,7 @@ class ExecutionCoordinator:
         self,
         *,
         predecessor: ExecutionRunRecord,
-        plan: WorkflowCoordinatorPlan,
+        plan: ExecutionCoordinatorPlan,
         deployment: DeploymentIdentity,
         node_publications: tuple[_NodePublication, ...],
         task_publications: tuple[_TaskPublication, ...],
@@ -760,9 +760,9 @@ class ExecutionCoordinator:
             raise ValueError("Deployment Identity does not match Execution Run")
         return overview
 
-    def _run_store(self) -> WorkflowRunStore:
+    def _run_store(self) -> GraphExecutionRunStore:
         execution_run_id, _ = self._identity()
-        return WorkflowRunStore(
+        return GraphExecutionRunStore(
             Path(CONF.output_volume_mountpoint),
             execution_run_id,
             lock=self._lock(),
@@ -780,11 +780,11 @@ class ExecutionCoordinator:
             self._runtime = None
 
 
-def _decode_plan(content: bytes) -> WorkflowCoordinatorPlan:
-    """Decode one trusted, deployment-owned workflow plan."""
+def _decode_plan(content: bytes) -> ExecutionCoordinatorPlan:
+    """Decode one trusted, deployment-owned coordinator plan."""
     plan = pickle.loads(content)  # noqa: S301 - internal Volume state, not user input
-    if not isinstance(plan, WorkflowCoordinatorPlan):
-        raise TypeError("Stored workflow coordinator plan has an unsupported type")
+    if not isinstance(plan, ExecutionCoordinatorPlan):
+        raise TypeError("Stored coordinator plan has an unsupported type")
     return plan
 
 

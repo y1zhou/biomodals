@@ -18,9 +18,9 @@ from biomodals.schema import (
     AppRunResult,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
@@ -37,13 +37,13 @@ def _artifact_id(producing_node_id: str, output_name: str) -> str:
 
 @dataclass(frozen=True)
 class MaterializedAppRunResult:
-    """Workflow artifacts plus the ledger-safe app result that produced them."""
+    """Execution artifacts plus the ledger-safe app result that produced them."""
 
-    artifacts: list[WorkflowArtifact]
+    artifacts: list[ExecutionArtifact]
     result: AppRunResult
 
 
-def republish_workflow_artifact(artifact: WorkflowArtifact) -> AppOutput:
+def republish_execution_artifact(artifact: ExecutionArtifact) -> AppOutput:
     """Return an App output that keeps one upstream publication authoritative."""
     metadata = dict(artifact.metadata)
     metadata["source_artifact_id"] = artifact.artifact_id
@@ -85,7 +85,7 @@ def _write_json(path: Path, payload: object) -> None:
 
 def _artifact_files(root: Path) -> list[ArtifactFile]:
     if root.is_symlink():
-        raise ValueError("Workflow artifact paths must not be symlinks")
+        raise ValueError("Execution artifact paths must not be symlinks")
     if root.is_file():
         return [
             ArtifactFile(
@@ -96,7 +96,7 @@ def _artifact_files(root: Path) -> list[ArtifactFile]:
         ]
     paths = sorted(root.rglob("*"))
     if any(path.is_symlink() for path in paths):
-        raise ValueError("Workflow artifact trees must not contain symlinks")
+        raise ValueError("Execution artifact trees must not contain symlinks")
     return [
         ArtifactFile(
             path=str(path.relative_to(root)),
@@ -140,12 +140,12 @@ def _reference_artifact_files(
     *,
     storage: VolumePath,
     metadata: Mapping[str, Any],
-    workflow_volume_name: str,
+    artifact_volume_name: str,
     volume_root: Path | None,
 ) -> tuple[list[ArtifactFile], bool]:
-    """Bind workflow-owned references to their current file contents."""
+    """Bind execution-owned references to their current file contents."""
     declared = _declared_artifact_files(metadata)
-    if storage.volume_name != workflow_volume_name or volume_root is None:
+    if storage.volume_name != artifact_volume_name or volume_root is None:
         return declared, False
 
     artifact_path = _resolve_volume_child(volume_root, storage.path)
@@ -187,14 +187,14 @@ def _reference_artifact_files(
         actual = actual_by_path[file.path]
         if file.size_bytes is not None and file.size_bytes != actual.size_bytes:
             raise FileNotFoundError(
-                f"Workflow artifact file size does not match: {file.path}"
+                f"Execution artifact file size does not match: {file.path}"
             )
         if (
             file.content_sha256 is not None
             and file.content_sha256 != actual.content_sha256
         ):
             raise FileNotFoundError(
-                f"Workflow artifact file SHA-256 does not match: {file.path}"
+                f"Execution artifact file SHA-256 does not match: {file.path}"
             )
         files.append(
             file.model_copy(
@@ -228,7 +228,7 @@ def _materialize_inline_bytes(
     storage: InlineBytes,
     output_name: str,
     output_kind: ArtifactKind,
-    workflow_volume_name: str,
+    artifact_volume_name: str,
     result_dir: Path,
     volume_root: Path | None,
     producing_node_id: str,
@@ -236,7 +236,7 @@ def _materialize_inline_bytes(
     artifact_output_name: str | None = None,
     source_app_output_name: str | None = None,
     artifact_parent: Path | None = None,
-) -> WorkflowArtifact:
+) -> ExecutionArtifact:
     artifact_id = _artifact_id(
         producing_node_id,
         artifact_output_name or output_name,
@@ -252,12 +252,12 @@ def _materialize_inline_bytes(
     materialized_file = materialized_dir.joinpath(safe_filename)
     materialized_file.write_bytes(storage.data)
 
-    return WorkflowArtifact(
+    return ExecutionArtifact(
         artifact_id=artifact_id,
         producing_node_id=producing_node_id,
         kind=output_kind,
         storage=VolumePath(
-            volume_name=workflow_volume_name,
+            volume_name=artifact_volume_name,
             path=_volume_path(materialized_file, volume_root),
             media_type=storage.media_type,
         ),
@@ -328,10 +328,10 @@ def _resolve_artifact_file(root: Path, path: str) -> Path:
     return resolved_path
 
 
-def workflow_artifact_availability_errors(
-    artifact: WorkflowArtifact,
+def execution_artifact_availability_errors(
+    artifact: ExecutionArtifact,
     *,
-    workflow_volume_name: str,
+    artifact_volume_name: str,
     volume_root: Path,
 ) -> list[str]:
     """Return missing-file errors for workflow-volume artifacts.
@@ -339,20 +339,20 @@ def workflow_artifact_availability_errors(
     Artifacts stored in app-owned volumes are intentionally treated as unknown:
     the workflow runtime cannot validate volumes it has not mounted.
     """
-    if artifact.storage.volume_name != workflow_volume_name:
+    if artifact.storage.volume_name != artifact_volume_name:
         return []
 
     try:
         artifact_path = _resolve_volume_child(volume_root, artifact.storage.path)
     except ValueError as exc:
         return [
-            f"{artifact.artifact_id}: invalid workflow artifact path "
+            f"{artifact.artifact_id}: invalid execution artifact path "
             f"{artifact.storage.path!r}: {exc}"
         ]
 
     if not artifact_path.exists():
         return [
-            f"{artifact.artifact_id}: missing workflow artifact path "
+            f"{artifact.artifact_id}: missing execution artifact path "
             f"{artifact.storage.path}"
         ]
     if not artifact.files:
@@ -372,7 +372,7 @@ def workflow_artifact_availability_errors(
 
     if not artifact_path.is_dir():
         return [
-            f"{artifact.artifact_id}: workflow artifact path is not a file or "
+            f"{artifact.artifact_id}: execution artifact path is not a file or "
             f"directory: {artifact.storage.path}"
         ]
 
@@ -382,13 +382,13 @@ def workflow_artifact_availability_errors(
             file_path = _resolve_artifact_file(artifact_path, file.path)
         except ValueError as exc:
             errors.append(
-                f"{artifact.artifact_id}: invalid workflow artifact file "
+                f"{artifact.artifact_id}: invalid execution artifact file "
                 f"{file.path!r}: {exc}"
             )
             continue
         if not file_path.is_file():
             errors.append(
-                f"{artifact.artifact_id}: missing workflow artifact file "
+                f"{artifact.artifact_id}: missing execution artifact file "
                 f"{artifact.storage.path}/{file.path}"
             )
             continue
@@ -410,10 +410,10 @@ def _artifact_file_metadata_errors(
 ) -> list[str]:
     actual_size = file_path.stat().st_size
     if actual_size < 1 and file.size_bytes != 0:
-        return [f"{artifact_id}: workflow artifact file {file.path} is empty"]
+        return [f"{artifact_id}: execution artifact file {file.path} is empty"]
     if file.size_bytes is not None and actual_size != file.size_bytes:
         return [
-            f"{artifact_id}: workflow artifact file {file.path} has size "
+            f"{artifact_id}: execution artifact file {file.path} has size "
             f"{actual_size}, expected {file.size_bytes}"
         ]
     if (
@@ -421,7 +421,7 @@ def _artifact_file_metadata_errors(
         and _file_sha256(file_path) != file.content_sha256
     ):
         return [
-            f"{artifact_id}: workflow artifact file {file.path} does not match "
+            f"{artifact_id}: execution artifact file {file.path} does not match "
             "its SHA-256"
         ]
     return []
@@ -467,7 +467,7 @@ def _materialize_volume_path_copy(
     storage: VolumePath,
     output_name: str,
     output_kind: ArtifactKind,
-    workflow_volume_name: str,
+    artifact_volume_name: str,
     result_dir: Path,
     volume_root: Path | None,
     producing_node_id: str,
@@ -476,7 +476,7 @@ def _materialize_volume_path_copy(
     artifact_output_name: str | None = None,
     source_app_output_name: str | None = None,
     artifact_parent: Path | None = None,
-) -> WorkflowArtifact:
+) -> ExecutionArtifact:
     artifact_id = _artifact_id(
         producing_node_id,
         artifact_output_name or output_name,
@@ -498,12 +498,12 @@ def _materialize_volume_path_copy(
         source_root=source_root,
     )
 
-    return WorkflowArtifact(
+    return ExecutionArtifact(
         artifact_id=artifact_id,
         producing_node_id=producing_node_id,
         kind=output_kind,
         storage=VolumePath(
-            volume_name=workflow_volume_name,
+            volume_name=artifact_volume_name,
             path=_volume_path(materialized_dir, volume_root),
             media_type=storage.media_type,
         ),
@@ -516,7 +516,7 @@ def _materialize_volume_path_copy(
 def materialize_app_run_result(
     *,
     result: AppRunResult,
-    workflow_volume_name: str,
+    artifact_volume_name: str,
     result_dir: Path,
     artifact_dir: Path,
     producing_node_id: str,
@@ -525,8 +525,8 @@ def materialize_app_run_result(
     volume_path_mode: Literal["reference", "copy"] = "reference",
     volume_roots: Mapping[str, Path] | None = None,
 ) -> MaterializedAppRunResult:
-    """Write app outputs into local workflow volume paths and return manifests."""
-    artifacts: list[WorkflowArtifact] = []
+    """Write app outputs into local artifact volume paths and return manifests."""
+    artifacts: list[ExecutionArtifact] = []
     persisted_outputs: list[AppOutput] = []
     persisted_logs: list[AppOutput] = []
 
@@ -541,7 +541,7 @@ def materialize_app_run_result(
         artifact_output_name: str | None = None,
         source_app_output_name: str | None = None,
         artifact_parent: Path | None = None,
-    ) -> tuple[WorkflowArtifact, AppOutput]:
+    ) -> tuple[ExecutionArtifact, AppOutput]:
         artifact_output_name = scoped_output_name(artifact_output_name or output.name)
         artifact_id = _artifact_id(
             producing_node_id,
@@ -552,7 +552,7 @@ def materialize_app_run_result(
                 storage=output.storage,
                 output_name=output.name,
                 output_kind=output.kind,
-                workflow_volume_name=workflow_volume_name,
+                artifact_volume_name=artifact_volume_name,
                 result_dir=result_dir,
                 volume_root=volume_root,
                 producing_node_id=producing_node_id,
@@ -568,7 +568,7 @@ def materialize_app_run_result(
                 storage=output.storage,
                 output_name=output.name,
                 output_kind=output.kind,
-                workflow_volume_name=workflow_volume_name,
+                artifact_volume_name=artifact_volume_name,
                 result_dir=result_dir,
                 volume_root=volume_root,
                 producing_node_id=producing_node_id,
@@ -579,13 +579,13 @@ def materialize_app_run_result(
                 artifact_parent=artifact_parent,
             )
             return artifact, _persisted_output(output, artifact.storage)
-        reference_files, workflow_reference_validated = _reference_artifact_files(
+        reference_files, execution_reference_validated = _reference_artifact_files(
             storage=output.storage,
             metadata=output.metadata,
-            workflow_volume_name=workflow_volume_name,
+            artifact_volume_name=artifact_volume_name,
             volume_root=volume_root,
         )
-        artifact = WorkflowArtifact(
+        artifact = ExecutionArtifact(
             artifact_id=artifact_id,
             producing_node_id=producing_node_id,
             kind=output.kind,
@@ -594,22 +594,22 @@ def materialize_app_run_result(
             source_app_output_name=source_app_output_name or output.name,
             metadata=output.metadata,
         )
-        if not workflow_reference_validated:
-            raise_for_unavailable_workflow_artifact(artifact)
+        if not execution_reference_validated:
+            raise_for_unavailable_execution_artifact(artifact)
         return artifact, _persisted_output(output, artifact.storage)
 
-    def raise_for_unavailable_workflow_artifact(artifact: WorkflowArtifact) -> None:
+    def raise_for_unavailable_execution_artifact(artifact: ExecutionArtifact) -> None:
         if volume_root is None:
             return
-        errors = workflow_artifact_availability_errors(
+        errors = execution_artifact_availability_errors(
             artifact,
-            workflow_volume_name=workflow_volume_name,
+            artifact_volume_name=artifact_volume_name,
             volume_root=volume_root,
         )
         if not errors:
             return
         raise FileNotFoundError(
-            "Workflow artifact is unavailable:\n"
+            "Execution artifact is unavailable:\n"
             + "\n".join(f"- {error}" for error in errors)
         )
 

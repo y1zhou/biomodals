@@ -14,15 +14,15 @@ from biomodals.execution import (
     NodePlan,
 )
 from biomodals.execution.modal.graph_store import (
-    UnsupportedWorkflowRunStoreError,
-    WorkflowRunStore,
+    GraphExecutionRunStore,
+    UnsupportedGraphRunStoreError,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
 
 def test_run_store_uses_execution_identity_and_shared_schema(tmp_path: Path) -> None:
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
     with store.transaction():
         store.execution.create_run(
@@ -58,7 +58,7 @@ def test_run_store_uses_execution_identity_and_shared_schema(tmp_path: Path) -> 
         )
     }
     assert "execution_runs" in tables
-    assert "workflow_artifacts" in tables
+    assert "execution_artifacts" in tables
     assert "runs" not in tables
     assert "attempts" not in tables
 
@@ -66,26 +66,26 @@ def test_run_store_uses_execution_identity_and_shared_schema(tmp_path: Path) -> 
 def test_run_store_atomically_creates_one_immutable_workflow_plan(
     tmp_path: Path,
 ) -> None:
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
-    store.write_workflow_plan(b"serialized plan")
+    store.write_coordinator_plan(b"serialized plan")
 
-    assert store.read_workflow_plan() == b"serialized plan"
-    assert store.workflow_plan_path == store.state_root / "workflow-plan.pkl"
-    assert not store.workflow_plan_path.with_suffix(".pkl.tmp").exists()
+    assert store.read_coordinator_plan() == b"serialized plan"
+    assert store.coordinator_plan_path == store.state_root / "workflow-plan.pkl"
+    assert not store.coordinator_plan_path.with_suffix(".pkl.tmp").exists()
     with pytest.raises(FileExistsError):
-        store.write_workflow_plan(b"replacement")
+        store.write_coordinator_plan(b"replacement")
 
 
 def test_run_store_rejects_an_empty_workflow_plan(tmp_path: Path) -> None:
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
     with pytest.raises(ValueError, match="cannot be empty"):
-        store.write_workflow_plan(b"")
+        store.write_coordinator_plan(b"")
 
 
 def test_transaction_rolls_back_both_repository_views(tmp_path: Path) -> None:
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
     with pytest.raises(RuntimeError, match="stop"):
         with store.transaction():
@@ -109,7 +109,7 @@ def test_transaction_rolls_back_both_repository_views(tmp_path: Path) -> None:
 
 
 def test_closing_for_volume_sync_reopens_repository_views(tmp_path: Path) -> None:
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
     first_connection = store.connection
 
     with store.transaction():
@@ -133,10 +133,10 @@ def test_closing_for_volume_sync_reopens_repository_views(tmp_path: Path) -> Non
 
 
 def test_existing_legacy_or_unrecognized_ledger_is_rejected(tmp_path: Path) -> None:
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
     store.state_root.mkdir(parents=True)
     with sqlite3.connect(store.ledger_path) as connection:
         connection.execute("CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY)")
 
-    with pytest.raises(UnsupportedWorkflowRunStoreError, match="fresh"):
+    with pytest.raises(UnsupportedGraphRunStoreError, match="fresh"):
         _ = store.connection

@@ -11,15 +11,15 @@ import orjson
 import pytest
 
 from biomodals.execution import (
+    CoordinatorNode,
     DeploymentIdentity,
+    ExecutionGraph,
     NodeAggregationPolicy,
     NodeRunContext,
     NodeStatus,
     TaskStatus,
-    Workflow,
-    WorkflowNativeNode,
 )
-from biomodals.execution.graph_runtime import WorkflowRuntime
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
@@ -47,11 +47,11 @@ DEPLOYMENT = DeploymentIdentity("main", "PPIFlowWorkflow", 7)
 
 
 @dataclass
-class CandidateSourceNode(WorkflowNativeNode):
+class CandidateSourceNode(CoordinatorNode):
     candidate_ids: tuple[str, ...]
 
     def run(self, context: NodeRunContext) -> AppRunResult:
-        if context.volume_root is None or context.workflow_volume_name is None:
+        if context.volume_root is None or context.artifact_volume_name is None:
             raise RuntimeError("Workflow Volume context is unavailable")
         structures_dir = context.work_dir / "structures"
         structures_dir.mkdir(parents=True, exist_ok=True)
@@ -88,12 +88,12 @@ class CandidateSourceNode(WorkflowNativeNode):
                     kind=ArtifactKind.STRUCTURES,
                     remote_path=str(structures_dir),
                     mount_root=str(context.volume_root),
-                    volume_name=context.workflow_volume_name,
+                    volume_name=context.artifact_volume_name,
                 ),
                 manifests.manifest_artifact_output(
                     manifest_path=manifest_path,
                     mount_root=str(context.volume_root),
-                    volume_name=context.workflow_volume_name,
+                    volume_name=context.artifact_volume_name,
                     stage_name="source",
                     row_count=len(rows),
                 ),
@@ -102,7 +102,7 @@ class CandidateSourceNode(WorkflowNativeNode):
 
 
 @dataclass
-class RosettaPlanSourceNode(WorkflowNativeNode):
+class RosettaPlanSourceNode(CoordinatorNode):
     tasks: tuple[RosettaTaskSpec, ...]
 
     def run(self, context: NodeRunContext) -> AppRunResult:
@@ -206,7 +206,7 @@ def test_ppiflow_candidates_are_independent_kernel_tasks(
     node,
     expected_function: str,
 ) -> None:
-    workflow = Workflow("ppiflow-fanout")
+    workflow = ExecutionGraph("ppiflow-fanout")
     source = workflow.add_node(
         CandidateSourceNode(("candidate-b", "candidate-a")),
         id="source",
@@ -224,12 +224,12 @@ def test_ppiflow_candidates_are_independent_kernel_tasks(
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
     )
     driver = FakeModalDriver()
-    runtime = WorkflowRuntime(
-        workflow=workflow,
+    runtime = ExecutionGraphRuntime(
+        graph=workflow,
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         provider_driver=driver,
         max_active_provider_calls=2,
         max_active_gpu_provider_calls=2,
@@ -294,7 +294,7 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
             start=1,
         )
     )
-    workflow = Workflow("ppiflow-rosetta-pull")
+    workflow = ExecutionGraph("ppiflow-rosetta-pull")
     source = workflow.add_node(RosettaPlanSourceNode(tasks), id="prepare")
     workflow.add_node(
         RosettaWorkerNode("RosettaRelaxStep", {}),
@@ -310,12 +310,12 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         lambda *_args: True,
     )
     driver = RosettaPullModalDriver()
-    runtime = WorkflowRuntime(
-        workflow=workflow,
+    runtime = ExecutionGraphRuntime(
+        graph=workflow,
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         provider_driver=driver,
         max_active_provider_calls=1,
         max_active_gpu_provider_calls=0,
@@ -406,7 +406,7 @@ def test_ppiflow_rosetta_recovers_committed_task_after_lost_callback(
         input_sha256="1" * 64,
         candidate_id="candidate-a",
     )
-    workflow = Workflow("ppiflow-rosetta-callback-recovery")
+    workflow = ExecutionGraph("ppiflow-rosetta-callback-recovery")
     source = workflow.add_node(RosettaPlanSourceNode((task,)), id="prepare")
     workflow.add_node(
         RosettaWorkerNode("RosettaRelaxStep", {}),
@@ -420,12 +420,12 @@ def test_ppiflow_rosetta_recovers_committed_task_after_lost_callback(
         "validate_task_publication_from_volume",
         lambda *_args: True,
     )
-    runtime = WorkflowRuntime(
-        workflow=workflow,
+    runtime = ExecutionGraphRuntime(
+        graph=workflow,
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         provider_driver=RosettaPullModalDriver(),
         max_active_provider_calls=1,
         max_active_gpu_provider_calls=0,

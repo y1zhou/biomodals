@@ -14,8 +14,8 @@ from biomodals.execution.artifact_availability import (
     mounted_volume_checker,
 )
 from biomodals.execution.artifacts import (
+    execution_artifact_availability_errors,
     materialize_app_run_result,
-    workflow_artifact_availability_errors,
 )
 from biomodals.schema import (
     AppOutput,
@@ -23,9 +23,9 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 
 
@@ -45,7 +45,7 @@ def test_materialize_inline_bytes_writes_one_result_artifact_copy(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "nodes" / "summary" / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="summary",
@@ -86,7 +86,7 @@ def test_task_scope_keeps_repeated_output_names_distinct(
 
     first = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "candidate-a",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="design",
@@ -95,7 +95,7 @@ def test_task_scope_keeps_repeated_output_names_distinct(
     )
     second = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "candidate-b",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="design",
@@ -124,7 +124,7 @@ def test_long_scoped_artifact_ids_use_a_bounded_digest(tmp_path: Path) -> None:
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="fanout",
@@ -154,7 +154,7 @@ def test_inline_filename_rejects_an_overlong_component(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="filename exceeds"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "result",
             artifact_dir=tmp_path / "artifacts",
             producing_node_id="summary",
@@ -165,13 +165,13 @@ def test_inline_filename_rejects_an_overlong_component(tmp_path: Path) -> None:
     assert not (tmp_path / "artifacts").exists()
 
 
-def test_workflow_artifact_availability_accepts_existing_workflow_file(
+def test_execution_artifact_availability_accepts_existing_workflow_file(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "run" / "summary.txt"
     output_path.parent.mkdir(parents=True)
     output_path.write_text("ok\n", encoding="utf-8")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="summary-report",
         producing_node_id="summary",
         kind=ArtifactKind.REPORT,
@@ -188,22 +188,22 @@ def test_workflow_artifact_availability_accepts_existing_workflow_file(
     )
 
     assert (
-        workflow_artifact_availability_errors(
+        execution_artifact_availability_errors(
             artifact,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             volume_root=tmp_path,
         )
         == []
     )
 
 
-def test_workflow_artifact_availability_rejects_same_size_corruption(
+def test_execution_artifact_availability_rejects_same_size_corruption(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "run" / "model.pdb"
     output_path.parent.mkdir(parents=True)
     output_path.write_bytes(b"HACK\n")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="ranked-structure",
         producing_node_id="rank",
         kind=ArtifactKind.STRUCTURES,
@@ -220,9 +220,9 @@ def test_workflow_artifact_availability_rejects_same_size_corruption(
         ],
     )
 
-    errors = workflow_artifact_availability_errors(
+    errors = execution_artifact_availability_errors(
         artifact,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
     )
 
@@ -230,13 +230,13 @@ def test_workflow_artifact_availability_rejects_same_size_corruption(
     assert "SHA-256" in errors[0]
 
 
-def test_workflow_artifact_availability_rejects_empty_declared_file(
+def test_execution_artifact_availability_rejects_empty_declared_file(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "run" / "empty.csv"
     output_path.parent.mkdir(parents=True)
     output_path.touch()
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="empty-table",
         producing_node_id="table",
         kind=ArtifactKind.TABLE,
@@ -247,9 +247,9 @@ def test_workflow_artifact_availability_rejects_empty_declared_file(
         files=[ArtifactFile(path="empty.csv")],
     )
 
-    errors = workflow_artifact_availability_errors(
+    errors = execution_artifact_availability_errors(
         artifact,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
     )
 
@@ -257,10 +257,10 @@ def test_workflow_artifact_availability_rejects_empty_declared_file(
     assert "empty" in errors[0]
 
 
-def test_workflow_artifact_availability_reports_missing_workflow_file(
+def test_execution_artifact_availability_reports_missing_workflow_file(
     tmp_path: Path,
 ) -> None:
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="summary-report",
         producing_node_id="summary",
         kind=ArtifactKind.REPORT,
@@ -270,9 +270,9 @@ def test_workflow_artifact_availability_reports_missing_workflow_file(
         ),
     )
 
-    errors = workflow_artifact_availability_errors(
+    errors = execution_artifact_availability_errors(
         artifact,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
     )
 
@@ -281,12 +281,12 @@ def test_workflow_artifact_availability_reports_missing_workflow_file(
     assert "run/summary.txt" in errors[0]
 
 
-def test_workflow_artifact_availability_reports_missing_manifest_child(
+def test_execution_artifact_availability_reports_missing_manifest_child(
     tmp_path: Path,
 ) -> None:
     output_dir = tmp_path / "run" / "outputs"
     output_dir.mkdir(parents=True)
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="design-structures",
         producing_node_id="design",
         kind=ArtifactKind.STRUCTURES,
@@ -297,9 +297,9 @@ def test_workflow_artifact_availability_reports_missing_manifest_child(
         files=[ArtifactFile(path="model.pdb")],
     )
 
-    errors = workflow_artifact_availability_errors(
+    errors = execution_artifact_availability_errors(
         artifact,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
     )
 
@@ -307,10 +307,10 @@ def test_workflow_artifact_availability_reports_missing_manifest_child(
     assert "model.pdb" in errors[0]
 
 
-def test_workflow_artifact_availability_skips_unmounted_external_volumes(
+def test_execution_artifact_availability_skips_unmounted_external_volumes(
     tmp_path: Path,
 ) -> None:
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd",
         kind=ArtifactKind.DIRECTORY,
@@ -321,9 +321,9 @@ def test_workflow_artifact_availability_skips_unmounted_external_volumes(
     )
 
     assert (
-        workflow_artifact_availability_errors(
+        execution_artifact_availability_errors(
             artifact,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             volume_root=tmp_path,
         )
         == []
@@ -333,7 +333,7 @@ def test_workflow_artifact_availability_skips_unmounted_external_volumes(
 def test_typed_artifact_availability_reports_unknown_external_without_checker(
     tmp_path: Path,
 ) -> None:
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd",
         kind=ArtifactKind.DIRECTORY,
@@ -345,7 +345,7 @@ def test_typed_artifact_availability_reports_unknown_external_without_checker(
 
     availability = check_artifact_availability(
         artifact,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
     )
 
@@ -359,7 +359,7 @@ def test_typed_artifact_availability_reports_unknown_external_without_checker(
 def test_typed_artifact_availability_reports_unknown_when_checker_fails(
     tmp_path: Path,
 ) -> None:
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd",
         kind=ArtifactKind.DIRECTORY,
@@ -369,12 +369,12 @@ def test_typed_artifact_availability_reports_unknown_when_checker_fails(
         ),
     )
 
-    def broken_checker(_artifact: WorkflowArtifact) -> ArtifactAvailability:
+    def broken_checker(_artifact: ExecutionArtifact) -> ArtifactAvailability:
         raise RuntimeError("volume unavailable")
 
     availability = check_artifact_availability(
         artifact,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
         external_artifact_checker=broken_checker,
     )
@@ -394,10 +394,10 @@ def test_external_mounted_volume_checker_validates_app_volume_artifacts(
     app_output.mkdir(parents=True)
     app_output.joinpath("model.pdb").write_text("ATOM\n", encoding="utf-8")
     checker = mounted_volume_checker(
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_roots={"RFdiffusion-outputs": app_volume},
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd",
         kind=ArtifactKind.DIRECTORY,
@@ -418,10 +418,10 @@ def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
     tmp_path: Path,
 ) -> None:
     checker = mounted_volume_checker(
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_roots={"RFdiffusion-outputs": tmp_path / "app-volume"},
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd",
         kind=ArtifactKind.DIRECTORY,
@@ -435,17 +435,17 @@ def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
 
     assert availability.status == AvailabilityStatus.MISSING
     assert len(availability.errors) == 1
-    assert "missing workflow artifact path run/outputs" in availability.errors[0]
+    assert "missing execution artifact path run/outputs" in availability.errors[0]
 
 
 def test_external_mounted_volume_checker_reports_unknown_unmounted_volume(
     tmp_path: Path,
 ) -> None:
     checker = mounted_volume_checker(
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_roots={},
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd",
         kind=ArtifactKind.DIRECTORY,
@@ -489,7 +489,7 @@ def test_volume_path_reference_output_records_expected_files_from_metadata(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "nodes" / "rfd" / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="rfd",
@@ -501,7 +501,7 @@ def test_volume_path_reference_output_records_expected_files_from_metadata(
 
     app_output.joinpath("model.pdb").unlink()
     checker = mounted_volume_checker(
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_roots={"RFdiffusion-outputs": app_volume},
     )
 
@@ -510,7 +510,8 @@ def test_volume_path_reference_output_records_expected_files_from_metadata(
     assert availability.status == AvailabilityStatus.MISSING
     assert len(availability.errors) == 1
     assert (
-        "missing workflow artifact file run/outputs/model.pdb" in availability.errors[0]
+        "missing execution artifact file run/outputs/model.pdb"
+        in availability.errors[0]
     )
 
 
@@ -531,7 +532,7 @@ def test_materialized_inline_artifact_path_is_volume_relative(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=run_root / "nodes" / "summary" / "result",
         artifact_dir=run_root / "artifacts",
         producing_node_id="summary",
@@ -561,7 +562,7 @@ def test_materialize_inline_bytes_preserves_output_metadata(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="summary",
@@ -589,7 +590,7 @@ def test_materialize_app_run_result_persists_log_outputs_under_result_logs(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="node",
@@ -630,7 +631,7 @@ def test_materialize_volume_path_references_existing_remote_output(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="score",
@@ -644,7 +645,7 @@ def test_materialize_volume_path_references_existing_remote_output(
     assert (tmp_path / "artifacts" / "score-scores.json").exists()
 
 
-def test_workflow_volume_reference_records_content_identity(
+def test_artifact_volume_reference_records_content_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -677,7 +678,7 @@ def test_workflow_volume_reference_records_content_identity(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="score",
@@ -692,16 +693,16 @@ def test_workflow_volume_reference_records_content_identity(
     )
     assert hashed == ["scores.csv"]
     output_path.write_bytes(b"score\n2\n")
-    errors = workflow_artifact_availability_errors(
+    errors = execution_artifact_availability_errors(
         materialized.artifacts[0],
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         volume_root=tmp_path,
     )
     assert len(errors) == 1
     assert "SHA-256" in errors[0]
 
 
-def test_workflow_volume_reference_enriches_declared_file(tmp_path: Path) -> None:
+def test_artifact_volume_reference_enriches_declared_file(tmp_path: Path) -> None:
     output_path = tmp_path / "run-1" / "model.pdb"
     output_path.parent.mkdir()
     output_path.write_bytes(b"ATOM\n")
@@ -722,7 +723,7 @@ def test_workflow_volume_reference_enriches_declared_file(tmp_path: Path) -> Non
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="models",
@@ -739,7 +740,7 @@ def test_workflow_volume_reference_enriches_declared_file(tmp_path: Path) -> Non
     ]
 
 
-def test_workflow_volume_reference_hashes_only_declared_files(
+def test_artifact_volume_reference_hashes_only_declared_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -782,7 +783,7 @@ def test_workflow_volume_reference_hashes_only_declared_files(
 
     materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="models",
@@ -839,7 +840,7 @@ def test_partial_and_mixed_reference_manifests_hash_each_file_once(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="results",
@@ -853,7 +854,7 @@ def test_partial_and_mixed_reference_manifests_hash_each_file_once(
     )
 
 
-def test_workflow_volume_reference_rejects_symlink_before_hashing(
+def test_artifact_volume_reference_rejects_symlink_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -889,7 +890,7 @@ def test_workflow_volume_reference_rejects_symlink_before_hashing(
     with pytest.raises(ValueError, match="symlink"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "result",
             artifact_dir=tmp_path / "artifacts",
             producing_node_id="directory",
@@ -899,7 +900,7 @@ def test_workflow_volume_reference_rejects_symlink_before_hashing(
     assert hashed == []
 
 
-def test_materialize_volume_path_rejects_missing_workflow_volume_reference(
+def test_materialize_volume_path_rejects_missing_artifact_volume_reference(
     tmp_path: Path,
 ) -> None:
     result = AppRunResult(
@@ -919,7 +920,7 @@ def test_materialize_volume_path_rejects_missing_workflow_volume_reference(
     with pytest.raises(FileNotFoundError, match="summary-summary"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "result",
             artifact_dir=tmp_path / "artifacts",
             producing_node_id="summary",
@@ -950,7 +951,7 @@ def test_materialize_volume_path_can_copy_from_mounted_volume(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "workflow" / "result",
         artifact_dir=tmp_path / "workflow" / "artifacts",
         producing_node_id="score",
@@ -992,7 +993,7 @@ def test_materialize_volume_path_copy_preserves_empty_directories(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "workflow" / "result",
         artifact_dir=tmp_path / "workflow" / "artifacts",
         producing_node_id="score",
@@ -1032,7 +1033,7 @@ def test_materialize_volume_path_copy_rejects_traversal(
     with pytest.raises(ValueError, match="relative"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "workflow" / "result",
             artifact_dir=tmp_path / "workflow" / "artifacts",
             producing_node_id="score",
@@ -1069,7 +1070,7 @@ def test_materialize_volume_path_copy_rejects_symlinked_children(
     with pytest.raises(ValueError, match="symlink"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "workflow" / "result",
             artifact_dir=tmp_path / "workflow" / "artifacts",
             producing_node_id="score",
@@ -1104,7 +1105,7 @@ def test_materialize_volume_path_copy_rejects_symlink_path_component(
     with pytest.raises(ValueError, match="symlinks"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "workflow" / "result",
             artifact_dir=tmp_path / "workflow" / "artifacts",
             producing_node_id="score",
@@ -1134,7 +1135,7 @@ def test_materialize_inline_bytes_rejects_non_utf8_bytes(
     with pytest.raises(ValueError, match="UTF-8 text"):
         materialize_app_run_result(
             result=result,
-            workflow_volume_name="Workflow-outputs",
+            artifact_volume_name="Workflow-outputs",
             result_dir=tmp_path / "result",
             artifact_dir=tmp_path / "artifacts",
             producing_node_id="pack",
@@ -1162,7 +1163,7 @@ def test_materialize_inline_zstd_archive_preserves_binary_bytes(
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="pack",
@@ -1203,7 +1204,7 @@ def test_archive_outputs_use_volume_path_metadata(tmp_path: Path) -> None:
 
     materialized = materialize_app_run_result(
         result=result,
-        workflow_volume_name="Workflow-outputs",
+        artifact_volume_name="Workflow-outputs",
         result_dir=tmp_path / "result",
         artifact_dir=tmp_path / "artifacts",
         producing_node_id="pack",

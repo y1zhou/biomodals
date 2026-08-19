@@ -7,14 +7,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from biomodals.execution.model import NodeAggregationPolicy
+from biomodals.execution.nodes import ExecutionNode
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import ArtifactKind, ArtifactSelector
-from biomodals.execution.nodes import WorkflowNode
 
 
 @dataclass(frozen=True)
 class NodeHandle:
-    """Stable handle returned after adding a node to a workflow."""
+    """Stable handle returned after adding an Execution Node."""
 
     node_id: str
 
@@ -36,11 +36,11 @@ class NodeHandle:
 
 
 @dataclass
-class WorkflowNodeSpec:
+class ExecutionNodeSpec:
     """Builder-time node metadata."""
 
     node_id: str
-    node: WorkflowNode
+    node: ExecutionNode
     aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL
     allow_empty_result: bool = False
     reuse_predecessor_publication: bool = True
@@ -50,17 +50,17 @@ class WorkflowNodeSpec:
 
 
 @dataclass(frozen=True)
-class WorkflowDefinition:
-    """Validated workflow DAG definition."""
+class ExecutionDefinition:
+    """Validated executable DAG supplied to the execution kernel."""
 
     name: str
-    nodes: dict[str, WorkflowNodeSpec]
+    nodes: dict[str, ExecutionNodeSpec]
     dependencies: dict[str, set[str]]
     scientific_versions: dict[str, str]
 
 
-class Workflow:
-    """Python-first workflow DAG builder."""
+class ExecutionGraph:
+    """Python-first builder for one Execution Definition."""
 
     def __init__(
         self,
@@ -68,14 +68,14 @@ class Workflow:
         *,
         scientific_versions: Mapping[str, str] | None = None,
     ):
-        """Initialize an empty workflow definition."""
+        """Initialize an empty executable graph."""
         self.name = sanitize_filename(name)
         self.scientific_versions = dict(scientific_versions or {})
-        self._nodes: dict[str, WorkflowNodeSpec] = {}
+        self._nodes: dict[str, ExecutionNodeSpec] = {}
 
     def add_node(
         self,
-        node: WorkflowNode,
+        node: ExecutionNode,
         *,
         id: str,
         inputs: dict[str, ArtifactSelector] | None = None,
@@ -85,10 +85,10 @@ class Workflow:
         allow_empty_result: bool = False,
         reuse_predecessor_publication: bool = True,
     ) -> NodeHandle:
-        """Add one node to the workflow and return its handle."""
+        """Add one Execution Node and return its stable handle."""
         node_id = sanitize_filename(id)
         if node_id in self._nodes:
-            raise ValueError(f"Duplicate workflow node id: {node_id}")
+            raise ValueError(f"Duplicate Execution Node id: {node_id}")
 
         control_dependencies = {
             dependency.node_id if isinstance(dependency, NodeHandle) else dependency
@@ -98,7 +98,7 @@ class Workflow:
             dependency.node_id if isinstance(dependency, NodeHandle) else dependency
             for dependency in accept_partial_from or []
         }
-        self._nodes[node_id] = WorkflowNodeSpec(
+        self._nodes[node_id] = ExecutionNodeSpec(
             node_id=node_id,
             node=node,
             aggregation_policy=aggregation_policy,
@@ -122,8 +122,8 @@ class Workflow:
         )
         self._nodes[downstream_id].control_dependencies.add(upstream_id)
 
-    def validate(self) -> WorkflowDefinition:
-        """Validate the workflow DAG and return an immutable definition."""
+    def validate(self) -> ExecutionDefinition:
+        """Validate the DAG and return an immutable definition."""
         dependencies = self._dependencies()
         missing = {
             dependency
@@ -132,7 +132,7 @@ class Workflow:
             if dependency not in self._nodes
         }
         if missing:
-            raise ValueError(f"Unknown workflow node dependencies: {sorted(missing)}")
+            raise ValueError(f"Unknown Execution Node dependencies: {sorted(missing)}")
         invalid_partial = {
             node_id: sorted(spec.partial_dependencies - dependencies[node_id])
             for node_id, spec in self._nodes.items()
@@ -144,7 +144,7 @@ class Workflow:
                 f"{invalid_partial}"
             )
         self._raise_for_cycles(dependencies)
-        return WorkflowDefinition(
+        return ExecutionDefinition(
             name=self.name,
             nodes=dict(self._nodes),
             dependencies=dependencies,
@@ -169,7 +169,7 @@ class Workflow:
             if node_id in permanent:
                 return
             if node_id in temporary:
-                raise ValueError("Workflow DAG contains a cycle")
+                raise ValueError("Execution Definition contains a cycle")
             temporary.add(node_id)
             for dependency in dependencies.get(node_id, set()):
                 if dependency in dependencies:

@@ -3,7 +3,7 @@
 import shlex
 
 from biomodals.app.score import dockq_app
-from biomodals.schema import AppRunResult, WorkflowArtifact
+from biomodals.schema import AppRunResult, ExecutionArtifact
 from biomodals.workflow.ppiflow import staging
 from biomodals.workflow.ppiflow.runtime_context import (
     SOURCE_VOLUME_ROOTS,
@@ -18,9 +18,9 @@ from biomodals.workflow.ppiflow.runtime_support import (
 
 def run_ppiflow_dockq_stage(
     *,
-    reference_artifacts: list[WorkflowArtifact],
-    model_artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
+    reference_artifacts: list[ExecutionArtifact],
+    model_artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None,
     config: dict[str, object],
     run_name: str,
 ) -> AppRunResult:

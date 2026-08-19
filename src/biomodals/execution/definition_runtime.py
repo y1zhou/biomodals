@@ -1,4 +1,4 @@
-"""Execute app- and workflow-owned graphs through the shared kernel."""
+"""Execute app- and execution-owned graphs through the shared kernel."""
 
 from __future__ import annotations
 
@@ -41,7 +41,25 @@ from biomodals.execution import (
     result_probe_frontier,
     resume_execution_run,
 )
+from biomodals.execution.artifact_availability import (
+    ExternalArtifactChecker,
+    check_artifact_availability,
+    mounted_volume_checker,
+)
+from biomodals.execution.artifacts import materialize_app_run_result
+from biomodals.execution.definition import ExecutionDefinition, ExecutionGraph
+from biomodals.execution.definition_plan import execution_plan, node_task_plan
 from biomodals.execution.modal import ExecutionVolumeSync, ModalCallDriver
+from biomodals.execution.modal.graph_store import GraphExecutionRunStore
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    PullTaskProviderNode,
+    PullWorkerCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
+)
 from biomodals.execution.provider import ProviderDriver
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
@@ -52,25 +70,7 @@ from biomodals.execution.scheduler import (
     select_admissible_candidates,
 )
 from biomodals.helper.artifacts import VolumeHandle
-from biomodals.schema import AppRunResult, AppRunStatus, VolumePath, WorkflowArtifact
-from biomodals.execution.artifact_availability import (
-    ExternalArtifactChecker,
-    check_artifact_availability,
-    mounted_volume_checker,
-)
-from biomodals.execution.artifacts import materialize_app_run_result
-from biomodals.execution.graph import Workflow, WorkflowDefinition
-from biomodals.execution.graph_plan import execution_plan, node_task_plan
-from biomodals.execution.modal.graph_store import WorkflowRunStore
-from biomodals.execution.nodes import (
-    NodeRunContext,
-    RemoteNodeCall,
-    RemotePullTaskWorkflowNode,
-    RemotePullWorkerCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowNode,
-    RemoteWorkflowTask,
-)
+from biomodals.schema import AppRunResult, AppRunStatus, ExecutionArtifact, VolumePath
 
 _TASK_KEY = "node"
 
@@ -103,18 +103,18 @@ class _PreparedProviderResult:
     size_bytes: int
 
 
-class WorkflowRuntime:
-    """Advance one workflow through a per-Run kernel repository."""
+class ExecutionGraphRuntime:
+    """Advance one executable graph through a per-Run kernel repository."""
 
     def __init__(
         self,
         *,
-        workflow: Workflow,
+        graph: ExecutionGraph,
         execution_run_id: UUID,
         deployment: DeploymentIdentity,
         volume_root: str | Path,
-        workflow_volume_name: str,
-        workflow_volume: VolumeHandle | None = None,
+        artifact_volume_name: str,
+        artifact_volume: VolumeHandle | None = None,
         provider_driver: ProviderDriver | None = None,
         max_parallel_nodes: int = 32,
         max_active_provider_calls: int = 32,
@@ -123,12 +123,12 @@ class WorkflowRuntime:
         external_artifact_checker: ExternalArtifactChecker | None = None,
         external_volume_roots: Mapping[str, str | Path] | None = None,
         pull_worker_coordinator: Any | None = None,
-        store: WorkflowRunStore | None = None,
+        store: GraphExecutionRunStore | None = None,
         volume_io_lock: Any | None = None,
         now: Callable[[], int] | None = None,
         poll_interval_seconds: float = 1.0,
     ) -> None:
-        """Bind workflow code to one opaque Execution Run identity."""
+        """Bind an executable graph to one opaque Execution Run identity."""
         if max_parallel_nodes < 1:
             raise ValueError("max_parallel_nodes must be positive")
         if strict_external_artifact_checks:
@@ -139,14 +139,14 @@ class WorkflowRuntime:
                 )
             if external_artifact_checker is None:
                 external_artifact_checker = mounted_volume_checker(
-                    workflow_volume_name=workflow_volume_name,
+                    artifact_volume_name=artifact_volume_name,
                     volume_roots=external_volume_roots or {},
                 )
-        self.workflow = workflow
+        self.graph = graph
         self.execution_run_id = execution_run_id
         self.deployment = deployment
         self.volume_root = Path(volume_root)
-        self.workflow_volume_name = workflow_volume_name
+        self.artifact_volume_name = artifact_volume_name
         self.max_parallel_nodes = max_parallel_nodes
         self.max_active_provider_calls = max_active_provider_calls
         self.max_active_gpu_provider_calls = (
@@ -159,20 +159,19 @@ class WorkflowRuntime:
         self.poll_interval_seconds = poll_interval_seconds
         self._now = now or (lambda: int(time.time()))
         self._volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
-        self.store = store or WorkflowRunStore(self.volume_root, execution_run_id)
+        self.store = store or GraphExecutionRunStore(self.volume_root, execution_run_id)
         self._volume_sync = ExecutionVolumeSync(
-            volume=workflow_volume,
+            volume=artifact_volume,
             store=self.store,
         )
         self._provider = ExecutionRuntime(
             self.store.execution,
-            provider_driver=provider_driver
-            or cast(ProviderDriver, ModalCallDriver()),
+            provider_driver=provider_driver or cast(ProviderDriver, ModalCallDriver()),
             checkpoint=self._checkpoint,
             transaction=self.store.transaction,
             synchronize=self._synchronize_kernel_state,
         )
-        self._definition: WorkflowDefinition | None = None
+        self._definition: ExecutionDefinition | None = None
         self._workload_run_key: str | None = None
 
     def configure_provider_boundary(
@@ -371,7 +370,7 @@ class WorkflowRuntime:
                     published_artifacts,
                 ))
         node = self._require_definition().nodes[call.node_key].node
-        if not isinstance(node, RemotePullTaskWorkflowNode):
+        if not isinstance(node, PullTaskProviderNode):
             raise ValueError("Provider Call does not belong to a pull-worker Node")
         decoded_results: list[AppRunResult | Exception | None] = []
         for (
@@ -392,7 +391,7 @@ class WorkflowRuntime:
         if any(
             isinstance(result, AppRunResult)
             and result.status == AppRunStatus.SUCCEEDED
-            and self._uses_workflow_volume(result)
+            and self._uses_artifact_volume(result)
             for result in decoded_results
         ):
             self._reload_volume()
@@ -437,7 +436,7 @@ class WorkflowRuntime:
                         observation = self._observe_remote_task_publication(
                             node,
                             context,
-                            RemoteWorkflowTask(
+                            TaskDefinition(
                                 task_key=task.task_key,
                                 scientific_payload=task.scientific_payload,
                                 execution_payload=task.execution_payload,
@@ -451,7 +450,7 @@ class WorkflowRuntime:
                         completion_request_id,
                         observation,
                         (
-                            "Published workflow Task result is unavailable"
+                            "Published Execution Task result is unavailable"
                             if observation == AvailabilityStatus.MISSING
                             else None
                         ),
@@ -464,13 +463,13 @@ class WorkflowRuntime:
                         task,
                         completion_request_id,
                         AvailabilityStatus.MISSING,
-                        f"Could not decode workflow Task result: {decoded_result}",
+                        f"Could not decode Execution Task result: {decoded_result}",
                         None,
                         None,
                     ))
                     continue
                 if decoded_result is None:
-                    raise RuntimeError("Workflow Task result was not decoded")
+                    raise RuntimeError("Execution Task result was not decoded")
                 result = decoded_result
                 if result.status != AppRunStatus.SUCCEEDED:
                     prepared.append((
@@ -493,7 +492,7 @@ class WorkflowRuntime:
                 try:
                     materialized = materialize_app_run_result(
                         result=result,
-                        workflow_volume_name=self.workflow_volume_name,
+                        artifact_volume_name=self.artifact_volume_name,
                         result_dir=publication_dir,
                         artifact_dir=publication_dir / "artifacts",
                         producing_node_id=call.node_key,
@@ -504,7 +503,7 @@ class WorkflowRuntime:
                     observation = self._observe_remote_task_publication(
                         node,
                         context,
-                        RemoteWorkflowTask(
+                        TaskDefinition(
                             task_key=task.task_key,
                             scientific_payload=task.scientific_payload,
                             execution_payload=task.execution_payload,
@@ -512,7 +511,7 @@ class WorkflowRuntime:
                         task.fingerprint,
                         materialized.result,
                         artifacts,
-                        workflow_artifacts_validated=True,
+                        execution_artifacts_validated=True,
                     )
                 except (FileNotFoundError, ValueError) as error:
                     self._discard_pull_completion_staging(
@@ -522,7 +521,7 @@ class WorkflowRuntime:
                         task,
                         completion_request_id,
                         AvailabilityStatus.MISSING,
-                        f"Could not publish workflow Task result: {error}",
+                        f"Could not publish Execution Task result: {error}",
                         None,
                         None,
                     ))
@@ -532,7 +531,7 @@ class WorkflowRuntime:
                     completion_request_id,
                     observation,
                     (
-                        "Published workflow Task result is unavailable"
+                        "Published Execution Task result is unavailable"
                         if observation == AvailabilityStatus.MISSING
                         else None
                     ),
@@ -674,8 +673,8 @@ class WorkflowRuntime:
         *,
         reload_volume: bool = False,
     ) -> SqliteExecutionRepository:
-        """Load the workflow definition and create or verify its Run."""
-        definition = self.workflow.validate()
+        """Load the Execution Definition and create or verify its Run."""
+        definition = self.graph.validate()
         self._definition = definition
         self._workload_run_key = workload_run_key
         if reload_volume:
@@ -684,7 +683,7 @@ class WorkflowRuntime:
 
     def _ensure_run(
         self,
-        definition: WorkflowDefinition,
+        definition: ExecutionDefinition,
         workload_run_key: str,
     ) -> SqliteExecutionRepository:
         plan = execution_plan(definition, workload_run_key=workload_run_key)
@@ -709,7 +708,7 @@ class WorkflowRuntime:
                 != plan.workload_plan_fingerprint
             ):
                 raise ValueError(
-                    "Workflow Plan Fingerprint does not match Execution Run"
+                    "Execution Plan Fingerprint does not match Execution Run"
                 )
             if existing.plan.workload_run_key != workload_run_key:
                 raise ValueError("Workload Run Key does not match Execution Run")
@@ -801,14 +800,14 @@ class WorkflowRuntime:
                 and node.discovery_complete
             ):
                 implementation = definition.nodes[node.node_key].node
-                if isinstance(implementation, RemoteTaskWorkflowNode):
+                if isinstance(implementation, TaskProviderNode):
                     for task in tasks_by_node[node.node_key]:
                         context = self._node_context(
                             definition,
                             node.node_key,
                             task_key=task.task_key,
                         )
-                        task_definition = RemoteWorkflowTask(
+                        task_definition = TaskDefinition(
                             task_key=task.task_key,
                             scientific_payload=task.scientific_payload,
                             execution_payload=task.execution_payload,
@@ -828,7 +827,7 @@ class WorkflowRuntime:
                     observation = observations[node.node_key]
                     if observation is None:
                         raise RuntimeError(
-                            f"Workflow Node {node.node_key!r} was not probed"
+                            f"Execution Node {node.node_key!r} was not probed"
                         )
                     for task in tasks_by_node[node.node_key]:
                         task_observations.append((
@@ -893,7 +892,7 @@ class WorkflowRuntime:
             for call in terminal_calls
             if isinstance(
                 definition.nodes[call.node_key].node,
-                RemotePullTaskWorkflowNode,
+                PullTaskProviderNode,
             )
         }
         if not pull_calls:
@@ -918,19 +917,19 @@ class WorkflowRuntime:
                 ExecutionTaskRecord,
                 AvailabilityStatus,
                 AppRunResult | None,
-                tuple[WorkflowArtifact, ...],
+                tuple[ExecutionArtifact, ...],
             ]
         ] = []
         for task in tasks:
             implementation = definition.nodes[task.node_key].node
-            if not isinstance(implementation, RemotePullTaskWorkflowNode):
+            if not isinstance(implementation, PullTaskProviderNode):
                 continue
             context = self._node_context(
                 definition,
                 task.node_key,
                 task_key=task.task_key,
             )
-            task_definition = RemoteWorkflowTask(
+            task_definition = TaskDefinition(
                 task_key=task.task_key,
                 scientific_payload=task.scientific_payload,
                 execution_payload=task.execution_payload,
@@ -953,10 +952,10 @@ class WorkflowRuntime:
                 continue
             result = AppRunResult.model_validate(result)
             if result.status != AppRunStatus.SUCCEEDED:
-                raise ValueError("Recovered workflow Task result must be succeeded")
+                raise ValueError("Recovered Execution Task result must be succeeded")
             materialized = materialize_app_run_result(
                 result=result,
-                workflow_volume_name=self.workflow_volume_name,
+                artifact_volume_name=self.artifact_volume_name,
                 result_dir=context.work_dir,
                 artifact_dir=self.store.output_root / "artifacts",
                 producing_node_id=task.node_key,
@@ -968,7 +967,7 @@ class WorkflowRuntime:
                 task,
                 self._artifact_observation(
                     artifacts,
-                    workflow_artifacts_validated=True,
+                    execution_artifacts_validated=True,
                 ),
                 materialized.result,
                 artifacts,
@@ -1016,9 +1015,9 @@ class WorkflowRuntime:
             node_id = call.node_key
             envelope = call.result_envelope
             node = self._require_definition().nodes[node_id].node
-            if isinstance(node, RemotePullTaskWorkflowNode):
+            if isinstance(node, PullTaskProviderNode):
                 return
-            if isinstance(node, RemoteTaskWorkflowNode):
+            if isinstance(node, TaskProviderNode):
                 self._publish_provider_task_results(
                     node_id,
                     call.task_keys,
@@ -1034,7 +1033,7 @@ class WorkflowRuntime:
                 )
             if task.status.is_terminal:
                 return
-            if not isinstance(node, RemoteWorkflowNode):
+            if not isinstance(node, ProviderNode):
                 self._fail_task(node_id, "Provider result belongs to a local Node")
                 return
             try:
@@ -1046,7 +1045,7 @@ class WorkflowRuntime:
             except Exception as error:
                 self._fail_task(node_id, f"Could not decode provider result: {error}")
                 return
-            if self._uses_workflow_volume(result):
+            if self._uses_artifact_volume(result):
                 self._reload_volume()
             self._publish_result(node_id, result)
 
@@ -1055,7 +1054,7 @@ class WorkflowRuntime:
         node_id: str,
         task_keys: tuple[str, ...],
         envelope: object,
-        node: RemoteTaskWorkflowNode,
+        node: TaskProviderNode,
     ) -> None:
         with self.store.synchronize():
             tasks = tuple(
@@ -1071,7 +1070,7 @@ class WorkflowRuntime:
             return
         try:
             task_definitions = tuple(
-                RemoteWorkflowTask(
+                TaskDefinition(
                     task_key=task.task_key,
                     scientific_payload=task.scientific_payload,
                     execution_payload=task.execution_payload,
@@ -1107,7 +1106,7 @@ class WorkflowRuntime:
                     f"Could not decode provider result: {error}",
                 )
             return
-        if any(self._uses_workflow_volume(result) for result in results.values()):
+        if any(self._uses_artifact_volume(result) for result in results.values()):
             self._reload_volume()
         for task in unfinished:
             self._publish_task_result(
@@ -1116,7 +1115,7 @@ class WorkflowRuntime:
                 results[task.task_key],
             )
 
-    def _start_ready_nodes(self, definition: WorkflowDefinition) -> None:
+    def _start_ready_nodes(self, definition: ExecutionDefinition) -> None:
         with self.store.synchronize():
             repository = self.store.execution
             node_records = repository.list_nodes(self.execution_run_id)
@@ -1154,7 +1153,7 @@ class WorkflowRuntime:
                     self.store.execution.fail_node(
                         self.execution_run_id,
                         item.node_id,
-                        message=f"Could not prepare workflow Node: {item.error}",
+                        message=f"Could not prepare Execution Node: {item.error}",
                         now=self._now(),
                     )
                     continue
@@ -1180,13 +1179,13 @@ class WorkflowRuntime:
 
     def _prepare_node(
         self,
-        definition: WorkflowDefinition,
+        definition: ExecutionDefinition,
         node_id: str,
     ) -> _PreparedNode:
         context = self._node_context(definition, node_id)
         node = definition.nodes[node_id].node
         try:
-            if isinstance(node, RemoteTaskWorkflowNode):
+            if isinstance(node, TaskProviderNode):
                 discovered = node.discover_remote_tasks(context)
                 with self.store.synchronize():
                     workload_plan_fingerprint = self.store.execution.get_run(
@@ -1218,9 +1217,7 @@ class WorkflowRuntime:
                     )
                 return _PreparedNode(node_id, context, tuple(tasks))
             invocation = (
-                node.prepare_remote(context)
-                if isinstance(node, RemoteWorkflowNode)
-                else None
+                node.prepare_remote(context) if isinstance(node, ProviderNode) else None
             )
             task = _PreparedTask(
                 plan=TaskPlan(
@@ -1234,7 +1231,7 @@ class WorkflowRuntime:
         except Exception as error:
             return _PreparedNode(node_id, context, (), error)
 
-    def _run_local_tasks(self, definition: WorkflowDefinition) -> bool:
+    def _run_local_tasks(self, definition: ExecutionDefinition) -> bool:
         progressed = False
         with self.store.synchronize():
             node_records = self.store.execution.list_nodes(self.execution_run_id)
@@ -1245,7 +1242,7 @@ class WorkflowRuntime:
             ):
                 continue
             node = definition.nodes[node_record.node_key].node
-            if isinstance(node, RemoteWorkflowNode | RemoteTaskWorkflowNode):
+            if isinstance(node, ProviderNode | TaskProviderNode):
                 continue
             with self.store.synchronize():
                 task = self.store.execution.get_task(
@@ -1283,7 +1280,7 @@ class WorkflowRuntime:
 
     def _admit_remote_tasks(
         self,
-        definition: WorkflowDefinition,
+        definition: ExecutionDefinition,
         required: set[str],
     ) -> None:
         with self.store.synchronize():
@@ -1313,7 +1310,7 @@ class WorkflowRuntime:
             unfinished_node_keys=unfinished,
         )
         fixed_node_keys: set[str] = set()
-        pull_invocations: dict[str, RemotePullWorkerCall] = {}
+        pull_invocations: dict[str, PullWorkerCallSpec] = {}
         pull_descriptors: list[PullWorkerDispatchDescriptor] = []
         pull_node_keys = tuple(
             node_id
@@ -1324,7 +1321,7 @@ class WorkflowRuntime:
                 and node_record.discovery_complete
                 and isinstance(
                     definition.nodes[node_id].node,
-                    RemotePullTaskWorkflowNode,
+                    PullTaskProviderNode,
                 )
             )
         )
@@ -1341,9 +1338,9 @@ class WorkflowRuntime:
             ):
                 continue
             node = definition.nodes[node_id].node
-            if not isinstance(node, RemoteWorkflowNode | RemoteTaskWorkflowNode):
+            if not isinstance(node, ProviderNode | TaskProviderNode):
                 continue
-            if isinstance(node, RemotePullTaskWorkflowNode):
+            if isinstance(node, PullTaskProviderNode):
                 try:
                     with self._volume_io_lock:
                         invocation = node.prepare_pull_worker(
@@ -1404,21 +1401,21 @@ class WorkflowRuntime:
             node = definition.nodes[node_record.node_key].node
             try:
                 with self._volume_io_lock:
-                    if isinstance(node, RemoteTaskWorkflowNode):
+                    if isinstance(node, TaskProviderNode):
                         invocation = node.prepare_remote_task(
                             self._node_context(
                                 definition,
                                 node_record.node_key,
                                 task_key=task.task_key,
                             ),
-                            RemoteWorkflowTask(
+                            TaskDefinition(
                                 task_key=task.task_key,
                                 scientific_payload=task.scientific_payload,
                                 execution_payload=task.execution_payload,
                             ),
                         )
                         _json_value(_execution_payload(invocation))
-                    elif isinstance(node, RemoteWorkflowNode):
+                    elif isinstance(node, ProviderNode):
                         invocation = node.prepare_remote(
                             self._node_context(definition, node_record.node_key)
                         )
@@ -1428,9 +1425,7 @@ class WorkflowRuntime:
                                 "Remote Node preparation changed after Task discovery"
                             )
                     else:  # pragma: no cover - filtered by fixed_node_keys
-                        raise TypeError(
-                            "Fixed dispatch requires a remote workflow Node"
-                        )
+                        raise TypeError("Fixed dispatch requires a Provider Node")
             except Exception as error:
                 self._fail_discovered_task(
                     node_record.node_key,
@@ -1498,7 +1493,7 @@ class WorkflowRuntime:
         submissions = []
         for candidate in selected:
             node = definition.nodes[candidate.node_key].node
-            if isinstance(node, RemotePullTaskWorkflowNode):
+            if isinstance(node, PullTaskProviderNode):
                 if self.pull_worker_coordinator is None:
                     self._fail_node_publication(
                         candidate.node_key,
@@ -1535,9 +1530,9 @@ class WorkflowRuntime:
                 )
             try:
                 with self._volume_io_lock:
-                    if isinstance(node, RemoteTaskWorkflowNode):
+                    if isinstance(node, TaskProviderNode):
                         task_definitions = tuple(
-                            RemoteWorkflowTask(
+                            TaskDefinition(
                                 task_key=task.task_key,
                                 scientific_payload=task.scientific_payload,
                                 execution_payload=task.execution_payload,
@@ -1562,7 +1557,7 @@ class WorkflowRuntime:
                                 ),
                                 task_definitions,
                             )
-                    elif isinstance(node, RemoteWorkflowNode):
+                    elif isinstance(node, ProviderNode):
                         if len(tasks) != 1:  # pragma: no cover - scheduler contract
                             raise RuntimeError(
                                 "Only remote Task Nodes may own batched calls"
@@ -1578,9 +1573,7 @@ class WorkflowRuntime:
                                 "Remote Node preparation changed after Task discovery"
                             )
                     else:  # pragma: no cover - scheduler contract
-                        raise TypeError(
-                            "Fixed dispatch requires a remote workflow Node"
-                        )
+                        raise TypeError("Fixed dispatch requires a Provider Node")
 
                 invocation_binding = ProviderBinding(
                     environment=run.deployment.environment,
@@ -1629,7 +1622,7 @@ class WorkflowRuntime:
         context = self._node_context(self._require_definition(), node_id)
         materialized = materialize_app_run_result(
             result=result,
-            workflow_volume_name=self.workflow_volume_name,
+            artifact_volume_name=self.artifact_volume_name,
             result_dir=context.work_dir,
             artifact_dir=self.store.output_root / "artifacts",
             producing_node_id=node_id,
@@ -1637,7 +1630,7 @@ class WorkflowRuntime:
         )
         observation = self._artifact_observation(
             tuple(materialized.artifacts),
-            workflow_artifacts_validated=True,
+            execution_artifacts_validated=True,
         )
         with self.store.transaction():
             if self.store.execution.get_task(
@@ -1657,7 +1650,7 @@ class WorkflowRuntime:
                     self.execution_run_id,
                     node_id,
                     _TASK_KEY,
-                    message="Published workflow result is unavailable",
+                    message="Published execution result is unavailable",
                     now=self._now(),
                 )
             else:
@@ -1701,7 +1694,7 @@ class WorkflowRuntime:
         )
         materialized = materialize_app_run_result(
             result=result,
-            workflow_volume_name=self.workflow_volume_name,
+            artifact_volume_name=self.artifact_volume_name,
             result_dir=context.work_dir,
             artifact_dir=self.store.output_root / "artifacts",
             producing_node_id=node_id,
@@ -1710,7 +1703,7 @@ class WorkflowRuntime:
         )
         observation = self._artifact_observation(
             tuple(materialized.artifacts),
-            workflow_artifacts_validated=True,
+            execution_artifacts_validated=True,
         )
         with self.store.transaction():
             if self.store.execution.get_task(
@@ -1732,7 +1725,7 @@ class WorkflowRuntime:
                     self.execution_run_id,
                     node_id,
                     task_key,
-                    message="Published workflow Task result is unavailable",
+                    message="Published Execution Task result is unavailable",
                     now=self._now(),
                 )
             else:
@@ -1791,7 +1784,7 @@ class WorkflowRuntime:
             if node.status != NodeStatus.RUNNING or not node.discovery_complete:
                 continue
             implementation = definition.nodes[node.node_key].node
-            if isinstance(implementation, RemoteTaskWorkflowNode):
+            if isinstance(implementation, TaskProviderNode):
                 with self._volume_io_lock:
                     self._finalize_remote_task_node(
                         node.node_key,
@@ -1831,7 +1824,7 @@ class WorkflowRuntime:
         node_id: str,
         aggregation_policy: NodeAggregationPolicy,
         allow_empty_result: bool,
-        implementation: RemoteTaskWorkflowNode,
+        implementation: TaskProviderNode,
     ) -> None:
         with self.store.transaction():
             if self._node_publication_is_fenced(node_id):
@@ -1882,7 +1875,7 @@ class WorkflowRuntime:
                         self.execution_run_id,
                         RunStatus.SUSPENDED,
                         reason=RunStatusReason.RESULT_VALIDATION_UNKNOWN,
-                        message=f"Could not validate workflow Node {node_id!r}",
+                        message=f"Could not validate Execution Node {node_id!r}",
                         now=self._now(),
                     )
                 return
@@ -1916,7 +1909,7 @@ class WorkflowRuntime:
             tasks = self.store.execution.list_tasks(self.execution_run_id, node_id)
         results: dict[str, AppRunResult] = {}
         errors: dict[str, str] = {}
-        task_artifacts: list[WorkflowArtifact] = []
+        task_artifacts: list[ExecutionArtifact] = []
         with self.store.synchronize():
             publications = {
                 task.task_key: (
@@ -1963,7 +1956,7 @@ class WorkflowRuntime:
                     return
             materialized = materialize_app_run_result(
                 result=finalization,
-                workflow_volume_name=self.workflow_volume_name,
+                artifact_volume_name=self.artifact_volume_name,
                 result_dir=(
                     self.store.output_root / "nodes" / node_id / "result" / "aggregate"
                 ),
@@ -1998,13 +1991,13 @@ class WorkflowRuntime:
                 *(
                     artifact
                     for artifact in materialized.artifacts
-                    if artifact.storage.volume_name != self.workflow_volume_name
+                    if artifact.storage.volume_name != self.artifact_volume_name
                 ),
             ))
         except Exception as error:
             self._fail_node_publication(
                 node_id,
-                f"Could not finalize workflow Node: {error}",
+                f"Could not finalize Execution Node: {error}",
             )
             return
 
@@ -2035,7 +2028,7 @@ class WorkflowRuntime:
                 self.store.execution.fail_node(
                     self.execution_run_id,
                     node_id,
-                    message="Published workflow Node result is unavailable",
+                    message="Published Execution Node result is unavailable",
                     now=self._now(),
                 )
             else:
@@ -2043,7 +2036,7 @@ class WorkflowRuntime:
                     self.execution_run_id,
                     RunStatus.SUSPENDED,
                     reason=RunStatusReason.RESULT_VALIDATION_UNKNOWN,
-                    message=f"Could not validate workflow Node {node_id!r}",
+                    message=f"Could not validate Execution Node {node_id!r}",
                     now=self._now(),
                 )
 
@@ -2067,9 +2060,9 @@ class WorkflowRuntime:
     def _remote_task_publication_observation(
         self,
         node_id: str,
-        implementation: RemoteTaskWorkflowNode,
+        implementation: TaskProviderNode,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
     ) -> AvailabilityStatus:
         """Validate a stored Task result and its workload-owned publication."""
@@ -2100,19 +2093,19 @@ class WorkflowRuntime:
 
     def _observe_remote_task_publication(
         self,
-        implementation: RemoteTaskWorkflowNode,
+        implementation: TaskProviderNode,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
         result: AppRunResult,
-        artifacts: tuple[WorkflowArtifact, ...],
+        artifacts: tuple[ExecutionArtifact, ...],
         *,
-        workflow_artifacts_validated: bool = False,
+        execution_artifacts_validated: bool = False,
     ) -> AvailabilityStatus:
-        """Combine durable workflow artifacts with a workload-specific probe."""
+        """Combine durable execution artifacts with a workload-specific probe."""
         artifact_observation = self._artifact_observation(
             artifacts,
-            workflow_artifacts_validated=workflow_artifacts_validated,
+            execution_artifacts_validated=execution_artifacts_validated,
         )
         if artifact_observation != AvailabilityStatus.AVAILABLE:
             return artifact_observation
@@ -2127,21 +2120,21 @@ class WorkflowRuntime:
 
     def _artifact_observation(
         self,
-        artifacts: tuple[WorkflowArtifact, ...],
+        artifacts: tuple[ExecutionArtifact, ...],
         *,
-        workflow_artifacts_validated: bool = False,
+        execution_artifacts_validated: bool = False,
     ) -> AvailabilityStatus:
         statuses = [
             check_artifact_availability(
                 artifact,
-                workflow_volume_name=self.workflow_volume_name,
+                artifact_volume_name=self.artifact_volume_name,
                 volume_root=self.volume_root,
                 external_artifact_checker=self.external_artifact_checker,
             ).status
             for artifact in artifacts
             if not (
-                workflow_artifacts_validated
-                and artifact.storage.volume_name == self.workflow_volume_name
+                execution_artifacts_validated
+                and artifact.storage.volume_name == self.artifact_volume_name
             )
         ]
         if AvailabilityStatus.UNKNOWN in statuses:
@@ -2150,10 +2143,10 @@ class WorkflowRuntime:
             return AvailabilityStatus.MISSING
         return AvailabilityStatus.AVAILABLE
 
-    def _uses_workflow_volume(self, result: AppRunResult) -> bool:
+    def _uses_artifact_volume(self, result: AppRunResult) -> bool:
         return any(
             isinstance(output.storage, VolumePath)
-            and output.storage.volume_name == self.workflow_volume_name
+            and output.storage.volume_name == self.artifact_volume_name
             for output in (*result.outputs, *result.logs)
         )
 
@@ -2212,12 +2205,12 @@ class WorkflowRuntime:
         prepared.temporary_file.close()
 
     def _raw_result(self, envelope: object) -> object:
-        """Load and verify one workflow-owned provider return."""
+        """Load and verify one execution-owned provider return."""
         if not isinstance(envelope, dict):
-            raise ValueError("Workflow Result Envelope must be an object")
+            raise ValueError("Execution Result Envelope must be an object")
         reference = envelope.get("result_file")
         if not isinstance(reference, dict):
-            raise ValueError("Workflow Result Envelope has no result file")
+            raise ValueError("Execution Result Envelope has no result file")
         relative_value = reference.get("path")
         expected_digest = reference.get("sha256")
         expected_size = reference.get("size_bytes")
@@ -2226,25 +2219,25 @@ class WorkflowRuntime:
             or not isinstance(expected_digest, str)
             or not isinstance(expected_size, int)
         ):
-            raise ValueError("Workflow Result Envelope reference is invalid")
+            raise ValueError("Execution Result Envelope reference is invalid")
         relative_path = Path(relative_value)
         if (
             relative_path.is_absolute()
             or relative_path.parts[:1] != ("provider-results",)
             or any(part in {"", ".", ".."} for part in relative_path.parts)
         ):
-            raise ValueError("Workflow Result Envelope path is invalid")
+            raise ValueError("Execution Result Envelope path is invalid")
         result_path = self.store.output_root.joinpath(*relative_path.parts)
         content = result_path.read_bytes()
         if len(content) != expected_size:
-            raise ValueError("Workflow provider result size does not match")
+            raise ValueError("Provider result size does not match")
         if hashlib.sha256(content).hexdigest() != expected_digest:
-            raise ValueError("Workflow provider result checksum does not match")
+            raise ValueError("Provider result checksum does not match")
         return orjson.loads(content)
 
     def _node_context(
         self,
-        definition: WorkflowDefinition,
+        definition: ExecutionDefinition,
         node_id: str,
         *,
         task_key: str | None = None,
@@ -2275,7 +2268,7 @@ class WorkflowRuntime:
             cache_dir=cache_dir,
             inputs=inputs,
             volume_root=self.volume_root,
-            workflow_volume_name=self.workflow_volume_name,
+            artifact_volume_name=self.artifact_volume_name,
         )
 
     def _checkpoint(self) -> SqliteExecutionRepository:
@@ -2289,7 +2282,7 @@ class WorkflowRuntime:
 
     @contextmanager
     def _synchronize_kernel_state(self) -> Iterator[None]:
-        """Order explicit workflow Volume barriers before the SQLite writer."""
+        """Order explicit artifact Volume barriers before the SQLite writer."""
         with self._volume_io_lock, self.store.synchronize():
             yield
 
@@ -2301,18 +2294,18 @@ class WorkflowRuntime:
             finally:
                 self._provider.repository = self.store.execution
 
-    def _require_definition(self) -> WorkflowDefinition:
+    def _require_definition(self) -> ExecutionDefinition:
         if self._definition is None:
-            raise RuntimeError("Workflow Run has not been initialized")
+            raise RuntimeError("Execution Run has not been initialized")
         return self._definition
 
     def _require_workload_run_key(self) -> str:
         if self._workload_run_key is None:
-            raise RuntimeError("Workflow Run has not been initialized")
+            raise RuntimeError("Execution Run has not been initialized")
         return self._workload_run_key
 
 
-def _execution_payload(invocation: RemoteNodeCall | None) -> dict[str, object]:
+def _execution_payload(invocation: ProviderCallSpec | None) -> dict[str, object]:
     if invocation is None:
         return {"mode": "local"}
     return {

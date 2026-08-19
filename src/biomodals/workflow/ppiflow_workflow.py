@@ -29,22 +29,21 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 )
 from biomodals.app.score import af3score_app, dockq_app
 from biomodals.execution import (
-    AppBackedNode,
     AvailabilityStatus,
+    CoordinatorNode,
     DeploymentIdentity,
+    ExecutionGraph,
     NodeAggregationPolicy,
     NodeRunContext,
-    RemoteNodeCall,
-    RemotePullTaskWorkflowNode,
-    RemotePullWorkerCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowNode,
-    RemoteWorkflowTask,
-    Workflow,
-    WorkflowNativeNode,
-    republish_workflow_artifact,
+    ProviderCallSpec,
+    ProviderNode,
+    PullTaskProviderNode,
+    PullWorkerCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
+    republish_execution_artifact,
 )
-from biomodals.execution.graph_plan import app_scientific_version
+from biomodals.execution.definition_plan import app_scientific_version
 from biomodals.execution.modal import orchestrator, resolve_provider_call_limits
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
@@ -59,9 +58,9 @@ from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow.display import print_workflow_dag
 from biomodals.workflow.ppiflow import analysis_runtime, rosetta_runtime
@@ -360,7 +359,7 @@ prepare_ppiflow_rosetta_stage = app.function(
 
 
 def _read_af3score_plan_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
 ) -> dict[str, object]:
     """Load the single prepared AF3Score plan from a workflow artifact."""
     if len(artifacts) != 1:
@@ -466,7 +465,7 @@ _INPUT_DIGESTS_KEY = "_biomodals_input_sha256"
 
 
 @dataclass
-class _ConfiguredAppStepNode(AppBackedNode):
+class _ConfiguredAppStepNode(ProviderNode):
     """Base class for configured PPIFlow app-backed workflow nodes."""
 
     step_name: str
@@ -487,7 +486,7 @@ class _ConfiguredAppStepNode(AppBackedNode):
     def _structure_inputs(
         self,
         context: NodeRunContext,
-    ) -> list[WorkflowArtifact]:
+    ) -> list[ExecutionArtifact]:
         artifacts = context.inputs.get("structures") or []
         if not artifacts:
             raise ValueError(
@@ -497,16 +496,16 @@ class _ConfiguredAppStepNode(AppBackedNode):
 
 
 @dataclass(frozen=True)
-class PPIFlowModelValidationNode(RemoteWorkflowNode):
+class PPIFlowModelValidationNode(ProviderNode):
     """Validate the selected mutable checkpoint before GPU admission."""
 
     model_name: str
     expected_sha256: str
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare one CPU checkpoint hash for this Execution Run."""
         del context
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="validate_ppiflow_model",
             uses_gpu=False,
             kwargs={
@@ -526,12 +525,12 @@ class PPIFlowDesignNode(_ConfiguredAppStepNode):
     config: dict[str, Any] = field(default_factory=dict, metadata={"dag_hash": False})
     scientific_config: dict[str, Any] = field(default_factory=dict)
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare one direct PPIFlow design call for kernel submission."""
         raw_args = self.config.get("args", self.config)
         if not isinstance(raw_args, dict):
             raise ValueError(f"PPIFlow step {self.step_name!r} args must be a mapping")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_design_stage",
             uses_gpu=True,
             kwargs={
@@ -546,13 +545,13 @@ class PPIFlowDesignNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class PPIFlowPartialNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+class PPIFlowPartialNode(_ConfiguredAppStepNode, TaskProviderNode):
     """PPIFlow partial design with one kernel Task per candidate."""
 
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         """Discover stable candidate Tasks from the upstream manifest."""
         return _candidate_remote_tasks(
             context,
@@ -562,11 +561,11 @@ class PPIFlowPartialNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         """Prepare one partial-design candidate for kernel submission."""
         candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_partial_candidate",
             uses_gpu=True,
             kwargs={
@@ -598,7 +597,7 @@ class PPIFlowPartialNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 
 
 @dataclass
-class LigandMPNNNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+class LigandMPNNNode(_ConfiguredAppStepNode, TaskProviderNode):
     """LigandMPNN design with one kernel Task per input candidate."""
 
     def _model_type(self) -> str:
@@ -613,7 +612,7 @@ class LigandMPNNNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         """Discover stable candidate Tasks from the upstream manifest."""
         return _candidate_remote_tasks(
             context,
@@ -623,8 +622,8 @@ class LigandMPNNNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         """Prepare one LigandMPNN candidate for kernel submission."""
         candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
         script_mode = str(self.config.get("script_mode", "run"))
@@ -634,7 +633,7 @@ class LigandMPNNNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
             script_mode=script_mode,
             model_type=model_type,
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_ligandmpnn_candidate",
             uses_gpu=True,
             kwargs={
@@ -671,9 +670,9 @@ class LigandMPNNNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 class FlowPackerNode(_ConfiguredAppStepNode):
     """FlowPacker side-chain packing step."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare the FlowPacker app call."""
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_flowpacker_stage",
             uses_gpu=True,
             kwargs={
@@ -710,12 +709,12 @@ class AF3ScorePrepareNode(_ConfiguredAppStepNode):
             "alphafold3.model": DECLARED_MODEL_IDENTITY,
         }
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare AF3Score inputs and its durable Task plan."""
         structures = context.inputs.get("structures") or []
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="prepare_ppiflow_af3score_stage",
             uses_gpu=False,
             kwargs={
@@ -732,7 +731,7 @@ class AF3ScorePrepareNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+class AF3ScoreBatchNode(_ConfiguredAppStepNode, TaskProviderNode):
     """Schedule candidate Tasks through AF3Score's prepared GPU batches."""
 
     aggregation_policy = NodeAggregationPolicy.ALLOW_PARTIAL
@@ -743,7 +742,7 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         """Discover one Task per candidate that still needs GPU scoring."""
         plan = self._plan(context)
         candidates = plan.get("candidates")
@@ -762,7 +761,7 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
                 raise TypeError("AF3Score candidate chunk must be an object")
             candidate_id = str(candidate_payload["candidate_id"])
             tasks.append(
-                RemoteWorkflowTask(
+                TaskDefinition(
                     task_key=candidate_id,
                     scientific_payload=candidate_payload["scientific_payload"],
                     execution_payload={
@@ -778,16 +777,16 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         """Prepare the single-Task tail of one AF3Score batch."""
         return self.prepare_remote_task_batch(context, (task,))
 
     def prepare_remote_task_batch(
         self,
         context: NodeRunContext,
-        tasks: tuple[RemoteWorkflowTask, ...],
-    ) -> RemoteNodeCall:
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
         """Prepare one direct AF3Score GPU call for compatible Tasks."""
         if not tasks:
             raise ValueError("AF3Score provider batch cannot be empty")
@@ -829,7 +828,7 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
         batch_input_ids = tuple(
             Path(str(payload["input_name"])).stem for payload in payloads
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_af3score_batch",
             uses_gpu=True,
             kwargs={
@@ -892,7 +891,7 @@ class AF3ScoreBatchNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 
 
 @dataclass
-class AF3ScoreNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+class AF3ScoreNode(_ConfiguredAppStepNode, TaskProviderNode):
     """Postprocess AF3Score candidates while preserving partial outcomes."""
 
     aggregation_policy = NodeAggregationPolicy.ALLOW_PARTIAL
@@ -903,7 +902,7 @@ class AF3ScoreNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         """Discover one postprocessing outcome per requested candidate."""
         candidates = self._plan(context).get("candidates")
         if not isinstance(candidates, list):
@@ -914,7 +913,7 @@ class AF3ScoreNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
                 raise TypeError("AF3Score candidate plan entries must be objects")
             candidate = cast(Mapping[str, object], raw_candidate)
             tasks.append(
-                RemoteWorkflowTask(
+                TaskDefinition(
                     task_key=str(candidate["candidate_id"]),
                     scientific_payload=cast(
                         Mapping[str, object], candidate["scientific_payload"]
@@ -926,22 +925,22 @@ class AF3ScoreNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         """Describe the shared CPU postprocessor for one candidate."""
         return self.prepare_remote_task_batch(context, (task,))
 
     def prepare_remote_task_batch(
         self,
         context: NodeRunContext,
-        tasks: tuple[RemoteWorkflowTask, ...],
-    ) -> RemoteNodeCall:
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
         """Prepare one CPU call that postprocesses every admitted candidate."""
         if not tasks:
             raise ValueError("AF3Score postprocess batch cannot be empty")
         plan_artifacts = context.inputs.get("af3score_plan") or []
         candidate_count = len(self.discover_remote_tasks(context))
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="postprocess_ppiflow_af3score_stage",
             uses_gpu=False,
             kwargs={
@@ -996,12 +995,12 @@ class AF3ScoreNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 class RosettaPrepareNode(_ConfiguredAppStepNode):
     """Stage PPIFlow candidates and publish a finite Rosetta Task plan."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare the Rosetta input and job manifests without nested calls."""
         structures = context.inputs.get("structures") or []
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="prepare_ppiflow_rosetta_stage",
             uses_gpu=False,
             kwargs={
@@ -1018,7 +1017,7 @@ class RosettaPrepareNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
+class RosettaWorkerNode(_ConfiguredAppStepNode, PullTaskProviderNode):
     """Execute staged Rosetta candidates through kernel-owned pull Tasks."""
 
     def _plan(self, context: NodeRunContext) -> dict[str, object]:
@@ -1026,13 +1025,13 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
         if len(artifacts) != 1:
             raise ValueError(f"Expected one Rosetta task plan, found {len(artifacts)}")
         return rosetta_runtime._load_rosetta_plan(
-            context.resolve_workflow_artifact(artifacts[0])
+            context.resolve_artifact(artifacts[0])
         )
 
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         """Discover the complete staged Rosetta Task set in manifest order."""
         plan = self._plan(context)
         run_root = (
@@ -1041,7 +1040,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
             .as_posix()
         )
         return tuple(
-            RemoteWorkflowTask(
+            TaskDefinition(
                 task_key=task.task_key,
                 scientific_payload=task.scientific_payload,
                 execution_payload={
@@ -1058,7 +1057,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
     def prepare_pull_worker(
         self,
         context: NodeRunContext,
-    ) -> RemotePullWorkerCall:
+    ) -> PullWorkerCallSpec:
         """Bind the derived worker pool to the workflow's Rosetta function."""
         plan = self._plan(context)
         worker_count, claim_capacity, max_parallel = (
@@ -1067,7 +1066,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
                 self.config,
             )
         )
-        return RemotePullWorkerCall(
+        return PullWorkerCallSpec(
             function_name="run_ppiflow_rosetta_worker",
             uses_gpu=False,
             claim_capacity=claim_capacity,
@@ -1085,10 +1084,10 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
     def observe_remote_task_publication(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
         result: AppRunResult,
-        artifacts: tuple[WorkflowArtifact, ...],
+        artifacts: tuple[ExecutionArtifact, ...],
     ) -> AvailabilityStatus:
         """Revalidate the fingerprint-bound Rosetta marker and required files."""
         del context, result, artifacts
@@ -1105,7 +1104,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
     def recover_remote_task_result(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
     ) -> AppRunResult | None:
         """Rebuild the canonical receipt after a lost completion callback."""
@@ -1114,7 +1113,7 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
 
     @staticmethod
     def _recover_task_result(
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
     ) -> AppRunResult | None:
         payload = task.execution_payload
@@ -1167,13 +1166,13 @@ class RosettaWorkerNode(_ConfiguredAppStepNode, RemotePullTaskWorkflowNode):
 class _RosettaNode(_ConfiguredAppStepNode):
     """Finalize one PPIFlow Rosetta stage from durable Task outcomes."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Validate remote outputs and publish the established stage contract."""
         plan_artifacts = context.inputs.get("rosetta_plan") or []
         outcome_artifacts = context.inputs.get("rosetta_outcomes") or []
         if not plan_artifacts or not outcome_artifacts:
             raise ValueError(f"{self.step_name} requires Rosetta Task results")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="finalize_ppiflow_rosetta_stage",
             uses_gpu=False,
             kwargs={
@@ -1199,13 +1198,13 @@ class RosettaRelaxNode(_RosettaNode):
 
 
 @dataclass
-class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
+class ReFoldNode(_ConfiguredAppStepNode, TaskProviderNode):
     """AlphaFold3 refolding with one kernel Task per candidate."""
 
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         """Discover stable candidate Tasks from the upstream manifest."""
         return _candidate_remote_tasks(
             context,
@@ -1215,11 +1214,11 @@ class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         """Prepare one candidate wrapper for kernel submission."""
         candidate_id = _candidate_task_id(context, task, step_name=self.step_name)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_refold_candidate",
             uses_gpu=True,
             kwargs={
@@ -1253,12 +1252,12 @@ class ReFoldNode(_ConfiguredAppStepNode, RemoteTaskWorkflowNode):
 class DockQNode(_ConfiguredAppStepNode):
     """DockQ model/reference scoring step."""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare the DockQ app call."""
         model_artifacts = context.inputs.get("models") or []
         if not model_artifacts:
             raise ValueError(f"{self.step_name} requires model structure inputs")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_ppiflow_dockq_stage",
             uses_gpu=False,
             kwargs={
@@ -1283,7 +1282,7 @@ class DockQNode(_ConfiguredAppStepNode):
 
 
 @dataclass
-class ExistingStructuresNode(RemoteWorkflowNode):
+class ExistingStructuresNode(ProviderNode):
     """Reference existing structures for stage-2-only PPIFlow runs."""
 
     step_name: str
@@ -1293,9 +1292,9 @@ class ExistingStructuresNode(RemoteWorkflowNode):
         metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
     )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare Stage2Input normalization for kernel submission."""
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="normalize_ppiflow_stage2_input",
             uses_gpu=False,
             kwargs={
@@ -1309,7 +1308,7 @@ class ExistingStructuresNode(RemoteWorkflowNode):
 
 
 @dataclass
-class FilterStructuresNode(RemoteWorkflowNode):
+class FilterStructuresNode(ProviderNode):
     """Filter structures using score artifacts."""
 
     step_name: str
@@ -1318,7 +1317,7 @@ class FilterStructuresNode(RemoteWorkflowNode):
         metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
     )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare score filtering for kernel submission."""
         structures = context.inputs.get("structures") or []
         scores = context.inputs.get("scores") or []
@@ -1326,7 +1325,7 @@ class FilterStructuresNode(RemoteWorkflowNode):
             raise ValueError(f"{self.step_name} requires structure inputs")
         if not scores:
             raise ValueError(f"{self.step_name} requires score inputs")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="filter_ppiflow_artifacts",
             uses_gpu=False,
             kwargs={
@@ -1342,7 +1341,7 @@ class FilterStructuresNode(RemoteWorkflowNode):
 
 
 @dataclass
-class FixedPositionsNode(RemoteWorkflowNode):
+class FixedPositionsNode(ProviderNode):
     """Convert Rosetta residue energies into fixed-position constraints."""
 
     step_name: str
@@ -1351,12 +1350,12 @@ class FixedPositionsNode(RemoteWorkflowNode):
         metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
     )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare fixed-position conversion for kernel submission."""
         artifacts = context.inputs.get("structures") or []
         if not artifacts:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="derive_ppiflow_fixed_positions",
             uses_gpu=False,
             kwargs={
@@ -1371,7 +1370,7 @@ class FixedPositionsNode(RemoteWorkflowNode):
 
 
 @dataclass
-class RankNode(RemoteWorkflowNode):
+class RankNode(ProviderNode):
     """Rank final designs."""
 
     step_name: str
@@ -1380,7 +1379,7 @@ class RankNode(RemoteWorkflowNode):
         metadata={"dag_hash_exclude_keys": _OPERATIONAL_CONFIG_KEYS},
     )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare score-aware ranking for kernel submission."""
         structures = context.inputs.get("structures") or []
         score_artifacts = [
@@ -1391,7 +1390,7 @@ class RankNode(RemoteWorkflowNode):
         ]
         if not structures:
             raise ValueError(f"{self.step_name} requires structure inputs")
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="rank_ppiflow_artifacts",
             uses_gpu=False,
             kwargs={
@@ -1407,7 +1406,7 @@ class RankNode(RemoteWorkflowNode):
 
 
 @dataclass
-class ReportNode(WorkflowNativeNode):
+class ReportNode(CoordinatorNode):
     """Write the final design report."""
 
     step_name: str
@@ -1519,7 +1518,7 @@ class ReportNode(WorkflowNativeNode):
                     metadata={"step_name": self.step_name},
                 ),
                 *(
-                    republish_workflow_artifact(artifact)
+                    republish_execution_artifact(artifact)
                     for artifact in scientific_artifacts
                 ),
             ],
@@ -1538,7 +1537,7 @@ def _candidate_rows_for_task_discovery(
             f"PPIFlow Node {context.node_id!r} requires a candidate manifest"
         )
     frames = [
-        ppiflow_manifests.read_manifest(context.resolve_workflow_artifact(artifact))
+        ppiflow_manifests.read_manifest(context.resolve_artifact(artifact))
         for artifact in artifacts
     ]
     frame = pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
@@ -1567,10 +1566,10 @@ def _candidate_remote_tasks(
     context: NodeRunContext,
     *,
     max_candidates: int | None,
-) -> tuple[RemoteWorkflowTask, ...]:
+) -> tuple[TaskDefinition, ...]:
     """Discover one stable kernel Task per active candidate row."""
     return tuple(
-        RemoteWorkflowTask(
+        TaskDefinition(
             task_key=str(row["candidate_id"]),
             scientific_payload=row,
             execution_payload={"candidate_id": str(row["candidate_id"])},
@@ -1584,7 +1583,7 @@ def _candidate_remote_tasks(
 
 def _candidate_task_id(
     context: NodeRunContext,
-    task: RemoteWorkflowTask,
+    task: TaskDefinition,
     *,
     step_name: str,
 ) -> str:
@@ -1650,14 +1649,14 @@ def _task_manifest_output(
     rows: Sequence[Mapping[str, object]],
 ) -> AppOutput:
     """Write one task-aggregated manifest inside the workflow run Volume."""
-    if context.volume_root is None or context.workflow_volume_name is None:
+    if context.volume_root is None or context.artifact_volume_name is None:
         raise RuntimeError("Workflow Volume context is unavailable")
     manifest_path = context.work_dir / ppiflow_manifests.MANIFEST_FILENAME
     ppiflow_manifests.write_manifest(rows, manifest_path)
     return ppiflow_manifests.manifest_artifact_output(
         manifest_path=manifest_path,
         mount_root=str(context.volume_root),
-        volume_name=context.workflow_volume_name,
+        volume_name=context.artifact_volume_name,
         stage_name=step_name,
         row_count=len(rows),
     )
@@ -1668,7 +1667,7 @@ def _task_result_structure_files(
     result: AppRunResult,
 ) -> list[dict[str, object]]:
     """Describe workflow-owned Task structures for downstream fingerprints."""
-    if context.volume_root is None or context.workflow_volume_name is None:
+    if context.volume_root is None or context.artifact_volume_name is None:
         raise RuntimeError("Workflow Volume context is unavailable")
     records = []
     for output in result.outputs:
@@ -1683,7 +1682,7 @@ def _task_result_structure_files(
         if (
             output.kind != ArtifactKind.STRUCTURES
             or not isinstance(output.storage, VolumePath)
-            or output.storage.volume_name != context.workflow_volume_name
+            or output.storage.volume_name != context.artifact_volume_name
         ):
             continue
         root = output.storage.at_mountpoint(context.volume_root)
@@ -1698,7 +1697,7 @@ def _task_result_structure_files(
                 ppiflow_manifests.candidate_file_record(
                     role="structure",
                     workflow_path=relative,
-                    volume_name=context.workflow_volume_name,
+                    volume_name=context.artifact_volume_name,
                     path=path.name
                     if root.is_file()
                     else path.relative_to(root).as_posix(),
@@ -1761,7 +1760,7 @@ def build_ppiflow_workflow(
     stage: int | None = None,
     max_containers: int | None = None,
     max_gpu_containers: int | None = None,
-) -> Workflow:
+) -> ExecutionGraph:
     """Build a PPIFlow workflow DAG from upstream-style YAML files."""
     if stage not in {None, 1, 2}:
         raise ValueError("stage must be omitted, 1, or 2")
@@ -1790,7 +1789,7 @@ def build_ppiflow_workflow(
         stage=stage,
         steps=steps_doc,
     )
-    workflow = Workflow(
+    workflow = ExecutionGraph(
         "ppiflow-v2",
         scientific_versions={
             "af3score": app_scientific_version(af3score_app.CONF),
@@ -1922,7 +1921,7 @@ def _ppiflow_step_model_weights_name(
 
 def _add_stage1_nodes(
     *,
-    workflow: Workflow,
+    workflow: ExecutionGraph,
     enabled: dict[str, bool],
     steps: dict[str, Any],
     gentype: str,
@@ -2012,7 +2011,7 @@ def _add_stage1_nodes(
 
 def _add_af3score_nodes(
     *,
-    workflow: Workflow,
+    workflow: ExecutionGraph,
     node_id: str,
     step_name: str,
     config: dict[str, Any],
@@ -2049,7 +2048,7 @@ def _add_af3score_nodes(
 
 def _add_rosetta_nodes(
     *,
-    workflow: Workflow,
+    workflow: ExecutionGraph,
     node_id: str,
     step_name: str,
     finalizer_class: type[_RosettaNode],
@@ -2085,7 +2084,7 @@ def _add_rosetta_nodes(
 
 def _add_stage2_nodes(
     *,
-    workflow: Workflow,
+    workflow: ExecutionGraph,
     enabled: dict[str, bool],
     steps: dict[str, Any],
     gentype: str,
@@ -2784,7 +2783,7 @@ def submit_ppiflow_workflow(
         use_deployed_coordinator=use_deployed_coordinator,
     )
     orchestrator_kwargs = {
-        "workflow": workflow,
+        "graph": workflow,
         "workload_run_key": resolved_run_id,
         "max_parallel_nodes": total_limit,
         "max_active_provider_calls": total_limit,

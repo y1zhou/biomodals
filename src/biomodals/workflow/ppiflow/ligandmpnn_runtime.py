@@ -8,8 +8,8 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
-    WorkflowArtifact,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.ppiflow import staging, tables
@@ -31,8 +31,8 @@ from biomodals.workflow.ppiflow.runtime_support import (
 
 def run_ppiflow_ligandmpnn_candidate(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None,
     candidate_id: str,
     config: dict[str, object],
     step_name: str,

@@ -14,7 +14,7 @@ from typing import BinaryIO, TypeVar
 import polars as pl
 
 from biomodals.helper.shell import sanitize_filename
-from biomodals.schema import AppRunStatus, ArtifactKind, WorkflowArtifact
+from biomodals.schema import AppRunStatus, ArtifactKind, ExecutionArtifact
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.ppiflow import manifests, tables
 
@@ -79,7 +79,7 @@ class CandidateStructureFile:
 
 
 def artifact_mount_path(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     volume_roots: Mapping[str, str],
 ) -> Path:
     """Return an artifact path resolved under its mounted volume root."""
@@ -103,7 +103,7 @@ def matches_structure_pattern(path: str, patterns: Sequence[str] | None) -> bool
 
 
 def structure_patterns_from_metadata(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     patterns: Sequence[str] | None,
 ) -> Sequence[str] | None:
     """Resolve explicit or artifact-provided structure selection patterns."""
@@ -127,7 +127,7 @@ def safe_selected_file_name(artifact_id: str, member_name: str) -> str:
     return sanitize_filename("__".join([artifact_id, *parts]))
 
 
-def artifact_is_zstd_archive(artifact: WorkflowArtifact, path: Path) -> bool:
+def artifact_is_zstd_archive(artifact: ExecutionArtifact, path: Path) -> bool:
     """Return whether an artifact should be read as a tar.zst archive."""
     return (
         artifact.kind == ArtifactKind.ARCHIVE
@@ -138,7 +138,7 @@ def artifact_is_zstd_archive(artifact: WorkflowArtifact, path: Path) -> bool:
 
 
 def structure_files_from_tar_zst(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[tuple[str, bytes]]:
@@ -192,7 +192,7 @@ def files_from_tar_zst_path(
 
 
 def selected_structure_file_records_from_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     patterns: Sequence[str] | None,
     volume_roots: Mapping[str, str],
 ) -> list[SelectedStructureFile]:
@@ -243,7 +243,7 @@ def selected_structure_file_records_from_artifact(
 
 
 def _selected_structure_file_records_from_tar_zst(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[SelectedStructureFile]:
@@ -268,7 +268,7 @@ def _selected_structure_file_records_from_tar_zst(
 
 
 def stage2_input_manifest_rows(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     volume_roots: Mapping[str, str],
     *,
     patterns: Sequence[str] | None = None,
@@ -329,7 +329,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def structure_files_from_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     patterns: Sequence[str] | None,
     volume_roots: Mapping[str, str],
 ) -> list[tuple[str, bytes]]:
@@ -362,7 +362,7 @@ def structure_files_from_artifact(
 
 
 def csv_files_from_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     volume_roots: Mapping[str, str],
 ) -> list[tuple[str, bytes]]:
     """Read CSV files from one workflow artifact."""
@@ -387,7 +387,7 @@ def csv_files_from_artifact(
 
 
 def select_structure_files_from_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
     volume_roots: Mapping[str, str],
     *,
     patterns: Sequence[str] | None = None,

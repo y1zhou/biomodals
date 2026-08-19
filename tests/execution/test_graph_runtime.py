@@ -23,21 +23,21 @@ from biomodals.execution import (
     RunStatusReason,
     TaskStatus,
 )
-from biomodals.execution.graph import Workflow
-from biomodals.execution.graph_runtime import WorkflowRuntime
+from biomodals.execution.definition import ExecutionGraph
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
 from biomodals.execution.nodes import (
+    CoordinatorNode,
     NodeRunContext,
-    RemoteNodeCall,
-    RemotePullTaskWorkflowNode,
-    RemotePullWorkerCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowNode,
-    RemoteWorkflowTask,
-    WorkflowNativeNode,
+    ProviderCallSpec,
+    ProviderNode,
+    PullTaskProviderNode,
+    PullWorkerCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
 )
 from biomodals.schema import (
     AppOutput,
@@ -45,9 +45,9 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -55,7 +55,7 @@ DEPLOYMENT = DeploymentIdentity("main", "DemoWorkflow", 7)
 
 
 @dataclass
-class TextNode(WorkflowNativeNode):
+class TextNode(CoordinatorNode):
     text: str
     seen: list[NodeRunContext] = field(
         default_factory=list,
@@ -69,13 +69,13 @@ class TextNode(WorkflowNativeNode):
 
 
 @dataclass
-class RemoteTextNode(RemoteWorkflowNode):
+class RemoteTextNode(ProviderNode):
     text: str
     function_name: str
     uses_gpu: bool = False
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
-        return RemoteNodeCall(
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        return ProviderCallSpec(
             function_name=self.function_name,
             uses_gpu=self.uses_gpu,
             kwargs={"text": self.text},
@@ -85,7 +85,7 @@ class RemoteTextNode(RemoteWorkflowNode):
 
 
 @dataclass
-class RemoteFanoutNode(RemoteTaskWorkflowNode):
+class RemoteFanoutNode(TaskProviderNode):
     texts: tuple[str, ...]
     prepare_calls: list[str] = field(
         default_factory=list,
@@ -106,9 +106,9 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         return tuple(
-            RemoteWorkflowTask(
+            TaskDefinition(
                 task_key=f"candidate-{ordinal}",
                 scientific_payload={"text": text},
                 execution_payload={"text": text},
@@ -119,11 +119,11 @@ class RemoteFanoutNode(RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         self.prepare_calls.append(task.task_key)
         payload = dict(task.execution_payload)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_candidate",
             uses_gpu=False,
             kwargs={
@@ -173,10 +173,10 @@ class KeyedRemoteFanoutNode(RemoteFanoutNode):
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         del context
         return tuple(
-            RemoteWorkflowTask(
+            TaskDefinition(
                 task_key=task_key,
                 scientific_payload={"text": text},
                 execution_payload={"text": text},
@@ -190,10 +190,10 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         payload = dict(task.execution_payload)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_candidate_batch",
             uses_gpu=True,
             kwargs={"task_keys": [task.task_key], "texts": [payload["text"]]},
@@ -206,9 +206,9 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
     def prepare_remote_task_batch(
         self,
         context: NodeRunContext,
-        tasks: tuple[RemoteWorkflowTask, ...],
-    ) -> RemoteNodeCall:
-        return RemoteNodeCall(
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
+        return ProviderCallSpec(
             function_name="run_candidate_batch",
             uses_gpu=True,
             kwargs={
@@ -238,7 +238,7 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
 
 
 @dataclass
-class PullFanoutNode(RemotePullTaskWorkflowNode):
+class PullFanoutNode(PullTaskProviderNode):
     texts: tuple[str, ...]
     max_worker_calls: int = 2
     uses_gpu: bool = field(default=False, metadata={"dag_hash": False})
@@ -271,9 +271,9 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         return tuple(
-            RemoteWorkflowTask(
+            TaskDefinition(
                 task_key=f"candidate-{ordinal}",
                 scientific_payload={"text": text},
                 execution_payload={"text": text},
@@ -284,8 +284,8 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
     def prepare_pull_worker(
         self,
         context: NodeRunContext,
-    ) -> RemotePullWorkerCall:
-        return RemotePullWorkerCall(
+    ) -> PullWorkerCallSpec:
+        return PullWorkerCallSpec(
             function_name="run_pull_worker",
             uses_gpu=self.uses_gpu,
             claim_capacity=2,
@@ -297,10 +297,10 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
     def observe_remote_task_publication(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
         result: AppRunResult,
-        artifacts: tuple[WorkflowArtifact, ...],
+        artifacts: tuple[ExecutionArtifact, ...],
     ) -> AvailabilityStatus | None:
         del context, expected_fingerprint, result, artifacts
         self.publication_probes.append(task.task_key)
@@ -309,7 +309,7 @@ class PullFanoutNode(RemotePullTaskWorkflowNode):
     def recover_remote_task_result(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
+        task: TaskDefinition,
         expected_fingerprint: str,
     ) -> AppRunResult | None:
         del context, expected_fingerprint
@@ -474,7 +474,7 @@ class CoordinatorInterrupted(BaseException):
 
 
 @dataclass
-class InterruptOnceNode(WorkflowNativeNode):
+class InterruptOnceNode(CoordinatorNode):
     interrupted: bool = field(default=False, metadata={"dag_hash": False})
     calls: int = field(default=0, metadata={"dag_hash": False})
 
@@ -487,7 +487,7 @@ class InterruptOnceNode(WorkflowNativeNode):
 
 
 @dataclass
-class FailingNode(WorkflowNativeNode):
+class FailingNode(CoordinatorNode):
     calls: int = field(default=0, metadata={"dag_hash": False})
 
     def run(self, context: NodeRunContext) -> AppRunResult:
@@ -514,7 +514,7 @@ def _text_result(text: str) -> AppRunResult:
 
 def _runtime(
     tmp_path: Path,
-    workflow: Workflow,
+    workflow: ExecutionGraph,
     *,
     driver: FakeModalDriver | None = None,
     volume: FakeVolume | None = None,
@@ -522,14 +522,14 @@ def _runtime(
     max_calls: int = 8,
     max_gpu_calls: int = 4,
     pull_worker_coordinator: object | None = None,
-) -> WorkflowRuntime:
-    return WorkflowRuntime(
-        workflow=workflow,
+) -> ExecutionGraphRuntime:
+    return ExecutionGraphRuntime(
+        graph=workflow,
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
-        workflow_volume_name="Workflow-outputs",
-        workflow_volume=volume,
+        artifact_volume_name="Workflow-outputs",
+        artifact_volume=volume,
         provider_driver=driver,
         max_parallel_nodes=max_parallel_nodes,
         max_active_provider_calls=max_calls,
@@ -543,7 +543,7 @@ def _runtime(
 def test_initialization_reuses_the_host_volume_view(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("remote")
+    workflow = ExecutionGraph("remote")
     workflow.add_node(
         RemoteTextNode("hello", "remote_text"),
         id="remote",
@@ -567,7 +567,7 @@ def test_new_workflow_artifact_is_hashed_once(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    workflow = Workflow("local")
+    workflow = ExecutionGraph("local")
     workflow.add_node(TextNode("hello"), id="local")
     hashed: list[str] = []
 
@@ -588,10 +588,10 @@ def test_new_workflow_artifact_is_hashed_once(
     runtime.close()
 
 
-def test_running_provider_poll_does_not_synchronize_the_workflow_volume(
+def test_running_provider_poll_does_not_synchronize_the_artifact_volume(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("remote")
+    workflow = ExecutionGraph("remote")
     workflow.add_node(
         RemoteTextNode("hello", "remote_text"),
         id="remote",
@@ -618,7 +618,7 @@ def test_running_provider_poll_does_not_synchronize_the_workflow_volume(
 def test_provider_result_payload_is_file_backed_outside_the_ledger(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("remote-envelope")
+    workflow = ExecutionGraph("remote-envelope")
     workflow.add_node(RemoteTextNode("large-return", "remote_text"), id="remote")
     runtime = _runtime(tmp_path, workflow, driver=FakeModalDriver())
 
@@ -651,7 +651,7 @@ def test_provider_envelope_read_excludes_volume_reload(
                 raise RuntimeError("reload while provider envelope is open")
             super().reload()
 
-    workflow = Workflow("remote-envelope-concurrency")
+    workflow = ExecutionGraph("remote-envelope-concurrency")
     workflow.add_node(RemoteTextNode("answer", "run_remote"), id="remote")
     runtime = _runtime(
         tmp_path,
@@ -702,7 +702,7 @@ def test_provider_observation_does_not_hold_volume_lock(
 ) -> None:
     observe_started = Event()
     release_observe = Event()
-    workflow = Workflow("remote-observation-concurrency")
+    workflow = ExecutionGraph("remote-observation-concurrency")
     workflow.add_node(RemoteTextNode("answer", "run_remote"), id="remote")
     driver = FakeModalDriver()
     volume = FakeVolume()
@@ -732,11 +732,11 @@ def test_provider_observation_does_not_hold_volume_lock(
     assert volume.reloads == 1
 
 
-def test_inline_provider_result_does_not_reload_the_workflow_volume(
+def test_inline_provider_result_does_not_reload_the_artifact_volume(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    workflow = Workflow("remote")
+    workflow = ExecutionGraph("remote")
     workflow.add_node(
         RemoteTextNode("hello", "remote_text"),
         id="remote",
@@ -777,11 +777,11 @@ def test_inline_provider_result_does_not_reload_the_workflow_volume(
     runtime.close()
 
 
-def test_workflow_volume_log_reloads_before_publication(
+def test_artifact_volume_log_reloads_before_publication(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    workflow = Workflow("remote-volume")
+    workflow = ExecutionGraph("remote-volume")
     workflow.add_node(
         RemoteTextNode("hello", "remote_text"),
         id="remote",
@@ -839,7 +839,7 @@ def test_workflow_volume_log_reloads_before_publication(
 
 
 def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> None:
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     first_node = TextNode("first")
     first = workflow.add_node(first_node, id="first")
     second_node = TextNode("second")
@@ -890,7 +890,7 @@ def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> N
 def test_independent_remote_nodes_spawn_before_results_are_polled(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("parallel")
+    workflow = ExecutionGraph("parallel")
     workflow.add_node(
         RemoteTextNode("gpu", "run_gpu", uses_gpu=True),
         id="gpu",
@@ -925,7 +925,7 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
 def test_node_parallelism_is_independent_from_provider_call_limits(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("node-limit")
+    workflow = ExecutionGraph("node-limit")
     workflow.add_node(RemoteTextNode("first", "run_first"), id="first")
     workflow.add_node(RemoteTextNode("second", "run_second"), id="second")
     driver = CancellingModalDriver()
@@ -952,7 +952,7 @@ def test_node_parallelism_is_independent_from_provider_call_limits(
 def test_completed_branch_refills_provider_capacity_in_the_same_cycle(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("constant-refill")
+    workflow = ExecutionGraph("constant-refill")
     for branch in ("a", "b"):
         upstream = workflow.add_node(
             RemoteTextNode(branch, f"upstream_{branch}"),
@@ -998,7 +998,7 @@ def test_completed_branch_refills_provider_capacity_in_the_same_cycle(
 def test_cancel_requested_workflow_reconciles_provider_cancellation(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("cancel")
+    workflow = ExecutionGraph("cancel")
     workflow.add_node(RemoteTextNode("remote", "run_remote"), id="remote")
     driver = CancellingModalDriver()
     runtime = _runtime(tmp_path, workflow, driver=driver)
@@ -1022,7 +1022,7 @@ def test_cancel_requested_workflow_reconciles_provider_cancellation(
 def test_unknown_workflow_prunes_call_after_terminal_publication_appears(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("unknown-pruning")
+    workflow = ExecutionGraph("unknown-pruning")
     workflow.add_node(RemoteTextNode("remote", "run_remote"), id="remote")
     driver = StateUnknownUntilCancelledModalDriver()
     runtime = _runtime(tmp_path, workflow, driver=driver)
@@ -1057,7 +1057,7 @@ def test_unknown_workflow_prunes_call_after_terminal_publication_appears(
                 ],
             ),
             artifacts=(
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="remote-text",
                     producing_node_id="remote",
                     kind=ArtifactKind.REPORT,
@@ -1080,7 +1080,7 @@ def test_unknown_workflow_prunes_call_after_terminal_publication_appears(
 def test_remote_task_node_discovers_and_publishes_independent_tasks(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("fanout")
+    workflow = ExecutionGraph("fanout")
     node = RemoteFanoutNode(("alpha", "beta"))
     fanout = workflow.add_node(node, id="fanout")
     downstream = TextNode("joined")
@@ -1133,7 +1133,7 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
 def test_remote_task_storage_scopes_do_not_collide_after_path_sanitization(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("colliding-task-keys")
+    workflow = ExecutionGraph("colliding-task-keys")
     workflow.add_node(
         KeyedRemoteFanoutNode(
             texts=("alpha", "beta", "gamma"),
@@ -1168,7 +1168,7 @@ def test_remote_task_storage_scopes_do_not_collide_after_path_sanitization(
 def test_remote_task_admission_reuses_persisted_dispatch_policy(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("bounded-fanout")
+    workflow = ExecutionGraph("bounded-fanout")
     node = RemoteFanoutNode(tuple(f"value-{index}" for index in range(20)))
     workflow.add_node(node, id="fanout")
     runtime = _runtime(
@@ -1199,7 +1199,7 @@ def test_remote_task_admission_reuses_persisted_dispatch_policy(
 def test_remote_task_node_batches_compatible_tasks_into_one_call(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("batched-fanout")
+    workflow = ExecutionGraph("batched-fanout")
     node = BatchedRemoteFanoutNode(("alpha", "beta"))
     workflow.add_node(node, id="fanout")
     driver = BatchedFanoutModalDriver()
@@ -1224,7 +1224,7 @@ def test_remote_task_node_batches_compatible_tasks_into_one_call(
 def test_pull_task_node_uses_durable_claims_and_worker_publications(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("pull-fanout")
+    workflow = ExecutionGraph("pull-fanout")
     node = PullFanoutNode(("alpha", "beta", "gamma"))
     workflow.add_node(
         node,
@@ -1288,7 +1288,7 @@ def test_pull_task_node_uses_durable_claims_and_worker_publications(
 
 
 def test_zero_gpu_capacity_admits_cpu_pull_work(tmp_path: Path) -> None:
-    workflow = Workflow("mixed-zero-gpu")
+    workflow = ExecutionGraph("mixed-zero-gpu")
     workflow.add_node(RemoteTextNode("gpu", "run_gpu", uses_gpu=True), id="gpu")
     workflow.add_node(PullFanoutNode(("cpu",)), id="cpu-pull")
     driver = PullModalDriver()
@@ -1313,7 +1313,7 @@ def test_zero_gpu_capacity_admits_cpu_pull_work(tmp_path: Path) -> None:
 
 
 def test_zero_gpu_capacity_suspends_gpu_pull_work(tmp_path: Path) -> None:
-    workflow = Workflow("gpu-pull-zero-capacity")
+    workflow = ExecutionGraph("gpu-pull-zero-capacity")
     workflow.add_node(
         PullFanoutNode(("gpu",), uses_gpu=True),
         id="gpu-pull",
@@ -1343,7 +1343,7 @@ def test_zero_gpu_capacity_suspends_gpu_pull_work(tmp_path: Path) -> None:
 def test_terminal_pull_worker_recovers_publication_after_lost_callback(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("pull-callback-recovery")
+    workflow = ExecutionGraph("pull-callback-recovery")
     node = PullFanoutNode(
         ("alpha",),
         max_worker_calls=1,
@@ -1387,7 +1387,7 @@ def test_terminal_pull_worker_recovers_publication_after_lost_callback(
 def test_unknown_pull_publication_defers_terminal_owner_projection(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("pull-callback-unknown")
+    workflow = ExecutionGraph("pull-callback-unknown")
     workflow.add_node(
         PullFanoutNode(
             ("alpha",),
@@ -1431,7 +1431,7 @@ def test_unknown_pull_publication_defers_terminal_owner_projection(
 def test_pull_completion_and_next_claim_share_one_checkpoint(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("fused-pull-fanout")
+    workflow = ExecutionGraph("fused-pull-fanout")
     workflow.add_node(
         PullFanoutNode(
             ("alpha", "beta", "gamma"),
@@ -1499,7 +1499,7 @@ def test_pull_completion_and_next_claim_share_one_checkpoint(
 def test_pull_completion_after_cancellation_does_not_publish(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("cancelled-pull-publication")
+    workflow = ExecutionGraph("cancelled-pull-publication")
     node = PullFanoutNode(("alpha",), max_worker_calls=1)
     workflow.add_node(
         node,
@@ -1575,7 +1575,7 @@ def test_pull_completion_after_cancellation_does_not_publish(
 def test_pull_completion_replay_remains_idempotent_after_cancellation(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("cancelled-pull-replay")
+    workflow = ExecutionGraph("cancelled-pull-replay")
     workflow.add_node(
         PullFanoutNode(("alpha",), max_worker_calls=1),
         id="fanout",
@@ -1630,7 +1630,7 @@ def test_pull_completion_replay_remains_idempotent_after_cancellation(
 def test_pull_completion_rejects_another_worker_before_file_work(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("wrong-pull-owner")
+    workflow = ExecutionGraph("wrong-pull-owner")
     workflow.add_node(
         PullFanoutNode(("alpha", "beta", "gamma"), max_worker_calls=2),
         id="fanout",
@@ -1693,7 +1693,7 @@ def test_pull_completion_rejects_another_worker_before_file_work(
 def test_pull_completion_rejects_invalid_successor_claim_before_file_work(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("invalid-successor-claim")
+    workflow = ExecutionGraph("invalid-successor-claim")
     workflow.add_node(
         PullFanoutNode(("alpha",), max_worker_calls=1),
         id="fanout",
@@ -1742,7 +1742,7 @@ def test_pull_completion_rejects_invalid_successor_claim_before_file_work(
 def test_malformed_pull_completion_fails_task_without_staging_leaks(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("malformed-pull-completion")
+    workflow = ExecutionGraph("malformed-pull-completion")
     workflow.add_node(
         PullFanoutNode(("alpha",), max_worker_calls=1),
         id="fanout",
@@ -1804,7 +1804,7 @@ def test_malformed_pull_completion_fails_task_without_staging_leaks(
 
 
 def test_invalid_pull_result_schema_fails_only_its_task(tmp_path: Path) -> None:
-    workflow = Workflow("invalid-pull-result-schema")
+    workflow = ExecutionGraph("invalid-pull-result-schema")
     workflow.add_node(
         PullFanoutNode(("alpha",), max_worker_calls=1),
         id="fanout",
@@ -1855,7 +1855,7 @@ def test_retryable_pull_probe_failure_cleans_long_id_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow = Workflow("retryable-pull-probe")
+    workflow = ExecutionGraph("retryable-pull-probe")
     node = PullFanoutNode(("alpha",), max_worker_calls=1)
     workflow.add_node(node, id="fanout")
     runtime = _runtime(
@@ -1915,7 +1915,7 @@ def test_retryable_pull_probe_failure_cleans_long_id_staging(
 def test_new_pull_completion_revalidates_unknown_publication(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("unknown-pull-publication")
+    workflow = ExecutionGraph("unknown-pull-publication")
     node = PullFanoutNode(
         ("alpha",),
         max_worker_calls=1,
@@ -1970,7 +1970,7 @@ def test_pull_revalidation_does_not_restore_discarded_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow = Workflow("raced-pull-revalidation")
+    workflow = ExecutionGraph("raced-pull-revalidation")
     node = PullFanoutNode(
         ("alpha",),
         max_worker_calls=1,
@@ -2039,7 +2039,7 @@ def test_pull_revalidation_does_not_restore_discarded_publication(
 def test_remote_task_finalizer_does_not_publish_after_cancellation(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("cancelled-aggregate-publication")
+    workflow = ExecutionGraph("cancelled-aggregate-publication")
     node = RemoteFanoutNode(("alpha", "beta"))
     workflow.add_node(node, id="fanout")
     runtime = _runtime(tmp_path, workflow, driver=FanoutModalDriver())
@@ -2057,10 +2057,10 @@ def test_remote_task_finalizer_does_not_publish_after_cancellation(
     assert not (tmp_path / "artifacts" / "fanout-aggregate-summary.json").exists()
 
 
-def test_pull_completion_reloads_worker_owned_workflow_volume_output(
+def test_pull_completion_reloads_worker_owned_artifact_volume_output(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("pull-volume-publication")
+    workflow = ExecutionGraph("pull-volume-publication")
     workflow.add_node(
         PullFanoutNode(("alpha",), max_worker_calls=1),
         id="fanout",
@@ -2126,7 +2126,7 @@ def test_pull_completion_reloads_before_materializing_its_batch(
             assert list(tmp_path.rglob("completions")) == []
             super().reload()
 
-    workflow = Workflow("pull-volume-reload-order")
+    workflow = ExecutionGraph("pull-volume-reload-order")
     workflow.add_node(
         PullFanoutNode(("alpha", "beta"), max_worker_calls=1),
         id="fanout",
@@ -2197,7 +2197,7 @@ def test_concurrent_pull_completion_excludes_volume_reload(
                 raise RuntimeError("volume busy: open file")
             super().reload()
 
-    workflow = Workflow("pull-volume-concurrency")
+    workflow = ExecutionGraph("pull-volume-concurrency")
     workflow.add_node(
         PullFanoutNode(("alpha", "beta", "gamma"), max_worker_calls=2),
         id="fanout",
@@ -2317,7 +2317,7 @@ def test_pull_claim_checkpoint_excludes_open_materialization(
                 raise RuntimeError("volume busy: open file during commit reload")
             super().commit()
 
-    workflow = Workflow("pull-volume-checkpoint-concurrency")
+    workflow = ExecutionGraph("pull-volume-checkpoint-concurrency")
     workflow.add_node(
         PullFanoutNode(("alpha", "beta", "gamma", "delta"), max_worker_calls=2),
         id="fanout",
@@ -2400,7 +2400,7 @@ def test_pull_claim_checkpoint_excludes_open_materialization(
 
 
 def test_pull_task_node_limits_its_concurrent_worker_calls(tmp_path: Path) -> None:
-    workflow = Workflow("bounded-pull-fanout")
+    workflow = ExecutionGraph("bounded-pull-fanout")
     workflow.add_node(
         PullFanoutNode(tuple(str(index) for index in range(100)), max_worker_calls=1),
         id="fanout",
@@ -2425,7 +2425,7 @@ def test_pull_task_node_limits_its_concurrent_worker_calls(tmp_path: Path) -> No
 
 
 def test_pull_task_node_uses_workload_publication_probe(tmp_path: Path) -> None:
-    workflow = Workflow("pull-publication-probe")
+    workflow = ExecutionGraph("pull-publication-probe")
     node = PullFanoutNode(
         ("alpha",),
         publication_observation=AvailabilityStatus.MISSING,
@@ -2466,7 +2466,7 @@ def test_pull_task_node_uses_workload_publication_probe(tmp_path: Path) -> None:
 
 
 def test_remote_task_node_can_publish_partial_outcomes(tmp_path: Path) -> None:
-    workflow = Workflow("partial-fanout")
+    workflow = ExecutionGraph("partial-fanout")
     node = RemoteFanoutNode(("alpha", "beta"))
     workflow.add_node(
         node,
@@ -2493,7 +2493,7 @@ def test_remote_task_node_can_publish_partial_outcomes(tmp_path: Path) -> None:
 
 
 def test_remote_task_node_fail_fast_stops_unowned_siblings(tmp_path: Path) -> None:
-    workflow = Workflow("fail-fast-fanout")
+    workflow = ExecutionGraph("fail-fast-fanout")
     node = RemoteFanoutNode(("alpha", "beta", "gamma"))
     workflow.add_node(
         node,
@@ -2526,7 +2526,7 @@ def test_remote_task_node_fail_fast_stops_unowned_siblings(tmp_path: Path) -> No
 def test_remote_task_node_requires_explicit_empty_publication(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("empty-fanout")
+    workflow = ExecutionGraph("empty-fanout")
     node = RemoteFanoutNode(())
     workflow.add_node(node, id="fanout", allow_empty_result=True)
     driver = FanoutModalDriver()
@@ -2544,7 +2544,7 @@ def test_remote_task_node_requires_explicit_empty_publication(
 def test_durable_provider_envelope_is_published_without_another_spawn(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("recover")
+    workflow = ExecutionGraph("recover")
     workflow.add_node(RemoteTextNode("answer", "run_remote"), id="remote")
     driver = FakeModalDriver()
     runtime = _runtime(tmp_path, workflow, driver=driver)
@@ -2586,7 +2586,7 @@ def test_interrupted_local_task_recovers_without_an_attempt_or_new_task(
             events.append("run")
             return super().run(context)
 
-    workflow = Workflow("local-recovery")
+    workflow = ExecutionGraph("local-recovery")
     node = RecordingInterruptNode()
     workflow.add_node(node, id="local")
     runtime = _runtime(tmp_path, workflow, volume=RecordingVolume())
@@ -2612,7 +2612,7 @@ def test_interrupted_local_task_recovers_without_an_attempt_or_new_task(
 
 
 def test_caught_local_failure_is_terminal_and_never_reentered(tmp_path: Path) -> None:
-    workflow = Workflow("failure")
+    workflow = ExecutionGraph("failure")
     node = FailingNode()
     workflow.add_node(node, id="local")
     runtime = _runtime(tmp_path, workflow)
@@ -2629,7 +2629,7 @@ def test_caught_local_failure_is_terminal_and_never_reentered(tmp_path: Path) ->
 def test_cached_terminal_publication_prunes_its_ancestor_closure(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("cached")
+    workflow = ExecutionGraph("cached")
     ancestor_node = TextNode("should-not-run")
     ancestor = workflow.add_node(ancestor_node, id="ancestor")
     terminal_node = TextNode("should-not-run")
@@ -2661,7 +2661,7 @@ def test_cached_terminal_publication_prunes_its_ancestor_closure(
             )
         ],
     )
-    cached_artifact = WorkflowArtifact(
+    cached_artifact = ExecutionArtifact(
         artifact_id="terminal-text",
         producing_node_id="terminal",
         kind=ArtifactKind.REPORT,
@@ -2687,7 +2687,7 @@ def test_cached_terminal_publication_prunes_its_ancestor_closure(
                 ],
             ),
             artifacts=(
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="ancestor-text",
                     producing_node_id="ancestor",
                     kind=ArtifactKind.REPORT,
@@ -2719,7 +2719,7 @@ def test_cached_terminal_publication_prunes_its_ancestor_closure(
 def test_missing_copied_publication_is_discarded_and_recomputed(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("repair-cache")
+    workflow = ExecutionGraph("repair-cache")
     node = TextNode("recomputed")
     workflow.add_node(node, id="terminal")
     runtime = _runtime(tmp_path, workflow)
@@ -2746,7 +2746,7 @@ def test_missing_copied_publication_is_discarded_and_recomputed(
                 ],
             ),
             artifacts=(
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="terminal-text",
                     producing_node_id="terminal",
                     kind=ArtifactKind.REPORT,
@@ -2771,7 +2771,7 @@ def test_missing_copied_publication_is_discarded_and_recomputed(
 def test_unchecked_external_publication_suspends_instead_of_authorizing_work(
     tmp_path: Path,
 ) -> None:
-    workflow = Workflow("unknown-cache")
+    workflow = ExecutionGraph("unknown-cache")
     node = TextNode("should-not-run")
     workflow.add_node(node, id="terminal")
     runtime = _runtime(tmp_path, workflow)
@@ -2797,7 +2797,7 @@ def test_unchecked_external_publication_suspends_instead_of_authorizing_work(
                 ],
             ),
             artifacts=(
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="terminal-text",
                     producing_node_id="terminal",
                     kind=ArtifactKind.REPORT,

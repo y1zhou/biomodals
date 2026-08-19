@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from biomodals.execution.graph import WorkflowDefinition
-from biomodals.execution.nodes import RemoteTaskWorkflowNode, RemoteWorkflowNode
+from biomodals.execution.definition import ExecutionDefinition
+from biomodals.execution.nodes import ProviderNode, TaskProviderNode
 
 __all__ = ["print_workflow_dag"]
 
 
-def print_workflow_dag(definition: WorkflowDefinition) -> None:
+def print_workflow_dag(definition: ExecutionDefinition) -> None:
     """Print a compact workflow DAG graph."""
     print("[workflow] DAG graph: node_id [execution; class] <- dependency", flush=True)
     for node_id, spec in definition.nodes.items():
@@ -17,7 +17,7 @@ def print_workflow_dag(definition: WorkflowDefinition) -> None:
         node_class = spec.node.__class__.__qualname__
         execution = (
             "provider"
-            if isinstance(spec.node, RemoteWorkflowNode | RemoteTaskWorkflowNode)
+            if isinstance(spec.node, ProviderNode | TaskProviderNode)
             else "coordinator-local"
         )
         print(

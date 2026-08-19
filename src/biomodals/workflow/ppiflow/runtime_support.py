@@ -15,8 +15,8 @@ from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
-    WorkflowArtifact,
 )
 from biomodals.workflow.ppiflow import manifests, tables
 from biomodals.workflow.ppiflow.runtime_context import (
@@ -122,7 +122,7 @@ def write_candidate_manifest_output(
 
 
 def candidate_manifest_frame_from_inputs(
-    candidate_manifests: Sequence[WorkflowArtifact],
+    candidate_manifests: Sequence[ExecutionArtifact],
     selected_structures: Sequence[tuple[str, bytes]],
     *,
     step_name: str,
@@ -158,7 +158,7 @@ def candidate_manifest_frame_from_inputs(
 
 
 def read_candidate_manifest_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
 ) -> list[pl.DataFrame]:
     """Read and validate candidate-manifest artifacts."""
     frames = []

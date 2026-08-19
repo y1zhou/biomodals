@@ -8,21 +8,21 @@ import pytest
 
 import biomodals.workflow as workflow_api
 from biomodals.execution import NodeAggregationPolicy
-from biomodals.execution.graph import NodeHandle
-from biomodals.execution.graph_plan import execution_plan, node_task_plan
-from biomodals.execution.nodes import RemoteTaskWorkflowNode, WorkflowNativeNode
+from biomodals.execution.definition import NodeHandle
+from biomodals.execution.definition_plan import execution_plan, node_task_plan
+from biomodals.execution.nodes import CoordinatorNode, TaskProviderNode
 from biomodals.schema import ArtifactKind
-from biomodals.workflow import Workflow
+from biomodals.workflow import ExecutionGraph
 from biomodals.workflow.display import print_workflow_dag
 
 
-class DummyNode(WorkflowNativeNode):
+class DummyNode(CoordinatorNode):
     def run(self, context):  # pragma: no cover - builder tests do not execute nodes
         raise NotImplementedError
 
 
 @dataclass
-class ConfiguredDummyNode(WorkflowNativeNode):
+class ConfiguredDummyNode(CoordinatorNode):
     config: dict[str, object] = field(metadata={"dag_hash_exclude_keys": ("workers",)})
 
     def run(self, context):  # pragma: no cover - builder tests do not execute nodes
@@ -30,7 +30,7 @@ class ConfiguredDummyNode(WorkflowNativeNode):
 
 
 def test_selector_input_creates_data_dependency() -> None:
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     upstream = workflow.add_node(DummyNode(), id="design")
     downstream = workflow.add_node(
         DummyNode(),
@@ -56,7 +56,7 @@ def test_node_handle_exposes_only_node_id_and_selector_api() -> None:
 
 
 def test_depends_on_creates_control_edge() -> None:
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     ranked = workflow.add_node(DummyNode(), id="ranked")
     packaged = workflow.add_node(DummyNode(), id="package", depends_on=[ranked])
 
@@ -68,20 +68,20 @@ def test_depends_on_creates_control_edge() -> None:
 
 
 def test_duplicate_node_ids_raise_value_error() -> None:
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(DummyNode(), id="design")
 
-    with pytest.raises(ValueError, match="Duplicate workflow node id"):
+    with pytest.raises(ValueError, match="Duplicate Execution Node id"):
         workflow.add_node(DummyNode(), id="design")
 
 
 def test_empty_sanitized_workflow_name_raises_value_error() -> None:
     with pytest.raises(ValueError, match="safe filename"):
-        Workflow("///")
+        ExecutionGraph("///")
 
 
 def test_cycles_raise_value_error() -> None:
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     first = workflow.add_node(DummyNode(), id="first")
     second = workflow.add_node(DummyNode(), id="second", depends_on=[first])
     workflow.add_control_edge(second, first)
@@ -91,7 +91,7 @@ def test_cycles_raise_value_error() -> None:
 
 
 def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None:
-    workflow = Workflow("demo", scientific_versions={"model": "v1"})
+    workflow = ExecutionGraph("demo", scientific_versions={"model": "v1"})
     first = workflow.add_node(DummyNode(), id="first")
     workflow.add_node(
         DummyNode(),
@@ -123,7 +123,7 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
 
 def test_workflow_hash_can_exclude_declared_operational_config_keys() -> None:
     def fingerprint(*, workers: int, threshold: float) -> str:
-        workflow = Workflow("demo")
+        workflow = ExecutionGraph("demo")
         workflow.add_node(
             ConfiguredDummyNode({
                 "workers": workers,
@@ -144,7 +144,7 @@ def test_workflow_hash_can_exclude_declared_operational_config_keys() -> None:
 
 
 def test_partial_acceptance_must_name_an_actual_dependency() -> None:
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     first = workflow.add_node(DummyNode(), id="first")
     workflow.add_node(
         DummyNode(),
@@ -165,9 +165,9 @@ def test_workflow_node_is_one_scientifically_identified_task() -> None:
 
 
 def test_dag_display_marks_runtime_task_nodes_as_provider_work(capsys) -> None:
-    workflow = Workflow("display")
-    workflow.add_node(RemoteTaskWorkflowNode(), id="fanout")
+    workflow = ExecutionGraph("display")
+    workflow.add_node(TaskProviderNode(), id="fanout")
 
     print_workflow_dag(workflow.validate())
 
-    assert "[provider; RemoteTaskWorkflowNode]" in capsys.readouterr().out
+    assert "[provider; TaskProviderNode]" in capsys.readouterr().out

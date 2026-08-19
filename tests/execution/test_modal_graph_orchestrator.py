@@ -29,12 +29,12 @@ from biomodals.execution.modal import (
     load_execution_launch,
     orchestrator,
 )
-from biomodals.execution.modal.graph_store import WorkflowRunStore
+from biomodals.execution.modal.graph_store import GraphExecutionRunStore
 from biomodals.execution.nodes import (
     NodeRunContext,
-    RemoteNodeCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowTask,
+    ProviderCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
 )
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import (
@@ -45,7 +45,7 @@ from biomodals.schema import (
     ArtifactKind,
 )
 from biomodals.schema.storage import InlineBytes, VolumePath
-from biomodals.workflow import Workflow, WorkflowNativeNode, ppiflow_workflow
+from biomodals.workflow import CoordinatorNode, ExecutionGraph, ppiflow_workflow
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -77,7 +77,7 @@ class FakeHandle:
 
 
 @dataclass
-class TextNode(WorkflowNativeNode):
+class TextNode(CoordinatorNode):
     text: str
     workers: int = field(default=1, metadata={"dag_hash": False})
 
@@ -100,11 +100,11 @@ class TextNode(WorkflowNativeNode):
 
 
 @dataclass
-class RankedScientificNode(WorkflowNativeNode):
+class RankedScientificNode(CoordinatorNode):
     text: str
 
     def run(self, context: NodeRunContext) -> AppRunResult:
-        if context.volume_root is None or context.workflow_volume_name is None:
+        if context.volume_root is None or context.artifact_volume_name is None:
             raise RuntimeError("Workflow Volume context is unavailable")
         output_dir = context.work_dir / "ranked"
         structures_dir = output_dir / "structures"
@@ -120,7 +120,7 @@ class RankedScientificNode(WorkflowNativeNode):
                     name="ranked_structures",
                     kind=ArtifactKind.STRUCTURES,
                     storage=VolumePath(
-                        volume_name=context.workflow_volume_name,
+                        volume_name=context.artifact_volume_name,
                         path=structures_dir.relative_to(context.volume_root).as_posix(),
                     ),
                     metadata={
@@ -136,7 +136,7 @@ class RankedScientificNode(WorkflowNativeNode):
                     name="ranked_designs",
                     kind=ArtifactKind.TABLE,
                     storage=VolumePath(
-                        volume_name=context.workflow_volume_name,
+                        volume_name=context.artifact_volume_name,
                         path=ranking.relative_to(context.volume_root).as_posix(),
                         media_type="text/csv",
                     ),
@@ -146,16 +146,16 @@ class RankedScientificNode(WorkflowNativeNode):
 
 
 @dataclass
-class FanoutNode(RemoteTaskWorkflowNode):
+class FanoutNode(TaskProviderNode):
     texts: tuple[str, ...]
 
     def discover_remote_tasks(
         self,
         context: NodeRunContext,
-    ) -> tuple[RemoteWorkflowTask, ...]:
+    ) -> tuple[TaskDefinition, ...]:
         del context
         return tuple(
-            RemoteWorkflowTask(
+            TaskDefinition(
                 task_key=f"candidate-{ordinal}",
                 scientific_payload={"text": text},
                 execution_payload={"text": text},
@@ -166,10 +166,10 @@ class FanoutNode(RemoteTaskWorkflowNode):
     def prepare_remote_task(
         self,
         context: NodeRunContext,
-        task: RemoteWorkflowTask,
-    ) -> RemoteNodeCall:
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
         del context
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="run_candidate",
             uses_gpu=False,
             kwargs={
@@ -296,7 +296,7 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     class FakeRuntime:
         def __init__(self, **kwargs: object) -> None:
             calls["init"] = kwargs
-            self.store = WorkflowRunStore(tmp_path, RUN_ID)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
         def prepare(self, **_kwargs: object) -> None:
             _ = self.store.execution
@@ -308,14 +308,14 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
         def close(self) -> None:
             calls["closed"] = True
 
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
 
     result = _run_root(
         raw_cls,
         instance,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="friendly-name",
         max_parallel_nodes=4,
         max_active_provider_calls=9,
@@ -324,12 +324,12 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
 
     assert result.status == AppRunStatus.SUCCEEDED
     init = cast(dict[str, object], calls["init"])
-    assert init["workflow"] is workflow
+    assert init["graph"] is workflow
     assert init["execution_run_id"] == RUN_ID
     assert init["deployment"] == DEPLOYMENT
     assert init["volume_root"] == tmp_path
-    assert init["workflow_volume_name"] == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
-    assert init["workflow_volume"] is volume
+    assert init["artifact_volume_name"] == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
+    assert init["artifact_volume"] is volume
     assert init["max_parallel_nodes"] == 4
     assert init["max_active_provider_calls"] == 9
     assert init["max_active_gpu_provider_calls"] == 3
@@ -342,14 +342,14 @@ def test_coordinator_binds_parameterized_identity_and_persists_plan(
     assert volume.reload_count == 1
     assert volume.commit_count == 0
 
-    store = WorkflowRunStore(tmp_path, RUN_ID)
-    plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
-    assert isinstance(plan, orchestrator.WorkflowCoordinatorPlan)
-    assert plan.workflow is not workflow
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    plan = pickle.loads(store.read_coordinator_plan())  # noqa: S301
+    assert isinstance(plan, orchestrator.ExecutionCoordinatorPlan)
+    assert plan.graph is not workflow
     assert (
         plan.identity
-        == orchestrator.WorkflowCoordinatorPlan(
-            workflow=workflow,
+        == orchestrator.ExecutionCoordinatorPlan(
+            graph=workflow,
             workload_run_key="friendly-name",
             max_parallel_nodes=4,
             max_active_provider_calls=9,
@@ -364,16 +364,16 @@ def test_prepared_root_is_durable_and_immediately_cancellable(
 ) -> None:
     volume = FakeVolume()
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
-    workflow = Workflow("prepared-root")
+    workflow = ExecutionGraph("prepared-root")
     workflow.add_node(TextNode("must not run"), id="science")
 
     raw_cls.prepare_run._get_raw_f()(
         instance,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="prepared-root",
     )
 
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
     try:
         assert store.execution.get_run(RUN_ID).status == RunStatus.PENDING
     finally:
@@ -393,7 +393,7 @@ def test_coordinator_rejects_a_changed_plan_for_the_same_run(
 
     class FakeRuntime:
         def __init__(self, **_kwargs: object) -> None:
-            self.store = WorkflowRunStore(tmp_path, RUN_ID)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
         def prepare(self, **_kwargs: object) -> None:
             _ = self.store.execution
@@ -404,12 +404,12 @@ def test_coordinator_rejects_a_changed_plan_for_the_same_run(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
     _run_root(
         raw_cls,
         instance,
-        workflow=Workflow("first"),
+        graph=ExecutionGraph("first"),
         workload_run_key="demo",
     )
 
@@ -417,7 +417,7 @@ def test_coordinator_rejects_a_changed_plan_for_the_same_run(
         _run_root(
             raw_cls,
             instance,
-            workflow=Workflow("changed"),
+            graph=ExecutionGraph("changed"),
             workload_run_key="demo",
         )
 
@@ -432,7 +432,7 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
     class FakeRuntime:
         def __init__(self, **kwargs: object) -> None:
             calls.update(kwargs)
-            self.store = WorkflowRunStore(tmp_path, RUN_ID)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
         def prepare(self, **_kwargs: object) -> None:
             _ = self.store.execution
@@ -447,7 +447,7 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
             pass
 
     handle = FakeHandle()
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
     raw_cls, instance = _raw_coordinator(
         monkeypatch,
         tmp_path,
@@ -458,7 +458,7 @@ def test_coordinator_uses_explicit_handles_only_for_development_runs(
     _run_root(
         raw_cls,
         instance,
-        workflow=Workflow("demo"),
+        graph=ExecutionGraph("demo"),
         workload_run_key="demo",
         development_function_handles={"compute": handle},
     )
@@ -482,7 +482,7 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
     class FakeRuntime:
         def __init__(self, **kwargs: object) -> None:
             calls.update(kwargs)
-            self.store = WorkflowRunStore(tmp_path, RUN_ID)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
         def prepare(self, **_kwargs: object) -> None:
             _ = self.store.execution
@@ -496,7 +496,7 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
     raw_cls, instance = _raw_coordinator(
         monkeypatch,
         tmp_path,
@@ -507,7 +507,7 @@ def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
     _run_root(
         raw_cls,
         instance,
-        workflow=Workflow("demo"),
+        graph=ExecutionGraph("demo"),
         workload_run_key="demo",
         strict_external_artifact_checks=True,
         external_artifact_checker_function_name="check_external",
@@ -525,13 +525,13 @@ def test_status_and_terminal_cancel_are_read_only_kernel_views(
 ) -> None:
     volume = FakeVolume()
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(TextNode("complete"), id="write")
 
     result = _run_root(
         raw_cls,
         instance,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="demo",
         development_function_handles={},
     )
@@ -571,7 +571,7 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
         tmp_path,
         volume,
     )
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(TextNode("complete"), id="write")
     workflow.add_node(
         TextNode("refresh"),
@@ -581,7 +581,7 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="demo",
         development_function_handles={},
     )
@@ -613,7 +613,7 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
 
     assert first.status == AppRunStatus.SUCCEEDED
     assert second.status == AppRunStatus.SUCCEEDED
-    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     successor = store.execution.get_run(SUCCESSOR_ID)
     node = store.execution.get_node(SUCCESSOR_ID, "write")
     refreshed = store.execution.get_node(SUCCESSOR_ID, "refresh")
@@ -629,7 +629,7 @@ def test_restart_creates_an_idempotent_successor_from_cached_publications(
     assert str(SUCCESSOR_ID) in refreshed_publication[0].storage.path
     assert (
         store.connection.execute(
-            "SELECT COUNT(*) FROM workflow_node_results"
+            "SELECT COUNT(*) FROM execution_node_results"
         ).fetchone()[0]
         == 2
     )
@@ -646,12 +646,12 @@ def test_launch_restart_prepares_candidate_before_driving(
         tmp_path,
         volume,
     )
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(TextNode("complete", workers=8), id="write")
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="demo",
         max_parallel_nodes=7,
         max_active_provider_calls=8,
@@ -665,28 +665,28 @@ def test_launch_restart_prepares_candidate_before_driving(
         execution_run_id=str(SUCCESSOR_ID),
         deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
     )
-    candidate_workflow = Workflow("demo")
+    candidate_workflow = ExecutionGraph("demo")
     candidate_workflow.add_node(TextNode("complete", workers=2), id="write")
 
     raw_cls.prepare_restart_from._get_raw_f()(
         successor_coordinator,
         predecessor_execution_run_id=str(RUN_ID),
-        workflow=candidate_workflow,
+        graph=candidate_workflow,
         workload_run_key="demo",
         max_parallel_nodes=1,
         max_active_provider_calls=3,
         max_active_gpu_provider_calls=2,
     )
 
-    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     successor = store.execution.get_run(SUCCESSOR_ID)
     assert successor.predecessor_execution_run_id == RUN_ID
     assert successor.deployment == SUCCESSOR_DEPLOYMENT
     assert successor.max_active_provider_calls == 3
     assert successor.max_active_gpu_provider_calls == 2
-    successor_plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
+    successor_plan = pickle.loads(store.read_coordinator_plan())  # noqa: S301
     assert successor_plan.max_parallel_nodes == 1
-    successor_node = successor_plan.workflow.validate().nodes["write"].node
+    successor_node = successor_plan.graph.validate().nodes["write"].node
     assert successor_node.workers == 2
     assert getattr(successor_coordinator, "_runtime", None) is None
     store.close()
@@ -706,12 +706,12 @@ def test_generic_restart_prepares_successor_before_driving(
         tmp_path,
         volume,
     )
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(TextNode("complete"), id="write")
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="demo",
         development_function_handles={},
     )
@@ -731,10 +731,10 @@ def test_generic_restart_prepares_successor_before_driving(
         predecessor_deployment_version=DEPLOYMENT.deployment_version,
     )
 
-    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     assert store.execution.get_run(SUCCESSOR_ID).predecessor_execution_run_id == RUN_ID
     assert load_execution_launch(tmp_path, SUCCESSOR_ID) == RUN_ID
-    successor_plan = pickle.loads(store.read_workflow_plan())  # noqa: S301
+    successor_plan = pickle.loads(store.read_coordinator_plan())  # noqa: S301
     assert getattr(successor_coordinator, "_runtime", None) is None
     store.close()
 
@@ -742,7 +742,7 @@ def test_generic_restart_prepares_successor_before_driving(
         tmp_path / ".biomodals" / "execution" / "runs" / str(SUCCESSOR_ID) / "launch"
     )
     launch_path.unlink()
-    predecessor_store = WorkflowRunStore(tmp_path, RUN_ID)
+    predecessor_store = GraphExecutionRunStore(tmp_path, RUN_ID)
     predecessor = predecessor_store.execution.get_run(RUN_ID)
     predecessor_store.close()
     wrong_predecessor = replace(
@@ -782,16 +782,16 @@ def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
         tmp_path,
         volume,
     )
-    predecessor_workflow = Workflow("demo")
+    predecessor_workflow = ExecutionGraph("demo")
     predecessor_workflow.add_node(TextNode("original"), id="write")
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=predecessor_workflow,
+        graph=predecessor_workflow,
         workload_run_key="demo",
         development_function_handles={},
     )
-    candidate_workflow = Workflow("demo")
+    candidate_workflow = ExecutionGraph("demo")
     candidate_workflow.add_node(TextNode("changed"), id="write")
     raw_cls, successor_coordinator = _raw_coordinator(
         monkeypatch,
@@ -805,11 +805,11 @@ def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
         raw_cls.prepare_restart_from._get_raw_f()(
             successor_coordinator,
             predecessor_execution_run_id=str(RUN_ID),
-            workflow=candidate_workflow,
+            graph=candidate_workflow,
             workload_run_key="demo",
         )
 
-    assert not WorkflowRunStore(tmp_path, SUCCESSOR_ID).ledger_path.exists()
+    assert not GraphExecutionRunStore(tmp_path, SUCCESSOR_ID).ledger_path.exists()
 
 
 def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
@@ -822,12 +822,12 @@ def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
         tmp_path,
         volume,
     )
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(TextNode("unchanged"), id="write")
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="original",
         development_function_handles={},
     )
@@ -843,13 +843,13 @@ def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
         raw_cls.prepare_restart_from._get_raw_f()(
             successor_coordinator,
             predecessor_execution_run_id=str(RUN_ID),
-            workflow=workflow,
+            graph=workflow,
             workload_run_key="changed",
         )
 
-    successor_store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    successor_store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     assert not successor_store.ledger_path.exists()
-    assert not successor_store.workflow_plan_path.exists()
+    assert not successor_store.coordinator_plan_path.exists()
 
 
 def test_restart_reuses_successful_task_publications_from_partial_node(
@@ -868,7 +868,7 @@ def test_restart_reuses_successful_task_publications_from_partial_node(
         tmp_path,
         volume,
     )
-    workflow = Workflow("fanout")
+    workflow = ExecutionGraph("fanout")
     workflow.add_node(
         FanoutNode(("alpha", "beta")),
         id="fanout",
@@ -878,7 +878,7 @@ def test_restart_reuses_successful_task_publications_from_partial_node(
     predecessor_result = _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="fanout",
     )
 
@@ -910,7 +910,7 @@ def test_restart_reuses_successful_task_publications_from_partial_node(
 
     assert successor_result.status == AppRunStatus.SUCCEEDED
     assert successor_driver.spawned == ["candidate-1"]
-    store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     cached = store.execution.get_task(SUCCESSOR_ID, "fanout", "candidate-0")
     repaired = store.execution.get_task(SUCCESSOR_ID, "fanout", "candidate-1")
     assert cached.result_provenance == ResultProvenance.CACHE
@@ -931,16 +931,16 @@ def test_restart_recomputes_a_missing_predecessor_publication(
         tmp_path,
         volume,
     )
-    workflow = Workflow("demo")
+    workflow = ExecutionGraph("demo")
     workflow.add_node(TextNode("replacement"), id="write")
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="demo",
         development_function_handles={},
     )
-    predecessor_store = WorkflowRunStore(tmp_path, RUN_ID)
+    predecessor_store = GraphExecutionRunStore(tmp_path, RUN_ID)
     publication = predecessor_store.artifacts.load_node_output_artifacts("write")[0]
     predecessor_store.close()
     (tmp_path / publication.storage.path).unlink()
@@ -962,7 +962,7 @@ def test_restart_recomputes_a_missing_predecessor_publication(
     )
 
     assert result.status == AppRunStatus.SUCCEEDED
-    successor_store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    successor_store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     node = successor_store.execution.get_node(SUCCESSOR_ID, "write")
     task = successor_store.execution.get_task(SUCCESSOR_ID, "write", "node")
     publication = successor_store.artifacts.load_node_output_artifacts("write")[0]
@@ -987,7 +987,7 @@ def test_restart_repairs_missing_ranked_structure_behind_ppiflow_report(
         tmp_path,
         volume,
     )
-    workflow = Workflow("report-boundary")
+    workflow = ExecutionGraph("report-boundary")
     rank = workflow.add_node(
         RankedScientificNode("ATOM\n"),
         id="rank",
@@ -1003,11 +1003,11 @@ def test_restart_repairs_missing_ranked_structure_behind_ppiflow_report(
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=workflow,
+        graph=workflow,
         workload_run_key="report-boundary",
         development_function_handles={},
     )
-    predecessor_store = WorkflowRunStore(tmp_path, RUN_ID)
+    predecessor_store = GraphExecutionRunStore(tmp_path, RUN_ID)
     publication = next(
         artifact
         for artifact in predecessor_store.artifacts.load_node_output_artifacts("rank")
@@ -1034,7 +1034,7 @@ def test_restart_repairs_missing_ranked_structure_behind_ppiflow_report(
     )
 
     assert result.status == AppRunStatus.SUCCEEDED
-    successor_store = WorkflowRunStore(tmp_path, SUCCESSOR_ID)
+    successor_store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
     rank_task = successor_store.execution.get_task(
         SUCCESSOR_ID,
         "rank",
@@ -1069,7 +1069,7 @@ def test_restart_rejects_a_mismatched_predecessor_deployment(
     _run_root(
         raw_cls,
         predecessor_coordinator,
-        workflow=Workflow("demo"),
+        graph=ExecutionGraph("demo"),
         workload_run_key="demo",
         development_function_handles={},
     )
@@ -1097,7 +1097,7 @@ def test_status_does_not_create_state_for_an_unknown_run(
     tmp_path: Path,
 ) -> None:
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, FakeVolume())
-    store = WorkflowRunStore(tmp_path, RUN_ID)
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
     with pytest.raises(ExecutionRunNotFoundError):
         raw_cls.status._get_raw_f()(instance)
@@ -1111,17 +1111,17 @@ def test_resume_reloads_the_persisted_plan(
 ) -> None:
     calls: dict[str, object] = {}
     volume = FakeVolume()
-    plan = orchestrator.WorkflowCoordinatorPlan(
-        workflow=Workflow("demo"),
+    plan = orchestrator.ExecutionCoordinatorPlan(
+        graph=ExecutionGraph("demo"),
         workload_run_key="friendly-name",
     )
-    store = WorkflowRunStore(tmp_path, RUN_ID)
-    store.write_workflow_plan(pickle.dumps(plan))
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    store.write_coordinator_plan(pickle.dumps(plan))
     with store.transaction():
         store.execution.create_run(
             execution_run_id=RUN_ID,
             plan=orchestrator.execution_plan(
-                plan.workflow.validate(),
+                plan.graph.validate(),
                 workload_run_key=plan.workload_run_key,
             ),
             deployment=DEPLOYMENT,
@@ -1141,7 +1141,7 @@ def test_resume_reloads_the_persisted_plan(
     class FakeRuntime:
         def __init__(self, **kwargs: object) -> None:
             calls["init"] = kwargs
-            self.store = WorkflowRunStore(tmp_path, RUN_ID)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
 
         def resume(
             self,
@@ -1154,7 +1154,7 @@ def test_resume_reloads_the_persisted_plan(
         def close(self) -> None:
             calls["closed"] = True
 
-    monkeypatch.setattr(orchestrator, "WorkflowRuntime", FakeRuntime)
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
 
     result = raw_cls.resume._get_raw_f()(instance)
@@ -1194,8 +1194,8 @@ def test_existing_runtime_installs_strict_checker_before_drive(
 
     runtime = FakeRuntime()
     instance._runtime = runtime
-    plan = orchestrator.WorkflowCoordinatorPlan(
-        workflow=Workflow("demo"),
+    plan = orchestrator.ExecutionCoordinatorPlan(
+        graph=ExecutionGraph("demo"),
         workload_run_key="demo",
         strict_external_artifact_checks=True,
         external_artifact_checker_function_name="check_outputs",
@@ -1220,7 +1220,7 @@ def test_drive_keeps_runtime_open_for_concurrent_callback(
         tmp_path,
         FakeVolume(),
     )
-    plan = orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo")
+    plan = orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo")
     callback_attached = Event()
     release_callback = Event()
 
@@ -1307,7 +1307,7 @@ def test_workflow_cancel_does_not_start_a_second_driver(
 ) -> None:
     """Concurrent cancellation leaves exactly one workflow drive owner."""
     raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, FakeVolume())
-    plan = orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo")
+    plan = orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo")
 
     class FakeRuntime:
         def __init__(self) -> None:
@@ -1413,24 +1413,24 @@ def test_coordinator_rejects_invalid_parameterized_identity(
 
 
 def test_coordinator_plan_rejects_invalid_workflow_or_limits() -> None:
-    with pytest.raises(TypeError, match="Workflow object"):
-        orchestrator.WorkflowCoordinatorPlan(
+    with pytest.raises(TypeError, match="ExecutionGraph object"):
+        orchestrator.ExecutionCoordinatorPlan(
             cast(Any, {"nodes": []}),
             "demo",
         )
     with pytest.raises(ValueError, match="positive"):
-        orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo", 0)
+        orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo", 0)
     with pytest.raises(ValueError, match="max_parallel_nodes"):
-        orchestrator.WorkflowCoordinatorPlan(
-            Workflow("demo"),
+        orchestrator.ExecutionCoordinatorPlan(
+            ExecutionGraph("demo"),
             "demo",
             max_parallel_nodes=0,
         )
     with pytest.raises(ValueError, match="between zero"):
-        orchestrator.WorkflowCoordinatorPlan(Workflow("demo"), "demo", 2, 3)
+        orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo", 2, 3)
     with pytest.raises(ValueError, match="checker function"):
-        orchestrator.WorkflowCoordinatorPlan(
-            Workflow("demo"),
+        orchestrator.ExecutionCoordinatorPlan(
+            ExecutionGraph("demo"),
             "demo",
             strict_external_artifact_checks=True,
         )

@@ -15,10 +15,10 @@ from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     StorageKind,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
@@ -182,8 +182,8 @@ def test_volume_path_rejects_absolute_and_traversal_paths() -> None:
             VolumePath(volume_name="Workflow-outputs", path=unsafe_path)
 
 
-def test_workflow_artifact_is_volume_backed() -> None:
-    artifact = WorkflowArtifact(
+def test_execution_artifact_is_volume_backed() -> None:
+    artifact = ExecutionArtifact(
         artifact_id="art-packed",
         producing_node_id="packed",
         kind=ArtifactKind.STRUCTURES,

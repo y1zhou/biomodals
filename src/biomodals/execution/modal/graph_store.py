@@ -7,13 +7,13 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from biomodals.execution.modal.host import ExecutionRunStore
 from biomodals.execution.artifact_store import (
-    WORKFLOW_ARTIFACT_TABLES,
-    WorkflowArtifactStore,
+    EXECUTION_ARTIFACT_TABLES,
+    ExecutionArtifactStore,
 )
+from biomodals.execution.modal.host import ExecutionRunStore
 
-WORKFLOW_PLAN_FILENAME = "workflow-plan.pkl"
+COORDINATOR_PLAN_FILENAME = "workflow-plan.pkl"
 _LEGACY_TABLES = {
     "artifact_files",
     "artifacts",
@@ -23,15 +23,22 @@ _LEGACY_TABLES = {
     "nodes",
     "remote_calls",
     "runs",
+    "workflow_artifact_files",
+    "workflow_artifacts",
+    "workflow_node_inputs",
+    "workflow_node_outputs",
+    "workflow_node_results",
+    "workflow_task_outputs",
+    "workflow_task_results",
 }
 
 
-class UnsupportedWorkflowRunStoreError(RuntimeError):
-    """Raised when a workflow ledger predates the execution-kernel cutover."""
+class UnsupportedGraphRunStoreError(RuntimeError):
+    """Raised when a graph ledger predates the execution-kernel cutover."""
 
 
-class WorkflowRunStore(ExecutionRunStore):
-    """Own one workflow Run's paths, connection, and transaction boundary."""
+class GraphExecutionRunStore(ExecutionRunStore):
+    """Own one graph Run's paths, connection, and artifact boundary."""
 
     def __init__(
         self,
@@ -42,49 +49,49 @@ class WorkflowRunStore(ExecutionRunStore):
     ) -> None:
         """Select paths using only the opaque Execution Run identity."""
         super().__init__(volume_root, execution_run_id, lock=lock)
-        self._artifacts: WorkflowArtifactStore | None = None
+        self._artifacts: ExecutionArtifactStore | None = None
 
     @property
-    def workflow_plan_path(self) -> Path:
-        """Return the trusted internal workflow-plan path."""
-        return self.state_root / WORKFLOW_PLAN_FILENAME
+    def coordinator_plan_path(self) -> Path:
+        """Return the trusted internal coordinator-plan path."""
+        return self.state_root / COORDINATOR_PLAN_FILENAME
 
     @property
     def output_root(self) -> Path:
-        """Return the separate workflow-owned scientific output directory."""
+        """Return the separate execution-owned scientific output directory."""
         return self.volume_root / "workflow-runs" / str(self.execution_run_id)
 
     @property
-    def artifacts(self) -> WorkflowArtifactStore:
-        """Return workflow artifact storage on the active connection."""
+    def artifacts(self) -> ExecutionArtifactStore:
+        """Return execution artifact storage on the active connection."""
         with self._lock:
             self._connect()
             if self._artifacts is None:
-                raise RuntimeError("Workflow artifact store was not initialized")
+                raise RuntimeError("Execution artifact store was not initialized")
             return self._artifacts
 
-    def write_workflow_plan(self, content: bytes) -> None:
-        """Atomically create the immutable workflow plan for this Run."""
+    def write_coordinator_plan(self, content: bytes) -> None:
+        """Atomically create the immutable coordinator plan for this Run."""
         if not content:
-            raise ValueError("workflow plan cannot be empty")
+            raise ValueError("coordinator plan cannot be empty")
         with self._lock:
-            if self.workflow_plan_path.exists():
-                raise FileExistsError(str(self.workflow_plan_path))
+            if self.coordinator_plan_path.exists():
+                raise FileExistsError(str(self.coordinator_plan_path))
             self.state_root.mkdir(parents=True, exist_ok=True)
-            temporary_path = self.workflow_plan_path.with_suffix(".pkl.tmp")
+            temporary_path = self.coordinator_plan_path.with_suffix(".pkl.tmp")
             temporary_path.write_bytes(content)
-            temporary_path.replace(self.workflow_plan_path)
+            temporary_path.replace(self.coordinator_plan_path)
 
-    def read_workflow_plan(self) -> bytes:
-        """Read the trusted internal workflow plan for this Run."""
+    def read_coordinator_plan(self) -> bytes:
+        """Read the trusted internal coordinator plan for this Run."""
         with self._lock:
-            return self.workflow_plan_path.read_bytes()
+            return self.coordinator_plan_path.read_bytes()
 
     def _initialize_additional_schema(self, connection: sqlite3.Connection) -> None:
-        """Initialize workflow-owned tables on the shared connection."""
+        """Initialize execution-owned artifact tables on the connection."""
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._reject_legacy_schema(connection)
-        artifacts = WorkflowArtifactStore(connection)
+        artifacts = ExecutionArtifactStore(connection)
         artifacts.initialize_schema()
         self._artifacts = artifacts
 
@@ -97,13 +104,12 @@ class WorkflowRunStore(ExecutionRunStore):
             )
         }
         legacy = tables & _LEGACY_TABLES
-        partial_artifacts = tables & set(WORKFLOW_ARTIFACT_TABLES)
+        partial_artifacts = tables & set(EXECUTION_ARTIFACT_TABLES)
         if legacy or (
-            partial_artifacts and partial_artifacts != set(WORKFLOW_ARTIFACT_TABLES)
+            partial_artifacts and partial_artifacts != set(EXECUTION_ARTIFACT_TABLES)
         ):
-            raise UnsupportedWorkflowRunStoreError(
-                "Unsupported pre-kernel workflow ledger; initialize a fresh "
-                "Execution Run"
+            raise UnsupportedGraphRunStoreError(
+                "Unsupported pre-kernel graph ledger; initialize a fresh Execution Run"
             )
 
     def _close(self) -> None:

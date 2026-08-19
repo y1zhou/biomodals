@@ -24,21 +24,20 @@ import modal
 from biomodals.app.bioinfo import gromacs_app
 from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
 from biomodals.execution import (
-    AppBackedNode,
+    CoordinatorNode,
     DeploymentIdentity,
+    ExecutionGraph,
     NodeHandle,
     NodeRunContext,
-    RemoteNodeCall,
-    RemoteWorkflowNode,
-    Workflow,
-    WorkflowNativeNode,
-    republish_workflow_artifact,
+    ProviderCallSpec,
+    ProviderNode,
+    republish_execution_artifact,
 )
 from biomodals.execution.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
-from biomodals.execution.graph_plan import app_scientific_version
+from biomodals.execution.definition_plan import app_scientific_version
 from biomodals.execution.modal import (
     execution_lineage_root,
     orchestrator,
@@ -57,9 +56,9 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow.display import print_workflow_dag
 
@@ -99,12 +98,14 @@ GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
     timeout=CONF.timeout,
     volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
 )
-def check_shortmd_external_artifact(artifact: WorkflowArtifact) -> ArtifactAvailability:
+def check_shortmd_external_artifact(
+    artifact: ExecutionArtifact,
+) -> ArtifactAvailability:
     """Validate ShortMD artifacts stored in the GROMACS output volume."""
     GROMACS_OUTPUT_VOLUME.reload()
     return check_external_artifact_status(
         artifact,
-        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        artifact_volume_name=orchestrator.OUT_VOLUME_NAME,
         volume_roots={GROMACS_OUTPUT_VOLUME_NAME: GROMACS_OUTPUT_MOUNTPOINT},
     )
 
@@ -304,15 +305,15 @@ def analyze_shortmd_gromacs_run(
 
 
 @dataclass
-class ShortMDClearNode(RemoteWorkflowNode):
+class ShortMDClearNode(ProviderNode):
     """Tracked cleanup step used before a forced GROMACS preparation."""
 
     run_name: str
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare cleanup work for kernel submission."""
         safe_run_name = sanitize_filename(self.run_name)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="clear_shortmd_gromacs_run",
             uses_gpu=False,
             kwargs={"run_name": safe_run_name},
@@ -330,7 +331,7 @@ class ShortMDClearNode(RemoteWorkflowNode):
 
 
 @dataclass
-class ShortMDPrepNode(AppBackedNode):
+class ShortMDPrepNode(ProviderNode):
     """Workflow node that prepares one PDB for GROMACS production replicates."""
 
     pdb_content: bytes
@@ -354,12 +355,12 @@ class ShortMDPrepNode(AppBackedNode):
     def _metadata(self) -> dict[str, str]:
         return {"stage": "prep", "run_name": sanitize_filename(self.run_name)}
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare GROMACS preparation for kernel submission."""
         function_name = (
             "prepare_tpr_cpu" if self.gromacs.cpu_only else "prepare_tpr_gpu"
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name=function_name,
             uses_gpu=not self.gromacs.cpu_only,
             kwargs=self._app_kwargs(),
@@ -393,7 +394,7 @@ class ShortMDPrepNode(AppBackedNode):
 
 
 @dataclass
-class ShortMDCloneNode(RemoteWorkflowNode):
+class ShortMDCloneNode(ProviderNode):
     """Workflow-native adapter that clones prepared inputs for one replicate."""
 
     source_run_name: str
@@ -433,10 +434,10 @@ class ShortMDCloneNode(RemoteWorkflowNode):
             },
         )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare clone file-management work for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="clone_prepared_shortmd_run",
             uses_gpu=False,
             kwargs=kwargs,
@@ -475,7 +476,7 @@ class ShortMDCloneNode(RemoteWorkflowNode):
 
 
 @dataclass
-class ShortMDReplicateNode(AppBackedNode):
+class ShortMDReplicateNode(ProviderNode):
     """Workflow node that runs one short production replicate through GROMACS."""
 
     source_run_name: str
@@ -517,13 +518,13 @@ class ShortMDReplicateNode(AppBackedNode):
             },
         )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare GROMACS production for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
         function_name = (
             "production_run_cpu" if self.gromacs.cpu_only else "production_run_gpu"
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name=function_name,
             uses_gpu=not self.gromacs.cpu_only,
             kwargs=kwargs,
@@ -570,14 +571,14 @@ class ShortMDReplicateNode(AppBackedNode):
 
 
 @dataclass
-class ShortMDAnalysisNode(AppBackedNode):
+class ShortMDAnalysisNode(ProviderNode):
     """Workflow node that analyzes one completed production trajectory."""
 
     source_run_name: str
     replicate_run_name: str
     gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare GROMACS analysis for kernel submission."""
         production_artifacts = context.inputs.get("production") or []
         if len(production_artifacts) != 1:
@@ -596,7 +597,7 @@ class ShortMDAnalysisNode(AppBackedNode):
         safe_replicate_run_name = sanitize_filename(
             str(artifact.metadata.get("run_name") or self.replicate_run_name)
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="analyze_shortmd_gromacs_run",
             uses_gpu=False,
             kwargs={
@@ -609,7 +610,7 @@ class ShortMDAnalysisNode(AppBackedNode):
 
 
 @dataclass
-class ShortMDSummaryNode(WorkflowNativeNode):
+class ShortMDSummaryNode(CoordinatorNode):
     """Workflow-native node that emits a manifest of production replicates."""
 
     replicates: int
@@ -660,7 +661,7 @@ class ShortMDSummaryNode(WorkflowNativeNode):
                         "max_parallel": str(self.max_parallel),
                     },
                 ),
-                *(republish_workflow_artifact(artifact) for artifact in artifacts),
+                *(republish_execution_artifact(artifact) for artifact in artifacts),
             ],
         )
 
@@ -692,11 +693,11 @@ def build_shortmd_workflow(
     genion_seed: int = 0,
     max_parallel: int = 16,
     overwrite_existing: bool = False,
-) -> Workflow:
+) -> ExecutionGraph:
     """Build a ShortMD workflow DAG from local PDB payloads."""
     if replicates < 1:
         raise ValueError("replicates must be at least 1")
-    workflow = Workflow(
+    workflow = ExecutionGraph(
         "shortmd",
         scientific_versions={
             "biomodals.workflow.shortmd": _SCIENTIFIC_SCHEMA_VERSION,
@@ -929,7 +930,7 @@ def submit_shortmd_workflow(
         use_deployed_coordinator=use_deployed_coordinator,
     )
     orchestrator_kwargs = {
-        "workflow": workflow,
+        "graph": workflow,
         "workload_run_key": resolved_run_id,
         "max_parallel_nodes": total_limit,
         "max_active_provider_calls": total_limit,

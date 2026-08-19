@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.bioinfo import gromacs_app
-from biomodals.execution.graph_plan import execution_plan
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import persist_execution_launch
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.helper.styling import strip_ansi
@@ -22,9 +22,9 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow import shortmd_workflow
 from biomodals.workflow.shortmd_workflow import (
@@ -47,7 +47,7 @@ def _context(
     tmp_path: Path,
     *,
     node_id: str,
-    inputs: dict[str, list[WorkflowArtifact]] | None = None,
+    inputs: dict[str, list[ExecutionArtifact]] | None = None,
 ) -> NodeRunContext:
     return NodeRunContext(
         execution_run_id=RUN_ID,
@@ -460,7 +460,7 @@ def test_shortmd_clone_node_prepares_kernel_call_and_processes_result(
         node_id="clone-source-r001",
         inputs={
             "prepared": [
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="source",
                     producing_node_id="prep-source",
                     kind=ArtifactKind.DIRECTORY,
@@ -524,7 +524,7 @@ def test_shortmd_clone_node_does_not_submit_during_preparation(
             node_id="clone-source-r001",
             inputs={
                 "prepared": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="source",
                         producing_node_id="prep-source",
                         kind=ArtifactKind.DIRECTORY,
@@ -565,7 +565,7 @@ def test_shortmd_replicate_node_prepares_and_publishes_raw_production(
         node_id="replicate-source-r001",
         inputs={
             "cloned": [
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="source-r001",
                     producing_node_id="clone-source-r001",
                     kind=ArtifactKind.DIRECTORY,
@@ -626,7 +626,7 @@ def test_shortmd_replicate_node_selects_cpu_function(
             node_id="replicate-source-r001",
             inputs={
                 "cloned": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="source-r001",
                         producing_node_id="clone-source-r001",
                         kind=ArtifactKind.DIRECTORY,
@@ -672,7 +672,7 @@ def test_shortmd_analysis_node_prepares_and_publishes_analyzed_output(
             node_id="analysis-source-r001",
             inputs={
                 "production": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="source-r001",
                         producing_node_id="replicate-source-r001",
                         kind=ArtifactKind.DIRECTORY,
@@ -779,7 +779,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
         node_id="summary",
         inputs={
             "alpha-r001": [
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="alpha-r001",
                     producing_node_id="replicate-alpha-r001",
                     kind=ArtifactKind.DIRECTORY,
@@ -795,7 +795,7 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
                 )
             ],
             "alpha-r002": [
-                WorkflowArtifact(
+                ExecutionArtifact(
                     artifact_id="alpha-r002",
                     producing_node_id="replicate-alpha-r002",
                     kind=ArtifactKind.DIRECTORY,
@@ -896,8 +896,8 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
         max_gpu_containers=2,
     )
 
-    assert calls["prepare"]["workflow"].name == "shortmd"
-    definition = calls["prepare"]["workflow"].validate()
+    assert calls["prepare"]["graph"].name == "shortmd"
+    definition = calls["prepare"]["graph"].validate()
     suffix = str(calls["coordinator"]["execution_run_id"]).replace("-", "")
     run_name = f"shortmd-run-{suffix}-alpha"
     prep_node = definition.nodes[f"prep-{run_name}"].node
@@ -1094,7 +1094,7 @@ def test_submit_shortmd_workflow_uses_successor_operation_for_restart(
 
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "shortmd-run"
-    assert calls["prepare"]["workflow"].name == "shortmd"
+    assert calls["prepare"]["graph"].name == "shortmd"
     assert calls["drive"] == {"development_function_handles": None}
     assert shortmd_workflow.execution_lineage_root(
         _fake_workflow_output_volume,
@@ -1189,7 +1189,7 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
         wait=False,
     )
 
-    definition = calls["prepare"]["workflow"].validate()
+    definition = calls["prepare"]["graph"].validate()
     run_name = "shortmd-run-11111111222233334444555555555555-alpha"
     clear_node = definition.nodes[f"clear-{run_name}"].node
     clone_node = definition.nodes[f"clone-{run_name}-r001"].node

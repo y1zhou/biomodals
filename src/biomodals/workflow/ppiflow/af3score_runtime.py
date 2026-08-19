@@ -24,8 +24,8 @@ from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
-    WorkflowArtifact,
 )
 from biomodals.workflow.ppiflow import manifests, staging, tables
 from biomodals.workflow.ppiflow.runtime_context import (
@@ -46,8 +46,8 @@ from biomodals.workflow.ppiflow.runtime_support import (
 
 def prepare_ppiflow_af3score_stage(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None = None,
     config: dict[str, object],
     step_name: str,
     execution_run_name: str,
@@ -194,7 +194,7 @@ def run_ppiflow_af3score_batch(
 
 def postprocess_ppiflow_af3score_stage(
     *,
-    plan_artifacts: list[WorkflowArtifact],
+    plan_artifacts: list[ExecutionArtifact],
     task_keys: list[str],
     step_name: str,
     run_id: str,
@@ -335,8 +335,8 @@ def postprocess_ppiflow_af3score_stage(
 
 def _stage_candidate_inputs(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None,
     execution_run_name: str,
     patterns: Sequence[str] | None = None,
     max_files: int | None = None,
@@ -460,7 +460,7 @@ def _plan_artifact(plan: Mapping[str, object]) -> AppOutput:
 
 
 def _read_plan_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
 ) -> dict[str, object]:
     if len(artifacts) != 1:
         raise ValueError(f"Expected one AF3Score task plan, found {len(artifacts)}")

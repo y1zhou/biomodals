@@ -1,7 +1,7 @@
 """FlowPacker task implementation for the PPIFlow workflow."""
 
 from biomodals.app.fold import flowpacker_app
-from biomodals.schema import AppRunResult, WorkflowArtifact
+from biomodals.schema import AppRunResult, ExecutionArtifact
 from biomodals.workflow.ppiflow import staging
 from biomodals.workflow.ppiflow.runtime_context import (
     SOURCE_VOLUME_ROOTS,
@@ -15,7 +15,7 @@ from biomodals.workflow.ppiflow.runtime_support import (
 
 def run_ppiflow_flowpacker_stage(
     *,
-    artifacts: list[WorkflowArtifact],
+    artifacts: list[ExecutionArtifact],
     config: dict[str, object],
     run_name: str,
 ) -> AppRunResult:

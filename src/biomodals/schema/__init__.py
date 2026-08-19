@@ -1,13 +1,13 @@
-"""Shared Pydantic contracts for Biomodals apps and workflows."""
+"""Shared Pydantic contracts for Biomodals workloads."""
 
 from biomodals.schema.app import AppConfig, AppOutput, AppRunResult, AppRunStatus
-from biomodals.schema.storage import InlineBytes, StorageKind, VolumePath
-from biomodals.schema.workflow import (
+from biomodals.schema.execution import (
     ArtifactFile,
     ArtifactKind,
     ArtifactSelector,
-    WorkflowArtifact,
+    ExecutionArtifact,
 )
+from biomodals.schema.storage import InlineBytes, StorageKind, VolumePath
 
 __all__ = [
     "AppConfig",
@@ -17,8 +17,8 @@ __all__ = [
     "ArtifactFile",
     "ArtifactKind",
     "ArtifactSelector",
+    "ExecutionArtifact",
     "InlineBytes",
     "StorageKind",
     "VolumePath",
-    "WorkflowArtifact",
 ]

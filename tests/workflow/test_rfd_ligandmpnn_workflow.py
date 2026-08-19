@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
-from biomodals.execution.graph_plan import execution_plan
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
@@ -21,9 +21,9 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow import rfd_ligandmpnn_workflow
@@ -58,7 +58,7 @@ RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 def _context(
     *,
     node_id: str = "node",
-    inputs: dict[str, list[WorkflowArtifact]] | None = None,
+    inputs: dict[str, list[ExecutionArtifact]] | None = None,
     tmp_path: Path,
 ) -> NodeRunContext:
     return NodeRunContext(
@@ -70,15 +70,15 @@ def _context(
         cache_dir=tmp_path / "cache",
         inputs=inputs or {},
         volume_root=tmp_path,
-        workflow_volume_name="workflow-volume",
+        artifact_volume_name="workflow-volume",
     )
 
 
-def _selected_rfd_artifact(tmp_path: Path) -> WorkflowArtifact:
+def _selected_rfd_artifact(tmp_path: Path) -> ExecutionArtifact:
     selected_path = tmp_path / "selected" / "demo-rfd001_0.pdb"
     selected_path.parent.mkdir(parents=True, exist_ok=True)
     selected_path.write_bytes(b"ATOM\n")
-    return WorkflowArtifact(
+    return ExecutionArtifact(
         artifact_id="selected-rfd-design",
         producing_node_id="select-demo-rfd001-d000",
         kind=ArtifactKind.STRUCTURES,
@@ -404,7 +404,7 @@ def test_rfd_selection_node_prepares_tracked_provider_call(tmp_path: Path) -> No
         rfd_run_name="demo-rfd001",
         design_index=0,
     )
-    rfd_artifact = WorkflowArtifact(
+    rfd_artifact = ExecutionArtifact(
         artifact_id="rfd-output",
         producing_node_id="rfd-demo-rfd001",
         kind=ArtifactKind.DIRECTORY,
@@ -508,7 +508,7 @@ def test_rfd_ligandmpnn_summary_reports_design_artifacts(tmp_path: Path) -> None
         num_rfdiffusion_designs=2,
         max_parallel=4,
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="mpnn-output",
         producing_node_id="ligandmpnn-demo-rfd001-d000",
         kind=ArtifactKind.ARCHIVE,
@@ -591,8 +591,8 @@ def test_submit_rfd_ligandmpnn_workflow_uses_orchestrator_boundary(
         max_gpu_containers=2,
     )
 
-    assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
-    definition = calls["prepare"]["workflow"].validate()
+    assert calls["prepare"]["graph"].name == "rfd_ligandmpnn"
+    definition = calls["prepare"]["graph"].validate()
     rfd_node = definition.nodes["rfd-demo-rfd001"].node
     mpnn_node = definition.nodes["ligandmpnn-demo-rfd001-d000"].node
     assert isinstance(rfd_node, RFdiffusionTrajectoryNode)
@@ -673,7 +673,7 @@ def test_submit_rfd_ligandmpnn_workflow_uses_successor_operation_for_restart(
     assert calls["coordinator"]["deployment"].environment == "main"
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "demo"
-    assert calls["prepare"]["workflow"].name == "rfd_ligandmpnn"
+    assert calls["prepare"]["graph"].name == "rfd_ligandmpnn"
     assert calls["drive"] == {"development_function_handles": None}
 
 

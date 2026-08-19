@@ -7,17 +7,17 @@ from biomodals.execution.artifact_availability import (
     check_external_artifact_status,
     mounted_volume_checker,
 )
-from biomodals.execution.artifacts import republish_workflow_artifact
+from biomodals.execution.artifacts import republish_execution_artifact
 from biomodals.execution.coordinator import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     drive_execution_run,
     resume_execution_run,
 )
-from biomodals.execution.graph import (
+from biomodals.execution.definition import (
+    ExecutionDefinition,
+    ExecutionGraph,
+    ExecutionNodeSpec,
     NodeHandle,
-    Workflow,
-    WorkflowDefinition,
-    WorkflowNodeSpec,
 )
 from biomodals.execution.model import (
     ActiveProviderCallCounts,
@@ -46,16 +46,15 @@ from biomodals.execution.model import (
     WorkStatusReason,
 )
 from biomodals.execution.nodes import (
-    AppBackedNode,
+    CoordinatorNode,
+    ExecutionNode,
     NodeRunContext,
-    RemoteNodeCall,
-    RemotePullTaskWorkflowNode,
-    RemotePullWorkerCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowNode,
-    RemoteWorkflowTask,
-    WorkflowNativeNode,
-    WorkflowNode,
+    ProviderCallSpec,
+    ProviderNode,
+    PullTaskProviderNode,
+    PullWorkerCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
 )
 from biomodals.execution.provider import (
     AsyncProviderDriver,
@@ -85,11 +84,19 @@ from biomodals.execution.sqlite import (
     SqliteExecutionRepository,
     UnsupportedExecutionSchemaVersionError,
 )
+from biomodals.schema import (
+    ArtifactFile,
+    ArtifactKind,
+    ArtifactSelector,
+    ExecutionArtifact,
+)
 
 __all__ = [
     "ActiveProviderCallCounts",
-    "AppBackedNode",
     "ArtifactAvailability",
+    "ArtifactFile",
+    "ArtifactKind",
+    "ArtifactSelector",
     "AvailabilityStatus",
     "AsyncProviderDriver",
     "AsyncExecutionRuntime",
@@ -97,6 +104,8 @@ __all__ = [
     "DeploymentIdentity",
     "DispatchMode",
     "ExecutionNodeRecord",
+    "ExecutionNode",
+    "ExecutionNodeSpec",
     "ExecutionOverview",
     "ExecutionPlan",
     "ExecutionRunNotFoundError",
@@ -121,13 +130,13 @@ __all__ = [
     "ProviderDriver",
     "ProviderSubmissionOutcomeUnknownError",
     "ProviderCallRecord",
+    "ProviderCallSpec",
+    "ProviderNode",
     "PullTaskClaim",
-    "RemoteNodeCall",
-    "RemotePullTaskWorkflowNode",
-    "RemotePullWorkerCall",
-    "RemoteTaskWorkflowNode",
-    "RemoteWorkflowNode",
-    "RemoteWorkflowTask",
+    "PullTaskProviderNode",
+    "PullWorkerCallSpec",
+    "TaskDefinition",
+    "TaskProviderNode",
     "ResultProvenance",
     "RunStatus",
     "RunStatusReason",
@@ -135,11 +144,10 @@ __all__ = [
     "TaskPlan",
     "TaskStatus",
     "WorkerAssignmentRecord",
-    "Workflow",
-    "WorkflowDefinition",
-    "WorkflowNativeNode",
-    "WorkflowNode",
-    "WorkflowNodeSpec",
+    "ExecutionGraph",
+    "ExecutionDefinition",
+    "ExecutionArtifact",
+    "CoordinatorNode",
     "WorkStatusReason",
     "drive_execution_run",
     "check_artifact_availability",
@@ -150,7 +158,7 @@ __all__ = [
     "ready_node_keys",
     "required_node_keys",
     "result_probe_frontier",
-    "republish_workflow_artifact",
+    "republish_execution_artifact",
     "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",

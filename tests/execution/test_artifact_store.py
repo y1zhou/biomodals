@@ -16,8 +16,8 @@ from biomodals.execution import (
     TaskPlan,
 )
 from biomodals.execution.artifact_store import (
-    WORKFLOW_ARTIFACT_TABLES,
-    WorkflowArtifactStore,
+    EXECUTION_ARTIFACT_TABLES,
+    ExecutionArtifactStore,
 )
 from biomodals.schema import (
     AppOutput,
@@ -26,9 +26,9 @@ from biomodals.schema import (
     ArtifactFile,
     ArtifactKind,
     ArtifactSelector,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -49,12 +49,12 @@ EXPECTED_EXECUTION_TABLES = {
 def _stores() -> tuple[
     sqlite3.Connection,
     SqliteExecutionRepository,
-    WorkflowArtifactStore,
+    ExecutionArtifactStore,
 ]:
     connection = sqlite3.connect(":memory:")
     execution = SqliteExecutionRepository(connection)
     execution.initialize_schema()
-    artifacts = WorkflowArtifactStore(connection)
+    artifacts = ExecutionArtifactStore(connection)
     artifacts.initialize_schema()
     connection.commit()
     return connection, execution, artifacts
@@ -93,12 +93,12 @@ def _start_task(execution: SqliteExecutionRepository) -> None:
     )
 
 
-def _publication() -> tuple[AppRunResult, WorkflowArtifact]:
+def _publication() -> tuple[AppRunResult, ExecutionArtifact]:
     storage = VolumePath(
         volume_name="Workflow-outputs",
         path="demo/run/design/model.pdb",
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="design-structure",
         producing_node_id="design",
         kind=ArtifactKind.STRUCTURES,
@@ -178,7 +178,7 @@ def test_artifact_publication_and_task_completion_share_caller_transaction() -> 
     assert execution.get_task(RUN_ID, "design", "node").status.value == "succeeded"
 
 
-def test_schema_contains_shared_execution_and_workflow_artifacts_only() -> None:
+def test_schema_contains_shared_execution_and_execution_artifacts_only() -> None:
     connection, _, _ = _stores()
 
     tables = {
@@ -189,7 +189,7 @@ def test_schema_contains_shared_execution_and_workflow_artifacts_only() -> None:
     }
 
     assert EXPECTED_EXECUTION_TABLES.issubset(tables)
-    assert set(WORKFLOW_ARTIFACT_TABLES).issubset(tables)
+    assert set(EXECUTION_ARTIFACT_TABLES).issubset(tables)
     assert not {"runs", "nodes", "attempts", "remote_calls"} & tables
 
 
@@ -400,7 +400,7 @@ def test_input_links_and_artifact_order_survive_round_trip() -> None:
     input_rows = connection.execute(
         """
         SELECT input_name, ordinal, artifact_id
-        FROM workflow_node_inputs
+        FROM execution_node_inputs
         WHERE node_key = ?
         ORDER BY input_name, ordinal
         """,

@@ -14,8 +14,8 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow.ppiflow import manifests, staging, tables
 from biomodals.workflow.ppiflow.model_validation import (
@@ -92,8 +92,8 @@ def run_ppiflow_design_stage(
 
 def run_ppiflow_partial_candidate(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None,
     candidate_id: str,
     config: dict[str, object],
     step_name: str,
@@ -189,7 +189,7 @@ def _initial_candidate_rows(
             output.storage, VolumePath
         ):
             continue
-        artifact = WorkflowArtifact(
+        artifact = ExecutionArtifact(
             artifact_id=sanitize_filename(output.name),
             producing_node_id=step_name,
             kind=ArtifactKind.STRUCTURES,
@@ -236,7 +236,7 @@ def _initial_candidate_rows(
 
 
 def _fixed_positions_by_candidate(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
     selected_structures: Sequence[staging.CandidateStructureFile],
 ) -> dict[str, str]:
     lookup: dict[str, str] = {}

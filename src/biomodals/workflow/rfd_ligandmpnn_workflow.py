@@ -20,19 +20,19 @@ import modal
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
 from biomodals.execution import (
-    AppBackedNode,
+    CoordinatorNode,
     DeploymentIdentity,
+    ExecutionGraph,
     NodeRunContext,
-    RemoteNodeCall,
-    Workflow,
-    WorkflowNativeNode,
-    republish_workflow_artifact,
+    ProviderCallSpec,
+    ProviderNode,
+    republish_execution_artifact,
 )
 from biomodals.execution.artifact_availability import (
     ArtifactAvailability,
     check_external_artifact_status,
 )
-from biomodals.execution.graph_plan import app_scientific_version
+from biomodals.execution.definition_plan import app_scientific_version
 from biomodals.execution.modal import orchestrator, resolve_provider_call_limits
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.catalog import include_dependency_apps
@@ -44,9 +44,9 @@ from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow.display import print_workflow_dag
 
@@ -86,13 +86,13 @@ RFDIFFUSION_OUTPUT_MOUNTPOINT = rfdiffusion_app.CONF.output_volume_mountpoint
     volumes={RFDIFFUSION_OUTPUT_MOUNTPOINT: RFDIFFUSION_OUTPUT_VOLUME},
 )
 def check_rfd_ligandmpnn_external_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
 ) -> ArtifactAvailability:
     """Validate RFdiffusion artifacts referenced by the workflow runtime."""
     RFDIFFUSION_OUTPUT_VOLUME.reload()
     return check_external_artifact_status(
         artifact,
-        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        artifact_volume_name=orchestrator.OUT_VOLUME_NAME,
         volume_roots={RFDIFFUSION_OUTPUT_VOLUME_NAME: RFDIFFUSION_OUTPUT_MOUNTPOINT},
     )
 
@@ -236,7 +236,7 @@ def select_rfdiffusion_design(
 
 
 @dataclass
-class RFdiffusionTrajectoryNode(AppBackedNode):
+class RFdiffusionTrajectoryNode(ProviderNode):
     """Workflow node that runs one RFdiffusion trajectory."""
 
     pdb_content: bytes
@@ -249,10 +249,10 @@ class RFdiffusionTrajectoryNode(AppBackedNode):
     noise_scale_frame: float = 1.0
     rfd_args: str = ""
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare the RFdiffusion call for kernel submission."""
         safe_run_name = sanitize_filename(self.run_name)
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="rfdiffusion_infer",
             uses_gpu=True,
             kwargs={
@@ -274,13 +274,13 @@ class RFdiffusionTrajectoryNode(AppBackedNode):
 
 
 @dataclass
-class RFdiffusionSelectionNode(AppBackedNode):
+class RFdiffusionSelectionNode(ProviderNode):
     """Select one RFdiffusion design through a tracked provider call."""
 
     rfd_run_name: str
     design_index: int
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare one deterministic RFdiffusion output selection."""
         rfd_artifacts = context.inputs.get("rfd_output") or []
         if len(rfd_artifacts) != 1:
@@ -296,7 +296,7 @@ class RFdiffusionSelectionNode(AppBackedNode):
         run_name = sanitize_filename(
             str(artifact.metadata.get("run_name") or self.rfd_run_name)
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="select_rfdiffusion_design",
             uses_gpu=False,
             kwargs={
@@ -308,7 +308,7 @@ class RFdiffusionSelectionNode(AppBackedNode):
 
 
 @dataclass
-class LigandMPNNDesignNode(AppBackedNode):
+class LigandMPNNDesignNode(ProviderNode):
     """Workflow node that designs sequences for one RFdiffusion output PDB."""
 
     rfd_run_name: str
@@ -326,7 +326,7 @@ class LigandMPNNDesignNode(AppBackedNode):
                 "design"
             )
         selected = selected_artifacts[0]
-        pdb_bytes = context.resolve_workflow_artifact(selected).read_bytes()
+        pdb_bytes = context.resolve_artifact(selected).read_bytes()
         safe_rfd_run_name = sanitize_filename(
             str(selected.metadata.get("rfd_run_name") or self.rfd_run_name)
         )
@@ -341,7 +341,7 @@ class LigandMPNNDesignNode(AppBackedNode):
             },
         )
 
-    def prepare_remote(self, context: NodeRunContext) -> RemoteNodeCall:
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Prepare the LigandMPNN call for kernel submission."""
         pdb_bytes, redesigned_residues, metadata = self._select_ligandmpnn_inputs(
             context
@@ -358,7 +358,7 @@ class LigandMPNNDesignNode(AppBackedNode):
             repack_everything=True,
             redesigned_residues=redesigned_residues,
         )
-        return RemoteNodeCall(
+        return ProviderCallSpec(
             function_name="ligandmpnn_run",
             uses_gpu=True,
             kwargs={
@@ -387,7 +387,7 @@ class LigandMPNNDesignNode(AppBackedNode):
 
 
 @dataclass
-class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
+class RFDLigandMPNNSummaryNode(CoordinatorNode):
     """Workflow-native node that emits a manifest of LigandMPNN design outputs."""
 
     num_rfdiffusion_trajectories: int
@@ -451,7 +451,7 @@ class RFDLigandMPNNSummaryNode(WorkflowNativeNode):
                         "max_parallel": str(self.max_parallel),
                     },
                 ),
-                *(republish_workflow_artifact(artifact) for artifact in artifacts),
+                *(republish_execution_artifact(artifact) for artifact in artifacts),
             ],
         )
 
@@ -484,7 +484,7 @@ def build_rfd_ligandmpnn_workflow(
     noise_scale_frame: float = 1.0,
     rfd_args: str = "",
     max_parallel: int = 16,
-) -> Workflow:
+) -> ExecutionGraph:
     """Build an RFdiffusion to LigandMPNN workflow DAG from one PDB payload."""
     if num_rfdiffusion_trajectories < 1:
         raise ValueError("num_rfdiffusion_trajectories must be at least 1")
@@ -507,7 +507,7 @@ def build_rfd_ligandmpnn_workflow(
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else input_stem
     )
-    workflow = Workflow(
+    workflow = ExecutionGraph(
         "rfd_ligandmpnn",
         scientific_versions={
             "biomodals.workflow.rfd_ligandmpnn": _SCIENTIFIC_SCHEMA_VERSION,
@@ -678,7 +678,7 @@ def submit_rfd_ligandmpnn_workflow(
         use_deployed_coordinator=use_deployed_coordinator,
     )
     orchestrator_kwargs = {
-        "workflow": workflow,
+        "graph": workflow,
         "workload_run_key": resolved_run_id,
         "max_parallel_nodes": total_limit,
         "max_active_provider_calls": total_limit,

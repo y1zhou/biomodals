@@ -26,13 +26,13 @@ from biomodals.app.fold.alphafold3 import (
 )
 from biomodals.execution import (
     NodeRunContext,
+    ProviderNode,
     PullTaskClaim,
-    RemotePullTaskWorkflowNode,
-    RemoteWorkflowNode,
+    PullTaskProviderNode,
     WorkerAssignmentRecord,
     hashing,
 )
-from biomodals.execution.graph_plan import execution_plan
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.helper import shell as shell_helper
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
@@ -41,9 +41,9 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.ppiflow import (
@@ -140,8 +140,8 @@ def _upstream_structure_artifact(
     *,
     kind: ArtifactKind = ArtifactKind.STRUCTURES,
     metadata: dict[str, object] | None = None,
-) -> WorkflowArtifact:
-    return WorkflowArtifact(
+) -> ExecutionArtifact:
+    return ExecutionArtifact(
         artifact_id="upstream-structures",
         producing_node_id="upstream",
         kind=kind,
@@ -580,7 +580,7 @@ def test_ligandmpnn_step_prepares_selected_structures_for_kernel(
 
     submission = node.prepare_remote_task(
         context,
-        ppiflow_workflow.RemoteWorkflowTask(
+        ppiflow_workflow.TaskDefinition(
             task_key="candidate-1",
             scientific_payload={"candidate_id": "candidate-1"},
             execution_payload={"candidate_id": "candidate-1"},
@@ -620,7 +620,7 @@ def test_ligandmpnn_defers_multi_structure_selection_to_tracked_stage(
             cache_dir=tmp_path / "cache",
             inputs={"structures": artifacts},
         ),
-        ppiflow_workflow.RemoteWorkflowTask(
+        ppiflow_workflow.TaskDefinition(
             task_key="candidate-1",
             scientific_payload={"candidate_id": "candidate-1"},
             execution_payload={"candidate_id": "candidate-1"},
@@ -736,7 +736,7 @@ def test_partial_step_prepares_one_kernel_candidate_task(
             cache_dir=tmp_path / "cache",
             inputs={"structures": [_upstream_structure_artifact()]},
         ),
-        ppiflow_workflow.RemoteWorkflowTask(
+        ppiflow_workflow.TaskDefinition(
             task_key="candidate-1",
             scientific_payload={"candidate_id": "candidate-1"},
             execution_payload={"candidate_id": "candidate-1"},
@@ -908,7 +908,7 @@ def test_ligandmpnn_candidate_runs_science_in_kernel_owned_call(
     result = ppiflow_workflow.run_ppiflow_ligandmpnn_candidate.get_raw_f()(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[
-            WorkflowArtifact(
+            ExecutionArtifact(
                 artifact_id="candidate-manifest",
                 producing_node_id="source",
                 kind=ArtifactKind.TABLE,
@@ -1029,7 +1029,7 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
     result = ppiflow_workflow.run_ppiflow_partial_candidate.get_raw_f()(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[
-            WorkflowArtifact(
+            ExecutionArtifact(
                 artifact_id="candidate-manifest",
                 producing_node_id="source",
                 kind=ArtifactKind.TABLE,
@@ -1075,7 +1075,7 @@ def test_supplied_invalid_candidate_manifest_fails_closed(
     _source_root, workflow_root = _local_transform_environment(monkeypatch, tmp_path)
     manifest_path = workflow_root / "broken.parquet"
     manifest_path.write_bytes(b"not parquet")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="broken-manifest",
         producing_node_id="source",
         kind=ArtifactKind.TABLE,
@@ -1175,7 +1175,7 @@ def test_af3score_step_runs_app_sequence_and_returns_metrics_artifact(
         "PPI_FLOW_SOURCE_VOLUME_ROOTS",
         {"workflow-volume": str(tmp_path)},
     )
-    plan_artifact = WorkflowArtifact(
+    plan_artifact = ExecutionArtifact(
         artifact_id="af3score-plan",
         producing_node_id="stage1-af3score-prepare",
         kind=ArtifactKind.TABLE,
@@ -1268,7 +1268,7 @@ def test_af3score_staging_uses_candidate_key_not_full_artifact_path(
     )
 
     artifacts = [
-        WorkflowArtifact(
+        ExecutionArtifact(
             artifact_id="stage1-flowpacker-flowpacker_outputs",
             producing_node_id="stage1-flowpacker",
             kind=ArtifactKind.STRUCTURES,
@@ -1459,7 +1459,7 @@ def test_af3score_postprocess_returns_per_candidate_outcomes(
             ],
         })
     )
-    plan_artifact = WorkflowArtifact(
+    plan_artifact = ExecutionArtifact(
         artifact_id="af3score-plan",
         producing_node_id="prepare",
         kind=ArtifactKind.TABLE,
@@ -1578,7 +1578,7 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
         }).decode(),
         encoding="utf-8",
     )
-    plan_artifact = WorkflowArtifact(
+    plan_artifact = ExecutionArtifact(
         artifact_id="rosetta-plan",
         producing_node_id="stage2-rosetta-relax-prepare",
         kind=ArtifactKind.TABLE,
@@ -1634,9 +1634,9 @@ def test_rosetta_nodes_bind_prepare_pull_worker_and_finalizer(
         cache_dir=tmp_path / "worker-cache",
         inputs={"rosetta_plan": [plan_artifact]},
         volume_root=tmp_path,
-        workflow_volume_name="workflow-volume",
+        artifact_volume_name="workflow-volume",
     )
-    assert isinstance(worker_node, RemotePullTaskWorkflowNode)
+    assert isinstance(worker_node, PullTaskProviderNode)
     [discovered] = worker_node.discover_remote_tasks(worker_context)
     assert discovered.task_key == "candidate-a"
     assert discovered.scientific_payload == task.scientific_payload
@@ -1696,7 +1696,7 @@ def test_rosetta_worker_policy_uses_current_config_for_reused_plan(
             "tasks": [task.to_dict() for task in tasks],
         })
     )
-    plan_artifact = WorkflowArtifact(
+    plan_artifact = ExecutionArtifact(
         artifact_id="rosetta-plan",
         producing_node_id="prepare",
         kind=ArtifactKind.TABLE,
@@ -1715,7 +1715,7 @@ def test_rosetta_worker_policy_uses_current_config_for_reused_plan(
         cache_dir=tmp_path / "cache",
         inputs={"rosetta_plan": [plan_artifact]},
         volume_root=tmp_path,
-        workflow_volume_name="workflow-volume",
+        artifact_volume_name="workflow-volume",
     )
 
     predecessor = ppiflow_workflow.RosettaWorkerNode(
@@ -1969,7 +1969,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         }).decode(),
         encoding="utf-8",
     )
-    plan_artifact = WorkflowArtifact(
+    plan_artifact = ExecutionArtifact(
         artifact_id="rosetta-plan",
         producing_node_id="stage2-rosetta-relax-prepare",
         kind=ArtifactKind.TABLE,
@@ -1979,7 +1979,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
             media_type="application/json",
         ),
     )
-    outcomes_artifact = WorkflowArtifact(
+    outcomes_artifact = ExecutionArtifact(
         artifact_id="rosetta-outcomes",
         producing_node_id="stage2-rosetta-relax-workers",
         kind=ArtifactKind.TABLE,
@@ -2063,7 +2063,7 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
         ],
         manifest_path,
     )
-    manifest = WorkflowArtifact(
+    manifest = ExecutionArtifact(
         artifact_id="candidate-manifest",
         producing_node_id="stage2-filter",
         kind=ArtifactKind.TABLE,
@@ -2088,7 +2088,7 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
             "candidate_manifest": [manifest],
         },
         volume_root=tmp_path,
-        workflow_volume_name="workflow-volume",
+        artifact_volume_name="workflow-volume",
     )
     [task] = node.discover_remote_tasks(context)
     submission = node.prepare_remote_task(
@@ -2255,7 +2255,7 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
             cache_dir=tmp_path / "cache",
             inputs={},
             volume_root=tmp_path,
-            workflow_volume_name="workflow-volume",
+            artifact_volume_name="workflow-volume",
         ),
         {
             "candidate-a": AppRunResult(
@@ -2310,7 +2310,7 @@ def test_refold_discovers_manifest_candidates_in_order(
         ],
         manifest_path,
     )
-    manifest = WorkflowArtifact(
+    manifest = ExecutionArtifact(
         artifact_id="candidate-manifest",
         producing_node_id="stage2-filter",
         kind=ArtifactKind.TABLE,
@@ -2337,7 +2337,7 @@ def test_refold_discovers_manifest_candidates_in_order(
                 "candidate_manifest": [manifest],
             },
             volume_root=tmp_path,
-            workflow_volume_name="workflow-volume",
+            artifact_volume_name="workflow-volume",
         )
     )
 
@@ -2574,7 +2574,7 @@ def test_filter_transform_selects_only_passing_structures(
     result = ppiflow_workflow.filter_ppiflow_artifacts.get_raw_f()(
         structures=[structure_artifact],
         scores=[
-            WorkflowArtifact(
+            ExecutionArtifact(
                 artifact_id="scores",
                 producing_node_id="scores",
                 kind=ArtifactKind.SCORES,
@@ -2654,7 +2654,7 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
         "reference,dockq\ndesign-1.pdb,0.8\ndesign-2.pdb,0.4\n",
         encoding="utf-8",
     )
-    score_artifact = WorkflowArtifact(
+    score_artifact = ExecutionArtifact(
         artifact_id="dockq",
         producing_node_id="dockq",
         kind=ArtifactKind.SCORES,
@@ -2700,7 +2700,7 @@ def test_rank_transform_allows_empty_ranked_outputs(
         "reference,dockq\ndesign-1.pdb,0.1\n",
         encoding="utf-8",
     )
-    score_artifact = WorkflowArtifact(
+    score_artifact = ExecutionArtifact(
         artifact_id="dockq",
         producing_node_id="dockq",
         kind=ArtifactKind.SCORES,
@@ -2805,7 +2805,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
             cache_dir=tmp_path / "cache",
             inputs={
                 "structures": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="ranked-structures",
                         producing_node_id="rank",
                         kind=ArtifactKind.STRUCTURES,
@@ -2822,7 +2822,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                     )
                 ],
                 "rank": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="rank",
                         producing_node_id="rank",
                         kind=ArtifactKind.TABLE,
@@ -2833,7 +2833,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                     )
                 ],
                 "filter_audit": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="audit",
                         producing_node_id="filter",
                         kind=ArtifactKind.TABLE,
@@ -2842,7 +2842,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                             path="report-inputs/filter_audit.csv",
                         ),
                     ),
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="audit-stage1",
                         producing_node_id="filter-stage1",
                         kind=ArtifactKind.TABLE,
@@ -2853,7 +2853,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                     ),
                 ],
                 "candidate_manifest": [
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="manifest-stage1",
                         producing_node_id="filter-stage1",
                         kind=ArtifactKind.TABLE,
@@ -2863,7 +2863,7 @@ def test_report_node_renders_candidate_attrition(tmp_path: Path, monkeypatch) ->
                             media_type=ppiflow_manifests.MANIFEST_MEDIA_TYPE,
                         ),
                     ),
-                    WorkflowArtifact(
+                    ExecutionArtifact(
                         artifact_id="manifest",
                         producing_node_id="filter",
                         kind=ArtifactKind.TABLE,
@@ -3199,7 +3199,7 @@ PPIFlowStep:
     assert calls["coordinator"]["deployment"].environment == "main"
     assert calls["prepare"]["predecessor_execution_run_id"] == predecessor
     assert calls["prepare"]["workload_run_key"] == "demo"
-    assert calls["prepare"]["workflow"].name == "ppiflow-v2"
+    assert calls["prepare"]["graph"].name == "ppiflow-v2"
     assert calls["drive"] == {"development_function_handles": None}
 
 
@@ -3645,7 +3645,7 @@ def test_ppiflow_app_version_changes_plan_identity(
 def test_af3score_model_identity_changes_scientific_dag_hash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workflow = ppiflow_workflow.Workflow("af3score-identity")
+    workflow = ppiflow_workflow.ExecutionGraph("af3score-identity")
     workflow.add_node(
         ppiflow_workflow.AF3ScorePrepareNode("score", {}),
         id="score",
@@ -3714,7 +3714,7 @@ RosettaFixStep: {}
     )
     assert isinstance(
         definition.nodes["stage2-existing-input"].node,
-        RemoteWorkflowNode,
+        ProviderNode,
     )
 
 

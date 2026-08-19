@@ -24,8 +24,8 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     VolumePath,
-    WorkflowArtifact,
 )
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
@@ -171,13 +171,13 @@ def _volume_path_from_stage_config(path: str, *, volume_name: str) -> VolumePath
 
 
 def check_ppiflow_external_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
 ) -> ArtifactAvailability:
     """Validate app-owned artifacts referenced by the PPIFlow workflow."""
     _reload_ppiflow_source_volumes()
     return check_external_artifact_status(
         artifact,
-        workflow_volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
+        artifact_volume_name=WORKFLOW_OUTPUT_VOLUME_NAME,
         volume_roots=PPI_FLOW_SOURCE_VOLUME_ROOTS,
     )
 
@@ -193,7 +193,7 @@ def normalize_ppiflow_stage2_input(
     """Normalize Stage2Input structures into a workflow-owned manifest."""
     _reload_ppiflow_source_volumes()
     _validate_stage2_input_snapshot(storage=storage, config=config)
-    structure_artifact = WorkflowArtifact(
+    structure_artifact = ExecutionArtifact(
         artifact_id=f"{sanitize_filename(node_id)}-stage2-input-structures",
         producing_node_id=node_id,
         kind=ArtifactKind.STRUCTURES,
@@ -281,9 +281,9 @@ def normalize_ppiflow_stage2_input(
 
 def filter_ppiflow_artifacts(
     *,
-    structures: list[WorkflowArtifact],
-    scores: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
+    structures: list[ExecutionArtifact],
+    scores: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None = None,
     config: dict[str, object],
     run_id: str,
     node_id: str,
@@ -435,8 +435,8 @@ def filter_ppiflow_artifacts(
 
 def derive_ppiflow_fixed_positions(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None = None,
     config: dict[str, object],
     run_id: str,
     node_id: str,
@@ -597,9 +597,9 @@ def derive_ppiflow_fixed_positions(
 
 def rank_ppiflow_artifacts(
     *,
-    structures: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact],
-    score_artifacts: list[WorkflowArtifact],
+    structures: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact],
+    score_artifacts: list[ExecutionArtifact],
     config: dict[str, object],
     run_id: str,
     node_id: str,

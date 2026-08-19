@@ -26,8 +26,8 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
-    WorkflowArtifact,
 )
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging
@@ -130,7 +130,7 @@ def _load_rosetta_plan(path: Path) -> dict[str, object]:
 
 
 def _read_rosetta_plan_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
 ) -> dict[str, object]:
     """Load the single Rosetta plan from a materialized workflow artifact."""
     if len(artifacts) != 1:
@@ -160,8 +160,8 @@ def _rosetta_worker_policy(
 
 def prepare_ppiflow_rosetta_stage(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None = None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None = None,
     config: dict[str, object],
     step_name: str,
     run_name: str,
@@ -408,7 +408,7 @@ def _rosetta_task_outcomes_artifact(
 
 
 def _read_rosetta_task_outcomes(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
 ) -> tuple[set[str], dict[str, str]]:
     """Load one materialized Rosetta pull-Task outcome summary."""
     if len(artifacts) != 1:
@@ -438,8 +438,8 @@ def _read_rosetta_task_outcomes(
 
 def finalize_ppiflow_rosetta_stage(
     *,
-    plan_artifacts: list[WorkflowArtifact],
-    outcome_artifacts: list[WorkflowArtifact],
+    plan_artifacts: list[ExecutionArtifact],
+    outcome_artifacts: list[ExecutionArtifact],
     config: dict[str, object],
     step_name: str,
     run_id: str,

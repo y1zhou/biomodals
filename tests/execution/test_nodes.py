@@ -8,19 +8,19 @@ from uuid import UUID
 import pytest
 
 from biomodals.execution.nodes import (
-    AppBackedNode,
     NodeRunContext,
-    RemoteNodeCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowTask,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
 )
-from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
+from biomodals.schema import ArtifactKind, ExecutionArtifact, VolumePath
 
 
 def test_app_backed_node_requires_caller_owned_remote_preparation(
     tmp_path: Path,
 ) -> None:
-    node = AppBackedNode()
+    node = ProviderNode()
     context = NodeRunContext(
         execution_run_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
         workload_run_key="demo",
@@ -36,15 +36,15 @@ def test_app_backed_node_requires_caller_owned_remote_preparation(
 
 
 def test_app_backed_node_owns_no_modal_lookup_or_submission_api() -> None:
-    assert not hasattr(AppBackedNode, "app_name")
-    assert not hasattr(AppBackedNode, "function_name")
-    assert not hasattr(AppBackedNode, "load_app_function")
-    assert not hasattr(AppBackedNode, "invoke_app_function")
-    assert not hasattr(AppBackedNode, "submit_remote")
+    assert not hasattr(ProviderNode, "app_name")
+    assert not hasattr(ProviderNode, "function_name")
+    assert not hasattr(ProviderNode, "load_app_function")
+    assert not hasattr(ProviderNode, "invoke_app_function")
+    assert not hasattr(ProviderNode, "submit_remote")
 
 
 def test_remote_task_node_declares_data_without_modal_submission() -> None:
-    task = RemoteWorkflowTask(
+    task = TaskDefinition(
         task_key="candidate-a",
         scientific_payload={"candidate_id": "candidate-a"},
         execution_payload={"candidate_path": "inputs/candidate-a.pdb"},
@@ -52,14 +52,14 @@ def test_remote_task_node_declares_data_without_modal_submission() -> None:
 
     assert task.task_key == "candidate-a"
     assert task.execution_payload == {"candidate_path": "inputs/candidate-a.pdb"}
-    assert not hasattr(RemoteTaskWorkflowNode, "submit_remote")
+    assert not hasattr(TaskProviderNode, "submit_remote")
     with pytest.raises(ValueError, match="cannot be empty"):
-        RemoteWorkflowTask(
+        TaskDefinition(
             task_key="",
             scientific_payload={},
         )
     with pytest.raises(ValueError, match="max_tasks_per_call must be positive"):
-        RemoteNodeCall(
+        ProviderCallSpec(
             function_name="run_candidate",
             uses_gpu=False,
             max_tasks_per_call=0,
@@ -76,9 +76,9 @@ def test_node_context_resolves_workflow_artifact(tmp_path: Path) -> None:
         cache_dir=tmp_path / "cache",
         inputs={},
         volume_root=tmp_path,
-        workflow_volume_name="workflow-volume",
+        artifact_volume_name="workflow-volume",
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="input",
         producing_node_id="upstream",
         kind=ArtifactKind.STRUCTURES,
@@ -89,7 +89,7 @@ def test_node_context_resolves_workflow_artifact(tmp_path: Path) -> None:
     )
 
     assert (
-        context.resolve_workflow_artifact(artifact)
+        context.resolve_artifact(artifact)
         == (tmp_path / "runs/demo/input.pdb").resolve()
     )
 
@@ -108,9 +108,9 @@ def test_node_context_rejects_uncontained_artifact(
         cache_dir=tmp_path / "cache",
         inputs={},
         volume_root=tmp_path,
-        workflow_volume_name="workflow-volume",
+        artifact_volume_name="workflow-volume",
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="input",
         producing_node_id="upstream",
         kind=ArtifactKind.STRUCTURES,
@@ -121,4 +121,4 @@ def test_node_context_rejects_uncontained_artifact(
     )
 
     with pytest.raises(ValueError, match="relative and contained"):
-        context.resolve_workflow_artifact(artifact)
+        context.resolve_artifact(artifact)

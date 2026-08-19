@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from biomodals.execution.definition import ExecutionDefinition
+from biomodals.execution.hashing import dag_hash
 from biomodals.execution.model import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
 from biomodals.schema import AppConfig
-from biomodals.execution.graph import WorkflowDefinition
-from biomodals.execution.hashing import dag_hash
 
 _EXECUTION_PLAN_SCHEMA_VERSION = "1"
 
@@ -19,11 +19,11 @@ def app_scientific_version(config: AppConfig) -> str:
 
 
 def execution_plan(
-    definition: WorkflowDefinition,
+    definition: ExecutionDefinition,
     *,
     workload_run_key: str,
 ) -> ExecutionPlan:
-    """Map one validated workflow definition to immutable execution Nodes."""
+    """Map one validated Execution Definition to its immutable plan."""
     encounter_order = tuple(definition.nodes)
     nodes = tuple(
         NodePlan(
@@ -56,7 +56,7 @@ def execution_plan(
 
 
 def node_task_plan(node_id: str) -> TaskPlan:
-    """Represent one workflow Node invocation as one kernel Task."""
+    """Represent one Execution Node invocation as one kernel Task."""
     return TaskPlan(
         task_key="node",
         scientific_payload={"workflow_node_id": node_id},

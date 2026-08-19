@@ -11,12 +11,12 @@ from pathlib import Path
 import orjson
 from pydantic import BaseModel
 
-from biomodals.execution.graph import WorkflowDefinition
-from biomodals.execution.nodes import WorkflowNode
+from biomodals.execution.definition import ExecutionDefinition
+from biomodals.execution.nodes import ExecutionNode
 
 
-def dag_hash(definition: WorkflowDefinition) -> str:
-    """Return a deterministic hash for semantic workflow DAG identity."""
+def dag_hash(definition: ExecutionDefinition) -> str:
+    """Return a deterministic hash for semantic executable DAG identity."""
     payload = {
         "name": definition.name,
         "nodes": {
@@ -36,7 +36,7 @@ def dag_hash(definition: WorkflowDefinition) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def node_hash_payload(node: WorkflowNode) -> dict[str, object]:
+def node_hash_payload(node: ExecutionNode) -> dict[str, object]:
     """Return the semantic hash payload for one workflow node."""
     payload: dict[str, object] = {
         "class": f"{node.__class__.__module__}.{node.__class__.__qualname__}",

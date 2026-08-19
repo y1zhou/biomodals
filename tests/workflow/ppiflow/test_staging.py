@@ -13,7 +13,7 @@ import polars as pl
 import pytest
 
 from biomodals.app.design import ppiflow_app
-from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
+from biomodals.schema import ArtifactKind, ExecutionArtifact, VolumePath
 from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.ppiflow import manifests, staging
 from biomodals.workflow.ppiflow_workflow import (
@@ -23,8 +23,8 @@ from biomodals.workflow.ppiflow_workflow import (
 )
 
 
-def _source_artifact(path: str) -> WorkflowArtifact:
-    return WorkflowArtifact(
+def _source_artifact(path: str) -> ExecutionArtifact:
+    return ExecutionArtifact(
         artifact_id="upstream-structures",
         producing_node_id="upstream",
         kind=ArtifactKind.STRUCTURES,
@@ -67,7 +67,7 @@ def test_csv_files_from_artifact_reads_directory_csvs(tmp_path: Path) -> None:
     table_dir.mkdir(parents=True)
     (table_dir / "metrics.csv").write_text("score\n1\n", encoding="utf-8")
     (table_dir / "notes.txt").write_text("skip\n", encoding="utf-8")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="scores",
         producing_node_id="scores",
         kind=ArtifactKind.SCORES,
@@ -92,7 +92,7 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
             "notes.txt": b"skip\n",
         })
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="upstream-structures",
         producing_node_id="upstream",
         kind=ArtifactKind.ARCHIVE,
@@ -620,7 +620,7 @@ def test_report_node_reads_rank_artifact_from_configured_volume_root(
     source_root.mkdir()
     ranked_csv = source_root / "ranked.csv"
     ranked_csv.write_text("design,rank_score\ndesign-1,1.0\n", encoding="utf-8")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rank",
         producing_node_id="rank",
         kind=ArtifactKind.TABLE,

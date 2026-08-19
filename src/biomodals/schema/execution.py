@@ -1,4 +1,4 @@
-"""Schemas for workflow artifacts and selectors."""
+"""Provider-neutral schemas for execution artifacts and selectors."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ else:
 
 
 class ArtifactKind(StrEnum):
-    """Common artifact categories passed between workflow nodes."""
+    """Common artifact categories passed between Execution Nodes."""
 
     STRUCTURES = "structures"
     SCORES = "scores"
@@ -29,7 +29,7 @@ class ArtifactKind(StrEnum):
 
 
 class ArtifactFile(BaseModel):
-    """One file recorded inside a workflow artifact."""
+    """One file recorded inside an Execution Artifact."""
 
     path: str
     role: str | None = None
@@ -49,8 +49,8 @@ class ArtifactFile(BaseModel):
         return value
 
 
-class WorkflowArtifact(BaseModel):
-    """Durable manifest for data produced by a workflow node."""
+class ExecutionArtifact(BaseModel):
+    """Durable manifest for data produced by an Execution Node."""
 
     artifact_id: str
     producing_node_id: str
@@ -62,7 +62,7 @@ class WorkflowArtifact(BaseModel):
 
 
 class ArtifactSelector(BaseModel):
-    """Reference to upstream workflow artifacts consumed by a node input."""
+    """Reference to upstream artifacts consumed by an Execution Node."""
 
     producing_node_id: str
     kind: ArtifactKind | None = None

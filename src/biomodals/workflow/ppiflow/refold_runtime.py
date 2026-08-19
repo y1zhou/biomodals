@@ -36,7 +36,7 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
-    WorkflowArtifact,
+    ExecutionArtifact,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.ppiflow import manifests, staging, tables
@@ -59,8 +59,8 @@ from biomodals.workflow.ppiflow.runtime_support import (
 
 def run_ppiflow_refold_candidate(
     *,
-    artifacts: list[WorkflowArtifact],
-    candidate_manifests: list[WorkflowArtifact] | None,
+    artifacts: list[ExecutionArtifact],
+    candidate_manifests: list[ExecutionArtifact] | None,
     candidate_id: str,
     config: dict[str, object],
     step_name: str,

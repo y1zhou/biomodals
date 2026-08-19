@@ -1,4 +1,4 @@
-"""Tests for durable Direct CLI App Run storage."""
+"""Tests for the Modal execution host."""
 
 # ruff: noqa: D101,D102,D107
 
@@ -22,7 +22,7 @@ from biomodals.execution import (
     TaskPlan,
     drive_execution_run,
 )
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,

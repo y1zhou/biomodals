@@ -20,7 +20,7 @@ from biomodals.execution import (
     DeploymentIdentity,
     PullTaskClaim,
 )
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
 )
 

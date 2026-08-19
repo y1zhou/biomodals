@@ -35,11 +35,11 @@ from biomodals.execution import (
     RunStatus,
 )
 from biomodals.execution.modal import (
+    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
     ProviderDeploymentUnavailableError,
 )
-from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "AlphaFold3", 7)

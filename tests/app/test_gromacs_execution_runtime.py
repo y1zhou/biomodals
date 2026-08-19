@@ -18,10 +18,10 @@ from biomodals.app.bioinfo.gromacs_execution_runtime import (
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
 from biomodals.execution.modal import (
+    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SECOND_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")

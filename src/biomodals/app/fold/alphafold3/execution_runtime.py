@@ -96,16 +96,14 @@ from biomodals.execution import (
     result_probe_frontier,
 )
 from biomodals.execution.modal import (
+    ExecutionRunStore,
+    ExecutionRuntimeLifecycle,
     ProviderDefiniteSubmissionError,
     ProviderSubmissionOutcomeUnknownError,
 )
 from biomodals.execution.scheduler import (
     ProviderCallCandidate,
     TaskDispatchDescriptor,
-)
-from biomodals.helper.app_execution import (
-    ExecutionRunStore,
-    ExecutionRuntimeLifecycle,
 )
 from biomodals.helper.artifacts import (
     load_json_object,
@@ -218,13 +216,6 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 self._reconcile_nodes_and_run
             ),
             now=self._now,
-        )
-
-    def _initialize(self):
-        return self._create_or_verify_run(
-            plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:

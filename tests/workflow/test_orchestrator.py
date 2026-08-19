@@ -26,8 +26,8 @@ from biomodals.execution import (
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
+    load_execution_launch,
 )
-from biomodals.helper.app_execution import load_execution_launch
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import (
     AppOutput,

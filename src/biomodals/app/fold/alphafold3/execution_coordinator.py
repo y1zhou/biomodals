@@ -22,7 +22,7 @@ from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
 from biomodals.execution import (
     DeploymentIdentity,
 )
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
 )
 

@@ -24,12 +24,12 @@ import modal
 from biomodals.app.bioinfo import gromacs_app
 from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
 from biomodals.execution import DeploymentIdentity
-from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     execution_lineage_root,
     resolve_provider_call_limits,
     stage_execution_launch,
 )
+from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import volume_app_output
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT

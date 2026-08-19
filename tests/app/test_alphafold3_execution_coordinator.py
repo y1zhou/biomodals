@@ -21,7 +21,7 @@ from biomodals.app.fold.alphafold3.execution_request import (
     persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
-from biomodals.helper.app_execution import ExecutionRunStore, load_execution_launch
+from biomodals.execution.modal import ExecutionRunStore, load_execution_launch
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")

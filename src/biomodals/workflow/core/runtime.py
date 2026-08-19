@@ -41,7 +41,7 @@ from biomodals.execution import (
     result_probe_frontier,
     resume_execution_run,
 )
-from biomodals.execution.modal import ModalCallDriver
+from biomodals.execution.modal import ExecutionVolumeSync, ModalCallDriver
 from biomodals.execution.provider import ProviderDriver
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
@@ -51,7 +51,6 @@ from biomodals.execution.scheduler import (
     required_node_ranks,
     select_admissible_candidates,
 )
-from biomodals.helper.app_execution import ExecutionVolumeSync
 from biomodals.helper.artifacts import VolumeHandle
 from biomodals.schema import AppRunResult, AppRunStatus, VolumePath, WorkflowArtifact
 from biomodals.workflow.core.artifact_availability import (

@@ -24,10 +24,10 @@ from biomodals.app.score.ensirna_execution import (
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
 from biomodals.execution.modal import (
+    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "ENsiRNA", 7)

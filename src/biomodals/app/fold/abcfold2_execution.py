@@ -23,7 +23,7 @@ from biomodals.execution import (
     ProviderCallStatus,
     TaskPlan,
 )
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
@@ -277,13 +277,6 @@ class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
         )
         self.output_claims = output_claims
         self._claimed_models: set[str] = set()
-
-    def _initialize(self):
-        return self._create_or_verify_run(
-            plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
-        )
 
     def _recover_publications(self) -> None:
         self._provider.recover_publications(
@@ -542,7 +535,7 @@ class ABCFold2ExecutionRuntime(StandardExecutionRuntimeLifecycle):
             }
         raise ValueError(f"Unknown ABCFold2 Node {node_key!r}")
 
-    def _ensure_publication_claim(self, node_key: str) -> None:
+    def _ensure_publication_claim(self, node_key: str, _task_key: str) -> None:
         model_name = {
             BOLTZ_SEEDS_NODE: "boltz",
             BOLTZ_ARCHIVE_NODE: "boltz",

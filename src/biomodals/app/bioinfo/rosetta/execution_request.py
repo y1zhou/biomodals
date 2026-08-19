@@ -11,7 +11,7 @@ import orjson
 
 from biomodals.app.bioinfo.rosetta.execution_contracts import RosettaTaskSpec
 from biomodals.execution import ExecutionPlan, NodeAggregationPolicy, NodePlan
-from biomodals.helper.app_execution import ExecutionRequestFile
+from biomodals.execution.modal import ExecutionRequestFile
 from biomodals.helper.io import require_safe_filename_component
 
 REQUEST_SCHEMA_VERSION = 1

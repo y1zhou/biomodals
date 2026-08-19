@@ -14,7 +14,7 @@ from biomodals.app.design.boltzgen.execution_contracts import (
     collection_publication_path,
 )
 from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
-from biomodals.helper.app_execution import ExecutionRequestFile
+from biomodals.execution.modal import ExecutionRequestFile
 from biomodals.helper.io import require_safe_filename_component
 
 REQUEST_SCHEMA_VERSION = 1

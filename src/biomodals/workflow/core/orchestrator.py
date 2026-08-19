@@ -26,12 +26,12 @@ from biomodals.execution import (
 from biomodals.execution.modal import (
     ModalCallDriver,
     execution_coordinator_identity,
+    persist_execution_launch,
 )
 from biomodals.execution.modal import (
     execution_coordinator_handle as _shared_execution_coordinator_handle,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import persist_execution_launch
 from biomodals.helper.constant import (
     MAX_TIMEOUT,
     WORKFLOW_ORCHESTRATOR_VOLUME,

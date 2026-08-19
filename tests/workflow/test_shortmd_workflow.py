@@ -12,7 +12,7 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.bioinfo import gromacs_app
-from biomodals.helper.app_execution import persist_execution_launch
+from biomodals.execution.modal import persist_execution_launch
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,

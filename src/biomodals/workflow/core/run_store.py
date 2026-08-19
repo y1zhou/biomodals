@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from biomodals.helper.app_execution import ExecutionRunStore
+from biomodals.execution.modal import ExecutionRunStore
 from biomodals.workflow.core.artifact_store import (
     WORKFLOW_ARTIFACT_TABLES,
     WorkflowArtifactStore,

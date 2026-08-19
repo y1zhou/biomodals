@@ -24,7 +24,7 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
     prepare_invocation,
 )
 from biomodals.execution import ExecutionPlan
-from biomodals.helper.app_execution import ExecutionRequestFile
+from biomodals.execution.modal import ExecutionRequestFile
 
 EXECUTION_REQUEST_SCHEMA_VERSION = 4
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"

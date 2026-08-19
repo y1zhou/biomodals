@@ -32,11 +32,11 @@ from biomodals.execution import (
     required_node_keys,
     result_probe_frontier,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 
 
 @dataclass(frozen=True)
@@ -94,13 +94,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
                 required,
             ),
             now=self._now,
-        )
-
-    def _initialize(self):
-        return self._create_or_verify_run(
-            plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:

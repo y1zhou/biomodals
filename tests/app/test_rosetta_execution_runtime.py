@@ -26,10 +26,10 @@ from biomodals.execution import (
     TaskStatus,
 )
 from biomodals.execution.modal import (
+    ExecutionRunStore,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.helper.app_execution import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "Rosetta", 7)

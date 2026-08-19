@@ -19,7 +19,7 @@ from biomodals.app.design.boltzgen.execution_runtime import (
 from biomodals.execution import (
     DeploymentIdentity,
 )
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRunStore,
 )

@@ -20,8 +20,8 @@ import modal
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
 from biomodals.execution import DeploymentIdentity
+from biomodals.execution.modal import resolve_provider_call_limits
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import resolve_provider_call_limits
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename

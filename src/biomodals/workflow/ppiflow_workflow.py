@@ -33,8 +33,8 @@ from biomodals.execution import (
     DeploymentIdentity,
     NodeAggregationPolicy,
 )
+from biomodals.execution.modal import resolve_provider_call_limits
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.app_execution import resolve_provider_call_limits
 from biomodals.helper.app_run import (
     volume_path_from_mount_path,
 )

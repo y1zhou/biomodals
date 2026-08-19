@@ -34,13 +34,13 @@ from biomodals.execution import (
     ProviderCallSubmission,
     TaskStatus,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
     ExecutionRuntimeLifecycle,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.artifacts import (
     file_matches_sha256,
     replace_bytes_atomic,
@@ -254,13 +254,6 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 required,
             ),
             now=self._now,
-        )
-
-    def _initialize(self):
-        return self._create_or_verify_run(
-            plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
         )
 
     def _recover_publications(self) -> None:

@@ -27,13 +27,13 @@ from biomodals.execution import (
     ProviderCallSubmission,
     TaskPlan,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
     StandardExecutionRuntimeLifecycle,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.io import require_safe_filename_component
@@ -334,13 +334,6 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
     def layout(self) -> AppRunLayout:
         """Return the established app-owned run layout."""
         return AppRunLayout.from_run_root(self.output_root / self.request.run_name)
-
-    def _initialize(self):
-        return self._create_or_verify_run(
-            plan=self._plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
-        )
 
     def _recover_publications(self) -> None:
         self._provider.recover_publications(

@@ -23,13 +23,13 @@ from biomodals.execution import (
     ProviderCallSubmission,
     TaskPlan,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
-from biomodals.helper.app_execution import (
+from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
     StandardExecutionRuntimeLifecycle,
 )
+from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
@@ -361,13 +361,6 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
         self.model_volume = model_volume
         self.output_claims = output_claims
         self._claimed_publications: set[str] = set()
-
-    def _initialize(self):
-        return self._create_or_verify_run(
-            plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=(self.request.max_active_gpu_provider_calls),
-        )
 
     def _reconcile_provider_calls(self, required: set[str]) -> None:
         reconciled = self._provider.reconcile_provider_calls(

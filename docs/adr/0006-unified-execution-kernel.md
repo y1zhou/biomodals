@@ -47,6 +47,52 @@ simple and behavior-preserving. It does not add a local provider, duplicate
 image definitions, or require every existing operation to support multiple
 providers before merge.
 
+### Future local-provider migration
+
+Supporting a local container provider should reuse the same
+`ExecutionDefinition`, scheduler, repository, and scientific operation bodies.
+It should require a new `biomodals.execution.local` host and provider-specific
+composition roots, not a second execution model.
+
+Each portable operation has three layers:
+
+1. an app-owned scientific body that accepts ordinary values, explicit paths,
+   and configuration;
+2. a thin provider wrapper that translates mounted paths and invokes that body;
+3. provider-owned packaging that declares the image, resources, mounts,
+   environment, Secrets, and durable call handle.
+
+For Modal, layers two and three remain the decorated function and its Modal
+Image. A local provider would supply an equivalent wrapper and OCI image, then
+map provider calls to durable Docker or Podman container identities. The
+scientific body and its result contract remain unchanged. The kernel continues
+to decide what is ready, how many calls may run, and how their outcomes advance
+the graph.
+
+Migration effort therefore depends on how tightly an operation is coupled to
+Modal:
+
+- operations that already receive explicit paths and call ordinary Python or
+  subprocess code need only thin local wrappers and OCI packaging;
+- operations that read Modal environment state or Volume mount constants need
+  those values moved into explicit operation inputs;
+- operations that resolve, spawn, poll, commit, or reload Modal objects must
+  move that lifecycle code into `biomodals.execution.modal` before they can be
+  reused locally;
+- provider images, licensed datasets, GPU drivers, Secrets, and mount layouts
+  still need separate local deployment definitions even when the scientific
+  body is portable.
+
+This is an incremental migration. An app may support Modal only while still
+using the provider-neutral kernel. Local support is added operation by
+operation when there is a real use case; the shared interfaces do not promise
+that every deployed workload is available through every provider.
+
+A recoverable detached local Run also requires a durable local host to own the
+coordinator and observe container identities after the launching CLI exits. A
+foreground subprocess alone can implement development execution, but it cannot
+satisfy the existing resume and restart contract.
+
 Implementation of this amendment is pending. Existing text remains as the
 history and safety rationale of the first extraction unless it conflicts with
 the consolidation plan.

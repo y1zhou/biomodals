@@ -19,6 +19,7 @@ from biomodals.execution.modal.host import (
     persist_execution_launch,
     resolve_provider_call_limits,
     stage_execution_launch,
+    submit_staged_execution_run,
 )
 from biomodals.execution.modal.identity import (
     deployed_execution_coordinator,
@@ -62,4 +63,5 @@ __all__ = [
     "persist_execution_launch",
     "resolve_provider_call_limits",
     "stage_execution_launch",
+    "submit_staged_execution_run",
 ]

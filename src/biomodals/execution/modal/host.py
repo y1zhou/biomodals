@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -24,6 +24,7 @@ from biomodals.execution import (
     ExecutionTaskRecord,
     ProviderBinding,
     ProviderCallSubmission,
+    RunStatus,
     SqliteExecutionRepository,
     drive_execution_run,
     resume_execution_run,
@@ -40,6 +41,8 @@ from biomodals.helper.artifacts import (
     replace_bytes_atomic,
 )
 from biomodals.helper.output_claim import register_output_claim_successor
+
+from .identity import execution_coordinator_handle
 
 LEDGER_FILENAME = "ledger.sqlite3"
 
@@ -180,6 +183,58 @@ def stage_execution_launch(
         execution_run_id,
         _execution_launch_bytes(predecessor_execution_run_id),
     )
+
+
+def submit_staged_execution_run(
+    output_volume: Any,
+    *,
+    execution_run_id: UUID,
+    deployment: DeploymentIdentity,
+    predecessor_execution_run_id: UUID | None,
+    use_deployed_coordinator: bool,
+    local_coordinator: Callable[..., Any],
+    workload_name: str,
+    restart_kwargs: Mapping[str, object] | None = None,
+    accepted_statuses: Collection[RunStatus] = (RunStatus.SUCCEEDED,),
+) -> ExecutionOverview:
+    """Submit and await one staged direct App Run."""
+    stage_execution_launch(
+        output_volume,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
+    coordinator = execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=local_coordinator,
+    )
+    if predecessor_execution_run_id is None:
+        call = coordinator.run.spawn(development=not use_deployed_coordinator)
+    else:
+        kwargs = dict(restart_kwargs or ())
+        kwargs["predecessor_execution_run_id"] = str(predecessor_execution_run_id)
+        call = coordinator.restart_from.spawn(**kwargs)
+
+    print(
+        "Deployment Identity: "
+        f"{deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}"
+    )
+    print(f"Execution Run ID: {execution_run_id}")
+    print(f"Coordinator FunctionCall ID: {getattr(call, 'object_id', call)}")
+    overview = call.get()
+    if overview.run.status not in accepted_statuses:
+        diagnostic = overview.run.status_message or (
+            overview.run.status_reason.value
+            if overview.run.status_reason is not None
+            else overview.run.status.value
+        )
+        raise RuntimeError(
+            f"{workload_name} Execution Run ended as "
+            f"{overview.run.status.value}: {diagnostic}"
+        )
+    return overview
 
 
 def persist_execution_launch(

@@ -50,7 +50,6 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
-    RunStatus,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -59,10 +58,7 @@ from biomodals.execution.modal import (
     execution_coordinator_identity,
     initialize_execution_coordinator_host,
     resolve_provider_call_limits,
-    stage_execution_launch,
-)
-from biomodals.execution.modal import (
-    execution_coordinator_handle as _execution_coordinator_handle,
+    submit_staged_execution_run,
 )
 from biomodals.helper import hash_string, patch_image_for_helper
 from biomodals.helper.artifacts import (
@@ -1066,41 +1062,15 @@ def submit_protenix_task(
         deployment_version,
     )
     stage_execution_request(CONF.output_volume, execution_run_id, request)
-    stage_execution_launch(
+    submit_staged_execution_run(
         CONF.output_volume,
-        execution_run_id,
-        predecessor_execution_run_id,
-    )
-    coordinator = _execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
+        predecessor_execution_run_id=predecessor_execution_run_id,
         use_deployed_coordinator=use_deployed_coordinator,
         local_coordinator=ExecutionCoordinator,
+        workload_name=CONF.name,
     )
-    if predecessor_execution_run_id is None:
-        call = coordinator.run.spawn(development=not use_deployed_coordinator)
-    else:
-        call = coordinator.restart_from.spawn(
-            predecessor_execution_run_id=str(predecessor_execution_run_id),
-        )
-    print(f"Execution Run ID: {execution_run_id}")
-    print(
-        "Deployment Identity: "
-        f"{deployment.environment}/{deployment.deployment_name}/"
-        f"v{deployment.deployment_version}"
-    )
-    print(f"Coordinator FunctionCall ID: {call.object_id}")
-    overview = call.get()
-    if overview.run.status != RunStatus.SUCCEEDED:
-        diagnostic = overview.run.status_message or (
-            overview.run.status_reason.value
-            if overview.run.status_reason is not None
-            else overview.run.status.value
-        )
-        raise RuntimeError(
-            f"{CONF.name} Execution Run ended as "
-            f"{overview.run.status.value}: {diagnostic}"
-        )
 
     tarball_bytes = _download_result(request.result_key, request.run_name)
     write_local_tarball(out_file, tarball_bytes)

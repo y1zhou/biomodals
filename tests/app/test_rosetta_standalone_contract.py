@@ -56,15 +56,8 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
                 ),
             )
 
-    class Coordinator:
-        run = CoordinatorMethod()
-
     def stage(output_volume, execution_run_id, request):
         captured["staged"] = (output_volume, execution_run_id, request)
-
-    def coordinator_handle(**kwargs):
-        captured["coordinator"] = kwargs
-        return Coordinator()
 
     generated_ids = iter((WORKLOAD_UUID, EXECUTION_RUN_ID))
     output_volume = FakeVolume()
@@ -83,15 +76,11 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
     monkeypatch.setattr(rosetta_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         rosetta_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: captured.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs))
+            or CoordinatorMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        rosetta_app,
-        "_execution_coordinator_handle",
-        coordinator_handle,
     )
     monkeypatch.setattr(
         rosetta_app,
@@ -117,16 +106,25 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
     assert staged_run_id == EXECUTION_RUN_ID
     assert request.workload_run_key == workload_run_key
     assert request.tasks[0].pdb == "inputs/1/demo.pdb"
-    assert captured["launch"] == (EXECUTION_RUN_ID, None)
-    assert captured["run_kwargs"] == {"development": True}
-    assert captured["coordinator"] == {
+    volume, submit_kwargs = captured["submit"]
+    assert volume is output_volume
+    assert submit_kwargs == {
         "execution_run_id": EXECUTION_RUN_ID,
         "deployment": rosetta_app.DeploymentIdentity("main", "Rosetta", 1),
+        "predecessor_execution_run_id": None,
         "use_deployed_coordinator": False,
         "local_coordinator": rosetta_app.ExecutionCoordinator,
+        "workload_name": "Rosetta",
+        "restart_kwargs": {
+            "workload_plan_fingerprint": (
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            "max_active_provider_calls": request.max_active_provider_calls,
+            "claim_capacity": request.claim_capacity,
+            "max_parallel_per_worker": request.max_parallel_per_worker,
+        },
     }
     output = capsys.readouterr().out
-    assert f"Execution Run ID: {EXECUTION_RUN_ID}" in output
     assert (
         f"Results saved to '{workload_run_key}' in volume 'Rosetta-outputs'" in output
     )

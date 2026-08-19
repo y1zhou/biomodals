@@ -33,6 +33,7 @@ from biomodals.execution.modal import (
     persist_execution_launch,
     resolve_provider_call_limits,
     stage_execution_launch,
+    submit_staged_execution_run,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -116,6 +117,116 @@ def test_execution_lineage_root_follows_all_successors(tmp_path: Path) -> None:
     stage_execution_launch(volume, second, first)
 
     assert execution_lineage_root(volume, second) == root
+
+
+def test_submit_staged_execution_run_owns_direct_app_lifecycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Direct apps share launch, identity, waiting, and terminal validation."""
+    events: list[tuple[str, dict[str, object]]] = []
+    overview = SimpleNamespace(
+        run=SimpleNamespace(
+            status=RunStatus.PARTIAL,
+            status_message=None,
+            status_reason=None,
+        )
+    )
+
+    class Method:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def spawn(self, **kwargs: object) -> SimpleNamespace:
+            events.append((self.name, dict(kwargs)))
+            return SimpleNamespace(object_id="fc-1", get=lambda: overview)
+
+    class Coordinator:
+        def __init__(self, **kwargs: object) -> None:
+            events.append(("coordinator", dict(kwargs)))
+            self.run = Method("run")
+            self.restart_from = Method("restart")
+
+    predecessor = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    deployment = DeploymentIdentity("main", "Example", 3)
+    result = submit_staged_execution_run(
+        FakeVolume(tmp_path),
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor,
+        use_deployed_coordinator=False,
+        local_coordinator=Coordinator,
+        workload_name="Example",
+        restart_kwargs={"candidate": "request"},
+        accepted_statuses=(RunStatus.SUCCEEDED, RunStatus.PARTIAL),
+    )
+
+    assert result is overview
+    assert events == [
+        (
+            "coordinator",
+            {
+                "execution_run_id": str(RUN_ID),
+                "deployment_environment": "main",
+                "deployment_name": "Example",
+                "deployment_version": 3,
+                "development": True,
+            },
+        ),
+        (
+            "restart",
+            {
+                "candidate": "request",
+                "predecessor_execution_run_id": str(predecessor),
+            },
+        ),
+    ]
+    assert (
+        tmp_path / ".biomodals" / "execution" / "runs" / str(RUN_ID) / "launch"
+    ).read_bytes() == str(predecessor).encode()
+    assert capsys.readouterr().out.splitlines() == [
+        "Deployment Identity: main/Example/v3",
+        f"Execution Run ID: {RUN_ID}",
+        "Coordinator FunctionCall ID: fc-1",
+    ]
+
+
+def test_submit_staged_execution_run_rejects_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    """A direct app reports the workload's terminal failure consistently."""
+
+    class Method:
+        @staticmethod
+        def spawn(**_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=RunStatus.FAILED,
+                        status_message="science failed",
+                        status_reason=None,
+                    )
+                ),
+            )
+
+    class Coordinator:
+        def __init__(self, **_kwargs: object) -> None:
+            self.run = Method()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Example Execution Run ended as failed: science failed",
+    ):
+        submit_staged_execution_run(
+            FakeVolume(tmp_path),
+            execution_run_id=RUN_ID,
+            deployment=DeploymentIdentity("main", "Example", 3),
+            predecessor_execution_run_id=None,
+            use_deployed_coordinator=False,
+            local_coordinator=Coordinator,
+            workload_name="Example",
+        )
 
 
 def test_app_execution_store_uses_the_reserved_run_namespace(

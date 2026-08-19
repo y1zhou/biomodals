@@ -269,10 +269,6 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     def stage(volume, run_id, request):
         captured.update(volume=volume, run_id=run_id, request=request)
 
-    def coordinator_handle(**kwargs):
-        captured["handle_kwargs"] = kwargs
-        return SimpleNamespace(run=FakeMethod())
-
     volume = FakeVolume()
     monkeypatch.setattr(
         abcfold2_app,
@@ -289,15 +285,10 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     monkeypatch.setattr(abcfold2_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         abcfold2_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: captured.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs)) or FakeMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        abcfold2_app,
-        "_execution_coordinator_handle",
-        coordinator_handle,
     )
     monkeypatch.setattr(
         abcfold2_app,
@@ -327,10 +318,12 @@ def test_local_entrypoint_launches_one_execution_coordinator(
     )
 
     local = output_dir / "demo-no-tmpl"
-    assert captured["launch"] == (execution_run_id, None)
+    _, submit_kwargs = captured["submit"]
+    assert submit_kwargs["execution_run_id"] == execution_run_id
+    assert submit_kwargs["predecessor_execution_run_id"] is None
     assert captured["request"].max_active_provider_calls == 3
     assert captured["request"].max_active_gpu_provider_calls == 2
-    assert captured["run_kwargs"] == {"development": True}
+    assert submit_kwargs["use_deployed_coordinator"] is False
     assert (local / "run-config.json").is_file()
     assert (local / "boltz_models.tar.zst").read_bytes() == b"tar"
     assert (local / "chai_models.tar.zst").read_bytes() == b"tar"

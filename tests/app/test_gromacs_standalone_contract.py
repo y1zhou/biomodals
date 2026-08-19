@@ -153,23 +153,14 @@ def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     def stage(volume, run_id, request):
         staged.update(volume=volume, run_id=run_id, request=request)
 
-    def coordinator_handle(**kwargs):
-        launched["handle_kwargs"] = kwargs
-        return SimpleNamespace(run=FakeMethod())
-
     monkeypatch.setattr(gromacs_app, "uuid4", lambda: execution_run_id)
     monkeypatch.setattr(gromacs_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         gromacs_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: launched.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            launched.update(submit=(volume, kwargs)) or FakeMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        gromacs_app,
-        "_execution_coordinator_handle",
-        coordinator_handle,
     )
 
     submit_task_info = gromacs_app.submit_gromacs_task.info
@@ -194,9 +185,10 @@ def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     assert request.num_threads == 2
     assert request.max_active_provider_calls == 3
     assert request.max_active_gpu_provider_calls == 0
-    assert launched["launch"] == (execution_run_id, None)
-    assert launched["handle_kwargs"]["execution_run_id"] == execution_run_id
-    assert launched["run_kwargs"] == {"development": True}
+    _, submit_kwargs = launched["submit"]
+    assert submit_kwargs["execution_run_id"] == execution_run_id
+    assert submit_kwargs["predecessor_execution_run_id"] is None
+    assert submit_kwargs["use_deployed_coordinator"] is False
 
 
 def test_prepare_tpr_cpu_stages_input_with_app_run_layout(

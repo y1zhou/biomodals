@@ -14,6 +14,7 @@ import orjson
 import pytest
 
 from biomodals.app.score import ensirna_app
+from biomodals.execution import RunStatus
 from biomodals.helper.artifacts import sha256_bytes
 
 
@@ -1405,7 +1406,7 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
                 object_id="fc-1",
                 get=lambda: SimpleNamespace(
                     run=SimpleNamespace(
-                        status=ensirna_app.RunStatus.SUCCEEDED,
+                        status=RunStatus.SUCCEEDED,
                         status_message=None,
                         status_reason=None,
                     )
@@ -1414,10 +1415,6 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
 
     def stage(volume, run_id, request):
         captured.update(volume=volume, run_id=run_id, request=request)
-
-    def coordinator_handle(**kwargs):
-        captured["handle_kwargs"] = kwargs
-        return SimpleNamespace(run=FakeMethod())
 
     volume = FakeVolume()
     monkeypatch.setattr(
@@ -1435,15 +1432,10 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(ensirna_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         ensirna_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: captured.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs)) or FakeMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        ensirna_app,
-        "_execution_coordinator_handle",
-        coordinator_handle,
     )
     raw_f = ensirna_app.submit_ensirna_task.info.raw_f
     assert raw_f is not None
@@ -1460,14 +1452,16 @@ def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
 
     request = captured["request"]
     assert captured["run_id"] == execution_run_id
-    assert captured["launch"] == (execution_run_id, None)
+    _, submit_kwargs = captured["submit"]
+    assert submit_kwargs["execution_run_id"] == execution_run_id
+    assert submit_kwargs["predecessor_execution_run_id"] is None
     assert request.fasta_content == b">m\nAUGCUAGCUAGCUAGCUAGC\n"
     assert request.prepare_workers == 2
     assert request.max_active_provider_calls == 2
     assert request.max_active_gpu_provider_calls == 1
     assert request.pdb_cores == 3
     assert request.preprocess_shard_size == 17
-    assert captured["run_kwargs"] == {"development": True}
+    assert submit_kwargs["use_deployed_coordinator"] is False
     assert (tmp_path / "demo.xlsx").read_bytes() == b"xlsx"
 
 
@@ -1505,7 +1499,7 @@ def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
                 object_id="fc-1",
                 get=lambda: SimpleNamespace(
                     run=SimpleNamespace(
-                        status=ensirna_app.RunStatus.SUCCEEDED,
+                        status=RunStatus.SUCCEEDED,
                         status_message=None,
                         status_reason=None,
                     )
@@ -1532,15 +1526,10 @@ def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
     )
     monkeypatch.setattr(
         ensirna_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: captured.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs)) or RestartMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        ensirna_app,
-        "_execution_coordinator_handle",
-        lambda **_kwargs: SimpleNamespace(restart_from=RestartMethod()),
     )
     raw_f = ensirna_app.submit_ensirna_task.info.raw_f
     assert raw_f is not None
@@ -1554,7 +1543,7 @@ def test_submit_ensirna_restart_stages_the_supplied_scientific_input(
 
     assert captured["request"].fasta_content == input_fasta.read_bytes()
     assert captured["request"].app_version == "new-version"
-    assert captured["launch"] == (successor_id, predecessor_id)
-    assert captured["restart_kwargs"] == {
-        "predecessor_execution_run_id": str(predecessor_id)
-    }
+    _, submit_kwargs = captured["submit"]
+    assert submit_kwargs["execution_run_id"] == successor_id
+    assert submit_kwargs["predecessor_execution_run_id"] == predecessor_id
+    assert submit_kwargs.get("restart_kwargs") is None

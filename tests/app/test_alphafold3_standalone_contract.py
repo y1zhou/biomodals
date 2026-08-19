@@ -39,6 +39,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     SeedClaimPlan,
     guard_seed_prediction_claims,
 )
+from biomodals.execution import RunStatus
 
 
 class _ClaimStore:
@@ -385,38 +386,27 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
                 object_id="fc-coordinator",
                 get=lambda: SimpleNamespace(
                     run=SimpleNamespace(
-                        status=alphafold3_app.RunStatus.SUCCEEDED,
+                        status=RunStatus.SUCCEEDED,
                         status_reason=None,
                         status_message=None,
                     )
                 ),
             )
 
-    class Coordinator:
-        run = CoordinatorMethod()
-
     def stage(output_volume, execution_run_id, request):
         del output_volume
         captured["execution_run_id"] = execution_run_id
         captured["request"] = request
 
-    def coordinator_handle(**kwargs):
-        captured["coordinator"] = kwargs
-        return Coordinator()
-
     manifest: dict[str, object] = {"status": "complete"}
     monkeypatch.setattr(alphafold3_app, "stage_execution_request", stage)
     monkeypatch.setattr(
         alphafold3_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: captured.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs))
+            or CoordinatorMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "_execution_coordinator_handle",
-        coordinator_handle,
     )
     monkeypatch.setattr(
         alphafold3_app,
@@ -467,9 +457,11 @@ def test_submit_alphafold3_task_applies_run_name_to_prediction_config(
     assert request.allow_large_inference
     assert request.recycle == 3
     assert request.sample == 6
-    assert captured["launch"] == (captured["execution_run_id"], None)
-    assert captured["run_kwargs"] == {"development": False}
-    deployment = captured["coordinator"]["deployment"]
+    _, submit_kwargs = captured["submit"]
+    assert submit_kwargs["execution_run_id"] == captured["execution_run_id"]
+    assert submit_kwargs["predecessor_execution_run_id"] is None
+    assert submit_kwargs["use_deployed_coordinator"] is True
+    deployment = submit_kwargs["deployment"]
     assert deployment.environment == "production"
     assert deployment.deployment_name == "AlphaFold3Prod"
     assert deployment.deployment_version == 7
@@ -509,7 +501,7 @@ def test_submit_alphafold3_task_routes_a_cache_hit_through_a_new_root_run(
                 object_id="fc-cached",
                 get=lambda: SimpleNamespace(
                     run=SimpleNamespace(
-                        status=alphafold3_app.RunStatus.SUCCEEDED,
+                        status=RunStatus.SUCCEEDED,
                         status_reason=None,
                         status_message=None,
                     )
@@ -532,15 +524,11 @@ def test_submit_alphafold3_task_routes_a_cache_hit_through_a_new_root_run(
     )
     monkeypatch.setattr(
         alphafold3_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, predecessor: captured.update(
-            launch=(run_id, predecessor)
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs))
+            or CoordinatorMethod().spawn().get()
         ),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "_execution_coordinator_handle",
-        lambda **kwargs: SimpleNamespace(run=CoordinatorMethod()),
     )
     monkeypatch.setattr(
         alphafold3_app,
@@ -565,8 +553,10 @@ def test_submit_alphafold3_task_routes_a_cache_hit_through_a_new_root_run(
     )
 
     assert captured["request"].config.name == "cached"
-    assert captured["launch"] == (captured["run_id"], None)
-    assert captured["spawned"] == {"development": True}
+    _, submit_kwargs = captured["submit"]
+    assert submit_kwargs["execution_run_id"] == captured["run_id"]
+    assert submit_kwargs["predecessor_execution_run_id"] is None
+    assert submit_kwargs["use_deployed_coordinator"] is False
     assert captured["manifest"] is cached_manifest
     assert captured["display_name"] == "cached"
 
@@ -589,10 +579,6 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
     captured: dict[str, object] = {}
     predecessor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
-    class ForbiddenRun:
-        def spawn(self, **kwargs):
-            pytest.fail(f"restart submitted a root Run: {kwargs}")
-
     class Restart:
         def spawn(self, **kwargs):
             captured["restart"] = kwargs
@@ -600,7 +586,7 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
                 object_id="fc-successor",
                 get=lambda: SimpleNamespace(
                     run=SimpleNamespace(
-                        status=alphafold3_app.RunStatus.SUCCEEDED,
+                        status=RunStatus.SUCCEEDED,
                         status_reason=None,
                         status_message=None,
                     )
@@ -614,17 +600,10 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
     )
     monkeypatch.setattr(
         alphafold3_app,
-        "stage_execution_launch",
-        lambda _volume, run_id, selected_predecessor: captured.update(
-            launch=(run_id, selected_predecessor)
-        ),
-    )
-    monkeypatch.setattr(
-        alphafold3_app,
-        "_execution_coordinator_handle",
-        lambda **kwargs: SimpleNamespace(
-            run=ForbiddenRun(),
-            restart_from=Restart(),
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            captured.update(submit=(volume, kwargs))
+            or Restart().spawn(**kwargs["restart_kwargs"]).get()
         ),
     )
     monkeypatch.setattr(
@@ -653,9 +632,10 @@ def test_submit_alphafold3_task_restart_creates_a_successor_run(
         restart_from=predecessor,
     )
 
-    restart = cast(dict[str, object], captured["restart"])
-    assert captured["launch"] == (captured["staged"][0], UUID(predecessor))
-    assert restart["predecessor_execution_run_id"] == predecessor
+    _, submit_kwargs = captured["submit"]
+    assert submit_kwargs["execution_run_id"] == captured["staged"][0]
+    assert submit_kwargs["predecessor_execution_run_id"] == UUID(predecessor)
+    restart = cast(dict[str, object], submit_kwargs["restart_kwargs"])
     candidate_bytes = restart["candidate_request_bytes"]
     assert isinstance(candidate_bytes, bytes)
     candidate = alphafold3_app.AlphaFold3ExecutionRequest.from_bytes(candidate_bytes)

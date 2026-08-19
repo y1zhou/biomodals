@@ -43,6 +43,15 @@ def execution_plan(
         )
         for node_id in encounter_order
     )
+    metadata = definition.plan_metadata
+    if metadata is not None:
+        return ExecutionPlan(
+            workload_name=metadata.workload_name,
+            workload_run_key=workload_run_key,
+            nodes=nodes,
+            scientific_payload=metadata.scientific_payload,
+            scientific_versions=dict(metadata.scientific_versions),
+        )
     return ExecutionPlan(
         workload_name=f"workflow:{definition.name}",
         workload_run_key=workload_run_key,

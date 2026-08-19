@@ -50,6 +50,20 @@ class ExecutionNodeSpec:
 
 
 @dataclass(frozen=True)
+class ExecutionPlanMetadata:
+    """Workload-owned identity fields used by the durable Execution Plan."""
+
+    workload_name: str
+    scientific_payload: Any = None
+    scientific_versions: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject an empty workload identity."""
+        if not self.workload_name:
+            raise ValueError("Execution workload name cannot be empty")
+
+
+@dataclass(frozen=True)
 class ExecutionDefinition:
     """Validated executable DAG supplied to the execution kernel."""
 
@@ -57,6 +71,7 @@ class ExecutionDefinition:
     nodes: dict[str, ExecutionNodeSpec]
     dependencies: dict[str, set[str]]
     scientific_versions: dict[str, str]
+    plan_metadata: ExecutionPlanMetadata | None = None
 
 
 class ExecutionGraph:
@@ -67,10 +82,12 @@ class ExecutionGraph:
         name: str,
         *,
         scientific_versions: Mapping[str, str] | None = None,
+        plan_metadata: ExecutionPlanMetadata | None = None,
     ):
         """Initialize an empty executable graph."""
         self.name = sanitize_filename(name)
         self.scientific_versions = dict(scientific_versions or {})
+        self.plan_metadata = plan_metadata
         self._nodes: dict[str, ExecutionNodeSpec] = {}
 
     def add_node(
@@ -149,6 +166,7 @@ class ExecutionGraph:
             nodes=dict(self._nodes),
             dependencies=dependencies,
             scientific_versions=dict(self.scientific_versions),
+            plan_metadata=self.plan_metadata,
         )
 
     def _dependencies(self) -> dict[str, set[str]]:

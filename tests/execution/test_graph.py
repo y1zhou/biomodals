@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, fields
 import pytest
 
 import biomodals.workflow as workflow_api
-from biomodals.execution import NodeAggregationPolicy
+from biomodals.execution import ExecutionPlanMetadata, NodeAggregationPolicy
 from biomodals.execution.definition import NodeHandle
 from biomodals.execution.definition_plan import execution_plan, node_task_plan
 from biomodals.execution.nodes import CoordinatorNode, TaskProviderNode
@@ -119,6 +119,25 @@ def test_workflow_definition_maps_to_execution_plan_in_encounter_order() -> None
         "biomodals.workflow.execution_plan": "1",
         "model": "v1",
     }
+
+
+def test_explicit_plan_metadata_preserves_direct_app_identity() -> None:
+    graph = ExecutionGraph(
+        "direct-app",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="example",
+            scientific_payload={"input_sha256": "abc"},
+            scientific_versions={"example": "v4"},
+        ),
+    )
+    graph.add_node(DummyNode(), id="run")
+
+    plan = execution_plan(graph.validate(), workload_run_key="sample")
+
+    assert plan.workload_name == "example"
+    assert plan.workload_run_key == "sample"
+    assert plan.scientific_payload == {"input_sha256": "abc"}
+    assert plan.scientific_versions == {"example": "v4"}
 
 
 def test_workflow_hash_can_exclude_declared_operational_config_keys() -> None:

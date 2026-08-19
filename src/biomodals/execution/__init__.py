@@ -17,6 +17,7 @@ from biomodals.execution.definition import (
     ExecutionDefinition,
     ExecutionGraph,
     ExecutionNodeSpec,
+    ExecutionPlanMetadata,
     NodeHandle,
 )
 from biomodals.execution.model import (
@@ -114,6 +115,7 @@ __all__ = [
     "ExecutionNodeSpec",
     "ExecutionOverview",
     "ExecutionPlan",
+    "ExecutionPlanMetadata",
     "ExecutionRunNotFoundError",
     "EXECUTION_SCHEMA_VERSION",
     "ExecutionRunRecord",

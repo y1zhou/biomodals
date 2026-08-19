@@ -96,7 +96,39 @@ class ExecutionNode(Protocol):
         """Execute coordinator-local workload logic."""
 
 
-class CoordinatorNode:
+class ResultNode:
+    """Shared publication hooks for one-result Execution Nodes."""
+
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        """Reconstruct an already-durable workload publication when present."""
+        del context
+        return None
+
+    def commit_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        """Optionally commit and validate a workload-owned publication marker."""
+        del context, result, artifacts
+        return None
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        """Optionally validate a workload publication beyond its artifacts."""
+        del context, result, artifacts
+        return None
+
+
+class CoordinatorNode(ResultNode):
     """Base class for coordinator-local Execution Nodes."""
 
     def run(self, context: NodeRunContext) -> AppRunResult:
@@ -104,7 +136,7 @@ class CoordinatorNode:
         raise NotImplementedError
 
 
-class ProviderNode:
+class ProviderNode(ResultNode):
     """Base class for a Node executed by one tracked Provider Call."""
 
     def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
@@ -199,6 +231,16 @@ class TaskProviderNode:
         del context, task, expected_fingerprint, result, artifacts
         return None
 
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        """Reconstruct a result whose workload publication is already durable."""
+        del context, task, expected_fingerprint
+        return None
+
     def finalize_remote_tasks(
         self,
         context: NodeRunContext,
@@ -222,16 +264,6 @@ class PullTaskProviderNode(TaskProviderNode):
     ) -> PullWorkerCallSpec:
         """Prepare the immutable worker-pool binding for this Node."""
         raise NotImplementedError
-
-    def recover_remote_task_result(
-        self,
-        context: NodeRunContext,
-        task: TaskDefinition,
-        expected_fingerprint: str,
-    ) -> AppRunResult | None:
-        """Reconstruct a result whose workload publication is already durable."""
-        del context, task, expected_fingerprint
-        return None
 
     def prepare_remote_task(
         self,

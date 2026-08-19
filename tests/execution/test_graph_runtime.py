@@ -71,6 +71,50 @@ class TextNode(CoordinatorNode):
 
 
 @dataclass
+class RecoverableTextNode(CoordinatorNode):
+    text: str
+    publication_exists: bool = field(default=False, metadata={"dag_hash": False})
+    calls: int = field(default=0, metadata={"dag_hash": False})
+    commits: int = field(default=0, metadata={"dag_hash": False})
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        del context
+        self.calls += 1
+        return _text_result(self.text)
+
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        del context
+        return _text_result(self.text) if self.publication_exists else None
+
+    def commit_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        del context, result, artifacts
+        self.commits += 1
+        self.publication_exists = True
+        return AvailabilityStatus.AVAILABLE
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        del context, result, artifacts
+        return (
+            AvailabilityStatus.AVAILABLE
+            if self.publication_exists
+            else AvailabilityStatus.MISSING
+        )
+
+
+@dataclass
 class RemoteTextNode(ProviderNode):
     text: str
     function_name: str
@@ -166,6 +210,26 @@ class RemoteFanoutNode(TaskProviderNode):
                 )
             ],
         )
+
+
+@dataclass
+class RecoverableRemoteFanoutNode(RemoteFanoutNode):
+    recoverable_publications: set[str] = field(
+        default_factory=set,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        if task.task_key not in self.recoverable_publications:
+            return None
+        return _text_result(str(dict(task.scientific_payload)["text"]))
 
 
 @dataclass
@@ -589,6 +653,65 @@ def test_new_workflow_artifact_is_hashed_once(
 
     assert result.status == AppRunStatus.SUCCEEDED
     assert hashed == ["result.txt"]
+    runtime.close()
+
+
+def test_result_node_recovers_workload_publication_without_rerunning(
+    tmp_path: Path,
+) -> None:
+    node = RecoverableTextNode("cached", publication_exists=True)
+    graph = ExecutionGraph("recoverable")
+    graph.add_node(node, id="result")
+    runtime = _runtime(tmp_path, graph)
+
+    result = runtime.run(workload_run_key="recoverable")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert node.calls == 0
+    assert node.commits == 0
+    assert runtime.store.artifacts.load_node_result("result") is not None
+    runtime.close()
+
+
+def test_result_node_commits_workload_publication_after_execution(
+    tmp_path: Path,
+) -> None:
+    node = RecoverableTextNode("new")
+    graph = ExecutionGraph("publishable")
+    graph.add_node(node, id="result")
+    runtime = _runtime(tmp_path, graph)
+
+    result = runtime.run(workload_run_key="publishable")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert node.calls == 1
+    assert node.commits == 1
+    runtime.close()
+
+
+def test_task_node_recovers_workload_publication_without_provider_call(
+    tmp_path: Path,
+) -> None:
+    node = RecoverableRemoteFanoutNode(
+        ("cached",),
+        recoverable_publications={"candidate-0"},
+    )
+    graph = ExecutionGraph("recoverable-task")
+    graph.add_node(node, id="fanout")
+    driver = FakeModalDriver()
+    runtime = _runtime(tmp_path, graph, driver=driver)
+
+    result = runtime.run(workload_run_key="recoverable-task")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert not any(event.startswith("spawn:") for event in driver.events)
+    assert (
+        runtime.store.artifacts.load_task_result(
+            "fanout",
+            "candidate-0",
+        )
+        is not None
+    )
     runtime.close()
 
 

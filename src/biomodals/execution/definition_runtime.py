@@ -55,6 +55,7 @@ from biomodals.execution.nodes import (
     ProviderNode,
     PullTaskProviderNode,
     PullWorkerCallSpec,
+    ResultNode,
     TaskDefinition,
     TaskProviderNode,
 )
@@ -120,6 +121,16 @@ def _task_storage_scope(task_key: str) -> str:
 class _PreparedTask:
     plan: TaskPlan
     observation: AvailabilityStatus
+    fingerprint: str | None = None
+    recovered_result: AppRunResult | None = None
+    recovered_artifacts: tuple[ExecutionArtifact, ...] = ()
+
+
+@dataclass(frozen=True)
+class _TaskPublicationObservation:
+    status: AvailabilityStatus
+    recovered_result: AppRunResult | None = None
+    recovered_artifacts: tuple[ExecutionArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1218,6 +1229,19 @@ class ExecutionGraphRuntime:
                     now=self._now(),
                 )
                 for task in item.tasks:
+                    if task.recovered_result is not None:
+                        if task.fingerprint is None:
+                            raise RuntimeError(
+                                "Recovered Execution Task has no fingerprint"
+                            )
+                        self.store.artifacts.record_task_publication(
+                            item.node_id,
+                            task.plan.task_key,
+                            task_fingerprint=task.fingerprint,
+                            result=task.recovered_result,
+                            artifacts=task.recovered_artifacts,
+                            now=self._now(),
+                        )
                     if task.observation == AvailabilityStatus.MISSING:
                         self.store.artifacts.discard_task_publication(
                             item.node_id,
@@ -1252,21 +1276,24 @@ class ExecutionGraphRuntime:
                         scientific_payload=_json_value(task.scientific_payload),
                         execution_payload=_json_value(task.execution_payload),
                     )
+                    fingerprint = plan.fingerprint(
+                        workload_plan_fingerprint=workload_plan_fingerprint,
+                        node_key=node_id,
+                    )
+                    publication = self._prepare_remote_task_publication(
+                        node_id,
+                        node,
+                        context,
+                        task,
+                        fingerprint,
+                    )
                     tasks.append(
                         _PreparedTask(
                             plan=plan,
-                            observation=self._remote_task_publication_observation(
-                                node_id,
-                                node,
-                                context,
-                                task,
-                                plan.fingerprint(
-                                    workload_plan_fingerprint=(
-                                        workload_plan_fingerprint
-                                    ),
-                                    node_key=node_id,
-                                ),
-                            ),
+                            observation=publication.status,
+                            fingerprint=fingerprint,
+                            recovered_result=publication.recovered_result,
+                            recovered_artifacts=publication.recovered_artifacts,
                         )
                     )
                 return _PreparedNode(node_id, context, tuple(tasks))
@@ -1673,7 +1700,11 @@ class ExecutionGraphRuntime:
         if result.status != AppRunStatus.SUCCEEDED:
             self._fail_task(node_id, _node_error_message(result))
             return
-        context = self._node_context(self._require_definition(), node_id)
+        definition = self._require_definition()
+        implementation = definition.nodes[node_id].node
+        if not isinstance(implementation, ResultNode):
+            raise TypeError("One-result publication requires a Result Node")
+        context = self._node_context(definition, node_id)
         materialized = materialize_app_run_result(
             result=result,
             artifact_volume_name=self.artifact_volume_name,
@@ -1682,9 +1713,11 @@ class ExecutionGraphRuntime:
             producing_node_id=node_id,
             volume_root=self.volume_root,
         )
-        observation = self._artifact_observation(
+        observation = self._commit_result_publication(
+            implementation,
+            context,
+            materialized.result,
             tuple(materialized.artifacts),
-            execution_artifacts_validated=True,
         )
         with self.store.transaction():
             if self.store.execution.get_task(
@@ -2108,8 +2141,106 @@ class ExecutionGraphRuntime:
             result = self.store.artifacts.load_node_result(node_id)
             artifacts = self.store.artifacts.load_node_output_artifacts(node_id)
         if result is None or result.status != AppRunStatus.SUCCEEDED:
+            return self._recover_result_publication(node_id)
+        definition = self._require_definition()
+        implementation = definition.nodes[node_id].node
+        if not isinstance(implementation, ResultNode):
+            return self._artifact_observation(artifacts)
+        return self._observe_result_publication(
+            implementation,
+            self._node_context(definition, node_id),
+            result,
+            artifacts,
+        )
+
+    def _recover_result_publication(self, node_id: str) -> AvailabilityStatus:
+        """Recover one workload-owned result missing from the execution store."""
+        definition = self._require_definition()
+        implementation = definition.nodes[node_id].node
+        if not isinstance(implementation, ResultNode):
             return AvailabilityStatus.MISSING
-        return self._artifact_observation(artifacts)
+        context = self._node_context(definition, node_id)
+        try:
+            recovered = implementation.recover_result_publication(context)
+        except Exception:  # noqa: BLE001 - inconclusive workload validation
+            return AvailabilityStatus.UNKNOWN
+        if recovered is None:
+            return AvailabilityStatus.MISSING
+        result = AppRunResult.model_validate(recovered)
+        if result.status != AppRunStatus.SUCCEEDED:
+            raise ValueError("Recovered Execution Node result must be succeeded")
+        materialized = materialize_app_run_result(
+            result=result,
+            artifact_volume_name=self.artifact_volume_name,
+            result_dir=context.work_dir,
+            artifact_dir=self.store.output_root / "artifacts",
+            producing_node_id=node_id,
+            volume_root=self.volume_root,
+        )
+        artifacts = tuple(materialized.artifacts)
+        observation = self._observe_result_publication(
+            implementation,
+            context,
+            materialized.result,
+            artifacts,
+            execution_artifacts_validated=True,
+        )
+        if observation == AvailabilityStatus.MISSING:
+            return observation
+        with self.store.transaction():
+            if self._node_publication_is_fenced(node_id):
+                return observation
+            self.store.artifacts.record_node_publication(
+                node_id,
+                result=materialized.result,
+                artifacts=artifacts,
+                now=self._now(),
+            )
+        return observation
+
+    def _commit_result_publication(
+        self,
+        implementation: ResultNode,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        """Commit a workload marker after validating execution artifacts."""
+        artifact_observation = self._artifact_observation(
+            artifacts,
+            execution_artifacts_validated=True,
+        )
+        if artifact_observation != AvailabilityStatus.AVAILABLE:
+            return artifact_observation
+        workload_observation = implementation.commit_result_publication(
+            context,
+            result,
+            artifacts,
+        )
+        return workload_observation or AvailabilityStatus.AVAILABLE
+
+    def _observe_result_publication(
+        self,
+        implementation: ResultNode,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+        *,
+        execution_artifacts_validated: bool = False,
+    ) -> AvailabilityStatus:
+        """Combine execution artifacts with one workload publication probe."""
+        artifact_observation = self._artifact_observation(
+            artifacts,
+            execution_artifacts_validated=execution_artifacts_validated,
+        )
+        if artifact_observation != AvailabilityStatus.AVAILABLE:
+            return artifact_observation
+        workload_observation = implementation.observe_result_publication(
+            context,
+            result,
+            artifacts,
+        )
+        return workload_observation or AvailabilityStatus.AVAILABLE
 
     def _remote_task_publication_observation(
         self,
@@ -2120,6 +2251,48 @@ class ExecutionGraphRuntime:
         expected_fingerprint: str,
     ) -> AvailabilityStatus:
         """Validate a stored Task result and its workload-owned publication."""
+        publication = self._prepare_remote_task_publication(
+            node_id,
+            implementation,
+            context,
+            task,
+            expected_fingerprint,
+        )
+        if publication.recovered_result is None:
+            return publication.status
+        with self.store.transaction():
+            current = self.store.execution.get_task(
+                self.execution_run_id,
+                node_id,
+                task.task_key,
+            )
+            if (
+                self.store.execution.get_run(
+                    self.execution_run_id
+                ).cancellation_is_durable
+                or current.status.is_terminal
+            ):
+                return publication.status
+            self.store.artifacts.discard_task_publication(node_id, task.task_key)
+            self.store.artifacts.record_task_publication(
+                node_id,
+                task.task_key,
+                task_fingerprint=expected_fingerprint,
+                result=publication.recovered_result,
+                artifacts=publication.recovered_artifacts,
+                now=self._now(),
+            )
+        return publication.status
+
+    def _prepare_remote_task_publication(
+        self,
+        node_id: str,
+        implementation: TaskProviderNode,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> _TaskPublicationObservation:
+        """Validate or reconstruct one Task publication outside the writer."""
         with self.store.synchronize():
             result = self.store.artifacts.load_task_result(node_id, task.task_key)
             fingerprint = self.store.artifacts.load_task_fingerprint(
@@ -2131,18 +2304,60 @@ class ExecutionGraphRuntime:
                 task.task_key,
             )
         if (
-            result is None
-            or result.status != AppRunStatus.SUCCEEDED
-            or fingerprint != expected_fingerprint
+            result is not None
+            and result.status == AppRunStatus.SUCCEEDED
+            and fingerprint == expected_fingerprint
         ):
-            return AvailabilityStatus.MISSING
-        return self._observe_remote_task_publication(
+            return _TaskPublicationObservation(
+                self._observe_remote_task_publication(
+                    implementation,
+                    context,
+                    task,
+                    expected_fingerprint,
+                    result,
+                    artifacts,
+                )
+            )
+        if isinstance(implementation, PullTaskProviderNode):
+            return _TaskPublicationObservation(AvailabilityStatus.MISSING)
+        try:
+            recovered = implementation.recover_remote_task_result(
+                context,
+                task,
+                expected_fingerprint,
+            )
+        except Exception:  # noqa: BLE001 - inconclusive workload validation
+            return _TaskPublicationObservation(AvailabilityStatus.UNKNOWN)
+        if recovered is None:
+            return _TaskPublicationObservation(AvailabilityStatus.MISSING)
+        result = AppRunResult.model_validate(recovered)
+        if result.status != AppRunStatus.SUCCEEDED:
+            raise ValueError("Recovered Execution Task result must be succeeded")
+        materialized = materialize_app_run_result(
+            result=result,
+            artifact_volume_name=self.artifact_volume_name,
+            result_dir=context.work_dir,
+            artifact_dir=self.store.output_root / "artifacts",
+            producing_node_id=node_id,
+            artifact_id_scope=_task_storage_scope(task.task_key),
+            volume_root=self.volume_root,
+        )
+        artifacts = tuple(materialized.artifacts)
+        observation = self._observe_remote_task_publication(
             implementation,
             context,
             task,
             expected_fingerprint,
-            result,
+            materialized.result,
             artifacts,
+            execution_artifacts_validated=True,
+        )
+        if observation == AvailabilityStatus.MISSING:
+            return _TaskPublicationObservation(observation)
+        return _TaskPublicationObservation(
+            observation,
+            recovered_result=materialized.result,
+            recovered_artifacts=artifacts,
         )
 
     def _observe_remote_task_publication(

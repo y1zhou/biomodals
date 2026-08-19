@@ -5725,6 +5725,7 @@ class ExecutionCoordinator:
                 deployment=deployment,
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
+                output_volume_name=CONF.output_volume_name,
                 model_volume=MODEL_VOLUME,
                 output_claims=OLIGOFORMER_OUTPUT_CLAIMS,
                 provider_driver=_coordinator_modal_driver(development=selected_mode),

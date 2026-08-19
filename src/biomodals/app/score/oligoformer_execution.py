@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -15,20 +15,36 @@ import orjson
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionArtifact,
+    ExecutionGraph,
     ExecutionPlan,
+    ExecutionPlanMetadata,
     NodeDependency,
     NodePlan,
-    ProviderBinding,
-    ProviderCallStatus,
-    TaskPlan,
+    inline_json_result,
+    republish_execution_artifact,
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    OutputClaimExecutionCoordinatorLifecycle,
-    StandardExecutionRuntimeLifecycle,
+    OutputClaimExecutionDefinitionCoordinatorLifecycle,
 )
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
+)
 from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    InlineBytes,
+    VolumePath,
+)
 
 REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
@@ -323,418 +339,166 @@ def load_execution_request(
     )
 
 
-class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
-    """Drive deterministic OligoFormer scientific tiles through the kernel."""
+class OligoformerPublications:
+    """Own OligoFormer cache claims and publication reconstruction."""
 
     def __init__(
         self,
         *,
         request: OligoformerExecutionRequest,
         execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
+        output_root: str | Path,
+        output_volume_name: str,
         model_volume: Any,
         output_claims: Any,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
     ) -> None:
-        """Bind the kernel writer to OligoFormer's publication volumes."""
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-        )
+        """Bind one execution Run to app-owned caches and output claims."""
+        self.request = request
+        self.execution_run_id = execution_run_id
+        self.output_root = Path(output_root)
+        self.output_volume_name = output_volume_name
         self.model_volume = model_volume
         self.output_claims = output_claims
-        self._claimed_publications: set[str] = set()
+        self._claimed: set[str] = set()
 
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            now=self._now(),
+    def claim_reference(self, plan: Any) -> None:
+        """Claim the shared full-human reference cache generation."""
+        identity = plan.reference_identity
+        if identity is None:
+            raise ValueError("OligoFormer reference identity is unavailable")
+        self._claim(f"oligoformer-reference-cache:{identity}")
+
+    def claim_evidence(self, plan: Any, stem: str) -> None:
+        """Claim one run/stem off-target evidence publication."""
+        identity = _workload_module()._off_target_evidence_identity(
+            plan.run_root,
+            stem,
         )
-        succeeded_nodes = {
-            updated.node_key
-            for original, updated in reconciled
-            if not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-        }
-        if succeeded_nodes:
-            self._reload_output()
-        if DOWNLOAD_NODE in succeeded_nodes:
-            self.model_volume.reload()
+        self._claim(f"oligoformer-evidence:{identity}")
 
-    def _recover_publications(self) -> None:
-        self._provider.recover_publications(
-            self.execution_run_id,
-            observe_node=self._node_observation,
-            observe_task=lambda node_key, task: (
-                None
-                if node_key in self._plan_nodes
-                else self._task_observation(node_key, task)
-            ),
-            now=self._now(),
+    def _claim(self, claim_key: str) -> None:
+        if claim_key in self._claimed:
+            return
+        acquire_output_claim(
+            self.output_claims,
+            claim_key=claim_key,
+            owner=str(self.execution_run_id),
+            replace_owner=self.request.replace_claim_owner,
         )
+        self._claimed.add(claim_key)
 
-    @property
-    def _plan_nodes(self) -> frozenset[str]:
-        return frozenset({PREPARE_NODE, REFERENCE_PLAN_NODE, EVIDENCE_PLAN_NODE})
-
-    def _node_observation(self, node_key: str) -> AvailabilityStatus:
+    def result(self, plan: Any | None = None) -> AppRunResult | None:
+        """Reconstruct the exact published standalone result archive."""
         app = _workload_module()
         try:
-            if node_key in self._plan_nodes:
-                available = False
-            elif node_key == DOWNLOAD_NODE:
-                available = app._oligoformer_models_ready()
-            elif node_key in {REFERENCE_SHARDS_NODE, REFERENCE_FINALIZE_NODE}:
-                available = app._targetscan_rnaplfold_cache_ready()
-            elif node_key == EFFICACY_NODE:
-                plan = self._try_run_plan()
-                available = (
-                    plan is not None
-                    and app._build_plan(
-                        plan.cache_key,
-                        plan.efficacy_key,
-                        plan.output_stems,
-                        plan.run_root,
-                        config=plan.config,
-                        postprocess_key=plan.postprocess_key,
-                        reference_identity=plan.reference_identity,
-                        model_identity=plan.model_identity,
-                    ).efficacy_ready
-                )
-            elif node_key in {PITA_REFERENCE_NODE}:
-                available = False
-            elif node_key in {PITA_CANDIDATES_NODE, TARGETSCAN_TILES_NODE}:
-                tasks = self._planned_task_records(node_key)
-                available = tasks is not None and all(
-                    self._task_observation(node_key, task)
-                    == AvailabilityStatus.AVAILABLE
-                    for task in tasks
-                )
-            elif node_key == EVIDENCE_MERGE_NODE:
-                plan = self._try_run_plan()
-                available = (
-                    plan is not None
-                    and plan.config.off_target
-                    and all(
-                        app._raw_off_target_ready(
-                            app.AppRunLayout.from_run_root(plan.run_root).prep_dir
-                            / "off_target"
-                            / stem,
-                            expected_identity=app._off_target_evidence_identity(
-                                plan.run_root,
-                                stem,
-                            ),
-                        )
-                        for stem in plan.output_stems
+            expected_identities = (
+                (
+                    plan.model_identity
+                    if plan is not None and plan.model_identity is not None
+                    else app._oligoformer_model_volume_identity_digest()
+                ),
+                (
+                    plan.reference_identity
+                    if plan is not None
+                    else (
+                        app._oligoformer_reference_volume_identity_digest()
+                        if self.request.off_target and self.request.all_human
+                        else None
                     )
-                )
-            elif node_key == FINAL_NODE:
-                plan = self._try_run_plan()
-                available = (
-                    plan is not None
-                    and app._build_plan(
-                        plan.cache_key,
-                        plan.efficacy_key,
-                        plan.output_stems,
-                        plan.run_root,
-                        config=plan.config,
-                        postprocess_key=plan.postprocess_key,
-                        reference_identity=plan.reference_identity,
-                        model_identity=plan.model_identity,
-                    ).final_ready
-                )
-            elif node_key == PUBLISH_NODE:
-                plan = self._try_run_plan()
-                try:
-                    expected_identities = (
-                        (
-                            plan.model_identity
-                            if plan is not None and plan.model_identity is not None
-                            else app._oligoformer_model_volume_identity_digest()
-                        ),
-                        (
-                            plan.reference_identity
-                            if plan is not None
-                            else (
-                                app._oligoformer_reference_volume_identity_digest()
-                                if self.request.off_target and self.request.all_human
-                                else None
-                            )
-                        ),
-                    )
-                except FileNotFoundError:
-                    available = False
-                else:
-                    available = (
-                        app._oligoformer_result_publication(
-                            self.store.volume_root,
-                            self.request.execution_plan.workload_plan_fingerprint,
-                            expected_identities=expected_identities,
-                        )
-                        is not None
-                    )
-            else:
-                raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _planned_task_records(self, node_key: str) -> tuple[Any, ...] | None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            node = repository.get_node(self.execution_run_id, node_key)
-            if not node.discovery_complete:
-                return None
-            return repository.list_tasks(self.execution_run_id, node_key)
-
-    def _task_observation(self, node_key: str, task: Any) -> AvailabilityStatus:
-        app = _workload_module()
-        try:
-            if node_key == REFERENCE_SHARDS_NODE:
-                spec = app.TargetscanRnaPlfoldShardSpec(
-                    **task.execution_payload["spec"]
-                )
-                available = app._targetscan_rnaplfold_shard_state(
-                    spec,
-                    verify_output_hashes=False,
-                )[0]
-            elif node_key == PITA_CANDIDATES_NODE:
-                spec = app.OffTargetShardSpec(**task.execution_payload["spec"])
-                available = app._pita_candidate_ready(spec)
-            elif node_key == TARGETSCAN_TILES_NODE:
-                spec = app.TargetscanBatchSpec(**task.execution_payload["spec"])
-                available = app._targetscan_tile_ready(spec)
-            else:
-                return self._node_observation(node_key)
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _decode_completed_calls(self) -> None:
-        self._provider.decode_completed_calls(
-            self.execution_run_id,
-            observe_task=self._completed_task_observation,
-            missing_message="OligoFormer returned without a valid publication",
-            now=self._now(),
-        )
-
-    def _completed_task_observation(
-        self,
-        node_key: str,
-        task: Any,
-        envelope: object,
-    ) -> AvailabilityStatus:
-        if not isinstance(envelope, dict):
-            return AvailabilityStatus.MISSING
-        try:
-            if node_key in {PREPARE_NODE, EFFICACY_NODE, FINAL_NODE}:
-                _run_plan_from_envelope(envelope)
-            elif node_key == REFERENCE_PLAN_NODE:
-                _reference_plan_from_envelope(envelope)
-            elif node_key == EVIDENCE_PLAN_NODE:
-                _evidence_plan_from_envelope(envelope)
-            elif node_key == PITA_REFERENCE_NODE:
-                _pita_reference_from_envelope(envelope)
-            elif node_key == PUBLISH_NODE:
-                if envelope.get("kind") != "result":
-                    return AvailabilityStatus.MISSING
-            elif envelope.get("kind") not in {
-                "none",
-                "count",
-                "pita-result",
-                "path",
-            }:
-                return AvailabilityStatus.MISSING
-        except (TypeError, ValueError):
-            return AvailabilityStatus.MISSING
-        if node_key in self._plan_nodes or node_key == PITA_REFERENCE_NODE:
-            return AvailabilityStatus.AVAILABLE
-        return self._task_observation(node_key, task)
-
-    def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.start_ready_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            task_plans=self._task_plans,
-            observe_task=lambda node_key, task: (
-                AvailabilityStatus.MISSING
-                if node_key in self._plan_nodes or node_key == PITA_REFERENCE_NODE
-                else self._task_observation(node_key, task)
-            ),
-            now=self._now(),
-        )
-
-    def _task_plans(self, node_key: str) -> tuple[TaskPlan, ...]:
-        if node_key in {
-            DOWNLOAD_NODE,
-            PREPARE_NODE,
-            REFERENCE_PLAN_NODE,
-            REFERENCE_FINALIZE_NODE,
-            EFFICACY_NODE,
-            EVIDENCE_PLAN_NODE,
-            FINAL_NODE,
-            PUBLISH_NODE,
-        }:
-            return (TaskPlan(node_key, {"stage": node_key}),)
-        if node_key == REFERENCE_SHARDS_NODE:
-            return tuple(
-                TaskPlan(
-                    f"{spec.shard_index:05d}",
-                    {"shard_index": spec.shard_index},
-                    {"spec": asdict(spec)},
-                )
-                for spec in self._reference_plan().shard_specs
+                ),
             )
-        evidence = self._evidence_plan()
-        if node_key == PITA_REFERENCE_NODE:
-            return tuple(
-                TaskPlan(
-                    stem.stem,
-                    {"stem": stem.stem},
-                    {"spec": asdict(stem.pita_specs[0])},
-                )
-                for stem in evidence.stems
-            )
-        if node_key == PITA_CANDIDATES_NODE:
-            return tuple(
-                TaskPlan(
-                    _pita_task_key(spec),
-                    {
-                        "stem": spec.stem,
-                        "record_name": spec.record_name,
-                        "record_sequence_sha256": sha256(
-                            spec.record_sequence.encode()
-                        ).hexdigest(),
-                    },
-                    {"spec": asdict(spec)},
-                )
-                for stem in evidence.stems
-                for spec in stem.pita_specs
-            )
-        if node_key == TARGETSCAN_TILES_NODE:
-            return tuple(
-                TaskPlan(
-                    _targetscan_task_key(spec),
-                    {
-                        "stem": spec.stem,
-                        "candidate_shard_index": spec.candidate_shard_index,
-                        "reference_shard_index": spec.shard_index,
-                    },
-                    {"spec": asdict(spec)},
-                )
-                for stem in evidence.stems
-                for spec in stem.targetscan_specs
-            )
-        if node_key == EVIDENCE_MERGE_NODE:
-            return tuple(
-                TaskPlan(
-                    stem.stem,
-                    {"stem": stem.stem},
-                    {"stem_plan": asdict(stem)},
-                )
-                for stem in evidence.stems
-            )
-        raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
-
-    def _try_run_plan(self):
-        try:
-            return self._run_plan()
-        except (LookupError, TypeError, ValueError):
+        except FileNotFoundError:
             return None
-
-    def _run_plan(self):
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                PREPARE_NODE,
-            )
-        if call is None:
-            raise LookupError("OligoFormer run plan is unavailable")
-        return _run_plan_from_envelope(call.result_envelope)
-
-    def _reference_plan(self):
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                REFERENCE_PLAN_NODE,
-            )
-        if call is None:
-            raise LookupError("OligoFormer reference plan is unavailable")
-        return _reference_plan_from_envelope(call.result_envelope)
-
-    def _evidence_plan(self):
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                EVIDENCE_PLAN_NODE,
-            )
-        if call is None:
-            raise LookupError("OligoFormer evidence plan is unavailable")
-        return _evidence_plan_from_envelope(call.result_envelope)
-
-    def _pita_reference(self, stem: str):
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                PITA_REFERENCE_NODE,
-                task_key=stem,
-            )
-        if call is None:
-            raise LookupError(f"OligoFormer PITA reference plan is unavailable: {stem}")
-        return _pita_reference_from_envelope(call.result_envelope)
-
-    def _binding(self, node_key: str) -> ProviderBinding:
-        function_name = {
-            DOWNLOAD_NODE: "download_oligoformer_models",
-            PREPARE_NODE: "prepare_oligoformer_run",
-            REFERENCE_PLAN_NODE: "plan_oligoformer_targetscan_rnaplfold_cache",
-            REFERENCE_SHARDS_NODE: "run_oligoformer_targetscan_rnaplfold_shard",
-            REFERENCE_FINALIZE_NODE: "finalize_oligoformer_targetscan_rnaplfold_cache",
-            EFFICACY_NODE: "run_oligoformer_efficacy",
-            EVIDENCE_PLAN_NODE: "plan_oligoformer_off_target_evidence",
-            PITA_REFERENCE_NODE: "prepare_oligoformer_pita_reference",
-            PITA_CANDIDATES_NODE: "run_oligoformer_pita_candidate",
-            TARGETSCAN_TILES_NODE: "run_oligoformer_targetscan_tile",
-            EVIDENCE_MERGE_NODE: "publish_oligoformer_off_target_evidence",
-            FINAL_NODE: "build_oligoformer_final_tables",
-            PUBLISH_NODE: "publish_oligoformer_outputs",
-        }[node_key]
-        return ProviderBinding(
-            environment=self.deployment.environment,
-            app_name=self.deployment.deployment_name,
-            app_version=self.deployment.deployment_version,
-            function_name=function_name,
-            uses_gpu=node_key == EFFICACY_NODE,
-            runtime_image_key=(
-                "oligoformer-gpu" if node_key == EFFICACY_NODE else "oligoformer-cpu"
-            ),
+        publication = app._oligoformer_result_publication(
+            self.output_root,
+            self.request.execution_plan.workload_plan_fingerprint,
+            expected_identities=expected_identities,
+        )
+        if publication is None:
+            return None
+        relative = cast(str, publication["result_path"])
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="oligoformer-result",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=relative,
+                    ),
+                    metadata={
+                        "files": [
+                            ArtifactFile(
+                                path=Path(relative).name,
+                                size_bytes=cast(int, publication["size_bytes"]),
+                                content_sha256=cast(str, publication["sha256"]),
+                            ).model_dump(mode="json")
+                        ]
+                    },
+                )
+            ],
         )
 
-    def _invocation_kwargs(
+
+class _OligoformerProviderNode(ProviderNode):
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+
+class _OligoformerTaskNode(TaskProviderNode):
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+
+@dataclass
+class _DownloadNode(_OligoformerProviderNode):
+    publications: OligoformerPublications
+
+    def refresh_result_storage(self) -> None:
+        self.publications.model_volume.reload()
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return _call("download_oligoformer_models", kwargs={"force": False})
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        if result is not None or not _workload_module()._oligoformer_models_ready():
+            raise FileNotFoundError("OligoFormer models are unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        del context
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _workload_module()._oligoformer_models_ready()
+            else None
+        )
+
+    def observe_result_publication(
         self,
-        node_key: str,
-        task_key: str,
-    ) -> dict[str, object]:
-        app = _workload_module()
-        execution = self.request.execution_config
-        if node_key == DOWNLOAD_NODE:
-            return {"force": False}
-        if node_key == PREPARE_NODE:
-            return {
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, result, artifacts
+        return _status(_workload_module()._oligoformer_models_ready())
+
+
+@dataclass
+class _PrepareNode(_OligoformerProviderNode):
+    request: OligoformerExecutionRequest
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return _call(
+            "prepare_oligoformer_run",
+            kwargs={
                 "mrna_fasta_bytes": self.request.mrna_fasta_bytes,
                 "sirna_fasta_bytes": self.request.sirna_fasta_bytes,
                 "off_target": self.request.off_target,
@@ -749,111 +513,682 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 "toxicity_threshold": self.request.toxicity_threshold,
                 "force": self.request.force,
                 "force_generation": self.request.force_generation,
-            }
-        if node_key == REFERENCE_PLAN_NODE:
-            return {"force": False, "execution": execution}
-        if node_key == REFERENCE_SHARDS_NODE:
-            task = self._task(node_key, task_key)
-            return {
-                "spec": app.TargetscanRnaPlfoldShardSpec(
-                    **task.execution_payload["spec"]
-                ),
-                "local_workers": execution.targetscan_rnaplfold_workers,
-            }
-        if node_key == REFERENCE_FINALIZE_NODE:
-            return {"plan": self._reference_plan()}
-        if node_key == EFFICACY_NODE:
-            return {
-                "plan": self._run_plan(),
-                "functionality_filter": self.request.functionality_filter,
-            }
-        if node_key == EVIDENCE_PLAN_NODE:
-            return {
-                "plan": self._run_plan(),
-                "targetscan_ref_shard_size": self.request.targetscan_ref_shard_size,
-                "execution": execution,
-            }
-        if node_key == PITA_REFERENCE_NODE:
-            task = self._task(node_key, task_key)
-            return {
-                "spec": app.OffTargetShardSpec(**task.execution_payload["spec"]),
-                "execution": execution,
-            }
-        if node_key == PITA_CANDIDATES_NODE:
-            task = self._task(node_key, task_key)
-            spec = app.OffTargetShardSpec(**task.execution_payload["spec"])
-            return {
+            },
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        return _plan_result("run-plan", _run_plan_from_value(result))
+
+
+@dataclass
+class _ReferencePlanNode(_OligoformerProviderNode):
+    request: OligoformerExecutionRequest
+    publications: OligoformerPublications
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        plan = _run_plan_from_context(context)
+        self.publications.claim_reference(plan)
+        return _call(
+            "plan_oligoformer_targetscan_rnaplfold_cache",
+            kwargs={"force": False, "execution": self.request.execution_config},
+            metadata={"run_plan": asdict(plan)},
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        return _plan_result(
+            "reference-plan",
+            _reference_plan_from_value(result),
+            upstream=(_inline_plan_output("run-plan", metadata.get("run_plan")),),
+        )
+
+
+@dataclass
+class _ReferenceShardsNode(_OligoformerTaskNode):
+    request: OligoformerExecutionRequest
+    publications: OligoformerPublications
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        self.publications.claim_reference(_run_plan_from_context(context))
+        return tuple(
+            TaskDefinition(
+                task_key=f"{spec.shard_index:05d}",
+                scientific_payload={"shard_index": spec.shard_index},
+                execution_payload={"spec": asdict(spec)},
+            )
+            for spec in _reference_plan_from_context(context).shard_specs
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        self.publications.claim_reference(_run_plan_from_context(context))
+        spec = _reference_shard_from_task(task)
+        return _call(
+            "run_oligoformer_targetscan_rnaplfold_shard",
+            kwargs={
                 "spec": spec,
-                "reference": self._pita_reference(spec.stem),
-                "execution": execution,
-            }
-        if node_key == TARGETSCAN_TILES_NODE:
-            task = self._task(node_key, task_key)
-            return {
-                "spec": app.TargetscanBatchSpec(**task.execution_payload["spec"]),
-                "execution": execution,
-            }
-        if node_key == EVIDENCE_MERGE_NODE:
-            task = self._task(node_key, task_key)
-            return {
-                "run_root": self._run_plan().run_root,
-                "stem_plan": _evidence_stem_from_value(
-                    task.execution_payload["stem_plan"]
+                "local_workers": (
+                    self.request.execution_config.targetscan_rnaplfold_workers
                 ),
-            }
-        if node_key == FINAL_NODE:
-            return {"plan": self._run_plan()}
-        if node_key == PUBLISH_NODE:
-            return {
-                "plan": self._run_plan(),
+            },
+            metadata={"spec": asdict(spec)},
+        )
+
+    def process_remote_task_result(
+        self, task_key: str, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del task_key
+        spec = _reference_shard_from_metadata(metadata)
+        if type(result) is not int or not _reference_shard_ready(spec):
+            raise FileNotFoundError("OligoFormer reference shard is unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _reference_shard_ready(_reference_shard_from_task(task))
+            else None
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, expected_fingerprint, result, artifacts
+        return _status(_reference_shard_ready(_reference_shard_from_task(task)))
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        return _republish_inputs(
+            context,
+            ("run-plan", "reference-plan"),
+            results,
+            errors,
+        )
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        return _status(
+            all(
+                _reference_shard_ready(spec)
+                for spec in _reference_plan_from_context(context).shard_specs
+            )
+        )
+
+
+@dataclass
+class _ReferenceFinalizeNode(_OligoformerProviderNode):
+    publications: OligoformerPublications
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        self.publications.claim_reference(_run_plan_from_context(context))
+        return _call(
+            "finalize_oligoformer_targetscan_rnaplfold_cache",
+            kwargs={"plan": _reference_plan_from_context(context)},
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        if (
+            result is not None
+            or not _workload_module()._targetscan_rnaplfold_cache_ready()
+        ):
+            raise FileNotFoundError("OligoFormer reference cache is unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        del context
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _workload_module()._targetscan_rnaplfold_cache_ready()
+            else None
+        )
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, result, artifacts
+        return _status(_workload_module()._targetscan_rnaplfold_cache_ready())
+
+
+@dataclass
+class _EfficacyNode(_OligoformerProviderNode):
+    request: OligoformerExecutionRequest
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        return _call(
+            "run_oligoformer_efficacy",
+            uses_gpu=True,
+            kwargs={
+                "plan": _run_plan_from_context(context),
+                "functionality_filter": self.request.functionality_filter,
+            },
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        plan = _run_plan_from_value(result)
+        if not plan.efficacy_ready:
+            raise FileNotFoundError("OligoFormer efficacy output is unavailable")
+        return _plan_result("run-plan", plan)
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        if not context.inputs.get("run-plan"):
+            return None
+        plan = _refresh_run_plan(_run_plan_from_context(context))
+        return _plan_result("run-plan", plan) if plan.efficacy_ready else None
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        return _status(
+            _refresh_run_plan(_run_plan_from_context(context)).efficacy_ready
+        )
+
+
+@dataclass
+class _EvidencePlanNode(_OligoformerProviderNode):
+    request: OligoformerExecutionRequest
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        plan = _run_plan_from_context(context)
+        return _call(
+            "plan_oligoformer_off_target_evidence",
+            kwargs={
+                "plan": plan,
+                "targetscan_ref_shard_size": self.request.targetscan_ref_shard_size,
+                "execution": self.request.execution_config,
+            },
+            metadata={"run_plan": asdict(plan)},
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        return _plan_result(
+            "evidence-plan",
+            _evidence_plan_from_value(result),
+            upstream=(_inline_plan_output("run-plan", metadata.get("run_plan")),),
+        )
+
+
+@dataclass
+class _PitaReferenceNode(_OligoformerTaskNode):
+    request: OligoformerExecutionRequest
+    publications: OligoformerPublications
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        return tuple(
+            TaskDefinition(
+                task_key=stem.stem,
+                scientific_payload={"stem": stem.stem},
+                execution_payload={"spec": asdict(stem.pita_specs[0])},
+            )
+            for stem in _evidence_plan_from_context(context).stems
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        spec = _pita_spec_from_task(task)
+        self.publications.claim_evidence(_run_plan_from_context(context), spec.stem)
+        return _call(
+            "prepare_oligoformer_pita_reference",
+            kwargs={"spec": spec, "execution": self.request.execution_config},
+        )
+
+    def process_remote_task_result(
+        self, task_key: str, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        return _pita_reference_result(task_key, _pita_reference_from_value(result))
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        return _aggregate_results(
+            results,
+            errors,
+            upstream=tuple(
+                republish_execution_artifact(context.single_input(name))
+                for name in ("run-plan", "evidence-plan")
+            ),
+        )
+
+
+@dataclass
+class _PitaCandidatesNode(_OligoformerTaskNode):
+    request: OligoformerExecutionRequest
+    publications: OligoformerPublications
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        return tuple(
+            TaskDefinition(
+                task_key=_pita_task_key(spec),
+                scientific_payload={
+                    "stem": spec.stem,
+                    "record_name": spec.record_name,
+                    "record_sequence_sha256": sha256(
+                        spec.record_sequence.encode()
+                    ).hexdigest(),
+                },
+                execution_payload={"spec": asdict(spec)},
+            )
+            for stem in _evidence_plan_from_context(context).stems
+            for spec in stem.pita_specs
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        spec = _pita_spec_from_task(task)
+        self.publications.claim_evidence(_run_plan_from_context(context), spec.stem)
+        return _call(
+            "run_oligoformer_pita_candidate",
+            kwargs={
+                "spec": spec,
+                "reference": _pita_reference_for_stem(context, spec.stem),
+                "execution": self.request.execution_config,
+            },
+            metadata={"spec": asdict(spec)},
+        )
+
+    def process_remote_task_result(
+        self, task_key: str, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del task_key
+        spec = _pita_spec_from_metadata(metadata)
+        _off_target_result_from_value(result)
+        if not _workload_module()._pita_candidate_ready(spec):
+            raise FileNotFoundError("OligoFormer PITA candidate is unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _workload_module()._pita_candidate_ready(_pita_spec_from_task(task))
+            else None
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, expected_fingerprint, result, artifacts
+        return _status(
+            _workload_module()._pita_candidate_ready(_pita_spec_from_task(task))
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        return _aggregate_results(
+            results,
+            errors,
+            upstream=tuple(
+                republish_execution_artifact(context.single_input(name))
+                for name in ("run-plan", "evidence-plan")
+            ),
+        )
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        return _status(
+            all(
+                _workload_module()._pita_candidate_ready(spec)
+                for stem in _evidence_plan_from_context(context).stems
+                for spec in stem.pita_specs
+            )
+        )
+
+
+@dataclass
+class _TargetscanTilesNode(_OligoformerTaskNode):
+    request: OligoformerExecutionRequest
+    publications: OligoformerPublications
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        return tuple(
+            TaskDefinition(
+                task_key=_targetscan_task_key(spec),
+                scientific_payload={
+                    "stem": spec.stem,
+                    "candidate_shard_index": spec.candidate_shard_index,
+                    "reference_shard_index": spec.shard_index,
+                },
+                execution_payload={"spec": asdict(spec)},
+            )
+            for stem in _evidence_plan_from_context(context).stems
+            for spec in stem.targetscan_specs
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        spec = _targetscan_spec_from_task(task)
+        self.publications.claim_evidence(_run_plan_from_context(context), spec.stem)
+        return _call(
+            "run_oligoformer_targetscan_tile",
+            kwargs={"spec": spec, "execution": self.request.execution_config},
+            metadata={"spec": asdict(spec)},
+        )
+
+    def process_remote_task_result(
+        self, task_key: str, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del task_key
+        if not isinstance(result, str) or not _workload_module()._targetscan_tile_ready(
+            _targetscan_spec_from_metadata(metadata)
+        ):
+            raise FileNotFoundError("OligoFormer TargetScan tile is unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _workload_module()._targetscan_tile_ready(
+                _targetscan_spec_from_task(task)
+            )
+            else None
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, expected_fingerprint, result, artifacts
+        return _status(
+            _workload_module()._targetscan_tile_ready(_targetscan_spec_from_task(task))
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del context
+        return _aggregate_results(results, errors)
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        return _status(
+            all(
+                _workload_module()._targetscan_tile_ready(spec)
+                for stem in _evidence_plan_from_context(context).stems
+                for spec in stem.targetscan_specs
+            )
+        )
+
+
+@dataclass
+class _EvidenceMergeNode(_OligoformerTaskNode):
+    publications: OligoformerPublications
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        return tuple(
+            TaskDefinition(
+                task_key=stem.stem,
+                scientific_payload={"stem": stem.stem},
+                execution_payload={"stem_plan": asdict(stem)},
+            )
+            for stem in _evidence_plan_from_context(context).stems
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        plan = _run_plan_from_context(context)
+        stem = cast(str, cast(Mapping[str, Any], task.scientific_payload)["stem"])
+        self.publications.claim_evidence(plan, stem)
+        return _call(
+            "publish_oligoformer_off_target_evidence",
+            kwargs={
+                "run_root": plan.run_root,
+                "stem_plan": _evidence_stem_from_value(
+                    cast(Mapping[str, Any], task.execution_payload)["stem_plan"]
+                ),
+            },
+            metadata={"run_root": plan.run_root, "stem": stem},
+        )
+
+    def process_remote_task_result(
+        self, task_key: str, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        if result is not None:
+            raise ValueError("OligoFormer evidence merge returned a value")
+        return cast(
+            AppRunResult,
+            _evidence_result(
+                cast(str, metadata.get("run_root")),
+                cast(str, metadata.get("stem")),
+            ),
+        )
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del expected_fingerprint
+        return _evidence_result(
+            _run_plan_from_context(context).run_root,
+            task.task_key,
+            required=False,
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del expected_fingerprint, result, artifacts
+        return _status(
+            _evidence_result(
+                _run_plan_from_context(context).run_root,
+                task.task_key,
+                required=False,
+            )
+            is not None
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        return _republish_inputs(context, ("run-plan",), results, errors)
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        plan = _run_plan_from_context(context)
+        return _status(
+            all(
+                _evidence_result(plan.run_root, stem, required=False) is not None
+                for stem in plan.output_stems
+            )
+        )
+
+
+@dataclass
+class _FinalNode(_OligoformerProviderNode):
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        return _call(
+            "build_oligoformer_final_tables",
+            kwargs={"plan": _run_plan_from_context(context)},
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        plan = _run_plan_from_value(result)
+        if not plan.final_ready:
+            raise FileNotFoundError("OligoFormer final tables are unavailable")
+        return _plan_result("run-plan", plan)
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        if not context.inputs.get("run-plan"):
+            return None
+        plan = _refresh_run_plan(_run_plan_from_context(context))
+        return _plan_result("run-plan", plan) if plan.final_ready else None
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        return _status(_refresh_run_plan(_run_plan_from_context(context)).final_ready)
+
+
+@dataclass
+class _PublishNode(_OligoformerProviderNode):
+    request: OligoformerExecutionRequest
+    publications: OligoformerPublications
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        plan = _run_plan_from_context(context)
+        return _call(
+            "publish_oligoformer_outputs",
+            kwargs={
+                "plan": plan,
                 "publication_key": (
                     self.request.execution_plan.workload_plan_fingerprint
                 ),
-            }
-        raise ValueError(f"Unknown OligoFormer Node {node_key!r}")
-
-    def _task(self, node_key: str, task_key: str):
-        with self.store.synchronize():
-            return self.store.execution.get_task(
-                self.execution_run_id,
-                node_key,
-                task_key,
-            )
-
-    def _ensure_publication_claim(self, node_key: str, task_key: str) -> None:
-        claim_key = None
-        if node_key in {
-            REFERENCE_PLAN_NODE,
-            REFERENCE_SHARDS_NODE,
-            REFERENCE_FINALIZE_NODE,
-        }:
-            identity = self._run_plan().reference_identity
-            if identity is None:
-                raise ValueError("OligoFormer reference identity is unavailable")
-            claim_key = f"oligoformer-reference-cache:{identity}"
-        elif node_key in {
-            PITA_REFERENCE_NODE,
-            PITA_CANDIDATES_NODE,
-            TARGETSCAN_TILES_NODE,
-            EVIDENCE_MERGE_NODE,
-        }:
-            stem = str(self._task(node_key, task_key).scientific_payload["stem"])
-            claim_key = (
-                "oligoformer-evidence:"
-                + _workload_module()._off_target_evidence_identity(
-                    self._run_plan().run_root,
-                    stem,
-                )
-            )
-        if claim_key is None or claim_key in self._claimed_publications:
-            return
-        acquire_output_claim(
-            self.output_claims,
-            claim_key=claim_key,
-            owner=str(self.execution_run_id),
-            replace_owner=self.request.replace_claim_owner,
+            },
+            metadata={"run_plan": asdict(plan)},
         )
-        self._claimed_publications.add(claim_key)
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        if not isinstance(result, Mapping) or "result_path" not in result:
+            raise ValueError("OligoFormer result publication is invalid")
+        publication = self.publications.result(
+            _run_plan_from_value(metadata.get("run_plan"))
+        )
+        if publication is None:
+            raise FileNotFoundError("OligoFormer result publication is unavailable")
+        return publication
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        plan = (
+            _run_plan_from_context(context) if context.inputs.get("run-plan") else None
+        )
+        return self.publications.result(plan)
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        plan = (
+            _run_plan_from_context(context) if context.inputs.get("run-plan") else None
+        )
+        return _status(self.publications.result(plan) is not None)
 
 
 def _pita_task_key(spec: Any) -> str:
@@ -867,32 +1202,27 @@ def _targetscan_task_key(spec: Any) -> str:
     )
 
 
-def _run_plan_from_envelope(envelope: object):
+def _run_plan_from_value(value: object):
     app = _workload_module()
-    if not isinstance(envelope, dict) or envelope.get("kind") != "run-plan":
-        raise TypeError("OligoFormer run-plan envelope is invalid")
-    value = envelope.get("plan")
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise TypeError("OligoFormer run plan is invalid")
-    value = cast(dict[str, Any], value)
+    value = cast(Mapping[str, Any], value)
     config = value.get("config")
-    if not isinstance(config, dict):
+    if not isinstance(config, Mapping):
         raise TypeError("OligoFormer run configuration is invalid")
-    config = cast(dict[str, Any], config)
     parsed = dict(value)
-    parsed["config"] = app.OligoformerRunConfig(**config)
+    parsed["config"] = app.OligoformerRunConfig(**dict(config))
     parsed["output_stems"] = tuple(parsed["output_stems"])
     return app.OligoformerRunPlan(**parsed)
 
 
-def _reference_plan_from_envelope(envelope: object):
+def _reference_plan_from_value(value: object):
     app = _workload_module()
-    if not isinstance(envelope, dict) or envelope.get("kind") != "reference-plan":
-        raise TypeError("OligoFormer reference-plan envelope is invalid")
-    value = envelope.get("plan")
-    if not isinstance(value, dict) or not isinstance(value.get("shard_specs"), list):
+    if not isinstance(value, Mapping):
         raise TypeError("OligoFormer reference plan is invalid")
-    value = cast(dict[str, Any], value)
+    value = cast(Mapping[str, Any], value)
+    if not isinstance(value.get("shard_specs"), (list, tuple)):
+        raise TypeError("OligoFormer reference plan is invalid")
     shard_specs = cast(list[dict[str, Any]], value["shard_specs"])
     return app.OligoformerReferencePlan(
         record_count=value["record_count"],
@@ -928,31 +1258,29 @@ def _evidence_stem_from_value(value: object):
     )
 
 
-def _evidence_plan_from_envelope(envelope: object):
+def _evidence_plan_from_value(value: object):
     app = _workload_module()
-    if not isinstance(envelope, dict) or envelope.get("kind") != "evidence-plan":
-        raise TypeError("OligoFormer evidence-plan envelope is invalid")
-    value = envelope.get("plan")
-    if not isinstance(value, dict) or not isinstance(value.get("stems"), list):
+    if not isinstance(value, Mapping):
         raise TypeError("OligoFormer evidence plan is invalid")
-    value = cast(dict[str, Any], value)
+    value = cast(Mapping[str, Any], value)
+    if not isinstance(value.get("stems"), (list, tuple)):
+        raise TypeError("OligoFormer evidence plan is invalid")
     stems = cast(list[object], value["stems"])
     return app.OligoformerEvidencePlan(
         stems=tuple(_evidence_stem_from_value(stem) for stem in stems)
     )
 
 
-def _pita_reference_from_envelope(envelope: object):
+def _pita_reference_from_value(value: object):
     app = _workload_module()
-    if not isinstance(envelope, dict) or envelope.get("kind") != "pita-reference":
-        raise TypeError("OligoFormer PITA-reference envelope is invalid")
-    value = envelope.get("plan")
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise TypeError("OligoFormer PITA reference is invalid")
-    value = cast(dict[str, Any], value)
+    value = cast(Mapping[str, Any], value)
     utr_shard_paths = value.get("utr_shard_paths")
     ext_utr_path = value.get("ext_utr_path")
-    if not isinstance(utr_shard_paths, list) or not isinstance(ext_utr_path, str):
+    if not isinstance(utr_shard_paths, (list, tuple)) or not isinstance(
+        ext_utr_path, str
+    ):
         raise TypeError("OligoFormer PITA reference fields are invalid")
     return app.PitaReferencePlan(
         utr_shard_paths=tuple(cast(list[str], utr_shard_paths)),
@@ -960,28 +1288,232 @@ def _pita_reference_from_envelope(envelope: object):
     )
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Encode only bounded plans and publication metadata."""
+def _off_target_result_from_value(value: object):
     app = _workload_module()
-    if isinstance(result, app.OligoformerRunPlan):
-        return {"kind": "run-plan", "plan": asdict(result)}
-    if isinstance(result, app.OligoformerReferencePlan):
-        return {"kind": "reference-plan", "plan": asdict(result)}
-    if isinstance(result, app.OligoformerEvidencePlan):
-        return {"kind": "evidence-plan", "plan": asdict(result)}
-    if isinstance(result, app.PitaReferencePlan):
-        return {"kind": "pita-reference", "plan": asdict(result)}
-    if isinstance(result, app.OffTargetShardResult):
-        return {"kind": "pita-result", "result": asdict(result)}
-    if result is None:
-        return {"kind": "none"}
-    if type(result) is int:
-        return {"kind": "count", "count": result}
-    if isinstance(result, str):
-        return {"kind": "path", "path": result}
-    if isinstance(result, dict) and "result_path" in result:
-        return {"kind": "result", "publication": orjson.loads(orjson.dumps(result))}
-    return {"kind": "invalid"}
+    if not isinstance(value, Mapping):
+        raise TypeError("OligoFormer PITA result is invalid")
+    value = cast(Mapping[str, Any], value)
+    index = value.get("index")
+    pita_path = value.get("pita_path")
+    if type(index) is not int or not isinstance(pita_path, str):
+        raise TypeError("OligoFormer PITA result fields are invalid")
+    return app.OffTargetShardResult(index=index, pita_path=pita_path)
+
+
+def _run_plan_from_context(context: NodeRunContext):
+    return _run_plan_from_value(orjson.loads(context.read_input_bytes("run-plan")))
+
+
+def _reference_plan_from_context(context: NodeRunContext):
+    return _reference_plan_from_value(
+        orjson.loads(context.read_input_bytes("reference-plan"))
+    )
+
+
+def _evidence_plan_from_context(context: NodeRunContext):
+    return _evidence_plan_from_value(
+        orjson.loads(context.read_input_bytes("evidence-plan"))
+    )
+
+
+def _inline_plan_output(name: str, value: object) -> AppOutput:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"OligoFormer {name} metadata is invalid")
+    return AppOutput(
+        name=name,
+        kind=ArtifactKind.TABLE,
+        storage=InlineBytes(
+            data=orjson.dumps(value, option=orjson.OPT_SORT_KEYS),
+            filename=f"{name}.json",
+            media_type="application/json",
+        ),
+    )
+
+
+def _plan_result(
+    name: str,
+    value: Any,
+    *,
+    upstream: tuple[AppOutput, ...] = (),
+) -> AppRunResult:
+    result = inline_json_result(
+        name=name,
+        value=asdict(value),
+        filename=f"{name}.json",
+    )
+    return result.model_copy(update={"outputs": [*upstream, *result.outputs]})
+
+
+def _call(
+    function_name: str,
+    *,
+    uses_gpu: bool = False,
+    kwargs: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> ProviderCallSpec:
+    return ProviderCallSpec(
+        function_name=function_name,
+        uses_gpu=uses_gpu,
+        runtime_image_key="oligoformer-gpu" if uses_gpu else "oligoformer-cpu",
+        kwargs=kwargs,
+        metadata=metadata or {},
+    )
+
+
+def _task_payload(task: TaskDefinition) -> Mapping[str, Any]:
+    if not isinstance(task.execution_payload, Mapping):
+        raise TypeError("OligoFormer Task payload is invalid")
+    return cast(Mapping[str, Any], task.execution_payload)
+
+
+def _reference_shard_from_task(task: TaskDefinition):
+    return _workload_module().TargetscanRnaPlfoldShardSpec(
+        **cast(dict[str, Any], _task_payload(task)["spec"])
+    )
+
+
+def _reference_shard_from_metadata(metadata: Mapping[str, Any]):
+    value = metadata.get("spec")
+    if not isinstance(value, Mapping):
+        raise TypeError("OligoFormer reference shard metadata is invalid")
+    return _workload_module().TargetscanRnaPlfoldShardSpec(**dict(value))
+
+
+def _reference_shard_ready(spec: Any) -> bool:
+    return bool(
+        _workload_module()._targetscan_rnaplfold_shard_state(
+            spec,
+            verify_output_hashes=False,
+        )[0]
+    )
+
+
+def _pita_spec_from_task(task: TaskDefinition):
+    return _workload_module().OffTargetShardSpec(
+        **cast(dict[str, Any], _task_payload(task)["spec"])
+    )
+
+
+def _pita_spec_from_metadata(metadata: Mapping[str, Any]):
+    value = metadata.get("spec")
+    if not isinstance(value, Mapping):
+        raise TypeError("OligoFormer PITA Task metadata is invalid")
+    return _workload_module().OffTargetShardSpec(**dict(value))
+
+
+def _targetscan_spec_from_task(task: TaskDefinition):
+    return _workload_module().TargetscanBatchSpec(
+        **cast(dict[str, Any], _task_payload(task)["spec"])
+    )
+
+
+def _targetscan_spec_from_metadata(metadata: Mapping[str, Any]):
+    value = metadata.get("spec")
+    if not isinstance(value, Mapping):
+        raise TypeError("OligoFormer TargetScan Task metadata is invalid")
+    return _workload_module().TargetscanBatchSpec(**dict(value))
+
+
+def _pita_reference_result(stem: str, reference: Any) -> AppRunResult:
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="pita-reference",
+                kind=ArtifactKind.TABLE,
+                storage=InlineBytes(
+                    data=orjson.dumps(asdict(reference), option=orjson.OPT_SORT_KEYS),
+                    filename="pita-reference.json",
+                    media_type="application/json",
+                ),
+                metadata={"stem": stem},
+            )
+        ],
+    )
+
+
+def _pita_reference_for_stem(context: NodeRunContext, stem: str):
+    matches = {
+        artifact.storage.path: artifact
+        for artifact in context.inputs.get("pita-references", [])
+        if artifact.metadata.get("stem") == stem
+    }
+    if len(matches) != 1:
+        raise ValueError(f"OligoFormer requires one PITA reference for {stem!r}")
+    artifact = next(iter(matches.values()))
+    return _pita_reference_from_value(
+        orjson.loads(context.resolve_artifact(artifact).read_bytes())
+    )
+
+
+def _aggregate_results(
+    results: Mapping[str, AppRunResult],
+    errors: Mapping[str, str],
+    *,
+    upstream: tuple[AppOutput, ...] = (),
+) -> AppRunResult:
+    del results
+    if errors:
+        return AppRunResult(
+            status=AppRunStatus.FAILED,
+            warnings=list(errors.values()),
+        )
+    return AppRunResult(status=AppRunStatus.SUCCEEDED, outputs=list(upstream))
+
+
+def _republish_inputs(
+    context: NodeRunContext,
+    names: tuple[str, ...],
+    results: Mapping[str, AppRunResult],
+    errors: Mapping[str, str],
+) -> AppRunResult:
+    return _aggregate_results(
+        results,
+        errors,
+        upstream=tuple(
+            republish_execution_artifact(context.single_input(name)) for name in names
+        ),
+    )
+
+
+def _refresh_run_plan(plan: Any):
+    return _workload_module()._build_plan(
+        plan.cache_key,
+        plan.efficacy_key,
+        plan.output_stems,
+        plan.run_root,
+        config=plan.config,
+        postprocess_key=plan.postprocess_key,
+        reference_identity=plan.reference_identity,
+        model_identity=plan.model_identity,
+    )
+
+
+def _evidence_result(
+    run_root: str,
+    stem: str,
+    *,
+    required: bool = True,
+) -> AppRunResult | None:
+    app = _workload_module()
+    evidence_dir = (
+        app.AppRunLayout.from_run_root(run_root).prep_dir / "off_target" / stem
+    )
+    available = app._raw_off_target_ready(
+        evidence_dir,
+        expected_identity=app._off_target_evidence_identity(run_root, stem),
+    )
+    if not available:
+        if required:
+            raise FileNotFoundError(
+                f"OligoFormer off-target evidence is unavailable: {stem}"
+            )
+        return None
+    return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+def _status(available: bool) -> AvailabilityStatus:
+    return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
 
 
 def _workload_module():
@@ -991,7 +1523,145 @@ def _workload_module():
     return oligoformer_app
 
 
-class OligoformerExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
+def oligoformer_execution_graph(
+    request: OligoformerExecutionRequest,
+    publications: OligoformerPublications,
+) -> ExecutionGraph:
+    """Build OligoFormer's cache, GPU, evidence, and publication graph."""
+    graph = ExecutionGraph(
+        "oligoformer",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="oligoformer",
+            scientific_payload=request.execution_plan.scientific_payload,
+            scientific_versions=dict(request.execution_plan.scientific_versions),
+        ),
+    )
+    download = graph.add_node(_DownloadNode(publications), id=DOWNLOAD_NODE)
+    prepare = graph.add_node(
+        _PrepareNode(request),
+        id=PREPARE_NODE,
+        depends_on=[download],
+    )
+    efficacy = graph.add_node(
+        _EfficacyNode(request),
+        id=EFFICACY_NODE,
+        inputs={"run-plan": prepare.outputs(kind=ArtifactKind.TABLE)},
+    )
+    reference_final = None
+    if request.off_target and request.all_human:
+        reference_plan = graph.add_node(
+            _ReferencePlanNode(request, publications),
+            id=REFERENCE_PLAN_NODE,
+            inputs={"run-plan": prepare.outputs(kind=ArtifactKind.TABLE)},
+        )
+        reference_shards = graph.add_node(
+            _ReferenceShardsNode(request, publications),
+            id=REFERENCE_SHARDS_NODE,
+            inputs={
+                "run-plan": reference_plan.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="run-plan.json",
+                ),
+                "reference-plan": reference_plan.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="reference-plan.json",
+                ),
+            },
+        )
+        reference_final = graph.add_node(
+            _ReferenceFinalizeNode(publications),
+            id=REFERENCE_FINALIZE_NODE,
+            inputs={
+                "run-plan": reference_shards.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="run-plan.json",
+                ),
+                "reference-plan": reference_shards.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="reference-plan.json",
+                ),
+            },
+        )
+    if request.off_target:
+        evidence_plan = graph.add_node(
+            _EvidencePlanNode(request),
+            id=EVIDENCE_PLAN_NODE,
+            inputs={"run-plan": efficacy.outputs(kind=ArtifactKind.TABLE)},
+            depends_on=[] if reference_final is None else [reference_final],
+        )
+        plan_inputs = {
+            "run-plan": evidence_plan.outputs(
+                kind=ArtifactKind.TABLE,
+                pattern="run-plan.json",
+            ),
+            "evidence-plan": evidence_plan.outputs(
+                kind=ArtifactKind.TABLE,
+                pattern="evidence-plan.json",
+            ),
+        }
+        pita_reference = graph.add_node(
+            _PitaReferenceNode(request, publications),
+            id=PITA_REFERENCE_NODE,
+            inputs=plan_inputs,
+        )
+        pita_candidates = graph.add_node(
+            _PitaCandidatesNode(request, publications),
+            id=PITA_CANDIDATES_NODE,
+            inputs={
+                "run-plan": pita_reference.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="run-plan.json",
+                ),
+                "evidence-plan": pita_reference.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="evidence-plan.json",
+                ),
+                "pita-references": pita_reference.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="pita-reference.json",
+                ),
+            },
+        )
+        targetscan = graph.add_node(
+            _TargetscanTilesNode(request, publications),
+            id=TARGETSCAN_TILES_NODE,
+            inputs=plan_inputs,
+        )
+        evidence_merge = graph.add_node(
+            _EvidenceMergeNode(publications),
+            id=EVIDENCE_MERGE_NODE,
+            inputs={
+                "run-plan": pita_candidates.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="run-plan.json",
+                ),
+                "evidence-plan": pita_candidates.outputs(
+                    kind=ArtifactKind.TABLE,
+                    pattern="evidence-plan.json",
+                ),
+            },
+            depends_on=[targetscan],
+        )
+        final_inputs = {
+            "run-plan": evidence_merge.outputs(
+                kind=ArtifactKind.TABLE,
+                pattern="run-plan.json",
+            )
+        }
+    else:
+        final_inputs = {"run-plan": efficacy.outputs(kind=ArtifactKind.TABLE)}
+    final = graph.add_node(_FinalNode(), id=FINAL_NODE, inputs=final_inputs)
+    graph.add_node(
+        _PublishNode(request, publications),
+        id=PUBLISH_NODE,
+        inputs={"run-plan": final.outputs(kind=ArtifactKind.TABLE)},
+    )
+    return graph
+
+
+class OligoformerExecutionCoordinator(
+    OutputClaimExecutionDefinitionCoordinatorLifecycle
+):
     """Bind one run-scoped writer to OligoFormer publications."""
 
     _request_loader = staticmethod(load_execution_request)
@@ -1004,6 +1674,7 @@ class OligoformerExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
+        output_volume_name: str,
         model_volume: Any,
         output_claims: Any,
         provider_driver: Any,
@@ -1017,33 +1688,36 @@ class OligoformerExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            output_claims=output_claims,
+            provider_driver=provider_driver,
+            graph_builder=self._graph,
             target_scientific_versions={
                 "oligoformer": app_version,
                 "oligoformer.model": model_version,
                 "oligoformer.reference": reference_version,
             },
+            poll_interval_seconds=poll_interval_seconds,
         )
-        self.output_volume = output_volume
+        self.output_volume_name = output_volume_name
         self.model_volume = model_volume
         self.output_claims = output_claims
-        self.provider_driver = provider_driver
-        self.poll_interval_seconds = poll_interval_seconds
 
-    def _create_runtime(
+    def _graph(
         self,
         request: OligoformerExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> OligoformerExecutionRuntime:
-        return OligoformerExecutionRuntime(
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        del predecessor_execution_run_id
+        return oligoformer_execution_graph(
             request=request,
-            execution_run_id=self.execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            model_volume=self.model_volume,
-            output_claims=self.output_claims,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=self.poll_interval_seconds,
+            publications=OligoformerPublications(
+                request=request,
+                execution_run_id=self.execution_run_id,
+                output_root=self.volume_root,
+                output_volume_name=self.output_volume_name,
+                model_volume=self.model_volume,
+                output_claims=self.output_claims,
+            ),
         )

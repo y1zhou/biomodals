@@ -26,17 +26,21 @@ from biomodals.app.score.oligoformer_execution import (
     TARGETSCAN_TILES_NODE,
     OligoformerExecutionCoordinator,
     OligoformerExecutionRequest,
-    OligoformerExecutionRuntime,
+    OligoformerPublications,
+    oligoformer_execution_graph,
+    persist_execution_request,
 )
-from biomodals.execution import AvailabilityStatus, DeploymentIdentity, RunStatus
+from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "OligoFormer", 7)
+OUTPUT_VOLUME_NAME = "OligoFormer-outputs"
 
 
 class FakeVolume:
@@ -177,6 +181,48 @@ def _request(**changes) -> OligoformerExecutionRequest:
     return replace(request, **changes)
 
 
+def _publications(
+    tmp_path: Path,
+    request: OligoformerExecutionRequest,
+    *,
+    volume: FakeVolume | None = None,
+    claims: FakeClaims | None = None,
+) -> OligoformerPublications:
+    return OligoformerPublications(
+        request=request,
+        execution_run_id=RUN_ID,
+        output_root=tmp_path,
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        model_volume=volume or FakeVolume(),
+        output_claims=claims or FakeClaims(),
+    )
+
+
+def _coordinator(
+    tmp_path: Path,
+    request: OligoformerExecutionRequest,
+    driver: CompletingDriver,
+    *,
+    volume: FakeVolume | None = None,
+    claims: FakeClaims | None = None,
+) -> OligoformerExecutionCoordinator:
+    persist_execution_request(tmp_path, RUN_ID, request)
+    return OligoformerExecutionCoordinator(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=volume or FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        model_volume=volume or FakeVolume(),
+        output_claims=claims or FakeClaims(),
+        provider_driver=driver,
+        app_version=request.app_version,
+        model_version=request.model_version,
+        reference_version=cast(str, request.reference_version),
+        poll_interval_seconds=0,
+    )
+
+
 def test_request_round_trips_without_pickle() -> None:
     request = _request(
         off_target=True,
@@ -212,6 +258,7 @@ def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
         model_volume=FakeVolume(),
         output_claims=FakeClaims(),
         provider_driver=cast(Any, object()),
@@ -220,7 +267,7 @@ def test_coordinator_reuses_its_active_runtime(tmp_path: Path) -> None:
         reference_version=cast(str, request.reference_version),
     )
     runtime = cast(
-        OligoformerExecutionRuntime,
+        ExecutionGraphRuntime,
         SimpleNamespace(
             request=request,
             predecessor_execution_run_id=None,
@@ -238,6 +285,7 @@ def test_target_reference_version_is_required_only_when_used(tmp_path: Path) -> 
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
         model_volume=FakeVolume(),
         output_claims=FakeClaims(),
         provider_driver=cast(Any, object()),
@@ -253,7 +301,7 @@ def test_target_reference_version_is_required_only_when_used(tmp_path: Path) -> 
         )
 
 
-def test_efficacy_only_plan_is_minimal() -> None:
+def test_efficacy_only_plan_is_minimal(tmp_path: Path) -> None:
     request = _request()
 
     assert request.execution_plan.node_keys == (
@@ -262,6 +310,14 @@ def test_efficacy_only_plan_is_minimal() -> None:
         EFFICACY_NODE,
         FINAL_NODE,
         PUBLISH_NODE,
+    )
+    graph = oligoformer_execution_graph(
+        request,
+        _publications(tmp_path, request),
+    )
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
     )
 
 
@@ -303,24 +359,13 @@ def test_cached_terminal_publication_completes_without_a_run_plan(
     )
     driver = CompletingDriver({}, None)
     volume = FakeVolume()
-    runtime = OligoformerExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=volume,
-        model_volume=volume,
-        output_claims=FakeClaims(),
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, volume=volume)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert driver.spawns == []
-    runtime.close()
+    coordinator.close()
 
 
 def test_cached_terminal_publication_rejects_changed_model(
@@ -342,25 +387,10 @@ def test_cached_terminal_publication_rejects_changed_model(
         "_oligoformer_model_volume_identity_digest",
         lambda: "model-content-v2",
     )
-    volume = FakeVolume()
-    runtime = OligoformerExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=CompletingDriver({}, None),
-        output_volume=volume,
-        model_volume=volume,
-        output_claims=FakeClaims(),
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
-
-    assert runtime._node_observation(PUBLISH_NODE) == AvailabilityStatus.MISSING
-    runtime.close()
+    assert _publications(tmp_path, request).result() is None
 
 
-def test_custom_reference_plan_uses_kernel_off_target_tiles() -> None:
+def test_custom_reference_plan_uses_kernel_off_target_tiles(tmp_path: Path) -> None:
     request = _request(
         off_target=True,
         utr_bytes=b">utr\nAUGC\n",
@@ -379,15 +409,31 @@ def test_custom_reference_plan_uses_kernel_off_target_tiles() -> None:
         FINAL_NODE,
         PUBLISH_NODE,
     )
+    graph = oligoformer_execution_graph(
+        request,
+        _publications(tmp_path, request),
+    )
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
+    )
 
 
-def test_all_human_plan_prepares_reference_shards() -> None:
+def test_all_human_plan_prepares_reference_shards(tmp_path: Path) -> None:
     request = _request(off_target=True, all_human=True)
 
     assert request.execution_plan.node_keys[3:6] == (
         REFERENCE_PLAN_NODE,
         REFERENCE_SHARDS_NODE,
         REFERENCE_FINALIZE_NODE,
+    )
+    graph = oligoformer_execution_graph(
+        request,
+        _publications(tmp_path, request),
+    )
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
     )
 
 
@@ -461,20 +507,9 @@ def test_runtime_drives_efficacy_only_run_through_deployed_functions(
     )
     volume = FakeVolume()
     driver = CompletingDriver(state, plan)
-    runtime = OligoformerExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=volume,
-        model_volume=volume,
-        output_claims=FakeClaims(),
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, volume=volume)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert driver.spawns == [
@@ -484,7 +519,7 @@ def test_runtime_drives_efficacy_only_run_through_deployed_functions(
         "build_oligoformer_final_tables",
         "publish_oligoformer_outputs",
     ]
-    runtime.close()
+    coordinator.close()
 
 
 def test_runtime_dispatches_off_target_scientific_tiles(
@@ -581,24 +616,13 @@ def test_runtime_dispatches_off_target_scientific_tiles(
     )
     volume = FakeVolume()
     driver = CompletingDriver(state, plan, evidence_plan)
-    runtime = OligoformerExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=volume,
-        model_volume=volume,
-        output_claims=FakeClaims(),
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, volume=volume)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert "run_oligoformer_pita_candidate" in driver.spawns
     assert "run_oligoformer_targetscan_tile" in driver.spawns
     assert driver.spawns.count("run_oligoformer_pita_candidate") == 1
     assert driver.spawns.count("run_oligoformer_targetscan_tile") == 1
-    runtime.close()
+    coordinator.close()

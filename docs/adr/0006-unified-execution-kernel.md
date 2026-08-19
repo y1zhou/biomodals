@@ -54,6 +54,13 @@ Supporting a local container provider should reuse the same
 It should require a new `biomodals.execution.local` host and provider-specific
 composition roots, not a second execution model.
 
+Adding that provider is therefore an adapter-and-packaging project, not a
+scheduler rewrite. The app-specific migration cost comes from operation code
+that still depends on Modal lifecycle or implicit mount state: already-explicit
+Python and subprocess operations need little more than a local wrapper and OCI
+image, while tightly coupled operations need their provider concerns extracted
+first.
+
 Each portable operation has three layers:
 
 1. an app-owned scientific body that accepts ordinary values, explicit paths,

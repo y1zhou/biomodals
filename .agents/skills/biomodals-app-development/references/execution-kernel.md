@@ -1,11 +1,20 @@
 # Execution-Kernel Integration
 
-Use `biomodals.execution` for generic durable scheduling. Keep workload science
-and host persistence outside it. Read
+Use `biomodals.execution` for provider-neutral durable orchestration and
+`biomodals.execution.modal` for Modal hosting. Keep workload science app-owned.
+Read
 [ADR 0006](../../../../docs/adr/0006-unified-execution-kernel.md) and the
 [scheduler specification](../../../../docs/specs/unified-task-scheduler.md)
 before changing statuses, ownership, restart, durability, or coordinator
 semantics.
+
+The accepted
+[execution-kernel consolidation](../../../../docs/specs/execution-kernel-consolidation.md)
+is pending implementation. It removes `helper.app_execution` and
+`workflow.core`, gives apps and workflows one `ExecutionDefinition`, and moves
+Modal request, coordinator, Volume, and CLI-submission mechanics below
+`biomodals.execution.modal`. Treat existing imports and lifecycle subclasses as
+transitional: migrate them rather than adding new uses.
 
 ## Choose the execution boundary
 
@@ -46,18 +55,19 @@ The app owns:
 - Result Envelope encoding/decoding and Task-specific outcome mapping;
 - output paths, manifests, markers, claims, and scientific publication.
 
-The host owns the SQLite location and transaction boundary, request files, and
-Volume synchronization. Reuse the existing execution runtime and app-execution
-helpers; do not add a workload-handler hierarchy, callback registry, provider
-plugin layer, or universal coordinator deployment.
+The provider host owns the SQLite location and transaction boundary, request
+files, and provider-specific durability. Reuse the execution runtime and Modal
+host; add scientific behavior through Execution Nodes rather than copying or
+subclassing lifecycle loops. Keep deployment-local decorated composition roots;
+do not add a universal coordinator deployment.
 
 ## Reuse the host lifecycle
 
-Use `ExecutionRequestFile` and `ExecutionRunStore` for run-scoped persistence,
-the existing execution and coordinator lifecycle classes for app integration,
-`drive_execution_run` for coordinator driving, and `drive_pull_worker` for
-pull-worker loops. Add workload policy through their existing hooks instead of
-copying the host loop.
+Use the supported `biomodals.execution.modal` host interface for run-scoped
+persistence, request staging, coordinator driving, restart, and CLI submission.
+Use `drive_pull_worker` for pull-worker loops. Apps supply an
+`ExecutionDefinition` and scientific Node hooks; they do not assemble stores,
+locks, checkpoints, or lifecycle classes.
 
 ## Schedule and recover safely
 

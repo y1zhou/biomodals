@@ -32,9 +32,13 @@ description: Biomodals Modal app development standards. Use when Codex is creati
 
 - Preserve `*_app.py` discovery and help behavior; complex apps may delegate to
   sibling modules.
-- Give generic Run, Node, Task, and Provider Call scheduling to
-  `biomodals.execution`; keep scientific plans, cache probes, inputs, result
-  decoding, and publications app-owned.
+- Give generic graph, artifact, Run, Node, Task, Provider Call, coordinator, and
+  restart mechanics to `biomodals.execution`; use
+  `biomodals.execution.modal` for Modal hosting. Keep scientific plans, cache
+  probes, inputs, result decoding, and publications app-owned.
+- Build the same `ExecutionDefinition` whether an app runs from the CLI, a
+  workflow, or the API service. Add workload behavior through Execution Nodes,
+  not app-local lifecycle or admission loops.
 - Treat user-controlled content as untrusted across paths and processes.
 - Version scientific deviations into affected cache identities.
 - Publish validated artifacts before completion markers and cleanup.

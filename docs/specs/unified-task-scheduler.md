@@ -2,7 +2,17 @@
 
 # Unified task scheduler
 
-Status: accepted and implemented; manual Modal smoke validation pending.
+Status: the original extraction is implemented; the 2026-08-19 consolidation
+amendment is accepted and pending implementation.
+
+The accepted
+[execution-kernel consolidation](execution-kernel-consolidation.md) makes the
+root kernel provider-neutral, moves Modal hosting under
+`biomodals.execution.modal`, unifies app and workflow executable graphs, and
+removes `helper.app_execution` and `workflow.core`. It supersedes conflicting
+module-placement and caller-driven-boundary statements in this document while
+preserving the state machine, durability, cost-safety, and scientific
+publication rules defined here.
 
 Implemented:
 
@@ -47,9 +57,10 @@ The target is one place to reason about:
 - batching and Run-level total/GPU Provider Call limits;
 - reusable direct-fan-out and SQLite-backed pull worker-pool dispatch.
 
-It is not a framework for workload handlers, scientific input/output parsing,
-cache validation, or publication. Existing app and workflow code performs
-those operations and reports their results to the kernel.
+It is not a framework for scientific input/output parsing, cache policy, or
+publication meaning. Under the consolidation amendment, app and workflow Nodes
+implement one small execution interface for those workload-owned operations;
+the kernel invokes that interface and owns the surrounding lifecycle.
 
 ## Success definition
 
@@ -717,22 +728,22 @@ for another polling interval.
 | DAG | Validation, topological readiness, terminal reachability, and deterministic admission rank | Ordered Nodes, dependencies, semantic labels |
 | Task planning | Immutable task records, encounter ordinals, canonical fingerprint calculation, dependency links | Constructing the complete ordered Task sequence, normalized scientific payload, and content digests |
 | Cache | Recording `available` / `missing` / `unknown` observations and applying scheduling policy | Running validation logic and inspecting markers, manifests, and content |
-| Inputs | Persisting already-normalized Task plans and fingerprints | Parsing, validation, staging, and Modal function arguments |
-| Calls | Modal submit, attach, resolve, poll, cancel, recover state machine, and durable Result Envelope boundary | Function selection and normalizing its small returned value |
+| Inputs | Persisting already-normalized Task plans and fingerprints | Parsing, validation, staging, and provider operation arguments |
+| Calls | Provider submit, attach, resolve, poll, cancel, recover state machine, and durable Result Envelope boundary | Operation selection and normalizing its small returned value |
 | Local execution | Durable ownership and publication-first recovery transitions | Invoking idempotent local code, Task-specific staging, and atomic publication |
-| Dispatch | Durable fixed batches, direct fan-out, pull claims, call tracking, stable image cohorts, and outcome routing | Modal binding, Runtime Image Key, Task payloads, compatibility keys, and per-Task decoding |
-| Outputs | Persisting Result Envelopes and reported Task outcomes in legal order | Envelope decoding, schemas, scientific validation, paths, and publication |
+| Dispatch | Durable fixed and weighted batches, direct fan-out, pull claims, call tracking, stable image cohorts, and outcome routing | Provider binding, Runtime Image Key, Task payloads, compatibility keys, scientific weights, and per-Task decoding |
+| Outputs | Persisting Result Envelopes, Execution Artifacts, and reported Task outcomes in legal order | Envelope decoding, schemas, scientific validation, paths, and publication meaning |
 | Batching | Stable grouping by compatibility and encounter order, immutable call mapping, and outcome distribution | Positive maximum Tasks per call and whether batching changes scientific identity |
 | Resources | Run-scoped total and GPU Provider Call admission counts | Service admission, Modal decorators, deployment limits, cross-coordinator policy |
-| Persistence | State schema, legal transitions, and atomic repository operations | Repository location, transaction integration, Volume synchronization |
+| Persistence | State and artifact schemas, legal transitions, and atomic repository operations | Provider-host repository location, transaction integration, and durability synchronization |
 | Presentation | Bounded lifecycle overviews, full diagnostic snapshots, and stable events for adapters | HTTP Jobs, CLI output, timelines, logs, admin policy |
 
-The kernel is a caller-driven library rather than an inversion-of-control
-framework. Workload code constructs plans and Tasks, records cache
-observations, consumes Result Envelopes, publishes outputs, and reports Task
-outcomes through ordinary runtime operations. The kernel never loads a
-per-Node handler, calls a workload protocol, or parses PDB, A3M, Parquet,
-archives, or other scientific formats.
+The kernel executes an app- or workflow-owned `ExecutionDefinition` through a
+small Execution Node interface. It persists discovered Tasks, records cache
+observations, consumes Result Envelopes, and coordinates publication
+transitions. Node implementations parse and validate scientific formats; the
+kernel does not interpret PDB, A3M, Parquet, archives, or other scientific
+content.
 
 ## Minimal kernel shape
 
@@ -742,29 +753,31 @@ Add the package incrementally. Do not scaffold empty modules in advance.
 src/biomodals/execution/
   __init__.py             # deliberately small supported surface
   model.py                # immutable plan and state value objects
+  definition.py           # executable graph and Node interfaces
   sqlite.py               # schema and transitions on a host connection
-  scheduler.py            # graph readiness, batching, and call limits
-  modal.py                # Modal call lifecycle and remote coordination
-  runtime.py              # caller-driven composition facade
+  scheduler.py            # graph readiness, dispatch, and call limits
+  artifacts.py            # provider-neutral artifact records
+  runtime.py              # shared execution lifecycle
   coordinator.py          # reusable coordinator drive loop
   pull_worker.py          # reusable pull-worker claim/complete loop
+  modal/
+    __init__.py           # supported Modal-host surface
+    driver.py             # Modal SDK call adapter
+    host.py               # requests, lineage, Volumes, and coordinator host
 ```
 
-The supported internal interface is centered on:
+The supported interface is centered on:
 
-- `ExecutionPlan`
-- `NodePlan`
-- `TaskPlan`
+- `ExecutionDefinition`
+- `ExecutionNode`
+- provider-neutral Task and artifact values
 - `ExecutionRuntime`
 
-Each composition root supplies its SQLite connection and transaction,
-already-constructed plans and Task inputs, and Modal bindings explicitly. It
-uses the runtime to advance scheduling, reads durable Result Envelopes,
-performs workload-specific publication, and records outcomes. Do not add a
-workload-handler hierarchy, provider plugin layer, callback registry, global
-registry, plugin discovery, YAML workflows, or import-time Modal app or Volume
-bindings. Each app and workflow declares only its thin decorated coordinator
-wrapper over `execution.modal`.
+Apps and workflows supply their scientific Execution Definition. Provider
+integrations supply calls and durability. Do not add a global workload
+registry, plugin discovery, YAML workflows, or a universal deployed
+coordinator. Each app and workflow declares only its thin decorated
+composition root over `execution.modal`.
 
 `ExecutionRuntime.advance_once` owns the common reconciliation order. Its
 smaller operations own the terminal-first publication walk, ready-Node Task
@@ -1494,19 +1507,19 @@ cursor, aging, priority weights, per-Node quota, preemption, or scheduler
 plugin. A high-ranked Node may fill every available call slot; lower-ranked
 finite work becomes eligible as those calls finish.
 
-### Workflow run-store composition
+### Execution run-store composition
 
-Each physical workflow `ledger.sqlite3` file composes the shared execution
-repository with workflow-owned artifact records on one SQLite connection.
-There is no separate `WorkflowLedger` execution implementation.
+Each physical CLI-run `ledger.sqlite3` file composes the shared execution
+repository with Execution Artifact records on one SQLite connection. There is
+no separate workflow execution or artifact persistence implementation.
 
 | Concern | Owner |
 | --- | --- |
 | Run, Node, Task, Worker Assignment, and Provider Call state | Shared execution repository |
 | Status, placement, admission, and recovery policy | Shared execution models and scheduler |
-| `artifacts`, `artifact_files`, `node_inputs`, and `node_outputs` tables | Workflow-specific run store |
-| `WorkflowArtifact`, `ArtifactSelector`, and materialized `AppRunResult` handling | Workflow-specific artifact module |
-| Run-root directories, node/task output paths, connection closure, and Volume synchronization | Workflow-specific run store |
+| Artifact, file, Node-input, and Node-output tables | Shared execution repository |
+| Execution Artifact, selector, and materialized result handling | Shared execution artifact module |
+| Run-root directories, node/task output paths, connection closure, and Volume synchronization | Modal execution host |
 | Finalizing execution state and artifacts together | One host-owned SQLite transaction |
 
 The API service follows the same ownership boundary: a user-facing Service Job

@@ -2,6 +2,55 @@
 
 Status: accepted.
 
+## 2026-08-19 consolidation amendment
+
+The original extraction proved the Run, Node, Task, Provider Call, recovery,
+and SQLite model, but left generic orchestration divided among
+`biomodals.execution`, `biomodals.helper.app_execution`, and
+`biomodals.workflow.core`. That split is superseded by the accepted
+[execution-kernel consolidation](../specs/execution-kernel-consolidation.md).
+
+The root `biomodals.execution` package becomes provider-neutral and owns the
+single executable graph, runtime, artifact, and repository model used by apps,
+workflows, and the API service. Provider integrations live in subpackages;
+`biomodals.execution.modal` is the first implementation and owns Modal SDK,
+Volume, and remote coordinator mechanics. `helper.app_execution` and
+`workflow.core` are removed without compatibility aliases.
+
+App and workflow remain authoring and deployment concepts, not distinct
+execution models. Both supply app-owned scientific Nodes through one
+`ExecutionDefinition`. The kernel owns orchestration; workloads own scientific
+planning, provider arguments, cache and publication validation, and result
+interpretation. Statements below that prohibit a workload Node interface,
+describe the kernel itself as Modal-specific, or retain separate generic app
+and workflow runtimes are historical and superseded by this amendment.
+
+Provider portability is a design constraint, not a requirement to implement a
+second provider in this refactor. A workload operation's reusable body accepts
+ordinary request values, explicit filesystem roots and configuration, invokes
+Python or subprocess code, writes scientific outputs, and returns a
+provider-neutral result. It does not import Modal or manipulate Modal Functions,
+Volumes, Dicts, Secrets, or call handles. It need not be side-effect free:
+scientific file and subprocess I/O are expected.
+
+The deployment-local Modal function remains as a thin wrapper around that
+operation. Its decorator and composition root declare Modal images, resources,
+mounts, Secrets, and Volumes; the Modal execution host supplies synchronization
+and call lifecycle. A future `biomodals.execution.local` integration may bind
+the same operation to an OCI container, local filesystem, and durable container
+handle without changing its scientific implementation. Portable operation code
+does not imply that Modal image recipes are themselves portable OCI recipes;
+image construction remains provider-owned.
+
+This refactor extracts provider-independent operation bodies where doing so is
+simple and behavior-preserving. It does not add a local provider, duplicate
+image definitions, or require every existing operation to support multiple
+providers before merge.
+
+Implementation of this amendment is pending. Existing text remains as the
+history and safety rationale of the first extraction unless it conflicts with
+the consolidation plan.
+
 Biomodals should introduce a Modal execution kernel under
 `biomodals.execution` for durable DAG and Task scheduling, Modal-call
 attachment and recovery, batching, and Provider Call limits. Workload code
@@ -802,15 +851,16 @@ admission. Explicit cancellation prevents replay. Local code with an
 uncontrolled non-idempotent external side effect is invalid and must instead
 use an idempotency key or a tracked Provider Call.
 
-The caller-driven kernel boundary was accepted on 2026-07-30. The first kernel
-is a Modal scheduling library, not a workload framework. Existing app and
-workflow code constructs Nodes and Tasks, validates caches, prepares Modal
-arguments, normalizes returned Result Envelopes, publishes scientific output,
-and records observations and Task outcomes through ordinary runtime
-operations. The kernel validates and persists those inputs, computes DAG
-readiness, admits and observes Modal calls, enforces call limits, and applies
-legal recovery transitions. It defines no per-Node handler hierarchy, workload
-protocol, callback registry, provider plugin system, or generic scientific
+The original caller-driven kernel boundary was accepted on 2026-07-30 and is
+retained here as history. The first kernel was a Modal scheduling library, not
+a workload framework. App and workflow code constructed Nodes and Tasks,
+validated caches, prepared Modal arguments, normalized returned Result
+Envelopes, published scientific output, and recorded observations and Task
+outcomes through ordinary runtime operations. The kernel validated and
+persisted those inputs, computed DAG readiness, admitted and observed Modal
+calls, enforced call limits, and applied legal recovery transitions. It
+defined no per-Node handler hierarchy, workload protocol, callback registry,
+provider plugin system, or generic scientific
 input/output layer. Its small internal Modal seam exists only for deterministic
 tests. Common workload helpers may be extracted later from demonstrated
 duplication without expanding the scheduler contract first.

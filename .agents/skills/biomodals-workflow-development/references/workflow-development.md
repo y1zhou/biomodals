@@ -19,6 +19,15 @@ Treat [ADR 0006](../../../../docs/adr/0006-unified-execution-kernel.md) and the
 authoritative when changing execution statuses, ownership, restart, durability,
 or coordinator behavior. Keep this guide focused on workflow composition.
 
+The accepted
+[execution-kernel consolidation](../../../../docs/specs/execution-kernel-consolidation.md)
+is pending implementation. It makes workflow an authoring and deployment
+concept over the same `ExecutionDefinition` used by apps, moves generic graph
+and artifact execution into `biomodals.execution`, and removes
+`biomodals.workflow.core`. Names and import paths below describe the
+transitional implementation; migrate them instead of adding new dependencies
+on the old workflow runtime.
+
 ## Contents
 
 - [Vocabulary](#vocabulary)

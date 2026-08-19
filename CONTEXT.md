@@ -275,13 +275,44 @@ Assignments, and Provider Calls governed by the execution kernel's transition
 contract. Each durable coordinator may use a separate physical repository.
 _Avoid_: universal service database, scientific cache
 
+**Execution Definition**:
+The immutable executable DAG supplied by an app or workflow to the execution
+kernel. It contains ordered Execution Nodes, dependencies, scientific plan
+identity, and provider-neutral dispatch descriptions. Executable Node code
+comes from the pinned deployment; SQLite stores only canonical plan data and
+fingerprints.
+_Avoid_: serialized Python callable, workflow-only DAG, provider deployment
+
 **Execution Kernel**:
-The caller-driven `biomodals.execution` library that validates and schedules a
-durable Task DAG, orchestrates Modal calls, enforces Run-level call limits, and
-recovers execution state. App and workflow code constructs Tasks, validates
-caches, prepares inputs, processes Result Envelopes, publishes outputs, and
-records observations and outcomes through ordinary runtime operations.
-_Avoid_: workload framework, scientific parser, callback registry, provider plugin
+The provider-neutral `biomodals.execution` library that executes a durable
+`ExecutionDefinition`. It owns DAG readiness, Task discovery persistence,
+dispatch, Provider Call limits and lifecycle, restart, Result Envelopes, and
+execution artifact records. Workload Nodes supply scientific construction,
+provider arguments, cache and publication validation, and result
+interpretation through the kernel's supported interface.
+_Avoid_: Modal SDK adapter, scientific parser, app-local scheduler
+
+**Provider Integration**:
+A provider-specific adapter and host below the Execution Kernel. It translates
+provider-neutral deployments, operations, calls, errors, persistence, and
+durability boundaries into one compute provider's mechanisms. The first
+integration is `biomodals.execution.modal`.
+_Avoid_: workload plugin, scientific adapter, deployment registry
+
+**Workload Operation**:
+A provider-independent scientific implementation invoked by an Execution Node.
+It accepts ordinary request values, explicit paths and configuration, may run
+subprocesses and write files, and returns a provider-neutral result. Provider
+wrappers add decorators, images, resources, mounts, Secrets, and call-lifecycle
+behavior.
+_Avoid_: Modal Function, mathematically pure function, provider wrapper
+
+**Modal Execution Host**:
+The `biomodals.execution.modal` implementation that binds the kernel to Modal
+Functions, Function Calls, Environments, App deployments, Volumes, and
+run-scoped remote coordinators. It owns Modal request staging, launch lineage,
+Volume-backed ledgers, synchronization, and shared CLI submission mechanics.
+_Avoid_: Execution Kernel, workload app, universal deployed coordinator
 
 **App Run Ledger**:
 The physical per-run SQLite Execution State Repository for a Direct CLI App
@@ -316,17 +347,18 @@ submit commands to that container's single SQLite writer.
 _Avoid_: worker pool, timeout lease, service database
 
 **Deployment Coordinator Adapter**:
-A thin Modal binding included in each app or workflow deployment. It binds the
-shared execution kernel to that deployment's caller-owned task construction,
-result processing, Volumes, and configuration without introducing a universal
-coordinator service or workload-handler framework.
+A thin provider binding included in each app or workflow deployment. For
+Modal, it composes the Modal Execution Host with that deployment's scientific
+Execution Definition, decorated operations, Volumes, and configuration without
+introducing a universal coordinator deployment.
 _Avoid_: execution kernel, workload registry, API service
 
 **Deployment Identity**:
-The Modal Environment, deployed app or workflow name, and exact numeric
-deployment version selected and persisted before an Execution Run admits work.
-An explicit CLI version wins; otherwise the CLI resolves current deployment
-history once and pins the result.
+The compute provider, deployment namespace and name, and exact deployment
+version selected and persisted before an Execution Run admits work. The Modal
+integration maps these values to a Modal Environment, App, and numeric version.
+An explicit CLI version wins; otherwise the provider integration resolves and
+pins the deployment once.
 _Avoid_: floating latest handle, semantic app version, source revision alone
 
 **Deployed CLI Run**:
@@ -365,10 +397,13 @@ Workload-owned durable evidence that a Task's scientific output is complete
 and reusable.
 _Avoid_: provider success, build claim, database status alone
 
-**Workflow Artifact**:
-A durable record of data produced or consumed by a Workflow Node, including
-its data category, storage location, and metadata needed by downstream Nodes.
-_Avoid_: raw app output, untyped file path, loose tarball
+**Execution Artifact**:
+A durable, provider-neutral record of data produced or consumed by an
+Execution Node, including its data category, storage location, exact file
+manifest, and metadata needed by downstream Nodes. Its provider integration
+owns physical materialization; its workload owns scientific meaning and
+validation.
+_Avoid_: raw provider output, untyped file path, loose tarball, Workflow Artifact
 
 **Artifact Availability**:
 The observed state of a workflow artifact as available, missing, or unknown; unknown means verification could not establish presence or absence.
@@ -379,16 +414,26 @@ A workflow-compatible app output whose bytes are small enough to serialize direc
 _Avoid_: large archive, arbitrary binary bytes
 
 **Workflow Node**:
-A semantic step in a workflow DAG that consumes workflow artifacts and produces workflow artifacts.
-_Avoid_: Modal function, app function
+A legacy name for an Execution Node authored as part of a workflow. New shared
+interfaces and persistence use Execution Node because apps and workflows share
+one executable graph model.
+_Avoid_: separate workflow scheduler type, Modal function, app function
 
 **Terminal Workflow Node**:
 A workflow node with no downstream dependencies in a validated workflow DAG.
 _Avoid_: final node, last node
 
 **App**:
-A deployed Modal app that owns tool runtime, images, volumes, and exported app functions.
-_Avoid_: workflow node, app node
+A reusable scientific capability and its provider operations, deployment
+resources, cache and publication policy, and user-facing entrypoints. An App
+submits an Execution Definition to the same kernel as a Workflow.
+_Avoid_: execution runtime, workflow node, app node
+
+**Workflow**:
+A scientific composition of app and workflow-native operations into an
+Execution Definition. Workflow is an authoring, discovery, deployment, and CLI
+concept; it is not a separate execution model.
+_Avoid_: workflow runtime, second scheduler, Execution Run
 
 **Shard Build Recipe**:
 A versioned deterministic transformation from a reference-database monolith into the shard layout of a Sharded Database Profile.
@@ -778,8 +823,9 @@ ties. These values are operational and do not become scientific identity.
 _Avoid_: one-call-per-Node pass, round-robin fairness, unordered set iteration, configurable priority weights
 
 **Workflow Runtime**:
-The reusable library that validates a workflow DAG, schedules workflow nodes, tracks durable run state, and materializes workflow artifacts.
-_Avoid_: engine
+A legacy name for generic graph and artifact execution formerly implemented in
+`biomodals.workflow.core`. That behavior belongs to the Execution Kernel.
+_Avoid_: current runtime interface, separate workflow scheduler
 
 **Runtime Diagnostics**:
 An `ExecutionSnapshot` plus the durable Run, Node, Task, Provider Call, and
@@ -792,20 +838,21 @@ artifact manifests, Task status, node status, and Provider Call status agree.
 _Avoid_: returned function result, partially recorded success
 
 **Workflow Orchestrator**:
-A Modal-hosted coordinator that owns one workflow run, hosts the workflow runtime, records durable run state, and uses Modal lifecycle hooks to reconcile interrupted work.
-_Avoid_: workflow node, runner
+A legacy name for the Modal Execution Host when composed into a workflow
+deployment. Apps and workflows use the same coordinator lifecycle.
+_Avoid_: separate workflow scheduler, workflow node, runner
 
 **Workflow Ledger**:
-The physical per-run SQLite database in which a workflow orchestrator hosts
-the shared Execution State Repository alongside workflow-specific artifact
-records.
-_Avoid_: separate workflow execution state machine, worker-owned database
+The physical per-run SQLite Execution State Repository used by a workflow's
+Modal Execution Host. Execution Artifact records share the same repository and
+atomic transition boundary.
+_Avoid_: separate workflow state machine, worker-owned database
 
 **Workflow Artifact Store**:
-The workflow-specific persistence for artifact manifests, files, node
-inputs, and node outputs, colocated with shared execution tables in the
-Workflow Ledger.
-_Avoid_: execution repository, scientific publication
+A legacy name for Execution Artifact persistence. Apps and workflows use the
+same kernel-owned artifact records; scientific files and validation remain
+workload-owned.
+_Avoid_: current artifact interface, scientific publication
 
 **Node Placement**:
 The execution location for a workflow node, either inline in the workflow orchestrator or in a separate remote Modal function.

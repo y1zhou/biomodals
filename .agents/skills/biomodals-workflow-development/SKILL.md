@@ -5,8 +5,10 @@ description: Use when creating, editing, or reviewing Biomodals workflow code un
 
 # Biomodals Workflow Development
 
-Use this skill for Biomodals workflow scripts, the reusable workflow runtime,
-workflow schemas, and workflow-compatible app integration points.
+Use this skill for Biomodals workflow definitions, deployment composition,
+workflow schemas, and workflow-compatible app integration points. Apps and
+workflows use the same `biomodals.execution` graph and runtime; workflow code
+does not own a second orchestration core.
 
 ## Core Workflow
 
@@ -30,20 +32,19 @@ Tasks, focused task-image runtimes, and PPIFlow-specific stage wiring.
 ## Working Rules
 
 - Keep `biomodals.schema` pure Pydantic and free of Modal imports.
-- Compose workflow apps with the shared orchestrator and included dependency
-  apps. Remote calls name functions exactly; the kernel resolves those names
-  against the pinned containing deployment.
-- Prefer `AppBackedNode` for nodes that primarily call app functions.
-  Add `WorkflowNativeNode` only for adapters, summaries, selectors, and
-  workflow-specific file-management glue.
-- `REMOTE` nodes prepare `RemoteNodeCall` values through
-  `prepare_remote(context)` and adapt raw results with
-  `process_remote_result(...)` only when needed. They never submit directly.
+- Compose workflow deployments with the shared Modal execution host and
+  included dependency apps. Provider calls name operations exactly; the Modal
+  integration resolves them against the pinned containing deployment.
+- Build a kernel-owned `ExecutionDefinition`. Prefer app-backed Execution Nodes
+  for existing app operations; add workflow-owned Nodes only for adapters,
+  summaries, selectors, and workflow-specific file-management glue.
+- Execution Nodes prepare provider operations and adapt results, but never
+  submit directly.
 - Keep hydrated Modal objects out of workflow Nodes. Explicit development runs
   may supply a function-name-to-handle map at the coordinator boundary.
-- Keep generic execution state in `biomodals.execution` and scientific
-  publications in workflow artifacts. Do not add workflow attempt tables,
-  replacement-call loops, or a second task queue.
+- Keep generic execution state and artifact records in `biomodals.execution`;
+  keep publication meaning and validation workload-owned. Do not add workflow
+  attempt tables, replacement-call loops, or a second task queue.
 - Import app-owned volume handles, volume names, and mountpoints from source app
   modules, and reload relevant volumes before reading mutations committed by
   another container.
@@ -58,8 +59,8 @@ Tasks, focused task-image runtimes, and PPIFlow-specific stage wiring.
 - When adding or changing workflow-compatible app functions, use RFdiffusion and
   LigandMPNN as the current app-side reference implementations and coordinate
   with the app-development skill.
-- Keep the core runtime slim. Add public orchestrator/runtime API only for clear
-  missing capabilities, not one-off workflow conveniences.
+- Keep the kernel interface deep. Add shared behavior for repeated app and
+  workflow needs, not one-off workflow conveniences.
 
 ## Verification
 

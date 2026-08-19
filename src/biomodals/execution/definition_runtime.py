@@ -1935,13 +1935,18 @@ class ExecutionGraphRuntime:
         implementation: TaskProviderNode,
     ) -> None:
         with self.store.transaction():
-            if self._node_publication_is_fenced(node_id):
-                return
-            self.store.execution.apply_task_failure_policy(
+            run = self.store.execution.get_run(self.execution_run_id)
+            if self.store.execution.get_node(
                 self.execution_run_id,
                 node_id,
-                now=self._now(),
-            )
+            ).status.is_terminal:
+                return
+            if not run.cancellation_is_durable:
+                self.store.execution.apply_task_failure_policy(
+                    self.execution_run_id,
+                    node_id,
+                    now=self._now(),
+                )
         with self.store.synchronize():
             task_count, outcome = self.store.execution.summarize_node_tasks(
                 self.execution_run_id,

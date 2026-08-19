@@ -548,6 +548,13 @@ class CallIdentityModalDriver(FanoutModalDriver):
         return super().spawn(function, args=args, kwargs=kwargs)
 
 
+class CancellingFanoutModalDriver(FanoutModalDriver):
+    def observe(self, provider_call_handle_id):
+        if provider_call_handle_id in self.cancelled:
+            return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
+        return ProviderCallObservation(ProviderCallObservationKind.RUNNING)
+
+
 class PullModalDriver(FakeModalDriver):
     def __init__(self) -> None:
         super().__init__()
@@ -1153,7 +1160,7 @@ def test_node_parallelism_is_independent_from_provider_call_limits(
     workflow = ExecutionGraph("node-limit")
     workflow.add_node(RemoteTextNode("first", "run_first"), id="first")
     workflow.add_node(RemoteTextNode("second", "run_second"), id="second")
-    driver = CancellingModalDriver()
+    driver = CancellingFanoutModalDriver()
     runtime = _runtime(
         tmp_path,
         workflow,
@@ -1242,6 +1249,25 @@ def test_cancel_requested_workflow_reconciles_provider_cancellation(
     assert {call.status for call in snapshot.provider_calls} == {
         ProviderCallStatus.CANCELLED
     }
+
+
+def test_cancel_requested_fanout_reconciles_node_cancellation(
+    tmp_path: Path,
+) -> None:
+    workflow = ExecutionGraph("cancel-fanout")
+    workflow.add_node(RemoteFanoutNode(("a", "b")), id="fanout")
+    driver = CancellingFanoutModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+    runtime._initialize("cancel-fanout")
+    runtime.advance_once()
+
+    runtime.cancel()
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.run.status == RunStatus.CANCELLED
+    assert snapshot.nodes[0].status == NodeStatus.CANCELLED
+    assert {task.status for task in snapshot.tasks} == {TaskStatus.CANCELLED}
 
 
 def test_unknown_workflow_prunes_call_after_terminal_publication_appears(

@@ -22,8 +22,11 @@ from biomodals.execution import (
     TaskPlan,
     drive_execution_run,
 )
+from biomodals.execution.definition import ExecutionGraph, ExecutionPlanMetadata
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
+    ExecutionDefinitionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
@@ -34,7 +37,9 @@ from biomodals.execution.modal import (
     stage_execution_launch,
     submit_staged_execution_run,
 )
+from biomodals.execution.nodes import CoordinatorNode, NodeRunContext
 from biomodals.execution.store import ExecutionRunStore
+from biomodals.schema import AppRunResult, AppRunStatus
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 REQUEST_FILE = ExecutionRequestFile(
@@ -42,6 +47,12 @@ REQUEST_FILE = ExecutionRequestFile(
     32,
     "Example execution request",
 )
+
+
+class SuccessfulNode(CoordinatorNode):
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        del context
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
 
 def test_resolve_provider_call_limits_preserves_or_overrides_defaults() -> None:
@@ -75,6 +86,55 @@ def test_resolve_provider_call_limits_rejects_gpu_limit_above_total() -> None:
             max_containers=4,
             max_gpu_containers=5,
         )
+
+
+def test_definition_coordinator_hosts_app_owned_graph(tmp_path: Path) -> None:
+    """Direct apps can use the shared executable-graph lifecycle."""
+    deployment = DeploymentIdentity("main", "Example", 3)
+
+    def build_graph(_request: object) -> ExecutionGraph:
+        graph = ExecutionGraph(
+            "example",
+            plan_metadata=ExecutionPlanMetadata(
+                workload_name="example",
+                scientific_versions={"example": "1"},
+            ),
+        )
+        graph.add_node(
+            SuccessfulNode(),
+            id="finish",
+            allow_empty_result=True,
+        )
+        return graph
+
+    graph = build_graph(object())
+    plan = execution_plan(graph.validate(), workload_run_key="example-run")
+    request = SimpleNamespace(
+        execution_plan=plan,
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
+    )
+
+    class Coordinator(ExecutionDefinitionCoordinatorLifecycle):
+        _request_loader = staticmethod(lambda _root, _run_id: request)
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        volume_root=tmp_path,
+        artifact_volume_name="Example-outputs",
+        output_volume=None,
+        provider_driver=cast(Any, object()),
+        graph_builder=build_graph,
+        target_scientific_versions={"example": "1"},
+        poll_interval_seconds=0,
+    )
+
+    overview = coordinator.run()
+
+    assert overview.run.status == RunStatus.SUCCEEDED
+    assert overview.run.plan == plan
+    coordinator.close()
 
 
 class FakeVolume:

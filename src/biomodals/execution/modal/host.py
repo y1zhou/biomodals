@@ -28,12 +28,15 @@ from biomodals.execution import (
     drive_execution_run,
     resume_execution_run,
 )
+from biomodals.execution.definition import ExecutionGraph
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.scheduler import (
     NodeAdmissionRank,
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.execution.store import ExecutionRunStore, GraphExecutionRunStore
 from biomodals.helper.artifacts import (
     VolumeHandle,
     read_bounded_file_bytes,
@@ -975,4 +978,102 @@ class OutputClaimExecutionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
         return replace(
             request,
             replace_claim_owner=str(predecessor_execution_run_id),
+        )
+
+
+class ExecutionDefinitionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
+    """Host one app-owned Execution Definition through the shared graph runtime."""
+
+    def __init__(
+        self,
+        *,
+        execution_run_id: UUID,
+        deployment: DeploymentIdentity,
+        volume_root: str | Path,
+        artifact_volume_name: str,
+        output_volume: Any,
+        provider_driver: Any,
+        graph_builder: Callable[[Any], ExecutionGraph],
+        target_scientific_versions: Mapping[str, str],
+        max_parallel_nodes: int = 32,
+        pull_worker_coordinator: Any | None = None,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        """Bind app resources while leaving graph behavior app-owned."""
+        super().__init__(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=volume_root,
+            target_scientific_versions=target_scientific_versions,
+        )
+        self.artifact_volume_name = artifact_volume_name
+        self.output_volume = output_volume
+        self.provider_driver = provider_driver
+        self.graph_builder = graph_builder
+        self.max_parallel_nodes = max_parallel_nodes
+        self.pull_worker_coordinator = pull_worker_coordinator
+        self.poll_interval_seconds = poll_interval_seconds
+
+    def _drive(
+        self,
+        runtime: ExecutionGraphRuntime,
+        *,
+        resume: bool,
+    ) -> ExecutionOverview:
+        if resume:
+            runtime.resume()
+        else:
+            runtime.run()
+        overview = runtime.store.execution.overview(self.execution_run_id)
+        self._verify_overview(overview)
+        return overview
+
+    def _run_store(self) -> GraphExecutionRunStore:
+        return GraphExecutionRunStore(
+            self.volume_root,
+            self.execution_run_id,
+            lock=self._writer_lock,
+            volume_io_lock=self._volume_io_lock,
+        )
+
+    def _create_runtime(
+        self,
+        request: Any,
+        *,
+        predecessor_execution_run_id: UUID | None = None,
+    ) -> ExecutionGraphRuntime:
+        graph = self.graph_builder(request)
+        workload_run_key = request.execution_plan.workload_run_key
+        if not workload_run_key:
+            raise ValueError("App Execution Plan must define a Workload Run Key")
+        if (
+            execution_plan(
+                graph.validate(),
+                workload_run_key=workload_run_key,
+            )
+            != request.execution_plan
+        ):
+            raise ValueError("App Execution Definition changed its Execution Plan")
+        store = self._run_store()
+        return ExecutionGraphRuntime(
+            graph=graph,
+            execution_run_id=self.execution_run_id,
+            deployment=self.deployment,
+            volume_root=self.volume_root,
+            artifact_volume_name=self.artifact_volume_name,
+            workload_run_key=workload_run_key,
+            request=request,
+            predecessor_execution_run_id=predecessor_execution_run_id,
+            provider_driver=self.provider_driver,
+            storage_sync=ExecutionVolumeSync(
+                volume=self.output_volume,
+                store=store,
+            ),
+            max_parallel_nodes=self.max_parallel_nodes,
+            max_active_provider_calls=request.max_active_provider_calls,
+            max_active_gpu_provider_calls=(request.max_active_gpu_provider_calls),
+            pull_worker_coordinator=self.pull_worker_coordinator,
+            store=store,
+            volume_io_lock=self._volume_io_lock,
+            poll_interval_seconds=self.poll_interval_seconds,
         )

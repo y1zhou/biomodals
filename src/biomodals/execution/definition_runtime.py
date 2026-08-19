@@ -84,27 +84,30 @@ class _UnavailableProviderDriver:
     """Reject provider work when a coordinator-only runtime has no driver."""
 
     @staticmethod
-    def resolve(_binding: ProviderBinding) -> object:
+    def resolve(binding: ProviderBinding) -> object:
+        del binding
         raise ProviderDeploymentUnavailableError(
             "No provider driver is configured for this Execution Run"
         )
 
     @staticmethod
     def spawn(
-        _operation: object,
+        operation: object,
         *,
         args: tuple[object, ...],
         kwargs: Mapping[str, object],
     ) -> str:
-        del args, kwargs
+        del operation, args, kwargs
         raise RuntimeError("No provider driver is configured for this Execution Run")
 
     @staticmethod
-    def observe(_provider_call_handle_id: str) -> ProviderCallObservation:
+    def observe(provider_call_handle_id: str) -> ProviderCallObservation:
+        del provider_call_handle_id
         raise RuntimeError("No provider driver is configured for this Execution Run")
 
     @staticmethod
-    def cancel(_provider_call_handle_id: str) -> None:
+    def cancel(provider_call_handle_id: str) -> None:
+        del provider_call_handle_id
         raise RuntimeError("No provider driver is configured for this Execution Run")
 
 
@@ -147,6 +150,9 @@ class ExecutionGraphRuntime:
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         artifact_volume_name: str,
+        workload_run_key: str | None = None,
+        request: object | None = None,
+        predecessor_execution_run_id: UUID | None = None,
         provider_driver: ProviderDriver | None = None,
         storage_sync: ExecutionStorageSync | None = None,
         max_parallel_nodes: int = 32,
@@ -178,6 +184,8 @@ class ExecutionGraphRuntime:
         self.graph = graph
         self.execution_run_id = execution_run_id
         self.deployment = deployment
+        self.request = request
+        self.predecessor_execution_run_id = predecessor_execution_run_id
         self.volume_root = Path(volume_root)
         self.artifact_volume_name = artifact_volume_name
         self.max_parallel_nodes = max_parallel_nodes
@@ -202,7 +210,7 @@ class ExecutionGraphRuntime:
             synchronize=self._synchronize_kernel_state,
         )
         self._definition: ExecutionDefinition | None = None
-        self._workload_run_key: str | None = None
+        self._workload_run_key = workload_run_key
 
     def configure_provider_boundary(
         self,
@@ -217,11 +225,12 @@ class ExecutionGraphRuntime:
     def run(
         self,
         *,
-        workload_run_key: str,
+        workload_run_key: str | None = None,
     ) -> AppRunResult:
         """Create or recover this Run and drive it until it cannot advance."""
+        selected_key = self._select_workload_run_key(workload_run_key)
         with self.store.synchronize():
-            repository = self._initialize(workload_run_key)
+            repository = self._initialize(selected_key)
         snapshot = drive_execution_run(
             repository,
             self.execution_run_id,
@@ -237,11 +246,12 @@ class ExecutionGraphRuntime:
     def resume(
         self,
         *,
-        workload_run_key: str,
+        workload_run_key: str | None = None,
     ) -> AppRunResult:
         """Explicitly resume this persisted Run, then drive it."""
+        selected_key = self._select_workload_run_key(workload_run_key)
         with self.store.synchronize():
-            repository = self._initialize(workload_run_key)
+            repository = self._initialize(selected_key)
         resume_execution_run(
             repository,
             self.execution_run_id,
@@ -285,14 +295,20 @@ class ExecutionGraphRuntime:
         """Request cancellation through the shared provider lifecycle."""
         self._provider.cancel_run(self.execution_run_id, now=self._now())
 
-    def attach(self, *, workload_run_key: str) -> None:
+    def attach(self, *, workload_run_key: str | None = None) -> None:
         """Open and verify a Run without refreshing worker publications."""
-        self._initialize(workload_run_key, reload_volume=False)
+        self._initialize(
+            self._select_workload_run_key(workload_run_key),
+            reload_volume=False,
+        )
 
-    def prepare(self, *, workload_run_key: str) -> None:
+    def prepare(self, *, workload_run_key: str | None = None) -> None:
         """Create and checkpoint a pending Run before asynchronous driving."""
         with self._volume_io_lock:
-            self._initialize(workload_run_key, reload_volume=False)
+            self._initialize(
+                self._select_workload_run_key(workload_run_key),
+                reload_volume=False,
+            )
             self._checkpoint()
 
     def claim_pull_tasks(
@@ -725,6 +741,9 @@ class ExecutionGraphRuntime:
                 with self.store.transaction():
                     self.store.execution.create_run(
                         execution_run_id=self.execution_run_id,
+                        predecessor_execution_run_id=(
+                            self.predecessor_execution_run_id
+                        ),
                         plan=plan,
                         deployment=self.deployment,
                         max_active_provider_calls=self.max_active_provider_calls,
@@ -742,6 +761,11 @@ class ExecutionGraphRuntime:
                 )
             if existing.plan.workload_run_key != workload_run_key:
                 raise ValueError("Workload Run Key does not match Execution Run")
+            if (
+                existing.predecessor_execution_run_id
+                != self.predecessor_execution_run_id
+            ):
+                raise ValueError("Predecessor Execution Run does not match")
             if existing.deployment != self.deployment:
                 raise ValueError("Deployment Identity does not match Execution Run")
             return repository
@@ -2333,6 +2357,14 @@ class ExecutionGraphRuntime:
         if self._workload_run_key is None:
             raise RuntimeError("Execution Run has not been initialized")
         return self._workload_run_key
+
+    def _select_workload_run_key(self, candidate: str | None) -> str:
+        selected = self._workload_run_key if candidate is None else candidate
+        if not selected:
+            raise ValueError("Workload Run Key cannot be empty")
+        if self._workload_run_key is not None and self._workload_run_key != selected:
+            raise ValueError("Workload Run Key cannot change within a runtime")
+        return selected
 
 
 def _execution_payload(invocation: ProviderCallSpec | None) -> dict[str, object]:

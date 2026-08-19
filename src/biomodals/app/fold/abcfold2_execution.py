@@ -23,6 +23,7 @@ from biomodals.execution import (
     NodeDependency,
     NodePlan,
     ProviderCallStatus,
+    inline_json_result,
     republish_execution_artifact,
 )
 from biomodals.execution.modal import (
@@ -44,7 +45,6 @@ from biomodals.schema import (
     AppRunStatus,
     ArtifactFile,
     ArtifactKind,
-    InlineBytes,
     VolumePath,
 )
 
@@ -436,22 +436,10 @@ class _ABCFold2PrepareNode(ProviderNode):
     ) -> AppRunResult:
         del metadata
         run_config = _run_config_from_value(result)
-        return AppRunResult(
-            status=AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="run-config",
-                    kind=ArtifactKind.TABLE,
-                    storage=InlineBytes(
-                        data=orjson.dumps(
-                            run_config.as_kwargs(),
-                            option=orjson.OPT_SORT_KEYS,
-                        ),
-                        filename="run-config.json",
-                        media_type="application/json",
-                    ),
-                )
-            ],
+        return inline_json_result(
+            name="run-config",
+            value=run_config.as_kwargs(),
+            filename="run-config.json",
         )
 
 
@@ -579,9 +567,7 @@ class _ABCFold2SeedNode(TaskProviderNode):
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
-                republish_execution_artifact(
-                    _single_input_artifact(context, "run_config")
-                ),
+                republish_execution_artifact(context.single_input("run_config")),
                 *(output for result in results.values() for output in result.outputs),
             ],
         )
@@ -693,20 +679,7 @@ def _run_config_from_value(value: object) -> ABCFold2RunConfig:
 
 
 def _run_config_from_context(context: NodeRunContext) -> ABCFold2RunConfig:
-    artifact = _single_input_artifact(context, "run_config")
-    return _run_config_from_value(
-        orjson.loads(context.resolve_artifact(artifact).read_bytes())
-    )
-
-
-def _single_input_artifact(
-    context: NodeRunContext,
-    name: str,
-) -> ExecutionArtifact:
-    artifacts = context.inputs.get(name) or []
-    if len(artifacts) != 1:
-        raise ValueError(f"ABCFold2 Node requires exactly one {name}")
-    return artifacts[0]
+    return _run_config_from_value(orjson.loads(context.read_input_bytes("run_config")))
 
 
 def run_config_from_overview(

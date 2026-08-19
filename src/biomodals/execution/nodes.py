@@ -44,6 +44,19 @@ class NodeRunContext:
         path.relative_to(self.volume_root.resolve())
         return path
 
+    def single_input(self, name: str) -> ExecutionArtifact:
+        """Return one required input artifact without repeated cardinality checks."""
+        artifacts = self.inputs.get(name) or []
+        if len(artifacts) != 1:
+            raise ValueError(
+                f"Execution Node requires exactly one {name!r} input artifact"
+            )
+        return artifacts[0]
+
+    def read_input_bytes(self, name: str) -> bytes:
+        """Read one execution-owned input artifact from its mounted Volume."""
+        return self.resolve_artifact(self.single_input(name)).read_bytes()
+
 
 @dataclass(frozen=True)
 class ProviderCallSpec:

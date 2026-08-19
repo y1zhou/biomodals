@@ -16,6 +16,7 @@ from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
+    AppRunStatus,
     ArtifactFile,
     ArtifactKind,
     ExecutionArtifact,
@@ -123,6 +124,30 @@ def republish_execution_artifact(artifact: ExecutionArtifact) -> AppOutput:
         kind=artifact.kind,
         storage=artifact.storage,
         metadata=metadata,
+    )
+
+
+def inline_json_result(
+    *,
+    name: str,
+    value: object,
+    filename: str,
+    kind: ArtifactKind = ArtifactKind.TABLE,
+) -> AppRunResult:
+    """Publish one small JSON value as an execution-owned artifact."""
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name=name,
+                kind=kind,
+                storage=InlineBytes(
+                    data=orjson.dumps(value, option=orjson.OPT_SORT_KEYS),
+                    filename=filename,
+                    media_type="application/json",
+                ),
+            )
+        ],
     )
 
 

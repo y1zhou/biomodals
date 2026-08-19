@@ -10,23 +10,29 @@ from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Lock, RLock
-from typing import Any, Protocol, cast
+from typing import Any
 from uuid import UUID
 
 from biomodals.execution import (
     DeploymentIdentity,
+    ExecutionNodeRecord,
     ExecutionOverview,
     ExecutionPlan,
     ExecutionRunNotFoundError,
     ExecutionRunRecord,
     ExecutionRuntime,
+    ExecutionTaskRecord,
     ProviderBinding,
     ProviderCallSubmission,
     SqliteExecutionRepository,
     drive_execution_run,
     resume_execution_run,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
+from biomodals.execution.scheduler import (
+    NodeAdmissionRank,
+    ProviderCallCandidate,
+    TaskDispatchDescriptor,
+)
 from biomodals.helper.artifacts import (
     VolumeHandle,
     read_bounded_file_bytes,
@@ -560,20 +566,6 @@ class ExecutionRuntimeLifecycle:
             yield
 
 
-class _SingleTaskAdmissionHooks(Protocol):
-    """Workload hooks for the standard one-Task-per-call admission path."""
-
-    def _binding(self, node_key: str) -> ProviderBinding: ...
-
-    def _ensure_publication_claim(self, node_key: str, task_key: str) -> None: ...
-
-    def _invocation_kwargs(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> dict[str, object]: ...
-
-
 class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
     """Share the standard publication, recovery, and admission cycle."""
 
@@ -592,10 +584,14 @@ class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
                 self._start_ready_nodes,
                 required,
             ),
+            after_start_ready_nodes=lambda: self._with_volume_io(
+                self._after_start_ready_nodes
+            ),
             admit_remote_tasks=lambda required: self._with_volume_io(
                 self._admit_remote_tasks,
                 required,
             ),
+            reconcile_results=lambda: self._with_volume_io(self._reconcile_results),
             now=self._now,
         )
 
@@ -606,56 +602,110 @@ class StandardExecutionRuntimeLifecycle(ExecutionRuntimeLifecycle):
         raise NotImplementedError
 
     def _decode_completed_calls(self) -> None:
-        raise NotImplementedError
+        """Decode provider envelopes when a workload does not publish by probe."""
 
     def _start_ready_nodes(self, required: set[str]) -> None:
         raise NotImplementedError
 
+    def _after_start_ready_nodes(self) -> None:
+        """Complete coordinator-local work after Node discovery, when present."""
+
+    def _reconcile_results(self) -> None:
+        self._provider.reconcile_nodes_and_run(
+            self.execution_run_id,
+            now=self._now(),
+        )
+
     def _admit_remote_tasks(self, required: set[str]) -> None:
         """Admit fixed Provider Calls containing one Task each."""
-        hooks = cast(_SingleTaskAdmissionHooks, self)
         with self.store.synchronize():
             repository = self.store.execution
             run = repository.get_run(self.execution_run_id)
             counts = repository.active_provider_call_counts(self.execution_run_id)
+        self._prepare_admission(required)
         selected = self._provider.fixed_call_candidates(
             self.execution_run_id,
             required_node_keys=required,
-            describe_task=lambda node, task, rank: TaskDispatchDescriptor(
-                node_key=node.node_key,
-                node_ordinal=node.ordinal,
-                task_key=task.task_key,
-                task_ordinal=task.ordinal,
-                binding=hooks._binding(node.node_key),
-                compatibility_key=hooks._binding(node.node_key).function_name,
-                max_tasks_per_call=1,
-                depth=rank.depth,
-                unblocking_span=rank.unblocking_span,
-            ),
+            describe_task=self._dispatch_descriptor,
             available_total_slots=max(0, run.max_active_provider_calls - counts.total),
             available_gpu_slots=max(0, run.max_active_gpu_provider_calls - counts.gpu),
             now=self._now(),
         )
+        selected = self._prepare_candidates(selected)
+        submissions = tuple(
+            submission
+            for candidate in selected
+            if (submission := self._provider_call_submission(candidate)) is not None
+        )
+        self._provider.submit_provider_calls(
+            self.execution_run_id,
+            submissions,
+            now=self._now(),
+        )
+
+    def _prepare_admission(self, required: set[str]) -> None:
+        """Prepare workload-owned descriptor state without admitting work."""
+        del required
+
+    def _dispatch_descriptor(
+        self,
+        node: ExecutionNodeRecord,
+        task: ExecutionTaskRecord,
+        rank: NodeAdmissionRank,
+    ) -> TaskDispatchDescriptor | None:
+        """Describe standard one-Task dispatch for one ready Task."""
+        binding = self._binding(node.node_key)
+        return TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=binding,
+            compatibility_key=binding.function_name,
+            max_tasks_per_call=1,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
+        )
+
+    def _prepare_candidates(
+        self,
+        selected: tuple[ProviderCallCandidate, ...],
+    ) -> tuple[ProviderCallCandidate, ...]:
+        """Claim workload publications before Provider Call submission."""
         for candidate in selected:
-            hooks._ensure_publication_claim(
+            self._ensure_publication_claim(
                 candidate.node_key,
                 candidate.task_keys[0],
             )
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    kwargs=hooks._invocation_kwargs(
-                        candidate.node_key,
-                        candidate.task_keys[0],
-                    ),
-                )
-                for candidate in selected
+        return selected
+
+    def _provider_call_submission(
+        self,
+        candidate: ProviderCallCandidate,
+    ) -> ProviderCallSubmission | None:
+        """Build the provider invocation for one admitted candidate."""
+        return ProviderCallSubmission(
+            candidate=candidate,
+            submission_token=candidate.candidate_key,
+            kwargs=self._invocation_kwargs(
+                candidate.node_key,
+                candidate.task_keys[0],
             ),
-            now=self._now(),
         )
+
+    def _binding(self, node_key: str) -> ProviderBinding:
+        raise NotImplementedError
+
+    def _ensure_publication_claim(self, node_key: str, task_key: str) -> None:
+        del node_key, task_key
+
+    def _invocation_kwargs(
+        self,
+        node_key: str,
+        task_key: str,
+    ) -> dict[str, object]:
+        del node_key, task_key
+        raise NotImplementedError
 
 
 class ExecutionCoordinatorLifecycle:

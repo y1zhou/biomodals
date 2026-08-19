@@ -29,18 +29,19 @@ from biomodals.app.bioinfo.gromacs_execution import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionNodeRecord,
+    ExecutionTaskRecord,
     NodeStatus,
     ProviderCallStatus,
-    ProviderCallSubmission,
     TaskStatus,
 )
 from biomodals.execution.modal import (
     ExecutionCoordinatorLifecycle,
     ExecutionRequestFile,
     ExecutionRunStore,
-    ExecutionRuntimeLifecycle,
+    StandardExecutionRuntimeLifecycle,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
+from biomodals.execution.scheduler import NodeAdmissionRank, TaskDispatchDescriptor
 from biomodals.helper.artifacts import (
     file_matches_sha256,
     replace_bytes_atomic,
@@ -196,7 +197,7 @@ def load_execution_request(
     )
 
 
-class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
+class GromacsExecutionRuntime(StandardExecutionRuntimeLifecycle):
     """Drive one direct GROMACS request through fixed one-Task calls."""
 
     def __init__(
@@ -231,30 +232,8 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
         self._run_identity_verified = False
         self._verified_available_nodes: set[str] = set()
 
-    def advance_once(self) -> None:
-        """Apply one publication, recovery, and admission cycle."""
-        self._provider.advance_once(
-            self.execution_run_id,
-            recover_publications=lambda: self._with_volume_io(
-                self._recover_publications
-            ),
-            reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=lambda: self._with_volume_io(
-                self._decode_completed_calls
-            ),
-            start_ready_nodes=lambda required: self._with_volume_io(
-                self._start_ready_nodes,
-                required,
-            ),
-            after_start_ready_nodes=lambda: self._with_volume_io(
-                self._complete_local_result
-            ),
-            admit_remote_tasks=lambda required: self._with_volume_io(
-                self._admit_remote_tasks,
-                required,
-            ),
-            now=self._now,
-        )
+    def _after_start_ready_nodes(self) -> None:
+        self._complete_local_result()
 
     def _recover_publications(self) -> None:
         if not self._run_identity_verified:
@@ -611,58 +590,39 @@ class GromacsExecutionRuntime(ExecutionRuntimeLifecycle):
                 )
         return True
 
-    def _admit_remote_tasks(self, required: set[str]) -> None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            run = repository.get_run(self.execution_run_id)
-            counts = repository.active_provider_call_counts(self.execution_run_id)
-        selected = self._provider.fixed_call_candidates(
-            self.execution_run_id,
-            required_node_keys=required,
-            describe_task=lambda node, task, rank: (
-                None
-                if node.node_key == PREPARE_RESULT
-                else TaskDispatchDescriptor(
-                    node_key=node.node_key,
-                    node_ordinal=node.ordinal,
-                    task_key=task.task_key,
-                    task_ordinal=task.ordinal,
-                    binding=operation_provider_binding(
-                        node.node_key,
-                        environment=self.deployment.environment,
-                        app_name=self.deployment.deployment_name,
-                        app_version=self.deployment.deployment_version,
-                    ),
-                    compatibility_key=node.node_key,
-                    max_tasks_per_call=1,
-                    depth=rank.depth,
-                    unblocking_span=rank.unblocking_span,
-                )
-            ),
-            available_total_slots=max(
-                0,
-                run.max_active_provider_calls - counts.total,
-            ),
-            available_gpu_slots=max(
-                0,
-                run.max_active_gpu_provider_calls - counts.gpu,
-            ),
-            now=self._now(),
-        )
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    kwargs=self._invocation_kwargs(candidate.node_key),
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
+    def _dispatch_descriptor(
+        self,
+        node: ExecutionNodeRecord,
+        task: ExecutionTaskRecord,
+        rank: NodeAdmissionRank,
+    ) -> TaskDispatchDescriptor | None:
+        if node.node_key == PREPARE_RESULT:
+            return None
+        return TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=self._binding(node.node_key),
+            compatibility_key=node.node_key,
+            max_tasks_per_call=1,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
         )
 
-    def _invocation_kwargs(self, node_key: str) -> dict[str, object]:
+    def _binding(self, node_key: str):
+        return operation_provider_binding(
+            node_key,
+            environment=self.deployment.environment,
+            app_name=self.deployment.deployment_name,
+            app_version=self.deployment.deployment_version,
+        )
+
+    def _invocation_kwargs(
+        self,
+        node_key: str,
+        _task_key: str,
+    ) -> dict[str, object]:
         request = self.request
         if node_key.startswith("prepare_tpr_"):
             return {

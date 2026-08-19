@@ -34,9 +34,9 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ExecutionRunStore,
-    ExecutionRuntimeLifecycle,
+    StandardExecutionRuntimeLifecycle,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
+from biomodals.execution.scheduler import ProviderCallCandidate
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,7 @@ class _PlannedTask:
     run_id: str | None = None
 
 
-class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
+class BoltzGenExecutionRuntime(StandardExecutionRuntimeLifecycle):
     """Drive one BoltzGen request through direct one-Task GPU calls."""
 
     def __init__(
@@ -75,26 +75,6 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             now=now,
         )
         self.output_root = Path(output_root)
-
-    def advance_once(self) -> None:
-        """Apply one publication, recovery, and admission cycle."""
-        # BoltzGen completes Tasks from validated Volume publications.
-        self._provider.advance_once(
-            self.execution_run_id,
-            recover_publications=lambda: self._with_volume_io(
-                self._recover_publications
-            ),
-            reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=lambda: None,
-            start_ready_nodes=lambda _required: self._with_volume_io(
-                self._start_ready_nodes
-            ),
-            admit_remote_tasks=lambda required: self._with_volume_io(
-                self._admit_remote_tasks,
-                required,
-            ),
-            now=self._now,
-        )
 
     def _recover_publications(self) -> None:
         with self.store.synchronize():
@@ -281,7 +261,7 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
         ):
             self._reload_output()
 
-    def _start_ready_nodes(self) -> None:
+    def _start_ready_nodes(self, _required: set[str]) -> None:
         with self.store.synchronize():
             repository = self.store.execution
             statuses = {
@@ -363,63 +343,20 @@ class BoltzGenExecutionRuntime(ExecutionRuntimeLifecycle):
             )
         raise ValueError(f"Unknown BoltzGen Node {node_key!r}")
 
-    def _admit_remote_tasks(self, required: set[str]) -> None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            run = repository.get_run(self.execution_run_id)
-            counts = repository.active_provider_call_counts(self.execution_run_id)
-        bindings: dict[str, ProviderBinding] = {}
-
-        def describe_task(node, task, rank):
-            binding = bindings.get(node.node_key)
-            if binding is None:
-                binding = self._binding(node.node_key)
-                bindings[node.node_key] = binding
-            return TaskDispatchDescriptor(
-                node_key=node.node_key,
-                node_ordinal=node.ordinal,
-                task_key=task.task_key,
-                task_ordinal=task.ordinal,
-                binding=binding,
-                compatibility_key=binding.function_name,
-                max_tasks_per_call=1,
-                depth=rank.depth,
-                unblocking_span=rank.unblocking_span,
-            )
-
-        selected = self._provider.fixed_call_candidates(
-            self.execution_run_id,
-            required_node_keys=required,
-            describe_task=describe_task,
-            available_total_slots=max(
-                0,
-                run.max_active_provider_calls - counts.total,
+    def _provider_call_submission(
+        self,
+        candidate: ProviderCallCandidate,
+    ) -> ProviderCallSubmission:
+        return ProviderCallSubmission(
+            candidate=candidate,
+            submission_token=candidate.candidate_key,
+            kwargs=self._invocation_kwargs(
+                candidate.node_key,
+                candidate.task_keys[0],
             ),
-            available_gpu_slots=max(
-                0,
-                run.max_active_gpu_provider_calls - counts.gpu,
+            provider_call_id_kwarg=(
+                "claim_owner" if candidate.node_key == DESIGN_RUNS_NODE else None
             ),
-            now=self._now(),
-        )
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    kwargs=self._invocation_kwargs(
-                        candidate.node_key,
-                        candidate.task_keys[0],
-                    ),
-                    provider_call_id_kwarg=(
-                        "claim_owner"
-                        if candidate.node_key == DESIGN_RUNS_NODE
-                        else None
-                    ),
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
         )
 
     def _binding(self, node_key: str) -> ProviderBinding:

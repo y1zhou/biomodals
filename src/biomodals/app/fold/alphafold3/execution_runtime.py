@@ -86,6 +86,8 @@ from biomodals.app.fold.alphafold3.template_search import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionNodeRecord,
+    ExecutionTaskRecord,
     NodeStatus,
     ProviderBinding,
     ProviderCallRecord,
@@ -97,11 +99,10 @@ from biomodals.execution import (
 )
 from biomodals.execution.modal import (
     ExecutionRunStore,
-    ExecutionRuntimeLifecycle,
-    ProviderDefiniteSubmissionError,
-    ProviderSubmissionOutcomeUnknownError,
+    StandardExecutionRuntimeLifecycle,
 )
 from biomodals.execution.scheduler import (
+    NodeAdmissionRank,
     ProviderCallCandidate,
     TaskDispatchDescriptor,
 )
@@ -145,7 +146,7 @@ class _PlannedTask:
     value: object
 
 
-class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
+class AlphaFold3ExecutionRuntime(StandardExecutionRuntimeLifecycle):
     """Drive one AlphaFold3 App Run through ordinary kernel operations."""
 
     def __init__(
@@ -195,30 +196,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
         self._prepared_inference_error: _IncompletePrerequisiteError | None = None
         self._seed_prediction_cache: dict[int, dict[str, object]] | None = None
 
-    def advance_once(self) -> None:
-        """Apply one AlphaFold3-specific scheduling and publication cycle."""
-        self._provider.advance_once(
-            self.execution_run_id,
-            recover_publications=lambda: self._with_volume_io(
-                self._recover_cycle_publications
-            ),
-            reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=lambda: None,
-            start_ready_nodes=lambda _required: self._with_volume_io(
-                self._start_ready_nodes
-            ),
-            after_start_ready_nodes=lambda: self._with_volume_io(self._run_local_tasks),
-            admit_remote_tasks=lambda required: self._with_volume_io(
-                self._admit_remote_tasks,
-                required,
-            ),
-            reconcile_results=lambda: self._with_volume_io(
-                self._reconcile_nodes_and_run
-            ),
-            now=self._now,
-        )
-
-    def _recover_publications(self) -> None:
+    def _recover_node_publications(self) -> None:
         """Probe result Nodes backward until reusable work closes each branch."""
         with self.store.synchronize():
             repository = self.store.execution
@@ -257,11 +235,17 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             ):
                 return
 
-    def _recover_cycle_publications(self) -> None:
+    def _recover_publications(self) -> None:
         """Recover Node, request-receipt, and Task publications."""
-        self._recover_publications()
+        self._recover_node_publications()
         self._publish_request_receipt()
         self._recover_task_publications()
+
+    def _after_start_ready_nodes(self) -> None:
+        self._run_local_tasks()
+
+    def _reconcile_results(self) -> None:
+        self._reconcile_nodes_and_run()
 
     def _node_observation(self, node_key: str) -> AvailabilityStatus:
         """Validate one complete Node result without admitting its Tasks."""
@@ -325,7 +309,7 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             super()._reload_output()
             self._invalidate_planning_cache(succeeded_nodes)
 
-    def _start_ready_nodes(self) -> None:
+    def _start_ready_nodes(self, _required: set[str]) -> None:
         with self.store.synchronize():
             repository = self.store.execution
             statuses = {
@@ -657,51 +641,44 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
                 now=self._now(),
             )
 
-    def _admit_remote_tasks(self, required: set[str]) -> None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            run = repository.get_run(self.execution_run_id)
-            counts = repository.active_provider_call_counts(self.execution_run_id)
-        planned_by_node: dict[str, dict[str, _PlannedTask]] = {}
-        dispatch_by_node: dict[str, tuple[ProviderBinding, int]] = {}
+    def _prepare_admission(self, _required: set[str]) -> None:
+        self._admission_planned_by_node: dict[str, dict[str, _PlannedTask]] = {}
+        self._admission_dispatch_by_node: dict[str, tuple[ProviderBinding, int]] = {}
+        self._admission_functions: dict[ProviderBinding, Any] = {}
 
-        def describe_task(node, task, rank):
-            if node.node_key not in _REMOTE_NODE_FUNCTIONS:
-                return None
-            if node.node_key not in planned_by_node:
-                planned_by_node[node.node_key] = {
-                    item.plan.task_key: item
-                    for item in self._planned_tasks(node.node_key)
-                }
-            if node.node_key not in dispatch_by_node:
-                dispatch_by_node[node.node_key] = self._dispatch_binding(node.node_key)
-            binding, maximum = dispatch_by_node[node.node_key]
-            return TaskDispatchDescriptor(
-                node_key=node.node_key,
-                node_ordinal=node.ordinal,
-                task_key=task.task_key,
-                task_ordinal=task.ordinal,
-                binding=binding,
-                compatibility_key=binding.function_name,
-                max_tasks_per_call=maximum,
-                depth=rank.depth,
-                unblocking_span=rank.unblocking_span,
+    def _dispatch_descriptor(
+        self,
+        node: ExecutionNodeRecord,
+        task: ExecutionTaskRecord,
+        rank: NodeAdmissionRank,
+    ) -> TaskDispatchDescriptor | None:
+        if node.node_key not in _REMOTE_NODE_FUNCTIONS:
+            return None
+        if node.node_key not in self._admission_planned_by_node:
+            self._admission_planned_by_node[node.node_key] = {
+                item.plan.task_key: item for item in self._planned_tasks(node.node_key)
+            }
+        if node.node_key not in self._admission_dispatch_by_node:
+            self._admission_dispatch_by_node[node.node_key] = self._dispatch_binding(
+                node.node_key
             )
-
-        selected = self._provider.fixed_call_candidates(
-            self.execution_run_id,
-            required_node_keys=required,
-            describe_task=describe_task,
-            available_total_slots=max(
-                0,
-                run.max_active_provider_calls - counts.total,
-            ),
-            available_gpu_slots=max(
-                0,
-                run.max_active_gpu_provider_calls - counts.gpu,
-            ),
-            now=self._now(),
+        binding, maximum = self._admission_dispatch_by_node[node.node_key]
+        return TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=binding,
+            compatibility_key=binding.function_name,
+            max_tasks_per_call=maximum,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
         )
+
+    def _prepare_candidates(
+        self,
+        selected: tuple[ProviderCallCandidate, ...],
+    ) -> tuple[ProviderCallCandidate, ...]:
         if any(candidate.node_key == _SEED_PREDICTIONS for candidate in selected):
             super()._reload_output()
             self._seed_prediction_cache = None
@@ -711,41 +688,30 @@ class AlphaFold3ExecutionRuntime(ExecutionRuntimeLifecycle):
             now=self._now(),
         )
         if resolved_functions is None:
-            return
-        submissions = []
-        for candidate in selected:
-            planned = planned_by_node[candidate.node_key]
-            selected_candidate, claimed = self._claim_seed_candidate(
-                candidate,
-                planned,
-            )
-            if selected_candidate is None:
-                continue
-            args, kwargs = self._provider_arguments(
-                selected_candidate,
-                planned,
-                claimed,
-            )
-            submissions.append(
-                ProviderCallSubmission(
-                    candidate=selected_candidate,
-                    function=resolved_functions[selected_candidate.binding],
-                    submission_token=selected_candidate.candidate_key,
-                    args=args,
-                    kwargs=kwargs,
-                )
-            )
-        try:
-            self._provider.submit_provider_calls(
-                self.execution_run_id,
-                tuple(submissions),
-                now=self._now(),
-            )
-        except (
-            ProviderDefiniteSubmissionError,
-            ProviderSubmissionOutcomeUnknownError,
-        ):
-            return
+            return ()
+        self._admission_functions = resolved_functions
+        return selected
+
+    def _provider_call_submission(
+        self,
+        candidate: ProviderCallCandidate,
+    ) -> ProviderCallSubmission | None:
+        planned = self._admission_planned_by_node[candidate.node_key]
+        selected_candidate, claimed = self._claim_seed_candidate(candidate, planned)
+        if selected_candidate is None:
+            return None
+        args, kwargs = self._provider_arguments(
+            selected_candidate,
+            planned,
+            claimed,
+        )
+        return ProviderCallSubmission(
+            candidate=selected_candidate,
+            function=self._admission_functions[selected_candidate.binding],
+            submission_token=selected_candidate.candidate_key,
+            args=args,
+            kwargs=kwargs,
+        )
 
     def _claim_seed_candidate(
         self,

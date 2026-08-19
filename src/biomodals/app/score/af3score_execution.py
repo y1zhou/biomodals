@@ -18,13 +18,14 @@ from biomodals.app.score.af3score_publications import (
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionNodeRecord,
     ExecutionPlan,
+    ExecutionTaskRecord,
     NodeAggregationPolicy,
     NodeDependency,
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
-    ProviderCallSubmission,
     TaskPlan,
 )
 from biomodals.execution.modal import (
@@ -33,7 +34,11 @@ from biomodals.execution.modal import (
     OutputClaimExecutionCoordinatorLifecycle,
     StandardExecutionRuntimeLifecycle,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
+from biomodals.execution.scheduler import (
+    NodeAdmissionRank,
+    ProviderCallCandidate,
+    TaskDispatchDescriptor,
+)
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.io import require_safe_filename_component
@@ -504,7 +509,8 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
         digests = {Path(name).stem: digest for name, digest in self.request.inputs}
         plans = []
         for chunk in spec.chunk_specs:
-            for input_id in self._chunk_input_ids(chunk):
+            input_ids = self._chunk_input_ids(chunk)
+            for input_id in input_ids:
                 plans.append(
                     TaskPlan(
                         task_key=input_id,
@@ -512,7 +518,10 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
                             "input_id": input_id,
                             "sha256": digests[input_id],
                         },
-                        execution_payload={"chunk": asdict(chunk)},
+                        execution_payload={
+                            "chunk": asdict(chunk),
+                            "task_count": len(input_ids),
+                        },
                     )
                 )
         return tuple(plans)
@@ -618,63 +627,40 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
             if path.is_file()
         )
 
-    def _admit_remote_tasks(self, required: set[str]) -> None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            run = repository.get_run(self.execution_run_id)
-            tasks = repository.list_tasks(self.execution_run_id, BATCHES_NODE)
-            counts = repository.active_provider_call_counts(self.execution_run_id)
-        chunk_sizes: dict[str, int] = {}
-        for task in tasks:
-            name = task.execution_payload["chunk"]["batch_name"]
-            chunk_sizes[name] = chunk_sizes.get(name, 0) + 1
-
-        def describe_task(node, task, rank):
-            binding = self._binding(node.node_key)
-            compatibility = binding.function_name
-            batch_size = 1
-            if node.node_key == BATCHES_NODE:
-                compatibility = task.execution_payload["chunk"]["batch_name"]
-                batch_size = chunk_sizes[compatibility]
-            elif node.node_key == POSTPROCESS_NODE:
-                batch_size = len(self.request.inputs)
-            return TaskDispatchDescriptor(
-                node_key=node.node_key,
-                node_ordinal=node.ordinal,
-                task_key=task.task_key,
-                task_ordinal=task.ordinal,
-                binding=binding,
-                compatibility_key=compatibility,
-                max_tasks_per_call=batch_size,
-                depth=rank.depth,
-                unblocking_span=rank.unblocking_span,
-            )
-
-        selected = self._provider.fixed_call_candidates(
-            self.execution_run_id,
-            required_node_keys=required,
-            describe_task=describe_task,
-            available_total_slots=max(0, run.max_active_provider_calls - counts.total),
-            available_gpu_slots=max(0, run.max_active_gpu_provider_calls - counts.gpu),
-            now=self._now(),
+    def _dispatch_descriptor(
+        self,
+        node: ExecutionNodeRecord,
+        task: ExecutionTaskRecord,
+        rank: NodeAdmissionRank,
+    ) -> TaskDispatchDescriptor:
+        binding = self._binding(node.node_key)
+        compatibility = binding.function_name
+        batch_size = 1
+        if node.node_key == BATCHES_NODE:
+            chunk = cast(dict[str, object], task.execution_payload["chunk"])
+            compatibility = str(chunk["batch_name"])
+            batch_size = cast(int, task.execution_payload["task_count"])
+        elif node.node_key == POSTPROCESS_NODE:
+            batch_size = len(self.request.inputs)
+        return TaskDispatchDescriptor(
+            node_key=node.node_key,
+            node_ordinal=node.ordinal,
+            task_key=task.task_key,
+            task_ordinal=task.ordinal,
+            binding=binding,
+            compatibility_key=compatibility,
+            max_tasks_per_call=batch_size,
+            depth=rank.depth,
+            unblocking_span=rank.unblocking_span,
         )
+
+    def _prepare_candidates(
+        self,
+        selected: tuple[ProviderCallCandidate, ...],
+    ) -> tuple[ProviderCallCandidate, ...]:
         if selected:
             self._ensure_output_claim()
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    kwargs=self._invocation_kwargs(
-                        candidate.node_key,
-                        candidate.task_keys[0],
-                    ),
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
-        )
+        return selected
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

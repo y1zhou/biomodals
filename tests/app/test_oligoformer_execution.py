@@ -391,7 +391,7 @@ def test_all_human_plan_prepares_reference_shards() -> None:
     )
 
 
-def test_process_budget_is_split_without_extra_scheduler_state() -> None:
+def test_process_budget_only_controls_in_container_workers() -> None:
     execution = replace(
         oligoformer_app.DEFAULT_EXECUTION_CONFIG,
         off_target_process_slots=12,
@@ -408,14 +408,6 @@ def test_process_budget_is_split_without_extra_scheduler_state() -> None:
     assert oligoformer_app._off_target_branch_slots(execution) == (6, 6)
     assert oligoformer_app._pita_local_workers(execution) == (1, 2)
     assert oligoformer_app._targetscan_local_workers(execution) == 3
-
-    runtime = object.__new__(OligoformerExecutionRuntime)
-    runtime.request = _request(
-        off_target_process_slots=execution.off_target_process_slots,
-        off_target_nodes=execution.off_target_nodes,
-        pita_prepare_nodes=execution.pita_prepare_nodes,
-    )
-    assert runtime._node_call_limit(PITA_CANDIDATES_NODE) == 1
 
 
 def test_oligoformer_has_no_app_owned_modal_queue_or_nested_dispatch() -> None:

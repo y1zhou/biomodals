@@ -20,7 +20,6 @@ from biomodals.execution import (
     NodePlan,
     ProviderBinding,
     ProviderCallStatus,
-    ProviderCallSubmission,
     TaskPlan,
 )
 from biomodals.execution.modal import (
@@ -29,7 +28,6 @@ from biomodals.execution.modal import (
     OutputClaimExecutionCoordinatorLifecycle,
     StandardExecutionRuntimeLifecycle,
 )
-from biomodals.execution.scheduler import TaskDispatchDescriptor
 from biomodals.helper.output_claim import acquire_output_claim
 
 REQUEST_SCHEMA_VERSION = 2
@@ -698,110 +696,6 @@ class OligoformerExecutionRuntime(StandardExecutionRuntimeLifecycle):
         if call is None:
             raise LookupError(f"OligoFormer PITA reference plan is unavailable: {stem}")
         return _pita_reference_from_envelope(call.result_envelope)
-
-    def _admit_remote_tasks(self, required: set[str]) -> None:
-        with self.store.synchronize():
-            repository = self.store.execution
-            run = repository.get_run(self.execution_run_id)
-            counts = repository.active_provider_call_counts(self.execution_run_id)
-        available_total = max(0, run.max_active_provider_calls - counts.total)
-        if available_total == 0:
-            return
-        with self.store.synchronize():
-            active_counts_by_node = (
-                self.store.execution.active_provider_call_counts_by_node(
-                    self.execution_run_id
-                )
-            )
-        candidate_node_keys = {
-            node_key
-            for node_key in required
-            if active_counts_by_node.get(node_key, 0) < self._node_call_limit(node_key)
-        }
-        active_by_node = {
-            node_key: active_counts_by_node.get(node_key, 0) for node_key in required
-        }
-        window_size = available_total
-        while True:
-            ordered = self._provider.fixed_call_candidates(
-                self.execution_run_id,
-                required_node_keys=required,
-                candidate_node_keys=candidate_node_keys,
-                describe_task=lambda node, task, rank: TaskDispatchDescriptor(
-                    node_key=node.node_key,
-                    node_ordinal=node.ordinal,
-                    task_key=task.task_key,
-                    task_ordinal=task.ordinal,
-                    binding=self._binding(node.node_key),
-                    compatibility_key=self._binding(node.node_key).function_name,
-                    max_tasks_per_call=1,
-                    depth=rank.depth,
-                    unblocking_span=rank.unblocking_span,
-                ),
-                available_total_slots=window_size,
-                available_gpu_slots=max(
-                    0,
-                    run.max_active_gpu_provider_calls - counts.gpu,
-                ),
-                now=self._now(),
-            )
-            admitted_by_node = active_by_node.copy()
-            selected = []
-            for candidate in ordered:
-                if len(selected) >= available_total:
-                    break
-                if admitted_by_node[candidate.node_key] >= self._node_call_limit(
-                    candidate.node_key
-                ):
-                    continue
-                selected.append(candidate)
-                admitted_by_node[candidate.node_key] += 1
-            if len(selected) == available_total or len(ordered) < window_size:
-                break
-            window_size *= 2
-        for candidate in selected:
-            self._ensure_publication_claim(
-                candidate.node_key,
-                candidate.task_keys[0],
-            )
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    kwargs=self._invocation_kwargs(
-                        candidate.node_key,
-                        candidate.task_keys[0],
-                    ),
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
-        )
-
-    def _node_call_limit(self, node_key: str) -> int:
-        execution = self.request.execution_config
-        targetscan_slots, pita_slots = _workload_module()._off_target_branch_slots(
-            execution
-        )
-        if node_key == REFERENCE_SHARDS_NODE:
-            return execution.targetscan_rnaplfold_nodes
-        if node_key == PITA_CANDIDATES_NODE:
-            return min(
-                execution.off_target_nodes,
-                execution.pita_prepare_nodes,
-                pita_slots,
-            )
-        if node_key == TARGETSCAN_TILES_NODE:
-            return min(
-                execution.targetscan_prepare_nodes,
-                execution.targetscan_context_nodes,
-                targetscan_slots,
-            )
-        if node_key == EVIDENCE_MERGE_NODE:
-            return execution.targetscan_merge_nodes
-        return 1
 
     def _binding(self, node_key: str) -> ProviderBinding:
         function_name = {

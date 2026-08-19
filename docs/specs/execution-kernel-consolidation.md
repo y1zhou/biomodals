@@ -139,6 +139,12 @@ operations need only a local wrapper and OCI image, while operations coupled to
 Modal lifecycle or implicit mounts must first extract those concerns. The DAG,
 cache identity, scheduler policy, and scientific implementation remain shared.
 
+Provider subpackages implement generic host mechanics only. They do not own a
+workload registry or app-specific images. Each app or workflow composition root
+maps the logical operations in its Execution Definition to that provider's
+executable, packaging, resources, mounts, and configuration. This keeps adding
+`biomodals.execution.local` independent from migrating every workload to it.
+
 ## Workload interface
 
 An app or workflow supplies an immutable `ExecutionDefinition` containing

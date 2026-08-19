@@ -123,10 +123,14 @@ already portable operation bodies.
 
 The local integration must implement durable container submission,
 observation, cancellation, log access, filesystem binding, and result
-collection. Those responsibilities belong to `biomodals.execution.local`;
-they are not added to app operation bodies. The existing execution repository
-continues to own scheduling and recovery state, while Docker or Podman owns
-the actual container identity and lifecycle.
+collection. Those generic responsibilities belong to
+`biomodals.execution.local`; it does not contain a workload registry,
+scientific functions, or app-specific OCI image definitions. Each app or
+workflow keeps a thin local composition root that binds its logical operation
+names to provider packaging, resources, mounts, and configuration, just as its
+Modal composition root does today. The existing execution repository continues
+to own scheduling and recovery state, while Docker or Podman owns the actual
+container identity and lifecycle.
 
 This is an incremental migration. An app may support Modal only while still
 using the provider-neutral kernel. Local support is added operation by

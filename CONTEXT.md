@@ -299,6 +299,13 @@ durability boundaries into one compute provider's mechanisms. The first
 integration is `biomodals.execution.modal`.
 _Avoid_: workload plugin, scientific adapter, deployment registry
 
+**Provider Binding**:
+The app- or workflow-owned mapping from one logical operation in an Execution
+Definition to an exact executable, packaging, resources, mounts, and
+configuration for one provider and pinned deployment. A provider integration
+resolves and invokes the binding but does not own a global workload registry.
+_Avoid_: Workload Operation, Provider Integration, universal app registry
+
 **Workload Operation**:
 A provider-independent scientific implementation invoked by an Execution Node.
 It accepts ordinary request values, explicit paths and configuration, may run

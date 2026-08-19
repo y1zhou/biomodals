@@ -277,7 +277,10 @@ def load_execution_provider_result(
         size_bytes=size_bytes,
         content_sha256=reference.get("sha256"),
     )
-    return orjson.loads(content)
+    encoding = reference.get("encoding")
+    if encoding not in {"bytes", "json"}:
+        raise ValueError("Execution Result Envelope encoding is invalid")
+    return content if encoding == "bytes" else orjson.loads(content)
 
 
 def persist_execution_launch(

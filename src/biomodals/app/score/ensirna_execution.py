@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import orjson
@@ -15,21 +15,36 @@ import orjson
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
+    ExecutionArtifact,
+    ExecutionGraph,
     ExecutionPlan,
+    ExecutionPlanMetadata,
     NodeDependency,
     NodePlan,
-    ProviderBinding,
-    ProviderCallStatus,
-    TaskPlan,
+    inline_json_result,
+    republish_execution_artifact,
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    OutputClaimExecutionCoordinatorLifecycle,
-    StandardExecutionRuntimeLifecycle,
+    OutputClaimExecutionDefinitionCoordinatorLifecycle,
 )
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
+)
 from biomodals.helper.artifacts import sha256_file
 from biomodals.helper.output_claim import acquire_output_claim
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    VolumePath,
+)
 
 REQUEST_SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
@@ -126,6 +141,7 @@ class EnsirnaExecutionRequest:
                 NodePlan(
                     CHUNKS_NODE,
                     dependencies=(NodeDependency(PREPARE_NODE),),
+                    allow_empty_result=True,
                 ),
                 NodePlan(
                     FINALIZE_NODE,
@@ -221,370 +237,429 @@ def load_execution_request(
     )
 
 
-class EnsirnaExecutionRuntime(StandardExecutionRuntimeLifecycle):
-    """Drive one direct ENsiRNA request through its staged DAG."""
+class EnsirnaPublications:
+    """Own ENsiRNA cache claims and publication reconstruction."""
 
     def __init__(
         self,
         *,
         request: EnsirnaExecutionRequest,
         execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
+        output_root: str | Path,
+        output_volume_name: str,
         output_claims: Any,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
     ) -> None:
-        """Bind the kernel writer to ENsiRNA's content-addressed cache."""
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-        )
+        """Bind one Run to its content-addressed ENsiRNA cache."""
+        self.request = request
+        self.execution_run_id = execution_run_id
+        self.output_root = Path(output_root)
+        self.output_volume_name = output_volume_name
         self.output_claims = output_claims
-        self._claimed_publications: set[str] = set()
 
     @property
     def cache_key(self) -> str:
-        """Return the established content-addressed publication key."""
-        app = _workload_module()
-        return app._cache_key_for_fasta(
+        """Return the established scientific cache key."""
+        return _workload_module()._cache_key_for_fasta(
             self.request.fasta_content,
             force_generation=self.request.force_generation,
         )
 
     @property
     def layout(self):
-        """Return the established cache layout."""
+        """Return the established cache directory layout."""
         return _workload_module()._layout_for_cache_key(self.cache_key)
 
-    def _recover_publications(self) -> None:
-        self._provider.recover_publications(
-            self.execution_run_id,
-            observe_node=self._node_observation,
-            observe_task=lambda node_key, task: (
-                None
-                if node_key in {DOWNLOAD_MODELS_NODE, PREPARE_NODE}
-                else self._task_observation(node_key, task)
-            ),
-            now=self._now(),
-        )
-
-    def _node_observation(self, node_key: str) -> AvailabilityStatus:
-        app = _workload_module()
-        try:
-            if node_key in {DOWNLOAD_MODELS_NODE, PREPARE_NODE}:
-                available = False
-            elif node_key == CHUNKS_NODE:
-                plan = self._try_plan_from_node(PREPARE_NODE)
-                available = plan is not None and all(
-                    app._chunk_artifacts_valid(chunk) for chunk in plan.chunks
-                )
-            elif node_key == FINALIZE_NODE:
-                plan = self._try_plan_from_node(FINALIZE_NODE)
-                available = plan is not None and (
-                    len(app._json_records(Path(plan.json_path))) == plan.candidate_count
-                )
-            elif node_key == PREPROCESS_NODE:
-                available = app._is_prepared(self.layout)
-            elif node_key == INFERENCE_NODE:
-                available = app._result_ready(self.layout, self.cache_key)
-            else:
-                raise ValueError(f"Unknown ENsiRNA Node {node_key!r}")
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _task_observation(self, node_key: str, task: Any) -> AvailabilityStatus:
-        if node_key == CHUNKS_NODE:
-            try:
-                chunk = EnsirnaPdbChunkSpec(**task.execution_payload["chunk"])
-                available = _workload_module()._chunk_artifacts_valid(chunk)
-            except OSError:
-                return AvailabilityStatus.UNKNOWN
-            return (
-                AvailabilityStatus.AVAILABLE
-                if available
-                else AvailabilityStatus.MISSING
-            )
-        return self._node_observation(node_key)
-
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            now=self._now(),
-        )
-        succeeded_nodes = {
-            updated.node_key
-            for original, updated in reconciled
-            if not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-        }
-        if succeeded_nodes - {DOWNLOAD_MODELS_NODE}:
-            self._reload_output()
-
-    def _decode_completed_calls(self) -> None:
-        self._provider.decode_completed_calls(
-            self.execution_run_id,
-            observe_task=self._completed_task_observation,
-            missing_message="ENsiRNA returned without a valid publication",
-            now=self._now(),
-        )
-
-    def _completed_task_observation(
-        self,
-        node_key: str,
-        task: Any,
-        envelope: object,
-    ) -> AvailabilityStatus:
-        if not isinstance(envelope, dict):
-            return AvailabilityStatus.MISSING
-        if node_key == DOWNLOAD_MODELS_NODE:
-            return (
-                AvailabilityStatus.AVAILABLE
-                if envelope.get("kind") == "none"
-                else AvailabilityStatus.MISSING
-            )
-        if node_key in {PREPARE_NODE, FINALIZE_NODE, PREPROCESS_NODE}:
-            try:
-                self._plan_from_envelope(envelope)
-            except (TypeError, ValueError, OSError):
-                return AvailabilityStatus.MISSING
-            if node_key == PREPARE_NODE:
-                return AvailabilityStatus.AVAILABLE
-        if node_key == INFERENCE_NODE and envelope.get("kind") != "bytes":
-            return AvailabilityStatus.MISSING
-        return self._task_observation(node_key, task)
-
-    def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.start_ready_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            task_plans=self._task_plans,
-            observe_task=lambda node_key, task: (
-                AvailabilityStatus.MISSING
-                if node_key in {DOWNLOAD_MODELS_NODE, PREPARE_NODE}
-                else self._task_observation(node_key, task)
-            ),
-            now=self._now(),
-        )
-
-    def _task_plans(self, node_key: str) -> tuple[TaskPlan, ...]:
-        if node_key == DOWNLOAD_MODELS_NODE:
-            return (TaskPlan("models", {"app_version": self.request.app_version}),)
-        if node_key == PREPARE_NODE:
-            return (
-                TaskPlan(
-                    "prepare",
-                    scientific_payload={
-                        "fasta_sha256": sha256(self.request.fasta_content).hexdigest()
-                    },
-                ),
-            )
-        if node_key == CHUNKS_NODE:
-            plan = self._plan_from_node(PREPARE_NODE)
-            return tuple(
-                TaskPlan(
-                    chunk.chunk_name,
-                    scientific_payload={
-                        "csv_sha256": sha256_file(Path(chunk.csv_path))
-                    },
-                    execution_payload={"chunk": asdict(chunk)},
-                )
-                for chunk in plan.chunks
-            )
-        if node_key == FINALIZE_NODE:
-            return (TaskPlan("finalize", {"cache_key": self.cache_key}),)
-        if node_key == PREPROCESS_NODE:
-            return (TaskPlan("preprocess", {"cache_key": self.cache_key}),)
-        if node_key == INFERENCE_NODE:
-            return (TaskPlan("inference", {"cache_key": self.cache_key}),)
-        raise ValueError(f"Unknown ENsiRNA Node {node_key!r}")
-
-    def _try_plan_from_node(self, node_key: str) -> EnsirnaPreparationPlan | None:
-        try:
-            return self._plan_from_node(node_key)
-        except (LookupError, TypeError, ValueError, OSError):
-            return None
-
-    def _plan_from_node(self, node_key: str) -> EnsirnaPreparationPlan:
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                node_key,
-            )
-        if call is not None:
-            return self._plan_from_envelope(call.result_envelope)
-        if node_key == PREPROCESS_NODE:
-            cached = _workload_module()._cached_preparation_plan(
-                cache_key=self.cache_key,
-                layout=self.layout,
-            )
-            if cached is not None:
-                return cached
-        raise LookupError(f"ENsiRNA {node_key} result is unavailable")
-
-    def _plan_from_envelope(self, envelope: object) -> EnsirnaPreparationPlan:
-        if not isinstance(envelope, dict) or envelope.get("kind") != "plan":
-            raise TypeError("ENsiRNA plan envelope is invalid")
-        value = envelope.get("plan")
-        if not isinstance(value, dict):
-            raise TypeError("ENsiRNA plan payload is invalid")
-        chunks = value.get("chunks")
-        cache_key = value.get("cache_key")
-        prepared_dir = value.get("prepared_dir")
-        json_path = value.get("json_path")
-        processed_dir = value.get("processed_dir")
-        candidate_count = value.get("candidate_count")
-        chunk_count = value.get("chunk_count")
-        cached = value.get("cached")
-        if (
-            not isinstance(cache_key, str)
-            or not isinstance(prepared_dir, str)
-            or not isinstance(json_path, str)
-            or not isinstance(processed_dir, str)
-            or type(candidate_count) is not int
-            or type(chunk_count) is not int
-            or not isinstance(cached, bool)
-            or not isinstance(chunks, list)
-        ):
-            raise TypeError("ENsiRNA plan payload has invalid fields")
-        parsed_chunks = []
-        for chunk in chunks:
-            if not isinstance(chunk, dict):
-                raise TypeError("ENsiRNA chunk payload is invalid")
-            chunk_name = chunk.get("chunk_name")
-            csv_path = chunk.get("csv_path")
-            chunk_json_path = chunk.get("json_path")
-            pdb_dir = chunk.get("pdb_dir")
-            if (
-                not isinstance(chunk_name, str)
-                or not isinstance(csv_path, str)
-                or not isinstance(chunk_json_path, str)
-                or not isinstance(pdb_dir, str)
-            ):
-                raise TypeError("ENsiRNA chunk payload is invalid")
-            parsed_chunks.append(
-                EnsirnaPdbChunkSpec(
-                    chunk_name=chunk_name,
-                    csv_path=csv_path,
-                    json_path=chunk_json_path,
-                    pdb_dir=pdb_dir,
-                )
-            )
-        if len(parsed_chunks) != chunk_count:
-            raise TypeError("ENsiRNA chunk payload is invalid")
-        plan = EnsirnaPreparationPlan(
-            cache_key=cache_key,
-            prepared_dir=prepared_dir,
-            json_path=json_path,
-            processed_dir=processed_dir,
-            candidate_count=candidate_count,
-            chunk_count=chunk_count,
-            chunks=parsed_chunks,
-            cached=cached,
-        )
-        _workload_module()._validate_preparation_plan(plan)
-        return plan
-
-    def _binding(self, node_key: str) -> ProviderBinding:
-        function_name = {
-            DOWNLOAD_MODELS_NODE: "download_ensirna_models",
-            PREPARE_NODE: "ensirna_prepare_inputs",
-            CHUNKS_NODE: "ensirna_prepare_pdb_chunk",
-            FINALIZE_NODE: "ensirna_finalize_prepared_inputs",
-            PREPROCESS_NODE: "ensirna_preprocess_dataset",
-            INFERENCE_NODE: "run_ensirna_inference",
-        }[node_key]
-        uses_gpu = node_key in {PREPROCESS_NODE, INFERENCE_NODE}
-        return ProviderBinding(
-            environment=self.deployment.environment,
-            app_name=self.deployment.deployment_name,
-            app_version=self.deployment.deployment_version,
-            function_name=function_name,
-            uses_gpu=uses_gpu,
-            runtime_image_key="ensirna-gpu" if uses_gpu else "ensirna-cpu",
-        )
-
-    def _invocation_kwargs(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> dict[str, object]:
-        if node_key == DOWNLOAD_MODELS_NODE:
-            return {"force": False}
-        if node_key == PREPARE_NODE:
-            return {
-                "mrna_fasta_bytes": self.request.fasta_content,
-                "max_prepare_jobs": self.request.prepare_workers,
-                "force_generation": self.request.force_generation,
-            }
-        if node_key == CHUNKS_NODE:
-            with self.store.synchronize():
-                task = self.store.execution.get_task(
-                    self.execution_run_id,
-                    CHUNKS_NODE,
-                    task_key,
-                )
-            return {
-                "chunk": EnsirnaPdbChunkSpec(**task.execution_payload["chunk"]),
-                "pdb_cores": self.request.pdb_cores,
-            }
-        if node_key == FINALIZE_NODE:
-            return {"plan": self._plan_from_node(PREPARE_NODE)}
-        if node_key == PREPROCESS_NODE:
-            return {
-                "plan": self._plan_from_node(FINALIZE_NODE),
-                "preprocess_shard_size": self.request.preprocess_shard_size,
-            }
-        if node_key == INFERENCE_NODE:
-            return {
-                "prepared_dir": self._plan_from_node(PREPROCESS_NODE).prepared_dir,
-                "force": False,
-            }
-        raise ValueError(f"Unknown ENsiRNA Node {node_key!r}")
-
-    def _ensure_publication_claim(self, node_key: str, _task_key: str) -> None:
-        if node_key == DOWNLOAD_MODELS_NODE:
-            return
-        publication = "result" if node_key == INFERENCE_NODE else "prepared"
-        if publication in self._claimed_publications:
-            return
+    def claim(self, publication: str) -> None:
+        """Claim one cache publication before provider admission."""
         acquire_output_claim(
             self.output_claims,
             claim_key=f"ensirna-{publication}:{self.cache_key}",
             owner=str(self.execution_run_id),
             replace_owner=self.request.replace_claim_owner,
         )
-        self._claimed_publications.add(publication)
+
+    @staticmethod
+    def plan_result(plan: EnsirnaPreparationPlan) -> AppRunResult:
+        """Publish one small preparation plan through execution storage."""
+        return inline_json_result(
+            name="preparation-plan",
+            value=asdict(plan),
+            filename="preparation-plan.json",
+        )
+
+    def cached_plan(self) -> EnsirnaPreparationPlan | None:
+        """Recover a complete preprocessed plan when present."""
+        return _workload_module()._cached_preparation_plan(
+            cache_key=self.cache_key,
+            layout=self.layout,
+        )
+
+    def result(self) -> AppRunResult | None:
+        """Reconstruct the exact inference result when present."""
+        app = _workload_module()
+        if not app._result_ready(self.layout, self.cache_key):
+            return None
+        path = self.layout.outputs_dir / f"{app.APP_INFO.input_stem}_result.xlsx"
+        marker = orjson.loads(app._result_marker_path(self.layout).read_bytes())
+        if not isinstance(marker, dict):
+            return None
+        file = ArtifactFile(
+            path=path.name,
+            size_bytes=marker.get("size"),
+            content_sha256=marker.get("sha256"),
+        )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="ensirna-result",
+                    kind=ArtifactKind.TABLE,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=path.relative_to(self.output_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [file.model_dump(mode="json", exclude_none=True)]
+                    },
+                )
+            ],
+        )
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Encode only bounded plans, digests, or diagnostics."""
-    if isinstance(result, EnsirnaPreparationPlan):
-        return {"kind": "plan", "plan": asdict(result)}
-    if isinstance(result, bytes):
-        return {
-            "kind": "bytes",
-            "size": len(result),
-            "sha256": sha256(result).hexdigest(),
-        }
-    if isinstance(result, dict):
-        return {"kind": "dict", "result": orjson.loads(orjson.dumps(result))}
-    if result is None:
-        return {"kind": "none"}
-    return {"kind": "invalid"}
+@dataclass
+class _EnsirnaDownloadNode(ProviderNode):
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        return ProviderCallSpec(
+            function_name="download_ensirna_models",
+            uses_gpu=False,
+            runtime_image_key="ensirna-cpu",
+            kwargs={"force": False},
+        )
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        if result is not None:
+            raise ValueError("ENsiRNA model download returned an unexpected value")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+@dataclass
+class _EnsirnaPrepareNode(ProviderNode):
+    request: EnsirnaExecutionRequest
+    publications: EnsirnaPublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        self.publications.claim("prepared")
+        return ProviderCallSpec(
+            function_name="ensirna_prepare_inputs",
+            uses_gpu=False,
+            runtime_image_key="ensirna-cpu",
+            kwargs={
+                "mrna_fasta_bytes": self.request.fasta_content,
+                "max_prepare_jobs": self.request.prepare_workers,
+                "force_generation": self.request.force_generation,
+            },
+        )
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        return self.publications.plan_result(_plan_from_value(result))
+
+
+@dataclass
+class _EnsirnaChunkNode(TaskProviderNode):
+    request: EnsirnaExecutionRequest
+    publications: EnsirnaPublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[TaskDefinition, ...]:
+        plan = _plan_from_context(context)
+        return tuple(
+            TaskDefinition(
+                task_key=chunk.chunk_name,
+                scientific_payload={"csv_sha256": sha256_file(Path(chunk.csv_path))},
+                execution_payload={"chunk": asdict(chunk)},
+            )
+            for chunk in plan.chunks
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
+        del context
+        self.publications.claim("prepared")
+        chunk = _chunk_from_task(task)
+        return ProviderCallSpec(
+            function_name="ensirna_prepare_pdb_chunk",
+            uses_gpu=False,
+            runtime_image_key="ensirna-cpu",
+            kwargs={"chunk": chunk, "pdb_cores": self.request.pdb_cores},
+            metadata={"chunk": asdict(chunk)},
+        )
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        if not isinstance(result, dict) or result.get("chunk_name") != task_key:
+            raise ValueError("ENsiRNA chunk worker returned invalid metadata")
+        if not _workload_module()._chunk_artifacts_valid(
+            _chunk_from_value(metadata.get("chunk"))
+        ):
+            raise FileNotFoundError("ENsiRNA chunk publication is unavailable")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        return (
+            AppRunResult(status=AppRunStatus.SUCCEEDED)
+            if _workload_module()._chunk_artifacts_valid(_chunk_from_task(task))
+            else None
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del result, artifacts
+        try:
+            available = (
+                self.recover_remote_task_result(context, task, expected_fingerprint)
+                is not None
+            )
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del results
+        if errors:
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[
+                    "; ".join(f"{key}: {value}" for key, value in errors.items())
+                ],
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[republish_execution_artifact(context.single_input("plan"))],
+        )
+
+
+@dataclass
+class _EnsirnaPlanNode(ProviderNode):
+    stage: str
+    request: EnsirnaExecutionRequest
+    publications: EnsirnaPublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        plan = _plan_from_context(context)
+        self.publications.claim("prepared")
+        if self.stage == "finalize":
+            return ProviderCallSpec(
+                function_name="ensirna_finalize_prepared_inputs",
+                uses_gpu=False,
+                runtime_image_key="ensirna-cpu",
+                kwargs={"plan": plan},
+            )
+        if self.stage == "preprocess":
+            return ProviderCallSpec(
+                function_name="ensirna_preprocess_dataset",
+                uses_gpu=True,
+                runtime_image_key="ensirna-gpu",
+                kwargs={
+                    "plan": plan,
+                    "preprocess_shard_size": self.request.preprocess_shard_size,
+                },
+            )
+        raise ValueError(f"Unknown ENsiRNA plan stage {self.stage!r}")
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        plan = _plan_from_value(result)
+        app = _workload_module()
+        available = (
+            len(app._json_records(Path(plan.json_path))) == plan.candidate_count
+            if self.stage == "finalize"
+            else app._is_prepared(self.publications.layout)
+        )
+        if not available:
+            raise FileNotFoundError(f"ENsiRNA {self.stage} publication is unavailable")
+        return self.publications.plan_result(plan)
+
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        del context
+        if self.stage != "preprocess":
+            return None
+        plan = self.publications.cached_plan()
+        return None if plan is None else self.publications.plan_result(plan)
+
+
+@dataclass
+class _EnsirnaInferenceNode(ProviderNode):
+    publications: EnsirnaPublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        self.publications.claim("result")
+        return ProviderCallSpec(
+            function_name="run_ensirna_inference",
+            uses_gpu=True,
+            runtime_image_key="ensirna-gpu",
+            kwargs={
+                "prepared_dir": _plan_from_context(context).prepared_dir,
+                "force": False,
+            },
+        )
+
+    def process_remote_result(
+        self,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        if not isinstance(result, bytes):
+            raise ValueError("ENsiRNA inference returned invalid result bytes")
+        publication = self.publications.result()
+        if publication is None:
+            raise FileNotFoundError("ENsiRNA result publication is unavailable")
+        return publication
+
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        del context
+        return self.publications.result()
+
+    def observe_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, result, artifacts
+        try:
+            available = self.publications.result() is not None
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
+
+
+def _chunk_from_value(value: object) -> EnsirnaPdbChunkSpec:
+    if not isinstance(value, Mapping):
+        raise TypeError("ENsiRNA chunk payload is invalid")
+    value = cast(Mapping[str, object], value)
+    fields = {
+        name: value.get(name)
+        for name in ("chunk_name", "csv_path", "json_path", "pdb_dir")
+    }
+    if not all(isinstance(field, str) for field in fields.values()):
+        raise TypeError("ENsiRNA chunk payload is invalid")
+    return EnsirnaPdbChunkSpec(
+        chunk_name=cast(str, fields["chunk_name"]),
+        csv_path=cast(str, fields["csv_path"]),
+        json_path=cast(str, fields["json_path"]),
+        pdb_dir=cast(str, fields["pdb_dir"]),
+    )
+
+
+def _chunk_from_task(task: TaskDefinition) -> EnsirnaPdbChunkSpec:
+    if not isinstance(task.execution_payload, Mapping):
+        raise TypeError("ENsiRNA Task payload is invalid")
+    return _chunk_from_value(task.execution_payload.get("chunk"))
+
+
+def _plan_from_value(value: object) -> EnsirnaPreparationPlan:
+    if not isinstance(value, Mapping):
+        raise TypeError("ENsiRNA plan payload is invalid")
+    value = cast(Mapping[str, object], value)
+    chunks = value.get("chunks")
+    cache_key = value.get("cache_key")
+    prepared_dir = value.get("prepared_dir")
+    json_path = value.get("json_path")
+    processed_dir = value.get("processed_dir")
+    candidate_count = value.get("candidate_count")
+    chunk_count = value.get("chunk_count")
+    cached = value.get("cached")
+    if (
+        not isinstance(cache_key, str)
+        or not isinstance(prepared_dir, str)
+        or not isinstance(json_path, str)
+        or not isinstance(processed_dir, str)
+        or type(candidate_count) is not int
+        or type(chunk_count) is not int
+        or not isinstance(cached, bool)
+        or not isinstance(chunks, list)
+    ):
+        raise TypeError("ENsiRNA plan payload has invalid fields")
+    parsed_chunks = [_chunk_from_value(chunk) for chunk in chunks]
+    if len(parsed_chunks) != chunk_count:
+        raise TypeError("ENsiRNA chunk payload is invalid")
+    plan = EnsirnaPreparationPlan(
+        cache_key=cache_key,
+        prepared_dir=prepared_dir,
+        json_path=json_path,
+        processed_dir=processed_dir,
+        candidate_count=candidate_count,
+        chunk_count=chunk_count,
+        chunks=parsed_chunks,
+        cached=cached,
+    )
+    _workload_module()._validate_preparation_plan(plan)
+    return plan
+
+
+def _plan_from_context(context: NodeRunContext) -> EnsirnaPreparationPlan:
+    return _plan_from_value(orjson.loads(context.read_input_bytes("plan")))
 
 
 def _workload_module():
@@ -594,7 +669,50 @@ def _workload_module():
     return ensirna_app
 
 
-class EnsirnaExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
+def ensirna_execution_graph(
+    request: EnsirnaExecutionRequest,
+    publications: EnsirnaPublications,
+) -> ExecutionGraph:
+    """Build ENsiRNA's established preparation and inference pipeline."""
+    graph = ExecutionGraph(
+        "ensirna",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="ensirna",
+            scientific_payload=request.execution_plan.scientific_payload,
+            scientific_versions=dict(request.execution_plan.scientific_versions),
+        ),
+    )
+    download = graph.add_node(_EnsirnaDownloadNode(), id=DOWNLOAD_MODELS_NODE)
+    prepare = graph.add_node(
+        _EnsirnaPrepareNode(request, publications),
+        id=PREPARE_NODE,
+    )
+    chunks = graph.add_node(
+        _EnsirnaChunkNode(request, publications),
+        id=CHUNKS_NODE,
+        inputs={"plan": prepare.outputs(kind=ArtifactKind.TABLE)},
+        allow_empty_result=True,
+    )
+    finalize = graph.add_node(
+        _EnsirnaPlanNode("finalize", request, publications),
+        id=FINALIZE_NODE,
+        inputs={"plan": chunks.outputs(kind=ArtifactKind.TABLE)},
+    )
+    preprocess = graph.add_node(
+        _EnsirnaPlanNode("preprocess", request, publications),
+        id=PREPROCESS_NODE,
+        inputs={"plan": finalize.outputs(kind=ArtifactKind.TABLE)},
+        depends_on=[download],
+    )
+    graph.add_node(
+        _EnsirnaInferenceNode(publications),
+        id=INFERENCE_NODE,
+        inputs={"plan": preprocess.outputs(kind=ArtifactKind.TABLE)},
+    )
+    return graph
+
+
+class EnsirnaExecutionCoordinator(OutputClaimExecutionDefinitionCoordinatorLifecycle):
     """Bind one run-scoped writer to ENsiRNA publications."""
 
     _request_loader = staticmethod(load_execution_request)
@@ -607,6 +725,7 @@ class EnsirnaExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
+        output_volume_name: str,
         output_claims: Any,
         provider_driver: Any,
         app_version: str,
@@ -617,27 +736,30 @@ class EnsirnaExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            output_claims=output_claims,
+            provider_driver=provider_driver,
+            graph_builder=self._graph,
             target_scientific_versions={"ensirna": app_version},
+            poll_interval_seconds=poll_interval_seconds,
         )
-        self.output_volume = output_volume
+        self.output_volume_name = output_volume_name
         self.output_claims = output_claims
-        self.provider_driver = provider_driver
-        self.poll_interval_seconds = poll_interval_seconds
 
-    def _create_runtime(
+    def _graph(
         self,
         request: EnsirnaExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> EnsirnaExecutionRuntime:
-        return EnsirnaExecutionRuntime(
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        del predecessor_execution_run_id
+        return ensirna_execution_graph(
             request=request,
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            output_claims=self.output_claims,
-            poll_interval_seconds=self.poll_interval_seconds,
+            publications=EnsirnaPublications(
+                request=request,
+                execution_run_id=self.execution_run_id,
+                output_root=self.volume_root,
+                output_volume_name=self.output_volume_name,
+                output_claims=self.output_claims,
+            ),
         )

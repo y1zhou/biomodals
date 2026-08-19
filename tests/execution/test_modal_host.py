@@ -184,6 +184,7 @@ def test_load_execution_provider_result_verifies_bounded_content(
     envelope = {
         "result_file": {
             "path": relative,
+            "encoding": "json",
             "size_bytes": len(content),
             "sha256": sha256(content).hexdigest(),
         }
@@ -201,6 +202,32 @@ def test_load_execution_provider_result_verifies_bounded_content(
             execution_run_id=RUN_ID,
             envelope=envelope,
         )
+
+
+def test_load_execution_provider_result_preserves_bytes(tmp_path: Path) -> None:
+    """Binary provider returns stay binary across the Volume boundary."""
+    content = b"binary-provider-result"
+    relative = "provider-results/example.bin"
+    path = tmp_path / "workflow-runs" / str(RUN_ID) / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    envelope = {
+        "result_file": {
+            "path": relative,
+            "encoding": "bytes",
+            "size_bytes": len(content),
+            "sha256": sha256(content).hexdigest(),
+        }
+    }
+
+    assert (
+        load_execution_provider_result(
+            FakeVolume(tmp_path),
+            execution_run_id=RUN_ID,
+            envelope=envelope,
+        )
+        == content
+    )
 
 
 def test_execution_lineage_root_follows_all_successors(tmp_path: Path) -> None:

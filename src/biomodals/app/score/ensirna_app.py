@@ -1937,6 +1937,7 @@ class ExecutionCoordinator:
                 deployment=deployment,
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
+                output_volume_name=CONF.output_volume_name,
                 output_claims=ENSIRNA_OUTPUT_CLAIMS,
                 provider_driver=_coordinator_modal_driver(development=selected_mode),
                 app_version=CONF.repo_commit_hash or CONF.version or "unknown",

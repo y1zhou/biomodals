@@ -146,6 +146,7 @@ class _PreparedProviderResult:
     """A serialized provider return awaiting coordinator-owned publication."""
 
     temporary_file: BinaryIO
+    encoding: str
     sha256: str
     size_bytes: int
 
@@ -2435,7 +2436,12 @@ class ExecutionGraphRuntime:
         """Serialize a provider return without touching the shared Volume."""
         if isinstance(result, BaseModel):
             result = result.model_dump(mode="json")
-        content = orjson.dumps(result)
+        if isinstance(result, bytes):
+            content = result
+            encoding = "bytes"
+        else:
+            content = orjson.dumps(result)
+            encoding = "json"
         digest = hashlib.sha256(content).hexdigest()
         temporary_file = tempfile.TemporaryFile()
         try:
@@ -2446,6 +2452,7 @@ class ExecutionGraphRuntime:
             raise
         return _PreparedProviderResult(
             temporary_file=temporary_file,
+            encoding=encoding,
             sha256=digest,
             size_bytes=len(content),
         )
@@ -2456,7 +2463,8 @@ class ExecutionGraphRuntime:
     ) -> dict[str, object]:
         """Publish a prepared return within the coordinator writer boundary."""
         digest = prepared.sha256
-        relative_path = Path("provider-results") / f"{digest}.json"
+        suffix = ".bin" if prepared.encoding == "bytes" else ".json"
+        relative_path = Path("provider-results") / f"{digest}{suffix}"
         result_path = self.store.output_root / relative_path
         result_path.parent.mkdir(parents=True, exist_ok=True)
         volume_temporary = tempfile.NamedTemporaryFile(
@@ -2475,6 +2483,7 @@ class ExecutionGraphRuntime:
         return {
             "result_file": {
                 "path": relative_path.as_posix(),
+                "encoding": prepared.encoding,
                 "sha256": digest,
                 "size_bytes": prepared.size_bytes,
             }
@@ -2497,10 +2506,12 @@ class ExecutionGraphRuntime:
         relative_value = reference_mapping.get("path")
         expected_digest = reference_mapping.get("sha256")
         expected_size = reference_mapping.get("size_bytes")
+        encoding = reference_mapping.get("encoding")
         if (
             not isinstance(relative_value, str)
             or not isinstance(expected_digest, str)
             or not isinstance(expected_size, int)
+            or encoding not in {"bytes", "json"}
         ):
             raise ValueError("Execution Result Envelope reference is invalid")
         relative_path = Path(relative_value)
@@ -2516,7 +2527,7 @@ class ExecutionGraphRuntime:
             raise ValueError("Provider result size does not match")
         if hashlib.sha256(content).hexdigest() != expected_digest:
             raise ValueError("Provider result checksum does not match")
-        return orjson.loads(content)
+        return content if encoding == "bytes" else orjson.loads(content)
 
     def _node_context(
         self,

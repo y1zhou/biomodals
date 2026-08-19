@@ -2,11 +2,13 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+import orjson
 import pytest
 
 from biomodals.app.score import ensirna_app
@@ -17,20 +19,24 @@ from biomodals.app.score.ensirna_execution import (
     INFERENCE_NODE,
     PREPARE_NODE,
     PREPROCESS_NODE,
+    EnsirnaExecutionCoordinator,
     EnsirnaExecutionRequest,
-    EnsirnaExecutionRuntime,
     EnsirnaPdbChunkSpec,
     EnsirnaPreparationPlan,
+    EnsirnaPublications,
+    ensirna_execution_graph,
+    persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "ENsiRNA", 7)
+OUTPUT_VOLUME_NAME = "ENsiRNA-outputs"
 
 
 class FakeVolume:
@@ -126,10 +132,40 @@ class CompletingDriver:
         result = prepared_dir / "outputs" / "mrna_result.xlsx"
         result.parent.mkdir(parents=True, exist_ok=True)
         result.write_bytes(b"xlsx")
+        marker = prepared_dir / ".markers" / "inference.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(
+            orjson.dumps({
+                "size": result.stat().st_size,
+                "sha256": sha256(b"xlsx").hexdigest(),
+            })
+        )
         return b"xlsx"
 
 
-def test_ensirna_request_round_trip_preserves_the_staged_dag() -> None:
+def _coordinator(
+    tmp_path: Path,
+    request: EnsirnaExecutionRequest,
+    driver: CompletingDriver,
+    claims: FakeClaims,
+) -> EnsirnaExecutionCoordinator:
+    persist_execution_request(tmp_path, RUN_ID, request)
+    return EnsirnaExecutionCoordinator(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        output_claims=claims,
+        provider_driver=driver,
+        app_version=request.app_version,
+        poll_interval_seconds=0,
+    )
+
+
+def test_ensirna_request_round_trip_preserves_the_staged_dag(
+    tmp_path: Path,
+) -> None:
     request = EnsirnaExecutionRequest(
         run_name="design",
         fasta_content=b">target\nACGUACGUACGUACGUACG\n",
@@ -152,6 +188,20 @@ def test_ensirna_request_round_trip_preserves_the_staged_dag() -> None:
         INFERENCE_NODE,
     )
     assert decoded.execution_plan.terminal_node_keys == (INFERENCE_NODE,)
+    graph = ensirna_execution_graph(
+        request,
+        EnsirnaPublications(
+            request=request,
+            execution_run_id=RUN_ID,
+            output_root=tmp_path,
+            output_volume_name=OUTPUT_VOLUME_NAME,
+            output_claims=FakeClaims(),
+        ),
+    )
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == decoded.execution_plan
+    )
 
 
 def test_ensirna_concurrency_and_sharding_are_operational() -> None:
@@ -254,21 +304,11 @@ def test_runtime_dispatches_the_staged_graph(
     )
     driver = CompletingDriver(request)
     claims = FakeClaims()
-    runtime = EnsirnaExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=volume,
-        output_claims=claims,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, claims)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
-    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert snapshot.run.status == RunStatus.SUCCEEDED, snapshot
     assert [name for name, _kwargs in driver.spawns] == [
         "ensirna_prepare_inputs",
         "download_ensirna_models",
@@ -278,4 +318,4 @@ def test_runtime_dispatches_the_staged_graph(
         "run_ensirna_inference",
     ]
     assert set(claims.values.values()) == {str(RUN_ID)}
-    runtime.close()
+    coordinator.close()

@@ -69,6 +69,12 @@ Each portable operation has three layers:
 3. provider-owned packaging that declares the image, resources, mounts,
    environment, Secrets, and durable call handle.
 
+This does not require turning an app into a library of mathematically pure
+functions or moving its scientific code into the execution kernel. Only the
+provider-executed operation boundary must be provider-independent. The
+operation remains app-owned; Modal and local composition roots adapt that same
+operation to their respective provider call and container contracts.
+
 The first layer is provider-independent, not mathematically pure. It may read
 and write files, invoke subprocesses, use GPUs exposed inside its container,
 and update workload-owned publications. Its inputs make filesystem roots,

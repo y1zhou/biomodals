@@ -1705,20 +1705,24 @@ class ExecutionGraphRuntime:
         if not isinstance(implementation, ResultNode):
             raise TypeError("One-result publication requires a Result Node")
         context = self._node_context(definition, node_id)
-        materialized = materialize_app_run_result(
-            result=result,
-            artifact_volume_name=self.artifact_volume_name,
-            result_dir=context.work_dir,
-            artifact_dir=self.store.output_root / "artifacts",
-            producing_node_id=node_id,
-            volume_root=self.volume_root,
-        )
-        observation = self._commit_result_publication(
-            implementation,
-            context,
-            materialized.result,
-            tuple(materialized.artifacts),
-        )
+        try:
+            materialized = materialize_app_run_result(
+                result=result,
+                artifact_volume_name=self.artifact_volume_name,
+                result_dir=context.work_dir,
+                artifact_dir=self.store.output_root / "artifacts",
+                producing_node_id=node_id,
+                volume_root=self.volume_root,
+            )
+            observation = self._commit_result_publication(
+                implementation,
+                context,
+                materialized.result,
+                tuple(materialized.artifacts),
+            )
+        except (FileNotFoundError, ValueError) as error:
+            self._fail_task(node_id, f"Could not publish Execution Node: {error}")
+            return
         with self.store.transaction():
             if self.store.execution.get_task(
                 self.execution_run_id,
@@ -2475,14 +2479,16 @@ class ExecutionGraphRuntime:
 
     def _raw_result(self, envelope: object) -> object:
         """Load and verify one execution-owned provider return."""
-        if not isinstance(envelope, dict):
+        if not isinstance(envelope, Mapping):
             raise ValueError("Execution Result Envelope must be an object")
-        reference = envelope.get("result_file")
+        envelope_mapping = cast(Mapping[str, object], envelope)
+        reference = envelope_mapping.get("result_file")
         if not isinstance(reference, dict):
             raise ValueError("Execution Result Envelope has no result file")
-        relative_value = reference.get("path")
-        expected_digest = reference.get("sha256")
-        expected_size = reference.get("size_bytes")
+        reference_mapping = cast(Mapping[str, object], reference)
+        relative_value = reference_mapping.get("path")
+        expected_digest = reference_mapping.get("sha256")
+        expected_size = reference_mapping.get("size_bytes")
         if (
             not isinstance(relative_value, str)
             or not isinstance(expected_digest, str)
@@ -2596,14 +2602,17 @@ def _execution_payload(invocation: ProviderCallSpec | None) -> dict[str, object]
 
 
 def _remote_metadata(payload: object) -> dict[str, Any]:
-    if not isinstance(payload, dict) or payload.get("mode") != "remote":
+    if not isinstance(payload, Mapping):
         raise ValueError("Task does not contain remote execution metadata")
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
+    payload_mapping = cast(Mapping[str, object], payload)
+    if payload_mapping.get("mode") != "remote":
+        raise ValueError("Task does not contain remote execution metadata")
+    metadata = payload_mapping.get("metadata")
+    if not isinstance(metadata, Mapping):
         raise ValueError("Remote Task metadata must be an object")
     if not all(isinstance(key, str) for key in metadata):
         raise ValueError("Remote Task metadata keys must be strings")
-    return cast(dict[str, Any], metadata)
+    return dict(cast(Mapping[str, Any], metadata))
 
 
 def _json_value(value: object) -> Any:

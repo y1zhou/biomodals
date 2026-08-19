@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from stat import S_ISREG
 from typing import Any
 from uuid import UUID
 
@@ -22,35 +20,40 @@ from biomodals.app.bioinfo.gromacs_execution import (
     PRODUCTION_ANALYSIS,
     execution_plan,
     modal_invocation,
-    operation_provider_binding,
-    operation_task_plan,
+    operation_target,
     preparation_execution_paths,
 )
 from biomodals.execution import (
     AvailabilityStatus,
+    ContentBoundFileSet,
     DeploymentIdentity,
-    ExecutionNodeRecord,
-    ExecutionTaskRecord,
-    NodeStatus,
-    ProviderCallStatus,
-    TaskStatus,
+    ExecutionArtifact,
+    ExecutionGraph,
+    ExecutionPlanMetadata,
 )
 from biomodals.execution.modal import (
-    ExecutionCoordinatorLifecycle,
+    ExecutionDefinitionCoordinatorLifecycle,
     ExecutionRequestFile,
-    StandardExecutionRuntimeLifecycle,
 )
-from biomodals.execution.scheduler import NodeAdmissionRank, TaskDispatchDescriptor
-from biomodals.execution.store import ExecutionRunStore
-from biomodals.helper.artifacts import (
-    file_matches_sha256,
-    replace_bytes_atomic,
-    sha256_file,
+from biomodals.execution.nodes import (
+    CoordinatorNode,
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
 )
+from biomodals.helper.artifacts import replace_bytes_atomic
 from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.output_claim import (
     acquire_output_claim,
     register_output_claim_successor,
+)
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    VolumePath,
 )
 
 REQUEST_SCHEMA_VERSION = 2
@@ -60,10 +63,10 @@ _REQUEST_FILE = ExecutionRequestFile(
     MAX_REQUEST_BYTES,
     "GROMACS execution request",
 )
-_PUBLICATION_SCHEMA_VERSION = 1
 _RUN_IDENTITY_SCHEMA_VERSION = 2
 _RUN_IDENTITY_FILE = "run.json"
 _OUTPUT_CLAIMS_NAME = "Gromacs-output-claims"
+_OUTPUT_VOLUME_NAME = "Gromacs-outputs"
 
 
 @dataclass(frozen=True)
@@ -197,68 +200,31 @@ def load_execution_request(
     )
 
 
-class GromacsExecutionRuntime(StandardExecutionRuntimeLifecycle):
-    """Drive one direct GROMACS request through fixed one-Task calls."""
+class GromacsPublications:
+    """Own GROMACS run-name claims and scientific publication markers."""
 
     def __init__(
         self,
         *,
         request: GromacsExecutionRequest,
         execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
-        output_claims: Any,
+        predecessor_execution_run_id: UUID | None,
         output_root: str | Path,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
+        output_claims: Any,
+        output_volume_name: str,
     ) -> None:
-        """Bind the kernel writer to the established output directory."""
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-        )
-        self.output_claims = output_claims
+        """Bind one request to its established output directory and owner."""
+        self.request = request
+        self.execution_run_id = execution_run_id
+        self.predecessor_execution_run_id = predecessor_execution_run_id
         self.output_root = Path(output_root)
-        self._run_identity_verified = False
-        self._verified_available_nodes: set[str] = set()
+        self.output_claims = output_claims
+        self.output_volume_name = output_volume_name
 
-    def _after_start_ready_nodes(self) -> None:
-        self._complete_local_result()
-
-    def _recover_publications(self) -> None:
-        if not self._run_identity_verified:
-            if self._ensure_run_identity():
-                self._checkpoint()
-            self._run_identity_verified = True
-        self._provider.recover_publications(
-            self.execution_run_id,
-            observe_node=self._node_observation,
-            observe_task=lambda node_key, _task: self._node_observation(node_key),
-            now=self._now(),
-        )
-
-    def _run_identity_path(self) -> Path:
-        return (
-            self.request.run_root(self.output_root)
-            / ".biomodals"
-            / "gromacs"
-            / _RUN_IDENTITY_FILE
-        )
-
-    def _ensure_run_identity(self) -> bool:
+    def ensure_run_identity(self) -> bool:
         """Bind the app-owned directory to exactly one scientific plan."""
         root = self.request.run_root(self.output_root)
-        marker = self._run_identity_path()
+        marker = self.run_identity_path()
         scientific_identity = {
             "schema_version": _RUN_IDENTITY_SCHEMA_VERSION,
             "workload_plan_fingerprint": (
@@ -295,13 +261,10 @@ class GromacsExecutionRuntime(StandardExecutionRuntimeLifecycle):
                 raise ValueError(
                     f"GROMACS run identity has an invalid owner: {marker}"
                 ) from error
-            terminal_node_keys = self.request.execution_plan.terminal_node_keys
             publication_complete = all(
-                self._node_publication_ready(node_key)
-                for node_key in terminal_node_keys
+                self._read_node_publication(node_key) is not None
+                for node_key in self.request.execution_plan.terminal_node_keys
             )
-            if publication_complete:
-                self._verified_available_nodes.update(terminal_node_keys)
         if root.exists():
             if not root.is_dir():
                 raise ValueError(f"GROMACS run path is not a directory: {root}")
@@ -339,119 +302,102 @@ class GromacsExecutionRuntime(StandardExecutionRuntimeLifecycle):
         )
         return True
 
-    def _node_observation(self, node_key: str) -> AvailabilityStatus:
-        if node_key in self._verified_available_nodes:
-            self._verified_available_nodes.remove(node_key)
-            return AvailabilityStatus.AVAILABLE
-        try:
-            available = self._node_publication_ready(node_key)
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        if available:
-            return AvailabilityStatus.AVAILABLE
-        if (
-            node_key != PREPARE_RESULT
-            and self._node_publication_path(node_key).is_file()
-        ):
-            self._invalidate_node_publication(node_key)
-        return AvailabilityStatus.MISSING
+    def run_identity_path(self) -> Path:
+        """Return the immutable run-name identity marker path."""
+        return (
+            self.request.run_root(self.output_root)
+            / ".biomodals"
+            / "gromacs"
+            / _RUN_IDENTITY_FILE
+        )
 
-    def _invalidate_node_publication(self, node_key: str) -> None:
-        """Remove a digest-invalid publication before authorizing repair."""
-        for path in self._node_paths(node_key):
-            path.unlink(missing_ok=True)
-        self._node_publication_path(node_key).unlink(missing_ok=True)
-
-    def _node_publication_path(self, node_key: str) -> Path:
+    def publication_path(self, node_key: str) -> Path:
+        """Return one operation's content-bound publication marker path."""
         marker = sha256(node_key.encode()).hexdigest() + ".json"
         return (
             self.request.run_root(self.output_root) / ".biomodals" / "gromacs" / marker
         )
 
-    def _node_publication_ready(self, node_key: str) -> bool:
-        marker_path = self._node_publication_path(node_key)
+    def recover_result(self, node_key: str) -> AppRunResult | None:
+        """Return a content-bound result only for a valid existing marker."""
         try:
-            marker = orjson.loads(marker_path.read_bytes())
-        except (
-            FileNotFoundError,
-            IsADirectoryError,
-            NotADirectoryError,
-            orjson.JSONDecodeError,
-        ):
-            return False
-        if not (
-            isinstance(marker, dict)
-            and marker.get("schema_version") == _PUBLICATION_SCHEMA_VERSION
-            and marker.get("node_key") == node_key
-            and marker.get("workload_plan_fingerprint")
-            == self.request.execution_plan.workload_plan_fingerprint
-        ):
-            return False
-        raw_artifacts = marker.get("artifacts")
-        if not isinstance(raw_artifacts, list):
-            return False
-        root = self.request.run_root(self.output_root)
-        expected = {
-            path.relative_to(root).as_posix() for path in self._node_paths(node_key)
-        }
-        if {
-            artifact.get("path")
-            for artifact in raw_artifacts
-            if isinstance(artifact, dict)
-        } != expected:
-            return False
-        for artifact in raw_artifacts:
-            if not isinstance(artifact, dict):
-                return False
-            relative_text = artifact.get("path")
-            if not isinstance(relative_text, str):
-                return False
-            relative = PurePosixPath(relative_text)
-            if relative.is_absolute() or ".." in relative.parts:
-                return False
-            if not file_matches_sha256(
-                root.joinpath(*relative.parts),
-                artifact.get("size"),
-                artifact.get("sha256"),
-            ):
-                return False
-        return True
+            files = self._read_node_publication(node_key)
+        except OSError:
+            raise
+        if files is None:
+            if node_key != PREPARE_RESULT and self.publication_path(node_key).is_file():
+                self.invalidate(node_key)
+            return None
+        return self.result(node_key, files=files)
 
-    def _write_node_publication(self, node_key: str) -> bool:
-        root = self.request.run_root(self.output_root)
-        artifacts = []
+    def commit(
+        self,
+        node_key: str,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        """Write the workload marker from kernel-validated exact manifests."""
+        files = tuple(file for artifact in artifacts for file in artifact.files)
         try:
-            for path in self._node_paths(node_key):
-                if path.is_symlink():
-                    return False
-                stat = path.stat()
-                if not S_ISREG(stat.st_mode) or stat.st_size < 1:
-                    return False
-                artifacts.append({
-                    "path": path.relative_to(root).as_posix(),
-                    "size": stat.st_size,
-                    "sha256": sha256_file(path),
-                })
-        except (FileNotFoundError, NotADirectoryError):
-            return False
-        marker = self._node_publication_path(node_key)
-        replace_bytes_atomic(
-            marker,
-            orjson.dumps(
-                {
-                    "schema_version": _PUBLICATION_SCHEMA_VERSION,
-                    "node_key": node_key,
-                    "workload_plan_fingerprint": (
-                        self.request.execution_plan.workload_plan_fingerprint
-                    ),
-                    "artifacts": artifacts,
-                },
-                option=orjson.OPT_SORT_KEYS,
-            ),
+            self._file_set(node_key).write(files)
+        except ValueError:
+            return AvailabilityStatus.MISSING
+        return self.observe(node_key)
+
+    def observe(self, node_key: str) -> AvailabilityStatus:
+        """Validate both the workload marker and its exact file contents."""
+        try:
+            available = self._read_node_publication(node_key) is not None
+        except OSError:
+            return AvailabilityStatus.UNKNOWN
+        if available:
+            return AvailabilityStatus.AVAILABLE
+        if node_key != PREPARE_RESULT and self.publication_path(node_key).is_file():
+            self.invalidate(node_key)
+        return AvailabilityStatus.MISSING
+
+    def result(
+        self,
+        node_key: str,
+        *,
+        files: tuple[ArtifactFile, ...] | None = None,
+    ) -> AppRunResult:
+        """Describe one established output directory without copying it."""
+        declared = files or tuple(
+            ArtifactFile(
+                path=path.relative_to(
+                    self.request.run_root(self.output_root)
+                ).as_posix()
+            )
+            for path in self.node_paths(node_key)
         )
-        return True
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="outputs",
+                    kind=ArtifactKind.DIRECTORY,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=self.request.run_name,
+                    ),
+                    metadata={
+                        "files": [
+                            file.model_dump(mode="json", exclude_none=True)
+                            for file in declared
+                        ]
+                    },
+                )
+            ],
+        )
 
-    def _node_paths(self, node_key: str) -> tuple[Path, ...]:
+    def invalidate(self, node_key: str) -> None:
+        """Remove digest-invalid outputs before authorizing repair."""
+        for path in self.node_paths(node_key):
+            path.unlink(missing_ok=True)
+        self.publication_path(node_key).unlink(missing_ok=True)
+
+    def node_paths(self, node_key: str) -> tuple[Path, ...]:
+        """Return the exact scientific files published by one operation."""
         root = self.request.run_root(self.output_root)
         name = self.request.run_name
         prepare = tuple(root / path for path in preparation_execution_paths(name))
@@ -490,173 +436,165 @@ class GromacsExecutionRuntime(StandardExecutionRuntimeLifecycle):
             )
         raise ValueError(f"Unknown GROMACS Node {node_key!r}")
 
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            now=self._now(),
-        )
-        if any(
-            not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-            for original, updated in reconciled
-        ):
-            self._reload_output()
-
-    def _decode_completed_calls(self) -> None:
-        self._provider.decode_completed_calls(
-            self.execution_run_id,
-            observe_task=self._completed_task_observation,
-            missing_message="GROMACS returned without a valid publication",
-            now=self._now(),
-        )
-
-    def _completed_task_observation(
+    def _read_node_publication(
         self,
         node_key: str,
-        _task: Any,
-        envelope: object,
+    ) -> tuple[ArtifactFile, ...] | None:
+        return self._file_set(node_key).load()
+
+    def _file_set(self, node_key: str) -> ContentBoundFileSet:
+        root = self.request.run_root(self.output_root)
+        return ContentBoundFileSet(
+            root=root,
+            marker_path=self.publication_path(node_key),
+            expected_paths=tuple(
+                path.relative_to(root).as_posix() for path in self.node_paths(node_key)
+            ),
+            identity={
+                "node_key": node_key,
+                "workload_plan_fingerprint": (
+                    self.request.execution_plan.workload_plan_fingerprint
+                ),
+            },
+        )
+
+
+class _GromacsPublicationHooks:
+    operation: str
+    publications: GromacsPublications
+
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        del context
+        return self.publications.recover_result(self.operation)
+
+    def commit_result_publication(
+        self,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
     ) -> AvailabilityStatus:
-        remote_workdir = (
-            envelope.get("remote_workdir") if isinstance(envelope, dict) else None
-        )
-        valid = (
-            isinstance(remote_workdir, str)
-            and bool(remote_workdir)
-            and self._write_node_publication(node_key)
-        )
-        return self._node_observation(node_key) if valid else AvailabilityStatus.MISSING
+        del context, result
+        return self.publications.commit(self.operation, artifacts)
 
-    def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.start_ready_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            task_plans=lambda node_key: (operation_task_plan(node_key),),
-            observe_task=lambda node_key, _task: self._node_observation(node_key),
-            now=self._now(),
-        )
-
-    def _complete_local_result(self) -> bool:
-        with self.store.synchronize():
-            repository = self.store.execution
-            node = repository.get_node(self.execution_run_id, PREPARE_RESULT)
-            if node.status != NodeStatus.RUNNING:
-                return False
-            task = repository.get_task(
-                self.execution_run_id,
-                PREPARE_RESULT,
-                "operation",
-            )
-        if task.status != TaskStatus.PENDING:
-            return False
-        with self.store.synchronize():
-            with self.store.transaction():
-                acquired = self.store.execution.acquire_local_task(
-                    self.execution_run_id,
-                    PREPARE_RESULT,
-                    "operation",
-                    now=self._now(),
-                )
-            if acquired:
-                self._checkpoint()
-        if not acquired:
-            return False
-        self._write_node_publication(PREPARE_RESULT)
-        observation = self._node_observation(PREPARE_RESULT)
-        with self.store.transaction():
-            repository = self.store.execution
-            if repository.get_task(
-                self.execution_run_id,
-                PREPARE_RESULT,
-                "operation",
-            ).status.is_terminal:
-                return True
-            if observation == AvailabilityStatus.MISSING:
-                repository.fail_task(
-                    self.execution_run_id,
-                    PREPARE_RESULT,
-                    "operation",
-                    message="GROMACS final outputs are incomplete",
-                    now=self._now(),
-                )
-            else:
-                repository.record_task_result_observation(
-                    self.execution_run_id,
-                    PREPARE_RESULT,
-                    "operation",
-                    observation,
-                    now=self._now(),
-                )
-        return True
-
-    def _dispatch_descriptor(
+    def observe_result_publication(
         self,
-        node: ExecutionNodeRecord,
-        task: ExecutionTaskRecord,
-        rank: NodeAdmissionRank,
-    ) -> TaskDispatchDescriptor | None:
-        if node.node_key == PREPARE_RESULT:
-            return None
-        return TaskDispatchDescriptor(
-            node_key=node.node_key,
-            node_ordinal=node.ordinal,
-            task_key=task.task_key,
-            task_ordinal=task.ordinal,
-            binding=self._binding(node.node_key),
-            compatibility_key=node.node_key,
-            max_tasks_per_call=1,
-            depth=rank.depth,
-            unblocking_span=rank.unblocking_span,
+        context: NodeRunContext,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        del context, result, artifacts
+        return self.publications.observe(self.operation)
+
+
+@dataclass(frozen=True)
+class GromacsProviderNode(_GromacsPublicationHooks, ProviderNode):
+    """Describe one established remote GROMACS operation."""
+
+    operation: str
+    request: GromacsExecutionRequest
+    publications: GromacsPublications
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        """Describe the established deployed GROMACS function call."""
+        del context
+        target = operation_target(self.operation)
+        return ProviderCallSpec(
+            function_name=target.function_name,
+            uses_gpu=target.uses_gpu,
+            kwargs=_operation_kwargs(self.request, self.operation),
+            runtime_image_key=target.runtime_image_key,
+            compatibility_key=self.operation,
         )
 
-    def _binding(self, node_key: str):
-        return operation_provider_binding(
-            node_key,
-            environment=self.deployment.environment,
-            app_name=self.deployment.deployment_name,
-            app_version=self.deployment.deployment_version,
-        )
-
-    def _invocation_kwargs(
+    def process_remote_result(
         self,
-        node_key: str,
-        _task_key: str,
-    ) -> dict[str, object]:
-        request = self.request
-        if node_key.startswith("prepare_tpr_"):
-            return {
-                "pdb_content": request.pdb_content,
-                "run_name": request.run_name,
-                "simulation_time_ns": request.simulation_time_ns,
-                "run_pdbfixer": request.run_pdbfixer,
-                "num_threads": request.num_threads,
-                "use_openmp_threads": request.use_openmp_threads,
-                "ld_seed": request.ld_seed,
-                "gen_seed": request.gen_seed,
-                "genion_seed": request.genion_seed,
-            }
-        invocation = modal_invocation(
-            node_key,
-            cpu_only=request.cpu_only,
-            run_name=request.run_name,
-            simulation_time_ns=request.simulation_time_ns,
+        result: Any,
+        metadata: Any,
+    ) -> AppRunResult:
+        """Convert the remote directory reference into an exact result."""
+        del metadata
+        if not isinstance(result, str) or not result:
+            raise ValueError("GROMACS returned no output directory")
+        return self.publications.result(self.operation)
+
+
+@dataclass(frozen=True)
+class GromacsResultNode(_GromacsPublicationHooks, CoordinatorNode):
+    """Publish the complete user-facing GROMACS result boundary."""
+
+    operation: str
+    publications: GromacsPublications
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Describe the complete user-facing files after dependencies finish."""
+        del context
+        return self.publications.result(self.operation)
+
+
+def gromacs_execution_graph(
+    request: GromacsExecutionRequest,
+    publications: GromacsPublications,
+) -> ExecutionGraph:
+    """Build the direct-app graph without reproducing kernel orchestration."""
+    plan = request.execution_plan
+    graph = ExecutionGraph(
+        "gromacs",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name=plan.workload_name,
+            scientific_payload=plan.scientific_payload,
+            scientific_versions=dict(plan.scientific_versions),
+        ),
+    )
+    handles = {}
+    for node in plan.nodes:
+        implementation = (
+            GromacsResultNode(node.node_key, publications)
+            if node.node_key == PREPARE_RESULT
+            else GromacsProviderNode(node.node_key, request, publications)
         )
-        if invocation.function_name.startswith("production_run_"):
-            invocation.kwargs.update({
-                "num_threads": request.num_threads,
-                "use_openmp_threads": request.use_openmp_threads,
-            })
-        return invocation.kwargs
+        handles[node.node_key] = graph.add_node(
+            implementation,
+            id=node.node_key,
+            depends_on=[handles[item.node_key] for item in node.dependencies],
+        )
+    return graph
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Retain only the bounded output-directory reference."""
-    return {"remote_workdir": result if isinstance(result, str) else None}
+def _operation_kwargs(
+    request: GromacsExecutionRequest,
+    operation: str,
+) -> dict[str, object]:
+    if operation.startswith("prepare_tpr_"):
+        return {
+            "pdb_content": request.pdb_content,
+            "run_name": request.run_name,
+            "simulation_time_ns": request.simulation_time_ns,
+            "run_pdbfixer": request.run_pdbfixer,
+            "num_threads": request.num_threads,
+            "use_openmp_threads": request.use_openmp_threads,
+            "ld_seed": request.ld_seed,
+            "gen_seed": request.gen_seed,
+            "genion_seed": request.genion_seed,
+        }
+    invocation = modal_invocation(
+        operation,
+        cpu_only=request.cpu_only,
+        run_name=request.run_name,
+        simulation_time_ns=request.simulation_time_ns,
+    )
+    if invocation.function_name.startswith("production_run_"):
+        invocation.kwargs.update({
+            "num_threads": request.num_threads,
+            "use_openmp_threads": request.use_openmp_threads,
+        })
+    return invocation.kwargs
 
 
-class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
-    """Bind one run-scoped writer to GROMACS publications."""
+class GromacsExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
+    """Bind GROMACS publications to the shared definition host."""
 
     _request_loader = staticmethod(load_execution_request)
     _request_persister = staticmethod(persist_execution_request)
@@ -670,20 +608,10 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
         output_volume: Any,
         provider_driver: Any,
         output_claims: Any | None = None,
+        output_volume_name: str = _OUTPUT_VOLUME_NAME,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only the deployment resources used by this adapter."""
-        super().__init__(
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            volume_root=volume_root,
-            target_scientific_versions={
-                "gromacs": GROMACS_SCIENTIFIC_VERSION,
-                "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
-            },
-        )
-        self.output_volume = output_volume
-        self.provider_driver = provider_driver
         if output_claims is None:
             import modal
 
@@ -692,23 +620,35 @@ class GromacsExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 create_if_missing=True,
             )
         self.output_claims = output_claims
-        self.poll_interval_seconds = poll_interval_seconds
+        self.output_volume_name = output_volume_name
+        super().__init__(
+            execution_run_id=execution_run_id,
+            deployment=deployment,
+            volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            provider_driver=provider_driver,
+            graph_builder=self._build_graph,
+            target_scientific_versions={
+                "gromacs": GROMACS_SCIENTIFIC_VERSION,
+                "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
+            },
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
-    def _create_runtime(
+    def _build_graph(
         self,
         request: GromacsExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> GromacsExecutionRuntime:
-        return GromacsExecutionRuntime(
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        publications = GromacsPublications(
             request=request,
             execution_run_id=self.execution_run_id,
             predecessor_execution_run_id=predecessor_execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            output_claims=self.output_claims,
             output_root=self.volume_root,
-            poll_interval_seconds=self.poll_interval_seconds,
+            output_claims=self.output_claims,
+            output_volume_name=self.output_volume_name,
         )
+        if publications.ensure_run_identity():
+            self.output_volume.commit()
+        return gromacs_execution_graph(request, publications)

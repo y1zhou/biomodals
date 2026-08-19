@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from biomodals.execution import AvailabilityStatus
+from biomodals.execution import AvailabilityStatus, ContentBoundFileSet
 from biomodals.execution.artifact_availability import (
     ArtifactAvailability,
     check_artifact_availability,
@@ -27,6 +27,42 @@ from biomodals.schema import (
     InlineBytes,
     VolumePath,
 )
+
+
+def test_content_bound_file_set_round_trips_exact_manifest(tmp_path: Path) -> None:
+    output = tmp_path / "result.txt"
+    output.write_bytes(b"result")
+    publication = ContentBoundFileSet(
+        root=tmp_path,
+        marker_path=tmp_path / ".publication.json",
+        expected_paths=("result.txt",),
+        identity={"task": "example"},
+    )
+    files = (
+        ArtifactFile(
+            path="result.txt",
+            size_bytes=6,
+            content_sha256=sha256(b"result").hexdigest(),
+        ),
+    )
+
+    publication.write(files)
+
+    assert publication.load() == files
+    output.write_bytes(b"broken")
+    assert publication.load() is None
+
+
+def test_content_bound_file_set_rejects_incomplete_manifest(tmp_path: Path) -> None:
+    publication = ContentBoundFileSet(
+        root=tmp_path,
+        marker_path=tmp_path / ".publication.json",
+        expected_paths=("result.txt",),
+        identity={"task": "example"},
+    )
+
+    with pytest.raises(ValueError, match="expected file set"):
+        publication.write((ArtifactFile(path="other.txt"),))
 
 
 def test_materialize_inline_bytes_writes_one_result_artifact_copy(

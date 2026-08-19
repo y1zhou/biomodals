@@ -43,6 +43,72 @@ class MaterializedAppRunResult:
     result: AppRunResult
 
 
+@dataclass(frozen=True)
+class ContentBoundFileSet:
+    """Persist and validate one exact workload-owned file publication."""
+
+    root: Path
+    marker_path: Path
+    expected_paths: tuple[str, ...]
+    identity: Mapping[str, Any]
+
+    def load(self) -> tuple[ArtifactFile, ...] | None:
+        """Return exact file records only while identity and bytes still match."""
+        try:
+            marker = orjson.loads(self.marker_path.read_bytes())
+        except (
+            FileNotFoundError,
+            IsADirectoryError,
+            NotADirectoryError,
+            orjson.JSONDecodeError,
+        ):
+            return None
+        if not (
+            isinstance(marker, dict)
+            and marker.get("schema_version") == 1
+            and marker.get("identity") == dict(self.identity)
+            and isinstance(marker.get("files"), list)
+        ):
+            return None
+        try:
+            files = tuple(ArtifactFile.model_validate(item) for item in marker["files"])
+        except (TypeError, ValueError):
+            return None
+        if tuple(file.path for file in files) != self.expected_paths or any(
+            file.size_bytes is None or file.content_sha256 is None for file in files
+        ):
+            return None
+        for file in files:
+            path = _resolve_artifact_file(self.root, file.path)
+            try:
+                if (
+                    not path.is_file()
+                    or path.stat().st_size != file.size_bytes
+                    or _file_sha256(path) != file.content_sha256
+                ):
+                    return None
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                return None
+        return files
+
+    def write(self, files: tuple[ArtifactFile, ...]) -> None:
+        """Write a marker only from a complete content-bound manifest."""
+        if tuple(file.path for file in files) != self.expected_paths or any(
+            file.size_bytes is None or file.content_sha256 is None for file in files
+        ):
+            raise ValueError("Publication files do not match the expected file set")
+        _write_json(
+            self.marker_path,
+            {
+                "schema_version": 1,
+                "identity": dict(self.identity),
+                "files": [
+                    file.model_dump(mode="json", exclude_none=True) for file in files
+                ],
+            },
+        )
+
+
 def republish_execution_artifact(artifact: ExecutionArtifact) -> AppOutput:
     """Return an App output that keeps one upstream publication authoritative."""
     metadata = dict(artifact.metadata)
@@ -65,22 +131,14 @@ def _write_json(path: Path, payload: object) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    with TemporaryDirectory() as tmp_dir:
+    with TemporaryDirectory(dir=path.parent) as tmp_dir:
         tmp_path = Path(tmp_dir) / path.name
         if isinstance(payload, BaseModel):
             tmp_path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
         else:
             tmp_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
 
-        try:
-            # Attempt an efficient, atomic move on the same filesystem
-            tmp_path.replace(path)
-        except OSError as e:
-            # Check for the cross-device link error code (Errno 18)
-            if e.errno == 18:
-                shutil.move(tmp_path, path)
-            else:
-                raise
+        tmp_path.replace(path)
 
 
 def _artifact_files(root: Path) -> list[ArtifactFile]:

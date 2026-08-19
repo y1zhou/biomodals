@@ -64,6 +64,15 @@ class ModalInvocation:
 
 
 @dataclass(frozen=True, slots=True)
+class OperationTarget:
+    """Provider-neutral dispatch identity for one GROMACS operation."""
+
+    function_name: str
+    uses_gpu: bool
+    runtime_image_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlannedOperation:
     """One operation's identity, dependency, and invocation metadata."""
 
@@ -178,14 +187,24 @@ def operation_provider_binding(
     app_version: int,
 ) -> ProviderBinding:
     """Bind one remote operation to its exact deployed GROMACS function."""
-    function_name = operation.partition(":")[0]
-    if function_name not in REQUIRED_FUNCTIONS:
-        raise ValueError(f"Unsupported GROMACS operation: {operation}")
-    uses_gpu = function_name.endswith("_gpu")
+    target = operation_target(operation)
     return ProviderBinding(
         environment=environment,
         app_name=app_name,
         app_version=app_version,
+        function_name=target.function_name,
+        uses_gpu=target.uses_gpu,
+        runtime_image_key=target.runtime_image_key,
+    )
+
+
+def operation_target(operation: str) -> OperationTarget:
+    """Return provider-neutral dispatch metadata for one operation."""
+    function_name = operation.partition(":")[0]
+    if function_name not in REQUIRED_FUNCTIONS:
+        raise ValueError(f"Unsupported GROMACS operation: {operation}")
+    uses_gpu = function_name.endswith("_gpu")
+    return OperationTarget(
         function_name=function_name,
         uses_gpu=uses_gpu,
         runtime_image_key="gromacs-gpu" if uses_gpu else "gromacs-cpu",

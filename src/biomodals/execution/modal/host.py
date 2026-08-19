@@ -993,7 +993,7 @@ class ExecutionDefinitionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
         artifact_volume_name: str,
         output_volume: Any,
         provider_driver: Any,
-        graph_builder: Callable[[Any], ExecutionGraph],
+        graph_builder: Callable[[Any, UUID | None], ExecutionGraph],
         target_scientific_versions: Mapping[str, str],
         max_parallel_nodes: int = 32,
         pull_worker_coordinator: Any | None = None,
@@ -1042,7 +1042,7 @@ class ExecutionDefinitionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
         *,
         predecessor_execution_run_id: UUID | None = None,
     ) -> ExecutionGraphRuntime:
-        graph = self.graph_builder(request)
+        graph = self.graph_builder(request, predecessor_execution_run_id)
         workload_run_key = request.execution_plan.workload_run_key
         if not workload_run_key:
             raise ValueError("App Execution Plan must define a Workload Run Key")

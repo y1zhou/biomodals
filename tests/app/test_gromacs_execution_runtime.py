@@ -1,4 +1,4 @@
-"""Direct GROMACS execution-adapter tests."""
+"""Direct GROMACS execution-definition tests."""
 
 # ruff: noqa: D101,D102,D103,D107
 
@@ -13,28 +13,36 @@ import orjson
 import pytest
 
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
+    GromacsExecutionCoordinator,
     GromacsExecutionRequest,
-    GromacsExecutionRuntime,
+    GromacsPublications,
+    gromacs_execution_graph,
+    persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SECOND_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 THIRD_RUN_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 DEPLOYMENT = DeploymentIdentity("main", "Gromacs", 7)
+OUTPUT_VOLUME_NAME = "Gromacs-outputs"
 
 
 class FakeVolume:
+    def __init__(self) -> None:
+        self.commits = 0
+        self.reloads = 0
+
     def commit(self) -> None:
-        pass
+        self.commits += 1
 
     def reload(self) -> None:
-        pass
+        self.reloads += 1
 
 
 class FakeClaims:
@@ -136,26 +144,53 @@ def _request() -> GromacsExecutionRequest:
     )
 
 
-def _runtime(
+def _publications(
     tmp_path: Path,
     request: GromacsExecutionRequest,
     claims: FakeClaims,
     execution_run_id: UUID,
-    predecessor_execution_run_id: UUID | None,
-) -> GromacsExecutionRuntime:
-    return GromacsExecutionRuntime(
+    predecessor_execution_run_id: UUID | None = None,
+) -> GromacsPublications:
+    return GromacsPublications(
         request=request,
         execution_run_id=execution_run_id,
         predecessor_execution_run_id=predecessor_execution_run_id,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, execution_run_id),
-        provider_driver=CompletingDriver(tmp_path, request.run_name),
-        output_volume=FakeVolume(),
-        output_claims=claims,
         output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
+        output_claims=claims,
+        output_volume_name=OUTPUT_VOLUME_NAME,
     )
+
+
+def _coordinator(
+    tmp_path: Path,
+    request: GromacsExecutionRequest,
+    claims: FakeClaims,
+    execution_run_id: UUID,
+    *,
+    driver: CompletingDriver | None = None,
+) -> GromacsExecutionCoordinator:
+    persist_execution_request(tmp_path, execution_run_id, request)
+    return GromacsExecutionCoordinator(
+        execution_run_id=execution_run_id,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        provider_driver=driver or CompletingDriver(tmp_path, request.run_name),
+        output_claims=claims,
+        poll_interval_seconds=0,
+    )
+
+
+def _restart(
+    coordinator: GromacsExecutionCoordinator,
+    predecessor_execution_run_id: UUID,
+):
+    coordinator.prepare_restart(
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        predecessor_deployment=DEPLOYMENT,
+    )
+    return coordinator.drive_prepared()
 
 
 def test_gromacs_execution_request_round_trips_scientific_and_operational_data(
@@ -174,6 +209,22 @@ def test_gromacs_execution_request_round_trips_scientific_and_operational_data(
     }
 
 
+def test_gromacs_definition_preserves_exact_execution_plan(tmp_path: Path) -> None:
+    request = _request()
+    graph = gromacs_execution_graph(
+        request,
+        _publications(tmp_path, request, FakeClaims(), RUN_ID),
+    )
+
+    assert (
+        execution_plan(
+            graph.validate(),
+            workload_run_key=request.run_name,
+        )
+        == request.execution_plan
+    )
+
+
 def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
     request = _request()
     fingerprint = request.execution_plan.workload_plan_fingerprint
@@ -182,18 +233,15 @@ def test_gromacs_random_seeds_are_part_of_scientific_identity() -> None:
     assert request.gen_seed != -1
     assert request.genion_seed != 0
     assert GromacsExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert (
-        replace(request, ld_seed=17).execution_plan.workload_plan_fingerprint
-        != fingerprint
+    assert replace(request, ld_seed=17).execution_plan.workload_plan_fingerprint != (
+        fingerprint
     )
-    assert (
-        replace(request, gen_seed=23).execution_plan.workload_plan_fingerprint
-        != fingerprint
+    assert replace(request, gen_seed=23).execution_plan.workload_plan_fingerprint != (
+        fingerprint
     )
-    assert (
-        replace(request, genion_seed=29).execution_plan.workload_plan_fingerprint
-        != fingerprint
-    )
+    assert replace(
+        request, genion_seed=29
+    ).execution_plan.workload_plan_fingerprint != (fingerprint)
     assert (
         replace(
             request,
@@ -223,23 +271,12 @@ def test_gromacs_request_allows_zero_gpu_admission_for_cached_results() -> None:
     assert replace(_request(), max_active_gpu_provider_calls=0).cpu_only is False
 
 
-def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None:
+def test_direct_coordinator_drives_the_shared_parallel_graph(tmp_path: Path) -> None:
     request = _request()
     driver = CompletingDriver(tmp_path, request.run_name)
-    runtime = GromacsExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, FakeClaims(), RUN_ID, driver=driver)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert [name for name, _ in driver.spawns] == [
@@ -254,134 +291,83 @@ def test_direct_runtime_drives_the_shared_parallel_graph(tmp_path: Path) -> None
         for name, kwargs in driver.spawns
         if name == "collect_traj_stats"
     ] == ["nvt_", "npt_", "production_"]
-    runtime.close()
+    coordinator.close()
 
 
-def test_same_run_name_rejects_outputs_from_changed_science(
-    tmp_path: Path,
-) -> None:
-    first_request = _request()
+def test_same_run_name_rejects_outputs_from_changed_science(tmp_path: Path) -> None:
+    request = _request()
     claims = FakeClaims()
-    first_driver = CompletingDriver(tmp_path, first_request.run_name)
-    first = GromacsExecutionRuntime(
-        request=first_request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=first_driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    first = _coordinator(tmp_path, request, claims, RUN_ID)
     assert first.run().run.status == RunStatus.SUCCEEDED
     first.close()
 
-    changed_request = replace(first_request, pdb_content=b"ATOM changed\n")
-    changed_driver = CompletingDriver(tmp_path, changed_request.run_name)
-    changed = GromacsExecutionRuntime(
-        request=changed_request,
-        execution_run_id=SECOND_RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
-        provider_driver=changed_driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 20,
+    changed_request = replace(request, pdb_content=b"ATOM changed\n")
+    driver = CompletingDriver(tmp_path, changed_request.run_name)
+    changed = _coordinator(
+        tmp_path,
+        changed_request,
+        claims,
+        SECOND_RUN_ID,
+        driver=driver,
     )
-
     try:
         with pytest.raises(ValueError, match="different scientific inputs"):
             changed.run()
-        assert changed_driver.spawns == []
+        assert driver.spawns == []
     finally:
         changed.close()
 
 
-def test_same_science_reuses_published_run_name(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_same_science_reuses_published_run_name(tmp_path: Path) -> None:
     request = _request()
     claims = FakeClaims()
-    first = GromacsExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=CompletingDriver(tmp_path, request.run_name),
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    first = _coordinator(tmp_path, request, claims, RUN_ID)
     assert first.run().run.status == RunStatus.SUCCEEDED
     first.close()
     driver = CompletingDriver(tmp_path, request.run_name)
-    resumed = GromacsExecutionRuntime(
-        request=request,
-        execution_run_id=THIRD_RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, THIRD_RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 20,
+    reader = _coordinator(
+        tmp_path,
+        request,
+        claims,
+        THIRD_RUN_ID,
+        driver=driver,
     )
-    observed: list[str] = []
-    observe = resumed._node_publication_ready
-
-    def record_observation(node_key: str) -> bool:
-        observed.append(node_key)
-        return observe(node_key)
-
-    monkeypatch.setattr(resumed, "_node_publication_ready", record_observation)
 
     try:
-        assert resumed.run().run.status == RunStatus.SUCCEEDED
+        assert reader.run().run.status == RunStatus.SUCCEEDED
         assert driver.spawns == []
-        assert observed == list(request.execution_plan.terminal_node_keys)
     finally:
-        resumed.close()
+        reader.close()
 
 
 def test_prepare_publication_requires_downstream_inputs(tmp_path: Path) -> None:
     request = _request()
     driver = IncompletePreparationDriver(tmp_path, request.run_name)
-    runtime = GromacsExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
+    coordinator = _coordinator(
+        tmp_path,
+        request,
+        FakeClaims(),
+        RUN_ID,
+        driver=driver,
     )
 
     try:
-        assert runtime.run().run.status == RunStatus.FAILED
+        assert coordinator.run().run.status == RunStatus.FAILED
         assert [name for name, _kwargs in driver.spawns] == ["prepare_tpr_gpu"]
     finally:
-        runtime.close()
+        coordinator.close()
 
 
 def test_terminal_publication_covers_required_user_outputs(tmp_path: Path) -> None:
     request = _request()
-    runtime = _runtime(tmp_path, request, FakeClaims(), RUN_ID, None)
+    publications = _publications(tmp_path, request, FakeClaims(), RUN_ID)
     root = request.run_root(tmp_path)
 
     paths = {
         path.relative_to(root).as_posix()
-        for path in runtime._node_paths(request.execution_plan.terminal_node_keys[0])
+        for path in publications.node_paths(
+            request.execution_plan.terminal_node_keys[0]
+        )
     }
 
     assert {
@@ -390,7 +376,6 @@ def test_terminal_publication_covers_required_user_outputs(tmp_path: Path) -> No
         f"production_{request.run_name}_nopbc.xtc",
         f"production_{request.run_name}_nopbc_centered.pdb",
     } <= paths
-    runtime.close()
 
 
 @pytest.mark.parametrize(
@@ -411,26 +396,20 @@ def test_successor_repairs_missing_terminal_output(
 ) -> None:
     request = _request()
     claims = FakeClaims()
-    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
+    owner = _coordinator(tmp_path, request, claims, RUN_ID)
     assert owner.run().run.status == RunStatus.SUCCEEDED
     owner.close()
     (request.run_root(tmp_path) / missing_name).unlink()
     driver = CompletingDriver(tmp_path, request.run_name)
-    successor = GromacsExecutionRuntime(
-        request=request,
-        execution_run_id=SECOND_RUN_ID,
-        predecessor_execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 20,
+    successor = _coordinator(
+        tmp_path,
+        request,
+        claims,
+        SECOND_RUN_ID,
+        driver=driver,
     )
     try:
-        assert successor.run().run.status == RunStatus.SUCCEEDED
+        assert _restart(successor, RUN_ID).run.status == RunStatus.SUCCEEDED
         assert repair_function in {name for name, _kwargs in driver.spawns}
     finally:
         successor.close()
@@ -441,27 +420,21 @@ def test_successor_replaces_digest_invalid_preparation_output(
 ) -> None:
     request = _request()
     claims = FakeClaims()
-    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
+    owner = _coordinator(tmp_path, request, claims, RUN_ID)
     assert owner.run().run.status == RunStatus.SUCCEEDED
     owner.close()
     production_mdp = request.run_root(tmp_path) / "production.mdp"
     production_mdp.write_bytes(b"bad")
     driver = CompletingDriver(tmp_path, request.run_name)
-    successor = GromacsExecutionRuntime(
-        request=request,
-        execution_run_id=SECOND_RUN_ID,
-        predecessor_execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, SECOND_RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 20,
+    successor = _coordinator(
+        tmp_path,
+        request,
+        claims,
+        SECOND_RUN_ID,
+        driver=driver,
     )
     try:
-        assert successor.run().run.status == RunStatus.SUCCEEDED
+        assert _restart(successor, RUN_ID).run.status == RunStatus.SUCCEEDED
         assert "prepare_tpr_gpu" in {name for name, _kwargs in driver.spawns}
         assert production_mdp.read_bytes() == b"mdp"
     finally:
@@ -471,98 +444,84 @@ def test_successor_replaces_digest_invalid_preparation_output(
 def test_concurrent_same_name_roots_elect_one_output_owner(tmp_path: Path) -> None:
     request = _request()
     claims = FakeClaims()
-    runtimes = tuple(
-        GromacsExecutionRuntime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=DEPLOYMENT,
-            store=ExecutionRunStore(tmp_path, execution_run_id),
-            provider_driver=CompletingDriver(tmp_path, request.run_name),
-            output_volume=FakeVolume(),
-            output_claims=claims,
-            output_root=tmp_path,
-            poll_interval_seconds=0,
-            now=lambda: 10,
-        )
+    publications = tuple(
+        _publications(tmp_path, request, claims, execution_run_id)
         for execution_run_id in (RUN_ID, SECOND_RUN_ID)
     )
 
-    def ensure(runtime: GromacsExecutionRuntime) -> bool | str:
+    def ensure(item: GromacsPublications) -> bool | str:
         try:
-            return runtime._ensure_run_identity()
+            return item.ensure_run_identity()
         except (RuntimeError, ValueError) as error:
             return str(error)
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            outcomes = tuple(executor.map(ensure, runtimes))
-        assert outcomes.count(True) == 1
-        assert (
-            sum(
-                "already claimed" in str(outcome)
-                or "unclaimed existing outputs" in str(outcome)
-                for outcome in outcomes
-            )
-            == 1
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(ensure, publications))
+    assert outcomes.count(True) == 1
+    assert (
+        sum(
+            "already claimed" in str(outcome)
+            or "unclaimed existing outputs" in str(outcome)
+            for outcome in outcomes
         )
-    finally:
-        for runtime in runtimes:
-            runtime.close()
+        == 1
+    )
 
 
 def test_successors_transfer_incomplete_output_ownership(tmp_path: Path) -> None:
     request = _request()
     claims = FakeClaims()
-
     generations = (
-        _runtime(tmp_path, request, claims, RUN_ID, None),
-        _runtime(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID),
-        _runtime(tmp_path, request, claims, THIRD_RUN_ID, SECOND_RUN_ID),
+        _publications(tmp_path, request, claims, RUN_ID),
+        _publications(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID),
+        _publications(tmp_path, request, claims, THIRD_RUN_ID, SECOND_RUN_ID),
     )
-    try:
-        assert [item._ensure_run_identity() for item in generations] == [True] * 3
-        marker = orjson.loads(generations[-1]._run_identity_path().read_bytes())
-        assert marker["owner_execution_run_id"] == str(THIRD_RUN_ID)
-    finally:
-        for item in generations:
-            item.close()
+
+    assert [item.ensure_run_identity() for item in generations] == [True] * 3
+    marker = orjson.loads(generations[-1].run_identity_path().read_bytes())
+    assert marker["owner_execution_run_id"] == str(THIRD_RUN_ID)
 
 
 def test_sibling_successor_cannot_replace_active_owner(tmp_path: Path) -> None:
     request = _request()
     claims = FakeClaims()
-    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
-    first_successor = _runtime(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID)
-    sibling = _runtime(tmp_path, request, claims, THIRD_RUN_ID, RUN_ID)
-    try:
-        assert owner._ensure_run_identity()
-        assert first_successor._ensure_run_identity()
-        with pytest.raises(RuntimeError, match="already claimed"):
-            sibling._ensure_run_identity()
-        marker = orjson.loads(first_successor._run_identity_path().read_bytes())
-        assert marker["owner_execution_run_id"] == str(SECOND_RUN_ID)
-    finally:
-        owner.close()
-        first_successor.close()
-        sibling.close()
+    owner = _publications(tmp_path, request, claims, RUN_ID)
+    first_successor = _publications(
+        tmp_path,
+        request,
+        claims,
+        SECOND_RUN_ID,
+        RUN_ID,
+    )
+    sibling = _publications(tmp_path, request, claims, THIRD_RUN_ID, RUN_ID)
+
+    assert owner.ensure_run_identity()
+    assert first_successor.ensure_run_identity()
+    with pytest.raises(RuntimeError, match="already claimed"):
+        sibling.ensure_run_identity()
+    marker = orjson.loads(first_successor.run_identity_path().read_bytes())
+    assert marker["owner_execution_run_id"] == str(SECOND_RUN_ID)
 
 
 def test_cache_reading_successor_preserves_repair_lineage(tmp_path: Path) -> None:
     request = _request()
     claims = FakeClaims()
-    owner = _runtime(tmp_path, request, claims, RUN_ID, None)
-    cache_reader = _runtime(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID)
-    repair = _runtime(tmp_path, request, claims, THIRD_RUN_ID, SECOND_RUN_ID)
-    try:
-        assert owner.run().run.status == RunStatus.SUCCEEDED
-        assert not cache_reader._ensure_run_identity()
-        terminal_node = request.execution_plan.terminal_node_keys[0]
-        owner._node_publication_path(terminal_node).unlink()
+    owner = _coordinator(tmp_path, request, claims, RUN_ID)
+    assert owner.run().run.status == RunStatus.SUCCEEDED
+    owner.close()
+    cache_reader = _publications(tmp_path, request, claims, SECOND_RUN_ID, RUN_ID)
+    repair = _publications(
+        tmp_path,
+        request,
+        claims,
+        THIRD_RUN_ID,
+        SECOND_RUN_ID,
+    )
 
-        assert repair._ensure_run_identity()
-        marker = orjson.loads(repair._run_identity_path().read_bytes())
-        assert marker["owner_execution_run_id"] == str(THIRD_RUN_ID)
-    finally:
-        owner.close()
-        cache_reader.close()
-        repair.close()
+    assert not cache_reader.ensure_run_identity()
+    terminal_node = request.execution_plan.terminal_node_keys[0]
+    cache_reader.publication_path(terminal_node).unlink()
+
+    assert repair.ensure_run_identity()
+    marker = orjson.loads(repair.run_identity_path().read_bytes())
+    assert marker["owner_execution_run_id"] == str(THIRD_RUN_ID)

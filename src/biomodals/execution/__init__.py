@@ -7,7 +7,10 @@ from biomodals.execution.artifact_availability import (
     check_external_artifact_status,
     mounted_volume_checker,
 )
-from biomodals.execution.artifacts import republish_execution_artifact
+from biomodals.execution.artifacts import (
+    ContentBoundFileSet,
+    republish_execution_artifact,
+)
 from biomodals.execution.coordinator import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     drive_execution_run,
@@ -108,6 +111,7 @@ __all__ = [
     "AsyncProviderDriver",
     "AsyncExecutionRuntime",
     "COORDINATOR_SCALEDOWN_WINDOW_SECONDS",
+    "ContentBoundFileSet",
     "DeploymentIdentity",
     "DispatchMode",
     "ExecutionNodeRecord",

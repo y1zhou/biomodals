@@ -92,7 +92,10 @@ def test_definition_coordinator_hosts_app_owned_graph(tmp_path: Path) -> None:
     """Direct apps can use the shared executable-graph lifecycle."""
     deployment = DeploymentIdentity("main", "Example", 3)
 
-    def build_graph(_request: object) -> ExecutionGraph:
+    def build_graph(
+        _request: object,
+        _predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
         graph = ExecutionGraph(
             "example",
             plan_metadata=ExecutionPlanMetadata(
@@ -107,7 +110,7 @@ def test_definition_coordinator_hosts_app_owned_graph(tmp_path: Path) -> None:
         )
         return graph
 
-    graph = build_graph(object())
+    graph = build_graph(object(), None)
     plan = execution_plan(graph.validate(), workload_run_key="example-run")
     request = SimpleNamespace(
         execution_plan=plan,

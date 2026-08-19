@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -12,38 +12,49 @@ from uuid import UUID
 import orjson
 
 from biomodals.app.score.af3score_publications import (
+    COMPLETION_SAMPLE_SUBDIR,
+    METRICS_FILENAME,
     _input_publication_ready,
+    _input_publication_record,
+    _metrics_publication_path,
     _metrics_publication_ready,
 )
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
-    ExecutionNodeRecord,
+    ExecutionArtifact,
+    ExecutionGraph,
     ExecutionPlan,
-    ExecutionTaskRecord,
+    ExecutionPlanMetadata,
     NodeAggregationPolicy,
     NodeDependency,
     NodePlan,
-    ProviderBinding,
-    ProviderCallStatus,
-    TaskPlan,
+    inline_json_result,
 )
 from biomodals.execution.modal import (
     ExecutionRequestFile,
-    OutputClaimExecutionCoordinatorLifecycle,
-    StandardExecutionRuntimeLifecycle,
+    OutputClaimExecutionDefinitionCoordinatorLifecycle,
 )
-from biomodals.execution.scheduler import (
-    NodeAdmissionRank,
-    ProviderCallCandidate,
-    TaskDispatchDescriptor,
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
 )
-from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.app_run import AppRunLayout
 from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.output_claim import acquire_output_claim
 from biomodals.helper.task_budget import bounded_map
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    VolumePath,
+)
 
 REQUEST_SCHEMA_VERSION = 4
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
@@ -295,440 +306,59 @@ def load_execution_request(
     )
 
 
-class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
-    """Drive one direct AF3Score request through durable fixed batches."""
+class AF3ScorePublications:
+    """Own AF3Score cache validation, claims, and artifact reconstruction."""
 
     def __init__(
         self,
         *,
         request: AF3ScoreExecutionRequest,
         execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
         output_claims: Any,
         output_root: str | Path,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
+        output_volume_name: str,
     ) -> None:
-        """Bind the kernel writer to AF3Score's existing publications."""
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-        )
-        self._plan = request.execution_plan
-        self._input_digests = request.input_digests
-        self._publication_key = self._plan.workload_plan_fingerprint
+        """Bind one Run to its existing app-owned output directory."""
+        self.request = request
+        self.execution_run_id = execution_run_id
         self.output_claims = output_claims
         self.output_root = Path(output_root)
-        self._claim_acquired = False
+        self.output_volume_name = output_volume_name
 
     @property
     def layout(self) -> AppRunLayout:
         """Return the established app-owned run layout."""
         return AppRunLayout.from_run_root(self.output_root / self.request.run_name)
 
-    def _recover_publications(self) -> None:
-        self._provider.recover_publications(
-            self.execution_run_id,
-            observe_node=self._node_observation,
-            observe_task=lambda node_key, task: (
-                None
-                if node_key == PREPARE_NODE
-                else self._task_observation(node_key, task.task_key)
-            ),
-            now=self._now(),
-        )
+    @property
+    def publication_key(self) -> str:
+        """Return the scientific publication identity for this request."""
+        return self.request.execution_plan.workload_plan_fingerprint
 
-    def _node_observation(self, node_key: str) -> AvailabilityStatus:
-        try:
-            if node_key == PREPARE_NODE:
-                available = False
-            elif node_key == BATCHES_NODE:
-                with self.store.synchronize():
-                    tasks_discovered = self.store.execution.get_node(
-                        self.execution_run_id,
-                        BATCHES_NODE,
-                    ).discovery_complete
-                available = not tasks_discovered and all(
-                    bounded_map(
-                        self.request.input_names,
-                        lambda name: self._output_complete(Path(name).stem),
-                        max_parallel=_CACHE_VALIDATION_WORKERS,
-                    )
-                )
-            elif node_key == POSTPROCESS_NODE:
-                available = _metrics_publication_ready(
-                    self.layout.run_root,
-                    self._publication_key,
-                ) and all(
-                    bounded_map(
-                        self.request.input_names,
-                        lambda name: self._output_complete(Path(name).stem),
-                        max_parallel=_CACHE_VALIDATION_WORKERS,
-                    )
-                )
-            else:
-                raise ValueError(f"Unknown AF3Score Node {node_key!r}")
-        except OSError:
-            return AvailabilityStatus.UNKNOWN
-        return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
-
-    def _task_observation(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> AvailabilityStatus:
-        if node_key == BATCHES_NODE:
-            try:
-                available = self._output_complete(task_key)
-            except OSError:
-                return AvailabilityStatus.UNKNOWN
-            return (
-                AvailabilityStatus.AVAILABLE
-                if available
-                else AvailabilityStatus.MISSING
-            )
-        if node_key == POSTPROCESS_NODE:
-            try:
-                available = _metrics_publication_ready(
-                    self.layout.run_root,
-                    self._publication_key,
-                ) and self._output_complete(task_key)
-            except OSError:
-                return AvailabilityStatus.UNKNOWN
-            return (
-                AvailabilityStatus.AVAILABLE
-                if available
-                else AvailabilityStatus.MISSING
-            )
-        return self._node_observation(node_key)
-
-    def _output_complete(self, input_id: str) -> bool:
-        digest = self._input_digests.get(input_id)
+    def output_complete(self, input_id: str) -> bool:
+        """Validate one scored input publication."""
+        digest = self.request.input_digests.get(input_id)
         if digest is None:
             return False
         return _input_publication_ready(
             self.layout.outputs_dir,
             input_id,
-            publication_key=self._publication_key,
+            publication_key=self.publication_key,
             input_sha256=digest,
         )
 
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        reconciled = self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            now=self._now(),
-        )
-        if any(
-            not original.status.is_terminal
-            and updated.status == ProviderCallStatus.SUCCEEDED
-            for original, updated in reconciled
-        ):
-            self._reload_output()
-
-    def _decode_completed_calls(self) -> None:
-        self._provider.decode_completed_calls(
-            self.execution_run_id,
-            observe_task=lambda node_key, task, envelope: (
-                self._completed_task_observation(
-                    node_key,
-                    task.task_key,
-                    envelope,
-                )
-            ),
-            missing_message="AF3Score returned without a valid publication",
-            now=self._now(),
-        )
-
-    def _completed_task_observation(
-        self,
-        node_key: str,
-        task_key: str,
-        envelope: object,
-    ) -> AvailabilityStatus:
-        if not isinstance(envelope, dict):
-            return AvailabilityStatus.MISSING
-        if node_key == PREPARE_NODE:
-            try:
-                self._task_spec(envelope)
-            except (TypeError, ValueError, OSError):
-                return AvailabilityStatus.MISSING
-            return AvailabilityStatus.AVAILABLE
-        expected_kind = "batch" if node_key == BATCHES_NODE else "postprocess"
-        if envelope.get("kind") != expected_kind:
-            return AvailabilityStatus.MISSING
-        return self._task_observation(node_key, task_key)
-
-    def _start_ready_nodes(self, required: set[str]) -> None:
-        self._provider.start_ready_nodes(
-            self.execution_run_id,
-            required_node_keys=required,
-            task_plans=self._task_plans,
-            observe_task=lambda node_key, task: (
-                AvailabilityStatus.MISSING
-                if node_key == PREPARE_NODE
-                else self._task_observation(node_key, task.task_key)
-            ),
-            now=self._now(),
-        )
-
-    def _task_plans(self, node_key: str) -> tuple[TaskPlan, ...]:
-        if node_key == PREPARE_NODE:
-            return (
-                TaskPlan(
-                    task_key="prepare",
-                    scientific_payload={"inputs": list(self.request.input_names)},
-                ),
+    def outputs_complete(self) -> bool:
+        """Validate all requested per-input score publications in parallel."""
+        return all(
+            bounded_map(
+                self.request.input_names,
+                lambda name: self.output_complete(Path(name).stem),
+                max_parallel=_CACHE_VALIDATION_WORKERS,
             )
-        if node_key == POSTPROCESS_NODE:
-            return tuple(
-                TaskPlan(
-                    task_key=Path(name).stem,
-                    scientific_payload={
-                        "input_id": Path(name).stem,
-                        "sha256": digest,
-                    },
-                )
-                for name, digest in self.request.inputs
-            )
-        if node_key != BATCHES_NODE:
-            raise ValueError(f"Unknown AF3Score Node {node_key!r}")
-        spec = self._prepare_task_spec()
-        digests = {Path(name).stem: digest for name, digest in self.request.inputs}
-        plans = []
-        for chunk in spec.chunk_specs:
-            input_ids = self._chunk_input_ids(chunk)
-            for input_id in input_ids:
-                plans.append(
-                    TaskPlan(
-                        task_key=input_id,
-                        scientific_payload={
-                            "input_id": input_id,
-                            "sha256": digests[input_id],
-                        },
-                        execution_payload={
-                            "chunk": asdict(chunk),
-                            "task_count": len(input_ids),
-                        },
-                    )
-                )
-        return tuple(plans)
-
-    def _prepare_task_spec(self) -> TaskSpec:
-        with self.store.synchronize():
-            call = self.store.execution.succeeded_provider_call(
-                self.execution_run_id,
-                PREPARE_NODE,
-            )
-        if call is None:
-            raise RuntimeError("AF3Score preparation result is unavailable")
-        return self._task_spec(call.result_envelope)
-
-    def _task_spec(self, envelope: object) -> TaskSpec:
-        if not isinstance(envelope, dict) or envelope.get("kind") != "prepare":
-            raise TypeError("AF3Score preparation envelope is invalid")
-        value = envelope.get("task_spec")
-        if not isinstance(value, dict):
-            raise TypeError("AF3Score preparation payload is invalid")
-        chunks = value.get("chunk_specs")
-        if not isinstance(chunks, list):
-            raise TypeError("AF3Score chunk specifications are invalid")
-        total = value.get("total")
-        pending = value.get("pending")
-        skipped = value.get("skipped")
-        input_files = value.get("input_files")
-        output_dir = value.get("output_dir")
-        failed_dir = value.get("failed_dir")
-        if (
-            type(total) is not int
-            or type(pending) is not int
-            or type(skipped) is not int
-            or not isinstance(input_files, list)
-            or not all(isinstance(item, str) for item in input_files)
-            or not isinstance(output_dir, str)
-            or not isinstance(failed_dir, str)
-        ):
-            raise TypeError("AF3Score preparation payload has invalid fields")
-        parsed_chunks = []
-        for chunk in chunks:
-            if not isinstance(chunk, dict):
-                raise TypeError("AF3Score chunk specification is invalid")
-            batch_name = chunk.get("batch_name")
-            batch_json_dir = chunk.get("batch_json_dir")
-            batch_pdb_dir = chunk.get("batch_pdb_dir")
-            if (
-                not isinstance(batch_name, str)
-                or not isinstance(batch_json_dir, str)
-                or not isinstance(batch_pdb_dir, str)
-            ):
-                raise TypeError("AF3Score chunk specification is invalid")
-            parsed_chunks.append(
-                ChunkSpec(
-                    batch_name=batch_name,
-                    batch_json_dir=batch_json_dir,
-                    batch_pdb_dir=batch_pdb_dir,
-                )
-            )
-        spec = TaskSpec(
-            total=total,
-            pending=pending,
-            skipped=skipped,
-            input_files=cast(list[str], input_files),
-            chunk_specs=parsed_chunks,
-            output_dir=output_dir,
-            failed_dir=failed_dir,
-        )
-        self._validate_task_spec(spec)
-        return spec
-
-    def _validate_task_spec(self, spec: TaskSpec) -> None:
-        if (
-            spec.total != len(self.request.inputs)
-            or spec.pending + spec.skipped != spec.total
-            or tuple(spec.input_files) != self.request.input_names
-        ):
-            raise ValueError("AF3Score preparation counts do not match the request")
-        root = self.layout.run_root.resolve()
-        chunk_names: set[str] = set()
-        task_ids: list[str] = []
-        for chunk in spec.chunk_specs:
-            if not chunk.batch_name or chunk.batch_name in chunk_names:
-                raise ValueError("AF3Score chunk names must be unique")
-            chunk_names.add(chunk.batch_name)
-            for path in (Path(chunk.batch_json_dir), Path(chunk.batch_pdb_dir)):
-                path.resolve().relative_to(root)
-                if not path.is_dir():
-                    raise OSError(f"AF3Score prepared directory is missing: {path}")
-            task_ids.extend(self._chunk_input_ids(chunk))
-        requested_ids = {Path(name).stem for name in self.request.input_names}
-        if (
-            len(task_ids) != spec.pending
-            or len(task_ids) != len(set(task_ids))
-            or not set(task_ids).issubset(requested_ids)
-        ):
-            raise ValueError("AF3Score prepared Tasks do not match pending inputs")
-
-    def _chunk_input_ids(self, chunk: ChunkSpec) -> tuple[str, ...]:
-        return tuple(
-            path.stem
-            for path in sorted(Path(chunk.batch_json_dir).glob("*.json"))
-            if path.is_file()
         )
 
-    def _dispatch_descriptor(
-        self,
-        node: ExecutionNodeRecord,
-        task: ExecutionTaskRecord,
-        rank: NodeAdmissionRank,
-    ) -> TaskDispatchDescriptor:
-        binding = self._binding(node.node_key)
-        compatibility = binding.function_name
-        batch_size = 1
-        if node.node_key == BATCHES_NODE:
-            chunk = cast(dict[str, object], task.execution_payload["chunk"])
-            compatibility = str(chunk["batch_name"])
-            batch_size = cast(int, task.execution_payload["task_count"])
-        elif node.node_key == POSTPROCESS_NODE:
-            batch_size = len(self.request.inputs)
-        return TaskDispatchDescriptor(
-            node_key=node.node_key,
-            node_ordinal=node.ordinal,
-            task_key=task.task_key,
-            task_ordinal=task.ordinal,
-            binding=binding,
-            compatibility_key=compatibility,
-            max_tasks_per_call=batch_size,
-            depth=rank.depth,
-            unblocking_span=rank.unblocking_span,
-        )
-
-    def _prepare_candidates(
-        self,
-        selected: tuple[ProviderCallCandidate, ...],
-    ) -> tuple[ProviderCallCandidate, ...]:
-        if selected:
-            self._ensure_output_claim()
-        return selected
-
-    def _binding(self, node_key: str) -> ProviderBinding:
-        function_name = {
-            PREPARE_NODE: "af3score_prepare",
-            BATCHES_NODE: "af3score_run",
-            POSTPROCESS_NODE: "af3score_postprocess",
-        }[node_key]
-        uses_gpu = node_key == BATCHES_NODE
-        return ProviderBinding(
-            environment=self.deployment.environment,
-            app_name=self.deployment.deployment_name,
-            app_version=self.deployment.deployment_version,
-            function_name=function_name,
-            uses_gpu=uses_gpu,
-            runtime_image_key="af3score-gpu" if uses_gpu else "af3score-cpu",
-        )
-
-    def _invocation_kwargs(
-        self,
-        node_key: str,
-        task_key: str,
-    ) -> dict[str, object]:
-        if node_key == PREPARE_NODE:
-            return {
-                "run_name": self.request.run_name,
-                "staged_input_key": self.request.staged_input_key,
-                "input_files": list(self.request.input_names),
-                "input_digests": self._input_digests,
-                "publication_key": self._publication_key,
-                "num_jobs": self.request.max_active_gpu_provider_calls,
-                "prepare_workers": self.request.prepare_workers,
-            }
-        if node_key == POSTPROCESS_NODE:
-            completed_input_ids = [
-                Path(name).stem
-                for name in self.request.input_names
-                if self._output_complete(Path(name).stem)
-            ]
-            return {
-                "run_name": self.request.run_name,
-                "staged_input_key": self.request.staged_input_key,
-                "input_files": list(self.request.input_names),
-                "input_digests": self._input_digests,
-                "completed_input_ids": completed_input_ids,
-                "publication_key": self._publication_key,
-            }
-        with self.store.synchronize():
-            task = self.store.execution.get_task(
-                self.execution_run_id,
-                BATCHES_NODE,
-                task_key,
-            )
-        chunk = task.execution_payload["chunk"]
-        input_ids = self._chunk_input_ids(ChunkSpec(**chunk))
-        return {
-            "run_name": self.request.run_name,
-            "batch_name": chunk["batch_name"],
-            "batch_json_dir": chunk["batch_json_dir"],
-            "batch_pdb_dir": chunk["batch_pdb_dir"],
-            "input_digests": {
-                input_id: self._input_digests[input_id] for input_id in input_ids
-            },
-            "publication_key": self._publication_key,
-        }
-
-    def _ensure_output_claim(self) -> None:
-        if self._claim_acquired:
-            return
+    def claim(self) -> None:
+        """Claim the shared run-name output namespace before provider writes."""
         acquire_output_claim(
             self.output_claims,
             claim_key=(
@@ -737,22 +367,528 @@ class AF3ScoreExecutionRuntime(StandardExecutionRuntimeLifecycle):
             owner=str(self.execution_run_id),
             replace_owner=self.request.replace_claim_owner,
         )
-        self._claim_acquired = True
+
+    @staticmethod
+    def preparation_result(spec: TaskSpec) -> AppRunResult:
+        """Publish bounded preparation metadata through execution storage."""
+        return inline_json_result(
+            name="task-spec",
+            value=asdict(spec),
+            filename="task-spec.json",
+        )
+
+    def result(self, input_ids: tuple[str, ...], *, metrics: bool) -> AppRunResult:
+        """Publish exact per-input outputs and optional aggregate metrics."""
+        outputs: list[AppOutput] = []
+        for input_id in input_ids:
+            digest = self.request.input_digests[input_id]
+            marker = _input_publication_record(
+                self.layout.outputs_dir,
+                input_id,
+                publication_key=self.publication_key,
+                input_sha256=digest,
+            )
+            if marker is None or not self.output_complete(input_id):
+                raise FileNotFoundError(f"AF3Score output is unavailable: {input_id}")
+            records = cast(dict[str, dict[str, object]], marker["outputs"])
+            sample = self.layout.outputs_dir / input_id / COMPLETION_SAMPLE_SUBDIR
+            outputs.append(
+                AppOutput(
+                    name=f"score-{input_id}",
+                    kind=ArtifactKind.DIRECTORY,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=sample.relative_to(self.output_root).as_posix(),
+                    ),
+                    metadata={
+                        "input_id": input_id,
+                        "files": [
+                            ArtifactFile(
+                                path=name,
+                                size_bytes=cast(int, record["size"]),
+                                content_sha256=cast(str, record["sha256"]),
+                            ).model_dump(mode="json")
+                            for name, record in sorted(records.items())
+                        ],
+                    },
+                )
+            )
+        if metrics:
+            marker = orjson.loads(
+                _metrics_publication_path(self.layout.run_root).read_bytes()
+            )
+            path = self.layout.run_root / METRICS_FILENAME
+            outputs.append(
+                AppOutput(
+                    name="af3score-metrics",
+                    kind=ArtifactKind.TABLE,
+                    storage=VolumePath(
+                        volume_name=self.output_volume_name,
+                        path=path.relative_to(self.output_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [
+                            ArtifactFile(
+                                path=path.name,
+                                size_bytes=marker.get("size"),
+                                content_sha256=marker.get("sha256"),
+                            ).model_dump(mode="json", exclude_none=True)
+                        ]
+                    },
+                )
+            )
+        return AppRunResult(status=AppRunStatus.SUCCEEDED, outputs=outputs)
+
+    def terminal_result(self) -> AppRunResult | None:
+        """Recover a complete terminal metrics publication."""
+        if (
+            not _metrics_publication_ready(self.layout.run_root, self.publication_key)
+            or not self.outputs_complete()
+        ):
+            return None
+        return self.result(tuple(self.request.input_digests), metrics=True)
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Encode only bounded preparation metadata or completion diagnostics."""
-    if isinstance(result, TaskSpec):
-        return {"kind": "prepare", "task_spec": asdict(result)}
-    if isinstance(result, dict):
-        value = orjson.loads(orjson.dumps(result))
-        return {"kind": "postprocess", "result": value}
-    if result is None:
-        return {"kind": "batch"}
-    return {"kind": "invalid"}
+def _task_spec_from_value(
+    value: object, publications: AF3ScorePublications
+) -> TaskSpec:
+    if not isinstance(value, Mapping):
+        raise TypeError("AF3Score preparation payload is invalid")
+    value = cast(Mapping[str, object], value)
+    chunks = value.get("chunk_specs")
+    if not isinstance(chunks, list):
+        raise TypeError("AF3Score chunk specifications are invalid")
+    total = value.get("total")
+    pending = value.get("pending")
+    skipped = value.get("skipped")
+    input_files = value.get("input_files")
+    output_dir = value.get("output_dir")
+    failed_dir = value.get("failed_dir")
+    if (
+        type(total) is not int
+        or type(pending) is not int
+        or type(skipped) is not int
+        or not isinstance(input_files, list)
+        or not all(isinstance(item, str) for item in input_files)
+        or not isinstance(output_dir, str)
+        or not isinstance(failed_dir, str)
+    ):
+        raise TypeError("AF3Score preparation payload has invalid fields")
+    parsed_chunks = []
+    for chunk in chunks:
+        if not isinstance(chunk, Mapping):
+            raise TypeError("AF3Score chunk specification is invalid")
+        chunk = cast(Mapping[str, object], chunk)
+        fields = tuple(
+            chunk.get(name)
+            for name in ("batch_name", "batch_json_dir", "batch_pdb_dir")
+        )
+        if not all(isinstance(field, str) for field in fields):
+            raise TypeError("AF3Score chunk specification is invalid")
+        parsed_chunks.append(ChunkSpec(*cast(tuple[str, str, str], fields)))
+    spec = TaskSpec(
+        total=total,
+        pending=pending,
+        skipped=skipped,
+        input_files=cast(list[str], input_files),
+        chunk_specs=parsed_chunks,
+        output_dir=output_dir,
+        failed_dir=failed_dir,
+    )
+    _validate_task_spec(spec, publications)
+    return spec
 
 
-class AF3ScoreExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
+def _validate_task_spec(spec: TaskSpec, publications: AF3ScorePublications) -> None:
+    request = publications.request
+    if (
+        spec.total != len(request.inputs)
+        or spec.pending + spec.skipped != spec.total
+        or tuple(spec.input_files) != request.input_names
+    ):
+        raise ValueError("AF3Score preparation counts do not match the request")
+    root = publications.layout.run_root.resolve()
+    chunk_names: set[str] = set()
+    task_ids: list[str] = []
+    for chunk in spec.chunk_specs:
+        if not chunk.batch_name or chunk.batch_name in chunk_names:
+            raise ValueError("AF3Score chunk names must be unique")
+        chunk_names.add(chunk.batch_name)
+        for path in (Path(chunk.batch_json_dir), Path(chunk.batch_pdb_dir)):
+            path.resolve().relative_to(root)
+            if not path.is_dir():
+                raise OSError(f"AF3Score prepared directory is missing: {path}")
+        task_ids.extend(_chunk_input_ids(chunk))
+    requested_ids = {Path(name).stem for name in request.input_names}
+    if (
+        len(task_ids) != spec.pending
+        or len(task_ids) != len(set(task_ids))
+        or not set(task_ids).issubset(requested_ids)
+    ):
+        raise ValueError("AF3Score prepared Tasks do not match pending inputs")
+
+
+def _chunk_input_ids(chunk: ChunkSpec) -> tuple[str, ...]:
+    return tuple(
+        path.stem
+        for path in sorted(Path(chunk.batch_json_dir).glob("*.json"))
+        if path.is_file()
+    )
+
+
+def _task_spec_from_context(
+    context: NodeRunContext,
+    publications: AF3ScorePublications,
+) -> TaskSpec:
+    return _task_spec_from_value(
+        orjson.loads(context.read_input_bytes("task-spec")), publications
+    )
+
+
+@dataclass
+class _AF3ScorePrepareNode(ProviderNode):
+    request: AF3ScoreExecutionRequest
+    publications: AF3ScorePublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        del context
+        self.publications.claim()
+        return ProviderCallSpec(
+            function_name="af3score_prepare",
+            uses_gpu=False,
+            runtime_image_key="af3score-cpu",
+            kwargs={
+                "run_name": self.request.run_name,
+                "staged_input_key": self.request.staged_input_key,
+                "input_files": list(self.request.input_names),
+                "input_digests": self.request.input_digests,
+                "publication_key": self.publications.publication_key,
+                "num_jobs": self.request.max_active_gpu_provider_calls,
+                "prepare_workers": self.request.prepare_workers,
+            },
+        )
+
+    def process_remote_result(
+        self, result: Any, metadata: Mapping[str, Any]
+    ) -> AppRunResult:
+        del metadata
+        return self.publications.preparation_result(
+            _task_spec_from_value(result, self.publications)
+        )
+
+
+@dataclass
+class _AF3ScoreBatchNode(TaskProviderNode):
+    request: AF3ScoreExecutionRequest
+    publications: AF3ScorePublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        spec = _task_spec_from_context(context, self.publications)
+        tasks = []
+        for chunk in spec.chunk_specs:
+            input_ids = _chunk_input_ids(chunk)
+            for input_id in input_ids:
+                tasks.append(
+                    TaskDefinition(
+                        task_key=input_id,
+                        scientific_payload={
+                            "input_id": input_id,
+                            "sha256": self.request.input_digests[input_id],
+                        },
+                        execution_payload={
+                            "chunk": asdict(chunk),
+                            "task_count": len(input_ids),
+                        },
+                    )
+                )
+        return tuple(tasks)
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        del context
+        payload = cast(Mapping[str, object], task.execution_payload)
+        chunk = ChunkSpec(**cast(dict[str, str], payload["chunk"]))
+        return self._call_spec(chunk, cast(int, payload["task_count"]))
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
+        del context
+        payload = cast(Mapping[str, object], tasks[0].execution_payload)
+        chunk = ChunkSpec(**cast(dict[str, str], payload["chunk"]))
+        expected = _chunk_input_ids(chunk)
+        if tuple(task.task_key for task in tasks) != expected:
+            raise ValueError("AF3Score batch Tasks do not match their prepared chunk")
+        return self._call_spec(chunk, len(expected))
+
+    def _call_spec(self, chunk: ChunkSpec, task_count: int) -> ProviderCallSpec:
+        input_ids = _chunk_input_ids(chunk)
+        return ProviderCallSpec(
+            function_name="af3score_run",
+            uses_gpu=True,
+            runtime_image_key="af3score-gpu",
+            compatibility_key=chunk.batch_name,
+            max_tasks_per_call=task_count,
+            kwargs={
+                "run_name": self.request.run_name,
+                "batch_name": chunk.batch_name,
+                "batch_json_dir": chunk.batch_json_dir,
+                "batch_pdb_dir": chunk.batch_pdb_dir,
+                "input_digests": {
+                    input_id: self.request.input_digests[input_id]
+                    for input_id in input_ids
+                },
+                "publication_key": self.publications.publication_key,
+            },
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        del metadata
+        if result is not None:
+            raise ValueError("AF3Score GPU batch returned an unexpected value")
+        return {
+            task_key: (
+                self.publications.result((task_key,), metrics=False)
+                if self.publications.output_complete(task_key)
+                else AppRunResult(
+                    status=AppRunStatus.FAILED,
+                    warnings=[f"AF3Score output is unavailable: {task_key}"],
+                )
+            )
+            for task_key in task_keys
+        }
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        return self.process_remote_task_batch_result((task_key,), result, metadata)[
+            task_key
+        ]
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        return (
+            self.publications.result((task.task_key,), metrics=False)
+            if self.publications.output_complete(task.task_key)
+            else None
+        )
+
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, expected_fingerprint, result, artifacts
+        return (
+            AvailabilityStatus.AVAILABLE
+            if self.publications.output_complete(task.task_key)
+            else AvailabilityStatus.MISSING
+        )
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        del context
+        if not self.publications.outputs_complete():
+            return None
+        return self.publications.result(
+            tuple(self.request.input_digests), metrics=False
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del context
+        status = (
+            AppRunStatus.PARTIAL
+            if results and errors
+            else AppRunStatus.SUCCEEDED
+            if not errors
+            else AppRunStatus.FAILED
+        )
+        return AppRunResult(
+            status=status,
+            outputs=[
+                output for result in results.values() for output in result.outputs
+            ],
+            warnings=list(errors.values()),
+        )
+
+
+@dataclass
+class _AF3ScorePostprocessNode(TaskProviderNode):
+    request: AF3ScoreExecutionRequest
+    publications: AF3ScorePublications
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
+
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        del context
+        return tuple(
+            TaskDefinition(
+                task_key=Path(name).stem,
+                scientific_payload={"input_id": Path(name).stem, "sha256": digest},
+            )
+            for name, digest in self.request.inputs
+        )
+
+    def prepare_remote_task(
+        self, context: NodeRunContext, task: TaskDefinition
+    ) -> ProviderCallSpec:
+        del context, task
+        return self._call_spec()
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
+        del context, tasks
+        return self._call_spec()
+
+    def _call_spec(self) -> ProviderCallSpec:
+        completed = tuple(
+            input_id
+            for input_id in self.request.input_digests
+            if self.publications.output_complete(input_id)
+        )
+        return ProviderCallSpec(
+            function_name="af3score_postprocess",
+            uses_gpu=False,
+            runtime_image_key="af3score-cpu",
+            max_tasks_per_call=len(self.request.inputs),
+            kwargs={
+                "run_name": self.request.run_name,
+                "staged_input_key": self.request.staged_input_key,
+                "input_files": list(self.request.input_names),
+                "input_digests": self.request.input_digests,
+                "completed_input_ids": list(completed),
+                "publication_key": self.publications.publication_key,
+            },
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        del metadata
+        if not isinstance(result, Mapping) or not _metrics_publication_ready(
+            self.publications.layout.run_root, self.publications.publication_key
+        ):
+            raise FileNotFoundError("AF3Score metrics publication is unavailable")
+        return {
+            task_key: (
+                AppRunResult(status=AppRunStatus.SUCCEEDED)
+                if self.publications.output_complete(task_key)
+                else AppRunResult(
+                    status=AppRunStatus.FAILED,
+                    warnings=[f"AF3Score output is unavailable: {task_key}"],
+                )
+            )
+            for task_key in task_keys
+        }
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        return self.process_remote_task_batch_result((task_key,), result, metadata)[
+            task_key
+        ]
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        del context
+        return self.publications.terminal_result()
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del context
+        successful = tuple(results)
+        result = self.publications.result(successful, metrics=True)
+        return result.model_copy(
+            update={
+                "status": AppRunStatus.PARTIAL if errors else AppRunStatus.SUCCEEDED,
+                "warnings": list(errors.values()),
+            }
+        )
+
+
+def af3score_execution_graph(
+    request: AF3ScoreExecutionRequest,
+    publications: AF3ScorePublications,
+) -> ExecutionGraph:
+    """Build AF3Score's prepared, length-balanced GPU batch graph."""
+    graph = ExecutionGraph(
+        "af3score",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="af3score",
+            scientific_payload=request.execution_plan.scientific_payload,
+            scientific_versions=dict(request.execution_plan.scientific_versions),
+        ),
+    )
+    prepare = graph.add_node(
+        _AF3ScorePrepareNode(request, publications), id=PREPARE_NODE
+    )
+    batches = graph.add_node(
+        _AF3ScoreBatchNode(request, publications),
+        id=BATCHES_NODE,
+        inputs={"task-spec": prepare.outputs(kind=ArtifactKind.TABLE)},
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+    graph.add_node(
+        _AF3ScorePostprocessNode(request, publications),
+        id=POSTPROCESS_NODE,
+        depends_on=[batches],
+        accept_partial_from=[batches],
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+    return graph
+
+
+class AF3ScoreExecutionCoordinator(OutputClaimExecutionDefinitionCoordinatorLifecycle):
     """Bind one run-scoped writer to AF3Score publications."""
 
     _request_loader = staticmethod(load_execution_request)
@@ -765,6 +901,7 @@ class AF3ScoreExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
+        output_volume_name: str,
         output_claims: Any,
         provider_driver: Any,
         app_version: str,
@@ -775,31 +912,33 @@ class AF3ScoreExecutionCoordinator(OutputClaimExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            output_claims=output_claims,
+            provider_driver=provider_driver,
+            graph_builder=self._graph,
             target_scientific_versions={
                 "af3score": app_version,
                 "alphafold3.model": AF3SCORE_MODEL_IDENTITY,
             },
+            poll_interval_seconds=poll_interval_seconds,
         )
-        self.output_volume = output_volume
+        self.output_volume_name = output_volume_name
         self.output_claims = output_claims
-        self.provider_driver = provider_driver
-        self.poll_interval_seconds = poll_interval_seconds
 
-    def _create_runtime(
+    def _graph(
         self,
         request: AF3ScoreExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> AF3ScoreExecutionRuntime:
-        return AF3ScoreExecutionRuntime(
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        del predecessor_execution_run_id
+        return af3score_execution_graph(
             request=request,
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            output_claims=self.output_claims,
-            output_root=self.volume_root,
-            poll_interval_seconds=self.poll_interval_seconds,
+            publications=AF3ScorePublications(
+                request=request,
+                execution_run_id=self.execution_run_id,
+                output_claims=self.output_claims,
+                output_root=self.volume_root,
+                output_volume_name=self.output_volume_name,
+            ),
         )

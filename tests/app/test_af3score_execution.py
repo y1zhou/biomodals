@@ -19,9 +19,10 @@ from biomodals.app.score.af3score_execution import (
     PREPARE_NODE,
     AF3ScoreExecutionCoordinator,
     AF3ScoreExecutionRequest,
-    AF3ScoreExecutionRuntime,
+    AF3ScorePublications,
     ChunkSpec,
     TaskSpec,
+    af3score_execution_graph,
     af3score_staged_input_directory,
     af3score_staged_input_key,
     persist_execution_request,
@@ -32,23 +33,22 @@ from biomodals.app.score.af3score_publications import (
     METRICS_FILENAME,
 )
 from biomodals.execution import (
-    AvailabilityStatus,
     DeploymentIdentity,
     NodeAggregationPolicy,
     NodeStatus,
     RunStatus,
-    TaskPlan,
     TaskStatus,
 )
+from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OTHER_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 DEPLOYMENT = DeploymentIdentity("main", "AF3Score", 7)
+OUTPUT_VOLUME_NAME = "AF3Score-outputs"
 INPUT_CONTENT = {"a.pdb": b"ATOM A\n", "b.pdb": b"ATOM B\n"}
 
 
@@ -169,6 +169,45 @@ def _request() -> AF3ScoreExecutionRequest:
     )
 
 
+def _publications(
+    tmp_path: Path,
+    request: AF3ScoreExecutionRequest,
+    claims: FakeClaims | None = None,
+    *,
+    execution_run_id: UUID = RUN_ID,
+) -> AF3ScorePublications:
+    return AF3ScorePublications(
+        request=request,
+        execution_run_id=execution_run_id,
+        output_claims=claims or FakeClaims(),
+        output_root=tmp_path,
+        output_volume_name=OUTPUT_VOLUME_NAME,
+    )
+
+
+def _coordinator(
+    tmp_path: Path,
+    request: AF3ScoreExecutionRequest,
+    driver: object,
+    claims: FakeClaims,
+    *,
+    execution_run_id: UUID = RUN_ID,
+    app_version: str | None = None,
+) -> AF3ScoreExecutionCoordinator:
+    persist_execution_request(tmp_path, execution_run_id, request)
+    return AF3ScoreExecutionCoordinator(
+        execution_run_id=execution_run_id,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
+        output_claims=claims,
+        provider_driver=driver,
+        app_version=app_version or request.app_version,
+        poll_interval_seconds=0,
+    )
+
+
 def _stage_request_inputs(root: Path, request: AF3ScoreExecutionRequest) -> None:
     directory = root.joinpath(
         *af3score_staged_input_directory(request.staged_input_key).parts
@@ -207,7 +246,9 @@ def _publish_input(root: Path, input_id: str, digest: str, key: str) -> Path:
     return sample
 
 
-def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
+def test_af3score_request_round_trip_preserves_parallel_task_plan(
+    tmp_path: Path,
+) -> None:
     request = _request()
 
     decoded = AF3ScoreExecutionRequest.from_bytes(request.to_bytes())
@@ -228,6 +269,11 @@ def test_af3score_request_round_trip_preserves_parallel_task_plan() -> None:
         {"name": name, "sha256": sha256(content).hexdigest()}
         for name, content in INPUT_CONTENT.items()
     ]
+    graph = af3score_execution_graph(request, _publications(tmp_path, request))
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
+    )
 
 
 def test_af3score_rejects_dot_segment_input_ids(tmp_path: Path) -> None:
@@ -297,67 +343,21 @@ def test_summary_publication_does_not_rehash_full_confidences(
     assert hashed == ["summary_confidences.json"]
 
 
-def test_discovered_batch_tasks_skip_collection_wide_probe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    request = _request()
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=object(),
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        now=lambda: 10,
-    )
-    repository = runtime._initialize()
-    repository.start_node(RUN_ID, BATCHES_NODE, now=10)
-    repository.discover_tasks(
-        RUN_ID,
-        BATCHES_NODE,
-        (TaskPlan(task_key="a", scientific_payload={}),),
-        now=10,
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_output_complete",
-        lambda _input_id: pytest.fail("collection-wide probe should be skipped"),
-    )
-
-    assert runtime._node_observation(BATCHES_NODE) == AvailabilityStatus.MISSING
-    runtime.close()
-
-
 def test_undiscovered_batch_cache_is_validated_in_parallel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request()
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=object(),
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        now=lambda: 10,
-    )
-    runtime._initialize()
+    publications = _publications(tmp_path, request)
     workers = Barrier(len(request.inputs))
 
     def output_complete(_input_id: str) -> bool:
         workers.wait(timeout=5)
         return True
 
-    monkeypatch.setattr(runtime, "_output_complete", output_complete)
+    monkeypatch.setattr(publications, "output_complete", output_complete)
 
-    assert runtime._node_observation(BATCHES_NODE) == AvailabilityStatus.AVAILABLE
-    runtime.close()
+    assert publications.outputs_complete()
 
 
 def test_postprocess_validates_summaries_in_parallel(
@@ -617,35 +617,20 @@ def test_same_run_name_inputs_are_isolated_until_output_claim(
     stage(first_content)
     stage(second_content)
     claims = FakeClaims()
-    first = AF3ScoreExecutionRuntime(
-        request=request(first_content),
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=object(),
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-    )
-    second = AF3ScoreExecutionRuntime(
-        request=request(second_content),
+    first = _publications(tmp_path, request(first_content), claims)
+    second = _publications(
+        tmp_path,
+        request(second_content),
+        claims,
         execution_run_id=OTHER_RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, OTHER_RUN_ID),
-        provider_driver=object(),
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
     )
     shared_inputs = tmp_path / "scores" / "inputs"
 
-    first._ensure_output_claim()
+    first.claim()
     assert not shared_inputs.exists()
     with pytest.raises(RuntimeError, match="already claimed"):
-        second._ensure_output_claim()
+        second.claim()
     assert not shared_inputs.exists()
-    first.close()
-    second.close()
 
 
 def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
@@ -655,20 +640,11 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     _stage_request_inputs(tmp_path, request)
     driver = CompletingDriver(tmp_path, request)
     claims = FakeClaims()
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, claims)
 
-    overview = runtime.run()
+    overview = coordinator.run()
+    runtime = coordinator._runtime
+    assert runtime is not None
     snapshot = runtime.store.execution.snapshot(RUN_ID)
 
     assert overview.run.status == RunStatus.SUCCEEDED
@@ -687,7 +663,7 @@ def test_runtime_discovers_input_tasks_and_submits_one_gpu_batch(
     )
     assert batch_call.task_keys == ("a", "b")
     assert str(RUN_ID) in claims.values.values()
-    runtime.close()
+    coordinator.close()
 
 
 def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
@@ -696,20 +672,11 @@ def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
     request = _request()
     _stage_request_inputs(tmp_path, request)
     driver = CompletingDriver(tmp_path, request, missing_input_id="b")
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, FakeClaims())
 
-    overview = runtime.run()
+    overview = coordinator.run()
+    runtime = coordinator._runtime
+    assert runtime is not None
     snapshot = runtime.store.execution.snapshot(RUN_ID)
 
     assert overview.run.status == RunStatus.PARTIAL
@@ -724,7 +691,7 @@ def test_runtime_preserves_valid_scores_from_a_partial_gpu_batch(
     ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED]
     assert [name for name, _kwargs in driver.spawns][-1] == "af3score_postprocess"
     assert driver.spawns[-1][1]["completed_input_ids"] == ["a"]
-    runtime.close()
+    coordinator.close()
 
 
 def test_postprocess_includes_warm_and_newly_scored_inputs(tmp_path: Path) -> None:
@@ -738,49 +705,32 @@ def test_postprocess_includes_warm_and_newly_scored_inputs(tmp_path: Path) -> No
         request.execution_plan.workload_plan_fingerprint,
     )
     driver = CompletingDriver(tmp_path, request)
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, FakeClaims())
 
-    overview = runtime.run()
+    overview = coordinator.run()
 
     assert overview.run.status == RunStatus.SUCCEEDED
     assert driver.spawns[-1][1]["completed_input_ids"] == ["a", "b"]
-    runtime.close()
+    coordinator.close()
 
 
 def test_restart_rejects_target_scientific_version_drift(tmp_path: Path) -> None:
     request = _request()
     _stage_request_inputs(tmp_path, request)
-    persist_execution_request(tmp_path, RUN_ID, request)
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=CompletingDriver(tmp_path, request),
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
+    root = _coordinator(
+        tmp_path,
+        request,
+        CompletingDriver(tmp_path, request),
+        FakeClaims(),
     )
-    assert runtime.run().run.status == RunStatus.SUCCEEDED
-    runtime.close()
+    assert root.run().run.status == RunStatus.SUCCEEDED
+    root.close()
     coordinator = AF3ScoreExecutionCoordinator(
         execution_run_id=OTHER_RUN_ID,
         deployment=DEPLOYMENT,
         volume_root=tmp_path,
         output_volume=FakeVolume(),
+        output_volume_name=OUTPUT_VOLUME_NAME,
         output_claims=FakeClaims(),
         provider_driver=object(),
         app_version="changed-version",
@@ -801,20 +751,9 @@ def test_unbound_metrics_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
     (run_root / METRICS_FILENAME).write_text("name,score\na,1\n")
     driver = CompletingDriver(tmp_path, request)
     claims = FakeClaims()
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, claims)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert [name for name, _kwargs in driver.spawns] == [
@@ -823,7 +762,7 @@ def test_unbound_metrics_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
         "af3score_postprocess",
     ]
     assert str(RUN_ID) in claims.values.values()
-    runtime.close()
+    coordinator.close()
 
 
 def test_stale_input_outputs_do_not_satisfy_a_new_request(tmp_path: Path) -> None:
@@ -842,20 +781,9 @@ def test_stale_input_outputs_do_not_satisfy_a_new_request(tmp_path: Path) -> Non
             input_sha256=digest,
         )
     driver = CompletingDriver(tmp_path, request)
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=FakeClaims(),
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, FakeClaims())
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert [name for name, _kwargs in driver.spawns] == [
@@ -863,7 +791,7 @@ def test_stale_input_outputs_do_not_satisfy_a_new_request(tmp_path: Path) -> Non
         "af3score_run",
         "af3score_postprocess",
     ]
-    runtime.close()
+    coordinator.close()
 
 
 def test_fingerprint_bound_metrics_satisfy_the_terminal_node(tmp_path: Path) -> None:
@@ -886,22 +814,11 @@ def test_fingerprint_bound_metrics_satisfy_the_terminal_node(tmp_path: Path) -> 
         )
     driver = CompletingDriver(tmp_path, request)
     claims = FakeClaims()
-    runtime = AF3ScoreExecutionRuntime(
-        request=request,
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_claims=claims,
-        output_root=tmp_path,
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
+    coordinator = _coordinator(tmp_path, request, driver, claims)
 
-    snapshot = runtime.run()
+    snapshot = coordinator.run()
 
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert driver.spawns == []
     assert claims.values == {}
-    runtime.close()
+    coordinator.close()

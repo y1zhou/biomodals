@@ -190,15 +190,8 @@ class TaskDefinition:
             raise ValueError("Task key cannot be empty")
 
 
-class TaskProviderNode:
+class TaskProviderNode(ResultNode):
     """Base class for Nodes that discover finite provider-backed Tasks."""
-
-    def refresh_artifact_storage_before_result(self) -> bool:
-        """Return whether decoding reads provider-published artifact storage."""
-        return False
-
-    def refresh_result_storage(self) -> None:
-        """Refresh workload-owned storage before decoding completed results."""
 
     def discover_remote_tasks(
         self,

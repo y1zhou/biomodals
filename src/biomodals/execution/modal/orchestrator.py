@@ -512,10 +512,17 @@ class ExecutionCoordinator:
             if external_checker is None:
                 raise RuntimeError("External artifact checker was not preflighted")
         store = self._run_store()
+        try:
+            predecessor_execution_run_id = store.execution.get_run(
+                execution_run_id
+            ).predecessor_execution_run_id
+        except ExecutionRunNotFoundError:
+            predecessor_execution_run_id = None
         runtime = ExecutionGraphRuntime(
             graph=plan.graph,
             execution_run_id=execution_run_id,
             deployment=deployment,
+            predecessor_execution_run_id=predecessor_execution_run_id,
             volume_root=Path(CONF.output_volume_mountpoint),
             artifact_volume_name=OUT_VOLUME_NAME,
             provider_driver=driver,

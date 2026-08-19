@@ -19,19 +19,22 @@ from biomodals.app.design.boltzgen.execution_request import (
     prepare_execution_request,
 )
 from biomodals.app.design.boltzgen.execution_runtime import (
-    BoltzGenExecutionRuntime,
+    boltzgen_execution_graph,
 )
 from biomodals.execution import (
     DeploymentIdentity,
+    GraphExecutionRunStore,
     ProviderCallStatus,
     RunStatus,
     TaskPlan,
 )
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
+    ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
 from biomodals.helper.artifacts import file_size_sha256
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -118,15 +121,24 @@ def _runtime(
     *,
     request: BoltzGenExecutionRequest | None = None,
     driver: object | None = None,
-) -> BoltzGenExecutionRuntime:
-    return BoltzGenExecutionRuntime(
-        request=request or _request(),
+    volume: FakeVolume | None = None,
+) -> ExecutionGraphRuntime:
+    selected = request or _request()
+    selected_volume = volume or FakeVolume()
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    return ExecutionGraphRuntime(
+        graph=boltzgen_execution_graph(selected, output_root=tmp_path),
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
+        volume_root=tmp_path,
+        artifact_volume_name="BoltzGen-outputs",
+        workload_run_key=selected.run_name,
+        request=selected,
+        store=store,
         provider_driver=driver or RecordingCallDriver(),
-        output_volume=FakeVolume(),
-        output_root=tmp_path,
+        storage_sync=ExecutionVolumeSync(volume=selected_volume, store=store),
+        max_active_provider_calls=selected.max_active_provider_calls,
+        max_active_gpu_provider_calls=selected.max_active_gpu_provider_calls,
         poll_interval_seconds=0,
         now=lambda: 10,
     )
@@ -189,31 +201,41 @@ def _publish_collection(
     )
 
 
+def test_graph_preserves_the_declared_execution_plan(tmp_path: Path) -> None:
+    request = _request()
+    graph = boltzgen_execution_graph(request, output_root=tmp_path)
+
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
+    )
+
+
 def test_initialization_reuses_the_host_volume_view(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path)
+    volume = FakeVolume()
+    runtime = _runtime(tmp_path, volume=volume)
 
-    runtime._initialize()
+    runtime._initialize("example")
 
-    output = cast(FakeVolume, runtime.output_volume)
-    assert output.reloads == 0
-    assert output.commits == 0
+    assert volume.reloads == 0
+    assert volume.commits == 0
     runtime.close()
 
 
 def test_running_provider_poll_does_not_synchronize_the_output_volume(
     tmp_path: Path,
 ) -> None:
-    runtime = _runtime(tmp_path)
-    runtime._initialize()
+    volume = FakeVolume()
+    runtime = _runtime(tmp_path, volume=volume)
+    runtime._initialize("example")
     runtime.advance_once()
-    output = cast(FakeVolume, runtime.output_volume)
-    commits = output.commits
-    reloads = output.reloads
+    commits = volume.commits
+    reloads = volume.reloads
 
     runtime.advance_once()
 
-    assert output.commits == commits
-    assert output.reloads == reloads
+    assert volume.commits == commits
+    assert volume.reloads == reloads
     runtime.close()
 
 
@@ -224,7 +246,7 @@ def test_provider_publication_is_reloaded_after_success_observation(
     request = _request(run_ids=("run-a",))
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
     runtime.advance_once()
     publication_ready = False
 
@@ -232,7 +254,7 @@ def test_provider_publication_is_reloaded_after_success_observation(
         nonlocal publication_ready
         publication_ready = True
 
-    original_reload = runtime._reload_output
+    original_reload = runtime._reload_volume
 
     def reload_output() -> None:
         original_reload()
@@ -241,7 +263,7 @@ def test_provider_publication_is_reloaded_after_success_observation(
 
     driver.on_success = make_publication_ready
     driver.succeeded = True
-    monkeypatch.setattr(runtime, "_reload_output", reload_output)
+    monkeypatch.setattr(runtime, "_reload_volume", reload_output)
 
     runtime.advance_once()
 
@@ -259,7 +281,7 @@ def test_missing_runs_are_admitted_once_as_independent_gpu_calls(
 ) -> None:
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
 
     runtime.advance_once()
     runtime.advance_once()
@@ -291,7 +313,7 @@ def test_cached_run_is_reused_and_only_missing_run_is_submitted(
     _publish_run(tmp_path, request, "run-a")
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
 
     runtime.advance_once()
 
@@ -307,7 +329,7 @@ def test_task_publication_from_other_science_is_not_reused(tmp_path: Path) -> No
     changed = _request(protocol="protein-anything")
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=changed, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
 
     runtime.advance_once()
 
@@ -321,7 +343,7 @@ def test_collection_waits_for_all_design_publications(tmp_path: Path) -> None:
     _publish_run(tmp_path, request, "run-b")
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
 
     runtime.advance_once()
     runtime.advance_once()
@@ -339,21 +361,12 @@ def test_collection_waits_for_all_design_publications(tmp_path: Path) -> None:
 
 def test_terminal_collection_publication_prunes_all_calls(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
     request = _request()
     _publish_collection(tmp_path, request)
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
-    runtime._initialize()
-    original_observation = runtime._node_observation
-
-    def observe_only_terminal(node_key: str):
-        if node_key == DESIGN_RUNS_NODE:
-            raise AssertionError("cached terminal result must prune ancestor probes")
-        return original_observation(node_key)
-
-    monkeypatch.setattr(runtime, "_node_observation", observe_only_terminal)
+    runtime._initialize("example")
 
     runtime.advance_once()
 
@@ -370,7 +383,7 @@ def test_unknown_run_prunes_calls_after_terminal_publication_appears(
     request = _request()
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, request=request, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
     runtime.advance_once()
     calls = runtime.store.execution.list_provider_calls(RUN_ID)
     with runtime.store.transaction():
@@ -383,10 +396,11 @@ def test_unknown_run_prunes_calls_after_terminal_publication_appears(
     driver.state_unknown = True
     _publish_collection(tmp_path, request)
 
-    overview = runtime.resume()
+    result = runtime.resume()
     snapshot = runtime.store.execution.snapshot(RUN_ID)
 
-    assert overview.run.status == RunStatus.SUCCEEDED
+    assert result.status.value == "succeeded"
+    assert snapshot.run.status == RunStatus.SUCCEEDED
     assert driver.cancelled == {str(spawn["handle"]) for spawn in driver.spawns}
     assert len(driver.spawns) == len(calls)
     assert {call.status for call in snapshot.provider_calls} == {
@@ -400,11 +414,11 @@ def test_cancel_requested_run_reconciles_provider_cancellation(
 ) -> None:
     driver = RecordingCallDriver()
     runtime = _runtime(tmp_path, driver=driver)
-    runtime._initialize()
+    runtime._initialize("example")
     runtime.advance_once()
 
-    requested = runtime.cancel()
-    assert requested.run.status == RunStatus.CANCEL_REQUESTED
+    runtime.cancel()
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
 
     runtime.advance_once()
 

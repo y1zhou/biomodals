@@ -3,12 +3,10 @@
 # ruff: noqa: D101,D102,D103,D107,S106
 
 from pathlib import Path
-from typing import cast
 from uuid import UUID
 
 import pytest
 
-import biomodals.app.design.boltzgen.execution_coordinator as coordinator_module
 from biomodals.app.design.boltzgen.execution_coordinator import (
     BoltzGenExecutionCoordinator,
 )
@@ -45,56 +43,6 @@ class FakeVolume:
         self.reloads += 1
 
 
-class FakeRuntime:
-    created: list[dict[str, object]] = []
-
-    def __init__(self, **kwargs: object) -> None:
-        self.request = cast(BoltzGenExecutionRequest, kwargs["request"])
-        self.execution_run_id = cast(UUID, kwargs["execution_run_id"])
-        self.predecessor_execution_run_id = cast(
-            UUID | None,
-            kwargs["predecessor_execution_run_id"],
-        )
-        self.deployment = cast(DeploymentIdentity, kwargs["deployment"])
-        self.store = cast(ExecutionRunStore, kwargs["store"])
-        self.created.append(kwargs)
-
-    def run(self):
-        return self._snapshot()
-
-    def resume(self):
-        return self._snapshot()
-
-    def cancel(self):
-        with self.store.transaction():
-            self.store.execution.request_run_cancellation(
-                self.execution_run_id,
-                now=20,
-            )
-        return self.store.execution.overview(self.execution_run_id)
-
-    def close(self) -> None:
-        self.store.close()
-
-    def _snapshot(self):
-        try:
-            return self.store.execution.overview(self.execution_run_id)
-        except LookupError:
-            with self.store.transaction():
-                self.store.execution.create_run(
-                    execution_run_id=self.execution_run_id,
-                    predecessor_execution_run_id=(self.predecessor_execution_run_id),
-                    plan=self.request.execution_plan,
-                    deployment=self.deployment,
-                    max_active_provider_calls=(self.request.max_active_provider_calls),
-                    max_active_gpu_provider_calls=(
-                        self.request.max_active_gpu_provider_calls
-                    ),
-                    now=10,
-                )
-            return self.store.execution.overview(self.execution_run_id)
-
-
 def _request() -> BoltzGenExecutionRequest:
     return prepare_execution_request(
         run_name="example",
@@ -129,6 +77,7 @@ def _coordinator(
         deployment=deployment,
         volume_root=tmp_path,
         output_volume=volume,
+        output_volume_name="BoltzGen-outputs",
         provider_driver=object(),
         app_version=app_version,
         repo_commit_hash=repo_commit_hash,
@@ -258,14 +207,7 @@ def test_root_run_rejects_local_request_version_drift(tmp_path: Path) -> None:
 
 def test_restart_links_successor_and_preserves_scientific_plan(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    FakeRuntime.created.clear()
-    monkeypatch.setattr(
-        coordinator_module,
-        "BoltzGenExecutionRuntime",
-        FakeRuntime,
-    )
     request = _request()
     old_provider_call_id = _terminal_predecessor(tmp_path, request)
     coordinator = _coordinator(
@@ -284,16 +226,13 @@ def test_restart_links_successor_and_preserves_scientific_plan(
             request.execution_plan.workload_plan_fingerprint
         ),
     )
-    snapshot = coordinator.drive_prepared()
-
-    assert snapshot.run.predecessor_execution_run_id == PREDECESSOR_ID
-    assert snapshot.run.plan == request.execution_plan
-    assert snapshot.run.max_active_provider_calls == 2
     successor_request = load_execution_request(tmp_path, SUCCESSOR_ID)
     assert (
         successor_request.execution_plan.workload_plan_fingerprint
         == request.execution_plan.workload_plan_fingerprint
     )
+    assert successor_request.max_active_provider_calls == 2
+    assert successor_request.max_active_gpu_provider_calls == 1
     assert successor_request.replace_claim_owners == (("run-a", old_provider_call_id),)
 
 

@@ -1,4 +1,4 @@
-"""Workflow-owned artifacts colocated with shared execution state."""
+"""Execution artifacts colocated with shared execution state."""
 
 from __future__ import annotations
 

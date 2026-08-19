@@ -24,7 +24,15 @@ from biomodals.app.fold.alphafold3 import (
     modal_adapters,
     request_results,
 )
-from biomodals.execution import PullTaskClaim, WorkerAssignmentRecord
+from biomodals.execution import (
+    NodeRunContext,
+    PullTaskClaim,
+    RemotePullTaskWorkflowNode,
+    RemoteWorkflowNode,
+    WorkerAssignmentRecord,
+    hashing,
+)
+from biomodals.execution.graph_plan import execution_plan
 from biomodals.helper import shell as shell_helper
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
@@ -38,13 +46,6 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow import ppiflow_workflow
-from biomodals.workflow.core import (
-    NodeRunContext,
-    RemotePullTaskWorkflowNode,
-    RemoteWorkflowNode,
-    hashing,
-)
-from biomodals.workflow.core.execution import execution_plan
 from biomodals.workflow.ppiflow import (
     af3score_runtime,
     analysis_runtime,

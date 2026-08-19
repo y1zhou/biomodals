@@ -146,6 +146,10 @@ class ExecutionRuntime:
         self._transaction = transaction
         self._synchronize = synchronize
 
+    def configure_provider_driver(self, provider_driver: ProviderDriver) -> None:
+        """Replace the provider adapter before further call lifecycle work."""
+        self._driver = provider_driver
+
     def create_or_verify_run(
         self,
         *,

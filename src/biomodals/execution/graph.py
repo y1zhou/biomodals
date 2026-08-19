@@ -1,4 +1,4 @@
-"""Python-first workflow DAG builder."""
+"""Python-first executable graph builder."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from biomodals.execution import NodeAggregationPolicy
+from biomodals.execution.model import NodeAggregationPolicy
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import ArtifactKind, ArtifactSelector
-from biomodals.workflow.core.nodes import WorkflowNode
+from biomodals.execution.nodes import WorkflowNode
 
 
 @dataclass(frozen=True)

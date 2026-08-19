@@ -1,4 +1,4 @@
-"""Tests for the workflow-owned physical run store."""
+"""Tests for the Modal executable-graph Run store."""
 
 # ruff: noqa: D103
 
@@ -13,7 +13,7 @@ from biomodals.execution import (
     ExecutionPlan,
     NodePlan,
 )
-from biomodals.workflow.core.run_store import (
+from biomodals.execution.modal.graph_store import (
     UnsupportedWorkflowRunStoreError,
     WorkflowRunStore,
 )

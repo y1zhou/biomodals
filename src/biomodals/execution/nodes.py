@@ -1,4 +1,4 @@
-"""Small workload contracts used by the workflow execution adapter."""
+"""Executable Node contracts shared by apps and workflows."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 from uuid import UUID
 
-from biomodals.execution import AvailabilityStatus
+from biomodals.execution.model import AvailabilityStatus
 from biomodals.schema import AppRunResult, WorkflowArtifact
 
 

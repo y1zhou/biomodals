@@ -29,11 +29,23 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 )
 from biomodals.app.score import af3score_app, dockq_app
 from biomodals.execution import (
+    AppBackedNode,
     AvailabilityStatus,
     DeploymentIdentity,
     NodeAggregationPolicy,
+    NodeRunContext,
+    RemoteNodeCall,
+    RemotePullTaskWorkflowNode,
+    RemotePullWorkerCall,
+    RemoteTaskWorkflowNode,
+    RemoteWorkflowNode,
+    RemoteWorkflowTask,
+    Workflow,
+    WorkflowNativeNode,
+    republish_workflow_artifact,
 )
-from biomodals.execution.modal import resolve_provider_call_limits
+from biomodals.execution.graph_plan import app_scientific_version
+from biomodals.execution.modal import orchestrator, resolve_provider_call_limits
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import (
     volume_path_from_mount_path,
@@ -51,22 +63,7 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
-from biomodals.workflow.core import (
-    AppBackedNode,
-    NodeRunContext,
-    RemoteNodeCall,
-    RemotePullTaskWorkflowNode,
-    RemotePullWorkerCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowNode,
-    RemoteWorkflowTask,
-    Workflow,
-    WorkflowNativeNode,
-    orchestrator,
-    print_workflow_dag,
-    republish_workflow_artifact,
-)
-from biomodals.workflow.core.execution import app_scientific_version
+from biomodals.workflow.display import print_workflow_dag
 from biomodals.workflow.ppiflow import analysis_runtime, rosetta_runtime
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging

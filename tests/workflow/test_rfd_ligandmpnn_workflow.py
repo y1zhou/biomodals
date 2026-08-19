@@ -12,6 +12,8 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
+from biomodals.execution.graph_plan import execution_plan
+from biomodals.execution.nodes import NodeRunContext
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
@@ -25,8 +27,6 @@ from biomodals.schema import (
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow import rfd_ligandmpnn_workflow
-from biomodals.workflow.core.execution import execution_plan
-from biomodals.workflow.core.nodes import NodeRunContext
 from biomodals.workflow.rfd_ligandmpnn_workflow import (
     LigandMPNNDesignNode,
     LigandMPNNDesignSettings,

@@ -1,4 +1,4 @@
-"""Deterministic workflow DAG hashing helpers."""
+"""Deterministic executable DAG hashing helpers."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 import orjson
 from pydantic import BaseModel
 
-from biomodals.workflow.core.builder import WorkflowDefinition
-from biomodals.workflow.core.nodes import WorkflowNode
+from biomodals.execution.graph import WorkflowDefinition
+from biomodals.execution.nodes import WorkflowNode
 
 
 def dag_hash(definition: WorkflowDefinition) -> str:

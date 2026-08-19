@@ -1,4 +1,4 @@
-"""Tests for the workflow coordinator's Modal boundary."""
+"""Tests for the executable-graph coordinator's Modal boundary."""
 
 # ruff: noqa: D101,D102,D103,D107
 
@@ -27,6 +27,14 @@ from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
     load_execution_launch,
+    orchestrator,
+)
+from biomodals.execution.modal.graph_store import WorkflowRunStore
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    RemoteNodeCall,
+    RemoteTaskWorkflowNode,
+    RemoteWorkflowTask,
 )
 from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
 from biomodals.schema import (
@@ -38,14 +46,6 @@ from biomodals.schema import (
 )
 from biomodals.schema.storage import InlineBytes, VolumePath
 from biomodals.workflow import Workflow, WorkflowNativeNode, ppiflow_workflow
-from biomodals.workflow.core import orchestrator
-from biomodals.workflow.core.nodes import (
-    NodeRunContext,
-    RemoteNodeCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowTask,
-)
-from biomodals.workflow.core.run_store import WorkflowRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")

@@ -1,4 +1,4 @@
-"""Tests for reusable workflow node helpers."""
+"""Tests for reusable execution Node helpers."""
 
 # ruff: noqa: D101,D102,D103,D107
 
@@ -7,14 +7,14 @@ from uuid import UUID
 
 import pytest
 
-from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
-from biomodals.workflow.core.nodes import (
+from biomodals.execution.nodes import (
     AppBackedNode,
     NodeRunContext,
     RemoteNodeCall,
     RemoteTaskWorkflowNode,
     RemoteWorkflowTask,
 )
+from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
 
 
 def test_app_backed_node_requires_caller_owned_remote_preparation(

@@ -12,6 +12,10 @@ from typing import cast
 
 import polars as pl
 
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
+)
 from biomodals.helper.app_run import volume_app_output, volume_path_from_mount_path
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import (
@@ -22,10 +26,6 @@ from biomodals.schema import (
     ArtifactKind,
     VolumePath,
     WorkflowArtifact,
-)
-from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailability,
-    check_external_artifact_status,
 )
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import staging as ppiflow_staging

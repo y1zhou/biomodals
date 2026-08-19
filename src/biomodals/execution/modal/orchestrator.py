@@ -1,4 +1,4 @@
-"""Workflow-owned Modal adapter for the shared execution kernel."""
+"""Modal coordinator for app- and workflow-owned executable graphs."""
 
 import os
 import pickle
@@ -38,10 +38,10 @@ from biomodals.helper.constant import (
     WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
 )
 from biomodals.schema import AppRunResult, WorkflowArtifact
-from biomodals.workflow.core.builder import Workflow
-from biomodals.workflow.core.execution import execution_plan
-from biomodals.workflow.core.run_store import WorkflowRunStore
-from biomodals.workflow.core.runtime import WorkflowRuntime
+from biomodals.execution.graph import Workflow
+from biomodals.execution.graph_plan import execution_plan
+from biomodals.execution.graph_runtime import WorkflowRuntime
+from biomodals.execution.modal.graph_store import WorkflowRunStore
 
 CONF = AppConfig(
     tags={"group": "workflow"},

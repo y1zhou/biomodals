@@ -1,9 +1,23 @@
 """Durable task scheduling for Biomodals workloads."""
 
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    ExternalArtifactChecker,
+    check_artifact_availability,
+    check_external_artifact_status,
+    mounted_volume_checker,
+)
+from biomodals.execution.artifacts import republish_workflow_artifact
 from biomodals.execution.coordinator import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     drive_execution_run,
     resume_execution_run,
+)
+from biomodals.execution.graph import (
+    NodeHandle,
+    Workflow,
+    WorkflowDefinition,
+    WorkflowNodeSpec,
 )
 from biomodals.execution.model import (
     ActiveProviderCallCounts,
@@ -30,6 +44,18 @@ from biomodals.execution.model import (
     TaskStatus,
     WorkerAssignmentRecord,
     WorkStatusReason,
+)
+from biomodals.execution.nodes import (
+    AppBackedNode,
+    NodeRunContext,
+    RemoteNodeCall,
+    RemotePullTaskWorkflowNode,
+    RemotePullWorkerCall,
+    RemoteTaskWorkflowNode,
+    RemoteWorkflowNode,
+    RemoteWorkflowTask,
+    WorkflowNativeNode,
+    WorkflowNode,
 )
 from biomodals.execution.provider import (
     AsyncProviderDriver,
@@ -62,6 +88,8 @@ from biomodals.execution.sqlite import (
 
 __all__ = [
     "ActiveProviderCallCounts",
+    "AppBackedNode",
+    "ArtifactAvailability",
     "AvailabilityStatus",
     "AsyncProviderDriver",
     "AsyncExecutionRuntime",
@@ -76,8 +104,11 @@ __all__ = [
     "ExecutionRunRecord",
     "ExecutionRuntime",
     "ExecutionTaskRecord",
+    "ExternalArtifactChecker",
+    "NodeHandle",
     "NodeAggregationPolicy",
     "NodeDependency",
+    "NodeRunContext",
     "NodePlan",
     "NodeStatus",
     "ProviderCallStatus",
@@ -91,6 +122,12 @@ __all__ = [
     "ProviderSubmissionOutcomeUnknownError",
     "ProviderCallRecord",
     "PullTaskClaim",
+    "RemoteNodeCall",
+    "RemotePullTaskWorkflowNode",
+    "RemotePullWorkerCall",
+    "RemoteTaskWorkflowNode",
+    "RemoteWorkflowNode",
+    "RemoteWorkflowTask",
     "ResultProvenance",
     "RunStatus",
     "RunStatusReason",
@@ -98,13 +135,22 @@ __all__ = [
     "TaskPlan",
     "TaskStatus",
     "WorkerAssignmentRecord",
+    "Workflow",
+    "WorkflowDefinition",
+    "WorkflowNativeNode",
+    "WorkflowNode",
+    "WorkflowNodeSpec",
     "WorkStatusReason",
     "drive_execution_run",
+    "check_artifact_availability",
+    "check_external_artifact_status",
     "form_pull_worker_candidates",
+    "mounted_volume_checker",
     "propagated_skip_node_keys",
     "ready_node_keys",
     "required_node_keys",
     "result_probe_frontier",
+    "republish_workflow_artifact",
     "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",

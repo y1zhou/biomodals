@@ -1,4 +1,4 @@
-"""Workflow-owned artifact persistence beside shared execution state."""
+"""Execution artifact persistence beside shared execution state."""
 
 # ruff: noqa: D103
 
@@ -15,6 +15,10 @@ from biomodals.execution import (
     SqliteExecutionRepository,
     TaskPlan,
 )
+from biomodals.execution.artifact_store import (
+    WORKFLOW_ARTIFACT_TABLES,
+    WorkflowArtifactStore,
+)
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -25,10 +29,6 @@ from biomodals.schema import (
     InlineBytes,
     VolumePath,
     WorkflowArtifact,
-)
-from biomodals.workflow.core.artifact_store import (
-    WORKFLOW_ARTIFACT_TABLES,
-    WorkflowArtifactStore,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")

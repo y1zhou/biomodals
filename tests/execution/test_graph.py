@@ -1,4 +1,4 @@
-"""Tests for the Python workflow builder."""
+"""Tests for the Python executable-graph builder."""
 
 # ruff: noqa: D101,D102,D103
 
@@ -8,18 +8,12 @@ import pytest
 
 import biomodals.workflow as workflow_api
 from biomodals.execution import NodeAggregationPolicy
+from biomodals.execution.graph import NodeHandle
+from biomodals.execution.graph_plan import execution_plan, node_task_plan
+from biomodals.execution.nodes import RemoteTaskWorkflowNode, WorkflowNativeNode
 from biomodals.schema import ArtifactKind
 from biomodals.workflow import Workflow
-from biomodals.workflow.core.builder import NodeHandle
-from biomodals.workflow.core.display import print_workflow_dag
-from biomodals.workflow.core.execution import (
-    execution_plan,
-    node_task_plan,
-)
-from biomodals.workflow.core.nodes import (
-    RemoteTaskWorkflowNode,
-    WorkflowNativeNode,
-)
+from biomodals.workflow.display import print_workflow_dag
 
 
 class DummyNode(WorkflowNativeNode):

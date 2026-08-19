@@ -13,9 +13,13 @@ import pytest
 from biomodals.execution import (
     DeploymentIdentity,
     NodeAggregationPolicy,
+    NodeRunContext,
     NodeStatus,
     TaskStatus,
+    Workflow,
+    WorkflowNativeNode,
 )
+from biomodals.execution.graph_runtime import WorkflowRuntime
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
@@ -29,8 +33,6 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.workflow import ppiflow_workflow
-from biomodals.workflow.core import NodeRunContext, Workflow, WorkflowNativeNode
-from biomodals.workflow.core.runtime import WorkflowRuntime
 from biomodals.workflow.ppiflow import manifests
 from biomodals.workflow.ppiflow_workflow import (
     LigandMPNNNode,

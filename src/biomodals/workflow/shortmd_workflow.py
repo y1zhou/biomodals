@@ -23,9 +23,25 @@ import modal
 
 from biomodals.app.bioinfo import gromacs_app
 from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
-from biomodals.execution import DeploymentIdentity
+from biomodals.execution import (
+    AppBackedNode,
+    DeploymentIdentity,
+    NodeHandle,
+    NodeRunContext,
+    RemoteNodeCall,
+    RemoteWorkflowNode,
+    Workflow,
+    WorkflowNativeNode,
+    republish_workflow_artifact,
+)
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
+)
+from biomodals.execution.graph_plan import app_scientific_version
 from biomodals.execution.modal import (
     execution_lineage_root,
+    orchestrator,
     resolve_provider_call_limits,
     stage_execution_launch,
 )
@@ -45,23 +61,7 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
-from biomodals.workflow.core import (
-    AppBackedNode,
-    NodeHandle,
-    NodeRunContext,
-    RemoteNodeCall,
-    RemoteWorkflowNode,
-    Workflow,
-    WorkflowNativeNode,
-    orchestrator,
-    print_workflow_dag,
-    republish_workflow_artifact,
-)
-from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailability,
-    check_external_artifact_status,
-)
-from biomodals.workflow.core.execution import app_scientific_version
+from biomodals.workflow.display import print_workflow_dag
 
 DEPENDENCY_APPS = ("gromacs",)
 _SCIENTIFIC_SCHEMA_VERSION = "2"

@@ -12,7 +12,9 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.execution.graph_plan import execution_plan
 from biomodals.execution.modal import persist_execution_launch
+from biomodals.execution.nodes import NodeRunContext
 from biomodals.helper.styling import strip_ansi
 from biomodals.schema import (
     AppOutput,
@@ -25,8 +27,6 @@ from biomodals.schema import (
     WorkflowArtifact,
 )
 from biomodals.workflow import shortmd_workflow
-from biomodals.workflow.core.execution import execution_plan
-from biomodals.workflow.core.nodes import NodeRunContext
 from biomodals.workflow.shortmd_workflow import (
     ShortMDAnalysisNode,
     ShortMDClearNode,

@@ -1,9 +1,9 @@
-"""Workflow console display helpers."""
+"""Workflow-specific console display helpers."""
 
 from __future__ import annotations
 
-from biomodals.workflow.core.builder import WorkflowDefinition
-from biomodals.workflow.core.nodes import RemoteTaskWorkflowNode, RemoteWorkflowNode
+from biomodals.execution.graph import WorkflowDefinition
+from biomodals.execution.nodes import RemoteTaskWorkflowNode, RemoteWorkflowNode
 
 __all__ = ["print_workflow_dag"]
 

@@ -1,4 +1,4 @@
-"""Kernel-backed workflow runtime integration tests."""
+"""Kernel-backed executable-graph runtime integration tests."""
 
 # ruff: noqa: D101, D102, D103, D107
 
@@ -23,9 +23,21 @@ from biomodals.execution import (
     RunStatusReason,
     TaskStatus,
 )
+from biomodals.execution.graph import Workflow
+from biomodals.execution.graph_runtime import WorkflowRuntime
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
+)
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    RemoteNodeCall,
+    RemotePullTaskWorkflowNode,
+    RemotePullWorkerCall,
+    RemoteTaskWorkflowNode,
+    RemoteWorkflowNode,
+    RemoteWorkflowTask,
+    WorkflowNativeNode,
 )
 from biomodals.schema import (
     AppOutput,
@@ -37,18 +49,6 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
-from biomodals.workflow.core.builder import Workflow
-from biomodals.workflow.core.nodes import (
-    NodeRunContext,
-    RemoteNodeCall,
-    RemotePullTaskWorkflowNode,
-    RemotePullWorkerCall,
-    RemoteTaskWorkflowNode,
-    RemoteWorkflowNode,
-    RemoteWorkflowTask,
-    WorkflowNativeNode,
-)
-from biomodals.workflow.core.runtime import WorkflowRuntime
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "DemoWorkflow", 7)
@@ -576,7 +576,7 @@ def test_new_workflow_artifact_is_hashed_once(
         return sha256(path.read_bytes()).hexdigest()
 
     monkeypatch.setattr(
-        "biomodals.workflow.core.artifacts._file_sha256",
+        "biomodals.execution.artifacts._file_sha256",
         record_sha256,
     )
     runtime = _runtime(tmp_path, workflow)

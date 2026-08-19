@@ -1,4 +1,4 @@
-"""Typed workflow artifact availability checks."""
+"""Typed execution-artifact availability checks."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from biomodals.execution import AvailabilityStatus
+from biomodals.execution.model import AvailabilityStatus
 from biomodals.schema import WorkflowArtifact
-from biomodals.workflow.core.artifacts import workflow_artifact_availability_errors
+from biomodals.execution.artifacts import workflow_artifact_availability_errors
 
 
 @dataclass(frozen=True)

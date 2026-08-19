@@ -19,8 +19,21 @@ from uuid import UUID, uuid4
 import modal
 
 from biomodals.app.design import ligandmpnn_app, rfdiffusion_app
-from biomodals.execution import DeploymentIdentity
-from biomodals.execution.modal import resolve_provider_call_limits
+from biomodals.execution import (
+    AppBackedNode,
+    DeploymentIdentity,
+    NodeRunContext,
+    RemoteNodeCall,
+    Workflow,
+    WorkflowNativeNode,
+    republish_workflow_artifact,
+)
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
+)
+from biomodals.execution.graph_plan import app_scientific_version
+from biomodals.execution.modal import orchestrator, resolve_provider_call_limits
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
@@ -35,21 +48,7 @@ from biomodals.schema import (
     VolumePath,
     WorkflowArtifact,
 )
-from biomodals.workflow.core import (
-    AppBackedNode,
-    NodeRunContext,
-    RemoteNodeCall,
-    Workflow,
-    WorkflowNativeNode,
-    orchestrator,
-    print_workflow_dag,
-    republish_workflow_artifact,
-)
-from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailability,
-    check_external_artifact_status,
-)
-from biomodals.workflow.core.execution import app_scientific_version
+from biomodals.workflow.display import print_workflow_dag
 
 DEPENDENCY_APPS = ("rfdiffusion", "ligandmpnn")
 _SCIENTIFIC_SCHEMA_VERSION = "2"

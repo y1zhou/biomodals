@@ -1,4 +1,4 @@
-"""Workflow-owned adaptation of the shared execution kernel."""
+"""Execute app- and workflow-owned graphs through the shared kernel."""
 
 from __future__ import annotations
 
@@ -53,15 +53,16 @@ from biomodals.execution.scheduler import (
 )
 from biomodals.helper.artifacts import VolumeHandle
 from biomodals.schema import AppRunResult, AppRunStatus, VolumePath, WorkflowArtifact
-from biomodals.workflow.core.artifact_availability import (
+from biomodals.execution.artifact_availability import (
     ExternalArtifactChecker,
     check_artifact_availability,
     mounted_volume_checker,
 )
-from biomodals.workflow.core.artifacts import materialize_app_run_result
-from biomodals.workflow.core.builder import Workflow, WorkflowDefinition
-from biomodals.workflow.core.execution import execution_plan, node_task_plan
-from biomodals.workflow.core.nodes import (
+from biomodals.execution.artifacts import materialize_app_run_result
+from biomodals.execution.graph import Workflow, WorkflowDefinition
+from biomodals.execution.graph_plan import execution_plan, node_task_plan
+from biomodals.execution.modal.graph_store import WorkflowRunStore
+from biomodals.execution.nodes import (
     NodeRunContext,
     RemoteNodeCall,
     RemotePullTaskWorkflowNode,
@@ -70,7 +71,6 @@ from biomodals.workflow.core.nodes import (
     RemoteWorkflowNode,
     RemoteWorkflowTask,
 )
-from biomodals.workflow.core.run_store import WorkflowRunStore
 
 _TASK_KEY = "node"
 
@@ -166,7 +166,8 @@ class WorkflowRuntime:
         )
         self._provider = ExecutionRuntime(
             self.store.execution,
-            provider_driver=provider_driver or ModalCallDriver(),
+            provider_driver=provider_driver
+            or cast(ProviderDriver, ModalCallDriver()),
             checkpoint=self._checkpoint,
             transaction=self.store.transaction,
             synchronize=self._synchronize_kernel_state,
@@ -177,11 +178,11 @@ class WorkflowRuntime:
     def configure_provider_boundary(
         self,
         *,
-        provider_driver: ModalCallDriver,
+        provider_driver: ProviderDriver,
         external_artifact_checker: ExternalArtifactChecker | None,
     ) -> None:
         """Install driver-only dependencies unavailable to callback-first opens."""
-        self._provider._modal = provider_driver
+        self._provider.configure_provider_driver(provider_driver)
         self.external_artifact_checker = external_artifact_checker
 
     def run(

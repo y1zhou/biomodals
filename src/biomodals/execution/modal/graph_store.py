@@ -1,4 +1,4 @@
-"""Physical storage owned by one remotely coordinated workflow Run."""
+"""Modal Volume storage for one remotely coordinated executable graph."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from biomodals.execution.modal import ExecutionRunStore
-from biomodals.workflow.core.artifact_store import (
+from biomodals.execution.modal.host import ExecutionRunStore
+from biomodals.execution.artifact_store import (
     WORKFLOW_ARTIFACT_TABLES,
     WorkflowArtifactStore,
 )

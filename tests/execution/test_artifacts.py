@@ -1,4 +1,4 @@
-"""Tests for local workflow artifact materialization."""
+"""Tests for local execution artifact materialization."""
 
 # ruff: noqa: D103
 
@@ -8,6 +8,15 @@ from pathlib import Path
 import pytest
 
 from biomodals.execution import AvailabilityStatus
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    check_artifact_availability,
+    mounted_volume_checker,
+)
+from biomodals.execution.artifacts import (
+    materialize_app_run_result,
+    workflow_artifact_availability_errors,
+)
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -17,15 +26,6 @@ from biomodals.schema import (
     InlineBytes,
     VolumePath,
     WorkflowArtifact,
-)
-from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailability,
-    check_artifact_availability,
-    mounted_volume_checker,
-)
-from biomodals.workflow.core.artifacts import (
-    materialize_app_run_result,
-    workflow_artifact_availability_errors,
 )
 
 
@@ -658,7 +658,7 @@ def test_workflow_volume_reference_records_content_identity(
         return sha256(path.read_bytes()).hexdigest()
 
     monkeypatch.setattr(
-        "biomodals.workflow.core.artifacts._file_sha256",
+        "biomodals.execution.artifacts._file_sha256",
         record_sha256,
     )
     result = AppRunResult(
@@ -754,7 +754,7 @@ def test_workflow_volume_reference_hashes_only_declared_files(
         return sha256(path.read_bytes()).hexdigest()
 
     monkeypatch.setattr(
-        "biomodals.workflow.core.artifacts._file_sha256",
+        "biomodals.execution.artifacts._file_sha256",
         record_sha256,
     )
     result = AppRunResult(
@@ -807,7 +807,7 @@ def test_partial_and_mixed_reference_manifests_hash_each_file_once(
         return sha256(path.read_bytes()).hexdigest()
 
     monkeypatch.setattr(
-        "biomodals.workflow.core.artifacts._file_sha256",
+        "biomodals.execution.artifacts._file_sha256",
         record_sha256,
     )
     result = AppRunResult(
@@ -869,7 +869,7 @@ def test_workflow_volume_reference_rejects_symlink_before_hashing(
         return sha256(path.read_bytes()).hexdigest()
 
     monkeypatch.setattr(
-        "biomodals.workflow.core.artifacts._file_sha256",
+        "biomodals.execution.artifacts._file_sha256",
         record_sha256,
     )
     result = AppRunResult(

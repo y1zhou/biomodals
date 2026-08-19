@@ -1,11 +1,11 @@
-"""Execution-kernel plans for reusable workflows."""
+"""Map executable graph definitions to durable kernel plans."""
 
 from __future__ import annotations
 
-from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
+from biomodals.execution.model import ExecutionPlan, NodeDependency, NodePlan, TaskPlan
 from biomodals.schema import AppConfig
-from biomodals.workflow.core.builder import WorkflowDefinition
-from biomodals.workflow.core.hashing import dag_hash
+from biomodals.execution.graph import WorkflowDefinition
+from biomodals.execution.hashing import dag_hash
 
 _EXECUTION_PLAN_SCHEMA_VERSION = "1"
 

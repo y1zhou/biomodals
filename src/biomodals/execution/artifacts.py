@@ -1,4 +1,4 @@
-"""Local helpers for materializing app outputs into workflow artifacts."""
+"""Materialize workload outputs into durable execution artifacts."""
 
 from __future__ import annotations
 

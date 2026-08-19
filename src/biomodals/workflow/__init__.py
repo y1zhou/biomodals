@@ -1,6 +1,6 @@
 """Executable workflow scripts and public workflow runtime types."""
 
-from biomodals.workflow.core import (
+from biomodals.execution import (
     AppBackedNode,
     NodeHandle,
     NodeRunContext,

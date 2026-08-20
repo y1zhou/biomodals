@@ -142,8 +142,8 @@ class FakeModalDriver:
         self.events.append(f"resolve:{binding.function_name}")
         return binding.function_name
 
-    def spawn(self, function, *, args, kwargs):
-        del function, args
+    def spawn(self, operation, *, args, kwargs):
+        del operation, args
         candidate_id = str(kwargs["candidate_id"])
         self.events.append(f"spawn:{candidate_id}")
         call_id = f"fc-{candidate_id}"
@@ -176,9 +176,9 @@ class FakeModalDriver:
 
 
 class RosettaPullModalDriver(FakeModalDriver):
-    def spawn(self, function, *, args, kwargs):
+    def spawn(self, operation, *, args, kwargs):
         del args
-        self.events.append(f"spawn:{function}")
+        self.events.append(f"spawn:{operation}")
         call_id = "fc-rosetta-worker"
         self.results[call_id] = {"claimed_tasks": 2, "claim_requests": 2}
         return call_id
@@ -304,10 +304,11 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         },
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
     )
+    publication_available = False
     monkeypatch.setattr(
         ppiflow_workflow,
         "validate_task_publication_from_volume",
-        lambda *_args: True,
+        lambda *_args: publication_available,
     )
     driver = RosettaPullModalDriver()
     runtime = ExecutionGraphRuntime(
@@ -342,6 +343,7 @@ def test_ppiflow_rosetta_pull_worker_reconciles_partial_task_failure(
         "candidate-a",
         "candidate-b",
     ]
+    publication_available = True
     terminal = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
         (
@@ -415,10 +417,11 @@ def test_ppiflow_rosetta_recovers_committed_task_after_lost_callback(
             "rosetta_plan": source.outputs(kind=ArtifactKind.TABLE),
         },
     )
+    publication_available = False
     monkeypatch.setattr(
         ppiflow_workflow,
         "validate_task_publication_from_volume",
-        lambda *_args: True,
+        lambda *_args: publication_available,
     )
     runtime = ExecutionGraphRuntime(
         graph=workflow,
@@ -446,6 +449,7 @@ def test_ppiflow_rosetta_recovers_committed_task_after_lost_callback(
         capacity=1,
     ).assignments
 
+    publication_available = True
     runtime.advance_once()
 
     recovered = runtime.store.artifacts.load_task_result(

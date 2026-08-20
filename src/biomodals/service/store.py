@@ -9,14 +9,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 from uuid import UUID, uuid4
 
 import orjson
 
 from biomodals.execution import (
     EXECUTION_SCHEMA_VERSION,
-    AsyncExecutionRuntime,
     DeploymentIdentity,
     ExecutionOverview,
     ExecutionPlan,
@@ -1750,31 +1748,6 @@ class ServiceStore:
                 (str(job_id),),
             )
 
-    @contextmanager
-    def async_execution_runtime(
-        self,
-        provider_driver: Any,
-    ) -> Iterator[AsyncExecutionRuntime]:
-        """Open one API-hosted runtime with commit as its durability boundary."""
-        conn = sqlite3.connect(self.path, timeout=5, isolation_level="DEFERRED")
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        try:
-            yield AsyncExecutionRuntime(
-                SqliteExecutionRepository(conn),
-                provider_driver=provider_driver,
-                checkpoint=conn.commit,
-                commit_local=conn.commit,
-            )
-        except BaseException:
-            conn.rollback()
-            raise
-        else:
-            conn.commit()
-        finally:
-            conn.close()
-
     def request_cancel(
         self,
         owner_user_id: UUID,
@@ -2154,17 +2127,18 @@ def _job_from_row(
         cancel_requested_at = overview.run.updated_at
     elif overview.run.status == RunStatus.STATE_UNKNOWN:
         state_unknown_at = overview.run.updated_at
-        state_unknown_reason = {
-            RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN: (
-                JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
-            ),
-            RunStatusReason.PROVIDER_OUTCOME_UNKNOWN: (
-                JobStateUnknownReason.PROVIDER_OUTCOME_UNKNOWN
-            ),
-            RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN: (
-                JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN
-            ),
-        }.get(overview.run.status_reason)
+        if overview.run.status_reason is not None:
+            state_unknown_reason = {
+                RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN: (
+                    JobStateUnknownReason.SUBMISSION_OUTCOME_UNKNOWN
+                ),
+                RunStatusReason.PROVIDER_OUTCOME_UNKNOWN: (
+                    JobStateUnknownReason.PROVIDER_OUTCOME_UNKNOWN
+                ),
+                RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN: (
+                    JobStateUnknownReason.CANCELLATION_OUTCOME_UNKNOWN
+                ),
+            }.get(overview.run.status_reason)
     elif overview.run.status == RunStatus.SUSPENDED and blocked_at is None:
         blocked_at = overview.run.updated_at
     elif overview.run.status == RunStatus.FAILED and error_code is None:

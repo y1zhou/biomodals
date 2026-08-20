@@ -70,24 +70,3 @@ class ProviderDriver(Protocol):
     def cancel(self, provider_call_handle_id: str) -> None:
         """Request Provider Call cancellation."""
         ...
-
-
-class AsyncProviderDriver(Protocol):
-    """Asynchronous provider operations required by the execution runtime."""
-
-    async def resolve(self, binding: ProviderBinding) -> Any: ...
-
-    async def spawn(
-        self,
-        operation: Any,
-        *,
-        args: tuple[Any, ...],
-        kwargs: Mapping[str, Any],
-    ) -> str: ...
-
-    async def observe(
-        self,
-        provider_call_handle_id: str,
-    ) -> ProviderCallObservation: ...
-
-    async def cancel(self, provider_call_handle_id: str) -> None: ...

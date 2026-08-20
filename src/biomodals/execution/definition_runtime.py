@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any, BinaryIO, cast
@@ -52,6 +52,7 @@ from biomodals.execution.definition import ExecutionDefinition, ExecutionGraph
 from biomodals.execution.definition_plan import execution_plan, node_task_plan
 from biomodals.execution.nodes import (
     NodeRunContext,
+    PreparedTaskBatch,
     ProviderCallSpec,
     ProviderNode,
     PullTaskProviderNode,
@@ -1176,18 +1177,20 @@ class ExecutionGraphRuntime:
                 )
                 for task in tasks
             )
-            invocation = node.prepare_remote_task_batch(
-                self._node_context(
-                    self._require_definition(),
-                    node_id,
-                    task_key=task_keys[0],
-                ),
-                task_definitions,
-            )
+            metadata: Mapping[str, Any] = {}
+            if len(task_definitions) == 1:
+                metadata = node.prepare_remote_task(
+                    self._node_context(
+                        self._require_definition(),
+                        node_id,
+                        task_key=task_keys[0],
+                    ),
+                    task_definitions[0],
+                ).metadata
             decoded = node.process_remote_task_batch_result(
                 task_keys,
                 self._raw_result(envelope),
-                invocation.metadata,
+                metadata,
             )
             if set(decoded) != set(task_keys):
                 raise ValueError(
@@ -1607,7 +1610,15 @@ class ExecutionGraphRuntime:
                 now=self._now(),
             )
             return
+        resolved_functions = self._provider.resolve_provider_bindings(
+            self.execution_run_id,
+            (candidate.binding for candidate in selected),
+            now=self._now(),
+        )
+        if resolved_functions is None:
+            return
         submissions = []
+        prepared_results = False
         for candidate in selected:
             node = definition.nodes[candidate.node_key].node
             if isinstance(node, PullTaskProviderNode):
@@ -1627,6 +1638,7 @@ class ExecutionGraphRuntime:
                 submissions.append(
                     ProviderCallSubmission(
                         candidate=candidate,
+                        function=resolved_functions[candidate.binding],
                         claim_capacity=invocation.claim_capacity,
                         provider_call_id_kwarg="provider_call_id",
                         submission_token=candidate.candidate_key,
@@ -1656,24 +1668,66 @@ class ExecutionGraphRuntime:
                             )
                             for task in tasks
                         )
-                        if len(task_definitions) == 1:
-                            invocation = node.prepare_remote_task(
-                                self._node_context(
-                                    definition,
+                        prepared = node.prepare_remote_task_batch(
+                            self._node_context(
+                                definition,
+                                candidate.node_key,
+                                task_key=task_definitions[0].task_key,
+                            ),
+                            task_definitions,
+                        )
+                        if isinstance(prepared, PreparedTaskBatch):
+                            requested = candidate.task_keys
+                            selected_keys = prepared.task_keys
+                            completed_keys = tuple(prepared.completed)
+                            known = set(requested)
+                            if (
+                                len(set(selected_keys)) != len(selected_keys)
+                                or any(key not in known for key in selected_keys)
+                                or any(key not in known for key in completed_keys)
+                                or set(selected_keys) & set(completed_keys)
+                                or selected_keys
+                                != tuple(
+                                    key for key in requested if key in selected_keys
+                                )
+                            ):
+                                raise ValueError(
+                                    "Prepared Task batch does not partition its "
+                                    "selected Tasks"
+                                )
+                            for task_key, result in prepared.completed.items():
+                                self._publish_task_result(
                                     candidate.node_key,
-                                    task_key=task_definitions[0].task_key,
+                                    task_key,
+                                    AppRunResult.model_validate(result),
+                                )
+                                prepared_results = True
+                            if not selected_keys:
+                                if prepared.call is not None:
+                                    raise ValueError(
+                                        "Empty prepared Task batch cannot submit a call"
+                                    )
+                                continue
+                            if prepared.call is None:
+                                raise ValueError(
+                                    "Prepared Task batch is missing its provider call"
+                                )
+                            tasks_by_key = {task.task_key: task for task in tasks}
+                            tasks = tuple(tasks_by_key[key] for key in selected_keys)
+                            first = tasks[0]
+                            candidate = replace(
+                                candidate,
+                                candidate_key=(
+                                    f"{candidate.node_key}:"
+                                    f"{candidate.binding.function_name}:"
+                                    f"{candidate.compatibility_key}:{first.ordinal}"
                                 ),
-                                task_definitions[0],
+                                task_keys=selected_keys,
+                                task_ordinal=first.ordinal,
                             )
+                            invocation = prepared.call
                         else:
-                            invocation = node.prepare_remote_task_batch(
-                                self._node_context(
-                                    definition,
-                                    candidate.node_key,
-                                    task_key=task_definitions[0].task_key,
-                                ),
-                                task_definitions,
-                            )
+                            invocation = prepared
                     elif isinstance(node, ProviderNode):
                         if len(tasks) != 1:  # pragma: no cover - scheduler contract
                             raise RuntimeError(
@@ -1721,17 +1775,20 @@ class ExecutionGraphRuntime:
             submissions.append(
                 ProviderCallSubmission(
                     candidate=candidate,
+                    function=resolved_functions[candidate.binding],
                     submission_token=candidate.candidate_key,
                     args=invocation.args,
                     kwargs=invocation.kwargs,
                     provider_call_id_kwarg=invocation.provider_call_id_kwarg,
                 )
             )
-        self._provider.submit_provider_calls(
+        submitted = self._provider.submit_provider_calls(
             self.execution_run_id,
             tuple(submissions),
             now=self._now(),
         )
+        if prepared_results and not any(submitted):
+            self._checkpoint()
 
     def _publish_result(self, node_id: str, result: AppRunResult) -> None:
         if result.status != AppRunStatus.SUCCEEDED:

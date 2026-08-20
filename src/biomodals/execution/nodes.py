@@ -86,6 +86,15 @@ class ProviderCallSpec:
 
 
 @dataclass(frozen=True)
+class PreparedTaskBatch:
+    """Cache-aware preparation result for one selected fixed Task batch."""
+
+    call: ProviderCallSpec | None
+    task_keys: tuple[str, ...] = ()
+    completed: Mapping[str, AppRunResult] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PullWorkerCallSpec:
     """One prepared pull-worker pool backed by durable Task claims."""
 
@@ -218,7 +227,7 @@ class TaskProviderNode(ResultNode):
         self,
         context: NodeRunContext,
         tasks: tuple[TaskDefinition, ...],
-    ) -> ProviderCallSpec:
+    ) -> ProviderCallSpec | PreparedTaskBatch:
         """Prepare one provider call for a compatible fixed Task batch."""
         if len(tasks) != 1:
             raise ValueError("This Execution Node does not support Task batching")

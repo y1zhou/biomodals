@@ -20,6 +20,7 @@ from biomodals.execution import (
     NodeAggregationPolicy,
     NodeStatus,
     ProviderCallStatus,
+    ProviderDeploymentUnavailableError,
     RunStatus,
     RunStatusReason,
     TaskStatus,
@@ -34,6 +35,7 @@ from biomodals.execution.modal import (
 from biomodals.execution.nodes import (
     CoordinatorNode,
     NodeRunContext,
+    PreparedTaskBatch,
     ProviderCallSpec,
     ProviderNode,
     PullTaskProviderNode,
@@ -335,7 +337,7 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
         result: object,
         metadata: Mapping[str, object],
     ) -> Mapping[str, AppRunResult]:
-        assert metadata["task_keys"] == list(task_keys)
+        del metadata
         if not isinstance(result, Mapping):
             raise TypeError("batch result must be a mapping")
         result_by_task = cast(Mapping[str, object], result)
@@ -343,6 +345,24 @@ class BatchedRemoteFanoutNode(RemoteFanoutNode):
             task_key: AppRunResult.model_validate(result_by_task[task_key])
             for task_key in task_keys
         }
+
+
+@dataclass
+class CacheAwareBatchedFanoutNode(BatchedRemoteFanoutNode):
+    prepared_batches: int = field(default=0, metadata={"dag_hash": False})
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[TaskDefinition, ...],
+    ) -> PreparedTaskBatch:
+        self.prepared_batches += 1
+        call = super().prepare_remote_task_batch(context, tasks[1:])
+        return PreparedTaskBatch(
+            call=call,
+            task_keys=tuple(task.task_key for task in tasks[1:]),
+            completed={tasks[0].task_key: _text_result("reused")},
+        )
 
 
 @dataclass
@@ -588,6 +608,11 @@ class BatchedFanoutModalDriver(FakeModalDriver):
             for task_key, text in zip(task_keys, texts, strict=True)
         }
         return call_id
+
+
+class UnavailableModalDriver(FakeModalDriver):
+    def resolve(self, binding):
+        raise ProviderDeploymentUnavailableError(str(binding))
 
 
 class FakeVolume:
@@ -1500,6 +1525,47 @@ def test_remote_task_node_batches_compatible_tasks_into_one_call(
     assert node.finalized_results == [
         (("candidate-0", "candidate-1"), ()),
     ]
+
+
+def test_remote_task_batch_can_publish_reuse_and_shrink_its_call(
+    tmp_path: Path,
+) -> None:
+    workflow = ExecutionGraph("cache-aware-batch")
+    node = CacheAwareBatchedFanoutNode(("alpha", "beta"))
+    workflow.add_node(node, id="fanout")
+    driver = BatchedFanoutModalDriver()
+    runtime = _runtime(tmp_path, workflow, driver=driver)
+
+    result = runtime.run(workload_run_key="cache-aware-batch")
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert driver.events[:2] == [
+        "resolve:main/DemoWorkflow/7/run_candidate_batch",
+        "spawn:candidate-1",
+    ]
+    [provider_call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert provider_call.task_keys == ("candidate-1",)
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.SUCCEEDED]
+
+
+def test_remote_task_batch_preparation_follows_deployment_resolution(
+    tmp_path: Path,
+) -> None:
+    workflow = ExecutionGraph("unavailable-cache-aware-batch")
+    node = CacheAwareBatchedFanoutNode(("alpha", "beta"))
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(tmp_path, workflow, driver=UnavailableModalDriver())
+
+    result = runtime.run(workload_run_key="unavailable-cache-aware-batch")
+
+    assert result.status == AppRunStatus.FAILED
+    assert node.prepared_batches == 0
+    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
+    assert [
+        task.status for task in runtime.store.execution.list_tasks(RUN_ID, "fanout")
+    ] == [TaskStatus.PENDING, TaskStatus.PENDING]
 
 
 def test_pull_task_node_uses_durable_claims_and_worker_publications(

@@ -121,6 +121,18 @@ definition has a binding and packaging for that provider. Apps may remain
 Modal-only without weakening the provider neutrality of the kernel or of
 already portable operation bodies.
 
+These are separate claims:
+
+- the execution kernel is provider-neutral when its graph, scheduling,
+  repository, and result contracts do not depend on a provider SDK;
+- an operation body is provider-independent when provider wrappers can invoke
+  it using explicit values, paths, and configuration;
+- an app or workflow supports a provider only when every operation selected by
+  that Execution Definition has both a provider binding and runnable packaging.
+
+Provider support is therefore derived from the selected operations, not a
+blanket property conferred by using the shared kernel.
+
 The local integration must implement durable container submission,
 observation, cancellation, log access, filesystem binding, and result
 collection. Those generic responsibilities belong to

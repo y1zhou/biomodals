@@ -1,4 +1,4 @@
-# Workflow runtime and PPIFlow decisions
+# Workflow and PPIFlow decisions
 
 Status: accepted for the current pre-release workflow formats.
 
@@ -16,12 +16,12 @@ not require changing kernel scheduling or recovery semantics.
 
 ## Recover interrupted work through durable ownership
 
-The workflow runtime records Coordinator-Local Task ownership and Provider
-Call identity instead of Node attempts. Interrupted local work first observes
-its publication and may re-enter the same idempotent operation only when the
-result is authoritatively missing. Remote work without a conclusively terminal
-owner remains blocked because blindly replacing it could duplicate work that
-is still writing deterministic outputs.
+The shared execution runtime records Coordinator-Local Task ownership and
+Provider Call identity instead of Node attempts. Interrupted local work first
+observes its publication and may re-enter the same idempotent operation only
+when the result is authoritatively missing. Remote work without a conclusively
+terminal owner remains blocked because blindly replacing it could duplicate
+work that is still writing deterministic outputs.
 
 ## Separate Provider Call completion from scientific publication
 
@@ -249,7 +249,12 @@ PPIFlow stage-specific remote wrappers start with the current workflow resource 
 
 ## Prune workflow runs from terminal nodes
 
-The workflow runtime will decide run completion and resume scope from terminal workflow nodes. If every terminal node has durable completion and non-missing recorded outputs, the run succeeds without scheduling intermediate nodes, even when stale failed, running, or incomplete intermediate state remains. If some terminal nodes are incomplete, the scheduler only considers those terminals and their ancestor closure.
+The shared execution runtime decides run completion and resume scope from
+terminal workflow Nodes. If every terminal Node has durable completion and
+non-missing recorded outputs, the Run succeeds without scheduling intermediate
+Nodes, even when stale failed, running, or incomplete intermediate state
+remains. If some terminal Nodes are incomplete, the scheduler considers only
+those terminals and their ancestor closure.
 
 This keeps execution result-driven and avoids recomputing expensive
 intermediate work when the externally relevant workflow outputs already exist.

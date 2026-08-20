@@ -10,7 +10,7 @@ and SQLite model, but left generic orchestration divided among
 `biomodals.workflow.core`. That split is superseded by the accepted
 [execution-kernel consolidation](../specs/execution-kernel-consolidation.md).
 
-The root `biomodals.execution` package becomes provider-neutral and owns the
+The root `biomodals.execution` package is provider-neutral and owns the
 single executable graph, runtime, artifact, and repository model used by apps,
 workflows, and the API service. Provider integrations live in subpackages;
 `biomodals.execution.modal` is the first implementation and owns Modal SDK,
@@ -42,7 +42,7 @@ handle without changing its scientific implementation. Portable operation code
 does not imply that Modal image recipes are themselves portable OCI recipes;
 image construction remains provider-owned.
 
-This refactor extracts provider-independent operation bodies where doing so is
+This refactor extracted provider-independent operation bodies where doing so is
 simple and behavior-preserving. It does not add a local provider, duplicate
 image definitions, or require every existing operation to support multiple
 providers before merge.
@@ -184,13 +184,20 @@ coordinator and observe container identities after the launching CLI exits. A
 foreground subprocess alone can implement development execution, but it cannot
 satisfy the existing resume and restart contract.
 
-Implementation of this amendment is in progress. The local provider remains
+Implementation of this amendment is complete. The local provider remains
 deferred. Existing text remains as the history and safety rationale of the
-first extraction unless it conflicts with the consolidation plan.
+first extraction unless it conflicts with this amendment.
 
-Biomodals should introduce a Modal execution kernel under
-`biomodals.execution` for durable DAG and Task scheduling, Modal-call
-attachment and recovery, batching, and Provider Call limits. Workload code
+## Historical original decision
+
+The remainder of this ADR records the original Modal-specific extraction. It
+explains the durability and cost-safety decisions retained by the consolidated
+kernel, but its package boundaries and caller-driven app/workflow split are
+superseded by the 2026-08-19 amendment above.
+
+Biomodals introduced a Modal execution kernel under `biomodals.execution` for
+durable DAG and Task scheduling, Modal-call attachment and recovery, batching,
+and Provider Call limits. Workload code
 continues to construct plans, validate caches, prepare inputs, decode results,
 and publish outputs, then reports its observations and outcomes to the kernel.
 The kernel should embed its execution tables into host-owned databases without

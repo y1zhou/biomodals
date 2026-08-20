@@ -139,6 +139,24 @@ operations need only a local wrapper and OCI image, while operations coupled to
 Modal lifecycle or implicit mounts must first extract those concerns. The DAG,
 cache identity, scheduler policy, and scientific implementation remain shared.
 
+A provider binding maps one logical operation name to a provider entrypoint,
+container packaging, resources, mounts, environment, Secrets, and argument and
+result translation. These bindings belong to the app or workflow composition
+root because they package workload code; generic submission, observation,
+cancellation, and durable call identity belong to the provider subpackage.
+
+The provider host must validate before admission that every operation selected
+by an Execution Definition has a binding. A partially migrated app therefore
+remains unsupported by that provider rather than switching providers partway
+through a Run.
+
+The portable operation body must be directly testable without importing or
+hydrating a provider SDK object. It may use files, subprocesses, accelerators,
+and ordinary side effects, but provider mount roots and configuration are
+explicit inputs. Provider wrappers may translate those roots and result
+envelopes; they must invoke the same scientific body and preserve its output
+layout and scientific identity.
+
 Provider subpackages implement generic host mechanics only. They do not own a
 workload registry or app-specific images. Each app or workflow composition root
 maps the logical operations in its Execution Definition to that provider's

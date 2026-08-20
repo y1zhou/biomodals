@@ -69,6 +69,21 @@ Each portable operation has three layers:
 3. provider-owned packaging that declares the image, resources, mounts,
    environment, Secrets, and durable call handle.
 
+The Execution Definition names the logical operation; it does not embed the
+provider wrapper or container recipe. A provider composition root binds that
+logical name to:
+
+- the provider entrypoint that invokes the scientific body;
+- runnable image or container packaging;
+- CPU, GPU, memory, timeout, mount, environment, and Secret declarations;
+- translation between provider call arguments and the body's ordinary values,
+  paths, configuration, and shared result contract.
+
+For Modal, that binding is normally the existing decorated function and Modal
+Image. For a local provider, it would be an OCI image plus a small Docker or
+Podman entrypoint. The scheduler sees the same logical operation, dependencies,
+Task identities, dispatch policy, and resource class in both cases.
+
 This does not require turning an app into a library of mathematically pure
 functions or moving its scientific code into the execution kernel. Only the
 provider-executed operation boundary must be provider-independent. The
@@ -114,6 +129,21 @@ Existing apps migrate operation by operation:
    configuration, and result contract;
 4. bind that operation in the local composition root without changing its
    `ExecutionDefinition`, DAG, cache identity, or scheduler policy.
+
+An operation is ready for a second provider when its body can be exercised in a
+test without importing Modal, hydrating a Modal object, relying on a fixed
+Modal mount constant, or committing and reloading a Modal Volume. Moving only
+the decorator while leaving those dependencies in the called function is not a
+portability migration.
+
+This boundary preserves the existing scientific implementation and output
+layout. Provider wrappers may translate mount roots and provider call
+envelopes, but they must not introduce a second scientific code path. Where an
+existing decorated function already delegates to ordinary Python or a
+subprocess with explicit paths, local support should be a small packaging and
+binding change. Functions that combine science with Volume synchronization,
+Function lookup, spawning, or polling require a larger extraction before the
+same body can run locally.
 
 Provider support is therefore declared per operation. An app or workflow can
 run through a provider only when every remote operation in that execution

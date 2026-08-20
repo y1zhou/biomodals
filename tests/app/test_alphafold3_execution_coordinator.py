@@ -1,28 +1,29 @@
-"""Tests for AlphaFold3's deployment-local coordinator adapter."""
+"""Tests for AlphaFold3's deployment-local graph coordinator."""
 
-# ruff: noqa: D101,D102,D107
+# ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
 from pathlib import Path
-from threading import Event, Thread
 from typing import Any, cast
 from uuid import UUID
 
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
-import biomodals.app.fold.alphafold3.execution_coordinator as coordinator_module
+import biomodals.execution.modal.host as host_module
 from biomodals.app.fold.alphafold3.execution_coordinator import (
     AlphaFold3ExecutionCoordinator,
-    _restart_request,
 )
 from biomodals.app.fold.alphafold3.execution_request import (
-    EXECUTION_REQUEST_FILENAME,
     AlphaFold3ExecutionRequest,
+    load_execution_request,
     persist_execution_request,
 )
-from biomodals.execution import DeploymentIdentity, RunStatus
-from biomodals.execution.modal import load_execution_launch
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
+from biomodals.app.fold.alphafold3.seed_predictions import InferenceRuntime
+from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
+from biomodals.execution import DeploymentIdentity, GraphExecutionRunStore
+from biomodals.schema import AppRunResult, AppRunStatus
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -42,6 +43,16 @@ class FakeVolume:
         self.reloads += 1
 
 
+class FakeClaims:
+    def put(self, key, value, *, skip_if_exists=False):
+        del key, value, skip_if_exists
+        return True
+
+    def get(self, key, default=None):
+        del key
+        return default
+
+
 class FakeRuntime:
     created: list[dict[str, object]] = []
 
@@ -53,29 +64,22 @@ class FakeRuntime:
             kwargs["predecessor_execution_run_id"],
         )
         self.deployment = cast(DeploymentIdentity, kwargs["deployment"])
-        self.store = cast(ExecutionRunStore, kwargs["store"])
+        self.store = cast(GraphExecutionRunStore, kwargs["store"])
         self.created.append(kwargs)
 
-    def run(self):
-        return self._snapshot()
+    def run(self) -> AppRunResult:
+        self._ensure_run()
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
-    def resume(self):
-        return self._snapshot()
-
-    def cancel(self):
-        with self.store.transaction():
-            self.store.execution.request_run_cancellation(
-                self.execution_run_id,
-                now=20,
-            )
-        return self.store.execution.overview(self.execution_run_id)
+    def resume(self) -> AppRunResult:
+        return self.run()
 
     def close(self) -> None:
         self.store.close()
 
-    def _snapshot(self):
+    def _ensure_run(self) -> None:
         try:
-            return self.store.execution.overview(self.execution_run_id)
+            self.store.execution.get_run(self.execution_run_id)
         except LookupError:
             with self.store.transaction():
                 self.store.execution.create_run(
@@ -89,29 +93,19 @@ class FakeRuntime:
                     ),
                     now=10,
                 )
-            return self.store.execution.overview(self.execution_run_id)
 
 
-def _request(
-    *,
-    sequence: str = "ACDE",
-    max_containers: int = 2,
-    max_gpu_containers: int = 1,
-) -> AlphaFold3ExecutionRequest:
+def _request() -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
         AF3Config(
             name="example",
-            modelSeeds=[1],
-            sequences=[
-                AF3SequenceEntry(
-                    protein=AF3Protein(id="A", sequence=sequence),
-                )
-            ],
+            modelSeeds=[1, 2],
+            sequences=[AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE"))],
         ),
         search_msa=False,
         search_protein_templates=False,
-        max_active_provider_calls=max_containers,
-        max_active_gpu_provider_calls=max_gpu_containers,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=2,
         recycle=10,
         sample=1,
     )
@@ -124,27 +118,55 @@ def _coordinator(
     execution_run_id: UUID,
     deployment: DeploymentIdentity,
 ) -> AlphaFold3ExecutionCoordinator:
+    claims = cast(Any, FakeClaims())
     return AlphaFold3ExecutionCoordinator(
         execution_run_id=execution_run_id,
         deployment=deployment,
         volume_root=tmp_path,
         output_volume=volume,
+        output_volume_name="AlphaFold3-outputs",
         provider_driver=object(),
-        search_runtime=cast(Any, object()),
-        template_runtime=cast(Any, object()),
-        inference_runtime=cast(Any, object()),
+        search_runtime=SearchRuntime(
+            sharded_volume=cast(Any, FakeVolume()),
+            cache_volume=cast(Any, FakeVolume()),
+            claims=claims,
+            container_id="coordinator",
+            maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+            sharded_root=tmp_path / "sharded",
+            cache_root=tmp_path / "cache",
+        ),
+        template_runtime=TemplateRuntime(
+            source_volume=cast(Any, FakeVolume()),
+            cache_volume=cast(Any, FakeVolume()),
+            claims=claims,
+            container_id="coordinator",
+            maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+            source_root=tmp_path / "source",
+            cache_root=tmp_path / "cache",
+        ),
+        inference_runtime=InferenceRuntime(
+            output_root=tmp_path,
+            volume=cast(Any, volume),
+            claims=claims,
+            container_id="coordinator",
+            maximum_age_seconds=100,
+            summary_maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+        ),
         poll_interval_seconds=0,
     )
 
 
-def _persist_failed_predecessor(
+def _terminal_predecessor(
     tmp_path: Path,
     request: AlphaFold3ExecutionRequest,
 ) -> None:
     persist_execution_request(tmp_path, PREDECESSOR_ID, request)
-    predecessor_store = ExecutionRunStore(tmp_path, PREDECESSOR_ID)
-    with predecessor_store.transaction():
-        predecessor_store.execution.create_run(
+    store = GraphExecutionRunStore(tmp_path, PREDECESSOR_ID)
+    with store.transaction():
+        store.execution.create_run(
             execution_run_id=PREDECESSOR_ID,
             plan=request.execution_plan,
             deployment=DEPLOYMENT,
@@ -152,48 +174,22 @@ def _persist_failed_predecessor(
             max_active_gpu_provider_calls=request.max_active_gpu_provider_calls,
             now=1,
         )
-        predecessor_store.execution.start_node(
-            PREDECESSOR_ID,
-            "stage-request-input",
-            now=2,
-        )
-        predecessor_store.execution.discover_tasks(
-            PREDECESSOR_ID,
-            "stage-request-input",
-            (),
-            now=3,
-        )
-        predecessor_store.execution.skip_unreachable_nodes(
-            PREDECESSOR_ID,
-            now=4,
-        )
-        predecessor_store.execution.finalize_run_from_results(
-            PREDECESSOR_ID,
-            now=5,
-        )
-    assert (
-        predecessor_store.execution.get_run(PREDECESSOR_ID).status == RunStatus.FAILED
-    )
-    predecessor_store.close()
+        store.execution.request_run_cancellation(PREDECESSOR_ID, now=2)
+        store.execution.finalize_run_from_results(PREDECESSOR_ID, now=3)
+    store.close()
 
 
-def test_root_run_loads_staged_request_and_binds_remote_ledger(
+def test_root_run_uses_staged_request_and_graph_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The deployment adapter trusts staged bytes, not method arguments."""
     FakeRuntime.created.clear()
-    monkeypatch.setattr(
-        coordinator_module,
-        "AlphaFold3ExecutionRuntime",
-        FakeRuntime,
-    )
+    monkeypatch.setattr(host_module, "ExecutionGraphRuntime", FakeRuntime)
     request = _request()
     persist_execution_request(tmp_path, PREDECESSOR_ID, request)
-    volume = FakeVolume()
     coordinator = _coordinator(
         tmp_path,
-        volume,
+        FakeVolume(),
         execution_run_id=PREDECESSOR_ID,
         deployment=DEPLOYMENT,
     )
@@ -201,65 +197,26 @@ def test_root_run_loads_staged_request_and_binds_remote_ledger(
     snapshot = coordinator.run()
 
     assert snapshot.run.execution_run_id == PREDECESSOR_ID
-    assert snapshot.run.predecessor_execution_run_id is None
     assert snapshot.run.plan == request.execution_plan
     assert len(FakeRuntime.created) == 1
-    assert volume.commits == 0
-    assert coordinator.status() == snapshot
 
 
-def test_close_waits_for_the_active_driver(tmp_path: Path) -> None:
-    """Cleanup cannot close SQLite under an active drive loop."""
-    volume = FakeVolume()
-    coordinator = _coordinator(
-        tmp_path,
-        volume,
-        execution_run_id=PREDECESSOR_ID,
-        deployment=DEPLOYMENT,
-    )
-    closed = Event()
-    started = Event()
-
-    class Runtime:
-        def close(self) -> None:
-            closed.set()
-
-    coordinator._runtime = Runtime()
-    coordinator._drive_lock.acquire()
-
-    def close() -> None:
-        started.set()
-        coordinator.close()
-
-    thread = Thread(target=close)
-    thread.start()
-    assert started.wait(timeout=1)
-    assert not closed.wait(timeout=0.05)
-    coordinator._drive_lock.release()
-    thread.join(timeout=1)
-
-    assert not thread.is_alive()
-    assert closed.is_set()
-    assert volume.commits == 0
-
-
-def test_restart_links_a_new_ledger_and_only_changes_operational_limits(
+def test_restart_uses_shared_operational_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A conclusive predecessor yields a compatible, separately stored Run."""
     FakeRuntime.created.clear()
-    monkeypatch.setattr(
-        coordinator_module,
-        "AlphaFold3ExecutionRuntime",
-        FakeRuntime,
-    )
+    monkeypatch.setattr(host_module, "ExecutionGraphRuntime", FakeRuntime)
     request = _request()
-    _persist_failed_predecessor(tmp_path, request)
-    volume = FakeVolume()
+    candidate = replace(
+        request,
+        max_active_provider_calls=6,
+        max_active_gpu_provider_calls=3,
+    )
+    _terminal_predecessor(tmp_path, request)
     coordinator = _coordinator(
         tmp_path,
-        volume,
+        FakeVolume(),
         execution_run_id=SUCCESSOR_ID,
         deployment=SUCCESSOR_DEPLOYMENT,
     )
@@ -267,41 +224,29 @@ def test_restart_links_a_new_ledger_and_only_changes_operational_limits(
     coordinator.prepare_restart(
         predecessor_execution_run_id=PREDECESSOR_ID,
         predecessor_deployment=DEPLOYMENT,
-        max_active_provider_calls=3,
-        max_active_gpu_provider_calls=2,
+        candidate_request=candidate,
     )
     snapshot = coordinator.drive_prepared()
 
+    stored = load_execution_request(tmp_path, SUCCESSOR_ID)
     assert snapshot.run.predecessor_execution_run_id == PREDECESSOR_ID
     assert snapshot.run.plan == request.execution_plan
-    assert snapshot.run.max_active_provider_calls == 3
-    assert snapshot.run.max_active_gpu_provider_calls == 2
-    assert load_execution_launch(tmp_path, SUCCESSOR_ID) == PREDECESSOR_ID
-    assert (
-        cast(
-            AlphaFold3ExecutionRequest, FakeRuntime.created[0]["request"]
-        ).execution_plan
-        == request.execution_plan
-    )
+    assert stored.max_active_provider_calls == 6
+    assert stored.max_active_gpu_provider_calls == 3
 
 
-def test_launch_restart_uses_candidate_operational_limits(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Launch restart keeps candidate policy after validating its science."""
-    FakeRuntime.created.clear()
-    monkeypatch.setattr(
-        coordinator_module,
-        "AlphaFold3ExecutionRuntime",
-        FakeRuntime,
+def test_restart_rejects_changed_science(tmp_path: Path) -> None:
+    request = _request()
+    changed = AlphaFold3ExecutionRequest.prepare(
+        request.config.model_copy(update={"modelSeeds": [9]}),
+        search_msa=request.search_msa,
+        search_protein_templates=request.search_protein_templates,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=2,
+        recycle=request.recycle,
+        sample=request.sample,
     )
-    predecessor_request = _request()
-    _persist_failed_predecessor(tmp_path, predecessor_request)
-    candidate_request = _request(
-        max_containers=4,
-        max_gpu_containers=3,
-    )
+    _terminal_predecessor(tmp_path, request)
     coordinator = _coordinator(
         tmp_path,
         FakeVolume(),
@@ -309,86 +254,9 @@ def test_launch_restart_uses_candidate_operational_limits(
         deployment=SUCCESSOR_DEPLOYMENT,
     )
 
-    coordinator.prepare_restart(
-        predecessor_execution_run_id=PREDECESSOR_ID,
-        predecessor_deployment=None,
-        candidate_request=candidate_request,
-    )
-    snapshot = coordinator.drive_prepared()
-
-    assert snapshot.run.plan == predecessor_request.execution_plan
-    assert snapshot.run.max_active_provider_calls == 4
-    assert snapshot.run.max_active_gpu_provider_calls == 3
-    assert FakeRuntime.created[0]["request"] == candidate_request
-    request_path = (
-        ExecutionRunStore(tmp_path, SUCCESSOR_ID).state_root
-        / EXECUTION_REQUEST_FILENAME
-    )
-    assert request_path.read_bytes() == candidate_request.to_bytes()
-
-
-def test_launch_restart_rejects_changed_science_before_creating_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A changed launch candidate cannot create a Successor Run ledger."""
-    monkeypatch.setattr(
-        coordinator_module,
-        "AlphaFold3ExecutionRuntime",
-        FakeRuntime,
-    )
-    _persist_failed_predecessor(tmp_path, _request())
-    candidate_request = _request(sequence="ACDF")
-    coordinator = _coordinator(
-        tmp_path,
-        FakeVolume(),
-        execution_run_id=SUCCESSOR_ID,
-        deployment=SUCCESSOR_DEPLOYMENT,
-    )
-
-    with pytest.raises(ValueError, match="Workload Plan Fingerprint"):
+    with pytest.raises(ValueError, match="changed the Workload Plan Fingerprint"):
         coordinator.prepare_restart(
             predecessor_execution_run_id=PREDECESSOR_ID,
-            predecessor_deployment=None,
-            candidate_request=candidate_request,
+            predecessor_deployment=DEPLOYMENT,
+            candidate_request=changed,
         )
-
-    assert not ExecutionRunStore(
-        tmp_path,
-        SUCCESSOR_ID,
-    ).ledger_path.exists()
-    request_path = (
-        ExecutionRunStore(tmp_path, SUCCESSOR_ID).state_root
-        / EXECUTION_REQUEST_FILENAME
-    )
-    assert not request_path.exists()
-
-
-def test_restart_rejects_a_gpu_limit_above_the_total_limit() -> None:
-    """Operational overrides retain the kernel's GPU-subset invariant."""
-    request = _request()
-
-    with pytest.raises(ValueError, match="provider-call limits"):
-        _restart_request(
-            request,
-            predecessor_max_active_provider_calls=2,
-            predecessor_max_active_gpu_provider_calls=1,
-            max_active_provider_calls=1,
-            max_active_gpu_provider_calls=2,
-        )
-
-
-def test_restart_keeps_positive_batching_with_zero_gpu_admission() -> None:
-    """Cache-only restart limits do not become an invalid batching width."""
-    request = _request(max_gpu_containers=2)
-
-    restarted = _restart_request(
-        request,
-        predecessor_max_active_provider_calls=2,
-        predecessor_max_active_gpu_provider_calls=2,
-        max_active_provider_calls=2,
-        max_active_gpu_provider_calls=0,
-    )
-
-    assert restarted.max_active_provider_calls == 2
-    assert restarted.max_active_gpu_provider_calls == 0

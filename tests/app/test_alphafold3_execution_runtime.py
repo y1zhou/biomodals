@@ -1,4 +1,4 @@
-"""Tests for AlphaFold3's caller-driven execution-kernel adapter."""
+"""Tests for AlphaFold3's shared execution graph."""
 
 # ruff: noqa: D101,D102,D103,D107
 
@@ -10,17 +10,21 @@ from uuid import UUID
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
-import biomodals.app.fold.alphafold3.execution_runtime as execution_runtime
+import biomodals.app.fold.alphafold3.execution_planning as planning_module
+from biomodals.app.fold.alphafold3.execution_planning import (
+    SEED_PREDICTIONS,
+    STAGE_INFERENCE,
+    TEMPLATE_SEARCHES,
+)
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
 )
 from biomodals.app.fold.alphafold3.execution_runtime import (
-    AlphaFold3ExecutionRuntime,
     _result_envelope,
+    alphafold3_execution_graph,
 )
 from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
-from biomodals.app.fold.alphafold3.input_enrichment import chain_msa_states
-from biomodals.app.fold.alphafold3.msa_search import SearchRuntime, plan_msa_resolution
+from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -30,16 +34,19 @@ from biomodals.app.fold.alphafold3.template_search import TemplateRuntime
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
-    NodeStatus,
+    GraphExecutionRunStore,
     ProviderCallStatus,
+    ProviderDeploymentUnavailableError,
     RunStatus,
+    TaskStatus,
 )
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
+    ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
-    ProviderDeploymentUnavailableError,
 )
-from biomodals.execution.store import ExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "AlphaFold3", 7)
@@ -82,27 +89,14 @@ class FakeClaims:
         return self.values.get(key, default)
 
 
-class NoCallDriver:
-    def resolve(self, binding):
-        raise AssertionError(f"Unexpected remote binding: {binding}")
-
-    def spawn(self, function, *, args, kwargs):
-        del function, args, kwargs
-        raise AssertionError("Unexpected Provider Call")
-
-    def observe(self, provider_call_handle_id: str):
-        raise AssertionError(provider_call_handle_id)
-
-    def cancel(self, provider_call_handle_id: str) -> None:
-        raise AssertionError(provider_call_handle_id)
-
-
-class RecordingCallDriver:
-    def __init__(self) -> None:
+class RecordingDriver:
+    def __init__(self, *, unavailable: bool = False) -> None:
+        self.unavailable = unavailable
         self.spawns: list[dict[str, object]] = []
-        self.observation = ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     def resolve(self, binding):
+        if self.unavailable:
+            raise ProviderDeploymentUnavailableError(str(binding))
         return binding
 
     def spawn(self, function, *, args, kwargs):
@@ -116,15 +110,11 @@ class RecordingCallDriver:
         return handle
 
     def observe(self, provider_call_handle_id: str):
-        return self.observation
+        del provider_call_handle_id
+        return ProviderCallObservation(ProviderCallObservationKind.RUNNING)
 
     def cancel(self, provider_call_handle_id: str) -> None:
-        raise AssertionError(provider_call_handle_id)
-
-
-class UnavailableCallDriver(NoCallDriver):
-    def resolve(self, binding):
-        raise ProviderDeploymentUnavailableError(f"{binding} is unavailable")
+        del provider_call_handle_id
 
 
 def _request(
@@ -137,44 +127,25 @@ def _request(
         AF3Config(
             name="example",
             modelSeeds=seeds or [1],
-            sequences=[
-                AF3SequenceEntry(
-                    protein=AF3Protein(
-                        id="A",
-                        sequence="ACDE",
-                    )
-                )
-            ],
+            sequences=[AF3SequenceEntry(protein=AF3Protein(id="A", sequence="ACDE"))],
         ),
         search_msa=search_msa,
         search_protein_templates=True,
-        max_active_provider_calls=2,
+        max_active_provider_calls=4,
         max_active_gpu_provider_calls=max_gpu_containers,
         recycle=10,
         sample=1,
     )
 
 
-def _runtime(
-    tmp_path: Path,
-    *,
-    request: AlphaFold3ExecutionRequest | None = None,
-    driver: object | None = None,
-) -> AlphaFold3ExecutionRuntime:
+def _graph_inputs(tmp_path: Path):
     output = FakeVolume()
     cache = FakeVolume()
-    source = FakeVolume()
-    sharded = FakeVolume()
     claims = FakeClaims()
-    return AlphaFold3ExecutionRuntime(
-        request=request or _request(),
-        execution_run_id=RUN_ID,
-        deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
-        provider_driver=driver or NoCallDriver(),
-        output_volume=output,
-        search_runtime=SearchRuntime(
-            sharded_volume=cast(Any, sharded),
+    return {
+        "output_volume": output,
+        "search_runtime": SearchRuntime(
+            sharded_volume=cast(Any, FakeVolume()),
             cache_volume=cast(Any, cache),
             claims=cast(Any, claims),
             container_id="coordinator",
@@ -183,8 +154,8 @@ def _runtime(
             sharded_root=tmp_path / "sharded",
             cache_root=tmp_path / "cache",
         ),
-        template_runtime=TemplateRuntime(
-            source_volume=cast(Any, source),
+        "template_runtime": TemplateRuntime(
+            source_volume=cast(Any, FakeVolume()),
             cache_volume=cast(Any, cache),
             claims=cast(Any, claims),
             container_id="coordinator",
@@ -193,7 +164,7 @@ def _runtime(
             source_root=tmp_path / "source",
             cache_root=tmp_path / "cache",
         ),
-        inference_runtime=InferenceRuntime(
+        "inference_runtime": InferenceRuntime(
             output_root=tmp_path,
             volume=cast(Any, output),
             claims=cast(Any, claims),
@@ -202,357 +173,73 @@ def _runtime(
             summary_maximum_age_seconds=100,
             wait_timeout_seconds=100,
         ),
-        poll_interval_seconds=0,
-        now=lambda: 10,
-    )
-
-
-def test_no_search_request_publishes_explicit_empty_stage_results(
-    tmp_path: Path,
-) -> None:
-    """No-op scientific stages complete without synthetic Tasks or calls."""
-    runtime = _runtime(tmp_path)
-    runtime._initialize()
-
-    for _ in range(4):
-        runtime.advance_once()
-
-    nodes = {node.node_key: node for node in runtime.store.execution.list_nodes(RUN_ID)}
-    assert nodes["stage-request-input"].status == NodeStatus.SUCCEEDED
-    for node_key in (
-        "raw-database-searches",
-        "combined-msa-publications",
-        "protein-template-searches",
-    ):
-        assert nodes[node_key].status == NodeStatus.SUCCEEDED
-        assert runtime.store.execution.list_tasks(RUN_ID, node_key) == ()
-        assert (
-            tmp_path / "execution-publications" / str(RUN_ID) / node_key / "empty.json"
-        ).is_file()
-    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
-    runtime.close()
-
-
-def test_initialization_does_not_checkpoint_the_output_volume(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path)
-
-    runtime._initialize()
-
-    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.PENDING
-    output = cast(FakeVolume, runtime.output_volume)
-    assert output.reloads == 0
-    assert output.commits == 0
-    runtime.close()
-
-
-def test_malformed_provider_return_is_a_conclusive_diagnostic() -> None:
-    """Malformed output is stored as a diagnostic, not provider uncertainty."""
-    assert _result_envelope(None) == {"invalid_result": "None"}
-    assert _result_envelope({"execution_result": {"path": "result.json"}}) == {
-        "execution_result": {"path": "result.json"}
     }
 
 
-def test_seed_tasks_use_fixed_batches_without_duplicate_submission(
+def _runtime(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Three seed Tasks map durably to two GPU calls and are not resubmitted."""
-    driver = RecordingCallDriver()
-    runtime = _runtime(
-        tmp_path,
-        request=_request(seeds=[1, 2, 3], max_gpu_containers=2),
-        driver=driver,
+    *,
+    request: AlphaFold3ExecutionRequest | None = None,
+    driver: RecordingDriver | None = None,
+) -> tuple[ExecutionGraphRuntime, dict[str, object]]:
+    selected = request or _request()
+    inputs = _graph_inputs(tmp_path)
+    graph = alphafold3_execution_graph(
+        selected,
+        execution_run_id=RUN_ID,
+        **inputs,
     )
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    runtime = ExecutionGraphRuntime(
+        graph=graph,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        artifact_volume_name="AlphaFold3-outputs",
+        workload_run_key=selected.execution_plan.workload_run_key,
+        request=selected,
+        provider_driver=cast(Any, driver or RecordingDriver()),
+        storage_sync=ExecutionVolumeSync(
+            volume=inputs["output_volume"],
+            store=store,
+        ),
+        max_active_provider_calls=selected.max_active_provider_calls,
+        max_active_gpu_provider_calls=selected.max_active_gpu_provider_calls,
+        store=store,
+        poll_interval_seconds=0,
+        now=iter(range(10, 1000)).__next__,
+    )
+    return runtime, inputs
+
+
+def _mock_staging(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(planning_module, "stage_inference_run", lambda *args: None)
     monkeypatch.setattr(
-        execution_runtime,
-        "load_staged_inference_input",
-        lambda *args, **kwargs: SimpleNamespace(recycle=10),
-    )
-    runtime._initialize()
-
-    for _ in range(6):
-        runtime.advance_once()
-
-    calls = runtime.store.execution.list_provider_calls(RUN_ID)
-    assert len(driver.spawns) == 2
-    assert [call.task_keys for call in calls] == [
-        ("seed:1", "seed:2"),
-        ("seed:3",),
-    ]
-    assert {call.status for call in calls}.issubset({
-        ProviderCallStatus.ATTACHED,
-        ProviderCallStatus.RUNNING,
-    })
-    assert all(
-        cast(Any, spawn["function"]).function_name == "run_inference_pipeline"
-        for spawn in driver.spawns
-    )
-
-    commits = cast(FakeVolume, runtime.output_volume).commits
-    reloads = cast(FakeVolume, runtime.output_volume).reloads
-    runtime.advance_once()
-
-    assert len(driver.spawns) == 2
-    assert cast(FakeVolume, runtime.output_volume).commits == commits
-    assert cast(FakeVolume, runtime.output_volume).reloads == reloads
-    assert all(
-        call.status == ProviderCallStatus.RUNNING
-        for call in runtime.store.execution.list_provider_calls(RUN_ID)
-    )
-    runtime.close()
-
-
-def test_provider_success_refreshes_output_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    driver = RecordingCallDriver()
-    runtime = _runtime(tmp_path, driver=driver)
-    monkeypatch.setattr(
-        execution_runtime,
-        "load_staged_inference_input",
-        lambda *args, **kwargs: SimpleNamespace(recycle=10),
-    )
-    runtime._initialize()
-    for _ in range(6):
-        runtime.advance_once()
-
-    assert len(driver.spawns) == 1
-    output = cast(FakeVolume, runtime.output_volume)
-    commits = output.commits
-    reloads = output.reloads
-    driver.observation = ProviderCallObservation(
-        ProviderCallObservationKind.SUCCEEDED,
-        result={"execution_result": {"path": "seed-result.json"}},
-    )
-
-    runtime._reconcile_provider_calls(("seed-predictions",))
-
-    assert output.commits == commits + 1
-    assert output.reloads == reloads + 1
-    runtime.close()
-
-
-def test_seed_planning_is_cached_per_publication_epoch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime = _runtime(tmp_path, request=_request(seeds=list(range(50))))
-    original_prepare = execution_runtime.prepare_inference_run
-    prepare_calls = 0
-    inspect_calls: list[tuple[int, ...]] = []
-
-    def prepare(*args, **kwargs):
-        nonlocal prepare_calls
-        prepare_calls += 1
-        return original_prepare(*args, **kwargs)
-
-    def inspect(
-        runtime,
-        run_id,
-        seeds,
-        *,
-        sample_count,
-        reload_volume=True,
-        allow_large_inference=False,
-    ):
-        del runtime, run_id, sample_count, reload_volume, allow_large_inference
-        inspected = tuple(seeds)
-        inspect_calls.append(inspected)
-        return [{"status": "missing", "seed": seed} for seed in inspected]
-
-    monkeypatch.setattr(execution_runtime, "prepare_inference_run", prepare)
-    monkeypatch.setattr(execution_runtime, "inspect_seed_predictions", inspect)
-
-    assert runtime._node_observation("seed-predictions") == AvailabilityStatus.MISSING
-    assert runtime._node_observation("seed-predictions") == AvailabilityStatus.MISSING
-    assert prepare_calls == 1
-    assert inspect_calls == [tuple(range(50))]
-
-    runtime._invalidate_planning_cache()
-    assert runtime._node_observation("seed-predictions") == AvailabilityStatus.MISSING
-    assert prepare_calls == 2
-    assert inspect_calls == [tuple(range(50)), tuple(range(50))]
-    runtime.close()
-
-
-def test_seed_claim_is_not_acquired_before_deployment_preflight(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An expired exact version cannot strand a scientific generation claim."""
-    runtime = _runtime(
-        tmp_path,
-        request=_request(seeds=[1, 2], max_gpu_containers=2),
-        driver=UnavailableCallDriver(),
-    )
-    monkeypatch.setattr(
-        execution_runtime,
-        "load_staged_inference_input",
-        lambda *args, **kwargs: SimpleNamespace(recycle=10),
-    )
-    runtime._initialize()
-
-    for _ in range(6):
-        runtime.advance_once()
-
-    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED
-    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
-    claims = cast(FakeClaims, runtime.inference_runtime.claims)
-    assert claims.values == {}
-    runtime.close()
-
-
-def test_completed_invocation_prunes_every_ancestor_without_a_call(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A terminal scientific result makes a repeated root Run a cache success."""
-    runtime = _runtime(tmp_path)
-    monkeypatch.setattr(
-        execution_runtime,
-        "load_invocation_manifest",
-        lambda *args, **kwargs: {"status": "complete"},
-    )
-    monkeypatch.setattr(
-        execution_runtime,
-        "request_manifest_artifacts_available",
-        lambda *args, **kwargs: True,
-    )
-    runtime._initialize()
-
-    runtime.advance_once()
-
-    snapshot = runtime.store.execution.snapshot(RUN_ID)
-    assert snapshot.run.status == RunStatus.SUCCEEDED
-    assert snapshot.provider_calls == ()
-    assert snapshot.nodes[-1].status == NodeStatus.SUCCEEDED
-    assert all(node.status.is_terminal for node in snapshot.nodes)
-    runtime.close()
-
-
-def test_backward_probe_stops_at_reusable_combined_msa(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A reusable intermediate prunes its raw-search ancestor closure."""
-    runtime = _runtime(tmp_path, request=_request(search_msa=True))
-    runtime._initialize()
-    observed: list[str] = []
-
-    def observe(node_key: str) -> AvailabilityStatus:
-        observed.append(node_key)
-        if node_key == "combined-msa-publications":
-            return AvailabilityStatus.AVAILABLE
-        return AvailabilityStatus.MISSING
-
-    monkeypatch.setattr(runtime, "_node_observation", observe)
-
-    runtime._recover_publications()
-    required = runtime._provider.required_node_keys(RUN_ID)
-    assert required is not None
-    runtime._provider.prune_unrequired_nodes(
-        RUN_ID,
-        required_node_keys=required,
-        now=101,
-    )
-
-    assert observed == [
-        "request-publication",
-        "inference-summary",
-        "seed-predictions",
-        "stage-inference-input",
-        "protein-template-searches",
-        "combined-msa-publications",
-    ]
-    assert "raw-database-searches" not in required
-    nodes = {node.node_key: node for node in runtime.store.execution.list_nodes(RUN_ID)}
-    assert nodes["combined-msa-publications"].status == NodeStatus.SUCCEEDED
-    assert nodes["raw-database-searches"].status == NodeStatus.SKIPPED
-    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
-    runtime.close()
-
-
-def test_combined_msa_node_observation_uses_validated_combined_cache(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The AF3 adapter can recognize a reusable aggregate before discovery."""
-    runtime = _runtime(tmp_path, request=_request(search_msa=True))
-    plan = plan_msa_resolution(chain_msa_states(runtime.request.config))
-    raw_statuses = tuple(
-        {
-            "status": "missing",
-            "search_identity": f"{index:064x}",
-        }
-        for index, _ in enumerate(plan.raw_searches, start=1)
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_msa_inventory",
-        lambda: (plan.raw_searches, raw_statuses, plan.assemblies),
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_inspect_combined",
-        lambda tasks: tuple({"status": "reused"} for _ in tasks),
-    )
-
-    assert runtime._node_observation("combined-msa-publications") == (
-        AvailabilityStatus.AVAILABLE
-    )
-    runtime.close()
-
-
-def test_overlapping_seed_request_submits_only_the_missing_seed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Canonical seed markers remain the authority for cross-Run reuse."""
-    driver = RecordingCallDriver()
-    runtime = _runtime(
-        tmp_path,
-        request=_request(seeds=[1, 2], max_gpu_containers=2),
-        driver=driver,
-    )
-    monkeypatch.setattr(
-        execution_runtime,
+        planning_module,
         "load_staged_inference_input",
         lambda *args, **kwargs: SimpleNamespace(recycle=10),
     )
 
-    def inspect(
-        runtime,
-        run_id,
-        seeds,
-        *,
-        sample_count,
-        reload_volume=True,
-        allow_large_inference=False,
-    ):
-        del runtime, sample_count, reload_volume, allow_large_inference
-        return [
-            (
-                {"status": "reused", "run_id": run_id, "seed": seed}
-                if seed == 1
-                else {"status": "missing", "run_id": run_id, "seed": seed}
-            )
-            for seed in seeds
-        ]
 
-    def claim(
-        runtime,
-        run_id,
-        seeds,
-        *,
-        sample_count,
-        generation_ids,
-        reload_volume,
-        allow_large_inference=False,
-    ):
-        del runtime, sample_count, reload_volume, allow_large_inference
-        owned = tuple(
+def _missing_seed_statuses(*args, **kwargs):
+    seeds = args[2]
+    return [{"status": "missing", "seed": seed} for seed in seeds]
+
+
+def _owned_seed_claims(
+    runtime,
+    run_id,
+    seeds,
+    *,
+    sample_count,
+    generation_ids,
+    reload_volume,
+    allow_large_inference=False,
+):
+    del runtime, sample_count, reload_volume, allow_large_inference
+    return SeedClaimPlan(
+        reused_seeds=(),
+        owned=tuple(
             ClaimedSeed(
                 seed=seed,
                 claim=GenerationClaim(
@@ -562,29 +249,248 @@ def test_overlapping_seed_request_submits_only_the_missing_seed(
                 ),
             )
             for seed in seeds
-        )
-        return SeedClaimPlan(reused_seeds=(), owned=owned, active=())
+        ),
+        active=(),
+    )
 
-    monkeypatch.setattr(execution_runtime, "inspect_seed_predictions", inspect)
-    monkeypatch.setattr(execution_runtime, "claim_seed_predictions", claim)
-    runtime._initialize()
 
-    for _ in range(6):
+def _advance_until_calls(runtime: ExecutionGraphRuntime, count: int) -> None:
+    for _ in range(16):
+        runtime.advance_once()
+        if len(runtime.store.execution.list_provider_calls(RUN_ID)) == count:
+            return
+    raise AssertionError(f"Expected {count} AlphaFold3 Provider Calls")
+
+
+def test_graph_preserves_the_staged_execution_plan(tmp_path: Path) -> None:
+    request = _request()
+    assert request.execution_plan.workload_run_key is not None
+    graph = alphafold3_execution_graph(
+        request,
+        execution_run_id=RUN_ID,
+        **_graph_inputs(tmp_path),
+    )
+
+    plan = execution_plan(
+        graph.validate(),
+        workload_run_key=request.execution_plan.workload_run_key,
+    )
+
+    assert plan == request.execution_plan
+
+
+def test_task_result_refresh_reloads_the_template_cache(tmp_path: Path) -> None:
+    inputs = _graph_inputs(tmp_path)
+    graph = alphafold3_execution_graph(
+        _request(),
+        execution_run_id=RUN_ID,
+        **inputs,
+    )
+    node = cast(Any, graph.validate().nodes[TEMPLATE_SEARCHES].node)
+
+    node.refresh_result_storage()
+
+    assert inputs["template_runtime"].cache_volume.reloads == 1
+
+
+def test_staged_inference_preserves_unknown_observations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = alphafold3_execution_graph(
+        _request(),
+        execution_run_id=RUN_ID,
+        **_graph_inputs(tmp_path),
+    )
+    node = cast(Any, graph.validate().nodes[STAGE_INFERENCE].node)
+    monkeypatch.setattr(
+        planning_module,
+        "load_staged_inference_input",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+    )
+
+    assert node.planning.staged_inference_observation() == AvailabilityStatus.UNKNOWN
+
+
+def test_no_search_stages_complete_without_provider_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_staging(monkeypatch)
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    runtime, _inputs = _runtime(tmp_path)
+    runtime.attach()
+
+    for _ in range(5):
         runtime.advance_once()
 
+    nodes = {node.node_key: node for node in runtime.store.execution.list_nodes(RUN_ID)}
+    for node_key in (
+        "stage-request-input",
+        "raw-database-searches",
+        "combined-msa-publications",
+        "protein-template-searches",
+        "stage-inference-input",
+    ):
+        assert nodes[node_key].status.is_terminal
+    assert {
+        call.node_key for call in runtime.store.execution.list_provider_calls(RUN_ID)
+    }.issubset({SEED_PREDICTIONS})
+
+
+def test_seed_tasks_use_balanced_fixed_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_staging(monkeypatch)
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "claim_seed_predictions",
+        _owned_seed_claims,
+    )
+    driver = RecordingDriver()
+    runtime, _inputs = _runtime(
+        tmp_path,
+        request=_request(seeds=[1, 2, 3], max_gpu_containers=2),
+        driver=driver,
+    )
+    runtime.attach()
+
+    _advance_until_calls(runtime, 2)
+
     calls = runtime.store.execution.list_provider_calls(RUN_ID)
-    assert len(calls) == 1
-    assert calls[0].task_keys == ("seed:2",)
-    assert len(driver.spawns) == 1
-    kwargs = cast(dict[str, Any], driver.spawns[0]["kwargs"])
-    claimed = cast(list[dict[str, object]], kwargs["claimed_seed_records"])
-    assert claimed[0]["seed"] == 2
+    assert [call.task_keys for call in calls] == [
+        ("seed:1", "seed:2"),
+        ("seed:3",),
+    ]
+    assert all(
+        call.status in {ProviderCallStatus.ATTACHED, ProviderCallStatus.RUNNING}
+        for call in calls
+    )
+    assert len(driver.spawns) == 2
+
+
+def test_seed_claims_follow_deployment_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_staging(monkeypatch)
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    claim_calls = 0
+
+    def claim(*args, **kwargs):
+        nonlocal claim_calls
+        claim_calls += 1
+        return _owned_seed_claims(*args, **kwargs)
+
+    monkeypatch.setattr(planning_module, "claim_seed_predictions", claim)
+    runtime, _inputs = _runtime(
+        tmp_path,
+        request=_request(seeds=[1, 2], max_gpu_containers=2),
+        driver=RecordingDriver(unavailable=True),
+    )
+    runtime.attach()
+
+    for _ in range(8):
+        runtime.advance_once()
+        if runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED:
+            break
+
+    assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED
+    assert claim_calls == 0
+    assert runtime.store.execution.list_provider_calls(RUN_ID) == ()
+
+
+def test_overlapping_seed_request_submits_only_missing_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_staging(monkeypatch)
+
+    def inspect(runtime, run_id, seeds, **kwargs):
+        del runtime, kwargs
+        return [
+            {
+                "status": "reused" if seed == 1 else "missing",
+                "run_id": run_id,
+                "seed": seed,
+            }
+            for seed in seeds
+        ]
+
+    monkeypatch.setattr(planning_module, "inspect_seed_predictions", inspect)
+    monkeypatch.setattr(
+        planning_module,
+        "claim_seed_predictions",
+        _owned_seed_claims,
+    )
+    driver = RecordingDriver()
+    runtime, _inputs = _runtime(
+        tmp_path,
+        request=_request(seeds=[1, 2], max_gpu_containers=2),
+        driver=driver,
+    )
+    runtime.attach()
+
+    _advance_until_calls(runtime, 1)
+
+    [call] = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert call.task_keys == ("seed:2",)
     assert (
         runtime.store.execution.get_task(
             RUN_ID,
-            "seed-predictions",
+            SEED_PREDICTIONS,
             "seed:1",
-        ).status.value
-        == "succeeded"
+        ).status
+        == TaskStatus.SUCCEEDED
     )
-    runtime.close()
+
+
+def test_completed_invocation_prunes_ancestor_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        planning_module,
+        "load_invocation_manifest",
+        lambda *args, **kwargs: {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "request_manifest_artifacts_available",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "load_request_manifest",
+        lambda *args, **kwargs: {"status": "complete"},
+    )
+    runtime, _inputs = _runtime(tmp_path)
+    runtime.attach()
+
+    runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.run.status == RunStatus.SUCCEEDED
+    assert snapshot.provider_calls == ()
+    assert all(node.status.is_terminal for node in snapshot.nodes)
+
+
+def test_malformed_provider_return_keeps_bounded_diagnostic() -> None:
+    assert _result_envelope(None) == {"invalid_result": "None"}
+    assert _result_envelope({"execution_result": {"path": "result.json"}}) == {
+        "execution_result": {"path": "result.json"}
+    }

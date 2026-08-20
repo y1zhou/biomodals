@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from fnmatch import fnmatch
+from uuid import UUID
 
 import orjson
 
@@ -29,9 +30,14 @@ EXECUTION_ARTIFACT_TABLES = (
 class ExecutionArtifactStore:
     """Persist artifact publications without owning execution state."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
-        """Bind a caller-owned connection without committing or closing it."""
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        execution_run_id: UUID,
+    ) -> None:
+        """Bind one Run on a caller-owned connection."""
         self._connection = connection
+        self._execution_run_id = str(execution_run_id)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
 
@@ -40,7 +46,10 @@ class ExecutionArtifactStore:
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS execution_artifacts (
-                artifact_id TEXT PRIMARY KEY,
+                execution_run_id TEXT NOT NULL
+                    REFERENCES execution_runs(execution_run_id)
+                    ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
                 producing_node_key TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 volume_name TEXT NOT NULL,
@@ -48,13 +57,13 @@ class ExecutionArtifactStore:
                 storage_media_type TEXT,
                 source_app_output_name TEXT,
                 created_at INTEGER NOT NULL,
-                metadata_json TEXT NOT NULL
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY (execution_run_id, artifact_id)
             );
 
             CREATE TABLE IF NOT EXISTS execution_artifact_files (
-                artifact_id TEXT NOT NULL
-                    REFERENCES execution_artifacts(artifact_id)
-                    ON DELETE CASCADE,
+                execution_run_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
                 path TEXT NOT NULL,
                 role TEXT,
@@ -62,58 +71,76 @@ class ExecutionArtifactStore:
                 size_bytes INTEGER,
                 content_sha256 TEXT,
                 metadata_json TEXT NOT NULL,
-                PRIMARY KEY (artifact_id, path),
-                UNIQUE (artifact_id, ordinal)
+                FOREIGN KEY (execution_run_id, artifact_id)
+                    REFERENCES execution_artifacts(execution_run_id, artifact_id)
+                    ON DELETE CASCADE,
+                PRIMARY KEY (execution_run_id, artifact_id, path),
+                UNIQUE (execution_run_id, artifact_id, ordinal)
             );
 
             CREATE TABLE IF NOT EXISTS execution_node_inputs (
+                execution_run_id TEXT NOT NULL,
                 node_key TEXT NOT NULL,
                 input_name TEXT NOT NULL,
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-                artifact_id TEXT NOT NULL
-                    REFERENCES execution_artifacts(artifact_id),
-                PRIMARY KEY (node_key, input_name, artifact_id),
-                UNIQUE (node_key, input_name, ordinal)
+                artifact_id TEXT NOT NULL,
+                FOREIGN KEY (execution_run_id, artifact_id)
+                    REFERENCES execution_artifacts(execution_run_id, artifact_id),
+                PRIMARY KEY (
+                    execution_run_id, node_key, input_name, artifact_id
+                ),
+                UNIQUE (execution_run_id, node_key, input_name, ordinal)
             );
 
             CREATE TABLE IF NOT EXISTS execution_task_outputs (
+                execution_run_id TEXT NOT NULL,
                 node_key TEXT NOT NULL,
                 task_key TEXT NOT NULL,
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-                artifact_id TEXT NOT NULL UNIQUE
-                    REFERENCES execution_artifacts(artifact_id),
-                PRIMARY KEY (node_key, task_key, ordinal)
+                artifact_id TEXT NOT NULL,
+                FOREIGN KEY (execution_run_id, artifact_id)
+                    REFERENCES execution_artifacts(execution_run_id, artifact_id),
+                PRIMARY KEY (execution_run_id, node_key, task_key, ordinal),
+                UNIQUE (execution_run_id, artifact_id)
             );
 
             CREATE TABLE IF NOT EXISTS execution_task_results (
+                execution_run_id TEXT NOT NULL,
                 node_key TEXT NOT NULL,
                 task_key TEXT NOT NULL,
                 task_fingerprint TEXT NOT NULL,
                 result_json TEXT NOT NULL,
                 completed_at INTEGER NOT NULL,
-                PRIMARY KEY (node_key, task_key)
+                PRIMARY KEY (execution_run_id, node_key, task_key)
             );
 
             CREATE TABLE IF NOT EXISTS execution_node_outputs (
+                execution_run_id TEXT NOT NULL,
                 node_key TEXT NOT NULL,
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-                artifact_id TEXT NOT NULL UNIQUE
-                    REFERENCES execution_artifacts(artifact_id),
-                PRIMARY KEY (node_key, ordinal)
+                artifact_id TEXT NOT NULL,
+                FOREIGN KEY (execution_run_id, artifact_id)
+                    REFERENCES execution_artifacts(execution_run_id, artifact_id),
+                PRIMARY KEY (execution_run_id, node_key, ordinal),
+                UNIQUE (execution_run_id, artifact_id)
             );
 
             CREATE TABLE IF NOT EXISTS execution_node_results (
-                node_key TEXT PRIMARY KEY,
+                execution_run_id TEXT NOT NULL,
+                node_key TEXT NOT NULL,
                 result_json TEXT NOT NULL,
-                completed_at INTEGER NOT NULL
+                completed_at INTEGER NOT NULL,
+                PRIMARY KEY (execution_run_id, node_key)
             );
 
             CREATE INDEX IF NOT EXISTS execution_artifacts_node
-                ON execution_artifacts(producing_node_key);
+                ON execution_artifacts(execution_run_id, producing_node_key);
             CREATE INDEX IF NOT EXISTS execution_node_inputs_artifact
-                ON execution_node_inputs(artifact_id);
+                ON execution_node_inputs(execution_run_id, artifact_id);
             CREATE INDEX IF NOT EXISTS execution_task_outputs_task
-                ON execution_task_outputs(node_key, task_key);
+                ON execution_task_outputs(
+                    execution_run_id, node_key, task_key
+                );
             """
         )
 
@@ -124,22 +151,32 @@ class ExecutionArtifactStore:
     ) -> None:
         """Replace one Node's resolved artifact-input links."""
         self._connection.execute(
-            "DELETE FROM execution_node_inputs WHERE node_key = ?",
-            (node_key,),
+            """
+            DELETE FROM execution_node_inputs
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (self._execution_run_id, node_key),
         )
         for input_name, selected in inputs.items():
             self._connection.executemany(
                 """
                 INSERT INTO execution_node_inputs (
+                    execution_run_id,
                     node_key,
                     input_name,
                     ordinal,
                     artifact_id
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 [
-                    (node_key, input_name, ordinal, artifact.artifact_id)
+                    (
+                        self._execution_run_id,
+                        node_key,
+                        input_name,
+                        ordinal,
+                        artifact.artifact_id,
+                    )
                     for ordinal, artifact in enumerate(selected)
                 ],
             )
@@ -169,20 +206,35 @@ class ExecutionArtifactStore:
             self._insert_artifact(artifact, now=now)
         self._connection.executemany(
             """
-            INSERT INTO execution_node_outputs (node_key, ordinal, artifact_id)
-            VALUES (?, ?, ?)
+            INSERT INTO execution_node_outputs (
+                execution_run_id,
+                node_key,
+                ordinal,
+                artifact_id
+            )
+            VALUES (?, ?, ?, ?)
             """,
             [
-                (node_key, ordinal, artifact.artifact_id)
+                (
+                    self._execution_run_id,
+                    node_key,
+                    ordinal,
+                    artifact.artifact_id,
+                )
                 for ordinal, artifact in enumerate(artifacts)
             ],
         )
         self._connection.execute(
             """
-            INSERT INTO execution_node_results (node_key, result_json, completed_at)
-            VALUES (?, ?, ?)
+            INSERT INTO execution_node_results (
+                execution_run_id,
+                node_key,
+                result_json,
+                completed_at
+            )
+            VALUES (?, ?, ?, ?)
             """,
-            (node_key, result.model_dump_json(), now),
+            (self._execution_run_id, node_key, result.model_dump_json(), now),
         )
 
     def load_node_result(self, node_key: str) -> AppRunResult | None:
@@ -191,9 +243,9 @@ class ExecutionArtifactStore:
             """
             SELECT result_json
             FROM execution_node_results
-            WHERE node_key = ?
+            WHERE execution_run_id = ? AND node_key = ?
             """,
-            (node_key,),
+            (self._execution_run_id, node_key),
         ).fetchone()
         if row is None:
             return None
@@ -238,30 +290,39 @@ class ExecutionArtifactStore:
         self._connection.executemany(
             """
             INSERT INTO execution_task_outputs (
+                execution_run_id,
                 node_key,
                 task_key,
                 ordinal,
                 artifact_id
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             """,
             [
-                (node_key, task_key, ordinal, artifact.artifact_id)
+                (
+                    self._execution_run_id,
+                    node_key,
+                    task_key,
+                    ordinal,
+                    artifact.artifact_id,
+                )
                 for ordinal, artifact in enumerate(artifacts)
             ],
         )
         self._connection.execute(
             """
             INSERT INTO execution_task_results (
+                execution_run_id,
                 node_key,
                 task_key,
                 task_fingerprint,
                 result_json,
                 completed_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
+                self._execution_run_id,
                 node_key,
                 task_key,
                 task_fingerprint,
@@ -280,9 +341,9 @@ class ExecutionArtifactStore:
             """
             SELECT result_json
             FROM execution_task_results
-            WHERE node_key = ? AND task_key = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
             """,
-            (node_key, task_key),
+            (self._execution_run_id, node_key, task_key),
         ).fetchone()
         if row is None:
             return None
@@ -294,9 +355,9 @@ class ExecutionArtifactStore:
             """
             SELECT task_fingerprint
             FROM execution_task_results
-            WHERE node_key = ? AND task_key = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
             """,
-            (node_key, task_key),
+            (self._execution_run_id, node_key, task_key),
         ).fetchone()
         if row is None:
             return None
@@ -312,10 +373,10 @@ class ExecutionArtifactStore:
             """
             SELECT artifact_id
             FROM execution_task_outputs
-            WHERE node_key = ? AND task_key = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
             ORDER BY ordinal
             """,
-            (node_key, task_key),
+            (self._execution_run_id, node_key, task_key),
         ).fetchall()
         return tuple(self.load_artifact(str(row["artifact_id"])) for row in rows)
 
@@ -325,24 +386,24 @@ class ExecutionArtifactStore:
             """
             SELECT artifact_id
             FROM execution_task_outputs
-            WHERE node_key = ? AND task_key = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
             """,
-            (node_key, task_key),
+            (self._execution_run_id, node_key, task_key),
         ).fetchall()
         artifact_ids = tuple(str(row["artifact_id"]) for row in artifact_rows)
         self._connection.execute(
             """
             DELETE FROM execution_task_results
-            WHERE node_key = ? AND task_key = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
             """,
-            (node_key, task_key),
+            (self._execution_run_id, node_key, task_key),
         )
         self._connection.execute(
             """
             DELETE FROM execution_task_outputs
-            WHERE node_key = ? AND task_key = ?
+            WHERE execution_run_id = ? AND node_key = ? AND task_key = ?
             """,
-            (node_key, task_key),
+            (self._execution_run_id, node_key, task_key),
         )
         self._delete_unreferenced_artifacts(artifact_ids)
 
@@ -352,18 +413,24 @@ class ExecutionArtifactStore:
             """
             SELECT artifact_id
             FROM execution_node_outputs
-            WHERE node_key = ?
+            WHERE execution_run_id = ? AND node_key = ?
             """,
-            (node_key,),
+            (self._execution_run_id, node_key),
         ).fetchall()
         artifact_ids = tuple(str(row["artifact_id"]) for row in artifact_rows)
         self._connection.execute(
-            "DELETE FROM execution_node_results WHERE node_key = ?",
-            (node_key,),
+            """
+            DELETE FROM execution_node_results
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (self._execution_run_id, node_key),
         )
         self._connection.execute(
-            "DELETE FROM execution_node_outputs WHERE node_key = ?",
-            (node_key,),
+            """
+            DELETE FROM execution_node_outputs
+            WHERE execution_run_id = ? AND node_key = ?
+            """,
+            (self._execution_run_id, node_key),
         )
         self._delete_unreferenced_artifacts(artifact_ids)
 
@@ -373,9 +440,9 @@ class ExecutionArtifactStore:
             """
             SELECT *
             FROM execution_artifacts
-            WHERE artifact_id = ?
+            WHERE execution_run_id = ? AND artifact_id = ?
             """,
-            (artifact_id,),
+            (self._execution_run_id, artifact_id),
         ).fetchone()
         if row is None:
             raise FileNotFoundError(f"Execution artifact not found: {artifact_id}")
@@ -390,10 +457,10 @@ class ExecutionArtifactStore:
             """
             SELECT artifact_id
             FROM execution_node_outputs
-            WHERE node_key = ?
+            WHERE execution_run_id = ? AND node_key = ?
             ORDER BY ordinal
             """,
-            (node_key,),
+            (self._execution_run_id, node_key),
         ).fetchall()
         return tuple(self.load_artifact(str(row["artifact_id"])) for row in rows)
 
@@ -423,6 +490,7 @@ class ExecutionArtifactStore:
         self._connection.execute(
             """
             INSERT INTO execution_artifacts (
+                execution_run_id,
                 artifact_id,
                 producing_node_key,
                 kind,
@@ -433,9 +501,10 @@ class ExecutionArtifactStore:
                 created_at,
                 metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                self._execution_run_id,
                 artifact.artifact_id,
                 artifact.producing_node_id,
                 artifact.kind.value,
@@ -450,6 +519,7 @@ class ExecutionArtifactStore:
         self._connection.executemany(
             """
             INSERT INTO execution_artifact_files (
+                execution_run_id,
                 artifact_id,
                 ordinal,
                 path,
@@ -459,10 +529,11 @@ class ExecutionArtifactStore:
                 content_sha256,
                 metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
+                    self._execution_run_id,
                     artifact.artifact_id,
                     ordinal,
                     file.path,
@@ -484,19 +555,26 @@ class ExecutionArtifactStore:
             self._connection.execute(
                 """
                 DELETE FROM execution_artifacts
-                WHERE artifact_id = ?
+                WHERE execution_run_id = ? AND artifact_id = ?
                   AND NOT EXISTS (
                       SELECT 1
                       FROM execution_node_outputs
-                      WHERE artifact_id = ?
+                      WHERE execution_run_id = ? AND artifact_id = ?
                   )
                   AND NOT EXISTS (
                       SELECT 1
                       FROM execution_task_outputs
-                      WHERE artifact_id = ?
+                      WHERE execution_run_id = ? AND artifact_id = ?
                   )
                 """,
-                (artifact_id, artifact_id, artifact_id),
+                (
+                    self._execution_run_id,
+                    artifact_id,
+                    self._execution_run_id,
+                    artifact_id,
+                    self._execution_run_id,
+                    artifact_id,
+                ),
             )
 
     def _artifact_from_row(self, row: sqlite3.Row) -> ExecutionArtifact:
@@ -504,10 +582,10 @@ class ExecutionArtifactStore:
             """
             SELECT *
             FROM execution_artifact_files
-            WHERE artifact_id = ?
+            WHERE execution_run_id = ? AND artifact_id = ?
             ORDER BY ordinal
             """,
-            (row["artifact_id"],),
+            (self._execution_run_id, row["artifact_id"]),
         ).fetchall()
         return ExecutionArtifact.model_validate({
             "artifact_id": row["artifact_id"],

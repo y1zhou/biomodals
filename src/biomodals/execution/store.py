@@ -249,7 +249,7 @@ class GraphExecutionRunStore(ExecutionRunStore):
         """Initialize execution-owned artifact tables on the connection."""
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._reject_legacy_schema(connection)
-        artifacts = ExecutionArtifactStore(connection)
+        artifacts = ExecutionArtifactStore(connection, self.execution_run_id)
         artifacts.initialize_schema()
         self._artifacts = artifacts
 

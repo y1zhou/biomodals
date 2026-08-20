@@ -32,6 +32,7 @@ from biomodals.schema import (
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+OTHER_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 EXPECTED_EXECUTION_TABLES = {
     "execution_dispatch_batches",
     "execution_node_dependencies",
@@ -54,13 +55,8 @@ def _stores() -> tuple[
     connection = sqlite3.connect(":memory:")
     execution = SqliteExecutionRepository(connection)
     execution.initialize_schema()
-    artifacts = ExecutionArtifactStore(connection)
+    artifacts = ExecutionArtifactStore(connection, RUN_ID)
     artifacts.initialize_schema()
-    connection.commit()
-    return connection, execution, artifacts
-
-
-def _start_task(execution: SqliteExecutionRepository) -> None:
     execution.create_run(
         execution_run_id=RUN_ID,
         plan=ExecutionPlan(
@@ -72,6 +68,11 @@ def _start_task(execution: SqliteExecutionRepository) -> None:
         max_active_gpu_provider_calls=1,
         now=100,
     )
+    connection.commit()
+    return connection, execution, artifacts
+
+
+def _start_task(execution: SqliteExecutionRepository) -> None:
     execution.start_node(RUN_ID, "design", now=101)
     execution.discover_tasks(
         RUN_ID,
@@ -191,6 +192,47 @@ def test_schema_contains_shared_execution_and_execution_artifacts_only() -> None
     assert EXPECTED_EXECUTION_TABLES.issubset(tables)
     assert set(EXECUTION_ARTIFACT_TABLES).issubset(tables)
     assert not {"runs", "nodes", "attempts", "remote_calls"} & tables
+
+
+def test_artifact_publications_are_scoped_to_one_execution_run() -> None:
+    connection, execution, first = _stores()
+    execution.create_run(
+        execution_run_id=OTHER_RUN_ID,
+        plan=ExecutionPlan(
+            workload_name="workflow:demo",
+            nodes=(NodePlan(node_key="design"),),
+        ),
+        deployment=DeploymentIdentity("production", "DemoWorkflow", 3),
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=1,
+        now=100,
+    )
+    second = ExecutionArtifactStore(connection, OTHER_RUN_ID)
+    result, artifact = _publication()
+    changed = artifact.model_copy(
+        update={
+            "storage": VolumePath(
+                volume_name="Workflow-outputs",
+                path="another/run/design/model.pdb",
+            )
+        }
+    )
+
+    first.record_node_publication(
+        "design",
+        result=result,
+        artifacts=(artifact,),
+        now=110,
+    )
+    second.record_node_publication(
+        "design",
+        result=result,
+        artifacts=(changed,),
+        now=110,
+    )
+
+    assert first.load_node_output_artifacts("design") == (artifact,)
+    assert second.load_node_output_artifacts("design") == (changed,)
 
 
 def test_publication_rejects_unmaterialized_inline_bytes() -> None:

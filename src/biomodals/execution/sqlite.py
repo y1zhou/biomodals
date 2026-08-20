@@ -51,7 +51,7 @@ from biomodals.execution.scheduler import (
 
 _MAX_RESULT_ENVELOPE_BYTES = 1024 * 1024
 
-EXECUTION_SCHEMA_VERSION = 5
+EXECUTION_SCHEMA_VERSION = 6
 
 
 class UnsupportedExecutionSchemaVersionError(RuntimeError):

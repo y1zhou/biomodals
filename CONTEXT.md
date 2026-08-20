@@ -413,7 +413,8 @@ validation.
 _Avoid_: raw provider output, untyped file path, loose tarball, Workflow Artifact
 
 **Artifact Availability**:
-The observed state of a workflow artifact as available, missing, or unknown; unknown means verification could not establish presence or absence.
+The observed state of an Execution Artifact as `available`, `missing`, or
+`unknown`; unknown means verification could not establish presence or absence.
 _Avoid_: boolean existence, checker success
 
 **Inline Byte Output**:
@@ -427,8 +428,8 @@ one executable graph model.
 _Avoid_: separate workflow scheduler type, Modal function, app function
 
 **Terminal Workflow Node**:
-A workflow node with no downstream dependencies in a validated workflow DAG.
-_Avoid_: final node, last node
+A legacy name for a Terminal Execution Node authored as part of a workflow.
+_Avoid_: current interface, final node, last executed node
 
 **App**:
 A reusable scientific capability and its provider operations, deployment
@@ -763,31 +764,40 @@ A stable app-run identifier that contains no path traversal or separator semanti
 _Avoid_: raw user path, silently normalized cache key
 
 **App-Backed Node**:
-A workflow node implemented by calling one or more app functions.
-_Avoid_: app node, runner node
+A descriptive, legacy shorthand for an Execution Node whose Provider Calls
+invoke one or more app-owned operations. The shared interface remains
+`ProviderNode` or `TaskProviderNode`.
+_Avoid_: current interface name, app node, runner node
 
 **Workflow-Native Node**:
-A workflow node implemented directly in workflow code for orchestration, transformation, selection, ranking, packaging, or reporting.
-_Avoid_: runtime node, orchestrator node
+A descriptive, legacy shorthand for an Execution Node whose scientific logic
+is owned by a workflow. It may be a `CoordinatorNode` or provider-backed Node.
+_Avoid_: current interface name, runtime node, orchestrator node
 
-**Workflow Builder**:
-A Python interface for declaring workflow nodes, dependencies, artifact selectors, and execution settings before a workflow run.
-_Avoid_: workflow YAML, scheduler config
+**Execution Graph Builder**:
+The Python `ExecutionGraph` interface for declaring Execution Nodes,
+dependencies, Artifact Selectors, and scientific plan metadata before
+validation produces an immutable Execution Definition.
+_Avoid_: Workflow Builder, workflow YAML, scheduler config
 
 **Artifact Selector**:
-A named input reference that selects upstream workflow artifacts by kind, file role, path pattern, metadata, or producing node.
+A named input reference that selects upstream Execution Artifacts by kind, file
+role, path pattern, metadata, or producing Node.
 _Avoid_: raw input path, wildcard-only dependency
 
 **Control Edge**:
-A dependency between workflow nodes that enforces execution order without passing workflow artifacts.
+A dependency between Execution Nodes that enforces order without passing an
+Execution Artifact.
 _Avoid_: dummy artifact
 
 **Dynamic Task Fan-Out**:
-A workflow node execution pattern where the DAG node is fixed but the number of per-input tasks is determined from upstream artifacts at runtime.
+A pattern where the Execution Node is fixed but its Task count is determined
+from upstream artifacts at runtime.
 _Avoid_: dynamic DAG
 
 **Worker Pool**:
-A bounded process or thread pool from `concurrent.futures` that limits concurrent task execution within one workflow node.
+A bounded process or thread pool from `concurrent.futures` that limits
+concurrent work inside one Execution Node or Provider Call.
 _Avoid_: server pool, runner server
 
 **Workflow Node Parallelism**:
@@ -836,7 +846,7 @@ _Avoid_: current runtime interface, separate workflow scheduler
 
 **Runtime Diagnostics**:
 An `ExecutionSnapshot` plus the durable Run, Node, Task, Provider Call, and
-workflow artifact records used to inspect execution state.
+Execution Artifact records used to inspect execution state.
 _Avoid_: private scheduler API, debug-only in-memory history
 
 **Durable Node Completion**:
@@ -861,9 +871,11 @@ same kernel-owned artifact records; scientific files and validation remain
 workload-owned.
 _Avoid_: current artifact interface, scientific publication
 
-**Node Placement**:
-The execution location for a workflow node, either inline in the workflow orchestrator or in a separate remote Modal function.
-_Avoid_: runner location, execution site
+**Execution Boundary**:
+Whether an Execution Node runs as a Coordinator-Local Task or through one or
+more Provider Calls. The Node contract declares this boundary independently of
+whether the Definition was authored by an app or workflow.
+_Avoid_: Node Placement, runner location, execution site
 
 **Durable Node Cache**:
 Volume-backed intermediate checkpoint state that workload code may use when
@@ -873,17 +885,27 @@ _Avoid_: temporary scratch, local cache
 
 ## Flagged ambiguities
 
-- "artifact" can mean either inline app bytes or remote files. Resolved: an **Inline Byte Output** is a small app output before materialization; a **Workflow Artifact** is durable volume-backed state after materialization.
-- "step" can mean either a semantic workflow operation or one callable remote function. Resolved: use **Workflow Node** for the semantic DAG unit and **App Function** for a Modal remote callable.
-- "app node" can mean either a Modal deployment unit or a DAG vertex backed by that app. Resolved: use **App** for the deployment unit and **App-Backed Node** for the DAG vertex.
+- "artifact" can mean either inline app bytes or durable files. Resolved: an
+  **Inline Byte Output** is a small app result before materialization; an
+  **Execution Artifact** is the durable materialized or referenced record.
+- "step" can mean either a semantic operation or one callable remote function.
+  Resolved: use **Execution Node** for the DAG unit, **Workload Operation** for
+  its provider-independent implementation, and **Provider Call** for a
+  concrete invocation.
+- "app node" can mean either a deployment unit or a DAG vertex backed by that
+  app. Resolved: use **App** for the deployment unit and **App-Backed Execution
+  Node** for the DAG vertex.
 - "workflow entrypoint" can be confused with Modal's local entrypoint. Resolved: use **Workflow-Compatible App Function** for reusable remote app functions and **Local Entrypoint** for CLI wrappers.
-- "parallelism" can mean ready Workflow Nodes, Provider Calls, or local CPU
-  workers. Resolved: use **Workflow Node Parallelism** for the adapter ceiling,
+- "parallelism" can mean ready Execution Nodes, Provider Calls, or local CPU
+  workers. Resolved: use **Execution Node Parallelism** for the adapter ceiling,
   **Run-Level Provider Call Limits** for remote-call limits, and **Worker Pool**
   for local thread or process pools.
 - "dynamic workflow" can mean changing the DAG at runtime or changing only the task count. Resolved: first-version workflows use static DAGs with **Dynamic Task Fan-Out** only.
 - "scheduler database" can mean either the common execution-state contract or one shared physical database. Resolved: the kernel governs the **Execution State Repository** contract, while each durable coordinator may persist it separately and **Workload Publications** remain authoritative for scientific completion.
 - "job" can mean a user-facing service request or actual scheduled work. Resolved: a **Service Job** holds service metadata and refers one-way to an **Execution Run**; the execution kernel knows only the Run and its work.
 - "Job state" can mean either persisted compute state or the API's user-facing summary. Resolved: compute state exists only in the Execution State Repository; the service exposes a **Job State Projection**.
-- "Workflow Ledger" can mean either the physical per-run database or a workflow-specific implementation of execution state. Resolved: it names the physical database; shared execution tables come from the execution kernel, while the **Workflow Artifact Store** owns only workflow artifact records.
+- "Workflow Ledger" can mean either the physical per-run database or a
+  workflow-specific execution implementation. Resolved: it names only the
+  physical database used by a workflow's Modal Execution Host; both execution
+  state and **Execution Artifact** records are kernel-owned.
 - "positions marked for RFdiffusion to generate scaffolds for" can mean every RFdiffusion output residue or only de novo contig residues. Resolved: use **LigandMPNN Redesign Set** for de novo output residues and exclude copied motif residues.

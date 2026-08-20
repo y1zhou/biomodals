@@ -2,18 +2,20 @@
 
 # Execution kernel consolidation
 
-Status: accepted on 2026-08-19; implementation in progress.
+Status: implemented on 2026-08-20. A local-container provider remains
+deferred.
 
-This plan amends [ADR 0006](../adr/0006-unified-execution-kernel.md) and the
+This specification amends
+[ADR 0006](../adr/0006-unified-execution-kernel.md) and the
 [unified scheduler specification](unified-task-scheduler.md). Where an older
-statement conflicts with this plan, this plan is authoritative. The older text
-remains useful history until the migration is complete.
+statement conflicts with this specification, this specification is
+authoritative. Older text is retained only as labeled history.
 
 ## Objective
 
-Biomodals will have one provider-neutral execution kernel for apps, workflows,
-and API-owned app calls. Provider integrations live below that kernel. Modal is
-the only provider integration implemented today.
+Biomodals has one provider-neutral execution kernel for apps, workflows, and
+API-owned app calls. Provider integrations live below that kernel. Modal is the
+only provider integration implemented today.
 
 The consolidation removes two parallel orchestration surfaces:
 
@@ -70,19 +72,26 @@ remain under `biomodals.workflow`. Generic graph execution does not.
 
 ## Target module shape
 
-The package should grow only as implementation requires. The intended seams
-are:
+The implemented package has these maintained seams:
 
 ```text
 src/biomodals/execution/
   __init__.py          # small supported provider-neutral interface
-  model.py             # Run, Node, Task, result, artifact, identity values
+  model.py             # Run, Node, Task, call, and identity values
   definition.py        # executable graph and Node interfaces
+  definition_plan.py   # immutable graph-to-plan conversion
+  definition_runtime.py # definition-owned runtime integration
   scheduler.py         # readiness, ranking, and dispatch policies
   runtime.py           # shared execution lifecycle
   sqlite.py            # repository schema and atomic transitions
   coordinator.py       # provider-neutral drive and resume loops
   artifacts.py         # artifact records and provider-neutral validation
+  artifact_availability.py # reusable tri-state availability checks
+  artifact_store.py    # execution artifact persistence
+  hashing.py           # stable scientific and artifact hashing
+  provider.py          # provider driver protocol and observations
+  store.py             # host-supplied Run storage boundaries
+  pull_worker.py       # provider-neutral pull-worker loop
   modal/
     __init__.py        # small supported Modal-host interface
     driver.py          # Modal SDK resolution, calls, and error translation
@@ -205,8 +214,9 @@ Local Entrypoints remain thin. They parse workload arguments, stage local
 scientific inputs, construct the workload request, and call the Modal host.
 
 The API service does not use the Volume-backed CLI host. It uses the same
-provider-neutral definition and asynchronous execution runtime with its own
-database and process lifecycle, plus the Modal driver from
+provider-neutral definition and synchronous `ExecutionRuntime` behind its
+asynchronous service boundary, with its own database and process lifecycle. Its
+provider adapter uses `AsyncModalCallDriver` from
 `biomodals.execution.modal`.
 
 ## Source layout
@@ -220,7 +230,7 @@ entrypoints rather than generic orchestration.
 ## Compatibility and behavior
 
 There is no compatibility layer for pre-release Python imports or execution
-ledger schemas. The migration will:
+ledger schemas. The migration:
 
 - bump the execution schema version;
 - reject older ledgers explicitly;
@@ -238,9 +248,10 @@ Local-container execution, parallel provider image definitions, and a generic
 provider registry are outside this refactor. The code should leave a real seam
 for them without implementing or testing hypothetical providers.
 
-## Implementation sequence
+## Implemented sequence
 
-Each step is an independently reviewable commit with focused tests kept green:
+The consolidation was delivered as independently reviewable commits with
+focused tests kept green:
 
 1. Record this domain and interface amendment.
 2. Introduce provider-neutral names and the `execution.modal` package.

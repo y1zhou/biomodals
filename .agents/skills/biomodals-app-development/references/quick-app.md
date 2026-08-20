@@ -78,4 +78,4 @@ Use these valid relative paths as examples:
 - [LigandMPNN](../../../../src/biomodals/app/design/ligandmpnn_app.py): small
   workflow `InlineBytes` output.
 
-Set `depends_on_apps` only when composing apps through the workflow runtime.
+Set `depends_on_apps` only when composing apps into a workflow deployment.

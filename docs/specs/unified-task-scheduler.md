@@ -2,8 +2,8 @@
 
 # Unified task scheduler
 
-Status: the original extraction is implemented; the 2026-08-19 consolidation
-amendment is accepted and pending implementation.
+Status: implemented. Explicitly authorized paid-provider smoke tests remain a
+manual release gate.
 
 The accepted
 [execution-kernel consolidation](execution-kernel-consolidation.md) makes the
@@ -19,8 +19,8 @@ Implemented:
 - the shared model, SQLite repository, deterministic admission, fixed-batch
   and pull-worker dispatch, Modal call boundary, cancellation, restart, and
   coordinator loops;
-- the GROMACS service cutover and explicit pre-release service-state
-  transition;
+- the GROMACS service cutover to the app-owned execution graph and removal of
+  pre-release service-state migration;
 - the workflow ledger decomposition, remote workflow coordinator, deployed
   workflow CLI lifecycle, and successor recovery;
 - PPIFlow runtime Task discovery for ReFold, Partial, and LigandMPNN, plus
@@ -41,10 +41,10 @@ Still pending:
 - explicitly authorized manual Modal smoke tests. CI and local verification do
   not make paid provider calls.
 
-This specification records the execution and recovery contract shared by the API
-service, reusable workflow runtime, PPIFlow fan-out, and AlphaFold3 search and
-inference pipelines. It defines a narrow `biomodals.execution` kernel rather
-than an all-purpose `TaskManager`.
+This specification records the execution and recovery contract shared by the
+API service, executable app and workflow graphs, PPIFlow fan-out, and
+AlphaFold3 search and inference pipelines. It defines a narrow
+`biomodals.execution` kernel rather than an all-purpose `TaskManager`.
 
 The target is one place to reason about:
 
@@ -536,7 +536,7 @@ partial, or skipped upstream Node does not override complete terminal results.
 This is intentionally not an aggregation across every planned Node: the graph
 describes ways to obtain scientific results, while validated terminal
 publications determine whether those results exist. It preserves fast cached
-return and the current workflow runtime's terminal-pruning semantics.
+return and the shared execution runtime's terminal-pruning semantics.
 
 After provider ownership and control states are conclusive, terminal Nodes
 aggregate strictly for that Execution Run:
@@ -754,12 +754,17 @@ src/biomodals/execution/
   __init__.py             # deliberately small supported surface
   model.py                # immutable plan and state value objects
   definition.py           # executable graph and Node interfaces
+  definition_plan.py      # immutable graph-to-plan conversion
+  definition_runtime.py   # definition-owned runtime integration
   sqlite.py               # schema and transitions on a host connection
   scheduler.py            # graph readiness, dispatch, and call limits
   artifacts.py            # provider-neutral artifact records
+  artifact_store.py       # execution artifact persistence
   runtime.py              # shared execution lifecycle
   coordinator.py          # reusable coordinator drive loop
   pull_worker.py          # reusable pull-worker claim/complete loop
+  provider.py             # provider driver protocol and observations
+  store.py                # host-supplied Run storage boundaries
   modal/
     __init__.py           # supported Modal-host surface
     driver.py             # Modal SDK call adapter
@@ -1604,11 +1609,12 @@ No path automatically invokes spawn again for that Provider Call. Failed Tasks
 can run again only in a Successor Execution Run; unknown ownership must first
 be resolved conclusively.
 
-The first runtime targets Modal directly. `modal.py` isolates only the
-operations needed for spawn, call-ID resolution, observation or collection,
-and cancellation so tests can use fakes. This is an internal test seam, not a
-public provider abstraction or plugin system. Modal-specific objects do not
-leak into plans or persisted models.
+The root runtime targets a provider-neutral `ProviderDriver` boundary for
+submission, call-ID attachment, observation, and cancellation. Modal-specific
+drivers, deployment lookup, Volume synchronization, and remote coordinator
+hosting live under `biomodals.execution.modal`. Provider SDK objects do not
+leak into plans or persisted models. This is a narrow provider seam, not a
+plugin registry or universal coordinator deployment.
 
 ### Result Envelope and split completion
 
@@ -1622,8 +1628,8 @@ archives, and other scientific files remain in workload-owned durable
 storage; the envelope may refer to them but never embeds them and is excluded
 from scientific fingerprints.
 
-Workflow adapters also keep serialized provider returns out of SQLite. They
-write the return once to a checksum-addressed file in the workflow Run's
+Volume-backed graph hosts also keep serialized provider returns out of SQLite.
+They write the return once to a checksum-addressed file in the Execution Run's
 durable output directory and store only its relative path, SHA-256 digest, and
 byte count in the Result Envelope. Recovery verifies that reference before
 decoding the return. This keeps InlineBytes and other potentially large app
@@ -1815,8 +1821,8 @@ remain available for validation by a newly created Execution Run.
 | AlphaFold3 | Search/run/request identities, claims, publications, seed batching/reuse, summaries, archive hashes |
 | CLI | App and workflow discovery/help, version resolution and overrides, deployed versus development launch, representative dry tests |
 
-CI uses an in-memory SQLite repository, a fake internal Modal call driver, and
-temporary workload storage. Remote Modal validation remains a manual,
+CI uses an in-memory SQLite repository, a fake `ProviderDriver`, and temporary
+workload storage. Remote Modal validation remains a manual,
 explicitly authorized smoke test after local and CI gates pass.
 
 ## Risks and controls

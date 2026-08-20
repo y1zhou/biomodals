@@ -20,13 +20,13 @@ BioModals supports three ways to run scientific work:
 | Offer a tool through the web interface | `biomodals api` and the frontend repository |
 
 The same execution kernel provides durable task state, dependency scheduling,
-Modal call tracking, cancellation, and recovery for coordinated apps,
+provider-call tracking, cancellation, and recovery for coordinated apps,
 workflows, and web Jobs.
 
 ## Architecture
 
-Coordinated direct apps, workflows, and web Jobs use the same execution kernel.
-A workflow reaches it through `biomodals.workflow.core`; a direct app does not:
+Coordinated direct apps, workflows, and web Jobs submit an
+`ExecutionDefinition` to the same provider-neutral execution kernel:
 
 ```mermaid
 ---
@@ -41,15 +41,17 @@ config:
     curve: rounded
 ---
 flowchart LR
-    App["Direct app coordinator<br/>App plan and hooks"] --> Kernel
-    Workflow["Workflow coordinator<br/>biomodals.workflow.core"] --> Kernel
-    Service["FastAPI service<br/>Workload adapter"] --> Kernel
+    App["Direct app<br/>Scientific plan and bindings"] --> Kernel
+    Workflow["Workflow<br/>Scientific DAG and bindings"] --> Kernel
+    Service["FastAPI service<br/>Job and workload adapter"] --> Kernel
     Kernel["biomodals.execution<br/>Durable Task orchestration"]
-    Kernel <-->|"Calls and outcomes"| Modal["Deployed Modal functions"]
+    Kernel <-->|"Provider calls"| ModalHost["biomodals.execution.modal<br/>Modal host and driver"]
+    ModalHost <-->|"Functions and outcomes"| Modal["Modal"]
 ```
 
 Inside the kernel, the coordinator runtime combines a pure scheduler with
-durable state and a narrow Modal boundary. Workload-owned hooks remain outside:
+durable state and a provider-neutral call boundary. Workload-owned hooks and
+provider integrations remain outside:
 
 ```mermaid
 ---
@@ -71,14 +73,15 @@ flowchart TD
         Runtime["Coordinator runtime<br/>Drive, recover, and cancel"]
         Scheduler["Scheduler<br/>DAG readiness and admission"]
         Ledger[("SQLite repository<br/>Durable state and atomic claims")]
-        Driver["Modal call driver<br/>Provider boundary"]
+        Boundary["Provider interface<br/>Submit · observe · cancel"]
 
         Runtime <-->|"Priorities and candidates"| Scheduler
         Runtime <-->|"State and claims"| Ledger
-        Runtime <-->|"Calls and observations"| Driver
+        Runtime <-->|"Calls and observations"| Boundary
     end
 
-    Driver <--> Modal["Modal"]
+    Boundary <--> ModalHost["biomodals.execution.modal<br/>Driver and durable host"]
+    ModalHost <--> Modal["Modal"]
 ```
 
 `biomodals.execution` is an embedded Python library, not a central scheduler
@@ -89,7 +92,8 @@ coordinates.
 | --- | --- |
 | `biomodals.app` | Independently deployed scientific Modal apps |
 | `biomodals.workflow` | DAGs that compose app functions into larger pipelines |
-| `biomodals.execution` | Shared task, DAG, SQLite, scheduling, and Modal-call mechanics |
+| `biomodals.execution` | Provider-neutral DAG, task, artifact, scheduling, and SQLite mechanics |
+| `biomodals.execution.modal` | Modal calls, Volumes, deployment identity, and remote coordinators |
 | `biomodals.service` | Accounts, web Jobs, administration, Results, and HTTP routes |
 
 The kernel owns execution state only. Scientific cache validation, input and

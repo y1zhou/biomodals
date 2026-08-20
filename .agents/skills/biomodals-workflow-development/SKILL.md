@@ -1,6 +1,6 @@
 ---
 name: biomodals-workflow-development
-description: Use when creating, editing, or reviewing Biomodals workflow code under src/biomodals/workflow/, shared workflow schemas under src/biomodals/schema/, workflow-compatible app functions, or workflow CLI/tests, including execution-kernel Task scheduling, ShortMD-style DAG construction, orchestrator composition, app dependency inclusion, workflow artifacts, and Modal volume handling.
+description: Use when creating, editing, or reviewing Biomodals workflow code under src/biomodals/workflow/, shared workflow schemas under src/biomodals/schema/, workflow-compatible app functions, or workflow CLI/tests, including execution-kernel Task scheduling, ShortMD-style DAG construction, orchestrator composition, app dependency inclusion, execution artifacts, and Modal volume handling.
 ---
 
 # Biomodals Workflow Development

@@ -8,13 +8,14 @@ Read
 before changing statuses, ownership, restart, durability, or coordinator
 semantics.
 
-The accepted
+The implemented
 [execution-kernel consolidation](../../../../docs/specs/execution-kernel-consolidation.md)
-is pending implementation. It removes `helper.app_execution` and
-`workflow.core`, gives apps and workflows one `ExecutionDefinition`, and moves
-Modal request, coordinator, Volume, and CLI-submission mechanics below
-`biomodals.execution.modal`. Treat existing imports and lifecycle subclasses as
-transitional: migrate them rather than adding new uses.
+gives apps and workflows one `ExecutionDefinition`. Generic graph, artifact,
+runtime, repository, and scheduling behavior belongs to
+`biomodals.execution`; Modal request, coordinator, Volume, and CLI-submission
+behavior belongs to `biomodals.execution.modal`. The removed
+`helper.app_execution` and `workflow.core` packages have no compatibility
+aliases.
 
 ## Choose the execution boundary
 

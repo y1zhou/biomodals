@@ -3,6 +3,8 @@
 # ruff: noqa: D101, D102, D103, D107, S105, S106
 
 import asyncio
+import hashlib
+from itertools import count
 from pathlib import Path
 from uuid import UUID
 
@@ -39,6 +41,8 @@ JOB_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 
 
 class FakeGromacsExecutionAdapter:
+    output_volume_name = "Gromacs-outputs"
+
     def __init__(self) -> None:
         self.spawn_waves: list[list[str]] = []
         self._current_wave: list[str] = []
@@ -184,7 +188,7 @@ def _admit(store: ServiceStore, user_id: UUID) -> None:
     plan = execution_plan(
         cpu_only=False,
         workload_run_key="simulation-1",
-        pdb_sha256="b" * 64,
+        pdb_sha256=hashlib.sha256(b"ATOM\n").hexdigest(),
         simulation_time_ns=5,
         run_pdbfixer=False,
         ld_seed=11,
@@ -226,7 +230,7 @@ def test_gromacs_kernel_advances_parallel_function_waves_and_local_result(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 200)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(4):
@@ -301,7 +305,7 @@ def test_existing_archive_prunes_every_stage_before_task_discovery(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 180)).__next__,
+            now=count(110).__next__,
         )
 
         adapter.begin_wave()
@@ -338,7 +342,7 @@ def test_unknown_initial_archive_probe_suspends_without_discovering_tasks(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 180)).__next__,
+            now=count(110).__next__,
         )
 
         adapter.begin_wave()
@@ -374,7 +378,7 @@ def test_replacement_coordinator_recovers_published_local_result(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 220)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(3):
@@ -414,7 +418,7 @@ def test_conclusive_local_result_recovery_failure_terminates_run(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 240)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(3):
@@ -455,7 +459,7 @@ def test_missing_local_result_is_republished_after_interruption(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 240)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(3):
@@ -490,7 +494,7 @@ def test_inconclusive_local_result_recovery_suspends_run(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 240)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(3):
@@ -530,7 +534,7 @@ def test_conclusive_initial_publication_failure_terminates_run(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 240)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(4):
@@ -561,7 +565,7 @@ def test_infrastructure_publication_failure_suspends_run(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 240)).__next__,
+            now=count(110).__next__,
         )
 
         for _ in range(3):
@@ -594,7 +598,7 @@ def test_unexpected_coordinator_error_suspends_without_replacing_call(
         coordinator = GromacsExecutionCoordinator(
             store,
             adapter,
-            now=iter(range(110, 240)).__next__,
+            now=count(110).__next__,
         )
 
         adapter.begin_wave()

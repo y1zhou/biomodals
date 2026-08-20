@@ -3535,6 +3535,40 @@ class SqliteExecutionRepository:
             explicit_resume=False,
         )
 
+    def suspend_run(
+        self,
+        execution_run_id: UUID,
+        *,
+        reason: RunStatusReason,
+        message: str | None = None,
+        now: int,
+    ) -> ExecutionRunRecord:
+        """Suspend an active Run or replace its suspension diagnostics."""
+        _validate_run_reason(RunStatus.SUSPENDED, reason)
+        current = self.get_run(execution_run_id)
+        if current.status == RunStatus.SUSPENDED:
+            self._connection.execute(
+                """
+                UPDATE execution_runs
+                SET status_reason = ?,
+                    status_message = ?,
+                    updated_at = ?
+                WHERE execution_run_id = ?
+                """,
+                (reason.value, message, now, str(execution_run_id)),
+            )
+            return self.get_run(execution_run_id)
+        if current.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
+            raise ValueError(f"cannot suspend Run while {current.status.value}")
+        return self._transition_run(
+            execution_run_id,
+            RunStatus.SUSPENDED,
+            reason=reason,
+            message=message,
+            now=now,
+            explicit_resume=False,
+        )
+
     def resume_run(
         self,
         execution_run_id: UUID,

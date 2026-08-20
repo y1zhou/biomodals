@@ -70,6 +70,8 @@ VALID_PDB = (
 class FakeGromacsAdapter:
     """Small fake for the Modal boundary; no Modal object reaches HTTP tests."""
 
+    output_volume_name = "Gromacs-outputs"
+
     def __init__(self) -> None:
         self.submissions: list[tuple[bytes, str, GromacsJobOptions]] = []
         self.submission_configurations: list[tuple[str, str, int]] = []
@@ -2214,7 +2216,7 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         repository.record_task_result_observation(
             execution_run_id,
             call.node_key,
-            "operation",
+            "node",
             AvailabilityStatus.AVAILABLE,
             now=1_800_000_003,
         )
@@ -2239,13 +2241,13 @@ def test_job_stage_contract_supports_parallel_deployed_functions(
         repository.discover_tasks(
             execution_run_id,
             "prepare_result",
-            (TaskPlan(task_key="operation", scientific_payload={}),),
+            (TaskPlan(task_key="node", scientific_payload={}),),
             now=1_800_000_003,
         )
         repository.record_task_result_observation(
             execution_run_id,
             "prepare_result",
-            "operation",
+            "node",
             AvailabilityStatus.MISSING,
             now=1_800_000_003,
         )

@@ -6,7 +6,7 @@ from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 import orjson
@@ -198,6 +198,35 @@ def load_execution_request(
     return GromacsExecutionRequest.from_bytes(
         _REQUEST_FILE.load(volume_root, execution_run_id)
     )
+
+
+class GromacsPublicationBoundary(Protocol):
+    """Scientific publication operations required by the GROMACS graph."""
+
+    def recover_result(self, node_key: str) -> AppRunResult | None:
+        """Recover one already durable scientific publication."""
+        ...
+
+    def commit(
+        self,
+        node_key: str,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        """Commit and validate one newly materialized publication."""
+        ...
+
+    def observe(self, node_key: str) -> AvailabilityStatus:
+        """Observe one existing publication without repairing it."""
+        ...
+
+    def result(
+        self,
+        node_key: str,
+        *,
+        files: tuple[ArtifactFile, ...] | None = None,
+    ) -> AppRunResult:
+        """Describe one Node's provider-neutral result."""
+        ...
 
 
 class GromacsPublications:
@@ -461,7 +490,7 @@ class GromacsPublications:
 
 class _GromacsPublicationHooks:
     operation: str
-    publications: GromacsPublications
+    publications: GromacsPublicationBoundary
 
     def recover_result_publication(
         self,
@@ -495,7 +524,7 @@ class GromacsProviderNode(_GromacsPublicationHooks, ProviderNode):
 
     operation: str
     request: GromacsExecutionRequest
-    publications: GromacsPublications
+    publications: GromacsPublicationBoundary
 
     def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
         """Describe the established deployed GROMACS function call."""
@@ -526,7 +555,7 @@ class GromacsResultNode(_GromacsPublicationHooks, CoordinatorNode):
     """Publish the complete user-facing GROMACS result boundary."""
 
     operation: str
-    publications: GromacsPublications
+    publications: GromacsPublicationBoundary
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Describe the complete user-facing files after dependencies finish."""
@@ -536,7 +565,7 @@ class GromacsResultNode(_GromacsPublicationHooks, CoordinatorNode):
 
 def gromacs_execution_graph(
     request: GromacsExecutionRequest,
-    publications: GromacsPublications,
+    publications: GromacsPublicationBoundary,
 ) -> ExecutionGraph:
     """Build the direct-app graph without reproducing kernel orchestration."""
     plan = request.execution_plan

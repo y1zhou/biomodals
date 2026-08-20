@@ -1,41 +1,40 @@
-"""Caller-owned GROMACS coordination over the shared execution kernel."""
+"""Service-owned GROMACS hosting for the shared executable graph."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from collections.abc import Callable, Coroutine, Mapping
+from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
-from biomodals.app.bioinfo.gromacs_execution import (
-    PREPARE_RESULT,
-    modal_invocation,
-    operation_provider_binding,
-    operation_task_plan,
+from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs_execution_runtime import (
+    GromacsExecutionRequest,
+    gromacs_execution_graph,
 )
 from biomodals.execution import (
-    AsyncExecutionRuntime,
     AvailabilityStatus,
-    NodeStatus,
-    ProviderCallStatus,
-    ProviderCallSubmission,
+    DeploymentIdentity,
+    GraphExecutionRunStore,
     RunStatus,
     RunStatusReason,
-    TaskStatus,
-    result_probe_frontier,
 )
+from biomodals.execution.artifact_availability import ArtifactAvailability
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderDefiniteSubmissionError,
 )
-from biomodals.execution.scheduler import (
-    TaskDispatchDescriptor,
-    form_fixed_batches,
-    ready_node_keys,
-    required_node_ranks,
-    select_admissible_candidates,
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    ExecutionArtifact,
+    VolumePath,
 )
 from biomodals.service.gromacs.archive import GROMACS_ARCHIVE_SCHEMA_VERSION
 from biomodals.service.gromacs.contracts import GromacsJobOptions
@@ -48,15 +47,19 @@ from biomodals.service.gromacs.results import (
 from biomodals.service.jobs import JobLifecycleLocks
 from biomodals.service.store import JobRecord, ServiceStore
 
-_RESULT_ENVELOPE_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
+_SERVICE_ARTIFACT_VOLUME = "Biomodals-service-execution"
+_GROMACS_THREADS = 16
+_T = TypeVar("_T")
 
 
 class GromacsExecutionAdapter(Protocol):
-    """Modal calls and result publication required by GROMACS coordination."""
+    """Provider calls and Result publication required by GROMACS."""
+
+    output_volume_name: str
 
     async def resolve(self, binding: Any) -> Any:
-        """Resolve one exact deployed function."""
+        """Resolve one exact deployed operation."""
 
     async def spawn(
         self,
@@ -65,13 +68,13 @@ class GromacsExecutionAdapter(Protocol):
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> str:
-        """Spawn one detached function call."""
+        """Spawn one detached provider call."""
 
     async def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
-        """Observe one attached function call."""
+        """Observe one attached provider call."""
 
     async def cancel(self, provider_call_handle_id: str) -> None:
-        """Cancel one attached function call."""
+        """Cancel one attached provider call."""
 
     async def publish_archive(
         self,
@@ -79,17 +82,267 @@ class GromacsExecutionAdapter(Protocol):
         *,
         completed_at: int,
     ) -> FinalArchive:
-        """Publish and validate the user-facing result archive."""
+        """Publish and validate the user-facing Result archive."""
 
     async def recover_archive(self, job: JobRecord) -> FinalArchive:
-        """Recover metadata for an already published immutable archive."""
+        """Recover an already published immutable Result archive."""
 
     async def cleanup_intermediates(self, job: JobRecord) -> None:
-        """Remove remote files that can be reconstructed from publications."""
+        """Remove remote files reconstructible from durable publications."""
+
+
+class _EventLoopBridge:
+    """Run host-owned async operations from one graph-runtime worker thread."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+
+    def call(self, awaitable: Coroutine[Any, Any, _T]) -> _T:
+        return asyncio.run_coroutine_threadsafe(awaitable, self.loop).result()
+
+
+class _AsyncProviderBridge:
+    """Present the service's async adapter through the kernel's provider seam."""
+
+    def __init__(
+        self,
+        bridge: _EventLoopBridge,
+        adapter: GromacsExecutionAdapter,
+    ) -> None:
+        self.bridge = bridge
+        self.adapter = adapter
+        self.definite_submission_error: ProviderDefiniteSubmissionError | None = None
+
+    def resolve(self, binding: Any) -> Any:
+        return self.bridge.call(self.adapter.resolve(binding))
+
+    def spawn(
+        self,
+        operation: Any,
+        *,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> str:
+        try:
+            return self.bridge.call(
+                self.adapter.spawn(operation, args=args, kwargs=kwargs)
+            )
+        except ProviderDefiniteSubmissionError as error:
+            self.definite_submission_error = error
+            raise
+
+    def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
+        return self.bridge.call(self.adapter.observe(provider_call_handle_id))
+
+    def cancel(self, provider_call_handle_id: str) -> None:
+        self.bridge.call(self.adapter.cancel(provider_call_handle_id))
+
+
+class _ServiceGromacsPublications:
+    """Adapt the service-owned final ZIP to GROMACS graph publications."""
+
+    _CONCLUSIVE_ERRORS: tuple[type[Exception], ...] = (
+        GromacsResultInvalidError,
+        ResultIdentityMismatchError,
+        ValueError,
+    )
+
+    def __init__(
+        self,
+        *,
+        store: ServiceStore,
+        adapter: GromacsExecutionAdapter,
+        bridge: _EventLoopBridge,
+        job_id: UUID,
+        now: Callable[[], int],
+    ) -> None:
+        self.store = store
+        self.adapter = adapter
+        self.bridge = bridge
+        self.job_id = job_id
+        self.now = now
+        self.archive: FinalArchive | None = None
+        self.archive_observation: AvailabilityStatus | None = None
+        self.conclusive_error: Exception | None = None
+        self.publication_error: Exception | None = None
+
+    def recover_result(self, node_key: str) -> AppRunResult | None:
+        if node_key != PREPARE_RESULT:
+            return None
+        if self.archive is not None:
+            return self._archive_result(self.archive)
+        if self.archive_observation == AvailabilityStatus.MISSING:
+            return None
+        if not self._result_needs_recovery():
+            return None
+        try:
+            self.archive = self.bridge.call(self.adapter.recover_archive(self._job()))
+        except ArchiveNotReadyError:
+            self.archive_observation = AvailabilityStatus.MISSING
+            return None
+        except self._CONCLUSIVE_ERRORS as error:
+            self.conclusive_error = error
+            self.archive_observation = AvailabilityStatus.MISSING
+            return None
+        except Exception:
+            self.archive_observation = AvailabilityStatus.UNKNOWN
+            raise
+        self.archive_observation = AvailabilityStatus.AVAILABLE
+        return self._archive_result(self.archive)
+
+    def result(
+        self,
+        node_key: str,
+        *,
+        files: tuple[ArtifactFile, ...] | None = None,
+    ) -> AppRunResult:
+        del files
+        if node_key != PREPARE_RESULT:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+        if self.conclusive_error is not None:
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[str(self.conclusive_error)],
+            )
+        try:
+            self.archive = self.bridge.call(
+                self.adapter.publish_archive(
+                    self._job(),
+                    completed_at=self.now(),
+                )
+            )
+        except self._CONCLUSIVE_ERRORS as error:
+            self.conclusive_error = error
+            self.archive_observation = AvailabilityStatus.MISSING
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[str(error)],
+            )
+        except Exception as error:  # provider/storage availability is inconclusive
+            self.publication_error = error
+            self.archive_observation = AvailabilityStatus.UNKNOWN
+            return self._archive_result(None)
+        self.archive_observation = AvailabilityStatus.AVAILABLE
+        return self._archive_result(self.archive)
+
+    def commit(
+        self,
+        node_key: str,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus:
+        del artifacts
+        return self.observe(node_key)
+
+    def observe(self, node_key: str) -> AvailabilityStatus:
+        if node_key != PREPARE_RESULT:
+            return AvailabilityStatus.AVAILABLE
+        if self.archive is not None:
+            return AvailabilityStatus.AVAILABLE
+        if self.conclusive_error is not None:
+            return AvailabilityStatus.MISSING
+        if self.publication_error is not None:
+            return AvailabilityStatus.UNKNOWN
+        if self.archive_observation is not None:
+            return self.archive_observation
+        try:
+            self.archive = self.bridge.call(self.adapter.recover_archive(self._job()))
+        except ArchiveNotReadyError:
+            self.archive_observation = AvailabilityStatus.MISSING
+        except self._CONCLUSIVE_ERRORS as error:
+            self.conclusive_error = error
+            self.archive_observation = AvailabilityStatus.MISSING
+        except Exception:
+            self.archive_observation = AvailabilityStatus.UNKNOWN
+        else:
+            self.archive_observation = AvailabilityStatus.AVAILABLE
+        return self.archive_observation
+
+    def check_artifact(self, artifact: ExecutionArtifact) -> ArtifactAvailability:
+        expected_path = self._archive_path()
+        if (
+            artifact.storage.volume_name != self.adapter.output_volume_name
+            or artifact.storage.path != expected_path
+        ):
+            return ArtifactAvailability(
+                artifact_id=artifact.artifact_id,
+                status=AvailabilityStatus.UNKNOWN,
+                unknown_reason="Artifact is outside the GROMACS Result publication",
+            )
+        status = self.observe(PREPARE_RESULT)
+        return ArtifactAvailability(
+            artifact_id=artifact.artifact_id,
+            status=status,
+            errors=("Published GROMACS Result is unavailable",)
+            if status == AvailabilityStatus.MISSING
+            else (),
+            unknown_reason=(
+                "Published GROMACS Result could not be inspected"
+                if status == AvailabilityStatus.UNKNOWN
+                else None
+            ),
+        )
+
+    def _archive_result(self, archive: FinalArchive | None) -> AppRunResult:
+        job = self._job()
+        path = self._archive_path()
+        metadata: dict[str, object] = {}
+        if archive is not None:
+            metadata["files"] = [
+                ArtifactFile(
+                    path=archive.filename,
+                    role="result_archive",
+                    size_bytes=archive.size_bytes,
+                    content_sha256=archive.sha256,
+                ).model_dump(mode="json", exclude_none=True)
+            ]
+            path = archive.path
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="result-archive",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name=self.adapter.output_volume_name,
+                        path=path,
+                    ),
+                    metadata=metadata,
+                )
+            ],
+            metrics={"job_id": str(job.job_id)},
+        )
+
+    def _archive_path(self) -> str:
+        job = self._job()
+        if job.run_name is None:
+            raise ValueError("GROMACS Job has no run name")
+        return f"api-results/{job.run_name}/result.zip"
+
+    def _job(self) -> JobRecord:
+        job = self.store.get_job_by_id(self.job_id)
+        if job is None:
+            raise LookupError(f"Job not found: {self.job_id}")
+        return job
+
+    def _result_needs_recovery(self) -> bool:
+        job = self._job()
+        if job.execution_run_id is None:
+            return False
+        with self.store.execution_repository() as repository:
+            node = repository.get_node(job.execution_run_id, PREPARE_RESULT)
+            if node.result_observation != AvailabilityStatus.MISSING:
+                return True
+            return any(
+                task.local_owned and not task.status.is_terminal
+                for task in repository.list_tasks(
+                    job.execution_run_id,
+                    PREPARE_RESULT,
+                )
+            )
 
 
 class GromacsExecutionCoordinator:
-    """Advance one service-owned GROMACS Execution Run by one provider wave."""
+    """Advance service Jobs through the app-owned shared execution graph."""
 
     def __init__(
         self,
@@ -101,7 +354,7 @@ class GromacsExecutionCoordinator:
         intermediate_retention_days: int | None = None,
         max_concurrent_jobs: int = 4,
     ) -> None:
-        """Bind service metadata, Modal calls, and result publication."""
+        """Bind service state and async provider operations."""
         self.store = store
         self.adapter = adapter
         self.lifecycle_locks = lifecycle_locks or JobLifecycleLocks()
@@ -118,7 +371,7 @@ class GromacsExecutionCoordinator:
         )
 
     async def reconcile(self) -> None:
-        """Advance every active GROMACS Execution Run once."""
+        """Advance every active GROMACS Job once."""
         jobs = iter(self.store.list_reconcilable_jobs("gromacs"))
 
         async def worker() -> None:
@@ -126,194 +379,205 @@ class GromacsExecutionCoordinator:
                 try:
                     await self.advance(job.job_id)
                 except Exception:
-                    LOGGER.exception(
-                        "Could not reconcile GROMACS job %s",
-                        job.job_id,
-                    )
+                    LOGGER.exception("Could not reconcile GROMACS job %s", job.job_id)
 
         await asyncio.gather(*(worker() for _ in range(self.max_concurrent_jobs)))
         await self._cleanup_intermediates()
 
     async def cancel_job(self, job_id: UUID) -> None:
-        """Durably cancel one Run and every conclusively attached call."""
+        """Durably cancel one Run and its attached provider calls."""
         async with self.lifecycle_locks.for_job(job_id):
-            job = self.store.get_job_by_id(job_id)
-            if job is None:
-                raise LookupError(f"Job not found: {job_id}")
-            if job.execution_run_id is None:
-                raise ValueError("Job is not linked to an Execution Run")
-            with self.store.async_execution_runtime(self.adapter) as runtime:
-                run = await runtime.cancel_run(
-                    job.execution_run_id,
-                    now=self._now(),
-                )
-                run = runtime.repository.finalize_run_from_results(
-                    job.execution_run_id,
-                    now=self._now(),
-                )
-                runtime.checkpoint()
-            self._project_terminal_or_running_job(job, run.status)
+            bridge = _EventLoopBridge(asyncio.get_running_loop())
+            await asyncio.to_thread(self._cancel_sync, job_id, bridge)
 
     async def advance(self, job_id: UUID) -> None:
         """Advance one Job and suspend unexpected coordinator failures."""
         try:
-            await self._advance(job_id)
+            async with self.lifecycle_locks.for_job(job_id):
+                bridge = _EventLoopBridge(asyncio.get_running_loop())
+                await asyncio.to_thread(self._advance_sync, job_id, bridge)
         except ProviderDefiniteSubmissionError:
             raise
-        except Exception as exc:
-            self._suspend_after_coordinator_error(job_id, exc)
+        except Exception as error:
+            self._suspend_after_coordinator_error(job_id, error)
             raise
 
-    async def _advance(self, job_id: UUID) -> None:
-        """Reconcile existing calls, admit one ready wave, and publish results."""
-        archive: FinalArchive | None = None
-        clear_staged_input = False
-        async with self.lifecycle_locks.for_job(job_id):
-            job = self.store.get_job_by_id(job_id)
-            if job is None:
-                raise LookupError(f"Job not found: {job_id}")
-            if job.execution_run_id is None:
-                raise ValueError("Job is not linked to an Execution Run")
-            execution_run_id = job.execution_run_id
+    def _advance_sync(self, job_id: UUID, bridge: _EventLoopBridge) -> None:
+        job = self._job(job_id)
+        if job.execution_run_id is None:
+            raise ValueError("Job is not linked to an Execution Run")
+        with self.store.execution_repository() as repository:
+            run = repository.get_run(job.execution_run_id)
+        if run.status.is_terminal:
+            self.store.clear_job_input(job_id)
+            self._finish_terminal_job(job, run.status, bridge)
+            return
+        if run.status == RunStatus.SUSPENDED:
+            self._project_terminal_or_running_job(job, run.status)
+            return
 
-            with self.store.async_execution_runtime(self.adapter) as runtime:
-                run = runtime.repository.get_run(execution_run_id)
-                if run.cancellation_is_durable:
-                    await runtime.cancel_run(execution_run_id, now=self._now())
-                    await runtime.reconcile_provider_calls(
-                        execution_run_id,
-                        required_node_keys=set(),
-                        encode_result=_result_envelope,
-                        now=self._now(),
-                    )
-                    self._reconcile_running_nodes(runtime, execution_run_id)
-                    run = runtime.repository.finalize_run_from_results(
-                        execution_run_id,
-                        now=self._now(),
-                    )
-                    runtime.checkpoint()
-                    self._project_terminal_or_running_job(job, run.status)
-                    return
-                archive = await self._recover_node_publications(runtime, job)
-                required = self._required_nodes(runtime, execution_run_id)
-                if required is None:
-                    runtime.checkpoint()
-                    overview = runtime.repository.overview(execution_run_id)
-                    self._project_terminal_or_running_job(job, overview.run.status)
-                    return
+        publications = _ServiceGromacsPublications(
+            store=self.store,
+            adapter=self.adapter,
+            bridge=bridge,
+            job_id=job_id,
+            now=self._now,
+        )
+        provider = _AsyncProviderBridge(bridge, self.adapter)
+        runtime = self._runtime(job, run, publications, provider)
+        try:
+            runtime.attach(workload_run_key=self._run_name(job))
+            if run.cancellation_is_durable:
+                runtime.cancel()
+            runtime.advance_once()
+            overview = runtime.store.execution.overview(job.execution_run_id)
+        finally:
+            runtime.close()
 
-                calls_to_cancel = runtime.repository.prune_unrequired_nodes(
-                    execution_run_id,
-                    required_node_keys=required,
+        if overview.run.status.is_terminal:
+            self.store.clear_job_input(job_id)
+        if publications.archive is not None:
+            self._complete_job(self._job(job_id), publications.archive)
+        else:
+            self._project_terminal_or_running_job(job, overview.run.status)
+        if provider.definite_submission_error is not None:
+            raise provider.definite_submission_error
+        if publications.publication_error is not None:
+            raise publications.publication_error
+
+    def _cancel_sync(self, job_id: UUID, bridge: _EventLoopBridge) -> None:
+        job = self._job(job_id)
+        if job.execution_run_id is None:
+            raise ValueError("Job is not linked to an Execution Run")
+        with self.store.execution_repository() as repository:
+            run = repository.get_run(job.execution_run_id)
+        if run.status.is_terminal:
+            return
+        publications = _ServiceGromacsPublications(
+            store=self.store,
+            adapter=self.adapter,
+            bridge=bridge,
+            job_id=job_id,
+            now=self._now,
+        )
+        runtime = self._runtime(
+            job,
+            run,
+            publications,
+            _AsyncProviderBridge(bridge, self.adapter),
+        )
+        try:
+            runtime.attach(workload_run_key=self._run_name(job))
+            runtime.cancel()
+            with runtime.store.transaction():
+                status = runtime.store.execution.finalize_run_from_results(
+                    job.execution_run_id,
                     now=self._now(),
-                )
-                runtime.checkpoint()
-                for provider_call_id in calls_to_cancel:
-                    await runtime.request_provider_call_cancellation(
-                        provider_call_id,
-                        now=self._now(),
-                    )
+                ).status
+        finally:
+            runtime.close()
+        if status.is_terminal:
+            self.store.clear_job_input(job_id)
+        self._project_terminal_or_running_job(job, status)
 
-                await runtime.reconcile_provider_calls(
-                    execution_run_id,
-                    required_node_keys=required,
-                    encode_result=_result_envelope,
-                    now=self._now(),
-                )
+    def _runtime(
+        self,
+        job: JobRecord,
+        run: Any,
+        publications: _ServiceGromacsPublications,
+        provider: _AsyncProviderBridge,
+    ) -> ExecutionGraphRuntime:
+        execution_run_id = job.execution_run_id
+        if execution_run_id is None:
+            raise ValueError("Job is not linked to an Execution Run")
+        input_content = self.store.load_job_input(job.job_id)
+        if input_content is None:
+            raise RuntimeError("Staged GROMACS input is unavailable")
+        options = GromacsJobOptions.model_validate_json(job.parameters_json)
+        payload = run.plan.scientific_payload
+        if not isinstance(payload, Mapping):
+            raise TypeError("GROMACS plan scientific payload is invalid")
+        request = GromacsExecutionRequest(
+            run_name=self._run_name(job),
+            pdb_content=input_content,
+            simulation_time_ns=options.simulation_time_ns,
+            run_pdbfixer=options.run_pdbfixer,
+            cpu_only=options.cpu_only,
+            num_threads=_GROMACS_THREADS,
+            use_openmp_threads=False,
+            ld_seed=_persisted_seed(payload, "ld_seed"),
+            gen_seed=_persisted_seed(payload, "gen_seed"),
+            genion_seed=_persisted_seed(payload, "genion_seed"),
+            max_active_provider_calls=run.max_active_provider_calls,
+            max_active_gpu_provider_calls=run.max_active_gpu_provider_calls,
+        )
+        graph = gromacs_execution_graph(request, publications)
+        execution_root = self.store.path.parent / "execution"
+        graph_store = GraphExecutionRunStore(
+            execution_root,
+            execution_run_id,
+            database_path=self.store.path,
+            output_root=execution_root / "runs" / str(execution_run_id),
+        )
+        return ExecutionGraphRuntime(
+            graph=graph,
+            execution_run_id=execution_run_id,
+            deployment=DeploymentIdentity(
+                job.modal_environment,
+                job.modal_app_name,
+                job.modal_app_version,
+            ),
+            volume_root=execution_root,
+            artifact_volume_name=_SERVICE_ARTIFACT_VOLUME,
+            workload_run_key=request.run_name,
+            request=request,
+            provider_driver=provider,
+            max_active_provider_calls=run.max_active_provider_calls,
+            max_active_gpu_provider_calls=run.max_active_gpu_provider_calls,
+            strict_external_artifact_checks=True,
+            external_artifact_checker=publications.check_artifact,
+            store=graph_store,
+            now=self._now,
+        )
 
-                self._decode_completed_calls(
-                    runtime,
-                    execution_run_id,
-                )
-                self._reconcile_running_nodes(runtime, execution_run_id)
-                runtime.repository.skip_unreachable_nodes(
-                    execution_run_id,
-                    now=self._now(),
-                )
-
-                run = runtime.repository.get_run(execution_run_id)
-                if run.status in {RunStatus.PENDING, RunStatus.RUNNING}:
-                    self._start_ready_nodes(
-                        runtime,
-                        execution_run_id,
-                        required=required,
-                    )
-                    runtime.checkpoint()
-                    archive = archive or await self._run_result_publication(
-                        runtime, job
-                    )
-                    try:
-                        await self._submit_ready_remote_tasks(
-                            runtime,
-                            job,
-                            required=required,
-                        )
-                    except ProviderDefiniteSubmissionError:
-                        self._reconcile_running_nodes(runtime, execution_run_id)
-                        runtime.repository.skip_unreachable_nodes(
-                            execution_run_id,
-                            now=self._now(),
-                        )
-                        runtime.repository.finalize_run_from_results(
-                            execution_run_id,
-                            now=self._now(),
-                        )
-                        runtime.checkpoint()
-                        raise
-                    self._reconcile_running_nodes(runtime, execution_run_id)
-                    runtime.repository.skip_unreachable_nodes(
-                        execution_run_id,
-                        now=self._now(),
-                    )
-
-                runtime.repository.finalize_run_from_results(
-                    execution_run_id,
-                    now=self._now(),
-                )
-                runtime.checkpoint()
-                overview = runtime.repository.overview(execution_run_id)
-                prepare = next(
-                    (
-                        node
-                        for node in overview.nodes
-                        if node.node_key.startswith("prepare_tpr_")
-                    ),
-                    None,
-                )
-                clear_staged_input = bool(
-                    prepare is not None and prepare.status == NodeStatus.SUCCEEDED
-                )
-
-            if clear_staged_input:
-                self.store.clear_job_input(job_id)
-            if (
-                archive is None
-                and job.result_filename is None
-                and overview.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}
-            ):
-                archive = await self.adapter.recover_archive(job)
-            if archive is not None:
-                self._complete_job(job, archive)
-            else:
-                self._project_terminal_or_running_job(job, overview.run.status)
+    def _finish_terminal_job(
+        self,
+        job: JobRecord,
+        status: RunStatus,
+        bridge: _EventLoopBridge,
+    ) -> None:
+        if status not in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}:
+            self._project_terminal_or_running_job(job, status)
+            return
+        if job.result_filename is not None:
+            return
+        try:
+            archive = bridge.call(self.adapter.recover_archive(job))
+        except ArchiveNotReadyError:
+            archive = bridge.call(
+                self.adapter.publish_archive(job, completed_at=self._now())
+            )
+        self._complete_job(job, archive)
 
     def _suspend_after_coordinator_error(
         self,
         job_id: UUID,
         error: Exception,
     ) -> None:
-        """Best-effort persistence without masking the coordinator exception."""
         try:
             job = self.store.get_job_by_id(job_id)
             if job is None or job.execution_run_id is None:
                 return
             with self.store.execution_repository() as repository:
                 run = repository.get_run(job.execution_run_id)
-                if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-                    return
-                repository.transition_run(
-                    job.execution_run_id,
+                if run.status not in {
+                    RunStatus.PENDING,
+                    RunStatus.RUNNING,
                     RunStatus.SUSPENDED,
+                }:
+                    return
+                repository.suspend_run(
+                    job.execution_run_id,
                     reason=RunStatusReason.COORDINATOR_ERROR,
                     message=str(error) or type(error).__name__,
                     now=self._now(),
@@ -323,437 +587,6 @@ class GromacsExecutionCoordinator:
                 "Could not persist coordinator suspension for GROMACS job %s",
                 job_id,
             )
-
-    async def _recover_node_publications(
-        self,
-        runtime: AsyncExecutionRuntime,
-        job: JobRecord,
-    ) -> FinalArchive | None:
-        """Probe GROMACS results backward before discovering any Tasks."""
-        execution_run_id = job.execution_run_id
-        if execution_run_id is None:
-            return None
-        run = runtime.repository.get_run(execution_run_id)
-        observations: dict[str, AvailabilityStatus | None] = {}
-        for node in runtime.repository.list_nodes(execution_run_id):
-            if node.status == NodeStatus.SUCCEEDED:
-                observations[node.node_key] = AvailabilityStatus.AVAILABLE
-            elif node.status.is_terminal:
-                observations[node.node_key] = AvailabilityStatus.MISSING
-            elif (
-                node.result_observation == AvailabilityStatus.UNKNOWN
-                and run.status in {RunStatus.PENDING, RunStatus.RUNNING}
-            ):
-                observations[node.node_key] = None
-            elif self._local_result_needs_recovery(
-                runtime,
-                execution_run_id,
-                node.node_key,
-            ):
-                observations[node.node_key] = None
-            else:
-                observations[node.node_key] = node.result_observation
-
-        archive: FinalArchive | None = None
-        while frontier := result_probe_frontier(run.plan, observations):
-            observed: list[tuple[str, AvailabilityStatus]] = []
-            for node_key in frontier:
-                if node_key != PREPARE_RESULT:
-                    observation = AvailabilityStatus.MISSING
-                else:
-                    recovering_local_result = self._local_result_needs_recovery(
-                        runtime,
-                        execution_run_id,
-                        node_key,
-                    )
-                    try:
-                        archive = await self.adapter.recover_archive(job)
-                    except ArchiveNotReadyError:
-                        observation = AvailabilityStatus.MISSING
-                        if recovering_local_result:
-                            runtime.repository.record_task_result_observation(
-                                execution_run_id,
-                                PREPARE_RESULT,
-                                "operation",
-                                observation,
-                                now=self._now(),
-                            )
-                    except (
-                        GromacsResultInvalidError,
-                        ResultIdentityMismatchError,
-                        ValueError,
-                    ) as exc:
-                        observation = AvailabilityStatus.MISSING
-                        if recovering_local_result:
-                            self._fail_result_task(
-                                runtime,
-                                execution_run_id,
-                                str(exc),
-                            )
-                            observations[node_key] = observation
-                            continue
-                    except Exception:
-                        observation = AvailabilityStatus.UNKNOWN
-                    else:
-                        observation = AvailabilityStatus.AVAILABLE
-                        if recovering_local_result:
-                            self._complete_result_task(runtime, execution_run_id)
-                            observations[node_key] = observation
-                            continue
-                observed.append((node_key, observation))
-
-            for node_key, observation in observed:
-                runtime.repository.record_node_result_observation(
-                    execution_run_id,
-                    node_key,
-                    observation,
-                    now=self._now(),
-                )
-                observations[node_key] = observation
-            runtime.checkpoint()
-            if any(
-                observation == AvailabilityStatus.UNKNOWN for _, observation in observed
-            ):
-                return None
-        return archive
-
-    def _local_result_needs_recovery(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-        node_key: str,
-    ) -> bool:
-        """Return whether interrupted local publication must be revalidated."""
-        if node_key != PREPARE_RESULT:
-            return False
-        node = runtime.repository.get_node(execution_run_id, node_key)
-        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
-            return False
-        task = runtime.repository.get_task(
-            execution_run_id,
-            node_key,
-            "operation",
-        )
-        return (
-            task.status == TaskStatus.RUNNING
-            and task.local_owned
-            and task.provider_call_id is None
-            and task.worker_provider_call_id is None
-        )
-
-    def _required_nodes(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-    ) -> set[str] | None:
-        """Return the result-driven GROMACS repair closure."""
-        required = runtime.required_node_keys(execution_run_id)
-        return None if required is None else set(required)
-
-    def _decode_completed_calls(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-    ) -> None:
-        """Turn durable call envelopes into scientific Task outcomes."""
-        for call in runtime.repository.list_provider_calls(execution_run_id):
-            if call.status != ProviderCallStatus.SUCCEEDED:
-                continue
-            envelope = call.result_envelope
-            valid = (
-                isinstance(envelope, dict)
-                and envelope.get("schema_version") == _RESULT_ENVELOPE_SCHEMA_VERSION
-                and isinstance(envelope.get("remote_workdir"), str)
-                and bool(envelope["remote_workdir"])
-            )
-            for task_key in call.task_keys:
-                task = runtime.repository.get_task(
-                    execution_run_id,
-                    call.node_key,
-                    task_key,
-                )
-                if task.status != TaskStatus.RUNNING:
-                    continue
-                if valid:
-                    runtime.repository.record_task_result_observation(
-                        execution_run_id,
-                        call.node_key,
-                        task_key,
-                        AvailabilityStatus.AVAILABLE,
-                        now=self._now(),
-                    )
-                else:
-                    runtime.repository.fail_task(
-                        execution_run_id,
-                        call.node_key,
-                        task_key,
-                        message="GROMACS returned an invalid operation result",
-                        now=self._now(),
-                    )
-
-    def _reconcile_running_nodes(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-    ) -> None:
-        for node in runtime.repository.list_nodes(execution_run_id):
-            if node.status == NodeStatus.RUNNING and node.discovery_complete:
-                runtime.repository.reconcile_node_tasks(
-                    execution_run_id,
-                    node.node_key,
-                    now=self._now(),
-                )
-
-    def _start_ready_nodes(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-        *,
-        required: set[str],
-    ) -> None:
-        run = runtime.repository.get_run(execution_run_id)
-        nodes = runtime.repository.list_nodes(execution_run_id)
-        statuses = {node.node_key: node.status for node in nodes}
-        for node_key in ready_node_keys(run.plan, statuses):
-            if node_key not in required:
-                continue
-            runtime.repository.start_node(
-                execution_run_id,
-                node_key,
-                now=self._now(),
-            )
-            runtime.repository.discover_tasks(
-                execution_run_id,
-                node_key,
-                (operation_task_plan(node_key),),
-                now=self._now(),
-            )
-            runtime.repository.record_task_result_observation(
-                execution_run_id,
-                node_key,
-                "operation",
-                AvailabilityStatus.MISSING,
-                now=self._now(),
-            )
-
-    async def _run_result_publication(
-        self,
-        runtime: AsyncExecutionRuntime,
-        job: JobRecord,
-    ) -> FinalArchive | None:
-        execution_run_id = job.execution_run_id
-        if execution_run_id is None:
-            return None
-        node = runtime.repository.get_node(execution_run_id, PREPARE_RESULT)
-        if node.status != NodeStatus.RUNNING:
-            return None
-        task = runtime.repository.get_task(
-            execution_run_id,
-            PREPARE_RESULT,
-            "operation",
-        )
-        if task.status == TaskStatus.SUCCEEDED:
-            return None
-        if not runtime.repository.acquire_local_task(
-            execution_run_id,
-            PREPARE_RESULT,
-            "operation",
-            now=self._now(),
-        ):
-            return None
-        runtime.checkpoint()
-        try:
-            archive = await self.adapter.publish_archive(
-                job,
-                completed_at=self._now(),
-            )
-        except (
-            GromacsResultInvalidError,
-            ResultIdentityMismatchError,
-            ValueError,
-        ) as exc:
-            self._fail_result_task(runtime, execution_run_id, str(exc))
-            return None
-        except Exception as exc:
-            runtime.repository.transition_run(
-                execution_run_id,
-                RunStatus.SUSPENDED,
-                reason=RunStatusReason.COORDINATOR_ERROR,
-                message=str(exc),
-                now=self._now(),
-            )
-            runtime.checkpoint()
-            raise
-        self._complete_result_task(runtime, execution_run_id)
-        return archive
-
-    def _complete_result_task(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-    ) -> None:
-        """Record one successfully validated result publication."""
-        runtime.repository.record_task_result_observation(
-            execution_run_id,
-            PREPARE_RESULT,
-            "operation",
-            AvailabilityStatus.AVAILABLE,
-            now=self._now(),
-        )
-        runtime.repository.reconcile_node_tasks(
-            execution_run_id,
-            PREPARE_RESULT,
-            now=self._now(),
-        )
-        runtime.checkpoint()
-
-    def _fail_result_task(
-        self,
-        runtime: AsyncExecutionRuntime,
-        execution_run_id: UUID,
-        message: str,
-    ) -> None:
-        """Record one conclusive result-publication failure."""
-        runtime.repository.fail_task(
-            execution_run_id,
-            PREPARE_RESULT,
-            "operation",
-            message=message,
-            now=self._now(),
-        )
-        runtime.repository.reconcile_node_tasks(
-            execution_run_id,
-            PREPARE_RESULT,
-            now=self._now(),
-        )
-        runtime.checkpoint()
-
-    async def _submit_ready_remote_tasks(
-        self,
-        runtime: AsyncExecutionRuntime,
-        job: JobRecord,
-        *,
-        required: set[str],
-    ) -> None:
-        execution_run_id = job.execution_run_id
-        if execution_run_id is None:
-            return
-        run = runtime.repository.get_run(execution_run_id)
-        nodes = runtime.repository.list_nodes(execution_run_id)
-        unfinished = {node.node_key for node in nodes if not node.status.is_terminal}
-        ranks = required_node_ranks(
-            run.plan,
-            required_node_keys=required,
-            unfinished_node_keys=unfinished,
-        )
-        descriptors: list[TaskDispatchDescriptor] = []
-        for node in nodes:
-            if (
-                node.node_key not in required
-                or node.node_key == PREPARE_RESULT
-                or node.status != NodeStatus.RUNNING
-            ):
-                continue
-            for task in runtime.repository.list_tasks(
-                execution_run_id,
-                node.node_key,
-            ):
-                if (
-                    task.status == TaskStatus.PENDING
-                    and task.result_observation == AvailabilityStatus.MISSING
-                ):
-                    binding = operation_provider_binding(
-                        node.node_key,
-                        environment=job.modal_environment,
-                        app_name=job.modal_app_name,
-                        app_version=job.modal_app_version,
-                    )
-                    rank = ranks[node.node_key]
-                    descriptors.append(
-                        TaskDispatchDescriptor(
-                            node_key=node.node_key,
-                            node_ordinal=node.ordinal,
-                            task_key=task.task_key,
-                            task_ordinal=task.ordinal,
-                            binding=binding,
-                            compatibility_key=node.node_key,
-                            max_tasks_per_call=1,
-                            depth=rank.depth,
-                            unblocking_span=rank.unblocking_span,
-                        )
-                    )
-        descriptors = list(
-            runtime.persist_fixed_dispatch_policy(
-                execution_run_id,
-                tuple(descriptors),
-                now=self._now(),
-            )
-        )
-        counts = runtime.repository.active_provider_call_counts(execution_run_id)
-        selected = select_admissible_candidates(
-            form_fixed_batches(tuple(descriptors)),
-            available_total_slots=max(
-                run.max_active_provider_calls - counts.total,
-                0,
-            ),
-            available_gpu_slots=max(
-                run.max_active_gpu_provider_calls - counts.gpu,
-                0,
-            ),
-        )
-        options = GromacsJobOptions.model_validate_json(job.parameters_json)
-        submitted = await runtime.submit_provider_calls(
-            execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=(
-                        f"{execution_run_id}:{candidate.node_key}:operation"
-                    ),
-                    kwargs=self._operation_kwargs(
-                        job,
-                        candidate.node_key,
-                        options,
-                        run.plan.scientific_payload,
-                    ),
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
-        )
-        if any(call is None for call in submitted):
-            return
-
-    def _operation_kwargs(
-        self,
-        job: JobRecord,
-        operation: str,
-        options: GromacsJobOptions,
-        scientific_payload: object,
-    ) -> dict[str, object]:
-        if job.run_name is None:
-            raise ValueError("GROMACS Job has no run name")
-        if operation.startswith("prepare_tpr_"):
-            pdb_content = self.store.load_job_input(job.job_id)
-            if pdb_content is None:
-                raise RuntimeError("Staged GROMACS input is unavailable")
-            if not isinstance(scientific_payload, Mapping):
-                raise TypeError("GROMACS plan scientific payload is invalid")
-            return {
-                "pdb_content": pdb_content,
-                "run_name": job.run_name,
-                "simulation_time_ns": options.simulation_time_ns,
-                "run_pdbfixer": options.run_pdbfixer,
-                "ld_seed": _persisted_seed(scientific_payload, "ld_seed"),
-                "gen_seed": _persisted_seed(scientific_payload, "gen_seed"),
-                "genion_seed": _persisted_seed(scientific_payload, "genion_seed"),
-            }
-        return modal_invocation(
-            operation,
-            cpu_only=options.cpu_only,
-            run_name=job.run_name,
-            simulation_time_ns=options.simulation_time_ns,
-        ).kwargs
 
     def _complete_job(self, job: JobRecord, archive: FinalArchive) -> None:
         try:
@@ -787,6 +620,18 @@ class GromacsExecutionCoordinator:
                 now=self._now(),
             )
 
+    def _job(self, job_id: UUID) -> JobRecord:
+        job = self.store.get_job_by_id(job_id)
+        if job is None:
+            raise LookupError(f"Job not found: {job_id}")
+        return job
+
+    @staticmethod
+    def _run_name(job: JobRecord) -> str:
+        if job.run_name is None:
+            raise ValueError("GROMACS Job has no run name")
+        return job.run_name
+
     async def _cleanup_intermediates(self) -> None:
         if self.intermediate_retention_seconds is None:
             return
@@ -809,11 +654,3 @@ def _persisted_seed(scientific_payload: Mapping[Any, object], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"GROMACS plan {key} is invalid")
     return value
-
-
-def _result_envelope(result: Any) -> dict[str, object]:
-    """Normalize a small provider result without treating it as publication."""
-    return {
-        "schema_version": _RESULT_ENVELOPE_SCHEMA_VERSION,
-        "remote_workdir": result if isinstance(result, str) else None,
-    }

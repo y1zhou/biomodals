@@ -153,11 +153,14 @@ def _suspend_after_application_error(
                 raise
             repository = replacement
             run = repository.get_run(execution_run_id)
-        if run.status not in {RunStatus.PENDING, RunStatus.RUNNING}:
-            return
-        repository.transition_run(
-            execution_run_id,
+        if run.status not in {
+            RunStatus.PENDING,
+            RunStatus.RUNNING,
             RunStatus.SUSPENDED,
+        }:
+            return
+        repository.suspend_run(
+            execution_run_id,
             reason=RunStatusReason.COORDINATOR_ERROR,
             message=message,
             now=now,

@@ -148,6 +148,17 @@ def test_repository_enforces_run_transitions_and_reason_compatibility() -> None:
     assert suspended.status_reason == RunStatusReason.COORDINATOR_ERROR
     assert suspended.status_message == "coordinator stopped"
 
+    replaced = repository.suspend_run(
+        execution_run_id,
+        reason=RunStatusReason.RESULT_VALIDATION_UNKNOWN,
+        message="result store unavailable",
+        now=125,
+    )
+    assert replaced.status == RunStatus.SUSPENDED
+    assert replaced.status_reason == RunStatusReason.RESULT_VALIDATION_UNKNOWN
+    assert replaced.status_message == "result store unavailable"
+    assert replaced.updated_at == 125
+
     with pytest.raises(ValueError, match="explicit resume"):
         repository.transition_run(
             execution_run_id,

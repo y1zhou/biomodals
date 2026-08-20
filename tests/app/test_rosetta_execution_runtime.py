@@ -1,10 +1,9 @@
-"""Tests for direct Rosetta SQLite pull-worker scheduling."""
+"""Tests for Rosetta's shared-graph pull-worker adapter."""
 
 # ruff: noqa: D101,D102,D103,D107
 
 from hashlib import sha256
 from pathlib import Path
-from threading import RLock
 from typing import Any, cast
 from uuid import UUID
 
@@ -13,23 +12,23 @@ from biomodals.app.bioinfo.rosetta.execution_contracts import (
     execute_rosetta_task,
     task_publication_path,
 )
-from biomodals.app.bioinfo.rosetta.execution_request import (
-    RosettaExecutionRequest,
-)
-from biomodals.app.bioinfo.rosetta.execution_runtime import (
-    RosettaExecutionRuntime,
-)
+from biomodals.app.bioinfo.rosetta.execution_request import RosettaExecutionRequest
+from biomodals.app.bioinfo.rosetta.execution_runtime import rosetta_execution_graph
 from biomodals.execution import (
     DeploymentIdentity,
+    GraphExecutionRunStore,
     ProviderCallStatus,
     RunStatus,
     TaskStatus,
 )
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
+    ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.schema import AppRunResult, AppRunStatus
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 DEPLOYMENT = DeploymentIdentity("main", "Rosetta", 7)
@@ -90,25 +89,24 @@ class RecordingDriver:
 
 
 def _request() -> RosettaExecutionRequest:
-    tasks = tuple(
-        RosettaTaskSpec(
-            task_key=str(index),
-            index=index,
-            binary="relax",
-            pdb=f"inputs/{index}/input.pdb",
-            rosetta_script=None,
-            flags_file=None,
-            output_dir=f"outputs/{index}",
-            worker_log=f"logs/{index}.log",
-            expected_files=(),
-            input_sha256=sha256(f"ATOM {index}\n".encode()).hexdigest(),
-        )
-        for index in range(1, 4)
-    )
     return RosettaExecutionRequest(
         run_name="example",
         run_id="workload",
-        tasks=tasks,
+        tasks=tuple(
+            RosettaTaskSpec(
+                task_key=str(index),
+                index=index,
+                binary="relax",
+                pdb=f"inputs/{index}/input.pdb",
+                rosetta_script=None,
+                flags_file=None,
+                output_dir=f"outputs/{index}",
+                worker_log=f"logs/{index}.log",
+                expected_files=(),
+                input_sha256=sha256(f"ATOM {index}\n".encode()).hexdigest(),
+            )
+            for index in range(1, 4)
+        ),
         app_version="2025.51",
         max_active_provider_calls=2,
         claim_capacity=2,
@@ -119,147 +117,109 @@ def _request() -> RosettaExecutionRequest:
 def _runtime(
     tmp_path: Path,
     driver: RecordingDriver,
-    *,
-    volume_io_lock: Any | None = None,
-) -> RosettaExecutionRuntime:
-    return RosettaExecutionRuntime(
-        request=_request(),
+) -> tuple[ExecutionGraphRuntime, FakeVolume]:
+    request = _request()
+    volume = FakeVolume()
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    runtime = ExecutionGraphRuntime(
+        graph=rosetta_execution_graph(request, output_root=tmp_path),
         execution_run_id=RUN_ID,
         deployment=DEPLOYMENT,
-        store=ExecutionRunStore(tmp_path, RUN_ID),
+        volume_root=tmp_path,
+        artifact_volume_name="Rosetta-outputs",
+        workload_run_key=request.workload_run_key,
+        request=request,
         provider_driver=driver,
-        output_volume=FakeVolume(),
-        output_root=tmp_path,
+        storage_sync=ExecutionVolumeSync(volume=volume, store=store),
+        max_active_provider_calls=request.max_active_provider_calls,
+        max_active_gpu_provider_calls=0,
         pull_worker_coordinator="coordinator",
+        store=store,
         poll_interval_seconds=0,
-        now=lambda: 10,
-        volume_io_lock=volume_io_lock,
+        now=iter(range(10, 1000)).__next__,
     )
+    return runtime, volume
 
 
-def test_volume_barriers_own_the_run_scoped_lock(tmp_path: Path) -> None:
-    volume_io_lock = RLock()
-    runtime = _runtime(
-        tmp_path,
-        RecordingDriver(),
-        volume_io_lock=volume_io_lock,
-    )
-    output = cast(FakeVolume, runtime.output_volume)
-    real_commit = output.commit
-    real_reload = output.reload
-
-    def commit() -> None:
-        assert volume_io_lock._is_owned()
-        real_commit()
-
-    def reload() -> None:
-        assert volume_io_lock._is_owned()
-        real_reload()
-
-    output.commit = commit
-    output.reload = reload
-
-    runtime._initialize()
-    runtime.advance_once()
-    runtime.refresh_publications()
-    runtime.close()
+def _run_root(runtime: ExecutionGraphRuntime) -> Path:
+    request = cast(RosettaExecutionRequest, runtime.request)
+    return runtime.volume_root / request.workload_run_key
 
 
-def _publish_assignment(runtime, assignment) -> dict[str, object]:
+def _publish_assignment(
+    runtime: ExecutionGraphRuntime,
+    assignment: Any,
+) -> AppRunResult:
     task = RosettaTaskSpec.from_dict(assignment.execution_payload)
-    input_path = runtime.run_root / task.pdb
+    run_root = _run_root(runtime)
+    input_path = run_root / task.pdb
     input_path.parent.mkdir(parents=True, exist_ok=True)
     input_path.write_bytes(f"ATOM {task.index}\n".encode())
 
     def run_command(command, *, output_mode, log_file):
         del command, output_mode
         Path(log_file).write_text("log\n", encoding="utf-8")
-        output = runtime.run_root / task.output_dir / "result.pdb"
+        output = run_root / task.output_dir / "result.pdb"
         output.write_text("ATOM\n", encoding="utf-8")
 
-    return execute_rosetta_task(
-        run_root=runtime.run_root,
+    execute_rosetta_task(
+        run_root=run_root,
         task=task,
         task_fingerprint=assignment.task_fingerprint,
         run_command=run_command,
     )
+    return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
 
-def test_initialization_reuses_the_host_volume_view(tmp_path: Path) -> None:
-    runtime = _runtime(tmp_path, RecordingDriver())
+def test_graph_preserves_the_staged_execution_plan(tmp_path: Path) -> None:
+    request = _request()
 
-    runtime._initialize()
+    plan = execution_plan(
+        rosetta_execution_graph(request, output_root=tmp_path).validate(),
+        workload_run_key=request.workload_run_key,
+    )
 
-    output = cast(FakeVolume, runtime.output_volume)
-    assert output.reloads == 0
-    assert output.commits == 0
-    runtime.attach()
-    runtime.attach()
-    assert output.reloads == 0
-    runtime.refresh_publications()
-    assert output.reloads == 1
-    runtime.close()
-
-
-def test_running_provider_poll_does_not_synchronize_the_output_volume(
-    tmp_path: Path,
-) -> None:
-    runtime = _runtime(tmp_path, RecordingDriver())
-    runtime._initialize()
-    runtime.advance_once()
-    output = cast(FakeVolume, runtime.output_volume)
-    commits = output.commits
-    reloads = output.reloads
-
-    runtime.advance_once()
-
-    assert output.commits == commits
-    assert output.reloads == reloads
-    runtime.close()
+    assert plan == request.execution_plan
 
 
 def test_workers_claim_disjoint_microbatches_and_complete_each_task(
     tmp_path: Path,
 ) -> None:
     driver = RecordingDriver()
-    runtime = _runtime(tmp_path, driver)
-    runtime._initialize()
+    runtime, _volume = _runtime(tmp_path, driver)
+    runtime.attach()
     runtime.advance_once()
 
     calls = runtime.store.execution.list_provider_calls(RUN_ID)
     assert len(calls) == 2
-    for spawn in driver.spawns:
-        kwargs = cast(dict[str, Any], spawn["kwargs"])
-        assert kwargs["coordinator"] == "coordinator"
-    claims = [
-        runtime.claim_pull_tasks(
+    assert all(
+        cast(dict[str, Any], spawn["kwargs"])["coordinator"] == "coordinator"
+        for spawn in driver.spawns
+    )
+    claimed_keys = []
+    for ordinal, call in enumerate(calls):
+        claim = runtime.claim_pull_tasks(
             call.provider_call_id,
             request_id=f"claim-{ordinal}",
             capacity=2,
         )
-        for ordinal, call in enumerate(calls)
-    ]
-    claimed_keys = []
-    for ordinal, (call, claim) in enumerate(zip(calls, claims, strict=True)):
-        completions = []
-        for assignment in claim.assignments:
-            claimed_keys.append(assignment.task_key)
-            result = _publish_assignment(runtime, assignment)
-            completions.append((
-                assignment.task_key,
-                f"complete-{assignment.task_key}",
-                result,
-            ))
-        output = cast(FakeVolume, runtime.output_volume)
-        commits = output.commits
-        next_claim = runtime.complete_pull_tasks_and_claim(
-            call.provider_call_id,
-            tuple(completions),
-            request_id=f"claim-{ordinal}-next",
-            capacity=2,
-        )
-        assert output.commits == commits + 1
-        assert next_claim.assignments == ()
+        batch_index = 0
+        while claim.assignments:
+            claimed_keys.extend(assignment.task_key for assignment in claim.assignments)
+            claim = runtime.complete_pull_tasks_and_claim(
+                call.provider_call_id,
+                tuple(
+                    (
+                        assignment.task_key,
+                        f"complete-{assignment.task_key}",
+                        _publish_assignment(runtime, assignment),
+                    )
+                    for assignment in claim.assignments
+                ),
+                request_id=f"claim-{ordinal}-next-{batch_index}",
+                capacity=2,
+            )
+            batch_index += 1
 
     assert claimed_keys == ["1", "2", "3"]
     driver.succeeded = True
@@ -267,19 +227,16 @@ def test_workers_claim_disjoint_microbatches_and_complete_each_task(
     assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.SUCCEEDED
     assert {
         task.status
-        for task in runtime.store.execution.list_tasks(
-            RUN_ID,
-            "rosetta-tasks",
-        )
+        for task in runtime.store.execution.list_tasks(RUN_ID, "rosetta-tasks")
     } == {TaskStatus.SUCCEEDED}
     runtime.close()
 
 
-def test_fused_completion_replay_uses_its_durable_observations(
+def test_fused_completion_replay_uses_its_durable_observation(
     tmp_path: Path,
 ) -> None:
-    runtime = _runtime(tmp_path, RecordingDriver())
-    runtime._initialize()
+    runtime, _volume = _runtime(tmp_path, RecordingDriver())
+    runtime.attach()
     runtime.advance_once()
     [call, _other_call] = runtime.store.execution.list_provider_calls(RUN_ID)
     claim = runtime.claim_pull_tasks(
@@ -301,10 +258,7 @@ def test_fused_completion_replay_uses_its_durable_observations(
         request_id="claim-next",
         capacity=2,
     )
-    task_publication_path(
-        runtime.run_root,
-        claim.assignments[0].task_key,
-    ).unlink()
+    task_publication_path(_run_root(runtime), claim.assignments[0].task_key).unlink()
 
     replay = runtime.complete_pull_tasks_and_claim(
         call.provider_call_id,
@@ -322,11 +276,10 @@ def test_terminal_worker_recovers_committed_outputs_after_lost_callback(
     monkeypatch,
 ) -> None:
     driver = RecordingDriver()
-    runtime = _runtime(tmp_path, driver)
-    runtime._initialize()
+    runtime, volume = _runtime(tmp_path, driver)
+    runtime.attach()
     runtime.advance_once()
-    calls = runtime.store.execution.list_provider_calls(RUN_ID)
-    for ordinal, call in enumerate(calls):
+    for ordinal, call in enumerate(runtime.store.execution.list_provider_calls(RUN_ID)):
         claim = runtime.claim_pull_tasks(
             call.provider_call_id,
             request_id=f"claim-{ordinal}",
@@ -335,13 +288,12 @@ def test_terminal_worker_recovers_committed_outputs_after_lost_callback(
         for assignment in claim.assignments:
             _publish_assignment(runtime, assignment)
 
-    output = cast(FakeVolume, runtime.output_volume)
     from biomodals.app.bioinfo.rosetta import execution_runtime as runtime_module
 
     real_validate = runtime_module.validate_task_publication
 
     def validate_after_reload(*args, **kwargs):
-        return output.reloads > 0 and real_validate(*args, **kwargs)
+        return volume.reloads > 0 and real_validate(*args, **kwargs)
 
     monkeypatch.setattr(
         runtime_module,
@@ -352,7 +304,7 @@ def test_terminal_worker_recovers_committed_outputs_after_lost_callback(
 
     runtime.advance_once()
 
-    assert output.reloads == 1
+    assert volume.reloads == 1
     assert {
         task.status
         for task in runtime.store.execution.list_tasks(RUN_ID, "rosetta-tasks")
@@ -361,16 +313,13 @@ def test_terminal_worker_recovers_committed_outputs_after_lost_callback(
     runtime.close()
 
 
-def test_one_worker_failure_is_recorded_without_losing_sibling_success(
-    tmp_path: Path,
-) -> None:
+def test_one_worker_failure_preserves_sibling_success(tmp_path: Path) -> None:
     driver = RecordingDriver()
-    runtime = _runtime(tmp_path, driver)
-    runtime._initialize()
+    runtime, _volume = _runtime(tmp_path, driver)
+    runtime.attach()
     runtime.advance_once()
-    calls = runtime.store.execution.list_provider_calls(RUN_ID)
 
-    for ordinal, call in enumerate(calls):
+    for ordinal, call in enumerate(runtime.store.execution.list_provider_calls(RUN_ID)):
         claim = runtime.claim_pull_tasks(
             call.provider_call_id,
             request_id=f"claim-{ordinal}",
@@ -385,11 +334,10 @@ def test_one_worker_failure_is_recorded_without_losing_sibling_success(
                         assignment.task_key,
                         f"complete-{assignment.task_key}",
                         (
-                            {
-                                "status": "failed",
-                                "task_key": assignment.task_key,
-                                "error": "Rosetta failed",
-                            }
+                            AppRunResult(
+                                status=AppRunStatus.FAILED,
+                                warnings=["Rosetta failed"],
+                            )
                             if assignment.task_key == "2"
                             else _publish_assignment(runtime, assignment)
                         ),
@@ -403,43 +351,18 @@ def test_one_worker_failure_is_recorded_without_losing_sibling_success(
 
     driver.succeeded = True
     runtime.advance_once()
-    tasks = runtime.store.execution.list_tasks(RUN_ID, "rosetta-tasks")
-    assert [task.status for task in tasks] == [
-        TaskStatus.SUCCEEDED,
-        TaskStatus.FAILED,
-        TaskStatus.SUCCEEDED,
-    ]
+    assert [
+        task.status
+        for task in runtime.store.execution.list_tasks(RUN_ID, "rosetta-tasks")
+    ] == [TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.SUCCEEDED]
     assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED
     runtime.close()
 
 
-def test_cancel_requested_run_reconciles_worker_cancellation(
-    tmp_path: Path,
-) -> None:
+def test_resume_recovers_publications_owned_by_unknown_workers(tmp_path: Path) -> None:
     driver = RecordingDriver()
-    runtime = _runtime(tmp_path, driver)
-    runtime._initialize()
-    runtime.advance_once()
-
-    requested = runtime.cancel()
-    assert requested.run.status == RunStatus.CANCEL_REQUESTED
-
-    runtime.advance_once()
-
-    snapshot = runtime.store.execution.snapshot(RUN_ID)
-    assert snapshot.run.status == RunStatus.CANCELLED
-    assert {call.status for call in snapshot.provider_calls} == {
-        ProviderCallStatus.CANCELLED
-    }
-    runtime.close()
-
-
-def test_unknown_run_prunes_workers_after_task_publications_appear(
-    tmp_path: Path,
-) -> None:
-    driver = RecordingDriver()
-    runtime = _runtime(tmp_path, driver)
-    runtime._initialize()
+    runtime, volume = _runtime(tmp_path, driver)
+    runtime.attach()
     runtime.advance_once()
     calls = runtime.store.execution.list_provider_calls(RUN_ID)
     for ordinal, call in enumerate(calls):
@@ -454,15 +377,16 @@ def test_unknown_run_prunes_workers_after_task_publications_appear(
         with runtime.store.transaction():
             runtime.store.execution.mark_provider_call_state_unknown(
                 call.provider_call_id,
-                message="Modal state lookup was inconclusive",
+                message="Provider state lookup was inconclusive",
                 now=11,
             )
     driver.state_unknown = True
 
-    overview = runtime.resume()
+    result = runtime.resume()
     snapshot = runtime.store.execution.snapshot(RUN_ID)
 
-    assert overview.run.status == RunStatus.SUCCEEDED
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert volume.reloads == 1
     assert driver.cancelled == {str(spawn["handle"]) for spawn in driver.spawns}
     assert {call.status for call in snapshot.provider_calls} == {
         ProviderCallStatus.CANCELLED

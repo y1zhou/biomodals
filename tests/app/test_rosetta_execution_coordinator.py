@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -9,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-import biomodals.app.bioinfo.rosetta.execution_coordinator as coordinator_module
+import biomodals.execution.modal.host as host_module
 from biomodals.app.bioinfo.rosetta.execution_contracts import RosettaTaskSpec
 from biomodals.app.bioinfo.rosetta.execution_coordinator import (
     RosettaExecutionCoordinator,
@@ -19,8 +20,8 @@ from biomodals.app.bioinfo.rosetta.execution_request import (
     load_execution_request,
     persist_execution_request,
 )
-from biomodals.execution import DeploymentIdentity
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.execution import DeploymentIdentity, GraphExecutionRunStore
+from biomodals.schema import AppRunResult, AppRunStatus
 
 PREDECESSOR_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -51,33 +52,22 @@ class FakeRuntime:
             kwargs["predecessor_execution_run_id"],
         )
         self.deployment = cast(DeploymentIdentity, kwargs["deployment"])
-        self.store = cast(ExecutionRunStore, kwargs["store"])
+        self.store = cast(GraphExecutionRunStore, kwargs["store"])
         self.created.append(kwargs)
 
-    def run(self):
-        return self._snapshot()
+    def run(self) -> AppRunResult:
+        self._ensure_run()
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
-    def resume(self):
-        return self._snapshot()
-
-    def cancel(self):
-        with self.store.transaction():
-            self.store.execution.request_run_cancellation(
-                self.execution_run_id,
-                now=20,
-            )
-            self.store.execution.finalize_run_from_results(
-                self.execution_run_id,
-                now=21,
-            )
-        return self.store.execution.overview(self.execution_run_id)
+    def resume(self) -> AppRunResult:
+        return self.run()
 
     def close(self) -> None:
         self.store.close()
 
-    def _snapshot(self):
+    def _ensure_run(self) -> None:
         try:
-            return self.store.execution.overview(self.execution_run_id)
+            self.store.execution.get_run(self.execution_run_id)
         except LookupError:
             with self.store.transaction():
                 self.store.execution.create_run(
@@ -89,7 +79,6 @@ class FakeRuntime:
                     max_active_gpu_provider_calls=0,
                     now=10,
                 )
-            return self.store.execution.overview(self.execution_run_id)
 
 
 def _request() -> RosettaExecutionRequest:
@@ -129,6 +118,7 @@ def _coordinator(
         deployment=deployment,
         volume_root=tmp_path,
         output_volume=volume,
+        output_volume_name="Rosetta-outputs",
         provider_driver=object(),
         pull_worker_coordinator=object(),
         app_version="2025.51",
@@ -141,7 +131,7 @@ def _terminal_predecessor(
     request: RosettaExecutionRequest,
 ) -> None:
     persist_execution_request(tmp_path, PREDECESSOR_ID, request)
-    store = ExecutionRunStore(tmp_path, PREDECESSOR_ID)
+    store = GraphExecutionRunStore(tmp_path, PREDECESSOR_ID)
     with store.transaction():
         store.execution.create_run(
             execution_run_id=PREDECESSOR_ID,
@@ -161,11 +151,7 @@ def test_root_run_uses_staged_request_and_remote_ledger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeRuntime.created.clear()
-    monkeypatch.setattr(
-        coordinator_module,
-        "RosettaExecutionRuntime",
-        FakeRuntime,
-    )
+    monkeypatch.setattr(host_module, "ExecutionGraphRuntime", FakeRuntime)
     request = _request()
     persist_execution_request(tmp_path, PREDECESSOR_ID, request)
     volume = FakeVolume()
@@ -187,18 +173,21 @@ def test_root_run_uses_staged_request_and_remote_ledger(
     assert coordinator.status() == snapshot
 
 
-def test_restart_links_successor_and_only_changes_worker_policy(
+def test_restart_links_successor_and_uses_candidate_worker_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeRuntime.created.clear()
-    monkeypatch.setattr(
-        coordinator_module,
-        "RosettaExecutionRuntime",
-        FakeRuntime,
-    )
+    monkeypatch.setattr(host_module, "ExecutionGraphRuntime", FakeRuntime)
     request = _request()
+    candidate = replace(
+        request,
+        max_active_provider_calls=3,
+        claim_capacity=2,
+        max_parallel_per_worker=2,
+    )
     _terminal_predecessor(tmp_path, request)
+    persist_execution_request(tmp_path, SUCCESSOR_ID, candidate)
     coordinator = _coordinator(
         tmp_path,
         FakeVolume(),
@@ -209,12 +198,7 @@ def test_restart_links_successor_and_only_changes_worker_policy(
     coordinator.prepare_restart(
         predecessor_execution_run_id=PREDECESSOR_ID,
         predecessor_deployment=DEPLOYMENT,
-        max_active_provider_calls=3,
-        claim_capacity=2,
-        max_parallel_per_worker=2,
-        expected_workload_plan_fingerprint=(
-            request.execution_plan.workload_plan_fingerprint
-        ),
+        candidate_request=candidate,
     )
     snapshot = coordinator.drive_prepared()
 
@@ -224,10 +208,6 @@ def test_restart_links_successor_and_only_changes_worker_policy(
     assert snapshot.run.max_active_provider_calls == 3
     assert successor_request.claim_capacity == 2
     assert successor_request.max_parallel_per_worker == 2
-    assert (
-        successor_request.execution_plan.workload_plan_fingerprint
-        == request.execution_plan.workload_plan_fingerprint
-    )
 
 
 def test_launch_time_restart_rejects_changed_science(tmp_path: Path) -> None:

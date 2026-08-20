@@ -115,14 +115,6 @@ def test_rosetta_no_local_output_uses_remote_coordinator(
         "use_deployed_coordinator": False,
         "local_coordinator": rosetta_app.ExecutionCoordinator,
         "workload_name": "Rosetta",
-        "restart_kwargs": {
-            "workload_plan_fingerprint": (
-                request.execution_plan.workload_plan_fingerprint
-            ),
-            "max_active_provider_calls": request.max_active_provider_calls,
-            "claim_capacity": request.claim_capacity,
-            "max_parallel_per_worker": request.max_parallel_per_worker,
-        },
     }
     output = capsys.readouterr().out
     assert (
@@ -272,7 +264,7 @@ def test_rosetta_worker_uses_app_run_layout(
         "1",
         f"{PROVIDER_CALL_ID}:complete:fingerprint",
     )
-    assert completions[0][3]["status"] == "succeeded"
+    assert completions[0][3].status == rosetta_app.AppRunStatus.SUCCEEDED
     assert summary == {"claimed_tasks": 1, "claim_requests": 2}
     assert output_volume.commit_count == 1
 

@@ -1,14 +1,10 @@
-"""Direct Rosetta App Run adapter for SQLite-backed pull workers."""
+"""Rosetta pull-worker Node for the shared execution graph."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
-from typing import Any, cast
-from uuid import UUID
-
-import orjson
 
 from biomodals.app.bioinfo.rosetta.execution_contracts import (
     RosettaTaskSpec,
@@ -20,506 +16,130 @@ from biomodals.app.bioinfo.rosetta.execution_request import (
 )
 from biomodals.execution import (
     AvailabilityStatus,
-    DeploymentIdentity,
-    NodeStatus,
-    ProviderBinding,
-    ProviderCallRecord,
-    ProviderCallSubmission,
-    PullTaskClaim,
-    TaskPlan,
-    form_pull_worker_candidates,
-    ready_node_keys,
+    ExecutionArtifact,
+    ExecutionGraph,
+    ExecutionPlanMetadata,
 )
-from biomodals.execution.modal import (
-    ExecutionRuntimeLifecycle,
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    PullTaskProviderNode,
+    PullWorkerCallSpec,
+    TaskDefinition,
 )
-from biomodals.execution.scheduler import (
-    PullWorkerDispatchDescriptor,
-    required_node_ranks,
-    select_admissible_candidates,
-)
-from biomodals.execution.store import ExecutionRunStore
+from biomodals.schema import AppRunResult, AppRunStatus
 
 
-class RosettaExecutionRuntime(ExecutionRuntimeLifecycle):
-    """Drive one direct Rosetta request through a durable pull-worker pool."""
+@dataclass
+class _RosettaTasksNode(PullTaskProviderNode):
+    """Execute independent Rosetta commands through bounded pull workers."""
 
-    def __init__(
-        self,
-        *,
-        request: RosettaExecutionRequest,
-        execution_run_id: UUID,
-        deployment: DeploymentIdentity,
-        store: ExecutionRunStore,
-        provider_driver: Any,
-        output_volume: Any,
-        output_root: str | Path,
-        pull_worker_coordinator: Any,
-        predecessor_execution_run_id: UUID | None = None,
-        poll_interval_seconds: float = 1.0,
-        now: Callable[[], int] | None = None,
-        volume_io_lock: RLock | None = None,
-    ) -> None:
-        """Bind the kernel writer to Rosetta's Task publications."""
-        volume_io_lock = RLock() if volume_io_lock is None else volume_io_lock
-        self._bind_execution_runtime(
-            request=request,
-            execution_run_id=execution_run_id,
-            deployment=deployment,
-            store=store,
-            provider_driver=provider_driver,
-            output_volume=output_volume,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            poll_interval_seconds=poll_interval_seconds,
-            now=now,
-            volume_io_lock=volume_io_lock,
-        )
-        self.output_root = Path(output_root)
-        self.pull_worker_coordinator = pull_worker_coordinator
+    request: RosettaExecutionRequest
+    output_root: Path
 
     @property
     def run_root(self) -> Path:
-        """Return the existing app-owned run directory."""
         return self.output_root / self.request.workload_run_key
 
-    def attach(self) -> None:
-        """Open and verify this Run without refreshing worker publications."""
-        self._initialize(reload_output=False)
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return True
 
-    def refresh_publications(self) -> None:
-        """Refresh worker publications and verify this Run."""
-        self._initialize(reload_output=True)
-
-    def claim_pull_tasks(
+    def discover_remote_tasks(
         self,
-        provider_call_id: UUID,
-        *,
-        request_id: str,
-        capacity: int,
-    ) -> PullTaskClaim:
-        """Checkpoint one idempotent claim before returning Task payloads."""
-        return self._provider.claim_pull_tasks(
-            provider_call_id,
-            request_id=request_id,
-            capacity=capacity,
-            now=self._now(),
+        context: NodeRunContext,
+    ) -> tuple[TaskDefinition, ...]:
+        del context
+        return tuple(
+            TaskDefinition(
+                task_key=task.task_key,
+                scientific_payload=task.scientific_payload,
+                execution_payload=task.to_dict(),
+            )
+            for task in self.request.tasks
         )
 
-    def complete_pull_tasks_and_claim(
+    def prepare_pull_worker(
         self,
-        provider_call_id: UUID,
-        completions: tuple[
-            tuple[str, str, Mapping[str, object]],
-            ...,
-        ],
-        *,
-        request_id: str,
-        capacity: int,
-    ):
-        """Validate one microbatch and checkpoint its next claim atomically."""
-        if not completions:
-            raise ValueError("fused pull completion requires a nonempty batch")
-        volume_io_lock = cast(Any, self._volume_io_lock)
-        with volume_io_lock:
-            return self._provider.record_pull_task_completions_and_claim(
-                provider_call_id,
-                self._pull_completion_observations(provider_call_id, completions),
-                request_id=request_id,
-                capacity=capacity,
-                now=self._now(),
-            )
-
-    def _pull_completion_observations(
-        self,
-        provider_call_id: UUID,
-        completions: tuple[
-            tuple[str, str, Mapping[str, object]],
-            ...,
-        ],
-    ) -> tuple[tuple[str, str, AvailabilityStatus, str | None], ...]:
-        with self.store.synchronize():
-            call = self.store.execution.get_provider_call(
-                provider_call_id,
-                include_task_keys=False,
-            )
-            receipts = {
-                (task_key, request_id): (
-                    self.store.execution.get_pull_task_completion_receipt(
-                        provider_call_id,
-                        task_key,
-                        request_id=request_id,
-                    )
-                )
-                for task_key, request_id, _result in completions
-            }
-            tasks = {
-                task_key: self.store.execution.get_task(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    task_key,
-                )
-                for task_key, _request_id, _result in completions
-            }
-        if call.node_key != ROSETTA_TASKS_NODE:
-            raise ValueError("Provider Call does not belong to Rosetta Tasks")
-        specs = self._task_specs()
-        observations = []
-        for task_key, request_id, result in completions:
-            if (receipt := receipts[(task_key, request_id)]) is not None:
-                observation, message = receipt
-                observations.append((task_key, request_id, observation, message))
-                continue
-            task = tasks[task_key]
-            status = result.get("status")
-            message = result.get("error")
-            if not isinstance(status, str):
-                raise TypeError("Rosetta worker result has no status")
-            if message is not None and not isinstance(message, str):
-                raise TypeError("Rosetta worker error must be text")
-            observation = AvailabilityStatus.MISSING
-            if status == "succeeded":
-                try:
-                    observation = (
-                        AvailabilityStatus.AVAILABLE
-                        if validate_task_publication(
-                            self.run_root,
-                            specs[task_key],
-                            task.fingerprint,
-                        )
-                        else AvailabilityStatus.MISSING
-                    )
-                except OSError:
-                    observation = AvailabilityStatus.UNKNOWN
-                if observation == AvailabilityStatus.MISSING:
-                    message = "Rosetta worker returned without a valid publication"
-                elif observation == AvailabilityStatus.UNKNOWN:
-                    message = "Rosetta worker publication could not be validated"
-            elif status != "failed":
-                raise ValueError(f"Unknown Rosetta worker status {status!r}")
-            observations.append((task_key, request_id, observation, message))
-        return tuple(observations)
-
-    def advance_once(self) -> None:
-        """Apply one result-driven recovery and greedy admission cycle."""
-        # Pull workers complete Tasks through coordinator callbacks.
-        self._provider.advance_once(
-            self.execution_run_id,
-            recover_publications=self._recover_publications,
-            reconcile_provider_calls=self._reconcile_provider_calls,
-            decode_completed_calls=lambda: None,
-            start_ready_nodes=lambda _required: self._start_ready_node(),
-            admit_remote_tasks=self._admit_pull_workers,
-            now=self._now,
+        context: NodeRunContext,
+    ) -> PullWorkerCallSpec:
+        del context
+        return PullWorkerCallSpec(
+            function_name="run_rosetta_worker",
+            uses_gpu=False,
+            claim_capacity=self.request.claim_capacity,
+            max_worker_calls=self.request.max_active_provider_calls,
+            kwargs={
+                "run_name": self.request.run_name,
+                "run_id": self.request.run_id,
+                "claim_capacity": self.request.claim_capacity,
+                "max_parallel": self.request.max_parallel_per_worker,
+            },
+            runtime_image_key="rosetta-cpu",
+            compatibility_key="rosetta-worker",
         )
 
-    def _initialize(self, *, reload_output: bool = False):
-        if reload_output:
-            self._reload_output()
-        return self._create_or_verify_run(
-            plan=self.request.execution_plan,
-            max_active_provider_calls=self.request.max_active_provider_calls,
-            max_active_gpu_provider_calls=0,
-        )
-
-    def _recover_publications(self) -> None:
-        volume_io_lock = cast(Any, self._volume_io_lock)
-        with volume_io_lock:
-            self._recover_publications_locked()
-
-    def _recover_publications_locked(self) -> None:
-        """Recover Rosetta publications while owning the Volume-I/O lock."""
-        with self.store.synchronize():
-            repository = self.store.execution
-            node = repository.get_node(self.execution_run_id, ROSETTA_TASKS_NODE)
-        if node.status == NodeStatus.PENDING:
-            observation = self._node_observation()
-            with self.store.transaction():
-                repository = self.store.execution
-                if repository.get_node(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                ).status.is_terminal:
-                    return
-                repository.record_node_result_observation(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    observation,
-                    now=self._now(),
-                )
-            return
-        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
-            return
-        specs = self._task_specs()
-        with self.store.synchronize():
-            tasks = self.store.execution.list_tasks_requiring_publication_recovery(
-                self.execution_run_id,
-                ROSETTA_TASKS_NODE,
-            )
-        observations = []
-        for task in tasks:
-            try:
-                observation = (
-                    AvailabilityStatus.AVAILABLE
-                    if validate_task_publication(
-                        self.run_root,
-                        specs[task.task_key],
-                        task.fingerprint,
-                    )
-                    else AvailabilityStatus.MISSING
-                )
-            except OSError:
-                observation = AvailabilityStatus.UNKNOWN
-            observations.append((task.task_key, observation))
-        if not observations:
-            return
-        with self.store.transaction():
-            repository = self.store.execution
-            for task_key, observation in observations:
-                if repository.get_task(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    task_key,
-                ).status.is_terminal:
-                    continue
-                repository.record_task_result_observation(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    task_key,
-                    observation,
-                    now=self._now(),
-                )
-
-    def _node_observation(self) -> AvailabilityStatus:
+    def observe_remote_task_publication(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+        result: AppRunResult,
+        artifacts: tuple[ExecutionArtifact, ...],
+    ) -> AvailabilityStatus | None:
+        del context, result, artifacts
         try:
-            available = all(
-                validate_task_publication(
-                    self.run_root,
-                    spec,
-                    self._task_plan(spec).fingerprint(
-                        workload_plan_fingerprint=(
-                            self.request.execution_plan.workload_plan_fingerprint
-                        ),
-                        node_key=ROSETTA_TASKS_NODE,
-                    ),
-                )
-                for spec in self.request.tasks
+            available = validate_task_publication(
+                self.run_root,
+                RosettaTaskSpec.from_dict(task.execution_payload),
+                expected_fingerprint,
             )
         except OSError:
             return AvailabilityStatus.UNKNOWN
         return AvailabilityStatus.AVAILABLE if available else AvailabilityStatus.MISSING
 
-    def _reconcile_provider_calls(self, required: set[str]) -> None:
-        self._provider.reconcile_provider_calls(
-            self.execution_run_id,
-            required_node_keys=required,
-            encode_result=_result_envelope,
-            recover_terminal_publications=self._recover_terminal_publications,
-            now=self._now(),
-        )
-
-    def _recover_terminal_publications(
+    def recover_remote_task_result(
         self,
-        terminal_calls: tuple[ProviderCallRecord, ...],
-    ) -> frozenset[UUID]:
-        """Refresh committed worker outputs before terminal call projection."""
-        terminal_call_ids = {call.provider_call_id for call in terminal_calls}
-        with self.store.synchronize():
-            has_unfinished_assignments = any(
-                not task.status.is_terminal
-                and task.worker_provider_call_id in terminal_call_ids
-                for task in self.store.execution.list_tasks(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                )
-            )
-        if not has_unfinished_assignments:
-            return frozenset()
-        self._reload_output()
-        self._recover_publications()
-        deferred: set[UUID] = set()
-        for task in self.store.execution.list_tasks(
-            self.execution_run_id,
-            ROSETTA_TASKS_NODE,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context
+        if not validate_task_publication(
+            self.run_root,
+            RosettaTaskSpec.from_dict(task.execution_payload),
+            expected_fingerprint,
         ):
-            owner = task.worker_provider_call_id
-            if (
-                not task.status.is_terminal
-                and task.result_observation == AvailabilityStatus.UNKNOWN
-                and owner in terminal_call_ids
-                and owner is not None
-            ):
-                deferred.add(owner)
-        return frozenset(deferred)
+            return None
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
-    def _start_ready_node(self) -> None:
-        volume_io_lock = cast(Any, self._volume_io_lock)
-        with volume_io_lock:
-            self._start_ready_node_locked()
-
-    def _start_ready_node_locked(self) -> None:
-        """Discover and validate Rosetta Tasks under the Volume-I/O lock."""
-        with self.store.synchronize():
-            repository = self.store.execution
-            statuses = {
-                node.node_key: node.status
-                for node in repository.list_nodes(self.execution_run_id)
-            }
-            plan = repository.get_run(self.execution_run_id).plan
-        if ROSETTA_TASKS_NODE not in ready_node_keys(
-            plan,
-            statuses,
-        ):
-            return
-        plans = tuple(self._task_plan(task) for task in self.request.tasks)
-        with self.store.transaction():
-            repository = self.store.execution
-            if repository.get_node(
-                self.execution_run_id,
-                ROSETTA_TASKS_NODE,
-            ).status.is_terminal:
-                return
-            repository.start_node(
-                self.execution_run_id,
-                ROSETTA_TASKS_NODE,
-                now=self._now(),
-            )
-            records = repository.discover_tasks(
-                self.execution_run_id,
-                ROSETTA_TASKS_NODE,
-                plans,
-                now=self._now(),
-            )
-        observations = []
-        for record, spec in zip(records, self.request.tasks, strict=True):
-            try:
-                observation = (
-                    AvailabilityStatus.AVAILABLE
-                    if validate_task_publication(
-                        self.run_root,
-                        spec,
-                        record.fingerprint,
-                    )
-                    else AvailabilityStatus.MISSING
-                )
-            except OSError:
-                observation = AvailabilityStatus.UNKNOWN
-            observations.append((record.task_key, observation))
-        with self.store.transaction():
-            repository = self.store.execution
-            for task_key, observation in observations:
-                if repository.get_task(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    task_key,
-                ).status.is_terminal:
-                    continue
-                repository.record_task_result_observation(
-                    self.execution_run_id,
-                    ROSETTA_TASKS_NODE,
-                    task_key,
-                    observation,
-                    now=self._now(),
-                )
-
-    def _admit_pull_workers(self, required: set[str]) -> None:
-        if ROSETTA_TASKS_NODE not in required:
-            return
-        with self.store.synchronize():
-            repository = self.store.execution
-            node = repository.get_node(self.execution_run_id, ROSETTA_TASKS_NODE)
-            run = repository.get_run(self.execution_run_id)
-            unfinished = repository.unfinished_pull_task_count(
-                self.execution_run_id,
-                ROSETTA_TASKS_NODE,
-            )
-            total_workers, nonterminal_workers = (
-                repository.provider_call_counts_by_node(
-                    self.execution_run_id,
-                    (ROSETTA_TASKS_NODE,),
-                ).get(ROSETTA_TASKS_NODE, (0, 0))
-            )
-        if node.status != NodeStatus.RUNNING or not node.discovery_complete:
-            return
-        rank = required_node_ranks(
-            run.plan,
-            required_node_keys=required,
-            unfinished_node_keys={ROSETTA_TASKS_NODE},
-        )[ROSETTA_TASKS_NODE]
-        binding = ProviderBinding(
-            environment=run.deployment.environment,
-            app_name=run.deployment.deployment_name,
-            app_version=run.deployment.deployment_version,
-            function_name="run_rosetta_worker",
-            uses_gpu=False,
-            runtime_image_key="rosetta-cpu",
-        )
-        descriptor = PullWorkerDispatchDescriptor(
-            node_key=ROSETTA_TASKS_NODE,
-            node_ordinal=node.ordinal,
-            binding=binding,
-            compatibility_key="rosetta-worker",
-            claim_capacity=self.request.claim_capacity,
-            max_worker_calls=self.request.max_active_provider_calls,
-            unfinished_task_count=unfinished,
-            nonterminal_worker_count=nonterminal_workers,
-            next_worker_ordinal=total_workers,
-            depth=rank.depth,
-            unblocking_span=rank.unblocking_span,
-        )
-        descriptor = self._provider.persist_pull_worker_dispatch_policy(
-            self.execution_run_id,
-            descriptor,
-            now=self._now(),
-        )
-        with self.store.synchronize():
-            counts = self.store.execution.active_provider_call_counts(
-                self.execution_run_id
-            )
-        selected = select_admissible_candidates(
-            form_pull_worker_candidates((descriptor,)),
-            available_total_slots=max(
-                0,
-                run.max_active_provider_calls - counts.total,
-            ),
-            available_gpu_slots=0,
-        )
-        self._provider.submit_provider_calls(
-            self.execution_run_id,
-            tuple(
-                ProviderCallSubmission(
-                    candidate=candidate,
-                    submission_token=candidate.candidate_key,
-                    claim_capacity=self.request.claim_capacity,
-                    provider_call_id_kwarg="provider_call_id",
-                    kwargs={
-                        "coordinator": self.pull_worker_coordinator,
-                        "run_name": self.request.run_name,
-                        "run_id": self.request.run_id,
-                        "claim_capacity": self.request.claim_capacity,
-                        "max_parallel": self.request.max_parallel_per_worker,
-                    },
-                )
-                for candidate in selected
-            ),
-            now=self._now(),
-        )
-
-    def _task_specs(self) -> dict[str, RosettaTaskSpec]:
-        return {task.task_key: task for task in self.request.tasks}
-
-    @staticmethod
-    def _task_plan(task: RosettaTaskSpec) -> TaskPlan:
-        return TaskPlan(
-            task_key=task.task_key,
-            scientific_payload=task.scientific_payload,
-            execution_payload=task.to_dict(),
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del context, results
+        return AppRunResult(
+            status=(AppRunStatus.SUCCEEDED if not errors else AppRunStatus.FAILED),
+            warnings=list(errors.values()),
         )
 
 
-def _result_envelope(result: object) -> dict[str, object]:
-    """Persist only a bounded JSON-compatible pull-worker summary."""
-    try:
-        value = orjson.loads(orjson.dumps(result))
-    except (TypeError, orjson.JSONEncodeError) as error:
-        raise ValueError("Rosetta worker returned a non-JSON result") from error
-    return {"result": value}
+def rosetta_execution_graph(
+    request: RosettaExecutionRequest,
+    *,
+    output_root: str | Path,
+) -> ExecutionGraph:
+    """Build Rosetta's single pull-worker Execution Definition."""
+    graph = ExecutionGraph(
+        "rosetta",
+        plan_metadata=ExecutionPlanMetadata(
+            workload_name="rosetta",
+            scientific_payload=request.execution_plan.scientific_payload,
+            scientific_versions=dict(request.execution_plan.scientific_versions),
+        ),
+    )
+    graph.add_node(
+        _RosettaTasksNode(request, Path(output_root)),
+        id=ROSETTA_TASKS_NODE,
+    )
+    return graph

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
-from threading import RLock
 from typing import Any
 from uuid import UUID
 
@@ -13,20 +11,14 @@ from biomodals.app.bioinfo.rosetta.execution_request import (
     load_execution_request,
     persist_execution_request,
 )
-from biomodals.app.bioinfo.rosetta.execution_runtime import (
-    RosettaExecutionRuntime,
-)
-from biomodals.execution import (
-    DeploymentIdentity,
-    PullTaskClaim,
-)
-from biomodals.execution.modal import (
-    ExecutionCoordinatorLifecycle,
-)
+from biomodals.app.bioinfo.rosetta.execution_runtime import rosetta_execution_graph
+from biomodals.execution import DeploymentIdentity, ExecutionGraph, PullTaskClaim
+from biomodals.execution.modal import ExecutionDefinitionCoordinatorLifecycle
+from biomodals.schema import AppRunResult
 
 
-class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
-    """Bind one single-writer App Run ledger to Rosetta publications."""
+class RosettaExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
+    """Bind one run-scoped writer to Rosetta's pull-worker publications."""
 
     _request_loader = staticmethod(load_execution_request)
     _request_persister = staticmethod(persist_execution_request)
@@ -38,6 +30,7 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         deployment: DeploymentIdentity,
         volume_root: str | Path,
         output_volume: Any,
+        output_volume_name: str,
         provider_driver: Any,
         pull_worker_coordinator: Any,
         app_version: str,
@@ -48,13 +41,14 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
             execution_run_id=execution_run_id,
             deployment=deployment,
             volume_root=volume_root,
+            artifact_volume_name=output_volume_name,
+            output_volume=output_volume,
+            provider_driver=provider_driver,
+            graph_builder=self._graph,
             target_scientific_versions={"rosetta": app_version},
+            pull_worker_coordinator=pull_worker_coordinator,
+            poll_interval_seconds=poll_interval_seconds,
         )
-        self.output_volume = output_volume
-        self._volume_io_lock = RLock()
-        self.provider_driver = provider_driver
-        self.pull_worker_coordinator = pull_worker_coordinator
-        self.poll_interval_seconds = poll_interval_seconds
 
     def claim_tasks(
         self,
@@ -64,16 +58,8 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
         capacity: int,
     ) -> PullTaskClaim:
         """Checkpoint one worker claim through the serialized writer."""
-        with self._volume_io_lock:
-            with self._writer_lock:
-                request = load_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
-                )
-                runtime = self._open_runtime(
-                    request,
-                    predecessor_execution_run_id=self._existing_predecessor(),
-                )
+        with self._volume_io_lock, self._writer_lock:
+            runtime = self._open_current_runtime(recover=True)
             runtime.attach()
             return runtime.claim_pull_tasks(
                 provider_call_id,
@@ -84,25 +70,14 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
     def complete_tasks_and_claim(
         self,
         provider_call_id: UUID,
-        completions: tuple[
-            tuple[str, str, dict[str, object]],
-            ...,
-        ],
+        completions: tuple[tuple[str, str, AppRunResult], ...],
         *,
         request_id: str,
         capacity: int,
     ) -> PullTaskClaim:
-        """Validate one microbatch and return its checkpointed successor claim."""
-        with self._volume_io_lock:
-            with self._writer_lock:
-                request = load_execution_request(
-                    self.volume_root,
-                    self.execution_run_id,
-                )
-                runtime = self._open_runtime(
-                    request,
-                    predecessor_execution_run_id=self._existing_predecessor(),
-                )
+        """Publish one microbatch and return its checkpointed successor claim."""
+        with self._volume_io_lock, self._writer_lock:
+            runtime = self._open_current_runtime(recover=True)
             runtime.refresh_publications()
             return runtime.complete_pull_tasks_and_claim(
                 provider_call_id,
@@ -111,67 +86,10 @@ class RosettaExecutionCoordinator(ExecutionCoordinatorLifecycle):
                 capacity=capacity,
             )
 
-    def prepare_restart(
-        self,
-        *,
-        predecessor_execution_run_id: UUID,
-        predecessor_deployment: DeploymentIdentity | None,
-        max_active_provider_calls: int | None = None,
-        claim_capacity: int | None = None,
-        max_parallel_per_worker: int | None = None,
-        expected_workload_plan_fingerprint: str | None = None,
-    ) -> None:
-        """Validate and persist a Successor request without driving it."""
-        with self._drive_lock:
-            with self._volume_io_lock, self._writer_lock:
-                self.output_volume.reload()
-                with self._open_successor_source(
-                    predecessor_execution_run_id,
-                    predecessor_deployment=predecessor_deployment,
-                    expected_workload_plan_fingerprint=(
-                        expected_workload_plan_fingerprint
-                    ),
-                ) as (predecessor, predecessor_request, _):
-                    request = replace(
-                        predecessor_request,
-                        max_active_provider_calls=(
-                            predecessor.max_active_provider_calls
-                            if max_active_provider_calls is None
-                            else max_active_provider_calls
-                        ),
-                        claim_capacity=(
-                            predecessor_request.claim_capacity
-                            if claim_capacity is None
-                            else claim_capacity
-                        ),
-                        max_parallel_per_worker=(
-                            predecessor_request.max_parallel_per_worker
-                            if max_parallel_per_worker is None
-                            else max_parallel_per_worker
-                        ),
-                    )
-                self._require_successor_plan_match(predecessor, request)
-                self._persist_successor_request(
-                    request,
-                    predecessor_execution_run_id,
-                )
-
-    def _create_runtime(
+    def _graph(
         self,
         request: RosettaExecutionRequest,
-        *,
-        predecessor_execution_run_id: UUID | None = None,
-    ) -> RosettaExecutionRuntime:
-        return RosettaExecutionRuntime(
-            request=request,
-            execution_run_id=self.execution_run_id,
-            predecessor_execution_run_id=predecessor_execution_run_id,
-            deployment=self.deployment,
-            store=self._run_store(),
-            provider_driver=self.provider_driver,
-            output_volume=self.output_volume,
-            output_root=self.volume_root,
-            pull_worker_coordinator=self.pull_worker_coordinator,
-            poll_interval_seconds=self.poll_interval_seconds,
-            volume_io_lock=self._volume_io_lock,
-        )
+        predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        del predecessor_execution_run_id
+        return rosetta_execution_graph(request, output_root=self.volume_root)

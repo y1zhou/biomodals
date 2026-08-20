@@ -30,6 +30,7 @@ from biomodals.app.bioinfo.rosetta.execution_coordinator import (
 )
 from biomodals.app.bioinfo.rosetta.execution_request import (
     RosettaExecutionRequest,
+    load_execution_request,
     load_execution_request_from_volume,
     stage_execution_request,
 )
@@ -57,6 +58,7 @@ from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.shell import package_outputs, warmup_directory
+from biomodals.schema import AppRunResult, AppRunStatus
 
 ##########################################
 # Modal configs
@@ -122,25 +124,25 @@ def run_rosetta_worker(
             capacity,
         )
 
-    def execute(assignment: WorkerAssignmentRecord) -> dict[str, object]:
+    def execute(assignment: WorkerAssignmentRecord) -> AppRunResult:
         task = RosettaTaskSpec.from_dict(assignment.execution_payload)
         try:
-            return execute_rosetta_task(
+            execute_rosetta_task(
                 run_root=layout.run_root,
                 task=task,
                 task_fingerprint=assignment.task_fingerprint,
                 run_command=run_command,
             )
         except Exception as error:  # noqa: BLE001
-            return {
-                "status": "failed",
-                "task_key": task.task_key,
-                "error": str(error) or type(error).__name__,
-            }
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[str(error) or type(error).__name__],
+            )
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
     def complete_and_claim(
         completions: tuple[
-            tuple[WorkerAssignmentRecord, str, dict[str, object]],
+            tuple[WorkerAssignmentRecord, str, AppRunResult],
             ...,
         ],
         request_id: str,
@@ -270,20 +272,16 @@ class ExecutionCoordinator:
     def restart_from(
         self,
         predecessor_execution_run_id: str,
-        workload_plan_fingerprint: str,
-        max_active_provider_calls: int,
-        claim_capacity: int,
-        max_parallel_per_worker: int,
     ) -> ExecutionOverview:
-        """Create a launch-time compatible Successor Run."""
+        """Create a compatible Successor while inferring predecessor identity."""
         adapter = self._adapter()
         adapter.prepare_restart(
             predecessor_execution_run_id=UUID(predecessor_execution_run_id),
             predecessor_deployment=None,
-            max_active_provider_calls=max_active_provider_calls,
-            claim_capacity=claim_capacity,
-            max_parallel_per_worker=max_parallel_per_worker,
-            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+            candidate_request=load_execution_request(
+                CONF.output_volume_mountpoint,
+                UUID(self.execution_run_id),
+            ),
         )
         return adapter.drive_prepared()
 
@@ -306,7 +304,7 @@ class ExecutionCoordinator:
         self,
         provider_call_id: str,
         completions: tuple[
-            tuple[str, str, dict[str, object]],
+            tuple[str, str, AppRunResult],
             ...,
         ],
         request_id: str,
@@ -344,6 +342,7 @@ class ExecutionCoordinator:
                 deployment=deployment,
                 volume_root=Path(CONF.output_volume_mountpoint),
                 output_volume=CONF.output_volume,
+                output_volume_name=CONF.output_volume_name,
                 provider_driver=_coordinator_modal_driver(development=selected_mode),
                 pull_worker_coordinator=self._worker_coordinator_handle(),
                 app_version=CONF.version or "",
@@ -697,14 +696,6 @@ def submit_rosetta_task(
         use_deployed_coordinator=use_deployed_coordinator,
         local_coordinator=ExecutionCoordinator,
         workload_name=CONF.name,
-        restart_kwargs={
-            "workload_plan_fingerprint": (
-                request.execution_plan.workload_plan_fingerprint
-            ),
-            "max_active_provider_calls": request.max_active_provider_calls,
-            "claim_capacity": request.claim_capacity,
-            "max_parallel_per_worker": request.max_parallel_per_worker,
-        },
     )
     completed_request = load_execution_request_from_volume(
         CONF.output_volume,

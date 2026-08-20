@@ -14,7 +14,7 @@ from biomodals.execution import ExecutionPlan, NodeAggregationPolicy, NodePlan
 from biomodals.execution.modal import ExecutionRequestFile
 from biomodals.helper.io import require_safe_filename_component
 
-REQUEST_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 ROSETTA_TASKS_NODE = "rosetta-tasks"
 _REQUEST_FILE = ExecutionRequestFile(
@@ -35,6 +35,7 @@ class RosettaExecutionRequest:
     max_active_provider_calls: int
     claim_capacity: int
     max_parallel_per_worker: int
+    max_active_gpu_provider_calls: int = 0
 
     def __post_init__(self) -> None:
         """Reject an unusable worker policy or duplicate Task identity."""
@@ -90,6 +91,7 @@ class RosettaExecutionRequest:
                 "tasks": [task.to_dict() for task in self.tasks],
                 "app_version": self.app_version,
                 "max_active_provider_calls": self.max_active_provider_calls,
+                "max_active_gpu_provider_calls": self.max_active_gpu_provider_calls,
                 "claim_capacity": self.claim_capacity,
                 "max_parallel_per_worker": self.max_parallel_per_worker,
             },

@@ -19,6 +19,7 @@ from biomodals.execution.store import (
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+OTHER_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 
 
 def test_run_store_uses_execution_identity_and_shared_schema(tmp_path: Path) -> None:
@@ -75,6 +76,43 @@ def test_run_store_atomically_creates_one_immutable_workflow_plan(
     assert not store.coordinator_plan_path.with_suffix(".pkl.tmp").exists()
     with pytest.raises(FileExistsError):
         store.write_coordinator_plan(b"replacement")
+
+
+def test_run_store_can_embed_multiple_runs_in_one_host_database(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "service.sqlite3"
+    first = GraphExecutionRunStore(
+        tmp_path / "execution",
+        RUN_ID,
+        database_path=database_path,
+        output_root=tmp_path / "cache" / str(RUN_ID),
+    )
+    second = GraphExecutionRunStore(
+        tmp_path / "execution",
+        OTHER_RUN_ID,
+        database_path=database_path,
+        output_root=tmp_path / "cache" / str(OTHER_RUN_ID),
+    )
+
+    for store in (first, second):
+        with store.transaction():
+            store.execution.create_run(
+                execution_run_id=store.execution_run_id,
+                plan=ExecutionPlan(
+                    workload_name="workflow:demo",
+                    nodes=(NodePlan(node_key="design"),),
+                ),
+                deployment=DeploymentIdentity("main", "DemoWorkflow", 4),
+                max_active_provider_calls=8,
+                max_active_gpu_provider_calls=2,
+                now=100,
+            )
+
+    assert first.ledger_path == second.ledger_path == database_path
+    assert first.output_root != second.output_root
+    assert first.execution.get_run(RUN_ID).execution_run_id == RUN_ID
+    assert second.execution.get_run(OTHER_RUN_ID).execution_run_id == OTHER_RUN_ID
 
 
 def test_run_store_rejects_an_empty_workflow_plan(tmp_path: Path) -> None:

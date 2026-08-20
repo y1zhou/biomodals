@@ -57,12 +57,14 @@ class ExecutionRunStore:
         volume_root: str | Path,
         execution_run_id: UUID,
         *,
+        database_path: str | Path | None = None,
         lock: Any | None = None,
         volume_io_lock: Any | None = None,
     ) -> None:
         """Bind storage only to its root and opaque Run ID."""
         self.volume_root = Path(volume_root)
         self.execution_run_id = execution_run_id
+        self._database_path = None if database_path is None else Path(database_path)
         self._connection: sqlite3.Connection | None = None
         self._execution: SqliteExecutionRepository | None = None
         self._lock = RLock() if lock is None else lock
@@ -83,7 +85,7 @@ class ExecutionRunStore:
     @property
     def ledger_path(self) -> Path:
         """Return the per-Run execution ledger path."""
-        return self.state_root / LEDGER_FILENAME
+        return self._database_path or self.state_root / LEDGER_FILENAME
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -155,6 +157,7 @@ class ExecutionRunStore:
             return self._connection
 
         self.state_root.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(
             self.ledger_path,
             check_same_thread=False,
@@ -196,6 +199,8 @@ class GraphExecutionRunStore(ExecutionRunStore):
         volume_root: str | Path,
         execution_run_id: UUID,
         *,
+        database_path: str | Path | None = None,
+        output_root: str | Path | None = None,
         lock: Any | None = None,
         volume_io_lock: Any | None = None,
     ) -> None:
@@ -203,9 +208,11 @@ class GraphExecutionRunStore(ExecutionRunStore):
         super().__init__(
             volume_root,
             execution_run_id,
+            database_path=database_path,
             lock=lock,
             volume_io_lock=volume_io_lock,
         )
+        self._output_root = None if output_root is None else Path(output_root)
         self._artifacts: ExecutionArtifactStore | None = None
 
     @property
@@ -216,6 +223,8 @@ class GraphExecutionRunStore(ExecutionRunStore):
     @property
     def output_root(self) -> Path:
         """Return the separate execution-owned scientific output directory."""
+        if self._output_root is not None:
+            return self._output_root
         # Preserve the established physical layout for downstream consumers.
         return self.volume_root / "workflow-runs" / str(self.execution_run_id)
 

@@ -129,7 +129,7 @@ class DispatchMode(StrEnum):
 
 @dataclass(frozen=True)
 class ProviderBinding:
-    """Resolved Modal function identity and operational scheduling metadata."""
+    """Resolved provider operation and operational scheduling metadata."""
 
     environment: str
     app_name: str
@@ -139,15 +139,15 @@ class ProviderBinding:
     runtime_image_key: str | None = None
 
     def __post_init__(self) -> None:
-        """Require an exact deployed function identity."""
+        """Require an exact deployed provider operation identity."""
         if not self.environment:
             raise ValueError("provider environment cannot be empty")
         if not self.app_name:
-            raise ValueError("provider app name cannot be empty")
+            raise ValueError("provider deployment name cannot be empty")
         if self.app_version < 1:
-            raise ValueError("provider app version must be positive")
+            raise ValueError("provider deployment version must be positive")
         if not self.function_name:
-            raise ValueError("provider function name cannot be empty")
+            raise ValueError("provider operation name cannot be empty")
 
 
 class AvailabilityStatus(StrEnum):
@@ -400,7 +400,7 @@ class ExecutionTaskRecord:
 
 @dataclass(frozen=True)
 class ProviderCallRecord:
-    """One durable concrete Modal function invocation."""
+    """One durable concrete provider operation invocation."""
 
     provider_call_id: UUID
     execution_run_id: UUID

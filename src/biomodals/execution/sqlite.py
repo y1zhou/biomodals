@@ -2810,10 +2810,10 @@ class SqliteExecutionRepository:
     ) -> tuple[ProviderCallRecord, ...]:
         """Load observable calls plus successful calls awaiting publication.
 
-        Active calls do not need their owned Task keys to query Modal. Successful
-        calls carry only still-running Tasks, which are the only Tasks awaiting
-        publication. This keeps pull-worker polling independent of its completed
-        assignment history.
+        Active calls do not need their owned Task keys to query the provider.
+        Successful calls carry only still-running Tasks, which are the only
+        Tasks awaiting publication. This keeps pull-worker polling independent
+        of its completed assignment history.
         """
         active = tuple(
             status.value for status in ProviderCallStatus if not status.is_terminal

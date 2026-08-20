@@ -563,7 +563,7 @@ def test_state_unknown_stops_automatic_driving_with_diagnostic(caplog) -> None:
     assert "automatic scheduling stopped" in caplog.text
     assert "Modal state lookup was inconclusive" in caplog.text
     assert "durable occupied Provider Call slots=1" in caplog.text
-    assert "not confirmed live Modal containers" in caplog.text
+    assert "not confirmed live provider workers" in caplog.text
 
 
 def test_hard_coordinator_interruption_preserves_running_state() -> None:

@@ -62,7 +62,7 @@ def drive_execution_run(
                     "Execution coordinator input returning for Run %s: "
                     "status=%s, reason=%s, message=%r; automatic scheduling stopped; "
                     "durable occupied Provider Call slots=%d (%d GPU). These "
-                    "are ownership records, not confirmed live Modal containers.",
+                    "are ownership records, not confirmed live provider workers.",
                     execution_run_id,
                     run.status.value,
                     reason,

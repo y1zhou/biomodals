@@ -73,9 +73,9 @@ class ProviderCallSpec:
     provider_call_id_kwarg: str | None = None
 
     def __post_init__(self) -> None:
-        """Reject an incomplete provider target before Task discovery."""
+        """Reject an incomplete provider operation before Task discovery."""
         if not self.function_name:
-            raise ValueError("Provider operation name cannot be empty")
+            raise ValueError("provider operation name cannot be empty")
         if self.max_tasks_per_call < 1:
             raise ValueError("max_tasks_per_call must be positive")
         if self.provider_call_id_kwarg is not None and (
@@ -110,7 +110,7 @@ class PullWorkerCallSpec:
     def __post_init__(self) -> None:
         """Reject an invalid worker policy before any provider preclaim."""
         if not self.function_name:
-            raise ValueError("Remote pull-worker function name cannot be empty")
+            raise ValueError("pull-worker provider operation name cannot be empty")
         if self.claim_capacity < 1:
             raise ValueError("claim_capacity must be positive")
         if self.max_worker_calls < 1:

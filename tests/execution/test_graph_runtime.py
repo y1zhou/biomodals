@@ -360,6 +360,11 @@ class PullFanoutNode(PullTaskProviderNode):
         repr=False,
         metadata={"dag_hash": False},
     )
+    refresh_before_result: bool = field(
+        default=False,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
     publication_observation: AvailabilityStatus | None = field(
         default=None,
         repr=False,
@@ -401,6 +406,9 @@ class PullFanoutNode(PullTaskProviderNode):
             kwargs={"node_id": context.node_id},
             runtime_image_key="pull-cpu",
         )
+
+    def refresh_artifact_storage_before_result(self) -> bool:
+        return self.refresh_before_result
 
     def observe_remote_task_publication(
         self,
@@ -685,7 +693,7 @@ def test_initialization_reuses_the_host_volume_view(
     runtime.attach(workload_run_key="friendly-name")
     runtime.attach(workload_run_key="friendly-name")
     assert volume.reloads == 0
-    runtime._initialize("friendly-name", reload_volume=True)
+    runtime.refresh_publications(workload_run_key="friendly-name")
     assert volume.reloads == 1
     runtime.close()
 
@@ -1237,10 +1245,8 @@ def test_cancel_requested_workflow_reconciles_provider_cancellation(
     runtime._initialize("cancel")
     runtime.advance_once()
 
-    runtime.cancel()
-    assert runtime.store.execution.get_run(RUN_ID).status == (
-        RunStatus.CANCEL_REQUESTED
-    )
+    overview = runtime.cancel()
+    assert overview.run.status == RunStatus.CANCEL_REQUESTED
 
     runtime.advance_once()
 
@@ -1617,14 +1623,16 @@ def test_zero_gpu_capacity_suspends_gpu_pull_work(tmp_path: Path) -> None:
 
 def test_terminal_pull_worker_recovers_publication_after_lost_callback(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     workflow = ExecutionGraph("pull-callback-recovery")
     node = PullFanoutNode(
         ("alpha",),
         max_worker_calls=1,
-        recoverable_publications={"candidate-0"},
+        refresh_before_result=True,
     )
     workflow.add_node(node, id="fanout")
+    volume = FakeVolume()
     runtime = _runtime(
         tmp_path,
         workflow,
@@ -1632,6 +1640,7 @@ def test_terminal_pull_worker_recovers_publication_after_lost_callback(
         max_calls=1,
         max_gpu_calls=0,
         pull_worker_coordinator="run-pool",
+        volume=volume,
     )
     runtime._initialize("pull-callback-recovery")
     runtime.advance_once()
@@ -1641,6 +1650,15 @@ def test_terminal_pull_worker_recovers_publication_after_lost_callback(
         request_id="claim",
         capacity=1,
     ).assignments
+    node.recoverable_publications.add("candidate-0")
+    recover = node.recover_remote_task_result
+    monkeypatch.setattr(
+        node,
+        "recover_remote_task_result",
+        lambda context, task, fingerprint: (
+            recover(context, task, fingerprint) if volume.reloads else None
+        ),
+    )
 
     runtime.advance_once()
 
@@ -1657,18 +1675,16 @@ def test_terminal_pull_worker_recovers_publication_after_lost_callback(
     assert recovered is not None
     assert recovered.status == AppRunStatus.SUCCEEDED
     assert [output.name for output in recovered.outputs] == ["text"]
+    assert volume.reloads == 1
 
 
 def test_unknown_pull_publication_defers_terminal_owner_projection(
     tmp_path: Path,
 ) -> None:
     workflow = ExecutionGraph("pull-callback-unknown")
+    node = PullFanoutNode(("alpha",), max_worker_calls=1)
     workflow.add_node(
-        PullFanoutNode(
-            ("alpha",),
-            max_worker_calls=1,
-            recovery_is_unknown=True,
-        ),
+        node,
         id="fanout",
     )
     runtime = _runtime(
@@ -1687,6 +1703,7 @@ def test_unknown_pull_publication_defers_terminal_owner_projection(
         request_id="claim",
         capacity=1,
     ).assignments
+    node.recovery_is_unknown = True
 
     runtime.advance_once()
 
@@ -2318,7 +2335,11 @@ def test_remote_task_finalizer_does_not_publish_after_cancellation(
     node = RemoteFanoutNode(("alpha", "beta"))
     workflow.add_node(node, id="fanout")
     runtime = _runtime(tmp_path, workflow, driver=FanoutModalDriver())
-    node.cancel_on_finalize = runtime.cancel
+
+    def cancel_on_finalize() -> None:
+        runtime.cancel()
+
+    node.cancel_on_finalize = cancel_on_finalize
 
     runtime.run(workload_run_key="cancelled-aggregate-publication")
 

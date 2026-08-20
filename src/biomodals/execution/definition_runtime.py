@@ -21,6 +21,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     ExecutionNodeRecord,
+    ExecutionOverview,
     ExecutionRuntime,
     ExecutionTaskRecord,
     NodeAggregationPolicy,
@@ -262,8 +263,7 @@ class ExecutionGraphRuntime:
     ) -> AppRunResult:
         """Explicitly resume this persisted Run, then drive it."""
         selected_key = self._select_workload_run_key(workload_run_key)
-        with self.store.synchronize():
-            repository = self._initialize(selected_key)
+        repository = self._initialize(selected_key, reload_volume=True)
         resume_execution_run(
             repository,
             self.execution_run_id,
@@ -303,15 +303,23 @@ class ExecutionGraphRuntime:
             now=self._now,
         )
 
-    def cancel(self) -> None:
+    def cancel(self) -> ExecutionOverview:
         """Request cancellation through the shared provider lifecycle."""
         self._provider.cancel_run(self.execution_run_id, now=self._now())
+        return self.store.execution.overview(self.execution_run_id)
 
     def attach(self, *, workload_run_key: str | None = None) -> None:
         """Open and verify a Run without refreshing worker publications."""
         self._initialize(
             self._select_workload_run_key(workload_run_key),
             reload_volume=False,
+        )
+
+    def refresh_publications(self, *, workload_run_key: str | None = None) -> None:
+        """Refresh provider publications before a coordinator callback."""
+        self._initialize(
+            self._select_workload_run_key(workload_run_key),
+            reload_volume=True,
         )
 
     def prepare(self, *, workload_run_key: str | None = None) -> None:
@@ -985,6 +993,18 @@ class ExecutionGraphRuntime:
                 not task.status.is_terminal and task.worker_provider_call_id in call_ids
             )
         ]
+        implementations = {
+            task.node_key: definition.nodes[task.node_key].node for task in tasks
+        }
+        if any(
+            isinstance(node, PullTaskProviderNode)
+            and node.refresh_artifact_storage_before_result()
+            for node in implementations.values()
+        ):
+            self._reload_volume()
+        for node in implementations.values():
+            if isinstance(node, PullTaskProviderNode):
+                node.refresh_result_storage()
         prepared: list[
             tuple[
                 ExecutionTaskRecord,
@@ -2344,8 +2364,6 @@ class ExecutionGraphRuntime:
                     artifacts,
                 )
             )
-        if isinstance(implementation, PullTaskProviderNode):
-            return _TaskPublicationObservation(AvailabilityStatus.MISSING)
         try:
             recovered = implementation.recover_remote_task_result(
                 context,

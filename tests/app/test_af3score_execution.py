@@ -127,8 +127,9 @@ class CompletingDriver:
                 failed_dir=str(self.root / "outputs" / "failed_records"),
             )
         if function_name == "af3score_run":
+            selected = set(cast(list[str], kwargs["input_ids"]))
             for path in Path(str(kwargs["batch_json_dir"])).glob("*.json"):
-                if path.stem == self.missing_input_id:
+                if path.stem not in selected or path.stem == self.missing_input_id:
                     continue
                 sample = self.root / "outputs" / path.stem / COMPLETION_SAMPLE_SUBDIR
                 sample.mkdir(parents=True, exist_ok=True)
@@ -710,6 +711,13 @@ def test_postprocess_includes_warm_and_newly_scored_inputs(tmp_path: Path) -> No
     overview = coordinator.run()
 
     assert overview.run.status == RunStatus.SUCCEEDED
+    batch_call = next(
+        call
+        for call in coordinator._runtime.store.execution.list_provider_calls(RUN_ID)
+        if call.node_key == BATCHES_NODE
+    )
+    assert batch_call.task_keys == ("a",)
+    assert driver.spawns[-2][1]["input_ids"] == ["a"]
     assert driver.spawns[-1][1]["completed_input_ids"] == ["a", "b"]
     coordinator.close()
 

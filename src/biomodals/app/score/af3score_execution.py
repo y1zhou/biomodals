@@ -617,7 +617,11 @@ class _AF3ScoreBatchNode(TaskProviderNode):
         del context
         payload = cast(Mapping[str, object], task.execution_payload)
         chunk = ChunkSpec(**cast(dict[str, str], payload["chunk"]))
-        return self._call_spec(chunk, cast(int, payload["task_count"]))
+        return self._call_spec(
+            chunk,
+            max_tasks_per_call=cast(int, payload["task_count"]),
+            input_ids=(task.task_key,),
+        )
 
     def prepare_remote_task_batch(
         self,
@@ -628,18 +632,28 @@ class _AF3ScoreBatchNode(TaskProviderNode):
         payload = cast(Mapping[str, object], tasks[0].execution_payload)
         chunk = ChunkSpec(**cast(dict[str, str], payload["chunk"]))
         expected = _chunk_input_ids(chunk)
-        if tuple(task.task_key for task in tasks) != expected:
-            raise ValueError("AF3Score batch Tasks do not match their prepared chunk")
-        return self._call_spec(chunk, len(expected))
+        selected = tuple(task.task_key for task in tasks)
+        if selected != tuple(input_id for input_id in expected if input_id in selected):
+            raise ValueError("AF3Score batch Tasks do not belong to one prepared chunk")
+        return self._call_spec(
+            chunk,
+            max_tasks_per_call=len(expected),
+            input_ids=selected,
+        )
 
-    def _call_spec(self, chunk: ChunkSpec, task_count: int) -> ProviderCallSpec:
-        input_ids = _chunk_input_ids(chunk)
+    def _call_spec(
+        self,
+        chunk: ChunkSpec,
+        *,
+        max_tasks_per_call: int,
+        input_ids: tuple[str, ...],
+    ) -> ProviderCallSpec:
         return ProviderCallSpec(
             function_name="af3score_run",
             uses_gpu=True,
             runtime_image_key="af3score-gpu",
             compatibility_key=chunk.batch_name,
-            max_tasks_per_call=task_count,
+            max_tasks_per_call=max_tasks_per_call,
             kwargs={
                 "run_name": self.request.run_name,
                 "batch_name": chunk.batch_name,
@@ -649,6 +663,7 @@ class _AF3ScoreBatchNode(TaskProviderNode):
                     input_id: self.request.input_digests[input_id]
                     for input_id in input_ids
                 },
+                "input_ids": list(input_ids),
                 "publication_key": self.publications.publication_key,
             },
         )

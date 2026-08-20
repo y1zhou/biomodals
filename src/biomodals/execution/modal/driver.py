@@ -1,5 +1,7 @@
 """Modal SDK adapter for Provider Call operations."""
 
+# ruff: noqa: D102, D107 - protocol implementations inherit their contracts
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -97,13 +99,13 @@ class ModalCallDriver:
 
     def spawn(
         self,
-        function: Any,
+        operation: Any,
         *,
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> str:
         try:
-            call = function.spawn(*args, **dict(kwargs))
+            call = operation.spawn(*args, **dict(kwargs))
             return str(call.object_id)
         except _DEFINITE_SUBMISSION_ERRORS as error:
             raise ProviderDefiniteSubmissionError(str(error)) from error
@@ -198,13 +200,13 @@ class AsyncModalCallDriver:
 
     async def spawn(
         self,
-        function: Any,
+        operation: Any,
         *,
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
     ) -> str:
         try:
-            call = await function.spawn.aio(*args, **dict(kwargs))
+            call = await operation.spawn.aio(*args, **dict(kwargs))
             return str(call.object_id)
         except _DEFINITE_SUBMISSION_ERRORS as error:
             raise ProviderDefiniteSubmissionError(str(error)) from error

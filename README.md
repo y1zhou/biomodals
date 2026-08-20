@@ -315,20 +315,16 @@ Related commands include `reset-password`, `disable-user`, `enable-user`,
 `promote-user`, and `demote-user`. The final active Administrator cannot be
 disabled or demoted.
 
-### Pre-release database transition
+### Pre-release database schemas
 
-The execution kernel intentionally does not migrate pre-release Job history.
-If startup reports service database version 3 or 4, stop the API and run:
+The service intentionally has no migration path for pre-release database
+schemas. If startup reports an unsupported version, stop the service, verify
+the configured database path, and select a new empty state directory for the
+new build. Retain the old database separately if its Users or settings still
+need to be inspected or copied manually.
 
-```bash
-uv run biomodals api transition-execution-state --yes
-```
-
-The transition preserves Users, Password Links, Sessions, and service and
-workload settings. It discards legacy Jobs and their local execution history.
-
-Remote Modal Volumes and workload publications are unchanged. The command
-rejects an unexpected source schema instead of guessing how to rewrite it.
+Remote provider Volumes and workload publications are unaffected by choosing
+new host-local service state.
 
 ## Production deployment
 

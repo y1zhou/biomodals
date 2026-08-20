@@ -109,10 +109,10 @@ and destructive schema resets are allowed. Backup implementation and restore
 drills are therefore outside the current implementation cycle.
 
 The backend never deletes, migrates, or destructively rewrites an incompatible
-database automatically. It reports the version and configured database
-location, then exits. During active development an Administrator must stop the
-service and explicitly migrate selected records or remove that exact database
-before restart initializes the current schema.
+database. It reports the version and configured database location, then exits.
+During active development an Administrator must stop the service and select a
+new empty pre-release state directory. The repository provides no migration or
+compatibility reader for obsolete pre-release schemas.
 
 Pre-release and production must not share service configuration or host-local
 mutable state. Every pre-release service definition explicitly selects

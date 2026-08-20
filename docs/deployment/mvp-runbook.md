@@ -77,20 +77,15 @@ record.
 
 ### Pre-release service schema
 
-If startup reports service database version 3 or 4, stop the API process and run
-the explicit offline transition with the same configuration:
+The service has no migration command or compatibility reader for pre-release
+database schemas. If startup rejects a version, stop the API process and first
+confirm the selected configuration and exact database path. Point the new build
+at a new empty, pre-release-only state directory; retain the old database
+separately if an Administrator needs to inspect or copy Users and settings.
 
-```console
-uv run biomodals api transition-execution-state --yes
-```
-
-The transition preserves Users, Password Links, Sessions, and service and
-workload settings. It removes legacy Jobs and their local execution history,
-then installs the current execution schema. It does not change Modal Volumes.
-
-The command accepts only the known version 3 or 4 schemas. Do not delete a database
-merely because startup rejects an unknown version; first confirm the selected
-configuration and exact database path.
+Changing host-local service state does not change Modal Volumes or workload
+publications. Never resolve an unsupported pre-release schema by deleting or
+repointing production state.
 
 ## Static frontend and reverse proxy
 

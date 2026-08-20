@@ -710,15 +710,13 @@ provisioning example.
 
 The SQLite schema has one current pre-release version. Encountering any other
 version is a startup error: the service reports the configured database
-location and never truncates, rewrites, or deletes it automatically. During
-active development an Administrator may explicitly migrate selected records or
-remove the unsupported database while the service is stopped, then restart to
-initialize a fresh schema. This reset policy ends at the first release.
+location and never truncates, rewrites, deletes, or migrates it. During active
+development an Administrator stops the service and selects a new empty
+pre-release state directory. This reset policy ends at the first release.
 
 The durable GROMACS Execution Plan and Node/Task keys are likewise a pre-release
-contract. Before changing them, drain active Jobs or perform an explicit
-offline service-state transition that preserves users and configuration while
-recreating Job and execution state. The service does not carry a compatibility
+contract. Before changing them, drain active Jobs and start the new build with
+separate empty pre-release state. The service does not carry a compatibility
 facade, dual-write old execution state, or reinterpret an in-flight Run under a
 different graph.
 

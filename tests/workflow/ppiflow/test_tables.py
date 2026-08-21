@@ -73,12 +73,13 @@ def test_refold_metric_rows_from_json_files() -> None:
                 b'{"ranking_score":0.7,"iptm":0.8,"nested":{"skip":true}}',
             )
         ],
+        candidate_id="candidate-0123",
         stage_name="ReFoldStep",
     )
 
     assert rows == [
         {
-            "candidate_id": "design-a",
+            "candidate_id": "candidate-0123",
             "stage_name": "ReFoldStep",
             "source_file": "outputs/design-a_summary_confidences.json",
             "ranking_score": 0.7,
@@ -168,6 +169,11 @@ def test_ranked_design_rows_exclude_below_threshold_and_missing_scores() -> None
         ],
         gentype="binder",
         dockq_threshold=0.49,
+        candidate_ids_by_filename={
+            "artifact__design-a.pdb": "design-a",
+            "artifact__design-b.pdb": "design-b",
+            "artifact__design-c.pdb": "design-c",
+        },
     )
 
     assert rows == [
@@ -180,6 +186,18 @@ def test_ranked_design_rows_exclude_below_threshold_and_missing_scores() -> None
             "interface_score": None,
         }
     ]
+
+
+def test_ranked_design_rows_uses_manifest_candidate_identity() -> None:
+    rows = tables.ranked_design_rows(
+        structures=[("artifact__design-a.pdb", b"ATOM A\n")],
+        score_frames=[pl.DataFrame({"candidate_id": ["cand_0123"], "iptm": [0.9]})],
+        gentype="binder",
+        dockq_threshold=0.49,
+        candidate_ids_by_filename={"artifact__design-a.pdb": "cand_0123"},
+    )
+
+    assert rows[0]["design"] == "cand_0123"
 
 
 def test_render_report_markdown_includes_attrition_and_ranked_rows() -> None:

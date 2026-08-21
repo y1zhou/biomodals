@@ -2,16 +2,18 @@
 
 # ruff: noqa: D103
 
+import hashlib
 import tarfile
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import polars as pl
 import pytest
 
 from biomodals.app.design import ppiflow_app
-from biomodals.schema import ArtifactKind, VolumePath, WorkflowArtifact
+from biomodals.schema import ArtifactKind, ExecutionArtifact, VolumePath
 from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.ppiflow import manifests, staging
 from biomodals.workflow.ppiflow_workflow import (
@@ -21,8 +23,8 @@ from biomodals.workflow.ppiflow_workflow import (
 )
 
 
-def _source_artifact(path: str) -> WorkflowArtifact:
-    return WorkflowArtifact(
+def _source_artifact(path: str) -> ExecutionArtifact:
+    return ExecutionArtifact(
         artifact_id="upstream-structures",
         producing_node_id="upstream",
         kind=ArtifactKind.STRUCTURES,
@@ -65,7 +67,7 @@ def test_csv_files_from_artifact_reads_directory_csvs(tmp_path: Path) -> None:
     table_dir.mkdir(parents=True)
     (table_dir / "metrics.csv").write_text("score\n1\n", encoding="utf-8")
     (table_dir / "notes.txt").write_text("skip\n", encoding="utf-8")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="scores",
         producing_node_id="scores",
         kind=ArtifactKind.SCORES,
@@ -85,11 +87,12 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
     archive_path.write_bytes(
         _tar_zst_bytes({
             "nested/design.pdb": b"ATOM\n",
+            "nested/design-2.pdb": b"ATOM 2\n",
             "scores/metrics.csv": b"score\n1\n",
             "notes.txt": b"skip\n",
         })
     )
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="upstream-structures",
         producing_node_id="upstream",
         kind=ArtifactKind.ARCHIVE,
@@ -102,7 +105,8 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
     roots = {"source-volume": str(source_root)}
 
     assert staging.structure_files_from_artifact(artifact, None, roots) == [
-        ("upstream-structures__nested__design.pdb", b"ATOM\n")
+        ("upstream-structures__nested__design.pdb", b"ATOM\n"),
+        ("upstream-structures__nested__design-2.pdb", b"ATOM 2\n"),
     ]
     assert staging.csv_files_from_artifact(artifact, roots) == [
         ("scores/metrics.csv", b"score\n1\n")
@@ -117,8 +121,66 @@ def test_archive_readers_extract_selected_members(tmp_path: Path) -> None:
         None,
         roots,
     )
-    assert [record.artifact_file_path for record in records] == ["nested/design.pdb"]
-    assert records[0].size_bytes == archive_path.stat().st_size
+    assert [record.artifact_file_path for record in records] == [
+        "nested/design.pdb",
+        "nested/design-2.pdb",
+    ]
+    archive_bytes = archive_path.read_bytes()
+    assert {record.size_bytes for record in records} == {len(archive_bytes)}
+    assert {record.content_sha256 for record in records} == {
+        hashlib.sha256(archive_bytes).hexdigest()
+    }
+    assert records[0].member_size_bytes == len(b"ATOM\n")
+    assert records[0].member_content_sha256 == hashlib.sha256(b"ATOM\n").hexdigest()
+
+    rows = staging.stage2_input_manifest_rows(artifact, roots)
+    [(storage, size_bytes, digest)] = ppiflow_workflow._manifest_structure_storages(
+        pl.DataFrame(rows)
+    )
+    assert (storage.volume_name, storage.path) == (
+        artifact.storage.volume_name,
+        artifact.storage.path,
+    )
+    assert size_bytes == len(archive_bytes)
+    assert digest == hashlib.sha256(archive_bytes).hexdigest()
+
+
+def test_archive_reader_rejects_oversized_selected_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "outputs.tar.zst"
+    archive_path.write_bytes(_tar_zst_bytes({"design.pdb": b"ATOM\n"}))
+    monkeypatch.setattr(staging, "MAX_ARCHIVE_MEMBER_BYTES", 4)
+
+    with pytest.raises(ValueError, match="member is too large"):
+        staging.files_from_tar_zst_path(archive_path, suffixes=(".pdb",))
+
+
+def test_archive_reader_rejects_oversized_ignored_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "outputs.tar.zst"
+    archive_path.write_bytes(
+        _tar_zst_bytes({"notes.txt": b"large", "design.pdb": b"ATOM"})
+    )
+    monkeypatch.setattr(staging, "MAX_ARCHIVE_MEMBER_BYTES", 4)
+
+    with pytest.raises(ValueError, match="member is too large"):
+        staging.files_from_tar_zst_path(archive_path, suffixes=(".pdb",))
+
+
+def test_archive_reader_bounds_headers_padding_and_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "outputs.tar.zst"
+    archive_path.write_bytes(_tar_zst_bytes({"design.pdb": b"ATOM"}))
+    monkeypatch.setattr(staging, "MAX_ARCHIVE_DECOMPRESSED_BYTES", 8)
+
+    with pytest.raises(ValueError, match="decompressed-stream limit"):
+        staging.files_from_tar_zst_path(archive_path, suffixes=(".pdb",))
 
 
 def test_stage2_input_manifest_rows_scan_structure_directory(
@@ -170,6 +232,51 @@ def test_candidate_structure_files_use_manifest_candidate_ids() -> None:
             source_path="artifact__design-a.pdb",
         )
     ]
+
+
+def test_candidate_structure_files_preserve_nested_candidate_identity() -> None:
+    manifest = pl.DataFrame({
+        "candidate_id": ["candidate-a", "candidate-b"],
+        "source_artifact_id": ["upstream", "upstream"],
+        "source_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "derived_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "files": [
+            [{"path": "a/design.pdb"}],
+            [{"path": "b/design.pdb"}],
+        ],
+    })
+    selected = [
+        (staging.safe_selected_file_name("upstream", "a/design.pdb"), b"ATOM A\n"),
+        (staging.safe_selected_file_name("upstream", "b/design.pdb"), b"ATOM B\n"),
+    ]
+
+    structures = staging.candidate_structure_files_from_selected(
+        selected,
+        manifest_frame=manifest,
+    )
+
+    assert [structure.candidate_id for structure in structures] == [
+        "candidate-a",
+        "candidate-b",
+    ]
+
+
+def test_candidate_structure_files_reject_ambiguous_basename_alias() -> None:
+    manifest = pl.DataFrame({
+        "candidate_id": ["candidate-a", "candidate-b"],
+        "source_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "derived_path": ["root/a/design.pdb", "root/b/design.pdb"],
+        "files": [
+            [{"path": "a/design.pdb"}],
+            [{"path": "b/design.pdb"}],
+        ],
+    })
+
+    with pytest.raises(ValueError, match="Ambiguous PPIFlow candidate filename"):
+        staging.candidate_structure_files_from_selected(
+            [("legacy__design.pdb", b"ATOM\n")],
+            manifest_frame=manifest,
+        )
 
 
 def test_prepare_dockq_pairs_by_candidate_matches_ids() -> None:
@@ -224,17 +331,6 @@ def test_prepare_dockq_pairs_by_candidate_rejects_missing_pairs() -> None:
             references=[staging.CandidateStructureFile("a", "a-ref.pdb", b"REF")],
             models=[staging.CandidateStructureFile("b", "b-model.pdb", b"MODEL")],
         )
-
-
-def test_discover_partial_sample_dirs(tmp_path: Path) -> None:
-    sample_dir = tmp_path / "stage2" / "partial" / "sample_0"
-    sample_dir.mkdir(parents=True)
-    (sample_dir / "model.pdb").write_text("ATOM\n", encoding="utf-8")
-    other_dir = tmp_path / "stage2" / "other"
-    other_dir.mkdir()
-    (other_dir / "model.pdb").write_text("ATOM\n", encoding="utf-8")
-
-    assert staging.discover_partial_sample_dirs(tmp_path) == [sample_dir]
 
 
 def test_rosetta_job_manifest_rows_and_writer(tmp_path: Path) -> None:
@@ -325,10 +421,11 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         app_steps=("PPIFlowStep",),
     )
 
+    digest = hashlib.sha256(input_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["input_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/input_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/input_pdb/{digest}.pdb"
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
     assert upload_forces == [True]
 
     uploaded.clear()
@@ -338,7 +435,7 @@ def test_ppiflow_entrypoint_stages_local_app_inputs(
         run_id="run-1",
         app_steps=("PPIFlowStep",),
     )
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
     assert upload_forces == [True]
 
 
@@ -406,11 +503,12 @@ def test_ppiflow_staging_uses_active_stage_steps(
         app_steps=_active_ppiflow_app_steps(task_doc, stage=1),
     )
 
+    digest = hashlib.sha256(input_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["input_pdb"].endswith(
-        "/PPIFlowStep/input_pdb/input.pdb"
+        f"/PPIFlowStep/input_pdb/{digest}.pdb"
     )
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
 
     staged = _stage_ppiflow_app_inputs(
         steps_doc=steps_doc,
@@ -419,7 +517,7 @@ def test_ppiflow_staging_uses_active_stage_steps(
     )
 
     assert staged["PartialStep"]["args"]["input_pdb"].endswith("stage2-not-local.pdb")
-    assert uploaded == [(input_pdb, "/run-1/PPIFlowStep/input_pdb/input.pdb")]
+    assert uploaded == [(input_pdb, f"/run-1/PPIFlowStep/input_pdb/{digest}.pdb")]
 
 
 def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
@@ -477,15 +575,23 @@ def test_ppiflow_staging_keeps_same_basename_inputs_distinct(
         app_steps=("PPIFlowStep",),
     )
 
+    antigen_digest = hashlib.sha256(antigen_pdb.read_bytes()).hexdigest()
+    framework_digest = hashlib.sha256(framework_pdb.read_bytes()).hexdigest()
     assert staged["PPIFlowStep"]["args"]["antigen_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/antigen_pdb/{antigen_digest}.pdb"
     )
     assert staged["PPIFlowStep"]["args"]["framework_pdb"] == (
-        "/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/input.pdb"
+        f"/biomodals-outputs/run-1/PPIFlowStep/framework_pdb/{framework_digest}.pdb"
     )
     assert uploaded == [
-        (antigen_pdb, "/run-1/PPIFlowStep/antigen_pdb/input.pdb"),
-        (framework_pdb, "/run-1/PPIFlowStep/framework_pdb/input.pdb"),
+        (
+            antigen_pdb,
+            f"/run-1/PPIFlowStep/antigen_pdb/{antigen_digest}.pdb",
+        ),
+        (
+            framework_pdb,
+            f"/run-1/PPIFlowStep/framework_pdb/{framework_digest}.pdb",
+        ),
     ]
 
 
@@ -514,7 +620,7 @@ def test_report_node_reads_rank_artifact_from_configured_volume_root(
     source_root.mkdir()
     ranked_csv = source_root / "ranked.csv"
     ranked_csv.write_text("design,rank_score\ndesign-1,1.0\n", encoding="utf-8")
-    artifact = WorkflowArtifact(
+    artifact = ExecutionArtifact(
         artifact_id="rank",
         producing_node_id="rank",
         kind=ArtifactKind.TABLE,
@@ -528,9 +634,11 @@ def test_report_node_reads_rank_artifact_from_configured_volume_root(
 
     result = ppiflow_workflow.ReportNode("ReportStep").run(
         ppiflow_workflow.NodeRunContext(
-            run_id="run-1",
+            execution_run_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            workload_run_key="run-1",
             node_id="report",
-            attempt_id="attempt-1",
+            task_key="node",
+            work_dir=tmp_path / "result",
             cache_dir=tmp_path,
             inputs={"rank": [artifact]},
         )

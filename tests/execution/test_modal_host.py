@@ -1,0 +1,824 @@
+"""Tests for the Modal execution host."""
+
+# ruff: noqa: D101,D102,D107
+
+from contextlib import contextmanager
+from hashlib import sha256
+from pathlib import Path
+from threading import Event, Lock, Thread
+from time import sleep
+from types import SimpleNamespace
+from typing import Any, cast
+from uuid import UUID
+
+import orjson
+import pytest
+
+from biomodals.execution import (
+    AvailabilityStatus,
+    DeploymentIdentity,
+    ExecutionPlan,
+    ExecutionRuntime,
+    NodePlan,
+    RunStatus,
+    TaskPlan,
+    drive_execution_run,
+)
+from biomodals.execution.definition import ExecutionGraph, ExecutionPlanMetadata
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.modal import (
+    ExecutionCoordinatorLifecycle,
+    ExecutionDefinitionCoordinatorLifecycle,
+    ExecutionRequestFile,
+    ExecutionRuntimeLifecycle,
+    ExecutionVolumeSync,
+    execution_lineage_root,
+    load_execution_launch,
+    load_execution_provider_result,
+    persist_execution_launch,
+    resolve_provider_call_limits,
+    stage_execution_launch,
+    submit_staged_execution_run,
+)
+from biomodals.execution.nodes import CoordinatorNode, NodeRunContext
+from biomodals.execution.store import ExecutionRunStore
+from biomodals.schema import AppRunResult, AppRunStatus
+
+RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+REQUEST_FILE = ExecutionRequestFile(
+    "example-request.json",
+    32,
+    "Example execution request",
+)
+
+
+class SuccessfulNode(CoordinatorNode):
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        del context
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+def test_resolve_provider_call_limits_preserves_or_overrides_defaults() -> None:
+    """Unified limits preserve defaults and apply explicit overrides."""
+    assert resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=8,
+        max_containers=None,
+        max_gpu_containers=None,
+    ) == (16, 8)
+    assert resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=8,
+        max_containers=4,
+        max_gpu_containers=None,
+    ) == (4, 4)
+    assert resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=8,
+        max_containers=12,
+        max_gpu_containers=3,
+    ) == (12, 3)
+
+
+def test_resolve_provider_call_limits_rejects_gpu_limit_above_total() -> None:
+    """The GPU container ceiling cannot exceed the total ceiling."""
+    with pytest.raises(ValueError, match="max_gpu_containers"):
+        resolve_provider_call_limits(
+            default_max_containers=16,
+            default_max_gpu_containers=8,
+            max_containers=4,
+            max_gpu_containers=5,
+        )
+
+
+def test_definition_coordinator_hosts_app_owned_graph(tmp_path: Path) -> None:
+    """Direct apps can use the shared executable-graph lifecycle."""
+    deployment = DeploymentIdentity("main", "Example", 3)
+
+    def build_graph(
+        _request: object,
+        _predecessor_execution_run_id: UUID | None,
+    ) -> ExecutionGraph:
+        graph = ExecutionGraph(
+            "example",
+            plan_metadata=ExecutionPlanMetadata(
+                workload_name="example",
+                scientific_versions={"example": "1"},
+            ),
+        )
+        graph.add_node(
+            SuccessfulNode(),
+            id="finish",
+            allow_empty_result=True,
+        )
+        return graph
+
+    graph = build_graph(object(), None)
+    plan = execution_plan(graph.validate(), workload_run_key="example-run")
+    request = SimpleNamespace(
+        execution_plan=plan,
+        max_active_provider_calls=1,
+        max_active_gpu_provider_calls=0,
+    )
+
+    class Coordinator(ExecutionDefinitionCoordinatorLifecycle):
+        _request_loader = staticmethod(lambda _root, _run_id: request)
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        volume_root=tmp_path,
+        artifact_volume_name="Example-outputs",
+        output_volume=None,
+        provider_driver=cast(Any, object()),
+        graph_builder=build_graph,
+        target_scientific_versions={"example": "1"},
+        poll_interval_seconds=0,
+    )
+
+    overview = coordinator.run()
+
+    assert overview.run.status == RunStatus.SUCCEEDED
+    assert overview.run.plan == plan
+    coordinator.close()
+
+
+class FakeVolume:
+    """Small chunked Volume double for request staging tests."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def read_file(self, path: str):
+        selected = self.root / path.lstrip("/")
+        if not selected.is_file():
+            raise FileNotFoundError(path)
+        content = selected.read_bytes()
+        midpoint = len(content) // 2
+        yield content[:midpoint]
+        yield content[midpoint:]
+
+    @contextmanager
+    def batch_upload(self, *, force: bool):
+        assert force
+        root = self.root
+
+        class Batch:
+            def put_file(self, source, destination: str) -> None:
+                path = root / destination.lstrip("/")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(source.read())
+
+        yield Batch()
+
+
+def test_load_execution_provider_result_verifies_bounded_content(
+    tmp_path: Path,
+) -> None:
+    """Provider-result reads retain their path, size, and digest boundary."""
+    content = orjson.dumps({"run_id": "example"})
+    relative = "provider-results/example.json"
+    path = tmp_path / "workflow-runs" / str(RUN_ID) / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    envelope = {
+        "result_file": {
+            "path": relative,
+            "encoding": "json",
+            "size_bytes": len(content),
+            "sha256": sha256(content).hexdigest(),
+        }
+    }
+
+    assert load_execution_provider_result(
+        FakeVolume(tmp_path),
+        execution_run_id=RUN_ID,
+        envelope=envelope,
+    ) == {"run_id": "example"}
+    envelope["result_file"]["path"] = "../outside.json"
+    with pytest.raises(ValueError, match="contained"):
+        load_execution_provider_result(
+            FakeVolume(tmp_path),
+            execution_run_id=RUN_ID,
+            envelope=envelope,
+        )
+
+
+def test_load_execution_provider_result_preserves_bytes(tmp_path: Path) -> None:
+    """Binary provider returns stay binary across the Volume boundary."""
+    content = b"binary-provider-result"
+    relative = "provider-results/example.bin"
+    path = tmp_path / "workflow-runs" / str(RUN_ID) / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    envelope = {
+        "result_file": {
+            "path": relative,
+            "encoding": "bytes",
+            "size_bytes": len(content),
+            "sha256": sha256(content).hexdigest(),
+        }
+    }
+
+    assert (
+        load_execution_provider_result(
+            FakeVolume(tmp_path),
+            execution_run_id=RUN_ID,
+            envelope=envelope,
+        )
+        == content
+    )
+
+
+def test_execution_lineage_root_follows_all_successors(tmp_path: Path) -> None:
+    """Successor restarts retain the original root's scientific seed identity."""
+    volume = FakeVolume(tmp_path)
+    root = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    first = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    second = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    stage_execution_launch(volume, root, None)
+    stage_execution_launch(volume, first, root)
+    stage_execution_launch(volume, second, first)
+
+    assert execution_lineage_root(volume, second) == root
+
+
+def test_submit_staged_execution_run_owns_direct_app_lifecycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Direct apps share launch, identity, waiting, and terminal validation."""
+    events: list[tuple[str, dict[str, object]]] = []
+    overview = SimpleNamespace(
+        run=SimpleNamespace(
+            status=RunStatus.PARTIAL,
+            status_message=None,
+            status_reason=None,
+        )
+    )
+
+    class Method:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def spawn(self, **kwargs: object) -> SimpleNamespace:
+            events.append((self.name, dict(kwargs)))
+            return SimpleNamespace(object_id="fc-1", get=lambda: overview)
+
+    class Coordinator:
+        def __init__(self, **kwargs: object) -> None:
+            events.append(("coordinator", dict(kwargs)))
+            self.run = Method("run")
+            self.restart_from = Method("restart")
+
+    predecessor = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    deployment = DeploymentIdentity("main", "Example", 3)
+    result = submit_staged_execution_run(
+        FakeVolume(tmp_path),
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor,
+        use_deployed_coordinator=False,
+        local_coordinator=Coordinator,
+        workload_name="Example",
+        restart_kwargs={"candidate": "request"},
+        accepted_statuses=(RunStatus.SUCCEEDED, RunStatus.PARTIAL),
+    )
+
+    assert result is overview
+    assert events == [
+        (
+            "coordinator",
+            {
+                "execution_run_id": str(RUN_ID),
+                "deployment_environment": "main",
+                "deployment_name": "Example",
+                "deployment_version": 3,
+                "development": True,
+            },
+        ),
+        (
+            "restart",
+            {
+                "candidate": "request",
+                "predecessor_execution_run_id": str(predecessor),
+            },
+        ),
+    ]
+    assert (
+        tmp_path / ".biomodals" / "execution" / "runs" / str(RUN_ID) / "launch"
+    ).read_bytes() == str(predecessor).encode()
+    assert capsys.readouterr().out.splitlines() == [
+        "Deployment Identity: main/Example/v3",
+        f"Execution Run ID: {RUN_ID}",
+        "Coordinator FunctionCall ID: fc-1",
+    ]
+
+
+def test_submit_staged_execution_run_rejects_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    """A direct app reports the workload's terminal failure consistently."""
+
+    class Method:
+        @staticmethod
+        def spawn(**_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=RunStatus.FAILED,
+                        status_message="science failed",
+                        status_reason=None,
+                    )
+                ),
+            )
+
+    class Coordinator:
+        def __init__(self, **_kwargs: object) -> None:
+            self.run = Method()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Example Execution Run ended as failed: science failed",
+    ):
+        submit_staged_execution_run(
+            FakeVolume(tmp_path),
+            execution_run_id=RUN_ID,
+            deployment=DeploymentIdentity("main", "Example", 3),
+            predecessor_execution_run_id=None,
+            use_deployed_coordinator=False,
+            local_coordinator=Coordinator,
+            workload_name="Example",
+        )
+
+
+def test_app_execution_store_uses_the_reserved_run_namespace(
+    tmp_path: Path,
+) -> None:
+    """App execution state is isolated from scientific output paths."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+
+    assert store.state_root == (
+        tmp_path / ".biomodals" / "execution" / "runs" / str(RUN_ID)
+    )
+    assert store.ledger_path == store.state_root / "ledger.sqlite3"
+    assert not store.ledger_path.exists()
+
+
+def test_app_execution_store_persists_the_shared_repository(tmp_path: Path) -> None:
+    """Closing and reopening retains one kernel Execution Run."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    with store.transaction():
+        store.execution.create_run(
+            execution_run_id=RUN_ID,
+            plan=plan,
+            deployment=DeploymentIdentity("main", "Example", 3),
+            max_active_provider_calls=2,
+            max_active_gpu_provider_calls=1,
+            now=10,
+        )
+    store.close()
+
+    reopened = ExecutionRunStore(tmp_path, RUN_ID)
+    assert reopened.execution.get_run(RUN_ID).plan == plan
+    reopened.close()
+
+
+def test_app_execution_store_closes_sqlite_during_storage_sync(
+    tmp_path: Path,
+) -> None:
+    """A mounted SQLite file is never open while its Volume is synchronized."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    original = store.connection
+
+    with store.closed_for_storage_sync():
+        with pytest.raises(RuntimeError, match="closed for storage synchronization"):
+            _ = store.connection
+
+    assert store.connection is not original
+    store.close()
+
+
+def test_checkpoint_without_a_volume_keeps_sqlite_open(tmp_path: Path) -> None:
+    """Local-only durability is a commit, not a synthetic Volume sync."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    original = store.connection
+
+    ExecutionVolumeSync(volume=None, store=store).commit()
+
+    assert store.connection is original
+    store.close()
+
+
+def test_request_bytes_stage_and_load_idempotently(tmp_path: Path) -> None:
+    """Thin clients and mounted coordinators share one immutable byte boundary."""
+    path = REQUEST_FILE.path(RUN_ID)
+    volume = FakeVolume(tmp_path)
+
+    assert REQUEST_FILE.stage(volume, RUN_ID, b'{"ok":true}') == path
+    assert REQUEST_FILE.stage(volume, RUN_ID, b'{"ok":true}') == path
+    assert REQUEST_FILE.load(tmp_path, RUN_ID) == b'{"ok":true}'
+    assert REQUEST_FILE.load_from_volume(volume, RUN_ID) == b'{"ok":true}'
+
+
+def test_request_bytes_reject_conflicts_and_oversized_volume_files(
+    tmp_path: Path,
+) -> None:
+    """Existing request bytes remain immutable and bounded while reading."""
+    request_file = ExecutionRequestFile("request.json", 16, "Example request")
+    path = request_file.path(RUN_ID)
+    volume = FakeVolume(tmp_path)
+    selected = tmp_path.joinpath(*path.parts)
+    selected.parent.mkdir(parents=True)
+    selected.write_bytes(b"existing")
+
+    with pytest.raises(RuntimeError, match="conflicts with this run"):
+        request_file.stage(volume, RUN_ID, b"diff")
+    with pytest.raises(ValueError, match="byte limit"):
+        ExecutionRequestFile("request.json", 4, "Example request").load_from_volume(
+            volume,
+            RUN_ID,
+        )
+
+
+def test_request_bytes_persist_atomically_and_remain_immutable(tmp_path: Path) -> None:
+    """Successor coordinators may create, but never replace, request state."""
+    path = REQUEST_FILE.path(RUN_ID)
+
+    assert REQUEST_FILE.persist(tmp_path, RUN_ID, b"request") == path
+    assert REQUEST_FILE.persist(tmp_path, RUN_ID, b"request") == path
+    with pytest.raises(RuntimeError, match="immutable"):
+        REQUEST_FILE.persist(tmp_path, RUN_ID, b"changed")
+
+
+def test_execution_launch_identity_is_immutable(tmp_path: Path) -> None:
+    """Launch lineage is idempotent but cannot be changed in place."""
+    predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    volume = FakeVolume(tmp_path)
+
+    stage_execution_launch(volume, RUN_ID, predecessor_id)
+    stage_execution_launch(volume, RUN_ID, predecessor_id)
+    persist_execution_launch(tmp_path, RUN_ID, predecessor_id)
+
+    assert load_execution_launch(tmp_path, RUN_ID) == predecessor_id
+    with pytest.raises(RuntimeError, match="conflicts with this run"):
+        stage_execution_launch(volume, RUN_ID, None)
+
+
+def test_app_coordinator_cancel_does_not_start_a_second_driver(
+    tmp_path: Path,
+) -> None:
+    """Cancellation interleaves with polling but never owns a second drive loop."""
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.cancel_requested = Event()
+            self.status = RunStatus.RUNNING
+            self.active_drivers = 0
+            self.max_active_drivers = 0
+            self.closed_while_driving = False
+            self.close_count = 0
+            self._lock = Lock()
+            self.store = SimpleNamespace(
+                execution=SimpleNamespace(overview=lambda _run_id: self.snapshot())
+            )
+
+        def snapshot(self):
+            return SimpleNamespace(
+                run=SimpleNamespace(
+                    execution_run_id=RUN_ID,
+                    deployment=DeploymentIdentity("main", "Example", 3),
+                    status=self.status,
+                )
+            )
+
+        def run(self):
+            with self._lock:
+                self.active_drivers += 1
+                self.max_active_drivers = max(
+                    self.max_active_drivers,
+                    self.active_drivers,
+                )
+            self.started.set()
+            assert self.cancel_requested.wait(timeout=1)
+            sleep(0.05)
+            with self._lock:
+                self.status = RunStatus.CANCELLED
+            with self._lock:
+                self.active_drivers -= 1
+            return self.snapshot()
+
+        def cancel(self):
+            self.status = RunStatus.CANCEL_REQUESTED
+            self.cancel_requested.set()
+            return self.snapshot()
+
+        def close(self) -> None:
+            with self._lock:
+                self.close_count += 1
+                self.closed_while_driving |= self.active_drivers > 0
+
+    runtime = FakeRuntime()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        def _open_current_runtime(self, *, recover: bool):
+            del recover
+            self._runtime = runtime
+            return runtime
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=DeploymentIdentity("main", "Example", 3),
+        volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
+    )
+    errors: list[BaseException] = []
+
+    def call(operation) -> None:
+        try:
+            operation()
+        except BaseException as error:  # pragma: no cover - assertion aid
+            errors.append(error)
+
+    run_thread = Thread(target=call, args=(coordinator.run,))
+    run_thread.start()
+    assert runtime.started.wait(timeout=1)
+    cancel_thread = Thread(target=call, args=(coordinator.cancel,))
+    cancel_thread.start()
+    run_thread.join(timeout=2)
+    cancel_thread.join(timeout=2)
+
+    assert not run_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert errors == []
+    assert runtime.max_active_drivers == 1
+    assert not runtime.closed_while_driving
+    assert coordinator._runtime is runtime
+    assert runtime.close_count == 0
+
+    coordinator.close()
+    assert runtime.close_count == 1
+
+
+def test_app_coordinator_status_is_available_during_provider_io(
+    tmp_path: Path,
+) -> None:
+    """A slow scheduling effect does not occupy the SQLite writer lock."""
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    with store.transaction():
+        store.execution.create_run(
+            execution_run_id=RUN_ID,
+            plan=plan,
+            deployment=DeploymentIdentity("main", "Example", 3),
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=0,
+            now=10,
+        )
+    effect_started = Event()
+    release_effect = Event()
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.store = store
+
+        def run(self):
+            def advance_once() -> None:
+                effect_started.set()
+                assert release_effect.wait(timeout=1)
+                with store.transaction():
+                    store.execution.start_node(RUN_ID, "run", now=11)
+                    store.execution.discover_tasks(
+                        RUN_ID,
+                        "run",
+                        (TaskPlan("task", {}),),
+                        now=11,
+                    )
+                    store.execution.record_task_result_observation(
+                        RUN_ID,
+                        "run",
+                        "task",
+                        AvailabilityStatus.AVAILABLE,
+                        now=12,
+                    )
+                    store.execution.reconcile_node_tasks(RUN_ID, "run", now=13)
+                    store.execution.finalize_run_from_results(RUN_ID, now=14)
+
+            return drive_execution_run(
+                store.execution,
+                RUN_ID,
+                advance_once=advance_once,
+                checkpoint=lambda: store.execution,
+                current_repository=lambda: store.execution,
+                poll_interval_seconds=0,
+                synchronize=store.synchronize,
+            )
+
+        def close(self) -> None:
+            pass
+
+    runtime = Runtime()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        def _open_current_runtime(self, *, recover: bool):
+            del recover
+            self._runtime = runtime
+            return runtime
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=DeploymentIdentity("main", "Example", 3),
+        volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
+    )
+    run_thread = Thread(target=coordinator.run)
+    run_thread.start()
+    assert effect_started.wait(timeout=1)
+
+    snapshot = coordinator.status()
+
+    assert snapshot.run.status == RunStatus.PENDING
+    release_effect.set()
+    run_thread.join(timeout=1)
+    assert not run_thread.is_alive()
+    store.close()
+
+
+def test_runtime_cancel_initializes_an_unstarted_run(tmp_path: Path) -> None:
+    """An immediate cancellation wins even before the driver creates its row."""
+    deployment = DeploymentIdentity("main", "Example", 3)
+    plan = ExecutionPlan("example", (NodePlan("run"),))
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    initialize_calls = 0
+
+    class Runtime(ExecutionRuntimeLifecycle):
+        def __init__(self) -> None:
+            self.execution_run_id = RUN_ID
+            self.store = store
+            self._now = lambda: 10
+            self._provider = ExecutionRuntime(
+                store.execution,
+                provider_driver=cast(Any, object()),
+                checkpoint=lambda: store.execution,
+                transaction=store.transaction,
+            )
+
+        def _initialize(self):
+            nonlocal initialize_calls
+            initialize_calls += 1
+            self._provider.create_or_verify_run(
+                execution_run_id=RUN_ID,
+                predecessor_execution_run_id=None,
+                plan=plan,
+                deployment=deployment,
+                max_active_provider_calls=1,
+                max_active_gpu_provider_calls=0,
+                now=10,
+            )
+            return store.execution
+
+    runtime = Runtime()
+    snapshot = runtime.cancel()
+
+    assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
+    assert store.execution.get_run(RUN_ID).status == RunStatus.CANCEL_REQUESTED
+    assert initialize_calls == 1
+
+    runtime.cancel()
+
+    assert initialize_calls == 1
+    store.close()
+
+
+def test_app_coordinator_recovers_successor_identity_for_cancellation(
+    tmp_path: Path,
+) -> None:
+    """Reopened successor lifecycle calls retain immutable lineage."""
+    predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    deployment = DeploymentIdentity("main", "Example", 3)
+    plan = ExecutionPlan(
+        "example",
+        (NodePlan("run"),),
+        scientific_versions={"example": "1"},
+    )
+    store = ExecutionRunStore(tmp_path, RUN_ID)
+    with store.transaction():
+        store.execution.create_run(
+            execution_run_id=RUN_ID,
+            predecessor_execution_run_id=predecessor_id,
+            plan=plan,
+            deployment=deployment,
+            max_active_provider_calls=1,
+            max_active_gpu_provider_calls=0,
+            now=10,
+        )
+    store.close()
+    opened_with: list[UUID | None] = []
+    request = SimpleNamespace(execution_plan=plan)
+
+    class Runtime:
+        def __init__(self, predecessor: UUID | None) -> None:
+            self.request = request
+            self.predecessor_execution_run_id = predecessor
+            self.store = ExecutionRunStore(tmp_path, RUN_ID)
+
+        def cancel(self):
+            self.store.execution.request_run_cancellation(RUN_ID, now=11)
+            return self.store.execution.overview(RUN_ID)
+
+        def run(self):
+            return self.store.execution.overview(RUN_ID)
+
+        def close(self) -> None:
+            self.store.close()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        _request_loader = staticmethod(lambda _root, _run_id: request)
+
+        def _create_runtime(
+            self,
+            request,
+            *,
+            predecessor_execution_run_id: UUID | None = None,
+        ):
+            assert request.execution_plan == plan
+            opened_with.append(predecessor_execution_run_id)
+            return Runtime(predecessor_execution_run_id)
+
+    coordinator = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
+    )
+
+    snapshot = coordinator.cancel()
+
+    assert snapshot.run.status == RunStatus.CANCEL_REQUESTED
+    assert opened_with == [predecessor_id]
+
+
+def test_app_coordinator_cancels_successor_before_restart_initializes(
+    tmp_path: Path,
+) -> None:
+    """A staged launch preserves lineage when cancellation wins startup."""
+    predecessor_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    deployment = DeploymentIdentity("main", "Example", 3)
+    plan = ExecutionPlan(
+        "example",
+        (NodePlan("run"),),
+        scientific_versions={"example": "1"},
+    )
+    request = SimpleNamespace(execution_plan=plan)
+    stage_execution_launch(FakeVolume(tmp_path), RUN_ID, predecessor_id)
+
+    class Runtime:
+        def __init__(self, predecessor: UUID | None) -> None:
+            self.request = request
+            self.predecessor_execution_run_id = predecessor
+            self.store = ExecutionRunStore(tmp_path, RUN_ID)
+
+        def cancel(self):
+            with self.store.transaction():
+                self.store.execution.create_run(
+                    execution_run_id=RUN_ID,
+                    predecessor_execution_run_id=self.predecessor_execution_run_id,
+                    plan=plan,
+                    deployment=deployment,
+                    max_active_provider_calls=1,
+                    max_active_gpu_provider_calls=0,
+                    now=10,
+                )
+                self.store.execution.request_run_cancellation(RUN_ID, now=11)
+            return self.store.execution.overview(RUN_ID)
+
+        def run(self):
+            return self.store.execution.overview(RUN_ID)
+
+        def close(self) -> None:
+            self.store.close()
+
+    class Coordinator(ExecutionCoordinatorLifecycle):
+        _request_loader = staticmethod(lambda _root, _run_id: request)
+
+        def _create_runtime(
+            self,
+            request,
+            *,
+            predecessor_execution_run_id: UUID | None = None,
+        ):
+            assert request.execution_plan == plan
+            return Runtime(predecessor_execution_run_id)
+
+    snapshot = Coordinator(
+        execution_run_id=RUN_ID,
+        deployment=deployment,
+        volume_root=tmp_path,
+        target_scientific_versions={"example": "1"},
+    ).cancel()
+
+    assert snapshot.run.predecessor_execution_run_id == predecessor_id
+    assert snapshot.run.status == RunStatus.CANCEL_REQUESTED

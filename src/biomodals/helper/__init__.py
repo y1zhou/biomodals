@@ -4,6 +4,8 @@ from collections.abc import Iterable
 
 from modal import Image
 
+from biomodals.helper.artifacts import sha256_bytes
+
 
 def patch_image_for_helper(
     image: Image,
@@ -24,8 +26,8 @@ def patch_image_for_helper(
             This can slow down iteration since it requires a rebuild of the Image
             and any subsequent build steps whenever the included files change,
             but it is required if you want to run additional build steps after this one.
-        include_workflow_modules: Whether to include workflow modules in the patch.
-            By default, only helper dependencies are included.
+        include_workflow_modules: Whether to include workflow modules in addition
+            to the shared helper and execution modules.
         skip_deps: A list of package names to skip when installing
             `biomodals` dependencies. By default, all dependencies are included.
             This is to help with older project apps on Python <3.12.
@@ -43,7 +45,12 @@ def patch_image_for_helper(
     except metadata.PackageNotFoundError:
         helper_deps = []
 
-    mods = ["biomodals.helper", "biomodals.app.config", "biomodals.schema"]
+    mods = [
+        "biomodals.helper",
+        "biomodals.app.config",
+        "biomodals.schema",
+        "biomodals.execution",
+    ]
     if include_workflow_modules:
         mods.append("biomodals.workflow")
 
@@ -83,6 +90,4 @@ def patch_image_for_helper(
 
 def hash_string(s: str) -> str:
     """Hash a string using a simple algorithm."""
-    import hashlib
-
-    return hashlib.sha256(s.encode()).hexdigest()
+    return sha256_bytes(s.encode())

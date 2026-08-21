@@ -9,8 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from biomodals.schema.execution import ArtifactKind
 from biomodals.schema.storage import InlineBytes, VolumePath
-from biomodals.schema.workflow import ArtifactKind
 
 if sys.version_info >= (3, 11):  # noqa: UP036
     from enum import StrEnum

@@ -1,0 +1,199 @@
+"""Python-first executable graph builder."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from biomodals.execution.model import NodeAggregationPolicy
+from biomodals.execution.nodes import ExecutionNode
+from biomodals.helper.shell import sanitize_filename
+from biomodals.schema import ArtifactKind, ArtifactSelector
+
+
+@dataclass(frozen=True)
+class NodeHandle:
+    """Stable handle returned after adding an Execution Node."""
+
+    node_id: str
+
+    def outputs(
+        self,
+        kind: ArtifactKind | None = None,
+        pattern: str | None = None,
+        role: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ArtifactSelector:
+        """Select artifacts produced by this node."""
+        return ArtifactSelector(
+            producing_node_id=self.node_id,
+            kind=kind,
+            pattern=pattern,
+            role=role,
+            metadata=metadata or {},
+        )
+
+
+@dataclass
+class ExecutionNodeSpec:
+    """Builder-time node metadata."""
+
+    node_id: str
+    node: ExecutionNode
+    aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL
+    allow_empty_result: bool = False
+    reuse_predecessor_publication: bool = True
+    inputs: dict[str, ArtifactSelector] = field(default_factory=dict)
+    control_dependencies: set[str] = field(default_factory=set)
+    partial_dependencies: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class ExecutionPlanMetadata:
+    """Workload-owned identity fields used by the durable Execution Plan."""
+
+    workload_name: str
+    scientific_payload: Any = None
+    scientific_versions: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject an empty workload identity."""
+        if not self.workload_name:
+            raise ValueError("Execution workload name cannot be empty")
+
+
+@dataclass(frozen=True)
+class ExecutionDefinition:
+    """Validated executable DAG supplied to the execution kernel."""
+
+    name: str
+    nodes: dict[str, ExecutionNodeSpec]
+    dependencies: dict[str, set[str]]
+    scientific_versions: dict[str, str]
+    plan_metadata: ExecutionPlanMetadata | None = None
+
+
+class ExecutionGraph:
+    """Python-first builder for one Execution Definition."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        scientific_versions: Mapping[str, str] | None = None,
+        plan_metadata: ExecutionPlanMetadata | None = None,
+    ):
+        """Initialize an empty executable graph."""
+        self.name = sanitize_filename(name)
+        self.scientific_versions = dict(scientific_versions or {})
+        self.plan_metadata = plan_metadata
+        self._nodes: dict[str, ExecutionNodeSpec] = {}
+
+    def add_node(
+        self,
+        node: ExecutionNode,
+        *,
+        id: str,
+        inputs: dict[str, ArtifactSelector] | None = None,
+        depends_on: list[NodeHandle | str] | None = None,
+        accept_partial_from: list[NodeHandle | str] | None = None,
+        aggregation_policy: NodeAggregationPolicy = NodeAggregationPolicy.COLLECT_ALL,
+        allow_empty_result: bool = False,
+        reuse_predecessor_publication: bool = True,
+    ) -> NodeHandle:
+        """Add one Execution Node and return its stable handle."""
+        node_id = sanitize_filename(id)
+        if node_id in self._nodes:
+            raise ValueError(f"Duplicate Execution Node id: {node_id}")
+
+        control_dependencies = {
+            dependency.node_id if isinstance(dependency, NodeHandle) else dependency
+            for dependency in depends_on or []
+        }
+        partial_dependencies = {
+            dependency.node_id if isinstance(dependency, NodeHandle) else dependency
+            for dependency in accept_partial_from or []
+        }
+        self._nodes[node_id] = ExecutionNodeSpec(
+            node_id=node_id,
+            node=node,
+            aggregation_policy=aggregation_policy,
+            allow_empty_result=allow_empty_result,
+            reuse_predecessor_publication=reuse_predecessor_publication,
+            inputs=inputs or {},
+            control_dependencies=control_dependencies,
+            partial_dependencies=partial_dependencies,
+        )
+        return NodeHandle(node_id=node_id)
+
+    def add_control_edge(
+        self,
+        upstream: NodeHandle | str,
+        downstream: NodeHandle | str,
+    ) -> None:
+        """Add an ordering-only dependency between two existing nodes."""
+        upstream_id = upstream.node_id if isinstance(upstream, NodeHandle) else upstream
+        downstream_id = (
+            downstream.node_id if isinstance(downstream, NodeHandle) else downstream
+        )
+        self._nodes[downstream_id].control_dependencies.add(upstream_id)
+
+    def validate(self) -> ExecutionDefinition:
+        """Validate the DAG and return an immutable definition."""
+        dependencies = self._dependencies()
+        missing = {
+            dependency
+            for node_dependencies in dependencies.values()
+            for dependency in node_dependencies
+            if dependency not in self._nodes
+        }
+        if missing:
+            raise ValueError(f"Unknown Execution Node dependencies: {sorted(missing)}")
+        invalid_partial = {
+            node_id: sorted(spec.partial_dependencies - dependencies[node_id])
+            for node_id, spec in self._nodes.items()
+            if spec.partial_dependencies - dependencies[node_id]
+        }
+        if invalid_partial:
+            raise ValueError(
+                "Partial-result acceptance must name a Node dependency: "
+                f"{invalid_partial}"
+            )
+        self._raise_for_cycles(dependencies)
+        return ExecutionDefinition(
+            name=self.name,
+            nodes=dict(self._nodes),
+            dependencies=dependencies,
+            scientific_versions=dict(self.scientific_versions),
+            plan_metadata=self.plan_metadata,
+        )
+
+    def _dependencies(self) -> dict[str, set[str]]:
+        dependencies: dict[str, set[str]] = {}
+        for node_id, spec in self._nodes.items():
+            input_dependencies = {
+                selector.producing_node_id for selector in spec.inputs.values()
+            }
+            dependencies[node_id] = input_dependencies | spec.control_dependencies
+        return dependencies
+
+    @staticmethod
+    def _raise_for_cycles(dependencies: dict[str, set[str]]) -> None:
+        temporary: set[str] = set()
+        permanent: set[str] = set()
+
+        def visit(node_id: str) -> None:
+            if node_id in permanent:
+                return
+            if node_id in temporary:
+                raise ValueError("Execution Definition contains a cycle")
+            temporary.add(node_id)
+            for dependency in dependencies.get(node_id, set()):
+                if dependency in dependencies:
+                    visit(dependency)
+            temporary.remove(node_id)
+            permanent.add(node_id)
+
+        for node_id in dependencies:
+            visit(node_id)

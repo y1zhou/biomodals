@@ -8,7 +8,6 @@ import pytest
 
 from biomodals.helper.app_run import (
     AppRunLayout,
-    has_completed_output_files,
     inline_zstd_output,
     volume_app_output,
     volume_path_from_mount_path,
@@ -89,26 +88,6 @@ def test_inline_zstd_output_builds_archive_metadata() -> None:
             media_type=ZSTD_MEDIA_TYPE,
         ),
         metadata={"archive_format": "tar.zst", "run_name": "run-1"},
-    )
-
-
-def test_has_completed_output_files_checks_required_files(tmp_path: Path) -> None:
-    """Completion is based on required output files, not just a directory."""
-    sample_dir = tmp_path / "input-1" / "ranked_0"
-    sample_dir.mkdir(parents=True)
-    (sample_dir / "model.cif").write_text("data")
-
-    assert has_completed_output_files(
-        tmp_path,
-        "input-1",
-        sample_subdir="ranked_0",
-        required_files=("model.cif",),
-    )
-    assert not has_completed_output_files(
-        tmp_path,
-        "input-1",
-        sample_subdir="ranked_0",
-        required_files=("model.cif", "scores.json"),
     )
 
 

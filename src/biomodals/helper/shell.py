@@ -25,21 +25,6 @@ def _build_env(env: dict[str, str] | None) -> dict[str, str]:
     return {k: v for k, v in new_env.items() if v is not None}
 
 
-def run_background_command(cmd: list[str] | str, **kwargs) -> sp.Popen:
-    """Run a shell command in the background without waiting for it to finish."""
-    import shlex
-
-    if isinstance(cmd, str):
-        cmd = shlex.split(cmd)
-
-    sys.stdout.write(f"Running background command: {shlex.join(cmd)}\n")
-    sys.stdout.flush()
-    kwargs.setdefault("stdout", sp.DEVNULL)
-    kwargs.setdefault("stderr", sp.DEVNULL)
-    kwargs["env"] = _build_env(kwargs.get("env", None))
-    return sp.Popen(cmd, **kwargs)  # noqa: S603
-
-
 def run_command(
     cmd: list[str] | str,
     *,

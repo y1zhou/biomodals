@@ -1,0 +1,1644 @@
+"""Tests for the executable-graph coordinator's Modal boundary."""
+
+# ruff: noqa: D101,D102,D103,D107
+
+import pickle
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from threading import Event, Lock, Thread
+from time import sleep
+from types import SimpleNamespace
+from typing import Any, cast
+from uuid import UUID
+
+import pytest
+
+from biomodals.execution import (
+    DeploymentIdentity,
+    ExecutionRunNotFoundError,
+    NodeAggregationPolicy,
+    NodeStatus,
+    ProviderBinding,
+    ResultProvenance,
+    RunStatus,
+    RunStatusReason,
+)
+from biomodals.execution.modal import (
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+    load_execution_launch,
+    orchestrator,
+)
+from biomodals.execution.nodes import (
+    NodeRunContext,
+    ProviderCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
+)
+from biomodals.execution.store import GraphExecutionRunStore
+from biomodals.helper.constant import WORKFLOW_ORCHESTRATOR_VOLUME_NAME
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+)
+from biomodals.schema.storage import InlineBytes, VolumePath
+from biomodals.workflow import CoordinatorNode, ExecutionGraph, ppiflow_workflow
+
+RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+DEPLOYMENT = DeploymentIdentity("main", "DemoWorkflow", 7)
+SUCCESSOR_DEPLOYMENT = DeploymentIdentity("main", "DemoWorkflow", 8)
+
+
+class FakeVolume:
+    def __init__(self) -> None:
+        self.commit_count = 0
+        self.reload_count = 0
+
+    def commit(self) -> None:
+        self.commit_count += 1
+
+    def reload(self) -> None:
+        self.reload_count += 1
+
+
+class FakeHandle:
+    def __init__(self) -> None:
+        self.hydrated = False
+
+    def hydrate(self) -> None:
+        self.hydrated = True
+
+    def remote(self, value: object) -> object:
+        return value
+
+
+@dataclass
+class TextNode(CoordinatorNode):
+    text: str
+    workers: int = field(default=1, metadata={"dag_hash": False})
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        del context
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="result",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=self.text.encode(),
+                        filename="result.txt",
+                        media_type="text/plain",
+                    ),
+                )
+            ],
+        )
+
+
+@dataclass
+class RankedScientificNode(CoordinatorNode):
+    text: str
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        if context.volume_root is None or context.artifact_volume_name is None:
+            raise RuntimeError("Workflow Volume context is unavailable")
+        output_dir = context.work_dir / "ranked"
+        structures_dir = output_dir / "structures"
+        structures_dir.mkdir(parents=True)
+        structure = structures_dir / "design.pdb"
+        structure.write_text(self.text, encoding="utf-8")
+        ranking = output_dir / "ranked_designs.csv"
+        ranking.write_text("design,rank_score\ndesign,1.0\n", encoding="utf-8")
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="ranked_structures",
+                    kind=ArtifactKind.STRUCTURES,
+                    storage=VolumePath(
+                        volume_name=context.artifact_volume_name,
+                        path=structures_dir.relative_to(context.volume_root).as_posix(),
+                    ),
+                    metadata={
+                        "files": [
+                            ArtifactFile(
+                                path=structure.name,
+                                size_bytes=structure.stat().st_size,
+                            ).model_dump(exclude_none=True)
+                        ],
+                    },
+                ),
+                AppOutput(
+                    name="ranked_designs",
+                    kind=ArtifactKind.TABLE,
+                    storage=VolumePath(
+                        volume_name=context.artifact_volume_name,
+                        path=ranking.relative_to(context.volume_root).as_posix(),
+                        media_type="text/csv",
+                    ),
+                ),
+            ],
+        )
+
+
+@dataclass
+class FanoutNode(TaskProviderNode):
+    texts: tuple[str, ...]
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[TaskDefinition, ...]:
+        del context
+        return tuple(
+            TaskDefinition(
+                task_key=f"candidate-{ordinal}",
+                scientific_payload={"text": text},
+                execution_payload={"text": text},
+            )
+            for ordinal, text in enumerate(self.texts)
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
+        del context
+        return ProviderCallSpec(
+            function_name="run_candidate",
+            uses_gpu=False,
+            kwargs={
+                "task_key": task.task_key,
+                "text": task.execution_payload["text"],
+            },
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results,
+        errors,
+    ) -> AppRunResult:
+        del context
+        status = (
+            AppRunStatus.PARTIAL
+            if results and errors
+            else AppRunStatus.SUCCEEDED
+            if not errors
+            else AppRunStatus.FAILED
+        )
+        return AppRunResult(
+            status=status,
+            outputs=[
+                AppOutput(
+                    name="summary",
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=",".join(results).encode(),
+                        filename="summary.txt",
+                        media_type="text/plain",
+                    ),
+                )
+            ],
+        )
+
+
+class FanoutDriver:
+    def __init__(self, *, failing_tasks: set[str] | None = None) -> None:
+        self.failing_tasks = failing_tasks or set()
+        self.spawned: list[str] = []
+        self.results: dict[str, AppRunResult] = {}
+
+    def resolve(self, binding: ProviderBinding) -> str:
+        return binding.function_name
+
+    def spawn(self, function, *, args, kwargs) -> str:
+        del function, args
+        task_key = str(kwargs["task_key"])
+        self.spawned.append(task_key)
+        call_id = f"fc-{task_key}"
+        self.results[call_id] = TextNode(str(kwargs["text"])).run(
+            cast(NodeRunContext, None)
+        )
+        return call_id
+
+    def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
+        task_key = provider_call_handle_id.removeprefix("fc-")
+        if task_key in self.failing_tasks:
+            return ProviderCallObservation(
+                ProviderCallObservationKind.FAILED,
+                message=f"{task_key} failed",
+            )
+        return ProviderCallObservation(
+            ProviderCallObservationKind.SUCCEEDED,
+            result=self.results[provider_call_handle_id],
+        )
+
+    def cancel(self, provider_call_handle_id: str) -> None:
+        del provider_call_handle_id
+
+
+def _raw_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    volume: FakeVolume,
+    *,
+    execution_run_id: str = str(RUN_ID),
+    deployment_environment: str = DEPLOYMENT.environment,
+    deployment_name: str = DEPLOYMENT.deployment_name,
+    deployment_version: int = DEPLOYMENT.deployment_version,
+) -> tuple[Any, Any]:
+    monkeypatch.setattr(orchestrator, "OUT_VOLUME", volume)
+    monkeypatch.setattr(
+        orchestrator.CONF,
+        "output_volume_mountpoint",
+        str(tmp_path),
+    )
+    raw_cls = cast(Any, orchestrator.ExecutionCoordinator)._get_user_cls()
+    instance = raw_cls()
+    instance.execution_run_id = execution_run_id
+    instance.deployment_environment = deployment_environment
+    instance.deployment_name = deployment_name
+    instance.deployment_version = deployment_version
+    instance.development = deployment_environment == "development"
+    raw_cls.enter._get_raw_f()(instance)
+    return raw_cls, instance
+
+
+def _restart(raw_cls: Any, coordinator: Any, **kwargs: object) -> AppRunResult:
+    raw_cls.prepare_restart._get_raw_f()(coordinator, **kwargs)
+    return raw_cls.drive_prepared._get_raw_f()(coordinator)
+
+
+def _run_root(raw_cls: Any, coordinator: Any, **kwargs: object) -> AppRunResult:
+    prepare_kwargs = dict(kwargs)
+    development_handles = prepare_kwargs.pop("development_function_handles", None)
+    raw_cls.prepare_run._get_raw_f()(coordinator, **prepare_kwargs)
+    coordinator._development_function_handles = None
+    return raw_cls.drive_prepared._get_raw_f()(
+        coordinator,
+        development_function_handles=development_handles,
+    )
+
+
+def test_coordinator_binds_parameterized_identity_and_persists_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+    volume = FakeVolume()
+
+    class FakeRuntime:
+        def __init__(self, **kwargs: object) -> None:
+            calls["init"] = kwargs
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
+
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
+        def run(self, *, workload_run_key: str) -> AppRunResult:
+            calls["workload_run_key"] = workload_run_key
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+    workflow = ExecutionGraph("demo")
+
+    result = _run_root(
+        raw_cls,
+        instance,
+        graph=workflow,
+        workload_run_key="friendly-name",
+        max_parallel_nodes=4,
+        max_active_provider_calls=9,
+        max_active_gpu_provider_calls=3,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    init = cast(dict[str, object], calls["init"])
+    assert init["graph"] is workflow
+    assert init["execution_run_id"] == RUN_ID
+    assert init["deployment"] == DEPLOYMENT
+    assert init["volume_root"] == tmp_path
+    assert init["artifact_volume_name"] == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
+    storage_sync = init["storage_sync"]
+    assert storage_sync.volume is volume
+    assert init["max_parallel_nodes"] == 4
+    assert init["max_active_provider_calls"] == 9
+    assert init["max_active_gpu_provider_calls"] == 3
+    assert calls["workload_run_key"] == "friendly-name"
+    assert "closed" not in calls
+
+    raw_cls.exit._get_raw_f()(instance)
+
+    assert calls["closed"] is True
+    assert volume.reload_count == 1
+    assert volume.commit_count == 0
+
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    plan = pickle.loads(store.read_coordinator_plan())  # noqa: S301
+    assert isinstance(plan, orchestrator.ExecutionCoordinatorPlan)
+    assert plan.graph is not workflow
+    assert (
+        plan.identity
+        == orchestrator.ExecutionCoordinatorPlan(
+            graph=workflow,
+            workload_run_key="friendly-name",
+            max_parallel_nodes=4,
+            max_active_provider_calls=9,
+            max_active_gpu_provider_calls=3,
+        ).identity
+    )
+
+
+def test_prepared_root_is_durable_and_immediately_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+    workflow = ExecutionGraph("prepared-root")
+    workflow.add_node(TextNode("must not run"), id="science")
+
+    raw_cls.prepare_run._get_raw_f()(
+        instance,
+        graph=workflow,
+        workload_run_key="prepared-root",
+    )
+
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    try:
+        assert store.execution.get_run(RUN_ID).status == RunStatus.PENDING
+    finally:
+        store.close()
+    assert volume.commit_count == 1
+
+    overview = raw_cls.cancel._get_raw_f()(instance)
+
+    assert overview.run.status == RunStatus.CANCELLED
+
+
+def test_coordinator_rejects_a_changed_plan_for_the_same_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+
+    class FakeRuntime:
+        def __init__(self, **_kwargs: object) -> None:
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
+
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+    _run_root(
+        raw_cls,
+        instance,
+        graph=ExecutionGraph("first"),
+        workload_run_key="demo",
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        _run_root(
+            raw_cls,
+            instance,
+            graph=ExecutionGraph("changed"),
+            workload_run_key="demo",
+        )
+
+
+def test_coordinator_uses_explicit_handles_only_for_development_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+    volume = FakeVolume()
+
+    class FakeRuntime:
+        def __init__(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
+
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def configure_provider_boundary(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+
+        def close(self) -> None:
+            pass
+
+    handle = FakeHandle()
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
+    raw_cls, instance = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        deployment_environment="development",
+        deployment_version=1,
+    )
+    _run_root(
+        raw_cls,
+        instance,
+        graph=ExecutionGraph("demo"),
+        workload_run_key="demo",
+        development_function_handles={"compute": handle},
+    )
+
+    driver = cast(Any, calls["provider_driver"])
+    resolved = driver.resolve(
+        ProviderBinding("development", "DemoWorkflow", 1, "compute", False)
+    )
+    assert resolved is handle
+    assert handle.hydrated is True
+
+
+def test_coordinator_resolves_persisted_external_checker_by_exact_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+    volume = FakeVolume()
+    checker = FakeHandle()
+
+    class FakeRuntime:
+        def __init__(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
+
+        def prepare(self, **_kwargs: object) -> None:
+            _ = self.store.execution
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def configure_provider_boundary(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
+    raw_cls, instance = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        deployment_environment="development",
+        deployment_version=1,
+    )
+    _run_root(
+        raw_cls,
+        instance,
+        graph=ExecutionGraph("demo"),
+        workload_run_key="demo",
+        strict_external_artifact_checks=True,
+        external_artifact_checker_function_name="check_external",
+        development_function_handles={"check_external": checker},
+    )
+
+    resolved_checker = cast(Any, calls["external_artifact_checker"])
+    assert resolved_checker.__self__ is checker
+    assert checker.hydrated is True
+
+
+def test_status_and_terminal_cancel_are_read_only_kernel_views(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+    workflow = ExecutionGraph("demo")
+    workflow.add_node(TextNode("complete"), id="write")
+
+    result = _run_root(
+        raw_cls,
+        instance,
+        graph=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    status = raw_cls.status._get_raw_f()(instance)
+    cancelled = raw_cls.cancel._get_raw_f()(instance)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert status.run.status == RunStatus.SUCCEEDED
+    assert cancelled.run.status == RunStatus.SUCCEEDED
+    assert status.run.deployment == DEPLOYMENT
+
+
+def test_restart_creates_an_idempotent_successor_from_cached_publications(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class LockCheckingVolume(FakeVolume):
+        coordinator: Any | None = None
+
+        def _assert_successor_locks(self) -> None:
+            if self.coordinator is None:
+                return
+            assert self.coordinator._volume_lock()._is_owned()
+            assert self.coordinator._lock()._is_owned()
+
+        def commit(self) -> None:
+            self._assert_successor_locks()
+            super().commit()
+
+        def reload(self) -> None:
+            self._assert_successor_locks()
+            super().reload()
+
+    volume = LockCheckingVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("demo")
+    workflow.add_node(TextNode("complete"), id="write")
+    workflow.add_node(
+        TextNode("refresh"),
+        id="refresh",
+        reuse_predecessor_publication=False,
+    )
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+    volume.coordinator = successor_coordinator
+
+    first = _restart(
+        raw_cls,
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+    second = _restart(
+        raw_cls,
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert first.status == AppRunStatus.SUCCEEDED
+    assert second.status == AppRunStatus.SUCCEEDED
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    successor = store.execution.get_run(SUCCESSOR_ID)
+    node = store.execution.get_node(SUCCESSOR_ID, "write")
+    refreshed = store.execution.get_node(SUCCESSOR_ID, "refresh")
+    publication = store.artifacts.load_node_output_artifacts("write")
+    refreshed_publication = store.artifacts.load_node_output_artifacts("refresh")
+    assert successor.predecessor_execution_run_id == RUN_ID
+    assert successor.deployment == SUCCESSOR_DEPLOYMENT
+    assert successor.status == RunStatus.SUCCEEDED
+    assert node.status == NodeStatus.SUCCEEDED
+    assert node.result_provenance == ResultProvenance.CACHE
+    assert refreshed.status == NodeStatus.SUCCEEDED
+    assert str(RUN_ID) in publication[0].storage.path
+    assert str(SUCCESSOR_ID) in refreshed_publication[0].storage.path
+    assert (
+        store.connection.execute(
+            "SELECT COUNT(*) FROM execution_node_results"
+        ).fetchone()[0]
+        == 2
+    )
+    store.close()
+
+
+def test_launch_restart_prepares_candidate_before_driving(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("demo")
+    workflow.add_node(TextNode("complete", workers=8), id="write")
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="demo",
+        max_parallel_nodes=7,
+        max_active_provider_calls=8,
+        max_active_gpu_provider_calls=4,
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+    candidate_workflow = ExecutionGraph("demo")
+    candidate_workflow.add_node(TextNode("complete", workers=2), id="write")
+
+    raw_cls.prepare_restart_from._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        graph=candidate_workflow,
+        workload_run_key="demo",
+        max_parallel_nodes=1,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=2,
+    )
+
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    successor = store.execution.get_run(SUCCESSOR_ID)
+    assert successor.predecessor_execution_run_id == RUN_ID
+    assert successor.deployment == SUCCESSOR_DEPLOYMENT
+    assert successor.max_active_provider_calls == 3
+    assert successor.max_active_gpu_provider_calls == 2
+    successor_plan = pickle.loads(store.read_coordinator_plan())  # noqa: S301
+    assert successor_plan.max_parallel_nodes == 1
+    successor_node = successor_plan.graph.validate().nodes["write"].node
+    assert successor_node.workers == 2
+    assert getattr(successor_coordinator, "_runtime", None) is None
+    store.close()
+
+    result = raw_cls.drive_prepared._get_raw_f()(successor_coordinator)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+
+
+def test_generic_restart_prepares_successor_before_driving(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("demo")
+    workflow.add_node(TextNode("complete"), id="write")
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    raw_cls.prepare_restart._get_raw_f()(
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    assert store.execution.get_run(SUCCESSOR_ID).predecessor_execution_run_id == RUN_ID
+    assert load_execution_launch(tmp_path, SUCCESSOR_ID) == RUN_ID
+    successor_plan = pickle.loads(store.read_coordinator_plan())  # noqa: S301
+    assert getattr(successor_coordinator, "_runtime", None) is None
+    store.close()
+
+    launch_path = (
+        tmp_path / ".biomodals" / "execution" / "runs" / str(SUCCESSOR_ID) / "launch"
+    )
+    launch_path.unlink()
+    predecessor_store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    predecessor = predecessor_store.execution.get_run(RUN_ID)
+    predecessor_store.close()
+    wrong_predecessor = replace(
+        predecessor,
+        execution_run_id=UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+    )
+    with pytest.raises(ValueError, match="Persisted successor"):
+        successor_coordinator._persist_or_verify_successor(
+            predecessor=wrong_predecessor,
+            plan=successor_plan,
+            deployment=SUCCESSOR_DEPLOYMENT,
+            node_publications=(),
+            task_publications=(),
+        )
+    assert not launch_path.exists()
+    successor_coordinator._persist_or_verify_successor(
+        predecessor=predecessor,
+        plan=successor_plan,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        node_publications=(),
+        task_publications=(),
+    )
+    assert load_execution_launch(tmp_path, SUCCESSOR_ID) == RUN_ID
+
+    result = raw_cls.drive_prepared._get_raw_f()(successor_coordinator)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+
+
+def test_launch_restart_rejects_changed_scientific_plan_before_creating_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    predecessor_workflow = ExecutionGraph("demo")
+    predecessor_workflow.add_node(TextNode("original"), id="write")
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=predecessor_workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    candidate_workflow = ExecutionGraph("demo")
+    candidate_workflow.add_node(TextNode("changed"), id="write")
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    with pytest.raises(ValueError, match="Workload Plan Fingerprint"):
+        raw_cls.prepare_restart_from._get_raw_f()(
+            successor_coordinator,
+            predecessor_execution_run_id=str(RUN_ID),
+            graph=candidate_workflow,
+            workload_run_key="demo",
+        )
+
+    assert not GraphExecutionRunStore(tmp_path, SUCCESSOR_ID).ledger_path.exists()
+
+
+def test_launch_restart_rejects_changed_workload_run_key_before_creating_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("demo")
+    workflow.add_node(TextNode("unchanged"), id="write")
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="original",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    with pytest.raises(ValueError, match="Workload Run Key"):
+        raw_cls.prepare_restart_from._get_raw_f()(
+            successor_coordinator,
+            predecessor_execution_run_id=str(RUN_ID),
+            graph=workflow,
+            workload_run_key="changed",
+        )
+
+    successor_store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    assert not successor_store.ledger_path.exists()
+    assert not successor_store.coordinator_plan_path.exists()
+
+
+def test_restart_reuses_successful_task_publications_from_partial_node(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    predecessor_driver = FanoutDriver(failing_tasks={"candidate-1"})
+    monkeypatch.setattr(
+        orchestrator,
+        "ModalCallDriver",
+        lambda **_kwargs: predecessor_driver,
+    )
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("fanout")
+    workflow.add_node(
+        FanoutNode(("alpha", "beta")),
+        id="fanout",
+        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+    )
+
+    predecessor_result = _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="fanout",
+    )
+
+    assert predecessor_result.status == AppRunStatus.PARTIAL
+    assert predecessor_driver.spawned == ["candidate-0", "candidate-1"]
+
+    successor_driver = FanoutDriver()
+    monkeypatch.setattr(
+        orchestrator,
+        "ModalCallDriver",
+        lambda **_kwargs: successor_driver,
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    successor_result = _restart(
+        raw_cls,
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert successor_result.status == AppRunStatus.SUCCEEDED
+    assert successor_driver.spawned == ["candidate-1"]
+    store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    cached = store.execution.get_task(SUCCESSOR_ID, "fanout", "candidate-0")
+    repaired = store.execution.get_task(SUCCESSOR_ID, "fanout", "candidate-1")
+    assert cached.result_provenance == ResultProvenance.CACHE
+    assert repaired.result_provenance == ResultProvenance.CURRENT_RUN
+    assert store.execution.get_node(SUCCESSOR_ID, "fanout").status == (
+        NodeStatus.SUCCEEDED
+    )
+    store.close()
+
+
+def test_restart_recomputes_a_missing_predecessor_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("demo")
+    workflow.add_node(TextNode("replacement"), id="write")
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    predecessor_store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    publication = predecessor_store.artifacts.load_node_output_artifacts("write")[0]
+    predecessor_store.close()
+    (tmp_path / publication.storage.path).unlink()
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    result = _restart(
+        raw_cls,
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    successor_store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    node = successor_store.execution.get_node(SUCCESSOR_ID, "write")
+    task = successor_store.execution.get_task(SUCCESSOR_ID, "write", "node")
+    publication = successor_store.artifacts.load_node_output_artifacts("write")[0]
+    assert node.status == NodeStatus.SUCCEEDED
+    assert task.result_provenance == ResultProvenance.CURRENT_RUN
+    assert str(SUCCESSOR_ID) in publication.storage.path
+    successor_store.close()
+
+
+def test_restart_repairs_missing_ranked_structure_behind_ppiflow_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setitem(
+        ppiflow_workflow.PPI_FLOW_SOURCE_VOLUME_ROOTS,
+        WORKFLOW_ORCHESTRATOR_VOLUME_NAME,
+        tmp_path,
+    )
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    workflow = ExecutionGraph("report-boundary")
+    rank = workflow.add_node(
+        RankedScientificNode("ATOM\n"),
+        id="rank",
+    )
+    workflow.add_node(
+        ppiflow_workflow.ReportNode("ReportStep"),
+        id="report",
+        inputs={
+            "structures": rank.outputs(kind=ArtifactKind.STRUCTURES),
+            "rank": rank.outputs(kind=ArtifactKind.TABLE),
+        },
+    )
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=workflow,
+        workload_run_key="report-boundary",
+        development_function_handles={},
+    )
+    predecessor_store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    publication = next(
+        artifact
+        for artifact in predecessor_store.artifacts.load_node_output_artifacts("rank")
+        if artifact.kind == ArtifactKind.STRUCTURES
+    )
+    predecessor_store.close()
+    missing_structure = tmp_path / publication.storage.path / "design.pdb"
+    missing_structure.unlink()
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    result = _restart(
+        raw_cls,
+        successor_coordinator,
+        predecessor_execution_run_id=str(RUN_ID),
+        predecessor_deployment_environment=DEPLOYMENT.environment,
+        predecessor_deployment_name=DEPLOYMENT.deployment_name,
+        predecessor_deployment_version=DEPLOYMENT.deployment_version,
+    )
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    successor_store = GraphExecutionRunStore(tmp_path, SUCCESSOR_ID)
+    rank_task = successor_store.execution.get_task(
+        SUCCESSOR_ID,
+        "rank",
+        "node",
+    )
+    report_task = successor_store.execution.get_task(
+        SUCCESSOR_ID,
+        "report",
+        "node",
+    )
+    publication = next(
+        artifact
+        for artifact in successor_store.artifacts.load_node_output_artifacts("rank")
+        if artifact.kind == ArtifactKind.STRUCTURES
+    )
+    assert rank_task.result_provenance == ResultProvenance.CURRENT_RUN
+    assert report_task.result_provenance == ResultProvenance.CURRENT_RUN
+    assert (tmp_path / publication.storage.path / "design.pdb").is_file()
+    successor_store.close()
+
+
+def test_restart_rejects_a_mismatched_predecessor_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, predecessor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+    )
+    _run_root(
+        raw_cls,
+        predecessor_coordinator,
+        graph=ExecutionGraph("demo"),
+        workload_run_key="demo",
+        development_function_handles={},
+    )
+    raw_cls, successor_coordinator = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        volume,
+        execution_run_id=str(SUCCESSOR_ID),
+        deployment_version=SUCCESSOR_DEPLOYMENT.deployment_version,
+    )
+
+    with pytest.raises(ValueError, match="Predecessor Deployment Identity"):
+        _restart(
+            raw_cls,
+            successor_coordinator,
+            predecessor_execution_run_id=str(RUN_ID),
+            predecessor_deployment_environment=DEPLOYMENT.environment,
+            predecessor_deployment_name=DEPLOYMENT.deployment_name,
+            predecessor_deployment_version=DEPLOYMENT.deployment_version + 1,
+        )
+
+
+def test_status_does_not_create_state_for_an_unknown_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, FakeVolume())
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+
+    with pytest.raises(ExecutionRunNotFoundError):
+        raw_cls.status._get_raw_f()(instance)
+
+    assert not store.ledger_path.exists()
+
+
+def test_resume_reloads_the_persisted_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+    volume = FakeVolume()
+    plan = orchestrator.ExecutionCoordinatorPlan(
+        graph=ExecutionGraph("demo"),
+        workload_run_key="friendly-name",
+    )
+    store = GraphExecutionRunStore(tmp_path, RUN_ID)
+    store.write_coordinator_plan(pickle.dumps(plan))
+    with store.transaction():
+        store.execution.create_run(
+            execution_run_id=RUN_ID,
+            plan=orchestrator.execution_plan(
+                plan.graph.validate(),
+                workload_run_key=plan.workload_run_key,
+            ),
+            deployment=DEPLOYMENT,
+            max_active_provider_calls=32,
+            max_active_gpu_provider_calls=32,
+            now=100,
+        )
+        store.execution.transition_run(
+            RUN_ID,
+            RunStatus.SUSPENDED,
+            reason=RunStatusReason.COORDINATOR_ERROR,
+            message="test suspension",
+            now=101,
+        )
+    store.close()
+
+    class FakeRuntime:
+        def __init__(self, **kwargs: object) -> None:
+            calls["init"] = kwargs
+            self.store = GraphExecutionRunStore(tmp_path, RUN_ID)
+
+        def resume(
+            self,
+            *,
+            workload_run_key: str,
+        ) -> AppRunResult:
+            calls["workload_run_key"] = workload_run_key
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            calls["closed"] = True
+
+    monkeypatch.setattr(orchestrator, "ExecutionGraphRuntime", FakeRuntime)
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+
+    result = raw_cls.resume._get_raw_f()(instance)
+
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert calls["workload_run_key"] == "friendly-name"
+    assert cast(dict[str, object], calls["init"])["deployment"] == DEPLOYMENT
+    assert "closed" not in calls
+
+    raw_cls.exit._get_raw_f()(instance)
+
+    assert calls["closed"] is True
+
+
+def test_existing_runtime_installs_strict_checker_before_drive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_cls, instance = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        FakeVolume(),
+    )
+    checker = object()
+
+    class FakeRuntime:
+        external_artifact_checker = None
+
+        def configure_provider_boundary(
+            self,
+            *,
+            provider_driver: object,
+            external_artifact_checker: object,
+        ) -> None:
+            del provider_driver
+            self.external_artifact_checker = external_artifact_checker
+
+    runtime = FakeRuntime()
+    instance._runtime = runtime
+    plan = orchestrator.ExecutionCoordinatorPlan(
+        graph=ExecutionGraph("demo"),
+        workload_run_key="demo",
+        strict_external_artifact_checks=True,
+        external_artifact_checker_function_name="check_outputs",
+    )
+
+    opened = instance._open_runtime(
+        plan,
+        resolve_external_checker=True,
+        external_checker=checker,
+    )
+
+    assert opened is runtime
+    assert runtime.external_artifact_checker is checker
+
+
+def test_drive_keeps_runtime_open_for_concurrent_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw_cls, instance = _raw_coordinator(
+        monkeypatch,
+        tmp_path,
+        FakeVolume(),
+    )
+    plan = orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo")
+    callback_attached = Event()
+    release_callback = Event()
+
+    class FakeRuntime:
+        external_artifact_checker = None
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def attach(self, **_kwargs: object) -> None:
+            callback_attached.set()
+            assert release_callback.wait(timeout=1)
+
+        def claim_pull_tasks(self, *_args: object, **_kwargs: object) -> str:
+            if self.closed:
+                raise RuntimeError("callback observed a closed runtime")
+            return "claim"
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+        def close(self) -> None:
+            self.closed = True
+
+    runtime = FakeRuntime()
+    instance._runtime = runtime
+    instance._require_ledger = lambda: None
+    instance._load_plan = lambda: plan
+    callback_result: list[object] = []
+
+    def claim() -> None:
+        callback_result.append(
+            raw_cls.claim_tasks._get_raw_f()(
+                instance,
+                str(UUID(int=1)),
+                "claim-request",
+                1,
+            )
+        )
+
+    callback = Thread(target=claim)
+    callback.start()
+    assert callback_attached.wait(timeout=1)
+
+    raw_cls.drive_prepared._get_raw_f()(instance)
+    release_callback.set()
+    callback.join(timeout=1)
+
+    assert not callback.is_alive()
+    assert callback_result == ["claim"]
+    assert not runtime.closed
+
+    raw_cls.exit._get_raw_f()(instance)
+    assert runtime.closed
+
+
+def test_enter_and_exit_close_without_cancelling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    volume = FakeVolume()
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, volume)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    active_runtime = FakeRuntime()
+    instance._runtime = active_runtime
+    raw_cls.exit._get_raw_f()(instance)
+    raw_cls.exit._get_raw_f()(instance)
+
+    assert active_runtime.close_count == 1
+    assert instance._runtime is None
+    assert volume.commit_count == 0
+
+
+def test_workflow_cancel_does_not_start_a_second_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Concurrent cancellation leaves exactly one workflow drive owner."""
+    raw_cls, instance = _raw_coordinator(monkeypatch, tmp_path, FakeVolume())
+    plan = orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo")
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.started = Event()
+            self.cancel_requested = Event()
+            self.status = RunStatus.RUNNING
+            self.active_drivers = 0
+            self.max_active_drivers = 0
+            self.closed_while_driving = False
+            self._lock = Lock()
+
+        def run(self, **_kwargs: object) -> AppRunResult:
+            with self._lock:
+                self.active_drivers += 1
+                self.max_active_drivers = max(
+                    self.max_active_drivers,
+                    self.active_drivers,
+                )
+            self.started.set()
+            assert self.cancel_requested.wait(timeout=1)
+            sleep(0.05)
+            self.status = RunStatus.CANCELLED
+            with self._lock:
+                self.active_drivers -= 1
+            return AppRunResult(status=AppRunStatus.FAILED)
+
+        def cancel(self) -> None:
+            self.status = RunStatus.CANCEL_REQUESTED
+            self.cancel_requested.set()
+
+        def close(self) -> None:
+            with self._lock:
+                self.closed_while_driving |= self.active_drivers > 0
+
+    runtime = FakeRuntime()
+
+    def open_runtime(*_args: object, **_kwargs: object) -> FakeRuntime:
+        instance._runtime = runtime
+        return runtime
+
+    def snapshot():
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                execution_run_id=RUN_ID,
+                deployment=DEPLOYMENT,
+                status=runtime.status,
+            )
+        )
+
+    instance._persist_or_verify_plan = lambda candidate: candidate
+    instance._load_plan = lambda: plan
+    instance._open_runtime = open_runtime
+    instance._require_ledger = lambda: None
+    instance._verified_overview = snapshot
+    errors: list[BaseException] = []
+
+    def call(operation, *args: object, **kwargs: object) -> None:
+        try:
+            operation(instance, *args, **kwargs)
+        except BaseException as error:  # pragma: no cover - assertion aid
+            errors.append(error)
+
+    run_thread = Thread(
+        target=call,
+        args=(raw_cls.drive_prepared._get_raw_f(),),
+    )
+    run_thread.start()
+    assert runtime.started.wait(timeout=1)
+    cancel_thread = Thread(target=call, args=(raw_cls.cancel._get_raw_f(),))
+    cancel_thread.start()
+    run_thread.join(timeout=2)
+    cancel_thread.join(timeout=2)
+
+    assert not run_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert errors == []
+    assert runtime.max_active_drivers == 1
+    assert not runtime.closed_while_driving
+
+
+@pytest.mark.parametrize(
+    ("execution_run_id", "deployment_version", "message"),
+    [
+        ("not-a-uuid", 7, "badly formed"),
+        (str(RUN_ID), 0, "positive"),
+    ],
+)
+def test_coordinator_rejects_invalid_parameterized_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    execution_run_id: str,
+    deployment_version: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _raw_coordinator(
+            monkeypatch,
+            tmp_path,
+            FakeVolume(),
+            execution_run_id=execution_run_id,
+            deployment_version=deployment_version,
+        )
+
+
+def test_coordinator_plan_rejects_invalid_workflow_or_limits() -> None:
+    with pytest.raises(TypeError, match="ExecutionGraph object"):
+        orchestrator.ExecutionCoordinatorPlan(
+            cast(Any, {"nodes": []}),
+            "demo",
+        )
+    with pytest.raises(ValueError, match="positive"):
+        orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo", 0)
+    with pytest.raises(ValueError, match="max_parallel_nodes"):
+        orchestrator.ExecutionCoordinatorPlan(
+            ExecutionGraph("demo"),
+            "demo",
+            max_parallel_nodes=0,
+        )
+    with pytest.raises(ValueError, match="between zero"):
+        orchestrator.ExecutionCoordinatorPlan(ExecutionGraph("demo"), "demo", 2, 3)
+    with pytest.raises(ValueError, match="checker function"):
+        orchestrator.ExecutionCoordinatorPlan(
+            ExecutionGraph("demo"),
+            "demo",
+            strict_external_artifact_checks=True,
+        )
+
+
+def test_coordinator_handle_resolves_the_exact_deployed_class_version() -> None:
+    calls: dict[str, object] = {}
+
+    class FakeCoordinator:
+        def __init__(self, **kwargs: object) -> None:
+            calls["parameters"] = kwargs
+
+    def resolve(*args: object, **kwargs: object) -> type[FakeCoordinator]:
+        calls["lookup_args"] = args
+        calls["lookup_kwargs"] = kwargs
+        return FakeCoordinator
+
+    handle = orchestrator.execution_coordinator_handle(
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        use_deployed_coordinator=True,
+        class_resolver=resolve,
+    )
+
+    assert isinstance(handle, FakeCoordinator)
+    assert calls["lookup_args"] == ("DemoWorkflow", "ExecutionCoordinator")
+    assert calls["lookup_kwargs"] == {
+        "environment_name": "main",
+        "version": 7,
+    }
+    assert calls["parameters"] == {
+        "execution_run_id": str(RUN_ID),
+        "deployment_environment": "main",
+        "deployment_name": "DemoWorkflow",
+        "deployment_version": 7,
+        "development": False,
+    }
+
+
+def test_submit_successor_reports_identity_between_prepare_and_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
+    )
+    coordinator = SimpleNamespace(
+        prepare_restart_from=SimpleNamespace(
+            remote=lambda **_kwargs: events.append("prepare")
+        ),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda **_kwargs: events.append("drive") or "fc-successor"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        predecessor_execution_run_id=RUN_ID,
+        coordinator_kwargs={"workload_run_key": "demo"},
+    )
+
+    assert call == "fc-successor"
+    assert events == [
+        "prepare",
+        "print:Deployment Identity: main/DemoWorkflow/v8",
+        f"print:Execution Run ID: {SUCCESSOR_ID}",
+        "drive",
+    ]
+
+
+def test_submit_root_reports_identity_between_prepare_and_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
+    )
+    coordinator = SimpleNamespace(
+        prepare_run=SimpleNamespace(remote=lambda **_kwargs: events.append("prepare")),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda **_kwargs: events.append("drive") or "fc-root"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        predecessor_execution_run_id=None,
+        coordinator_kwargs={"workload_run_key": "demo"},
+    )
+
+    assert call == "fc-root"
+    assert events == [
+        "prepare",
+        "print:Deployment Identity: main/DemoWorkflow/v7",
+        f"print:Execution Run ID: {RUN_ID}",
+        "drive",
+    ]
+
+
+def test_submit_root_passes_development_handles_to_driver() -> None:
+    handle = FakeHandle()
+    calls: dict[str, object] = {}
+    coordinator = SimpleNamespace(
+        prepare_run=SimpleNamespace(
+            remote=lambda **kwargs: calls.update(prepare=kwargs)
+        ),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda **kwargs: calls.update(drive=kwargs) or "fc-root"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        predecessor_execution_run_id=None,
+        coordinator_kwargs={
+            "workload_run_key": "demo",
+            "development_function_handles": {"compute": handle},
+        },
+    )
+
+    assert call == "fc-root"
+    assert cast(dict[str, object], calls["drive"])["development_function_handles"] == {
+        "compute": handle
+    }
+
+
+def test_submit_successor_passes_development_handles_to_driver() -> None:
+    handle = FakeHandle()
+    calls: dict[str, object] = {}
+    coordinator = SimpleNamespace(
+        prepare_restart_from=SimpleNamespace(
+            remote=lambda **kwargs: calls.update(prepare=kwargs)
+        ),
+        drive_prepared=SimpleNamespace(
+            spawn=lambda **kwargs: calls.update(drive=kwargs) or "fc-successor"
+        ),
+    )
+
+    call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=SUCCESSOR_ID,
+        deployment=SUCCESSOR_DEPLOYMENT,
+        predecessor_execution_run_id=RUN_ID,
+        coordinator_kwargs={
+            "workload_run_key": "demo",
+            "development_function_handles": {"compute": handle},
+        },
+    )
+
+    assert call == "fc-successor"
+    assert cast(dict[str, object], calls["prepare"]) == {
+        "predecessor_execution_run_id": str(RUN_ID),
+        "workload_run_key": "demo",
+    }
+    assert cast(dict[str, object], calls["drive"])["development_function_handles"] == {
+        "compute": handle
+    }
+
+
+def test_submit_workflow_run_reports_identity_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *values, **_kwargs: events.append(f"print:{values[0]}"),
+    )
+
+    def interrupt(**_kwargs: object) -> None:
+        events.append("prepare")
+        raise KeyboardInterrupt
+
+    coordinator = SimpleNamespace(
+        prepare_restart_from=SimpleNamespace(remote=interrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.submit_workflow_run(
+            coordinator,
+            execution_run_id=SUCCESSOR_ID,
+            deployment=SUCCESSOR_DEPLOYMENT,
+            predecessor_execution_run_id=RUN_ID,
+            coordinator_kwargs={"workload_run_key": "demo"},
+        )
+
+    assert events == [
+        "prepare",
+        "print:Deployment Identity: main/DemoWorkflow/v8",
+        f"print:Execution Run ID: {SUCCESSOR_ID}",
+        "print:Coordinator submission outcome is unknown; inspect this Execution "
+        "Run before retrying.",
+    ]
+
+
+def test_orchestrator_modal_app_exposes_standard_coordinator_surface() -> None:
+    functions = orchestrator.app._local_state.functions
+
+    assert orchestrator.CONF.python_version == "3.13"
+    assert orchestrator.OUT_VOLUME_NAME == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
+    assert "ExecutionCoordinator.*" in functions
+    assert "WorkflowOrchestrator.*" not in functions
+    assert "run_workflow_orchestrator" not in functions

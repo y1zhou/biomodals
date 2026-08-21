@@ -13,15 +13,39 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
+from biomodals.app.bioinfo.gromacs_execution import (
+    concrete_gromacs_seed,
+    preparation_execution_paths,
+)
+from biomodals.app.bioinfo.gromacs_execution_runtime import (
+    GromacsExecutionCoordinator,
+    GromacsExecutionRequest,
+    stage_execution_request,
+)
 from biomodals.app.config import AppConfig
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionOverview,
+)
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    development_modal_call_driver,
+    execution_coordinator_adapter,
+    execution_coordinator_identity,
+    execution_lineage_root,
+    initialize_execution_coordinator_host,
+    resolve_provider_call_limits,
+    submit_staged_execution_run,
+)
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_path_from_mount_path
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import run_command
-from biomodals.helper.task_budget import bounded_map
 from biomodals.schema import ArtifactFile
 
 ##########################################
@@ -78,6 +102,29 @@ def production_workflow_files(run_name: str) -> list[ArtifactFile]:
         ArtifactFile(path=f"rg_{prefix}.csv", role="radius_of_gyration"),
         ArtifactFile(path=f"rmsf_{prefix}.csv", role="rmsf"),
     ]
+
+
+def _invalidate_incomplete_preparation(work_path: Path, run_name: str) -> None:
+    """Remove stage sentinels whose declared preparation outputs are incomplete."""
+    nvt_complete = all(
+        (work_path / f"nvt_{run_name}.{suffix}").is_file() for suffix in ("tpr", "xtc")
+    )
+    npt_complete = all(
+        (work_path / f"npt_{run_name}.{suffix}").is_file() for suffix in ("tpr", "xtc")
+    )
+    if not nvt_complete:
+        (work_path / f"nvt_{run_name}.gro").unlink(missing_ok=True)
+    if not nvt_complete or not npt_complete:
+        (work_path / f"npt_{run_name}.gro").unlink(missing_ok=True)
+    if (
+        not nvt_complete
+        or not npt_complete
+        or not all(
+            (work_path / relative_path).is_file()
+            for relative_path in (f"production_{run_name}.tpr", "production.mdp")
+        )
+    ):
+        (work_path / f"production_{run_name}.tpr").unlink(missing_ok=True)
 
 
 runtime_image = (
@@ -198,6 +245,10 @@ runtime_image = (
     )
     .add_local_dir(Path(__file__).parent / "gromacs", APP_INFO.gmx_scripts, copy=True)
     .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.gromacs_execution",
+        "biomodals.app.bioinfo.gromacs_execution_runtime",
+    )
 )
 
 biotite_image = (
@@ -206,9 +257,15 @@ biotite_image = (
     .apt_install("git", "build-essential")
     .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
     .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.gromacs_execution",
+        "biomodals.app.bioinfo.gromacs_execution_runtime",
+    )
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_gromacs_task"})
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 
 ##########################################
@@ -275,16 +332,13 @@ def prepare_tpr_gpu(
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
 
-    # Skip prep if production tpr already exists
     if all(
-        f.exists()
-        for f in (
-            work_path / f"production_{run_name}.tpr",
-            work_path / "production.mdp",
-        )
+        (work_path / relative_path).is_file()
+        for relative_path in preparation_execution_paths(run_name)
     ):
         print("✅ Preparation already completed, skipping.")
         return str(work_path)
+    _invalidate_incomplete_preparation(work_path, run_name)
 
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
     staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
@@ -350,16 +404,13 @@ def prepare_tpr_cpu(
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
 
-    # Skip prep if production tpr already exists
     if all(
-        f.exists()
-        for f in (
-            work_path / f"production_{run_name}.tpr",
-            work_path / "production.mdp",
-        )
+        (work_path / relative_path).is_file()
+        for relative_path in preparation_execution_paths(run_name)
     ):
         print("✅ Preparation already completed, skipping.")
         return str(work_path)
+    _invalidate_incomplete_preparation(work_path, run_name)
 
     layout.inputs_dir.mkdir(parents=True, exist_ok=True)
     staged_input_pdb_path = layout.inputs_dir / f"{run_name}.pdb"
@@ -826,7 +877,147 @@ def collect_traj_stats(
 
 
 ##########################################
-# Entrypoint for ephemeral usage
+# Deployment-local execution coordinator
+##########################################
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    volumes=CONF.mounts(output_volume=True),
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with GROMACS functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+    development: bool = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh output state before accepting lifecycle methods."""
+        initialize_execution_coordinator_host(self)
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionOverview:
+        """Drive one staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionOverview:
+        """Read this Run's durable kernel snapshot."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionOverview:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionOverview:
+        """Resume this Run without retrying failed Tasks."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Persist a validated Successor request without driving it."""
+        self._adapter().prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> ExecutionOverview:
+        """Drive one previously prepared root or Successor Run."""
+        return self._adapter().drive_prepared()
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        workload_plan_fingerprint: str,
+        max_active_provider_calls: int,
+        max_active_gpu_provider_calls: int,
+    ) -> ExecutionOverview:
+        """Create a compatible Successor while inferring predecessor identity."""
+        adapter = self._adapter()
+        adapter.prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+            expected_workload_plan_fingerprint=workload_plan_fingerprint,
+        )
+        return adapter.drive_prepared()
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return execution_coordinator_identity(self)
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> GromacsExecutionCoordinator:
+        execution_run_id, deployment = self._identity()
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: GromacsExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                output_volume_name=CONF.output_volume_name,
+                provider_driver=_coordinator_modal_driver(development=selected_mode),
+            ),
+        )
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "prepare_tpr_cpu": prepare_tpr_cpu,
+            "prepare_tpr_gpu": prepare_tpr_gpu,
+            "collect_traj_stats": collect_traj_stats,
+            "production_run_cpu": production_run_cpu,
+            "production_run_gpu": production_run_gpu,
+        },
+        workload_name="GROMACS",
+    )
+
+
+##########################################
+# Local entrypoint client
 ##########################################
 @app.local_entrypoint()
 def submit_gromacs_task(
@@ -840,7 +1031,13 @@ def submit_gromacs_task(
     ld_seed: int = -1,
     gen_seed: int = -1,
     genion_seed: int = 0,
-    max_parallel_analysis: int | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run GROMACS MD simulations on Modal and save results to a volume.
 
@@ -858,12 +1055,19 @@ def submit_gromacs_task(
         num_threads: Number of CPU threads to use for GROMACS.
         use_openmp_threads: Whether to use OpenMP threading in GROMACS.
         ld_seed: Random seed for the Langevin dynamics thermostat during
-            equilibration. If -1, a random seed will be chosen.
+            equilibration. -1 derives a stable seed from the scientific input.
         gen_seed: Random seed for initial velocity generation during
-            equilibration. If -1, a random seed will be chosen.
+            equilibration. -1 derives a stable seed from the scientific input.
         genion_seed: Random seed for ion placement during system neutralization.
-        max_parallel_analysis: Maximum number of trajectory-analysis containers
-            to run at once.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            Biomodals CLI supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
     # Load input PDB
     pdb_path = Path(input_pdb).expanduser().resolve()
@@ -871,56 +1075,69 @@ def submit_gromacs_task(
     if run_name is None:
         run_name = pdb_path.stem
 
-    print("🧬 Preparing Gromacs production run...")
-    prepare_tpr_conf = {
-        "pdb_content": pdb_str,
-        "run_name": run_name,
-        "simulation_time_ns": simulation_time_ns,
-        "run_pdbfixer": run_pdbfixer,
-        "num_threads": num_threads,
-        "use_openmp_threads": use_openmp_threads,
-        "ld_seed": ld_seed,
-        "gen_seed": gen_seed,
-        "genion_seed": genion_seed,
-    }
-    if cpu_only:
-        remote_workdir = prepare_tpr_cpu.remote(**prepare_tpr_conf)
-    else:
-        remote_workdir = prepare_tpr_gpu.remote(**prepare_tpr_conf)
-
-    bounded_map(
-        ["nvt_", "npt_"],
-        lambda prefix: collect_traj_stats.remote(prefix, run_name=run_name),
-        max_parallel=max_parallel_analysis,
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=3,
+        default_max_gpu_containers=0 if cpu_only else 1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
     )
-
-    print("🧬 Starting Gromacs production MD simulation...")
-    if cpu_only:
-        _ = production_run_cpu.remote(
-            run_name=run_name,
-            simulation_time_ns=simulation_time_ns,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
-        )
-    else:
-        _ = production_run_gpu.remote(
-            run_name=run_name,
-            simulation_time_ns=simulation_time_ns,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
-        )
-
-    print("🧬 Postprocessing Gromacs trajectory and generating analysis plots...")
-    bounded_map(
-        ["production_"],
-        lambda prefix: collect_traj_stats.remote(
-            run_name=run_name,
-            traj_prefix=prefix,
-            save_processed_traj=True,
+    execution_run_id = uuid4()
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    seed_run_id = (
+        execution_run_id
+        if predecessor_execution_run_id is None
+        else execution_lineage_root(CONF.output_volume, predecessor_execution_run_id)
+    )
+    request = GromacsExecutionRequest(
+        run_name=run_name,
+        pdb_content=pdb_str,
+        simulation_time_ns=simulation_time_ns,
+        run_pdbfixer=run_pdbfixer,
+        cpu_only=cpu_only,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        ld_seed=concrete_gromacs_seed(
+            ld_seed,
+            run_identity=str(seed_run_id),
+            purpose="ld-seed",
         ),
-        max_parallel=max_parallel_analysis,
+        gen_seed=concrete_gromacs_seed(
+            gen_seed,
+            run_identity=str(seed_run_id),
+            purpose="gen-seed",
+        ),
+        genion_seed=concrete_gromacs_seed(
+            genion_seed,
+            run_identity=str(seed_run_id),
+            purpose="genion-seed",
+            random_sentinel=0,
+        ),
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
     )
-
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
+    )
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    submit_staged_execution_run(
+        CONF.output_volume,
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
+        workload_name=CONF.name,
+        restart_kwargs={
+            "workload_plan_fingerprint": (
+                request.execution_plan.workload_plan_fingerprint
+            ),
+            "max_active_provider_calls": request.max_active_provider_calls,
+            "max_active_gpu_provider_calls": (request.max_active_gpu_provider_calls),
+        },
+    )
+    remote_workdir = str(Path(CONF.output_volume_mountpoint) / run_name)
     remote_vol = volume_path_from_mount_path(
         remote_workdir, CONF.output_volume_mountpoint, CONF.output_volume_name
     )

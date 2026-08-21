@@ -23,17 +23,6 @@ from typing import Any, ClassVar, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeHandle,
-    append_log,
-    artifact_record,
-    json_bytes,
-    require_regular_file,
-    sha256_bytes,
-    sha256_file,
-    utc_now,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -79,6 +68,17 @@ from biomodals.app.fold.alphafold3.sharding import (
     scan_record_multiset,
     shuffle_fasta_occurrences,
     verify_file,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    append_log,
+    artifact_record,
+    json_bytes,
+    require_regular_file,
+    sha256_bytes,
+    sha256_file,
+    utc_now,
+    write_json_atomic,
 )
 
 _JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE

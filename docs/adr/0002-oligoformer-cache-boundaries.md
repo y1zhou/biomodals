@@ -1,5 +1,9 @@
 # Split OligoFormer immutable assets from run intermediates
 
+Status: accepted for cache ownership. Execution mechanics are superseded by
+[ADR 0003](0003-oligoformer-off-target-tile-manifest.md) and
+[ADR 0006](0006-unified-execution-kernel.md).
+
 OligoFormer performance work will keep immutable upstream assets in the standard
 model volume and store run-specific cached intermediates in the app output
 volume. RNA-FM weights and full-human off-target references belong in the model
@@ -76,15 +80,9 @@ outputs. That is preferable to running the full upstream pipeline and then
 reverse-engineering partial state because it gives Modal a clear GPU/CPU
 boundary while keeping upstream file formats as the contract.
 
-The local entrypoint will orchestrate the GPU efficacy function and the CPU
-post-processing function as separate remote calls. GPU functions should not own
-downstream CPU scheduling in the first split; keeping orchestration local makes
-each function single-purpose and keeps retry behavior visible at the app
-boundary. For full-human off-target runs, the local entrypoint starts reusable
-RNAplfold reference preparation and GPU efficacy concurrently after model and
-reference readiness is established. It waits for both before starting
-post-processing. If efficacy or merged human off-target evidence is already
-ready, the entrypoint skips the corresponding model or reference setup.
+The deployment-local execution coordinator owns GPU/CPU ordering and
+concurrency. Provider functions remain single-purpose and do not schedule
+downstream work.
 
 Concurrent evidence variants can share an efficacy key, and concurrent
 final-table variants can share an evidence key. Efficacy, evidence, and

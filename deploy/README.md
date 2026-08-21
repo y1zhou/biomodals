@@ -13,7 +13,7 @@ All three examples:
 - keep durable SQLite state separate from the rebuildable Result cache; and
 - contain only boot-critical process settings, so the Modal Environment, App
   name, exact App deployment version, and admission limits remain editable in
-  the Admin interface.
+  the Admin interface, together with per-Tool Job-log visibility.
 
 Replace every Modal token placeholder before starting a service. The backend
 refuses to start when either credential is missing.
@@ -80,4 +80,4 @@ Do not run `systemctl enable` on the generated service.
 For all three options, wait for
 `http://127.0.0.1:4100/api/v1/ready` before exposing a release. The
 [deployment runbook](../docs/deployment/mvp-runbook.md) covers the frontend
-proxy, pre-release isolation, verification, and rollback.
+proxy, pre-release schema transition, isolation, verification, and rollback.

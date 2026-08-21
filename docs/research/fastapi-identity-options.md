@@ -1,7 +1,8 @@
 # FastAPI identity design for Biomodals
 
-Status: superseded by `api-service-architecture.md`; retained as decision
-research for the implemented identity boundary
+Status: superseded by
+[API service architecture](api-service-architecture.md); retained only as
+decision history for the implemented identity boundary.
 
 Decision date: 2026-07-16
 

@@ -1,23 +1,29 @@
 """Executable workflow scripts and public workflow runtime types."""
 
-from biomodals.workflow.core import (
-    AppBackedNode,
+from biomodals.execution import (
+    CoordinatorNode,
+    ExecutionDefinition,
+    ExecutionGraph,
+    ExecutionNode,
+    ExecutionNodeSpec,
     NodeHandle,
     NodeRunContext,
-    Workflow,
-    WorkflowDefinition,
-    WorkflowNativeNode,
-    WorkflowNode,
-    WorkflowNodeSpec,
+    ProviderCallSpec,
+    ProviderNode,
+    TaskDefinition,
+    TaskProviderNode,
 )
 
 __all__ = [
-    "AppBackedNode",
+    "CoordinatorNode",
+    "ExecutionDefinition",
+    "ExecutionGraph",
+    "ExecutionNode",
+    "ExecutionNodeSpec",
     "NodeHandle",
     "NodeRunContext",
-    "Workflow",
-    "WorkflowDefinition",
-    "WorkflowNativeNode",
-    "WorkflowNode",
-    "WorkflowNodeSpec",
+    "ProviderCallSpec",
+    "ProviderNode",
+    "TaskDefinition",
+    "TaskProviderNode",
 ]

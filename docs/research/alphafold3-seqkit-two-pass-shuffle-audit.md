@@ -1,5 +1,8 @@
 # SeqKit two-pass shuffle audit for AlphaFold 3 databases
 
+Status: historical implementation evidence supporting
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
+
 Date: 2026-07-24
 
 Scope: SeqKit `v2.13.0` at commit

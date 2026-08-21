@@ -6,8 +6,10 @@ import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.execution import RunStatus
 
 
 def test_analysis_csv_preserves_the_established_checkpoint_format(
@@ -83,34 +85,83 @@ def test_gromacs_declares_workflow_expected_files() -> None:
     ]
 
 
-def test_submit_gromacs_task_keeps_single_run_standalone_flow(
+def test_gromacs_preparation_rebuilds_an_incomplete_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_name = "demo"
+    run_root = tmp_path / run_name
+    run_root.mkdir()
+    (run_root / f"production_{run_name}.tpr").write_bytes(b"tpr")
+    (run_root / "production.mdp").write_bytes(b"mdp")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "prepare-tpr.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    calls = []
+
+    def run_command(command, **kwargs):
+        assert not (run_root / f"production_{run_name}.tpr").exists()
+        calls.append((command, kwargs))
+        for relative_path in gromacs_app.preparation_execution_paths(run_name):
+            (run_root / relative_path).write_bytes(b"result")
+
+    monkeypatch.setattr(
+        gromacs_app.CONF,
+        "output_volume_mountpoint",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        gromacs_app.CONF,
+        "output_volume",
+        SimpleNamespace(commit=lambda: None),
+    )
+    monkeypatch.setattr(gromacs_app.APP_INFO, "gmx_scripts", str(scripts))
+    monkeypatch.setattr(gromacs_app, "run_command", run_command)
+
+    gromacs_app.prepare_tpr_gpu.get_raw_f()(
+        pdb_content=b"ATOM\n",
+        run_name=run_name,
+    )
+
+    assert len(calls) == 1
+
+
+def test_submit_gromacs_task_launches_one_remote_execution_coordinator(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     pdb_path = tmp_path / "input.pdb"
     pdb_path.write_text("ATOM\n", encoding="utf-8")
-    prepare_kwargs = {}
-    production_kwargs = {}
-    analysis_stats = []
+    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    staged = {}
+    launched = {}
 
-    class FakePrepare:
-        def remote(self, **kwargs):
-            prepare_kwargs.update(kwargs)
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/single"
+    class FakeMethod:
+        def spawn(self, **kwargs):
+            launched["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                object_id="fc-1",
+                get=lambda: SimpleNamespace(
+                    run=SimpleNamespace(
+                        status=RunStatus.SUCCEEDED,
+                        status_message=None,
+                        status_reason=None,
+                    )
+                ),
+            )
 
-    class FakeProduction:
-        def remote(self, **kwargs):
-            production_kwargs.update(kwargs)
-            return f"{gromacs_app.CONF.output_volume_mountpoint}/single"
+    def stage(volume, run_id, request):
+        staged.update(volume=volume, run_id=run_id, request=request)
 
-    class FakeStats:
-        def remote(self, traj_prefix, **kwargs):
-            analysis_stats.append((traj_prefix, kwargs))
-            return f"stats-{traj_prefix}"
-
-    monkeypatch.setattr(gromacs_app, "prepare_tpr_cpu", FakePrepare())
-    monkeypatch.setattr(gromacs_app, "production_run_cpu", FakeProduction())
-    monkeypatch.setattr(gromacs_app, "collect_traj_stats", FakeStats())
+    monkeypatch.setattr(gromacs_app, "uuid4", lambda: execution_run_id)
+    monkeypatch.setattr(gromacs_app, "stage_execution_request", stage)
+    monkeypatch.setattr(
+        gromacs_app,
+        "submit_staged_execution_run",
+        lambda volume, **kwargs: (
+            launched.update(submit=(volume, kwargs)) or FakeMethod().spawn().get()
+        ),
+    )
 
     submit_task_info = gromacs_app.submit_gromacs_task.info
     assert submit_task_info is not None
@@ -124,22 +175,20 @@ def test_submit_gromacs_task_keeps_single_run_standalone_flow(
         num_threads=2,
     )
 
-    assert prepare_kwargs["run_name"] == "single"
-    assert prepare_kwargs["pdb_content"] == b"ATOM\n"
-    assert production_kwargs == {
-        "run_name": "single",
-        "simulation_time_ns": 3,
-        "num_threads": 2,
-        "use_openmp_threads": False,
-    }
-    assert analysis_stats == [
-        ("nvt_", {"run_name": "single"}),
-        ("npt_", {"run_name": "single"}),
-        (
-            "production_",
-            {"run_name": "single", "save_processed_traj": True},
-        ),
-    ]
+    request = staged["request"]
+    assert staged["run_id"] == execution_run_id
+    assert request.run_name == "single"
+    assert request.pdb_content == b"ATOM\n"
+    assert request.simulation_time_ns == 3
+    assert request.ld_seed != -1
+    assert request.gen_seed != -1
+    assert request.num_threads == 2
+    assert request.max_active_provider_calls == 3
+    assert request.max_active_gpu_provider_calls == 0
+    _, submit_kwargs = launched["submit"]
+    assert submit_kwargs["execution_run_id"] == execution_run_id
+    assert submit_kwargs["predecessor_execution_run_id"] is None
+    assert submit_kwargs["use_deployed_coordinator"] is False
 
 
 def test_prepare_tpr_cpu_stages_input_with_app_run_layout(

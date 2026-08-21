@@ -50,6 +50,8 @@ def run_upstream_seed_worker(
     recycle: int,
     sample_count: int,
     claimed_seeds: tuple[ClaimedSeed, ...],
+    *,
+    allow_large_inference: bool = False,
 ) -> dict[str, object]:
     """Run and marker-last publish one disjoint upstream seed group."""
     validate_inference_parameters(recycle, sample_count)
@@ -59,7 +61,11 @@ def run_upstream_seed_worker(
         base_config.modelSeeds
     ):
         raise ValueError("Claimed seeds must belong to the staged request")
-    validate_inference_workload(claimed_seed_values, sample_count)
+    validate_inference_workload(
+        claimed_seed_values,
+        sample_count,
+        allow_large_inference=allow_large_inference,
+    )
 
     def execute(
         worker_root: Path,

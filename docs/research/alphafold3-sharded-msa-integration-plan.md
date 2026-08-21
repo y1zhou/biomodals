@@ -2,6 +2,11 @@
 
 Status: implemented.
 
+Historical note: the experiments below use the former
+`max_parallel_search_workers` and `max_num_gpus` names. Current launches use
+the run-wide `--max-containers` and `--max-gpu-containers` CLI options defined
+by ADR 0006; the measurements and scientific conclusions remain applicable.
+
 Scope: this document records the experiments that matured the sharding method
 and its integration into `src/biomodals/app/fold/alphafold3_app.py` and the
 production modules under `src/biomodals/app/fold/alphafold3/`.
@@ -872,9 +877,10 @@ IDs, letter-only polymer sequences, modification-code prefix rules, at most 20
 protein templates, and nonempty unsigned 32-bit model seeds. Inference workers
 repeat this preflight before launching upstream. A request is capped at 1,000
 model seeds, while the accumulated summary may exceed that total across
-requests. Recycles, diffusion samples, and GPU workers are bounded at 0--100,
-1--100, and 1--100 respectively; the inference worker repeats the recycle and
-sample checks.
+requests. The seed/sample fan-out is capped at 5,000 by default; an explicit
+large-inference override warns before allowing a larger request. Recycles,
+diffusion samples, and GPU workers are bounded at 0--100, 1--100, and 1--100
+respectively; the inference worker repeats the recycle and sample checks.
 
 After enrichment, the module validates and explicitly dumps the complete
 input, removes only `name` and `modelSeeds`, and represents every inline

@@ -26,7 +26,6 @@ FlowpackerStep_stage1:
 AF3scoreStep_stage1:
   run_name: ppiflow_5b8c_vhh_stage1_af3score
   max_structures: 3
-  num_jobs: 1
   prepare_workers: 1
 
 FilterStep_stage1:
@@ -37,7 +36,6 @@ RosettaFixStep:
   run_name: ppiflow_5b8c_vhh_rosetta_fix
   max_structures: 3
   rosetta_binary: relax
-  max_num_pods: 1
 
 FixedPositions:
   fixed_positions: A26,A27,A28
@@ -71,7 +69,6 @@ FlowpackerStep_stage2:
 AF3scoreStep_stage2:
   run_name: ppiflow_5b8c_vhh_stage2_af3score
   max_structures: 3
-  num_jobs: 1
   prepare_workers: 1
 
 FilterStep_stage2:
@@ -95,7 +92,6 @@ RosettaRelaxStep:
   run_name: ppiflow_5b8c_vhh_rosetta_relax
   max_structures: 3
   rosetta_binary: relax
-  max_num_pods: 1
 
 RankStep:
   dockq_threshold: 0.0

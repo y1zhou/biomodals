@@ -1,0 +1,1256 @@
+"""Tests for local execution artifact materialization."""
+
+# ruff: noqa: D103
+
+from hashlib import sha256
+from pathlib import Path
+
+import pytest
+
+from biomodals.execution import AvailabilityStatus, ContentBoundFileSet
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    check_artifact_availability,
+    mounted_volume_checker,
+)
+from biomodals.execution.artifacts import (
+    execution_artifact_availability_errors,
+    materialize_app_run_result,
+)
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactFile,
+    ArtifactKind,
+    ExecutionArtifact,
+    InlineBytes,
+    VolumePath,
+)
+
+
+def test_content_bound_file_set_round_trips_exact_manifest(tmp_path: Path) -> None:
+    output = tmp_path / "result.txt"
+    output.write_bytes(b"result")
+    publication = ContentBoundFileSet(
+        root=tmp_path,
+        marker_path=tmp_path / ".publication.json",
+        expected_paths=("result.txt",),
+        identity={"task": "example"},
+    )
+    files = (
+        ArtifactFile(
+            path="result.txt",
+            size_bytes=6,
+            content_sha256=sha256(b"result").hexdigest(),
+        ),
+    )
+
+    publication.write(files)
+
+    assert publication.load() == files
+    output.write_bytes(b"broken")
+    assert publication.load() is None
+
+
+def test_content_bound_file_set_rejects_incomplete_manifest(tmp_path: Path) -> None:
+    publication = ContentBoundFileSet(
+        root=tmp_path,
+        marker_path=tmp_path / ".publication.json",
+        expected_paths=("result.txt",),
+        identity={"task": "example"},
+    )
+
+    with pytest.raises(ValueError, match="expected file set"):
+        publication.write((ArtifactFile(path="other.txt"),))
+
+
+def test_materialize_inline_bytes_writes_one_result_artifact_copy(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="summary.txt"),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "nodes" / "summary" / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="summary",
+        volume_root=tmp_path,
+    )
+
+    artifacts = materialized.artifacts
+    output_path = (
+        tmp_path / "nodes" / "summary" / "result" / "summary-summary" / "summary.txt"
+    )
+    assert not (tmp_path / "nodes" / "summary" / "result" / "raw_outputs").exists()
+    assert not (
+        tmp_path / "nodes" / "summary" / "result" / "materialized_outputs"
+    ).exists()
+    assert output_path.read_bytes() == b"ok\n"
+    assert artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="nodes/summary/result/summary-summary/summary.txt",
+    )
+    assert materialized.result.outputs[0].storage == artifacts[0].storage
+    assert artifacts[0].files[0].path == "summary.txt"
+    assert (tmp_path / "artifacts" / "summary-summary.json").exists()
+
+
+def test_task_scope_keeps_repeated_output_names_distinct(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="structure",
+                kind=ArtifactKind.STRUCTURES,
+                storage=InlineBytes(data=b"ATOM\n", filename="model.pdb"),
+            )
+        ],
+    )
+
+    first = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "candidate-a",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="design",
+        artifact_id_scope="candidate-a",
+        volume_root=tmp_path,
+    )
+    second = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "candidate-b",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="design",
+        artifact_id_scope="candidate-b",
+        volume_root=tmp_path,
+    )
+
+    assert first.artifacts[0].artifact_id == "design-candidate-a-structure"
+    assert second.artifacts[0].artifact_id == "design-candidate-b-structure"
+    assert first.artifacts[0].source_app_output_name == "structure"
+    assert second.artifacts[0].source_app_output_name == "structure"
+
+
+def test_long_scoped_artifact_ids_use_a_bounded_digest(tmp_path: Path) -> None:
+    output_name = "x" * 165
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name=output_name,
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="result.txt"),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="fanout",
+        artifact_id_scope="s" * 97,
+        volume_root=tmp_path,
+    )
+
+    [artifact] = materialized.artifacts
+    assert artifact.artifact_id.startswith("artifact-")
+    assert len(artifact.artifact_id.encode()) <= 200
+    assert artifact.source_app_output_name == output_name
+    assert (tmp_path / "artifacts" / f"{artifact.artifact_id}.json").is_file()
+
+
+def test_inline_filename_rejects_an_overlong_component(tmp_path: Path) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="x" * 256),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="filename exceeds"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="summary",
+            volume_root=tmp_path,
+        )
+
+    assert not (tmp_path / "result").exists()
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_execution_artifact_availability_accepts_existing_workflow_file(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "run" / "summary.txt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("ok\n", encoding="utf-8")
+    artifact = ExecutionArtifact(
+        artifact_id="summary-report",
+        producing_node_id="summary",
+        kind=ArtifactKind.REPORT,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/summary.txt",
+        ),
+        files=[
+            ArtifactFile(
+                path="summary.txt",
+                size_bytes=output_path.stat().st_size,
+            )
+        ],
+    )
+
+    assert (
+        execution_artifact_availability_errors(
+            artifact,
+            artifact_volume_name="Workflow-outputs",
+            volume_root=tmp_path,
+        )
+        == []
+    )
+
+
+def test_execution_artifact_availability_rejects_same_size_corruption(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "run" / "model.pdb"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"HACK\n")
+    artifact = ExecutionArtifact(
+        artifact_id="ranked-structure",
+        producing_node_id="rank",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/model.pdb",
+        ),
+        files=[
+            ArtifactFile(
+                path="model.pdb",
+                size_bytes=5,
+                content_sha256=sha256(b"ATOM\n").hexdigest(),
+            )
+        ],
+    )
+
+    errors = execution_artifact_availability_errors(
+        artifact,
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "SHA-256" in errors[0]
+
+
+def test_execution_artifact_availability_rejects_empty_declared_file(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "run" / "empty.csv"
+    output_path.parent.mkdir(parents=True)
+    output_path.touch()
+    artifact = ExecutionArtifact(
+        artifact_id="empty-table",
+        producing_node_id="table",
+        kind=ArtifactKind.TABLE,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/empty.csv",
+        ),
+        files=[ArtifactFile(path="empty.csv")],
+    )
+
+    errors = execution_artifact_availability_errors(
+        artifact,
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "empty" in errors[0]
+
+
+def test_execution_artifact_availability_reports_missing_workflow_file(
+    tmp_path: Path,
+) -> None:
+    artifact = ExecutionArtifact(
+        artifact_id="summary-report",
+        producing_node_id="summary",
+        kind=ArtifactKind.REPORT,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/summary.txt",
+        ),
+    )
+
+    errors = execution_artifact_availability_errors(
+        artifact,
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "summary-report" in errors[0]
+    assert "run/summary.txt" in errors[0]
+
+
+def test_execution_artifact_availability_reports_missing_manifest_child(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "run" / "outputs"
+    output_dir.mkdir(parents=True)
+    artifact = ExecutionArtifact(
+        artifact_id="design-structures",
+        producing_node_id="design",
+        kind=ArtifactKind.STRUCTURES,
+        storage=VolumePath(
+            volume_name="Workflow-outputs",
+            path="run/outputs",
+        ),
+        files=[ArtifactFile(path="model.pdb")],
+    )
+
+    errors = execution_artifact_availability_errors(
+        artifact,
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert len(errors) == 1
+    assert "model.pdb" in errors[0]
+
+
+def test_execution_artifact_availability_skips_unmounted_external_volumes(
+    tmp_path: Path,
+) -> None:
+    artifact = ExecutionArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    assert (
+        execution_artifact_availability_errors(
+            artifact,
+            artifact_volume_name="Workflow-outputs",
+            volume_root=tmp_path,
+        )
+        == []
+    )
+
+
+def test_typed_artifact_availability_reports_unknown_external_without_checker(
+    tmp_path: Path,
+) -> None:
+    artifact = ExecutionArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    availability = check_artifact_availability(
+        artifact,
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+
+    assert availability.status == AvailabilityStatus.UNKNOWN
+    assert availability.errors == ()
+    assert availability.unknown_reason == (
+        "external volume 'RFdiffusion-outputs' was not checked"
+    )
+
+
+def test_typed_artifact_availability_reports_unknown_when_checker_fails(
+    tmp_path: Path,
+) -> None:
+    artifact = ExecutionArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    def broken_checker(_artifact: ExecutionArtifact) -> ArtifactAvailability:
+        raise RuntimeError("volume unavailable")
+
+    availability = check_artifact_availability(
+        artifact,
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+        external_artifact_checker=broken_checker,
+    )
+
+    assert availability.status == AvailabilityStatus.UNKNOWN
+    assert availability.errors == ()
+    assert availability.unknown_reason == (
+        "rfd-output: external artifact checker failed: volume unavailable"
+    )
+
+
+def test_external_mounted_volume_checker_validates_app_volume_artifacts(
+    tmp_path: Path,
+) -> None:
+    app_volume = tmp_path / "app-volume"
+    app_output = app_volume / "run" / "outputs"
+    app_output.mkdir(parents=True)
+    app_output.joinpath("model.pdb").write_text("ATOM\n", encoding="utf-8")
+    checker = mounted_volume_checker(
+        artifact_volume_name="Workflow-outputs",
+        volume_roots={"RFdiffusion-outputs": app_volume},
+    )
+    artifact = ExecutionArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+        files=[ArtifactFile(path="model.pdb")],
+    )
+
+    availability = checker(artifact)
+
+    assert availability.status == AvailabilityStatus.AVAILABLE
+    assert availability.errors == ()
+
+
+def test_external_mounted_volume_checker_reports_missing_app_volume_artifacts(
+    tmp_path: Path,
+) -> None:
+    checker = mounted_volume_checker(
+        artifact_volume_name="Workflow-outputs",
+        volume_roots={"RFdiffusion-outputs": tmp_path / "app-volume"},
+    )
+    artifact = ExecutionArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    availability = checker(artifact)
+
+    assert availability.status == AvailabilityStatus.MISSING
+    assert len(availability.errors) == 1
+    assert "missing execution artifact path run/outputs" in availability.errors[0]
+
+
+def test_external_mounted_volume_checker_reports_unknown_unmounted_volume(
+    tmp_path: Path,
+) -> None:
+    checker = mounted_volume_checker(
+        artifact_volume_name="Workflow-outputs",
+        volume_roots={},
+    )
+    artifact = ExecutionArtifact(
+        artifact_id="rfd-output",
+        producing_node_id="rfd",
+        kind=ArtifactKind.DIRECTORY,
+        storage=VolumePath(
+            volume_name="RFdiffusion-outputs",
+            path="run/outputs",
+        ),
+    )
+
+    availability = checker(artifact)
+
+    assert availability.status == AvailabilityStatus.UNKNOWN
+    assert availability.errors == ()
+    assert availability.unknown_reason == (
+        "rfd-output: missing mounted volume root for external volume "
+        "'RFdiffusion-outputs'"
+    )
+
+
+def test_volume_path_reference_output_records_expected_files_from_metadata(
+    tmp_path: Path,
+) -> None:
+    app_volume = tmp_path / "app-volume"
+    app_output = app_volume / "run" / "outputs"
+    app_output.mkdir(parents=True)
+    app_output.joinpath("model.pdb").write_text("ATOM\n", encoding="utf-8")
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="rfd-output",
+                kind=ArtifactKind.DIRECTORY,
+                storage=VolumePath(
+                    volume_name="RFdiffusion-outputs",
+                    path="run/outputs",
+                ),
+                metadata={"files": [{"path": "model.pdb", "role": "structure"}]},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "nodes" / "rfd" / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="rfd",
+        volume_root=tmp_path,
+    )
+
+    artifact = materialized.artifacts[0]
+    assert artifact.files == [ArtifactFile(path="model.pdb", role="structure")]
+
+    app_output.joinpath("model.pdb").unlink()
+    checker = mounted_volume_checker(
+        artifact_volume_name="Workflow-outputs",
+        volume_roots={"RFdiffusion-outputs": app_volume},
+    )
+
+    availability = checker(artifact)
+
+    assert availability.status == AvailabilityStatus.MISSING
+    assert len(availability.errors) == 1
+    assert (
+        "missing execution artifact file run/outputs/model.pdb"
+        in availability.errors[0]
+    )
+
+
+def test_materialized_inline_artifact_path_is_volume_relative(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "demo" / "run-1"
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="summary.txt"),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=run_root / "nodes" / "summary" / "result",
+        artifact_dir=run_root / "artifacts",
+        producing_node_id="summary",
+        volume_root=tmp_path,
+    )
+
+    assert materialized.artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path=("demo/run-1/nodes/summary/result/summary-summary/summary.txt"),
+    )
+
+
+def test_materialize_inline_bytes_preserves_output_metadata(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=b"ok\n", filename="summary.txt"),
+                metadata={"stage": "stage1"},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="summary",
+        volume_root=tmp_path,
+    )
+
+    assert materialized.artifacts[0].metadata == {"stage": "stage1"}
+    assert materialized.result.outputs[0].metadata == {"stage": "stage1"}
+
+
+def test_materialize_app_run_result_persists_log_outputs_under_result_logs(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        logs=[
+            AppOutput(
+                name="stderr",
+                kind=ArtifactKind.LOGS,
+                storage=InlineBytes(data=b"warning\n", filename="stderr.log"),
+                metadata={"stream": "stderr"},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="node",
+        volume_root=tmp_path,
+    )
+
+    log_path = tmp_path / "result" / "logs" / "node-logs-stderr" / "stderr.log"
+    assert not (tmp_path / "result" / "logs" / "raw_outputs").exists()
+    assert log_path.read_bytes() == b"warning\n"
+    artifacts = materialized.artifacts
+    assert artifacts[0].kind == ArtifactKind.LOGS
+    assert artifacts[0].source_app_output_name == "stderr"
+    assert artifacts[0].metadata == {"stream": "stderr"}
+    assert artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="result/logs/node-logs-stderr/stderr.log",
+    )
+    assert materialized.result.logs[0].storage == artifacts[0].storage
+    assert (tmp_path / "artifacts" / "node-logs-stderr.json").exists()
+
+
+def test_materialize_volume_path_references_existing_remote_output(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="AF3Score-outputs",
+                    path="run-1/af3score_metrics.csv",
+                ),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="score",
+    )
+
+    assert materialized.artifacts[0].storage == VolumePath(
+        volume_name="AF3Score-outputs",
+        path="run-1/af3score_metrics.csv",
+    )
+    assert materialized.result.outputs[0].storage == materialized.artifacts[0].storage
+    assert (tmp_path / "artifacts" / "score-scores.json").exists()
+
+
+def test_artifact_volume_reference_records_content_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "run-1" / "scores.csv"
+    output_path.parent.mkdir()
+    output_path.write_bytes(b"score\n1\n")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.execution.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1/scores.csv",
+                ),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="score",
+        volume_root=tmp_path,
+    )
+
+    [file] = materialized.artifacts[0].files
+    assert file == ArtifactFile(
+        path="scores.csv",
+        size_bytes=len(b"score\n1\n"),
+        content_sha256=sha256(b"score\n1\n").hexdigest(),
+    )
+    assert hashed == ["scores.csv"]
+    output_path.write_bytes(b"score\n2\n")
+    errors = execution_artifact_availability_errors(
+        materialized.artifacts[0],
+        artifact_volume_name="Workflow-outputs",
+        volume_root=tmp_path,
+    )
+    assert len(errors) == 1
+    assert "SHA-256" in errors[0]
+
+
+def test_artifact_volume_reference_enriches_declared_file(tmp_path: Path) -> None:
+    output_path = tmp_path / "run-1" / "model.pdb"
+    output_path.parent.mkdir()
+    output_path.write_bytes(b"ATOM\n")
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+                metadata={"files": [{"path": "model.pdb", "role": "structure"}]},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="models",
+        volume_root=tmp_path,
+    )
+
+    assert materialized.artifacts[0].files == [
+        ArtifactFile(
+            path="model.pdb",
+            role="structure",
+            size_bytes=len(b"ATOM\n"),
+            content_sha256=sha256(b"ATOM\n").hexdigest(),
+        )
+    ]
+
+
+def test_artifact_volume_reference_hashes_only_declared_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run-1"
+    output_dir.mkdir()
+    (output_dir / "model.pdb").write_bytes(b"ATOM\n")
+    (output_dir / "unrelated.bin").write_bytes(b"large unrelated payload")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.execution.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="structures",
+                kind=ArtifactKind.STRUCTURES,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+                metadata={
+                    "files": [
+                        {
+                            "path": "model.pdb",
+                            "size_bytes": len(b"ATOM\n"),
+                            "content_sha256": sha256(b"ATOM\n").hexdigest(),
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+
+    materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="models",
+        volume_root=tmp_path,
+    )
+
+    assert hashed == ["model.pdb"]
+
+
+def test_partial_and_mixed_reference_manifests_hash_each_file_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run-1"
+    output_dir.mkdir()
+    (output_dir / "model.pdb").write_bytes(b"ATOM\n")
+    (output_dir / "scores.csv").write_bytes(b"score\n1\n")
+    hashed: list[str] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path.name)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.execution.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="results",
+                kind=ArtifactKind.DIRECTORY,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+                metadata={
+                    "files": [
+                        {
+                            "path": "model.pdb",
+                            "size_bytes": len(b"ATOM\n"),
+                        },
+                        {
+                            "path": "scores.csv",
+                            "size_bytes": len(b"score\n1\n"),
+                            "content_sha256": sha256(b"score\n1\n").hexdigest(),
+                        },
+                    ]
+                },
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="results",
+        volume_root=tmp_path,
+    )
+
+    assert hashed == ["model.pdb", "scores.csv"]
+    assert all(
+        file.size_bytes is not None and file.content_sha256 is not None
+        for file in materialized.artifacts[0].files
+    )
+
+
+def test_artifact_volume_reference_rejects_symlink_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "run-1"
+    output_dir.mkdir()
+    secret = tmp_path.with_name(f"{tmp_path.name}-secret.bin")
+    secret.write_bytes(b"secret")
+    (output_dir / "leak.bin").symlink_to(secret)
+    hashed: list[Path] = []
+
+    def record_sha256(path: Path) -> str:
+        hashed.append(path)
+        return sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(
+        "biomodals.execution.artifacts._file_sha256",
+        record_sha256,
+    )
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="directory",
+                kind=ArtifactKind.DIRECTORY,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="directory",
+            volume_root=tmp_path,
+        )
+
+    assert hashed == []
+
+
+def test_materialize_volume_path_rejects_missing_artifact_volume_reference(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="summary",
+                kind=ArtifactKind.REPORT,
+                storage=VolumePath(
+                    volume_name="Workflow-outputs",
+                    path="run-1/summary.md",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(FileNotFoundError, match="summary-summary"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="summary",
+            volume_root=tmp_path,
+        )
+
+
+def test_materialize_volume_path_can_copy_from_mounted_volume(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-volume"
+    source_dir = source_root / "runs" / "run-1"
+    source_dir.mkdir(parents=True)
+    source_dir.joinpath("scores.csv").write_text("score\n1\n", encoding="utf-8")
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="AF3Score-outputs",
+                    path="runs/run-1",
+                ),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "workflow" / "result",
+        artifact_dir=tmp_path / "workflow" / "artifacts",
+        producing_node_id="score",
+        volume_root=tmp_path / "workflow",
+        volume_path_mode="copy",
+        volume_roots={"AF3Score-outputs": source_root},
+    )
+
+    copied_file = tmp_path / "workflow" / "result" / "score-scores" / "scores.csv"
+    assert copied_file.read_text(encoding="utf-8") == "score\n1\n"
+    artifacts = materialized.artifacts
+    assert artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="result/score-scores",
+    )
+    assert materialized.result.outputs[0].storage == artifacts[0].storage
+    assert artifacts[0].files[0].path == "scores.csv"
+
+
+def test_materialize_volume_path_copy_preserves_empty_directories(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-volume"
+    source_dir = source_root / "runs" / "run-1"
+    source_dir.mkdir(parents=True)
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="AF3Score-outputs",
+                    path="runs/run-1",
+                ),
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "workflow" / "result",
+        artifact_dir=tmp_path / "workflow" / "artifacts",
+        producing_node_id="score",
+        volume_root=tmp_path / "workflow",
+        volume_path_mode="copy",
+        volume_roots={"AF3Score-outputs": source_root},
+    )
+
+    materialized_dir = tmp_path / "workflow" / "result" / "score-scores"
+    assert materialized_dir.is_dir()
+    assert materialized.artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="result/score-scores",
+    )
+
+
+def test_materialize_volume_path_copy_rejects_traversal(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-volume"
+    source_root.mkdir()
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath.model_construct(
+                    kind="volume_path",
+                    volume_name="AF3Score-outputs",
+                    path="../secret.csv",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="relative"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "workflow" / "result",
+            artifact_dir=tmp_path / "workflow" / "artifacts",
+            producing_node_id="score",
+            volume_root=tmp_path / "workflow",
+            volume_path_mode="copy",
+            volume_roots={"AF3Score-outputs": source_root},
+        )
+
+
+def test_materialize_volume_path_copy_rejects_symlinked_children(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-volume"
+    source_dir = source_root / "runs" / "run-1"
+    source_dir.mkdir(parents=True)
+    source_dir.joinpath("scores.csv").write_text("score\n1\n", encoding="utf-8")
+    secret = tmp_path / "secret.csv"
+    secret.write_text("secret\n", encoding="utf-8")
+    source_dir.joinpath("secret-link.csv").symlink_to(secret)
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="AF3Score-outputs",
+                    path="runs/run-1",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "workflow" / "result",
+            artifact_dir=tmp_path / "workflow" / "artifacts",
+            producing_node_id="score",
+            volume_root=tmp_path / "workflow",
+            volume_path_mode="copy",
+            volume_roots={"AF3Score-outputs": source_root},
+        )
+
+
+def test_materialize_volume_path_copy_rejects_symlink_path_component(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-volume"
+    real_dir = source_root / "real-run"
+    real_dir.mkdir(parents=True)
+    real_dir.joinpath("scores.csv").write_text("score\n1\n", encoding="utf-8")
+    source_root.joinpath("linked-run").symlink_to(real_dir, target_is_directory=True)
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="scores",
+                kind=ArtifactKind.SCORES,
+                storage=VolumePath(
+                    volume_name="AF3Score-outputs",
+                    path="linked-run",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="symlinks"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "workflow" / "result",
+            artifact_dir=tmp_path / "workflow" / "artifacts",
+            producing_node_id="score",
+            volume_root=tmp_path / "workflow",
+            volume_path_mode="copy",
+            volume_roots={"AF3Score-outputs": source_root},
+        )
+
+
+def test_materialize_inline_bytes_rejects_non_utf8_bytes(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult.model_construct(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput.model_construct(
+                name="archive",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes.model_construct(
+                    data=b"\xff\x00",
+                    filename="archive.tar.zst",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="UTF-8 text"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="Workflow-outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="pack",
+        )
+
+
+def test_materialize_inline_zstd_archive_preserves_binary_bytes(
+    tmp_path: Path,
+) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="archive",
+                kind=ArtifactKind.ARCHIVE,
+                storage=InlineBytes(
+                    data=b"\xff\x00",
+                    filename="archive.tar.zst",
+                    media_type="application/zstd",
+                ),
+                metadata={"archive_format": "tar.zst"},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="pack",
+        volume_root=tmp_path,
+    )
+
+    output_path = tmp_path / "result" / "pack-archive" / "archive.tar.zst"
+    assert not (tmp_path / "result" / "raw_outputs").exists()
+    assert not (tmp_path / "result" / "materialized_outputs").exists()
+    assert output_path.read_bytes() == b"\xff\x00"
+    artifacts = materialized.artifacts
+    assert artifacts[0].kind == ArtifactKind.ARCHIVE
+    assert artifacts[0].storage == VolumePath(
+        volume_name="Workflow-outputs",
+        path="result/pack-archive/archive.tar.zst",
+        media_type="application/zstd",
+    )
+    assert materialized.result.outputs[0].storage == artifacts[0].storage
+    assert artifacts[0].metadata == {"archive_format": "tar.zst"}
+
+
+def test_archive_outputs_use_volume_path_metadata(tmp_path: Path) -> None:
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="models",
+                kind=ArtifactKind.ARCHIVE,
+                storage=VolumePath(
+                    volume_name="FlowPacker-outputs",
+                    path="workflow/packed/outputs/packed.tar.zst",
+                    media_type="application/zstd",
+                ),
+                metadata={"archive_format": "tar.zst"},
+            )
+        ],
+    )
+
+    materialized = materialize_app_run_result(
+        result=result,
+        artifact_volume_name="Workflow-outputs",
+        result_dir=tmp_path / "result",
+        artifact_dir=tmp_path / "artifacts",
+        producing_node_id="pack",
+    )
+
+    artifacts = materialized.artifacts
+    assert artifacts[0].storage == VolumePath(
+        volume_name="FlowPacker-outputs",
+        path="workflow/packed/outputs/packed.tar.zst",
+        media_type="application/zstd",
+    )
+    assert materialized.result.outputs[0].storage == artifacts[0].storage
+    assert artifacts[0].metadata == {"archive_format": "tar.zst"}

@@ -11,15 +11,39 @@ the reusable Biomodals workflow runtime.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import modal
 
 from biomodals.app.bioinfo import gromacs_app
+from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
+from biomodals.execution import (
+    CoordinatorNode,
+    DeploymentIdentity,
+    ExecutionGraph,
+    NodeHandle,
+    NodeRunContext,
+    ProviderCallSpec,
+    ProviderNode,
+    republish_execution_artifact,
+)
+from biomodals.execution.artifact_availability import (
+    ArtifactAvailability,
+    check_external_artifact_status,
+)
+from biomodals.execution.definition_plan import app_scientific_version
+from biomodals.execution.modal import (
+    execution_lineage_root,
+    orchestrator,
+    resolve_provider_call_limits,
+    stage_execution_launch,
+)
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import volume_app_output
 from biomodals.helper.catalog import include_dependency_apps
@@ -30,28 +54,17 @@ from biomodals.schema import (
     AppOutput,
     AppRunResult,
     AppRunStatus,
+    ArtifactFile,
     ArtifactKind,
+    ExecutionArtifact,
     InlineBytes,
-    NodeExecutionPolicy,
-    NodePlacement,
     VolumePath,
-    WorkflowArtifact,
 )
-from biomodals.workflow.core import (
-    AppBackedNode,
-    NodeRunContext,
-    RemoteNodeSubmission,
-    Workflow,
-    WorkflowNativeNode,
-    orchestrator,
-    print_workflow_dag,
-)
-from biomodals.workflow.core.artifact_availability import (
-    ArtifactAvailability,
-    check_external_artifact_status,
-)
+from biomodals.workflow.display import print_workflow_dag
 
 DEPENDENCY_APPS = ("gromacs",)
+_SCIENTIFIC_SCHEMA_VERSION = "2"
+_MAX_GROMACS_RUN_NAME_BYTES = 180
 CONF = AppConfig(
     tags={"depends_on": "-".join(DEPENDENCY_APPS)},
     depends_on_apps=DEPENDENCY_APPS,
@@ -68,6 +81,7 @@ runtime_image = (
     .env(CONF.default_env)
     .pipe(patch_image_for_helper, include_workflow_modules=True)
 )
+analysis_image = gromacs_app.biotite_image.add_local_python_source("biomodals.workflow")
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags).include(
     orchestrator.app, inherit_tags=True
 )
@@ -84,12 +98,14 @@ GROMACS_OUTPUT_MOUNTPOINT = gromacs_app.CONF.output_volume_mountpoint
     timeout=CONF.timeout,
     volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
 )
-def check_shortmd_external_artifact(artifact: WorkflowArtifact) -> ArtifactAvailability:
+def check_shortmd_external_artifact(
+    artifact: ExecutionArtifact,
+) -> ArtifactAvailability:
     """Validate ShortMD artifacts stored in the GROMACS output volume."""
     GROMACS_OUTPUT_VOLUME.reload()
     return check_external_artifact_status(
         artifact,
-        workflow_volume_name=orchestrator.OUT_VOLUME_NAME,
+        artifact_volume_name=orchestrator.OUT_VOLUME_NAME,
         volume_roots={GROMACS_OUTPUT_VOLUME_NAME: GROMACS_OUTPUT_MOUNTPOINT},
     )
 
@@ -106,21 +122,7 @@ class ShortMDGromacsSettings:
     ld_seed: int = -1
     gen_seed: int = -1
     genion_seed: int = 0
-    save_processed_traj: bool = True
     make_figures: bool = True
-
-
-@dataclass(frozen=True)
-class WorkflowModalNamespace:
-    """Hydrated Modal objects carried across the orchestrator boundary."""
-
-    clear: modal.Function
-    clone: modal.Function
-    prepare_cpu: modal.Function
-    prepare_gpu: modal.Function
-    production_cpu: modal.Function
-    production_gpu: modal.Function
-    collect_stats: modal.Function
 
 
 @app.function(
@@ -194,6 +196,13 @@ def clone_prepared_shortmd_run(
         raise FileNotFoundError(f"Prepared production TPR not found: {source_tpr}")
     shutil.copy2(source_tpr, replicate_dir / f"production_{replicate_run_name}.tpr")
 
+    destination_mdp = replicate_dir / "production.mdp"
+    if not destination_mdp.exists():
+        source_mdp = source_dir / "production.mdp"
+        if not source_mdp.exists():
+            raise FileNotFoundError(f"Prepared production MDP not found: {source_mdp}")
+        shutil.copy2(source_mdp, destination_mdp)
+
     if created_clone:
         keep_tpr = f"production_{replicate_run_name}.tpr"
         for path in replicate_dir.glob("production_*"):
@@ -214,28 +223,120 @@ def clone_prepared_shortmd_run(
     return str(replicate_dir)
 
 
+def _content_bound_gromacs_files(
+    run_name: str,
+    *,
+    make_figures: bool,
+) -> list[ArtifactFile]:
+    """Return the final ShortMD file manifest with content identities."""
+    run_root = Path(GROMACS_OUTPUT_MOUNTPOINT) / sanitize_filename(run_name)
+    prefix = f"production_{run_name}"
+    declared_files = [
+        *gromacs_app.production_workflow_files(run_name),
+        ArtifactFile(path="production.mdp", role="production_parameters"),
+        ArtifactFile(path=f"{prefix}_nopbc.xtc", role="trajectory_no_pbc"),
+    ]
+    if make_figures:
+        declared_files.extend([
+            ArtifactFile(path=f"rmsd_{prefix}.png", role="rmsd_plot"),
+            ArtifactFile(path=f"rg_{prefix}.png", role="radius_of_gyration_plot"),
+            ArtifactFile(path=f"rmsf_{prefix}.png", role="rmsf_plot"),
+        ])
+    files = []
+    for declared in declared_files:
+        path = run_root / declared.path
+        if not path.is_file():
+            raise FileNotFoundError(f"Expected ShortMD output not found: {path}")
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        files.append(
+            declared.model_copy(
+                update={
+                    "size_bytes": path.stat().st_size,
+                    "content_sha256": digest,
+                }
+            )
+        )
+    return files
+
+
+@app.function(
+    image=analysis_image,
+    cpu=1,
+    memory=(1024, 65536),
+    timeout=CONF.timeout,
+    volumes={GROMACS_OUTPUT_MOUNTPOINT: GROMACS_OUTPUT_VOLUME},
+)
+def analyze_shortmd_gromacs_run(
+    *,
+    traj_prefix: str,
+    run_name: str,
+    source_run_name: str,
+    make_figures: bool,
+) -> AppRunResult:
+    """Analyze one replicate and publish its content-bound final files."""
+    workdir = gromacs_app.collect_traj_stats.get_raw_f()(
+        traj_prefix=traj_prefix,
+        run_name=run_name,
+        save_processed_traj=True,
+        make_figures=make_figures,
+    )
+    return AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            volume_app_output(
+                name="gromacs_production",
+                kind=ArtifactKind.DIRECTORY,
+                remote_path=str(workdir),
+                mount_root=GROMACS_OUTPUT_MOUNTPOINT,
+                volume_name=GROMACS_OUTPUT_VOLUME_NAME,
+                metadata={
+                    "stage": "analysis",
+                    "run_name": sanitize_filename(run_name),
+                    "source_run_name": sanitize_filename(source_run_name),
+                },
+                files=_content_bound_gromacs_files(
+                    run_name,
+                    make_figures=make_figures,
+                ),
+            )
+        ],
+    )
+
+
 @dataclass
-class ShortMDPrepNode(AppBackedNode):
+class ShortMDClearNode(ProviderNode):
+    """Tracked cleanup step used before a forced GROMACS preparation."""
+
+    run_name: str
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        """Prepare cleanup work for kernel submission."""
+        safe_run_name = sanitize_filename(self.run_name)
+        return ProviderCallSpec(
+            function_name="clear_shortmd_gromacs_run",
+            uses_gpu=False,
+            kwargs={"run_name": safe_run_name},
+            metadata={"stage": "clear", "run_name": safe_run_name},
+        )
+
+    def process_remote_result(
+        self,
+        result: object,
+        metadata: Mapping[str, object],
+    ) -> AppRunResult:
+        """Record successful cleanup after the provider call returns."""
+        _ = result, metadata
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+
+@dataclass
+class ShortMDPrepNode(ProviderNode):
     """Workflow node that prepares one PDB for GROMACS production replicates."""
 
     pdb_content: bytes
     run_name: str
-    modal_namespace: WorkflowModalNamespace = field(
-        repr=False,
-        compare=False,
-        metadata={"dag_hash": False},
-    )
-    overwrite_existing: bool = False
     gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
-
-    def _app_function(self) -> modal.Function:
-        return (
-            self.modal_namespace.prepare_cpu
-            if self.gromacs.cpu_only
-            else self.modal_namespace.prepare_gpu
-        )
 
     def _app_kwargs(self) -> dict[str, object]:
         safe_run_name = sanitize_filename(self.run_name)
@@ -254,17 +355,15 @@ class ShortMDPrepNode(AppBackedNode):
     def _metadata(self) -> dict[str, str]:
         return {"stage": "prep", "run_name": sanitize_filename(self.run_name)}
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit GROMACS preparation directly from the orchestrator."""
-        safe_run_name = sanitize_filename(self.run_name)
-        if self.overwrite_existing:
-            self.modal_namespace.clear.remote(run_name=safe_run_name)
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        """Prepare GROMACS preparation for kernel submission."""
         function_name = (
             "prepare_tpr_cpu" if self.gromacs.cpu_only else "prepare_tpr_gpu"
         )
-        return RemoteNodeSubmission(
-            function_call=self._app_function().spawn(**self._app_kwargs()),
+        return ProviderCallSpec(
             function_name=function_name,
+            uses_gpu=not self.gromacs.cpu_only,
+            kwargs=self._app_kwargs(),
             metadata=self._metadata(),
         )
 
@@ -295,19 +394,12 @@ class ShortMDPrepNode(AppBackedNode):
 
 
 @dataclass
-class ShortMDCloneNode(WorkflowNativeNode):
+class ShortMDCloneNode(ProviderNode):
     """Workflow-native adapter that clones prepared inputs for one replicate."""
 
     source_run_name: str
     replicate_run_name: str
-    modal_namespace: WorkflowModalNamespace = field(
-        repr=False,
-        compare=False,
-        metadata={"dag_hash": False},
-    )
     overwrite_clone: bool = False
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
 
     def _app_kwargs_and_metadata(
         self,
@@ -342,12 +434,13 @@ class ShortMDCloneNode(WorkflowNativeNode):
             },
         )
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit clone file-management work directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        """Prepare clone file-management work for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
-        return RemoteNodeSubmission(
-            function_call=self.modal_namespace.clone.spawn(**kwargs),
+        return ProviderCallSpec(
             function_name="clone_prepared_shortmd_run",
+            uses_gpu=False,
+            kwargs=kwargs,
             metadata=metadata,
         )
 
@@ -383,26 +476,12 @@ class ShortMDCloneNode(WorkflowNativeNode):
 
 
 @dataclass
-class ShortMDReplicateNode(AppBackedNode):
+class ShortMDReplicateNode(ProviderNode):
     """Workflow node that runs one short production replicate through GROMACS."""
 
     source_run_name: str
     replicate_run_name: str
-    modal_namespace: WorkflowModalNamespace = field(
-        repr=False,
-        compare=False,
-        metadata={"dag_hash": False},
-    )
     gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
-    execution_policy: NodeExecutionPolicy = NodeExecutionPolicy.RESUME
-    placement: NodePlacement = NodePlacement.REMOTE
-
-    def _app_function(self) -> modal.Function:
-        return (
-            self.modal_namespace.production_cpu
-            if self.gromacs.cpu_only
-            else self.modal_namespace.production_gpu
-        )
 
     def _app_kwargs_and_metadata(
         self,
@@ -439,15 +518,16 @@ class ShortMDReplicateNode(AppBackedNode):
             },
         )
 
-    def submit_remote(self, context: NodeRunContext) -> RemoteNodeSubmission:
-        """Submit GROMACS production directly from the orchestrator."""
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        """Prepare GROMACS production for kernel submission."""
         kwargs, metadata = self._app_kwargs_and_metadata(context)
         function_name = (
             "production_run_cpu" if self.gromacs.cpu_only else "production_run_gpu"
         )
-        return RemoteNodeSubmission(
-            function_call=self._app_function().spawn(**kwargs),
+        return ProviderCallSpec(
             function_name=function_name,
+            uses_gpu=not self.gromacs.cpu_only,
+            kwargs=kwargs,
             metadata=metadata,
         )
 
@@ -456,24 +536,18 @@ class ShortMDReplicateNode(AppBackedNode):
         result: object,
         metadata: Mapping[str, object],
     ) -> AppRunResult:
-        """Collect production stats and return a workflow app result."""
+        """Publish the raw production output for downstream analysis."""
         if isinstance(result, AppRunResult):
             return result
         safe_replicate_run_name = str(metadata["run_name"])
         safe_source_run_name = str(metadata["source_run_name"])
-        remote_workdir = self.modal_namespace.collect_stats.remote(
-            "production_",
-            run_name=safe_replicate_run_name,
-            save_processed_traj=self.gromacs.save_processed_traj,
-            make_figures=self.gromacs.make_figures,
-        )
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
                 volume_app_output(
-                    name="gromacs_production",
+                    name="gromacs_production_raw",
                     kind=ArtifactKind.DIRECTORY,
-                    remote_path=str(remote_workdir),
+                    remote_path=str(result),
                     mount_root=GROMACS_OUTPUT_MOUNTPOINT,
                     volume_name=GROMACS_OUTPUT_VOLUME_NAME,
                     metadata={
@@ -481,20 +555,66 @@ class ShortMDReplicateNode(AppBackedNode):
                         "run_name": safe_replicate_run_name,
                         "source_run_name": safe_source_run_name,
                     },
-                    files=gromacs_app.production_workflow_files(
-                        safe_replicate_run_name
-                    ),
+                    files=[
+                        ArtifactFile(
+                            path=f"production_{safe_replicate_run_name}.xtc",
+                            role="trajectory",
+                        ),
+                        ArtifactFile(
+                            path=f"production_{safe_replicate_run_name}.tpr",
+                            role="production_topology",
+                        ),
+                    ],
                 )
             ],
         )
 
 
 @dataclass
-class ShortMDSummaryNode(WorkflowNativeNode):
+class ShortMDAnalysisNode(ProviderNode):
+    """Workflow node that analyzes one completed production trajectory."""
+
+    source_run_name: str
+    replicate_run_name: str
+    gromacs: ShortMDGromacsSettings = field(default_factory=ShortMDGromacsSettings)
+
+    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
+        """Prepare GROMACS analysis for kernel submission."""
+        production_artifacts = context.inputs.get("production") or []
+        if len(production_artifacts) != 1:
+            raise ValueError(
+                "ShortMD analysis node requires exactly one production artifact"
+            )
+        artifact = production_artifacts[0]
+        if artifact.storage.volume_name != GROMACS_OUTPUT_VOLUME_NAME:
+            raise ValueError(
+                "ShortMD production artifact volume does not match the GROMACS "
+                f"output volume: {artifact.storage.volume_name}"
+            )
+        safe_source_run_name = sanitize_filename(
+            str(artifact.metadata.get("source_run_name") or self.source_run_name)
+        )
+        safe_replicate_run_name = sanitize_filename(
+            str(artifact.metadata.get("run_name") or self.replicate_run_name)
+        )
+        return ProviderCallSpec(
+            function_name="analyze_shortmd_gromacs_run",
+            uses_gpu=False,
+            kwargs={
+                "traj_prefix": "production_",
+                "run_name": safe_replicate_run_name,
+                "source_run_name": safe_source_run_name,
+                "make_figures": self.gromacs.make_figures,
+            },
+        )
+
+
+@dataclass
+class ShortMDSummaryNode(CoordinatorNode):
     """Workflow-native node that emits a manifest of production replicates."""
 
     replicates: int
-    max_parallel: int
+    max_parallel: int = field(metadata={"dag_hash": False})
 
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Write a Markdown summary of all replicate output artifacts."""
@@ -509,7 +629,7 @@ class ShortMDSummaryNode(WorkflowNativeNode):
             "# ShortMD Workflow Summary",
             "",
             f"- Replicates per input: {self.replicates}",
-            f"- Max parallel workflow nodes: {self.max_parallel}",
+            f"- Max parallel workflow Nodes: {self.max_parallel}",
             "",
             "| Source run | Replicate run | Volume | Path |",
             "| --- | --- | --- | --- |",
@@ -540,7 +660,8 @@ class ShortMDSummaryNode(WorkflowNativeNode):
                         "replicates": str(self.replicates),
                         "max_parallel": str(self.max_parallel),
                     },
-                )
+                ),
+                *(republish_execution_artifact(artifact) for artifact in artifacts),
             ],
         )
 
@@ -550,7 +671,7 @@ def discover_pdb_inputs(input_dir: str | Path) -> list[tuple[str, bytes]]:
     input_path = Path(input_dir).expanduser().resolve()
     if not input_path.is_dir():
         raise NotADirectoryError(input_path)
-    pdb_paths = list(input_path.glob("*.pdb"))
+    pdb_paths = sorted(input_path.glob("*.pdb"))
     if not pdb_paths:
         raise ValueError(f"No PDB files found in {input_path}")
     return [(path.name, path.read_bytes()) for path in pdb_paths]
@@ -559,6 +680,7 @@ def discover_pdb_inputs(input_dir: str | Path) -> list[tuple[str, bytes]]:
 def build_shortmd_workflow(
     *,
     input_pdbs: list[tuple[str, bytes]],
+    random_seed_identity: str,
     run_namespace: str | None = None,
     replicates: int = 50,
     simulation_time_ns: int = 2,
@@ -571,11 +693,17 @@ def build_shortmd_workflow(
     genion_seed: int = 0,
     max_parallel: int = 16,
     overwrite_existing: bool = False,
-) -> Workflow:
+) -> ExecutionGraph:
     """Build a ShortMD workflow DAG from local PDB payloads."""
     if replicates < 1:
         raise ValueError("replicates must be at least 1")
-    workflow = Workflow("shortmd")
+    workflow = ExecutionGraph(
+        "shortmd",
+        scientific_versions={
+            "biomodals.workflow.shortmd": _SCIENTIFIC_SCHEMA_VERSION,
+            "gromacs": app_scientific_version(gromacs_app.CONF),
+        },
+    )
     safe_run_namespace = (
         sanitize_filename(run_namespace) if run_namespace is not None else None
     )
@@ -585,25 +713,29 @@ def build_shortmd_workflow(
         cpu_only=cpu_only,
         num_threads=num_threads,
         use_openmp_threads=use_openmp_threads,
-        ld_seed=ld_seed,
-        gen_seed=gen_seed,
-        genion_seed=genion_seed,
-    )
-    modal_namespace = WorkflowModalNamespace(
-        clear=clear_shortmd_gromacs_run,
-        clone=clone_prepared_shortmd_run,
-        prepare_cpu=gromacs_app.prepare_tpr_cpu,
-        prepare_gpu=gromacs_app.prepare_tpr_gpu,
-        production_cpu=gromacs_app.production_run_cpu,
-        production_gpu=gromacs_app.production_run_gpu,
-        collect_stats=gromacs_app.collect_traj_stats,
+        ld_seed=concrete_gromacs_seed(
+            ld_seed,
+            run_identity=random_seed_identity,
+            purpose="ld-seed",
+        ),
+        gen_seed=concrete_gromacs_seed(
+            gen_seed,
+            run_identity=random_seed_identity,
+            purpose="gen-seed",
+        ),
+        genion_seed=concrete_gromacs_seed(
+            genion_seed,
+            run_identity=random_seed_identity,
+            purpose="genion-seed",
+            random_sentinel=0,
+        ),
     )
     used_run_names: set[str] = set()
-    replicate_handles = {}
+    analysis_handles = {}
 
     for file_name, pdb_content in input_pdbs:
         pdb_run_name = sanitize_filename(Path(file_name).stem)
-        run_name = (
+        run_name = _bounded_gromacs_run_name(
             f"{safe_run_namespace}-{pdb_run_name}"
             if safe_run_namespace is not None
             else pdb_run_name
@@ -611,15 +743,22 @@ def build_shortmd_workflow(
         if run_name in used_run_names:
             raise ValueError(f"Duplicate sanitized PDB run name: {run_name}")
         used_run_names.add(run_name)
+        prep_dependencies: list[NodeHandle | str] = []
+        if overwrite_existing:
+            prep_dependencies.append(
+                workflow.add_node(
+                    ShortMDClearNode(run_name=run_name),
+                    id=f"clear-{run_name}",
+                )
+            )
         prep = workflow.add_node(
             ShortMDPrepNode(
                 pdb_content=pdb_content,
                 run_name=run_name,
-                modal_namespace=modal_namespace,
-                overwrite_existing=overwrite_existing,
                 gromacs=gromacs,
             ),
             id=f"prep-{run_name}",
+            depends_on=prep_dependencies,
         )
         for replicate_idx in range(1, replicates + 1):
             replicate_run_name = f"{run_name}-r{replicate_idx:03d}"
@@ -627,7 +766,6 @@ def build_shortmd_workflow(
                 ShortMDCloneNode(
                     source_run_name=run_name,
                     replicate_run_name=replicate_run_name,
-                    modal_namespace=modal_namespace,
                     overwrite_clone=overwrite_existing,
                 ),
                 id=f"clone-{replicate_run_name}",
@@ -637,23 +775,42 @@ def build_shortmd_workflow(
                 ShortMDReplicateNode(
                     source_run_name=run_name,
                     replicate_run_name=replicate_run_name,
-                    modal_namespace=modal_namespace,
                     gromacs=gromacs,
                 ),
                 id=f"replicate-{replicate_run_name}",
                 inputs={"cloned": clone.outputs(kind=ArtifactKind.DIRECTORY)},
             )
-            replicate_handles[replicate_run_name] = replicate
+            analysis = workflow.add_node(
+                ShortMDAnalysisNode(
+                    source_run_name=run_name,
+                    replicate_run_name=replicate_run_name,
+                    gromacs=gromacs,
+                ),
+                id=f"analysis-{replicate_run_name}",
+                inputs={"production": replicate.outputs(kind=ArtifactKind.DIRECTORY)},
+            )
+            analysis_handles[replicate_run_name] = analysis
 
     workflow.add_node(
         ShortMDSummaryNode(replicates=replicates, max_parallel=max_parallel),
         id="summary",
         inputs={
             replicate_run_name: handle.outputs(kind=ArtifactKind.DIRECTORY)
-            for replicate_run_name, handle in replicate_handles.items()
+            for replicate_run_name, handle in analysis_handles.items()
         },
     )
     return workflow
+
+
+def _bounded_gromacs_run_name(value: str) -> str:
+    """Keep generated GROMACS filenames within common component limits."""
+    encoded = value.encode()
+    if len(encoded) <= _MAX_GROMACS_RUN_NAME_BYTES:
+        return value
+    digest = hashlib.sha256(encoded).hexdigest()
+    prefix_bytes = _MAX_GROMACS_RUN_NAME_BYTES - len(digest) - 1
+    prefix = encoded[:prefix_bytes].decode(errors="ignore").rstrip("._-")
+    return f"{prefix}-{digest}" if prefix else digest
 
 
 @app.local_entrypoint()
@@ -671,9 +828,14 @@ def submit_shortmd_workflow(
     genion_seed: int = 0,
     force: bool = False,
     wait: bool = True,
-    max_parallel: int = 16,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     dry_run: bool = False,
-    strict_artifact_checks: bool = False,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str | None = None,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run ShortMD production replicate workflow for a directory of PDB files.
 
@@ -689,24 +851,48 @@ def submit_shortmd_workflow(
         cpu_only: Whether to run GROMACS preparation and production on CPU only.
         num_threads: Number of CPU threads to pass to GROMACS.
         use_openmp_threads: Whether to use OpenMP threading in GROMACS.
-        ld_seed: Random seed for Langevin dynamics during preparation.
-        gen_seed: Random seed for initial velocity generation during preparation.
-        genion_seed: Random seed for ion placement during preparation.
-        force: Replace an existing workflow run ledger before running.
+        ld_seed: Langevin seed. -1 samples once for a new root Run.
+        gen_seed: Velocity seed. -1 samples once for a new root Run.
+        genion_seed: Ion-placement seed. 0 samples once for a new root Run.
+        force: Replace existing ShortMD-managed app outputs before running.
         wait: Wait locally for the remote workflow result. Disable to print the
             Modal function call id for asynchronous collection.
-        max_parallel: Maximum number of ready workflow nodes to execute
-            concurrently in one scheduler wave.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
         dry_run: Print the workflow DAG graph and skip orchestrator execution.
-        strict_artifact_checks: Validate referenced GROMACS volume artifacts
-            before reusing completed workflow nodes.
+        use_deployed_coordinator: Submit through an exact named deployment.
+        deployment_environment: Modal Environment containing the deployment.
+        deployment_name: Modal app deployment name. Defaults to this workflow.
+        deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
     """
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    if predecessor_execution_run_id is not None and not use_deployed_coordinator:
+        raise ValueError("restart_from requires an exact deployed workflow coordinator")
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=16,
+        default_max_gpu_containers=16,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     input_path = Path(input_dir).expanduser().resolve()
     input_pdbs = discover_pdb_inputs(input_path)
     resolved_run_id = sanitize_filename(run_id or input_path.name)
+    execution_run_id = uuid4()
+    seed_run_id = (
+        execution_run_id
+        if predecessor_execution_run_id is None or dry_run
+        else execution_lineage_root(
+            orchestrator.OUT_VOLUME,
+            predecessor_execution_run_id,
+        )
+    )
+    physical_run_namespace = f"{resolved_run_id}-{seed_run_id.hex}"
     workflow = build_shortmd_workflow(
         input_pdbs=input_pdbs,
-        run_namespace=resolved_run_id,
+        random_seed_identity=str(seed_run_id),
+        run_namespace=physical_run_namespace,
         replicates=replicates,
         simulation_time_ns=simulation_time_ns,
         run_pdbfixer=run_pdbfixer,
@@ -716,36 +902,73 @@ def submit_shortmd_workflow(
         ld_seed=ld_seed,
         gen_seed=gen_seed,
         genion_seed=genion_seed,
-        max_parallel=max_parallel,
+        max_parallel=total_limit,
         overwrite_existing=force,
     )
     if dry_run:
         print_workflow_dag(workflow.validate())
         return
 
-    orchestrator_handle = orchestrator.WorkflowOrchestrator()
+    stage_execution_launch(
+        orchestrator.OUT_VOLUME,
+        execution_run_id,
+        predecessor_execution_run_id,
+    )
+
+    deployment = DeploymentIdentity(
+        environment=(
+            deployment_environment if use_deployed_coordinator else "development"
+        ),
+        deployment_name=(
+            (deployment_name or CONF.name) if use_deployed_coordinator else CONF.name
+        ),
+        deployment_version=deployment_version if use_deployed_coordinator else 1,
+    )
+    coordinator = orchestrator.execution_coordinator_handle(
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        use_deployed_coordinator=use_deployed_coordinator,
+    )
     orchestrator_kwargs = {
-        "workflow": workflow,
-        "run_id": resolved_run_id,
-        "force": force,
-        "max_ready_workers": max_parallel,
+        "graph": workflow,
+        "workload_run_key": resolved_run_id,
+        "max_parallel_nodes": total_limit,
+        "max_active_provider_calls": total_limit,
+        "max_active_gpu_provider_calls": gpu_limit,
+        "strict_external_artifact_checks": True,
+        "external_artifact_checker_function_name": ("check_shortmd_external_artifact"),
     }
-    if strict_artifact_checks:
-        orchestrator_kwargs["strict_external_artifact_checks"] = True
-        orchestrator_kwargs["external_artifact_checker"] = (
-            check_shortmd_external_artifact.remote
-        )
+    if not use_deployed_coordinator:
+        orchestrator_kwargs["development_function_handles"] = {
+            "clear_shortmd_gromacs_run": clear_shortmd_gromacs_run,
+            "prepare_tpr_cpu": gromacs_app.prepare_tpr_cpu,
+            "prepare_tpr_gpu": gromacs_app.prepare_tpr_gpu,
+            "clone_prepared_shortmd_run": clone_prepared_shortmd_run,
+            "production_run_cpu": gromacs_app.production_run_cpu,
+            "production_run_gpu": gromacs_app.production_run_gpu,
+            "analyze_shortmd_gromacs_run": analyze_shortmd_gromacs_run,
+            "check_shortmd_external_artifact": check_shortmd_external_artifact,
+        }
     print(
         f"Submitting ShortMD workflow '{resolved_run_id}' with "
         f"{len(input_pdbs)} input PDB(s), {replicates} replicate(s) each",
         flush=True,
     )
+    function_call = orchestrator.submit_workflow_run(
+        coordinator,
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        coordinator_kwargs=orchestrator_kwargs,
+    )
+    print(
+        "Coordinator FunctionCall ID: "
+        f"{getattr(function_call, 'object_id', function_call)}",
+        flush=True,
+    )
     if wait:
-        result: AppRunResult | str = AppRunResult.model_validate(
-            orchestrator_handle.run.remote(**orchestrator_kwargs)
-        )
+        result: AppRunResult | str = AppRunResult.model_validate(function_call.get())
     else:
-        function_call = orchestrator_handle.run.spawn(**orchestrator_kwargs)
         result = str(getattr(function_call, "object_id", function_call))
     if isinstance(result, AppRunResult):
         print(f"ShortMD workflow run finished with status: {result.status}", flush=True)

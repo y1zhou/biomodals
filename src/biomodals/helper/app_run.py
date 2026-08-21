@@ -5,6 +5,7 @@ queue semantics stay owned by app code unless a caller explicitly moves to a
 Modal-supported atomic primitive.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -78,7 +79,7 @@ def volume_path_from_mount_path(
     )
 
 
-def _file_metadata(files: list[ArtifactFile | str]) -> list[dict[str, Any]]:
+def _file_metadata(files: Sequence[ArtifactFile | str]) -> list[dict[str, Any]]:
     return [
         (
             ArtifactFile(path=file).model_dump(
@@ -101,7 +102,7 @@ def volume_app_output(
     volume_name: str,
     media_type: str | None = None,
     metadata: dict[str, Any] | None = None,
-    files: list[ArtifactFile | str] | None = None,
+    files: Sequence[ArtifactFile | str] | None = None,
 ) -> AppOutput:
     """Build a workflow-compatible app output backed by a mounted volume path."""
     output_metadata = dict(metadata or {})
@@ -144,19 +145,3 @@ def inline_zstd_output(
         ),
         metadata=output_metadata,
     )
-
-
-def has_completed_output_files(
-    output_dir: str | Path,
-    input_id: str,
-    *,
-    sample_subdir: str,
-    required_files: tuple[str, ...],
-) -> bool:
-    """Return whether all required completion files exist for one input.
-
-    This encodes artifact-based completion only. It does not create marker files
-    or infer success from the presence of a run directory.
-    """
-    sample_dir = Path(output_dir) / input_id / sample_subdir
-    return all((sample_dir / file_name).exists() for file_name in required_files)

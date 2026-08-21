@@ -20,18 +20,6 @@ from typing import ClassVar, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeHandle,
-    append_log,
-    artifact_record,
-    json_bytes,
-    load_artifact_bytes,
-    require_regular_file,
-    sha256_bytes,
-    utc_now,
-    write_bytes_atomic,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -57,6 +45,18 @@ from biomodals.app.fold.alphafold3.profiles import (
     HMMER_VERSION,
     SOURCE_DB_VOLUME_NAME,
     resolve_database_profile,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    append_log,
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    write_bytes_atomic,
+    write_json_atomic,
 )
 
 DEFAULT_MAX_TEMPLATE_DATE = "2021-09-30"
@@ -542,8 +542,10 @@ def _template_claim_scope(context: TemplateContext) -> str:
 def _wait_for_template_claim(
     runtime: TemplateRuntime,
     context: TemplateContext,
+    *,
+    generation_id: str | None = None,
 ) -> tuple[TemplateEntry | None, GenerationClaim | None]:
-    generation_id = uuid.uuid4().hex
+    selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
     while True:
         runtime.cache_volume.reload()
@@ -553,7 +555,7 @@ def _wait_for_template_claim(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_template_claim_scope(context),
-                generation_id=generation_id,
+                generation_id=selected_generation,
                 identity=context.provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
@@ -573,6 +575,8 @@ def _wait_for_template_claim(
 def run_template_search(
     runtime: TemplateRuntime,
     task: TemplateTask,
+    *,
+    generation_id: str | None = None,
 ) -> dict[str, object]:
     """Run a request-local search or publish one canonical template result."""
     if not isinstance(task.publish_canonical, bool):
@@ -606,7 +610,15 @@ def run_template_search(
     runtime.cache_volume.reload()
     if entry := load_template_entry(context):
         return entry.summary("reused")
-    raced_entry, claim = _wait_for_template_claim(runtime, context)
+    raced_entry, claim = (
+        _wait_for_template_claim(runtime, context)
+        if generation_id is None
+        else _wait_for_template_claim(
+            runtime,
+            context,
+            generation_id=generation_id,
+        )
+    )
     if raced_entry is not None:
         return raced_entry.summary("reused")
     if claim is None:

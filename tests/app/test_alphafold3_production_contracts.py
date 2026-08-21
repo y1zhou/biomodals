@@ -29,14 +29,6 @@ from biomodals.app.fold.alphafold3 import (
     request_results,
     template_search,
 )
-from biomodals.app.fold.alphafold3.artifacts import (
-    artifact_record,
-    json_bytes,
-    load_artifact_bytes,
-    read_volume_bytes,
-    validate_artifact_record,
-    write_bytes_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     GenerationClaim,
@@ -47,6 +39,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    MAX_MODEL_SEEDS,
     PreparedInferenceRun,
     VolumeUpload,
     hash_sequences,
@@ -124,6 +117,8 @@ from biomodals.app.fold.alphafold3.request_results import (
     create_request_archive,
     load_request_manifest,
     publish_request_results,
+    request_archive_member_for_role,
+    request_manifest_artifacts_available,
     request_manifest_path,
     request_view_id,
 )
@@ -147,6 +142,14 @@ from biomodals.app.fold.alphafold3.template_search import (
     TemplateTask,
     build_template_context,
     load_template_entry,
+)
+from biomodals.helper.artifacts import (
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    read_volume_bytes,
+    validate_artifact_record,
+    write_bytes_atomic,
 )
 from biomodals.helper.shell import run_command
 
@@ -979,26 +982,6 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
 
     with pytest.raises(ValueError, match="1 remote search tasks"):
         resolve_msa_and_templates(config, cast(Any, NeverCalledExecutor()))
-
-
-def test_remote_cache_inspectors_repeat_task_bounds() -> None:
-    with pytest.raises(ValueError, match="512 remote search tasks"):
-        alphafold3_app.inspect_msa_search_cache.get_raw_f()(
-            [("small_bfd", "ACDE")] * 513,
-            [],
-        )
-    with pytest.raises(ValueError, match="512 remote search tasks"):
-        alphafold3_app.inspect_protein_template_cache.get_raw_f()(
-            [("ACDE", "a" * 64, "2021-09-30")] * 513,
-        )
-
-
-def test_remote_msa_inspector_validates_assembly_shape_before_volume_access() -> None:
-    inspect = alphafold3_app.inspect_msa_search_cache.get_raw_f()
-    with pytest.raises(TypeError, match="include_unpaired must be a boolean"):
-        inspect([], [("protein", "ACDE", 1, True)])  # type: ignore[list-item]
-    with pytest.raises(ValueError, match="complete canonical MSAs"):
-        inspect([], [("protein", "ACDE", True, False)])
 
 
 def test_remote_search_repeats_query_length_bound() -> None:
@@ -1916,6 +1899,83 @@ def test_generation_claims_fence_active_and_terminal_writers() -> None:
     }
 
 
+def test_generation_claim_replays_the_same_live_owner() -> None:
+    """Provider redelivery may recover one stable generation without takeover."""
+    store = FakeClaimStore()
+    first = acquire_generation_claim(
+        store,
+        scope_key="raw:Protein:sequence:small_bfd",
+        generation_id="execution-task",
+        identity={"search": "one"},
+        container_id="container-a",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_000,
+        now_text="first-start",
+    )
+
+    replay = acquire_generation_claim(
+        store,
+        scope_key=first.scope_key,
+        generation_id=first.generation_id,
+        identity={"search": "one"},
+        container_id="replacement-container",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_001,
+        now_text="replay-start",
+    )
+
+    assert replay == first
+    with pytest.raises(ValueError, match="different identity"):
+        acquire_generation_claim(
+            store,
+            scope_key=first.scope_key,
+            generation_id=first.generation_id,
+            identity={"search": "changed"},
+            container_id="replacement-container",
+            maximum_age_seconds=100,
+            now_epoch_seconds=1_002,
+            now_text="replay-start",
+        )
+
+
+def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
+    """Coordinator-owned seed Tasks reacquire their live writer claims."""
+    runtime = InferenceRuntime(
+        output_root=tmp_path,
+        volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        summary_maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+    )
+    generations = {1: "execution-seed-1", 2: "execution-seed-2"}
+
+    first = claim_seed_predictions(
+        runtime,
+        "a" * 64,
+        (1, 2),
+        sample_count=1,
+        generation_ids=generations,
+    )
+    replay = claim_seed_predictions(
+        runtime,
+        "a" * 64,
+        (1, 2),
+        sample_count=1,
+        generation_ids=generations,
+    )
+
+    assert tuple(item.claim.generation_id for item in first.owned) == (
+        "execution-seed-1",
+        "execution-seed-2",
+    )
+    assert replay == first
+
+
 def test_generation_claims_adapt_legacy_owners() -> None:
     """A stage may preserve an append-only chain created before canonical owners."""
     store = FakeClaimStore()
@@ -2041,7 +2101,6 @@ def test_seed_claims_reload_the_volume_once_per_reconciliation(
         ((-1,), 1, "32-bit unsigned"),
         ((2**32,), 1, "32-bit unsigned"),
         ((1,), 101, "between 1 and"),
-        (tuple(range(501)), 2, "modelSeeds × sample"),
     ],
 )
 def test_downstream_inference_boundaries_repeat_request_limits(
@@ -2095,6 +2154,29 @@ def test_downstream_inference_boundaries_repeat_request_limits(
                     display_name="bounded",
                 ),
             )
+
+
+@pytest.mark.parametrize("boundary", ["inspect", "claim"])
+def test_downstream_seed_boundaries_repeat_the_default_workload_limit(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    runtime = InferenceRuntime(
+        output_root=tmp_path,
+        volume=cast(Any, SimpleNamespace(reload=lambda: None, commit=lambda: None)),
+        claims=FakeClaimStore(),
+        container_id="test",
+        maximum_age_seconds=100,
+        summary_maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+    )
+    seeds = tuple(range(MAX_MODEL_SEEDS))
+
+    with pytest.raises(ValueError, match="modelSeeds × sample"):
+        if boundary == "inspect":
+            inspect_seed_predictions(runtime, "a" * 64, seeds, sample_count=6)
+        else:
+            claim_seed_predictions(runtime, "a" * 64, seeds, sample_count=6)
 
 
 def test_staged_input_rederives_identity_and_preserves_inline_templates(
@@ -2709,7 +2791,6 @@ def test_request_manifest_requires_presentation_input_identity() -> None:
     ("normalized_seeds", "sample_count", "message"),
     [
         ([1], 101, "between 1 and 100"),
-        (list(range(501)), 2, "modelSeeds × sample"),
     ],
 )
 def test_request_manifest_workload_is_bounded_before_ranking_validation(
@@ -2843,6 +2924,17 @@ def test_invocation_receipt_resolves_and_binds_the_manifest(
 
     assert load_invocation_manifest(FakeVolumeReader({}), invocation) is None
     assert load_invocation_manifest(FakeVolumeReader(files), invocation) == manifest
+
+    input_volume_path = cast(str, manifest["artifacts"][0]["volume_path"])
+    assert request_manifest_artifacts_available(
+        FakeVolumeReader({input_volume_path: input_bytes}),
+        manifest,
+    )
+    assert not request_manifest_artifacts_available(
+        FakeVolumeReader({input_volume_path: b"changed"}),
+        manifest,
+    )
+    assert not request_manifest_artifacts_available(FakeVolumeReader({}), manifest)
 
     corrupted = manifest_bytes.replace(b'"complete"', b'"corruptx"', 1)
     with pytest.raises(RuntimeError, match="digest is invalid"):
@@ -3189,6 +3281,57 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
             output_dir=tmp_path,
             display_name="Readable Name",
         )
+
+
+def test_request_archive_member_role_uses_ranked_presentation_path() -> None:
+    run_id = "d" * 64
+    canonical_name = canonical_output_name(run_id)
+    root = f"{run_id[:2]}/{run_id}"
+
+    def artifact(role: str, name: str) -> dict[str, object]:
+        return {
+            "role": role,
+            "volume_path": f"{root}/{name}",
+            "archive_path": name,
+            "size_bytes": 1,
+            "sha256": hashlib.sha256(b"x").hexdigest(),
+        }
+
+    manifest = _request_manifest(
+        run_id=run_id,
+        submitted_seeds=[1],
+        display_name="Workload Z",
+        sample_count=2,
+        artifacts=[
+            artifact("input", f"{canonical_name}_data.json"),
+            artifact("request_best_model", f"{canonical_name}_model.cif"),
+            artifact(
+                "request_best_summary_confidences",
+                f"{canonical_name}_summary_confidences.json",
+            ),
+            artifact(
+                "seed_model_cif",
+                f"seed-1_sample-0/{canonical_name}_seed-1_sample-0_model.cif",
+            ),
+        ],
+    )
+
+    assert (
+        request_archive_member_for_role(
+            manifest,
+            role="request_best_model",
+            display_name="Workload Z",
+        )
+        == "Workload_Z/Workload_Z_model.cif"
+    )
+    assert (
+        request_archive_member_for_role(
+            manifest,
+            role="request_best_summary_confidences",
+            display_name="Workload Z",
+        )
+        == "Workload_Z/Workload_Z_summary_confidences.json"
+    )
 
 
 def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> None:

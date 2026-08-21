@@ -22,20 +22,6 @@ from typing import Any, ClassVar, Literal, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    MAX_MSA_FIELD_BYTES,
-    VolumeHandle,
-    append_log,
-    artifact_record,
-    json_bytes,
-    load_artifact_bytes,
-    load_json_object,
-    require_regular_file,
-    sha256_bytes,
-    utc_now,
-    write_bytes_atomic,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -44,6 +30,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     assert_generation_current,
     finish_generation_claim,
 )
+from biomodals.app.fold.alphafold3.inference_inputs import MAX_MSA_FIELD_BYTES
 from biomodals.app.fold.alphafold3.profile_manifest import (
     profile_search_identity,
     validate_profile_manifest,
@@ -57,6 +44,19 @@ from biomodals.app.fold.alphafold3.profiles import (
     profile_root,
     resolve_database_profile,
     shard_names,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    append_log,
+    artifact_record,
+    json_bytes,
+    load_artifact_bytes,
+    load_json_object,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    write_bytes_atomic,
+    write_json_atomic,
 )
 
 Polymer = Literal["protein", "rna"]
@@ -878,8 +878,10 @@ def _raw_claim_scope(context: SearchContext) -> str:
 def _wait_for_raw_claim(
     runtime: SearchRuntime,
     context: SearchContext,
+    *,
+    generation_id: str | None = None,
 ) -> tuple[RawMsaEntry | None, GenerationClaim | None]:
-    generation_id = uuid.uuid4().hex
+    selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
     while True:
         runtime.cache_volume.reload()
@@ -889,7 +891,7 @@ def _wait_for_raw_claim(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_raw_claim_scope(context),
-                generation_id=generation_id,
+                generation_id=selected_generation,
                 identity=context.provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
@@ -910,6 +912,8 @@ def run_database_search(
     runtime: SearchRuntime,
     database_id: str,
     sequence: str,
+    *,
+    generation_id: str | None = None,
 ) -> dict[str, object]:
     """Validate/reuse or publish one resumable Raw Database MSA."""
     validate_query(resolve_database_profile(database_id), sequence)
@@ -923,7 +927,15 @@ def run_database_search(
     )
     if entry := load_raw_msa(context):
         return entry.summary("reused")
-    raced_entry, claim = _wait_for_raw_claim(runtime, context)
+    raced_entry, claim = (
+        _wait_for_raw_claim(runtime, context)
+        if generation_id is None
+        else _wait_for_raw_claim(
+            runtime,
+            context,
+            generation_id=generation_id,
+        )
+    )
     if raced_entry is not None:
         return raced_entry.summary("reused")
     if claim is None:
@@ -1263,6 +1275,8 @@ def _combined_claim_scope(task: MsaAssemblyTask) -> str:
 def assemble_and_publish_msas(
     runtime: SearchRuntime,
     task: MsaAssemblyTask,
+    *,
+    generation_id: str | None = None,
 ) -> dict[str, object]:
     """Assemble requested fields and publish complete canonical combinations."""
     validate_msa_assembly_task(task)
@@ -1334,7 +1348,7 @@ def assemble_and_publish_msas(
     if sequence_root is None or provenance is None:
         raise RuntimeError("Canonical MSA assembly identity was not initialized")
 
-    generation_id = uuid.uuid4().hex
+    selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
     claim: GenerationClaim | None = None
     while claim is None:
@@ -1345,7 +1359,7 @@ def assemble_and_publish_msas(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_combined_claim_scope(task),
-                generation_id=generation_id,
+                generation_id=selected_generation,
                 identity=provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,

@@ -1,9 +1,10 @@
 # Scientifically faithful AlphaFold 3 MSA database sharding
 
-Status: validated research conclusion after Phase 1 small-BFD preparation
+Status: historical research supporting
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
 Research dates: 2026-07-22 through 2026-07-23
 Scope: database partition semantics, profile preparation, and search equivalence
-Implementation target: `src/biomodals/app/fold/alphafold3_msa_app.py`
+Historical implementation target: `src/biomodals/app/fold/alphafold3_msa_app.py`
 
 ## Decision summary
 

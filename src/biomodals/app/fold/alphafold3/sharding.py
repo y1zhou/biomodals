@@ -13,13 +13,6 @@ from typing import Any
 
 import orjson
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    append_log,
-    load_json_object,
-    require_regular_file,
-    sha256_file,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.profiles import (
     ORDINAL_SHUFFLER_PREFETCH_BYTES,
     ORDINAL_SHUFFLER_PREFETCH_RECORDS,
@@ -28,6 +21,13 @@ from biomodals.app.fold.alphafold3.profiles import (
     RECORD_MULTISET_SOURCE_SHA256,
     RECORD_MULTISET_VERSION,
     record_multiset_identity,
+)
+from biomodals.helper.artifacts import (
+    append_log,
+    load_json_object,
+    require_regular_file,
+    sha256_file,
+    write_json_atomic,
 )
 
 SHUFFLER_SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024

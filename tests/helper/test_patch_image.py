@@ -50,3 +50,22 @@ def test_patch_image_can_ignore_dependency_versions(monkeypatch) -> None:
         "backports-strenum ; python_full_version < '3.11'",
         "custom @ https://example.invalid/custom.whl",
     ]
+    assert "biomodals.execution" in image.mods
+
+
+def test_patch_image_includes_execution_with_workflow_modules(monkeypatch) -> None:
+    monkeypatch.setattr(metadata, "requires", lambda package: [])
+    image = FakeImage()
+
+    helper_module.patch_image_for_helper(
+        cast(Any, image),
+        include_workflow_modules=True,
+    )
+
+    assert image.mods == (
+        "biomodals.helper",
+        "biomodals.app.config",
+        "biomodals.schema",
+        "biomodals.execution",
+        "biomodals.workflow",
+    )

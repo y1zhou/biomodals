@@ -3,20 +3,53 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import tarfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from io import BytesIO
+from io import BytesIO, RawIOBase
 from pathlib import Path
+from typing import BinaryIO, TypeVar
 
 import polars as pl
 
 from biomodals.helper.shell import sanitize_filename
-from biomodals.schema import AppRunStatus, ArtifactKind, WorkflowArtifact
+from biomodals.schema import AppRunStatus, ArtifactKind, ExecutionArtifact
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 from biomodals.workflow.ppiflow import manifests, tables
 
 STRUCTURE_SUFFIXES = {".pdb", ".cif"}
+MAX_ARCHIVE_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_DECOMPRESSED_BYTES = MAX_ARCHIVE_EXPANDED_BYTES + 64 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 100_000
+MAX_ARCHIVE_SELECTED_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_SELECTED_MEMBERS = 10_000
+_ARCHIVE_READ_CHUNK_BYTES = 1024 * 1024
+_ArchiveItem = TypeVar("_ArchiveItem")
+
+
+class _BoundedArchiveReader(RawIOBase):
+    """Count every decompressed tar byte, including metadata and padding."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        super().__init__()
+        self._stream = stream
+        self._bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        remaining_with_probe = MAX_ARCHIVE_DECOMPRESSED_BYTES - self._bytes_read + 1
+        requested = (
+            remaining_with_probe if size < 0 else min(size, remaining_with_probe)
+        )
+        data = self._stream.read(requested)
+        self._bytes_read += len(data)
+        if self._bytes_read > MAX_ARCHIVE_DECOMPRESSED_BYTES:
+            raise ValueError("Archive exceeds the decompressed-stream limit")
+        return data
 
 
 @dataclass(frozen=True)
@@ -30,6 +63,9 @@ class SelectedStructureFile:
     volume_name: str
     size_bytes: int | None = None
     media_type: str | None = None
+    content_sha256: str | None = None
+    member_size_bytes: int | None = None
+    member_content_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,7 +79,7 @@ class CandidateStructureFile:
 
 
 def artifact_mount_path(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     volume_roots: Mapping[str, str],
 ) -> Path:
     """Return an artifact path resolved under its mounted volume root."""
@@ -67,7 +103,7 @@ def matches_structure_pattern(path: str, patterns: Sequence[str] | None) -> bool
 
 
 def structure_patterns_from_metadata(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     patterns: Sequence[str] | None,
 ) -> Sequence[str] | None:
     """Resolve explicit or artifact-provided structure selection patterns."""
@@ -91,7 +127,7 @@ def safe_selected_file_name(artifact_id: str, member_name: str) -> str:
     return sanitize_filename("__".join([artifact_id, *parts]))
 
 
-def artifact_is_zstd_archive(artifact: WorkflowArtifact, path: Path) -> bool:
+def artifact_is_zstd_archive(artifact: ExecutionArtifact, path: Path) -> bool:
     """Return whether an artifact should be read as a tar.zst archive."""
     return (
         artifact.kind == ArtifactKind.ARCHIVE
@@ -102,7 +138,7 @@ def artifact_is_zstd_archive(artifact: WorkflowArtifact, path: Path) -> bool:
 
 
 def structure_files_from_tar_zst(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[tuple[str, bytes]]:
@@ -136,8 +172,27 @@ def files_from_tar_zst_bytes(
     )
 
 
+def files_from_tar_zst_path(
+    path: Path,
+    *,
+    suffixes: Sequence[str] | None = None,
+) -> list[tuple[str, bytes]]:
+    """Read selected files from a tar.zst path without buffering the archive."""
+    suffix_set = {suffix.lower() for suffix in suffixes or ()}
+    return _collect_tar_zst_members(
+        path,
+        include=lambda member: (
+            not suffix_set or Path(member.name).suffix.lower() in suffix_set
+        ),
+        build=lambda member, member_data: (
+            member.name,
+            _required_member_bytes(member, member_data),
+        ),
+    )
+
+
 def selected_structure_file_records_from_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     patterns: Sequence[str] | None,
     volume_roots: Mapping[str, str],
 ) -> list[SelectedStructureFile]:
@@ -163,6 +218,7 @@ def selected_structure_file_records_from_artifact(
                 volume_name=artifact.storage.volume_name,
                 size_bytes=root.stat().st_size,
                 media_type=artifact.storage.media_type,
+                content_sha256=_file_sha256(root),
             )
         ]
 
@@ -180,21 +236,23 @@ def selected_structure_file_records_from_artifact(
                 volume_name=artifact.storage.volume_name,
                 size_bytes=path.stat().st_size,
                 media_type=artifact.storage.media_type,
+                content_sha256=_file_sha256(path),
             )
         )
     return selected
 
 
 def _selected_structure_file_records_from_tar_zst(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     archive_path: Path,
     patterns: Sequence[str] | None,
 ) -> list[SelectedStructureFile]:
     archive_size = archive_path.stat().st_size
-    return _collect_tar_zst_members(
+    archive_digest = _file_sha256(archive_path)
+    return _stream_tar_zst_member_records(
         archive_path,
         include=lambda member: matches_structure_pattern(member.name, patterns),
-        build=lambda member, _data: SelectedStructureFile(
+        build=lambda member, member_digest: SelectedStructureFile(
             artifact_id=artifact.artifact_id,
             file_name=safe_selected_file_name(artifact.artifact_id, member.name),
             artifact_file_path=member.name,
@@ -202,13 +260,15 @@ def _selected_structure_file_records_from_tar_zst(
             volume_name=artifact.storage.volume_name,
             size_bytes=archive_size,
             media_type=artifact.storage.media_type or ZSTD_MEDIA_TYPE,
+            content_sha256=archive_digest,
+            member_size_bytes=member.size,
+            member_content_sha256=member_digest,
         ),
-        read_data=False,
     )
 
 
 def stage2_input_manifest_rows(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     volume_roots: Mapping[str, str],
     *,
     patterns: Sequence[str] | None = None,
@@ -225,7 +285,10 @@ def stage2_input_manifest_rows(
 
     rows = []
     for index, structure in enumerate(
-        sorted(selected, key=lambda item: item.app_volume_path),
+        sorted(
+            selected,
+            key=lambda item: (item.app_volume_path, item.artifact_file_path),
+        ),
         start=1,
     ):
         rows.append(
@@ -246,17 +309,27 @@ def stage2_input_manifest_rows(
                         path=structure.artifact_file_path,
                         media_type=structure.media_type,
                         size_bytes=structure.size_bytes,
+                        content_sha256=structure.content_sha256,
                         expected=True,
                     )
                 ],
-                summary={"file_name": structure.file_name},
+                summary={
+                    "file_name": structure.file_name,
+                    "archive_member_size_bytes": structure.member_size_bytes,
+                    "archive_member_content_sha256": (structure.member_content_sha256),
+                },
             )
         )
     return rows
 
 
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
 def structure_files_from_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     patterns: Sequence[str] | None,
     volume_roots: Mapping[str, str],
 ) -> list[tuple[str, bytes]]:
@@ -289,7 +362,7 @@ def structure_files_from_artifact(
 
 
 def csv_files_from_artifact(
-    artifact: WorkflowArtifact,
+    artifact: ExecutionArtifact,
     volume_roots: Mapping[str, str],
 ) -> list[tuple[str, bytes]]:
     """Read CSV files from one workflow artifact."""
@@ -314,7 +387,7 @@ def csv_files_from_artifact(
 
 
 def select_structure_files_from_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
+    artifacts: Sequence[ExecutionArtifact],
     volume_roots: Mapping[str, str],
     *,
     patterns: Sequence[str] | None = None,
@@ -342,13 +415,23 @@ def candidate_structure_files_from_selected(
     manifest_frame: pl.DataFrame | None = None,
 ) -> list[CandidateStructureFile]:
     """Attach candidate ids to selected structure bytes."""
-    lookup = _candidate_key_lookup(manifest_frame)
+    exact_lookup, legacy_lookup, ambiguous_legacy_keys = _candidate_lookups(
+        manifest_frame
+    )
     keyed = []
     for file_name, data in selected:
         key = tables.candidate_key(file_name)
+        if file_name in exact_lookup:
+            candidate_id = exact_lookup[file_name]
+        elif key in ambiguous_legacy_keys:
+            raise ValueError(
+                f"Ambiguous PPIFlow candidate filename alias: {file_name!r}"
+            )
+        else:
+            candidate_id = legacy_lookup.get(key, key)
         keyed.append(
             CandidateStructureFile(
-                candidate_id=lookup.get(key, key),
+                candidate_id=candidate_id,
                 file_name=file_name,
                 data=data,
                 source_path=file_name,
@@ -356,26 +439,6 @@ def candidate_structure_files_from_selected(
         )
     keyed.sort(key=lambda item: (item.candidate_id, item.file_name))
     return keyed
-
-
-def candidate_structure_files_from_artifacts(
-    artifacts: Sequence[WorkflowArtifact],
-    volume_roots: Mapping[str, str],
-    *,
-    manifest_frame: pl.DataFrame | None = None,
-    patterns: Sequence[str] | None = None,
-    max_files: int | None = None,
-) -> list[CandidateStructureFile]:
-    """Read selected structures and return candidate-keyed records."""
-    return candidate_structure_files_from_selected(
-        select_structure_files_from_artifacts(
-            artifacts,
-            volume_roots,
-            patterns=patterns,
-            max_files=max_files,
-        ),
-        manifest_frame=manifest_frame,
-    )
 
 
 def prepare_dockq_pairs_by_candidate(
@@ -410,20 +473,6 @@ def prepare_dockq_pairs_by_candidate(
     return pairs
 
 
-def discover_partial_sample_dirs(root: str | Path) -> list[Path]:
-    """Return PPIFlow partial sample directories below a run root."""
-    root = Path(root)
-    if not root.exists():
-        raise FileNotFoundError(f"PPIFlow partial root was not found: {root}")
-    return sorted({
-        path.parent
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in STRUCTURE_SUFFIXES
-        and ("sample" in path.parent.name.lower() or "partial" in path.parts)
-    })
-
-
 def rosetta_job_manifest_rows(
     structures: Sequence[CandidateStructureFile],
     *,
@@ -431,8 +480,8 @@ def rosetta_job_manifest_rows(
     rosetta_script: str | None = None,
     flags_file: str | None = None,
 ) -> list[dict[str, object]]:
-    """Build PPIFlow-owned Rosetta queue/job manifest rows."""
-    rows = []
+    """Build PPIFlow-owned Rosetta job manifest rows."""
+    rows: list[dict[str, object]] = []
     for index, structure in enumerate(structures, start=1):
         input_pdb = f"inputs/{index}/{sanitize_filename(structure.candidate_id)}.pdb"
         output_dir = f"outputs/{index}"
@@ -462,13 +511,62 @@ def write_rosetta_job_manifest(
     return manifest_path
 
 
-def _candidate_key_lookup(manifest_frame: pl.DataFrame | None) -> dict[str, str]:
+def _candidate_lookups(
+    manifest_frame: pl.DataFrame | None,
+) -> tuple[dict[str, str], dict[str, str], frozenset[str]]:
+    """Build exact selected-name and unambiguous legacy candidate lookups."""
     if manifest_frame is None or manifest_frame.is_empty():
-        return {}
-    return {
-        row["_candidate_key"]: row["candidate_id"]
-        for row in tables.manifest_candidate_key_pairs(manifest_frame)
+        return {}, {}, frozenset()
+
+    exact_candidates: dict[str, set[str]] = {}
+    for row in manifest_frame.iter_rows(named=True):
+        candidate_id = str(row["candidate_id"])
+        source_artifact_id = row.get("source_artifact_id")
+        if not source_artifact_id:
+            continue
+        for file_record in row.get("files") or ():
+            if not isinstance(file_record, Mapping):
+                continue
+            path = file_record.get("path")
+            if path:
+                selected_name = safe_selected_file_name(
+                    str(source_artifact_id),
+                    str(path),
+                )
+                exact_candidates.setdefault(selected_name, set()).add(candidate_id)
+    ambiguous_exact = {
+        name: candidate_ids
+        for name, candidate_ids in exact_candidates.items()
+        if len(candidate_ids) > 1
     }
+    if ambiguous_exact:
+        raise ValueError(
+            "Ambiguous exact PPIFlow candidate aliases: "
+            + ", ".join(sorted(ambiguous_exact))
+        )
+
+    legacy_candidates: dict[str, set[str]] = {}
+    for row in tables.manifest_candidate_key_pairs(manifest_frame):
+        legacy_candidates.setdefault(row["_candidate_key"], set()).add(
+            row["candidate_id"]
+        )
+    ambiguous_legacy = frozenset(
+        key
+        for key, candidate_ids in legacy_candidates.items()
+        if len(candidate_ids) > 1
+    )
+    return (
+        {
+            name: next(iter(candidate_ids))
+            for name, candidate_ids in exact_candidates.items()
+        },
+        {
+            key: next(iter(candidate_ids))
+            for key, candidate_ids in legacy_candidates.items()
+            if key not in ambiguous_legacy
+        },
+        ambiguous_legacy,
+    )
 
 
 def _unique_candidate_structures(
@@ -494,33 +592,126 @@ def _first_candidate_structures(
     return by_id
 
 
-def _collect_tar_zst_members[ArchiveItem](
+def _collect_tar_zst_members(  # noqa: UP047 - imported by Python 3.11 task images
     source: Path | bytes,
     *,
     include: Callable[[tarfile.TarInfo], bool],
-    build: Callable[[tarfile.TarInfo, bytes | None], ArchiveItem],
+    build: Callable[[tarfile.TarInfo, bytes | None], _ArchiveItem],
     read_data: bool = True,
-) -> list[ArchiveItem]:
+) -> list[_ArchiveItem]:
     import zstandard as zstd
 
-    selected: list[ArchiveItem] = []
+    selected: list[_ArchiveItem] = []
+    selected_bytes = 0
+    member_count = 0
+    expanded_bytes = 0
     compressed_context = (
         BytesIO(source) if isinstance(source, bytes) else source.open("rb")
     )
     with compressed_context as compressed:
         reader = zstd.ZstdDecompressor().stream_reader(compressed)
-        with reader, tarfile.open(fileobj=reader, mode="r|") as tar:
+        bounded_reader = _BoundedArchiveReader(reader)
+        with reader, tarfile.open(fileobj=bounded_reader, mode="r|") as tar:
             for member in tar:
+                member_count, expanded_bytes = _check_archive_input_limits(
+                    member,
+                    member_count=member_count,
+                    expanded_bytes=expanded_bytes,
+                )
                 if not member.isfile() or not include(member):
                     continue
+                _check_archive_selection_limits(
+                    selected_members=len(selected) + 1,
+                    selected_bytes=selected_bytes + member.size,
+                )
                 member_data = None
                 if read_data:
                     extracted = tar.extractfile(member)
                     if extracted is None:
                         continue
-                    member_data = extracted.read()
+                    member_data = extracted.read(member.size + 1)
+                    if len(member_data) != member.size:
+                        raise ValueError(
+                            f"Archive member size changed while reading: {member.name}"
+                        )
+                selected_bytes += member.size
                 selected.append(build(member, member_data))
     return selected
+
+
+def _stream_tar_zst_member_records(  # noqa: UP047 - Python 3.11 task images
+    source: Path,
+    *,
+    include: Callable[[tarfile.TarInfo], bool],
+    build: Callable[[tarfile.TarInfo, str], _ArchiveItem],
+) -> list[_ArchiveItem]:
+    import zstandard as zstd
+
+    selected: list[_ArchiveItem] = []
+    selected_bytes = 0
+    member_count = 0
+    expanded_bytes = 0
+    with source.open("rb") as compressed:
+        reader = zstd.ZstdDecompressor().stream_reader(compressed)
+        bounded_reader = _BoundedArchiveReader(reader)
+        with reader, tarfile.open(fileobj=bounded_reader, mode="r|") as tar:
+            for member in tar:
+                member_count, expanded_bytes = _check_archive_input_limits(
+                    member,
+                    member_count=member_count,
+                    expanded_bytes=expanded_bytes,
+                )
+                if not member.isfile() or not include(member):
+                    continue
+                _check_archive_selection_limits(
+                    selected_members=len(selected) + 1,
+                    selected_bytes=selected_bytes + member.size,
+                )
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    continue
+                digest = hashlib.sha256()
+                bytes_read = 0
+                while chunk := extracted.read(_ARCHIVE_READ_CHUNK_BYTES):
+                    digest.update(chunk)
+                    bytes_read += len(chunk)
+                if bytes_read != member.size:
+                    raise ValueError(
+                        f"Archive member size changed while reading: {member.name}"
+                    )
+                selected_bytes += bytes_read
+                selected.append(build(member, digest.hexdigest()))
+    return selected
+
+
+def _check_archive_selection_limits(
+    *,
+    selected_members: int,
+    selected_bytes: int,
+) -> None:
+    if selected_members > MAX_ARCHIVE_SELECTED_MEMBERS:
+        raise ValueError("Archive contains too many selected files")
+    if selected_bytes > MAX_ARCHIVE_SELECTED_BYTES:
+        raise ValueError("Selected archive files exceed the expanded-size limit")
+
+
+def _check_archive_input_limits(
+    member: tarfile.TarInfo,
+    *,
+    member_count: int,
+    expanded_bytes: int,
+) -> tuple[int, int]:
+    member_count += 1
+    if member_count > MAX_ARCHIVE_MEMBERS:
+        raise ValueError("Archive contains too many members")
+    if not member.isfile():
+        return member_count, expanded_bytes
+    if member.size > MAX_ARCHIVE_MEMBER_BYTES:
+        raise ValueError(f"Archive member is too large: {member.name}")
+    expanded_bytes += member.size
+    if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+        raise ValueError("Archive exceeds the expanded-size limit")
+    return member_count, expanded_bytes
 
 
 def _required_member_bytes(member: tarfile.TarInfo, data: bytes | None) -> bytes:

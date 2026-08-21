@@ -9,13 +9,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from time import time
-from typing import Protocol, cast
+from typing import Protocol, TypeAlias, cast
 
-from biomodals.app.fold.alphafold3.artifacts import utc_now
+from biomodals.helper.artifacts import utc_now
 
 _TERMINAL_STATUSES = frozenset({"complete", "failed", "abandoned"})
 
-type ClaimOwnerAdapter = Callable[[str, object], dict[str, object]]
+ClaimOwnerAdapter: TypeAlias = Callable[  # noqa: UP040 - Python 3.11 task images
+    [str, object], dict[str, object]
+]
 
 
 class ClaimStore(Protocol):
@@ -220,6 +222,22 @@ def acquire_generation_claim(
             selected_scope,
             predecessor_generation,
         )
+        if predecessor_generation == selected_generation:
+            if predecessor.get("identity") != identity:
+                raise ValueError(
+                    f"Generation {selected_generation!r} already owns "
+                    f"{selected_scope!r} with a different identity"
+                )
+            if predecessor_status is not None:
+                raise LostGenerationError(
+                    f"Generation {selected_generation!r} for "
+                    f"{selected_scope!r} is already terminal"
+                )
+            return GenerationClaim(
+                selected_scope,
+                selected_generation,
+                predecessor,
+            )
         if predecessor_status is None:
             started_at = cast(
                 int | float,

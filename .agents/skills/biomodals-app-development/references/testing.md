@@ -7,8 +7,9 @@ application, resumption, or scientific results.
 
 1. **Pure policy:** validation, safe IDs, identities, plans/manifests, budgets,
    parsers/reducers, ordering, and invariants.
-2. **Artifact lifecycle:** partial/corrupt state, missing shards, stale leases,
-   retry, cleanup ordering, and force isolation.
+2. **Artifact lifecycle:** partial/corrupt state, missing shards, stale workload
+   publication claims, provider redelivery, Successor recovery, cleanup
+   ordering, and force isolation.
 3. **Composition:** discovery, config/image/mount wiring, primitive payloads,
    orchestration, and fake remotes/`get_raw_f()`.
 4. **Upstream:** apply patches to the exact pinned commit, compile/import them,

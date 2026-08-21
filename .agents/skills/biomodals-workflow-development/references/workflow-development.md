@@ -11,8 +11,21 @@ workflows that select files from one app's volume-backed output and fan those
 files out into another app's workflow-compatible function. Do not use
 `src/biomodals/workflow/ppiflow_workflow.py` as a generic starter template, but
 use it as the reference for candidate-manifest joins, retained-candidate
-filtering, candidate-wide remote stage coordinators, and PPIFlow-specific stage
-wiring.
+filtering, candidate-wide Tasks, focused task-image runtimes, and
+PPIFlow-specific stage wiring.
+
+Treat [ADR 0006](../../../../docs/adr/0006-unified-execution-kernel.md) and the
+[scheduler specification](../../../../docs/specs/unified-task-scheduler.md) as
+authoritative when changing execution statuses, ownership, restart, durability,
+or coordinator behavior. Keep this guide focused on workflow composition.
+
+The implemented
+[execution-kernel consolidation](../../../../docs/specs/execution-kernel-consolidation.md)
+makes workflow an authoring and deployment concept over the same
+`ExecutionDefinition` used by apps. Generic graph and artifact execution lives
+in `biomodals.execution`; Modal hosting lives in
+`biomodals.execution.modal`. The removed `biomodals.workflow.core` package has
+no compatibility alias.
 
 ## Contents
 
@@ -22,7 +35,7 @@ wiring.
 - [Schema Boundaries](#schema-boundaries)
 - [Node Execution Policy](#node-execution-policy)
 - [Artifact Availability And Recovery](#artifact-availability-and-recovery)
-- [Node Placement](#node-placement)
+- [Execution Boundaries](#execution-boundaries)
 - [Ledger Layout](#ledger-layout)
 - [Modal Preemption](#modal-preemption)
 - [Fan-Out](#fan-out)
@@ -42,37 +55,49 @@ wiring.
 - **Local Entrypoint**: a CLI-only `@app.local_entrypoint`.
 - **Workflow-Compatible App Function**: a remote app function returning
   `AppRunResult`.
-- **Workflow Node**: one semantic DAG vertex.
-- **App-Backed Node**: a workflow node that calls app functions.
-- **Workflow-Native Node**: a workflow node implemented in workflow code.
-- **Workflow Runtime**: validates and schedules workflow nodes.
-- **Workflow Orchestrator**: the Modal-hosted coordinator class hosting the runtime for one workflow run.
-- **Workflow Artifact**: durable data passed between workflow nodes.
+- **Execution Node**: one semantic DAG vertex, whether app- or workflow-owned.
+- **App-Backed Execution Node**: an Execution Node that calls an app operation.
+- **Workflow-Owned Execution Node**: an Execution Node whose scientific logic
+  belongs only to a workflow.
+- **Task**: the smallest independently identified, cacheable, and verifiable
+  work item inside one Node.
+- **Provider Call**: one concrete Modal function invocation owned by one Node
+  and zero or more Tasks.
+- **Execution Run**: one immutable workflow plan invocation, keyed by an opaque
+  UUID.
+- **Successor Execution Run**: a new compatible Run that may reuse validated
+  predecessor publications and schedule conclusively missing work.
+- **Execution Coordinator**: the run-scoped Modal class that owns the only
+  SQLite writer and drives one Execution Run.
+- **Execution Artifact**: durable data passed between Execution Nodes.
 - **Artifact Selector**: a named reference to upstream artifacts.
 
-Avoid the terms `app node`, `runner node`, `engine`, and `workflow
-entrypoint`; they are ambiguous in this codebase.
+Use the canonical execution terms in `CONTEXT.md`. Avoid `app node`, `runner
+node`, `engine`, `workflow entrypoint`, and `attempt`; they are ambiguous or
+obsolete in this codebase.
 
 ## ShortMD Reference Pattern
 
 ShortMD is the current reference for executable workflow apps. Its data flow is:
 
 1. The local entrypoint discovers local `.pdb` files, sanitizes the workflow
-   `run_id`, reads PDB bytes, builds a static `Workflow`, and submits that
-   object to the included `WorkflowOrchestrator`.
+   `run_id`, reads PDB bytes, builds a static `ExecutionGraph`, validates it to
+   an `ExecutionDefinition`, and submits it to the included coordinator.
 2. The workflow app composes the shared orchestrator and the GROMACS app with
    `modal.App(...).include(orchestrator.app)` plus
    `include_dependency_apps(app, CONF.depends_on_apps)`.
-3. `ShortMDModalNamespace` carries the hydrated GROMACS functions and
-   workflow-native remote functions across the orchestrator boundary.
+3. Each provider-backed Node returns a `ProviderCallSpec` with the exact
+   included operation name. The Modal integration resolves it against the
+   pinned ShortMD deployment; explicit development runs provide a temporary
+   name-to-handle map.
 4. `ShortMDPrepNode` prepares one input PDB once through the GROMACS app.
 5. `ShortMDCloneNode` clones prepared production inputs into per-replicate
    directories. This file management is workflow-native because the standalone
    GROMACS app does not need it.
 6. `ShortMDReplicateNode` runs each production replicate through the GROMACS app
    and collects trajectory stats.
-7. `ShortMDSummaryNode` emits a Markdown report from completed production
-   artifacts.
+7. `ShortMDSummaryNode` emits a Markdown report and republishes the completed
+   production artifacts as the terminal scientific boundary.
 
 Follow this structure for new app-composed workflows: stage local inputs before
 DAG construction, build a static fan-out DAG, keep app-specific runtime work in
@@ -86,7 +111,7 @@ workflow-compatible app functions across an app-owned output volume. Its data
 flow is:
 
 1. The local entrypoint reads one local PDB, sanitizes `run_id`, builds a static
-   fan-out DAG, and submits it to the included `WorkflowOrchestrator`.
+   fan-out DAG, and submits it to the included `ExecutionCoordinator`.
 2. Each `RFdiffusionTrajectoryNode` calls the RFdiffusion app's
    workflow-compatible remote function and receives a durable `VolumePath`
    directory plus log artifact metadata.
@@ -95,8 +120,8 @@ flow is:
    downstream LigandMPNN should redesign.
 4. Each `LigandMPNNDesignNode` calls the LigandMPNN app's workflow-compatible
    remote function with PDB bytes and MPNN CLI args, receiving a small inline
-   zstd archive that the workflow runtime materializes.
-5. The summary node reports all LigandMPNN archive artifacts.
+   zstd archive that the execution runtime materializes.
+5. The summary node reports and republishes all LigandMPNN archive artifacts.
 
 Use this pattern when the source app owns durable outputs but downstream nodes
 need selected small files or derived arguments. Keep selector/adaptation logic in
@@ -109,42 +134,43 @@ Shared contracts live in `biomodals.schema`.
 Schema modules must not import `modal`, `biomodals.app`, or
 `biomodals.workflow`. They should contain Pydantic models and primitive fields
 only. The shared `AppConfig` Pydantic schema lives in `biomodals.schema.app`.
-Modal-specific helpers that construct volumes, images, or apps must stay in
-`biomodals.app` or `biomodals.helper`, with compatibility imports allowed during
-the transition from `biomodals.app.config`.
+Generic Modal execution hosting belongs in `biomodals.execution.modal`.
+App-specific Volume, Image, and App assembly stays in a thin app/workflow
+composition root or an existing focused helper.
 
-Workflow-compatible app functions return `AppRunResult`. The workflow runtime
-materializes each `AppOutput` into one or more `WorkflowArtifact` manifests.
+Workflow-compatible app functions return `AppRunResult`. The execution runtime
+materializes each `AppOutput` into one or more `ExecutionArtifact` manifests.
 Inline byte outputs are for UTF-8 text bytes or small zstd archives with
 `media_type="application/zstd"`. `InlineBytes` should rely on Pydantic's
 `ser_json_bytes` and `val_json_bytes` configuration for JSON byte encoding and
-decoding; keep text-vs-archive policy in the workflow runtime materialization
+decoding; keep text-vs-archive policy in the execution materialization
 layer rather than adding manual byte decoding validators to the shared schema.
 Inline byte outputs are materialized into the workflow run volume when the
-runtime records workflow artifacts. Other binary outputs, large archives, and
+runtime records Execution Artifacts. Other binary outputs, large archives, and
 non-text bytes must be written to deterministic volume paths and returned as
 `VolumePath` storage.
 
-`AppRunResult.logs` are durable workflow artifacts too. The runtime writes log
-outputs under `nodes/<node-id>/attempts/<attempt-id>/logs/` and records
-artifact manifests for them so failed or partial attempts retain diagnostic
-state.
+`AppRunResult.logs` are durable Execution Artifacts too. For a single-Task Node,
+the runtime materializes inline logs below
+`nodes/<node-id>/result/logs/`. Runtime-discovered Tasks use
+`nodes/<node-id>/tasks/<task-key>/result/logs/`. Artifact manifests retain the
+exact storage paths.
 
 Volume path outputs may either be referenced in place or copied into the
 workflow run volume when the source volume is mounted locally. Reference mode is
 the default because many app outputs are already durable in their owning app
 volume. Copy mode is for workflows that need a self-contained run directory.
 
-When staging selected files from upstream workflow artifacts into app input
+When staging selected files from upstream Execution Artifacts into app input
 directories, never reuse the full pipeline/provenance-derived selected name as
 the filesystem basename. Those names can accumulate node ids, artifact ids,
 archive paths, and run names and exceed per-component filename limits. Use a
 short deterministic basename from a candidate id, sanitized stem, or content
 hash, and keep provenance in manifests or metadata instead.
 
-The first workflow runtime is Python-first. Pass a `Workflow` object across the
-orchestrator boundary; serialized workflow dictionaries are intentionally
-deferred until the node and app-function contracts stabilize.
+Graph authoring is Python-first. Pass a validated `ExecutionDefinition` across
+the coordinator boundary; serialized graph dictionaries and factory import
+strings are intentionally unsupported.
 
 ## Node Execution Policy
 
@@ -153,156 +179,201 @@ durable completion and no missing recorded outputs, the run succeeds without
 rechecking or scheduling intermediate nodes. If only some terminal nodes are
 incomplete, schedule only those terminals and their ancestor closure.
 
-Within the scheduled closure, nodes check durable SQLite run state before
-execution and skip work when completed artifact manifests already exist.
+Within the required closure, the runtime records tri-state publication
+observations before authorizing work. `available` completes or reuses the Task,
+`missing` permits execution, and `unknown` suspends the Run without spending.
 
-Incomplete nodes use one of two policies:
+A Task has no retry policy or attempt counter. It receives at most one
+scheduler submission or remote owner in an Execution Run. `resume` continues a
+suspended Run or explicitly reconciles `state_unknown`, but never retries
+conclusive failure. Retrying missing or failed work requires an explicit
+Successor Execution Run with the same Workload Plan Fingerprint.
 
-- `RERUN`: discard incomplete attempt state and recompute.
-- `RESUME`: use a durable node cache to resume or skip completed subwork.
+Coordinator-local Tasks may re-enter the same idempotent operation after a
+coordinator interruption only when their publication is authoritatively
+missing. Long-running work must use deterministic run, node, and Task
+identifiers and store checkpoints in durable volumes rather than
+container-local scratch paths.
 
-Long-running nodes must be idempotent against deterministic run, node, input,
-and attempt identifiers. Store resumable state in volumes, not container-local
-scratch paths.
+`AppRunStatus.PARTIAL` is meaningful only when a Node's declared aggregation
+policy permits it. A single ordinary remote or local Task must return
+`SUCCEEDED` to publish success.
 
-`AppRunStatus.PARTIAL` is terminal but not successful in the first runtime. The
-runtime records the node as failed, records the run as failed, preserves logs,
-and does not unblock downstream nodes.
-
-Forced workflow runs replace the existing run directory before creating a fresh
-ledger. Use force only when discarding previous artifacts, node caches, and
-attempt records is intentional.
+A workflow-specific `force` flag may deliberately replace workload-owned
+scientific outputs, as ShortMD does through tracked cleanup Nodes. It does not
+reset or mutate kernel execution state.
 
 ## Artifact Availability And Recovery
 
 The runtime verifies workflow-volume artifact availability before reusing a
-previously completed node. If a recorded workflow-volume artifact manifest or
-expected file is missing, the producing node is treated as incomplete and normal
-node recovery decides whether to rerun or resume it.
+recorded publication. A conclusively missing publication may authorize work in
+the current incomplete Run or its explicit Successor; an unavailable checker
+returns `unknown` and authorizes no work.
 
-App-owned volume artifacts are skipped by default because the reusable runtime
-does not own those `modal.Volume` handles. Workflows that need strict recovery
-for app-owned outputs may enable the orchestrator/runtime
-`strict_external_artifact_checks` option and pass one checker that can inspect
-the required mounted app volumes. Keep those checks run-level and derived from
-recorded `WorkflowArtifact` locations; do not add per-node user settings or
-tool-specific logic to workflow core.
+An app-owned Volume cannot be inferred available when the execution runtime has
+not mounted it. Without a checker its observation is `unknown`, which
+authorizes no work. Workflows that publish or reuse app-owned outputs should
+enable `strict_external_artifact_checks` and name one workflow-local checker
+function that mounts and inspects the required volumes. Keep checks run-level
+and derived from recorded `ExecutionArtifact` locations; do not add per-Node
+user settings or tool-specific logic to the shared kernel.
 
-The helpers in `workflow.core.artifact_availability` are pure Python so workflow
-modules can call them from a lightweight Modal function that mounts the
-app-owned volumes needed for the run. Use the typed availability contract to
-distinguish `available`, `missing`, and `unknown` app-owned volume state; only
-missing artifacts should drive rerun or resume decisions.
+ShortMD, RFdiffusion-to-LigandMPNN, and PPIFlow install their checker
+unconditionally because they publish app-owned Volume paths. New workflows
+with external outputs must do the same; do not expose a flag that makes normal
+publication validation inconclusive.
 
-## Node Placement
+The helpers in `biomodals.execution.artifact_availability` are provider-neutral
+Python, so workflow modules can call them from a lightweight Modal function
+that mounts the app-owned Volumes needed for the Run. Use the typed availability
+contract to distinguish `available`, `missing`, and `unknown`; only missing
+artifacts may authorize execution.
 
-Use `ORCHESTRATOR` placement for lightweight workflow-native logic such as
-filtering, ranking, reporting, and small manifest transforms.
+## Execution Boundaries
 
-Use `REMOTE` placement for long-running work, app-backed work, and work that
-benefits from failure isolation.
+Use `CoordinatorNode` for lightweight coordinator-local logic such as filtering,
+ranking, reporting, and small manifest transforms. Its `run()` method executes
+through the kernel's Coordinator-Local Task boundary and consumes no Provider
+Call slot.
 
-Every `REMOTE` node must implement direct remote submission:
-`submit_remote(context)` returns a `RemoteNodeSubmission` containing the actual
-Modal `FunctionCall`, a readable function name, and any small JSON metadata
-needed to post-process or recover the result. If the remote result is not
-already an `AppRunResult`, or if workflow metadata must be attached before
-artifact materialization, implement `process_remote_result(result, metadata)`.
-`process_remote_result(...)` is part of the node contract and defaults to
-`AppRunResult.model_validate(result)`. `AppBackedNode` and `REMOTE`
-`WorkflowNativeNode` implementations inherit a default `run()` that submits the
-remote call, waits for `.get()`, and calls `process_remote_result(...)`.
-`ORCHESTRATOR` `WorkflowNativeNode` implementations must still implement
-`run(context)` directly. The runtime records the direct call ID in the ledger
-before waiting for the result and reuses the recorded processed `AppRunResult`
-during recovery.
+`max_parallel_nodes` limits how many workflow Nodes may be `running` at once.
+It is independent from the Run's total and GPU Provider Call limits: one
+running Node may fan out to several calls, while a local Node consumes no call
+slot.
 
-Do not add a generic remote-node wrapper that accepts arbitrary workflow nodes.
-Workflow-native file-management adapters and app-backed nodes that combine
+Use `ProviderNode` for one tracked provider call. Implement
+`prepare_remote(context)` to return a `ProviderCallSpec`; this prepares
+arguments and an exact operation name but never submits work.
+Implement `process_remote_result(result, metadata)` when the provider result
+needs adaptation before publication.
+
+Use `TaskProviderNode` when one semantic Node discovers a finite set of
+independently identified Tasks at runtime. Implement
+`discover_remote_tasks()`, `prepare_remote_task()` or
+`prepare_remote_task_batch()`, result decoding, publication observation when
+needed, and `finalize_remote_tasks()`.
+
+Use `PullTaskProviderNode` only for large variable-duration Task sets that
+benefit from lock-free work stealing. Implement `prepare_pull_worker()` with a
+bounded claim capacity and per-Node `max_worker_calls`. Ready Tasks and durable
+Worker Assignments in SQLite are the queue; workers claim and complete them
+through idempotent coordinator methods and never open the database.
+
+The runtime preclaims every Provider Call before invoking Modal, attaches the
+returned call ID durably, and recovers that exact call. Node implementations
+must not call `.spawn()`, `.remote()`, or `.get()` themselves.
+
+An app function invoked by a workflow is a Provider Call in the workflow's
+Execution Run. It must not launch the app's top-level coordinator or create a
+nested app-run ledger.
+
+Do not add a generic provider-node wrapper that accepts arbitrary workload
+Nodes. Workflow-owned file-management adapters and app-backed Nodes that combine
 multiple non-`AppRunResult` app calls should expose their own workflow-local
-Modal functions or submit the primary app call directly and adapt the raw result
-with `process_remote_result(...)`. Unit tests use fake `FunctionCall` objects
-and must not call live Modal APIs.
+Modal functions or prepare the primary app call and adapt its raw result with
+`process_remote_result(...)`. Unit tests use fake Modal drivers and must not
+call live Modal APIs.
 
 ## Ledger Layout
 
-The first durable run layout is:
+Each workflow Execution Run uses one opaque UUID and one coordinator-scoped
+SQLite repository:
 
 ```text
-<workflow-volume>/<workflow-name>/<run-id>/
-  ledger.sqlite3
-  inputs/
-  nodes/
-    <node-id>/
-      attempts/
-        <attempt-id>/
-          logs/
-            <log-artifact-id>/
-          <artifact-id>/
-      cache/
-  artifacts/
-    <artifact-id>.json
-  final/
+<workflow-volume>/
+  .biomodals/execution/runs/<execution-run-id>/
+    ledger.sqlite3
+    workflow-plan.pkl
+  workflow-runs/<execution-run-id>/
+    nodes/
+      <node-id>/
+        result/
+        cache/
+        tasks/<task-key>/
+          result/
+          cache/
+    artifacts/
+      <artifact-id>.json
 ```
 
-The workflow ledger is one SQLite database per run. The orchestrator is the only
-ledger writer. Remote nodes write deterministic output files and logs, then the
-orchestrator reloads the volume, reconciles those files, and updates the ledger.
-Inline byte outputs are materialized once into
-`nodes/<node-id>/attempts/<attempt-id>/<artifact-id>/`. Inline logs are
-materialized once under `nodes/<node-id>/attempts/<attempt-id>/logs/<artifact-id>/`.
-Store only materialized `VolumePath` app-result JSON in `attempts.app_result_json`;
-do not store base64 `InlineBytes` payloads in SQLite.
+`GraphExecutionRunStore` owns the connection and transaction boundary. It
+embeds `SqliteExecutionRepository` and `ExecutionArtifactStore` tables in the
+same database so publication and execution transitions can commit together.
+There is no separate workflow runtime, ledger, attempt table, or
+attempt-directory layer.
 
-Ledger updates mutate SQLite rows directly. Do not preserve obsolete
-Pydantic-status update patterns such as `model_copy(update=...)` for ledger
-state.
+The Execution Coordinator is the only SQLite writer. Provider workers write
+scientific outputs or Result Envelopes and communicate claims and completions
+through coordinator methods; they never open `ledger.sqlite3`.
 
-After orchestrator ledger writes inside Modal containers, call `commit()`.
-Before reading data written by another container, call `reload()`. Resuming a
-run with a different DAG hash fails unless the run is forced, because stale node
-state cannot safely be reused across workflow definition changes.
-
-Record a Modal `FunctionCall.object_id` in `remote_calls` immediately after
-submitting remote node work. On orchestrator startup or restart, reattach with
-`modal.FunctionCall.from_id(call_id)` and poll before launching replacement
-work. Reconcile existing pending, succeeded, failed, or expired calls and their
-deterministic output files before applying `RERUN` or `RESUME`. Do not blindly
-resubmit work while an older call may still be writing the same node outputs.
-
-Use these tables for the first ledger schema:
+The shared repository stores execution records:
 
 ```text
-runs(run_id, workflow_name, dag_hash, status, created_at, updated_at, metadata_json)
-nodes(node_id, status, execution_policy, placement, current_attempt_id, error, started_at, completed_at, updated_at)
-attempts(attempt_id, node_id, status, started_at, completed_at, app_result_json, error, metadata_json)
-remote_calls(call_id, node_id, attempt_id, function_name, call_kind, status, submitted_at, completed_at, error, metadata_json)
-artifacts(artifact_id, producing_node_id, kind, volume_name, storage_path, source_app_output_name, created_at, metadata_json)
-artifact_files(artifact_id, path, role, media_type, size_bytes, metadata_json)
-node_inputs(node_id, input_name, artifact_id)
-node_outputs(node_id, artifact_id)
+execution_runs
+execution_nodes
+execution_tasks
+execution_dispatch_batches
+execution_provider_calls
+execution_task_claim_requests
+execution_worker_assignments
+execution_task_completion_requests
+execution_node_dependencies
 ```
 
-Keep large payloads in files and store paths in SQLite. Store non-Pydantic
-metadata JSON text with `orjson`. Store Pydantic payload snapshots with
-`model_dump_json()` and load them with `model_validate_json(...)`. A human
-should be able to debug a run with `sqlite3` by
-checking `runs.status`, stalled rows in `nodes`, outstanding `remote_calls`,
-and artifact paths in `artifacts` plus `artifact_files`.
+Task rows carry fixed-call and pull-worker Provider Call ownership. Claim and
+completion request rows make worker callbacks durably idempotent.
+
+Execution artifact tables store artifacts, input/output links, and materialized
+Node and Task `AppRunResult` records:
+
+```text
+execution_artifacts
+execution_artifact_files
+execution_node_inputs
+execution_node_outputs
+execution_node_results
+execution_task_outputs
+execution_task_results
+```
+
+Keep large payloads in files and only durable `VolumePath` references in
+SQLite. `InlineBytes` are materialized before the result is recorded. Commit
+coordinator-local SQLite changes locally. Close SQLite and synchronize its
+Volume only at a cross-container visibility or ownership boundary; reload
+before reading another container's committed files. Do not commit the Volume
+after every same-container state or file mutation.
+
+The persisted `workflow-plan.pkl` is trusted internal state tied to the exact
+deployment. A reopened Run must match its Workload Plan Fingerprint, Workload
+Run Key, and Deployment Identity. Old pre-kernel workflow ledgers are rejected;
+there is no compatibility facade or migration.
 
 ## Modal Preemption
 
-All Modal functions are subject to preemption. Treat remote functions as
-restartable with the same inputs.
+All Modal functions are subject to preemption. Provider redelivery may execute
+the same Provider Call and Task identity again, so remote functions must be
+idempotent against deterministic inputs and publication paths.
+
+Coordinator interruption is different from Task failure. The exit hook closes
+and checkpoints state best-effort without cancelling children. A replacement
+coordinator reloads SQLite, reattaches recorded call IDs, and derives active
+call counts from durable records. An uncaught coordinator application error
+suspends the Run until explicit `resume`.
+
+Worker exit callbacks are advisory. They may checkpoint workload-owned data or
+record diagnostics, but they do not fail, reassign, or retry a Task. Pull-worker
+claims and completions use stable request IDs so a lost response can be replayed
+without creating a new assignment.
 
 Remote workflow code should:
 
-- split long work into smaller retryable tasks;
-- expose enough attempt status, artifacts, and logs for the orchestrator to
-  record ledger state before and after work;
-- write cache checkpoints for `RESUME` nodes;
-- use deterministic output paths from run and node identifiers;
-- leave enough artifacts and logs to reconcile after restart.
+- split large work into independently identified Tasks where scientifically
+  meaningful;
+- use deterministic output paths from Run, Node, and Task identities;
+- validate publications rather than treating a claim or marker alone as
+  completion;
+- leave enough output and logs to reconcile the retained Provider Call;
+- never submit replacement work when ownership or availability is `unknown`.
 
 ## Fan-Out
 
@@ -319,49 +390,71 @@ satisfied.
 
 ## Orchestrator Submission
 
-The reusable workflow orchestrator lives under `biomodals.workflow.core` and is
-not a user-facing workflow script. Workflow scripts should import the module and
-compose its app into their own Modal app:
+The reusable Modal orchestrator lives under
+`biomodals.execution.modal.orchestrator` and is not a user-facing workflow
+script. Workflow modules compose its app into their own Modal app:
 
 ```python
-from biomodals.workflow.core import orchestrator
+from biomodals.execution.modal import orchestrator
 
-app = modal.App(...).include(orchestrator.app)
+app = modal.App(...).include(orchestrator.app, inherit_tags=True)
 ```
 
 All remote orchestration functions should live as methods on
-`WorkflowOrchestrator`. Workflow apps may use the included
-`WorkflowOrchestrator` methods for run submission, but the reusable orchestrator
-must not perform deployed app lookups, import workflow app functions by name, or
-handle hydration details for workflow-specific apps. Domain-specific input
-staging and DAG construction belong in top-level workflow scripts.
+`ExecutionCoordinator`. Workflow apps obtain the class handle with
+`orchestrator.execution_coordinator_handle(...)` and call
+`orchestrator.submit_workflow_run(...)`. That helper synchronously calls
+`prepare_run` for a root Run or `prepare_restart_from` for a Successor before
+spawning `drive_prepared`. Development function handles are passed to the
+driver input so a replacement coordinator container does not lose them. The
+reusable orchestrator must not discover
+workflow modules, perform floating deployed-app lookups, or own
+workflow-specific input staging. Domain-specific staging, DAG construction,
+and development function handles belong in discoverable workflow modules.
+
+Expose remote admission only through the outer
+`biomodals workflow run --max-containers N --max-gpu-containers G` options.
+Coordinator-aware Local Entrypoints accept the corresponding hidden values and
+map them to `max_active_provider_calls` and
+`max_active_gpu_provider_calls`. A workflow may initialize
+`max_parallel_nodes` from the total ceiling, but the runtime fields remain
+independent. Do not add workflow-specific remote-container flags. Scientific
+task counts, shard sizes, batching, and in-container workers remain workflow
+arguments and may lower actual concurrency below the Run limits.
+
+Derive any performance-motivated batch count from the applicable Run ceiling;
+do not expose another remote concurrency setting. PPIFlow AF3Score uses the GPU
+ceiling to form length-balanced batches. PPIFlow Rosetta sizes its pull-worker
+pool from the total ceiling because those workers are CPU-only.
+
+The unified CLI accepts only positive explicit `--max-gpu-containers` values.
+CPU-only workflows may use a zero GPU ceiling through their defaults when the
+option is omitted. Do not duplicate this outer CLI validation in workflow
+entrypoints.
 
 ## Runtime Diagnostics
 
-`WorkflowRuntime.diagnostics` stores in-memory diagnostics for the most recent
-run, including stable scheduler decision snapshots and scheduled node waves.
-Use it in tests or debugging when you need to inspect why the runtime scheduled,
-blocked, or completed nodes. Do not expose private scheduler, ledger, or
-volume-sync collaborators as routine workflow authoring APIs.
+Use `ExecutionSnapshot` and the durable execution, Provider Call, and workflow
+artifact rows for diagnostics. Do not expose private scheduler, repository, or
+Volume-sync collaborators as routine workflow authoring APIs.
 
-Keep the public orchestrator method surface minimal. The intended remote method
-for user-facing submission is `WorkflowOrchestrator.run(...)`. The orchestrator
-does not expose a generic per-node execution method; runtime-managed `REMOTE`
-nodes submit the real Modal function via `RemoteNodeSubmission` instead. Do not
-add convenience wrappers or alternate submission APIs unless they cover a large
-missing capability or a clear ergonomics gap.
+Keep the public coordinator surface minimal: `prepare_run`, `status`, `cancel`,
+`resume`, `prepare_restart`, `prepare_restart_from`, `drive_prepared`, and the
+pull-worker claim/completion callbacks. The coordinator does not expose
+generic per-Node execution methods; runtime-managed Nodes only prepare work
+and the kernel owns submission.
 
-The reusable orchestrator module should not expose a local entrypoint for generic
-workflow submission. Each user-facing workflow script owns its own local
-entrypoint, stages its own inputs, builds its `Workflow` object, and submits that
-object to the included `WorkflowOrchestrator`.
+The reusable orchestrator module does not expose a local entrypoint for generic
+workflow submission. Each user-facing workflow module owns its local
+entrypoint, stages its inputs, builds an `ExecutionGraph`, and submits its
+validated `ExecutionDefinition` to the included coordinator.
 
-The orchestrator API accepts `Workflow` objects only. Workflow scripts build the
-DAG locally and submit that object to the included `WorkflowOrchestrator`
-method. The orchestrator should not accept serialized workflow dictionaries or
-workflow factory import strings as its primary run contract. Workflow node
-classes must therefore be importable in remote containers by their canonical
-package-qualified module names.
+The coordinator API accepts `ExecutionDefinition` objects. Workflow modules
+build and validate the DAG locally, then submit that definition to
+`ExecutionCoordinator.prepare_run`. Serialized graph dictionaries and factory
+import strings are not accepted as the primary Run contract. Execution Node
+classes must be importable in remote containers by canonical package-qualified
+module names.
 
 ## CLI Namespace
 
@@ -369,36 +462,44 @@ Use `biomodals app ...` for app commands and `biomodals workflow ...` for
 workflow commands. App and workflow discovery should live behind catalog helper
 APIs; `cli.py` should not import app or workflow home constants directly.
 
-The workflow namespace should expose `list` and `help` first. Other workflow
-commands can exist as placeholders until the runtime execution interface is
-stable. Existing top-level app commands may remain as deprecated aliases for one
-transition period, but documentation and smoke tests should prefer the
-namespaced commands.
-
 Workflows should be launched through the `biomodals workflow run` CLI rather
 than by running workflow Python files directly. The run command is responsible
 for importing workflow modules through the catalog/package path so workflow node
 classes serialize with stable canonical module names before being submitted to
-the included `WorkflowOrchestrator`. Its user-facing flags should mirror
-`biomodals app run`, including Modal mode, detach, timeout, and pass-through
-workflow flags after `--`.
+the included coordinator. Coordinator-aware workflows resolve and
+pin an exact deployed version by default. Their deployed-run flags mirror
+`biomodals app run`, including environment, deployment name/version,
+`--restart-from`, and pass-through workflow flags after `--`. The `--detach`,
+`--gpu`, and `--timeout` options apply only to explicit `--development` runs.
+
+Launches print Deployment Identity, Execution Run ID, and Coordinator
+FunctionCall ID. Use `biomodals run status|cancel|resume|restart` with the
+explicit deployment and Run fields from any later CLI process. Repeating a
+launch creates a new root Run unless `--restart-from` is supplied.
+
 The run command also exposes `--dry-run`, which forwards `--dry-run` to the
 selected workflow local entrypoint. User-facing workflow local entrypoints should
 accept `dry_run: bool = False`; when set, they should build and validate the DAG,
 call `print_workflow_dag(workflow.validate())`, and return before constructing
 or submitting the orchestrator. DAG graph output should stay compact and print
-node ids, placement, workflow node class qualnames, and dependencies without
-module-qualified class names.
-The command may accept workflow paths only when they resolve to package-qualified
-modules under the Biomodals workflow package. Reject ad hoc workflow files that
-cannot be imported by a stable package module path.
-Use Modal's module mode for workflow runs, for example
-`python -m modal run -m biomodals.workflow.shortmd_workflow::submit_shortmd_workflow`,
-so local and remote containers agree on workflow node class module names.
+Node IDs, execution boundary, workflow Node class qualnames, and dependencies
+without module-qualified class names.
+The command may accept workflow paths only when they resolve to
+package-qualified modules under the Biomodals workflow package. Reject ad hoc
+workflow files that cannot be imported by a stable package module path. For a
+source-backed run, use:
+
+```text
+biomodals workflow run --development <workflow> -- <workflow-options>
+```
+
+The CLI selects Modal module mode so local and remote containers agree on
+Workflow Node class module names. Development mode provides no cross-process
+recovery.
 
 ## Workflow App Composition
 
-Workflow scripts should compose every Modal app they need at import time. Define
+Workflow modules should compose every Modal app they need at import time. Define
 dependency app names once on `AppConfig.depends_on_apps`, mirror that list into
 `CONF.tags["depends_on"]` for Modal UI visibility, and call
 `include_dependency_apps(app, CONF.depends_on_apps)` after including the shared
@@ -421,13 +522,18 @@ app = include_dependency_apps(app, CONF.depends_on_apps)
 
 `depends_on_apps` is a composition declaration, not a deployment command. Do not
 auto-deploy dependency apps from workflow submission paths. Including dependency
-apps gives the workflow access to hydrated Modal functions and classes while
-letting Modal reuse normal image caching behavior.
+apps makes their functions and classes part of the containing workflow deployment
+while letting Modal reuse normal image caching behavior.
 
-Import dependency app modules directly for app metadata, Modal function handles,
-volume objects, volume names, and mountpoints. Do not duplicate volume names,
-mount paths, or app function names as workflow-local string constants when the
-source app exports them.
+Deploy the containing workflow with
+`biomodals workflow deploy <workflow-name> --env <environment>`. The command
+resolves its stable package module and uses Modal module mode. Do not instruct
+Users to deploy dependency apps separately for workflow execution.
+
+Import dependency app modules directly for app metadata, volume objects, volume
+names, and mountpoints. Do not duplicate volume names or mount paths. A
+`ProviderCallSpec` must declare the exact deployed operation name; reuse an
+app-exported name constant when one exists.
 
 ## App Interfaces
 
@@ -443,53 +549,30 @@ skill and use `rfdiffusion_app.py` as the reference for durable `VolumePath`
 outputs and `ligandmpnn_app.py` as the reference for small inline zstd archive
 outputs.
 
-For new Biomodals workflows that depend on other Biomodals apps, prefer
-included-app Modal handles over deployed-app lookup strings. Avoid
-`modal.Function.from_name(...)` in workflow definitions when the dependency app
-can be included; remote orchestrator containers can otherwise re-import the
-workflow module and see unhydrated function globals. Use deployed-app lookup only
-for legacy workflows or external apps that cannot be composed into the workflow
-app, and document that reason near the node.
+For new Biomodals workflows that depend on other Biomodals apps, include those
+apps in the workflow deployment and return exact function names from
+`ProviderCallSpec`. The Modal integration resolves each name against the Run's
+pinned containing deployment. Do not call `modal.Function.from_name(...)` or
+carry hydrated Modal handles inside workflow Nodes. Explicit source-backed
+development may pass a temporary function-name-to-handle map to the coordinator
+without making those handles part of the DAG or Workload Plan Fingerprint.
 
-When nodes need included Modal functions or classes, group those hydrated
-objects in a small workflow-local dataclass named `*ModalNamespace`. Type the
-fields as `modal.Function` or `modal.Cls`; avoid overly generic callable
-protocols. Store the namespace on nodes as runtime-only state:
-
-```python
-@dataclass(frozen=True)
-class ShortMDModalNamespace:
-    prepare_gpu: modal.Function
-    production_gpu: modal.Function
-
-
-@dataclass
-class ShortMDPrepNode(AppBackedNode):
-    modal_namespace: ShortMDModalNamespace = field(
-        repr=False,
-        compare=False,
-        metadata={"dag_hash": False},
-    )
-```
-
-The namespace is allowed to cross the orchestrator boundary because it contains
-Modal objects from apps included into the workflow app. Excluding it from the
-DAG hash keeps retry and resume behavior tied to semantic workflow inputs rather
-than runtime hydration objects.
-
-Prefer `AppBackedNode` for nodes whose primary job is to invoke app functions.
-Workflow definitions should reuse existing app functions whenever possible. Add
-`WorkflowNativeNode` implementations only when the source app lacks a needed
-function or when workflow-specific adapters are required to transform artifacts
-between apps. Use native nodes for lightweight transforms, selectors, summaries,
-and file-management glue that is not part of the source app's standalone
-contract.
+Prefer `ProviderNode` or `TaskProviderNode` for Nodes whose primary job is to
+invoke app operations. Workflow definitions should reuse existing app functions
+whenever possible. Add `CoordinatorNode` implementations for lightweight
+transforms, selectors, summaries, and workflow-specific file-management glue
+that is not part of the source app's standalone contract.
 
 If a workflow-native adapter needs a remote Modal boundary, define a top-level
-`@app.function` in the workflow module and put that hydrated function in the
-workflow's `*ModalNamespace`. Do not try to make ordinary node methods remote
-Modal methods; node methods are plain Python methods unless the node itself is a
-Modal `@app.cls`, which is not the generic workflow-node model.
+`@app.function` in the workflow module and use its exact function name in the
+Node's `ProviderCallSpec`. Node methods remain ordinary Python methods; the thin
+top-level wrapper owns the Modal decorator.
+
+For a large or mixed-Python workflow, keep the Modal binding and resource
+declaration in the discoverable workflow module while placing the bound
+implementation in a focused sibling package. Add only that implementation's
+app and workflow import closure to its task image. Keep DAG construction and
+Node classes in the public workflow module.
 
 Keep workflow-specific file cloning, cleanup, and adapter logic in workflow
 scripts, not in app modules, when the standalone app does not require that
@@ -513,22 +596,23 @@ that path to workflow storage with
 `str` inputs and returns a single validated `VolumePath`; do not construct a
 `VolumePath` only to extract `.path` and wrap it again.
 
-Workflow-native remote functions that mutate mounted volumes must call
-`reload()` before reading data written by other containers and `commit()` after
-writing, copying, or deleting files. Validate artifact storage paths with
-`VolumePath` before joining them to mounted paths.
+Workflow-native remote functions must `reload()` before reading data committed
+by another container. Explicitly `commit()` writes, copies, or deletions before
+another container consumes or acts on them; code in the same container sees its
+own writes without a commit. Validate artifact storage paths with `VolumePath`
+before joining them to mounted paths.
 
-When a caller waits for a remote function that created, copied, or deleted files
-in a mounted volume, reload that same volume before reading, selecting,
-materializing, or validating those paths in the caller.
+When a caller waits for a remote function that committed created, copied, or
+deleted files in a mounted Volume, reload that same Volume before reading,
+selecting, materializing, or validating those paths in the caller.
 
 ## DAG Construction
 
 Build workflow DAGs locally from already-staged primitive data or Pydantic
 models. Discover local inputs before DAG construction, sanitize user-derived
 identifiers with `sanitize_filename`, and reject duplicate sanitized names. Use
-stable node ids derived from sanitized names and deterministic indices so
-resume, force, and ledger debugging stay predictable.
+stable Node IDs derived from sanitized names and deterministic indices so
+fingerprints, successor recovery, and ledger debugging stay predictable.
 
 Use static fan-out when the input cardinality is known at submission time. For
 example, create one prep node per input, one clone node per replicate, one
@@ -536,11 +620,19 @@ production node per clone, and a final summary node that depends on all
 production outputs. Keep per-run namespace prefixes explicit when the same input
 filenames may appear across workflow runs.
 
-Summary/report nodes should usually be `WorkflowNativeNode` instances with
-`ORCHESTRATOR` placement when they only aggregate manifests or emit text
-reports. Return reports as UTF-8 `InlineBytes`; return small zstd archives as
-`InlineBytes` with `media_type="application/zstd"`; return other binary files,
-directories, and large archives as durable `VolumePath` outputs.
+Summary/report Nodes should usually be `CoordinatorNode` instances when they
+only aggregate manifests or emit text reports. Return reports as UTF-8
+`InlineBytes`; return small zstd archives as `InlineBytes` with
+`media_type="application/zstd"`; return other binary files, directories, and
+large archives as durable `VolumePath` outputs.
+
+A terminal report must also republish references to the final scientific
+artifacts it summarizes. Use `republish_execution_artifact(...)` so the new
+terminal publication retains the upstream `VolumePath` and exact file
+manifest. Otherwise terminal-first Successor recovery can mistake an intact
+report for a complete result after an upstream scientific file was deleted.
+Do not solve this by recursively validating every ancestor in the kernel;
+each workload defines its own scientific result boundary.
 
 When adding a workflow-compatible app function, keep existing local entrypoint
 behavior unchanged and add a focused pytest contract test that does not call
@@ -553,7 +645,7 @@ Keep tests under top-level `tests/`.
 Use pytest for non-Modal tests. Tests must not call `.remote()`, `.spawn()`,
 `modal.Function.from_name(...)`, real `modal.Queue`, real `modal.Volume`, or
 deployed Modal apps. Mock Modal boundaries with fake objects and deterministic
-`AppRunResult` or `WorkflowArtifact` payloads.
+`AppRunResult` or `ExecutionArtifact` payloads.
 
 For included-app workflows, tests should assert that the workflow app declares
 the expected `depends_on_apps`, composes dependency apps through
@@ -561,6 +653,6 @@ the expected `depends_on_apps`, composes dependency apps through
 hardcoding it. Patch `modal.Function.from_name` to fail in tests that exercise
 new included-app nodes so accidental deployed-app lookup regressions are caught.
 
-Use fake Modal namespace objects at node boundaries. Cast those fakes to
-`modal.Function` or `modal.Cls` in tests when needed to satisfy static typing;
-the production node contract should remain Modal-object based.
+Use fake `ProviderDriver` instances and deterministic function-name-to-handle maps at the
+coordinator boundary. The production Node contract remains primitive and names
+the exact function; it does not carry Modal objects.

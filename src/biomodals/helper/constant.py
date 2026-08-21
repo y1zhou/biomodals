@@ -10,9 +10,6 @@ MODEL_VOLUME = Volume.from_name(MODEL_VOLUME_NAME, create_if_missing=True)
 AF3_MSA_DB_VOLUME = Volume.from_name(
     "AlphaFold3-msa-db", create_if_missing=True, version=2
 )
-PROTENIX_MSA_DB_VOLUME = Volume.from_name(
-    "Protenix-msa-db", create_if_missing=True, version=2
-)
 
 # Volume for caching MSA search results.
 MSA_CACHE_VOLUME_NAME = "biomodals-msa-cache"

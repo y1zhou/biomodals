@@ -82,7 +82,7 @@ GROMACS_WORKLOAD = WorkloadDefinition(
             "analyze_production",
             "collect_traj_stats",
         ),
-        WorkloadStageDefinition("result_packaging", "prepare_result", None),
+        WorkloadStageDefinition("prepare_result", "prepare_result", None),
     ),
     job_logs_visible_to_owner_default=True,
 )

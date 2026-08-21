@@ -1,0 +1,240 @@
+"""Pure GROMACS operation graph and deployed-function invocation plan."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from hashlib import sha256
+
+from biomodals.execution import (
+    ExecutionPlan,
+    NodeDependency,
+    NodePlan,
+    ProviderBinding,
+    TaskPlan,
+)
+
+NVT_ANALYSIS = "collect_traj_stats:nvt_"
+NPT_ANALYSIS = "collect_traj_stats:npt_"
+PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
+PREPARE_RESULT = "prepare_result"
+REQUIRED_FUNCTIONS = (
+    "prepare_tpr_cpu",
+    "prepare_tpr_gpu",
+    "collect_traj_stats",
+    "production_run_cpu",
+    "production_run_gpu",
+)
+GROMACS_SCIENTIFIC_VERSION = "2026.1"
+EXECUTION_PLAN_SCHEMA_VERSION = "2"
+
+
+def concrete_gromacs_seed(
+    seed: int,
+    *,
+    run_identity: str,
+    purpose: str,
+    random_sentinel: int = -1,
+) -> int:
+    """Resolve a random sentinel once from the persisted root Run identity."""
+    if seed != random_sentinel:
+        return seed
+    digest = sha256(f"{run_identity}:{purpose}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31 - 1) + 1
+
+
+def preparation_execution_paths(run_name: str) -> tuple[str, ...]:
+    """Return every file required to reuse a completed preparation."""
+    return (
+        f"{run_name}.pdb",
+        f"nvt_{run_name}.tpr",
+        f"nvt_{run_name}.xtc",
+        f"npt_{run_name}.tpr",
+        f"npt_{run_name}.xtc",
+        f"production_{run_name}.tpr",
+        "production.mdp",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ModalInvocation:
+    """One deployed function name and its established keyword arguments."""
+
+    function_name: str
+    kwargs: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class OperationTarget:
+    """Provider-neutral dispatch identity for one GROMACS operation."""
+
+    function_name: str
+    uses_gpu: bool
+    runtime_image_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedOperation:
+    """One operation's identity, dependency, and invocation metadata."""
+
+    operation: str
+    dependencies: tuple[str, ...]
+    function_name: str
+    traj_prefix: str | None = None
+    include_simulation_time: bool = False
+    save_processed_traj: bool = False
+
+
+def _operation_plan(*, cpu_only: bool) -> tuple[PlannedOperation, ...]:
+    """Build the selected fixed plan from one CPU/GPU decision."""
+    prepare = "prepare_tpr_cpu" if cpu_only else "prepare_tpr_gpu"
+    production = "production_run_cpu" if cpu_only else "production_run_gpu"
+    return (
+        PlannedOperation(prepare, (), prepare),
+        PlannedOperation(NVT_ANALYSIS, (prepare,), "collect_traj_stats", "nvt_"),
+        PlannedOperation(NPT_ANALYSIS, (prepare,), "collect_traj_stats", "npt_"),
+        PlannedOperation(
+            production,
+            (prepare,),
+            production,
+            include_simulation_time=True,
+        ),
+        PlannedOperation(
+            PRODUCTION_ANALYSIS,
+            (production,),
+            "collect_traj_stats",
+            "production_",
+            save_processed_traj=True,
+        ),
+    )
+
+
+def execution_plan(
+    *,
+    cpu_only: bool,
+    workload_run_key: str,
+    pdb_sha256: str,
+    simulation_time_ns: int,
+    run_pdbfixer: bool,
+    ld_seed: int,
+    gen_seed: int,
+    genion_seed: int,
+    gromacs_version: str = GROMACS_SCIENTIFIC_VERSION,
+    execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION,
+) -> ExecutionPlan:
+    """Express the established service workflow as one immutable kernel plan."""
+    if ld_seed == -1 or gen_seed == -1 or genion_seed == 0:
+        raise ValueError(
+            "GROMACS random sentinels must be materialized before planning"
+        )
+    operations = _operation_plan(cpu_only=cpu_only)
+    analysis_nodes = (
+        NVT_ANALYSIS,
+        NPT_ANALYSIS,
+        PRODUCTION_ANALYSIS,
+    )
+    prepare_node = operations[0].operation
+    nodes = tuple(
+        NodePlan(
+            node_key=operation.operation,
+            dependencies=tuple(
+                NodeDependency(node_key=dependency)
+                for dependency in operation.dependencies
+            ),
+        )
+        for operation in operations
+    ) + (
+        NodePlan(
+            node_key=PREPARE_RESULT,
+            dependencies=tuple(
+                NodeDependency(node_key=dependency)
+                for dependency in (prepare_node, *analysis_nodes)
+            ),
+        ),
+    )
+    return ExecutionPlan(
+        workload_name="gromacs",
+        workload_run_key=workload_run_key,
+        nodes=nodes,
+        scientific_payload={
+            "cpu_only": cpu_only,
+            "gen_seed": gen_seed,
+            "genion_seed": genion_seed,
+            "ld_seed": ld_seed,
+            "pdb_sha256": pdb_sha256,
+            "run_pdbfixer": run_pdbfixer,
+            "simulation_time_ns": simulation_time_ns,
+        },
+        scientific_versions={
+            "gromacs": gromacs_version,
+            "biomodals.gromacs.execution_plan": execution_plan_version,
+        },
+    )
+
+
+def operation_task_plan(operation: str) -> TaskPlan:
+    """Represent one GROMACS operation as one scientific Task."""
+    return TaskPlan(
+        task_key="operation",
+        scientific_payload={"operation": operation},
+    )
+
+
+def operation_provider_binding(
+    operation: str,
+    *,
+    environment: str,
+    app_name: str,
+    app_version: int,
+) -> ProviderBinding:
+    """Bind one remote operation to its exact deployed GROMACS function."""
+    target = operation_target(operation)
+    return ProviderBinding(
+        environment=environment,
+        app_name=app_name,
+        app_version=app_version,
+        function_name=target.function_name,
+        uses_gpu=target.uses_gpu,
+        runtime_image_key=target.runtime_image_key,
+    )
+
+
+def operation_target(operation: str) -> OperationTarget:
+    """Return provider-neutral dispatch metadata for one operation."""
+    function_name = operation.partition(":")[0]
+    if function_name not in REQUIRED_FUNCTIONS:
+        raise ValueError(f"Unsupported GROMACS operation: {operation}")
+    uses_gpu = function_name.endswith("_gpu")
+    return OperationTarget(
+        function_name=function_name,
+        uses_gpu=uses_gpu,
+        runtime_image_key="gromacs-gpu" if uses_gpu else "gromacs-cpu",
+    )
+
+
+def modal_invocation(
+    operation: str,
+    *,
+    cpu_only: bool,
+    run_name: str,
+    simulation_time_ns: int,
+) -> ModalInvocation:
+    """Build established Modal function arguments for one successor operation."""
+    planned = next(
+        (
+            candidate
+            for candidate in _operation_plan(cpu_only=cpu_only)[1:]
+            if candidate.operation == operation
+        ),
+        None,
+    )
+    if planned is None:
+        raise ValueError(f"Unsupported GROMACS operation: {operation}")
+
+    kwargs: dict[str, object] = {"run_name": run_name}
+    if planned.traj_prefix is not None:
+        kwargs["traj_prefix"] = planned.traj_prefix
+    if planned.include_simulation_time:
+        kwargs["simulation_time_ns"] = simulation_time_ns
+    if planned.save_processed_traj:
+        kwargs["save_processed_traj"] = True
+    return ModalInvocation(function_name=planned.function_name, kwargs=kwargs)

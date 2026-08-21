@@ -13,6 +13,16 @@ def resolve_local_output_dir(out_dir: str | Path | None) -> Path:
     return Path(out_dir).expanduser().resolve()
 
 
+def require_safe_filename_component(value: str, *, field_name: str) -> None:
+    """Require one nonempty value unchanged by filename sanitization."""
+    try:
+        safe_value = sanitize_filename(value)
+    except ValueError as error:
+        raise ValueError(f"{field_name} must be a safe filename component") from error
+    if safe_value != value:
+        raise ValueError(f"{field_name} must be a safe filename component")
+
+
 def _clean_filename_part(value: str | Path | None) -> str:
     """Return one clean filename component."""
     if value is None:

@@ -78,15 +78,6 @@ class JobAdmissionConfiguration:
 
 
 @dataclass(frozen=True, slots=True)
-class ModalConfigurationSnapshot:
-    """Provider identity pinned to a Job when admission commits."""
-
-    environment: str
-    app_name: str
-    app_version: int
-
-
-@dataclass(frozen=True, slots=True)
 class _WorkloadDefaults:
     modal_app_name: str
     modal_app_version: int

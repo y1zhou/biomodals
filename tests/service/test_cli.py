@@ -23,7 +23,7 @@ def test_api_serve_runs_factory_with_one_worker(
     expected_host: str,
     expected_port: int,
 ) -> None:
-    """The CLI exposes network settings without exposing unsafe worker scaling."""
+    """The CLI exposes network settings without unsafe worker scaling."""
     call: dict[str, object] = {}
 
     def fake_run(application: str, **kwargs: object) -> None:

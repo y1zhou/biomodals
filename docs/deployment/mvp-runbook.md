@@ -75,6 +75,18 @@ Use `journalctl -u <unit-name>` to inspect startup failures and request IDs.
 Never paste Password Links, cookies, PDB data, or Modal secrets into a support
 record.
 
+### Pre-release service schema
+
+The service has no migration command or compatibility reader for pre-release
+database schemas. If startup rejects a version, stop the API process and first
+confirm the selected configuration and exact database path. Point the new build
+at a new empty, pre-release-only state directory; retain the old database
+separately if an Administrator needs to inspect or copy Users and settings.
+
+Changing host-local service state does not change Modal Volumes or workload
+publications. Never resolve an unsupported pre-release schema by deleting or
+repointing production state.
+
 ## Static frontend and reverse proxy
 
 Build the frontend repository with its committed Bun lockfile, then stage the
@@ -161,8 +173,10 @@ The checklist must order these actions:
 Rollback restores the prior backend checkout and frontend static release as a
 pair, restores the prior service or container configuration if it changed,
 restarts the one API process, and waits for readiness. Do not point a
-rolled-back binary at an
-incompatible newer database. During the current disposable-state phase, stop
-the pre-release service and explicitly remove only the exact pre-release
-database named by its configuration when a schema reset is required. Never
-apply that reset instruction to production state or cache.
+rolled-back binary at an incompatible newer database. The documented
+pre-release transition is one-way.
+
+During the current disposable-state phase, an Administrator may stop the
+pre-release service and remove only its exact configured database when an
+unsupported schema requires a reset. This also deletes its Users and settings.
+Never apply that reset instruction to production state or cache.

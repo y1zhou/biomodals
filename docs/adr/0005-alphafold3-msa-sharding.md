@@ -2,9 +2,20 @@
 
 Status: accepted.
 
+The scientific and cache decisions remain current. References below to
+`max_parallel_search_workers` and `max_num_gpus` describe the implementation
+at the time of this ADR and are not current CLI options. ADR 0006 now owns the
+unified `--max-containers` and `--max-gpu-containers` launch interface.
+
 This record consolidates and supersedes ADRs 0005–0048 as they appeared in
 branch history. It is the authoritative architecture decision for the
 AlphaFold3 sharded-MSA integration.
+
+[ADR 0006](0006-unified-execution-kernel.md) owns generic Run, Node, Task,
+Provider Call, and scheduling semantics. This record owns AlphaFold3's
+scientific plans, caches, generation claims, markers, and publications.
+Generation claims elect a scientific publisher across Runs; they are not Task
+ownership and never authorize replacement work inside one Execution Run.
 
 ## Context
 
@@ -532,7 +543,12 @@ With MSA search enabled, fields resolve independently:
 A non-empty field suppresses only the searches needed for that field. The app
 does not run unnecessary canonical searches merely to populate the cache.
 
-### Search worker topology
+### Historical search worker topology
+
+This section records the app-owned scheduling topology used when this ADR was
+accepted. Current runs express remote work as kernel Tasks and use the outer
+`--max-containers` and `--max-gpu-containers` options for Run-level admission;
+`max_parallel_search_workers` is no longer a public workload option.
 
 The entrypoint replaces `search_chains_in_parallel` and
 `max_parallel_data_pipelines` with:
@@ -820,14 +836,17 @@ root.
 
 The submitted seed list must be non-empty. It is normalized to a sorted unique
 set before computation identity, reconciliation, or scheduling. One invocation
-may produce at most 1,000 seed/sample pairs after normalization. The
-accumulated summary may grow beyond that ceiling through multiple valid
-requests. Inference controls are bounded both before scheduling and again in
-the worker: model seeds are unsigned 32-bit integers, recycles are 0--100,
-diffusion samples are 1--100, and `max_num_gpus` is 1--100. Seed-cache
-inspection, seed claiming, and request publication independently repeat the
-seed, sample, and per-request workload checks before touching the output
-Volume.
+may produce at most 5,000 seed/sample pairs after normalization by default.
+`--allow-large-inference` emits a warning and permits a larger request while
+retaining every seed, sample, and worker bound. The accumulated summary may
+grow beyond the default ceiling through multiple valid requests. Inference
+controls are bounded both before scheduling and again in the worker: model
+seeds are unsigned 32-bit integers, recycles are 0--100, and diffusion samples
+are 1--100. Remote GPU admission uses the Run-level `--max-gpu-containers`
+ceiling; setting it to zero prevents GPU provider calls. Seed-cache inspection
+and seed claiming repeat the default workload check unless the explicit
+override accompanies the request. Result publication repeats the hard seed and
+sample bounds before touching the output Volume.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
 normalized seed list. It identifies one computational seed request, not a seed
@@ -848,7 +867,7 @@ After a request manifest has been published, a deterministic immutable receipt
 binds this exact invocation to that manifest's path, byte size, and SHA-256.
 The manifest is always durable before its receipt. Receipt publication and
 loading enforce the same 64 MiB manifest ceiling, and manifest validation
-applies the seed/sample workload limit before expanding expected ranking rows.
+applies the hard seed and sample bounds before expanding expected ranking rows.
 
 An exact receipt hit is the earliest fast path: the local entrypoint validates
 the receipt and referenced manifest directly through the output Volume, skips
@@ -1017,7 +1036,9 @@ refresh the global summary for successful siblings but does not publish a
 successful request result or local archive.
 
 A later explicit invocation reuses valid raw searches, template results, and
-seed markers, then claims only missing work.
+seed markers, then creates a new Execution Run that claims only missing work.
+An explicit compatible Successor provides the corresponding restart path for a
+recorded Run.
 
 This preserves partial progress while requiring the caller to authorize another
 potentially costly attempt.

@@ -1,20 +1,40 @@
-# Workflow runtime and PPIFlow decisions
+# Workflow and PPIFlow decisions
+
+Status: accepted for the current pre-release workflow formats.
 
 ## Adopt the canonical App Run Layout without legacy path compatibility
 
-Biomodals apps moving to `AppRunLayout` will read and write only the canonical `inputs/`, `outputs/`, `logs/`, `failures/`, `metrics/`, and `.markers/` locations. RFdiffusion, Rosetta, FlowPacker workflow outputs, PPIFlow logs, and IgGM logs may require one-time migration or recomputation; the branch will not retain legacy cache probes or dual write formats because it has not yet merged and maintaining two durable layouts would complicate artifact recovery.
+Biomodals apps moving to `AppRunLayout` read and write only the canonical
+`inputs/`, `outputs/`, `logs/`, `failures/`, `metrics/`, and `.markers/`
+locations. RFdiffusion, Rosetta, FlowPacker workflow outputs, PPIFlow logs, and
+IgGM logs may require one-time migration or recomputation. The implementation
+does not retain legacy cache probes or dual-write formats.
 
-## Recover stale node attempts according to placement
+This publication-layout migration is a workflow decision, not a requirement of
+the unified execution kernel. Reconsidering downstream path compatibility does
+not require changing kernel scheduling or recovery semantics.
 
-The workflow runtime will recover a stale orchestrator-placed attempt through its declared rerun or resume policy, while a stale remote attempt without a recorded Modal function-call identity remains blocked. Orchestrator work has no independent execution after its owner is gone, but blindly replacing an untracked remote call could duplicate work that is still writing deterministic outputs.
+## Recover interrupted work through durable ownership
 
-## Finalize remote node success as one durable operation
+The shared execution runtime records Coordinator-Local Task ownership and
+Provider Call identity instead of Node attempts. Interrupted local work first
+observes its publication and may re-enter the same idempotent operation only
+when the result is authoritatively missing. Remote work without a conclusively
+terminal owner remains blocked because blindly replacing it could duplicate
+work that is still writing deterministic outputs.
 
-A remote call will remain recoverable until its processed app result, materialized files, artifact manifests, attempt state, node state, and remote-call status are recorded under one workflow-volume synchronization lock and committed together. This ordering prevents a reload from discarding uncommitted ledger mutations and prevents preemption from leaving a successful call without the result needed for recovery.
+## Separate Provider Call completion from scientific publication
+
+A successful remote call remains recoverable until its small Result Envelope
+is committed. The Provider Call may then release its slot while its Tasks stay
+running through result decoding, artifact materialization, publication, and
+validation. Task, Node, and artifact transitions cross the workflow-volume
+durability boundary together. This prevents preemption from losing a returned
+result without conflating provider completion with scientific completion.
 
 ## Treat artifact availability as available, missing, or unknown
 
-Artifact verification will treat an explicit missing result as authoritative, checker failures and unmounted volumes as unknown, and only missing artifacts as grounds to invalidate completed node state. A producer rerun must verify its new outputs before durable completion; outputs that remain missing fail the attempt rather than entering an unbounded retry loop.
+Artifact verification will treat an explicit missing result as authoritative, checker failures and unmounted volumes as unknown, and only missing artifacts as grounds to authorize work. Unknown availability suspends the Execution Run until explicit resume repeats validation. A producer must verify its new outputs before durable Task completion; outputs that remain missing fail the Task rather than entering an unbounded retry loop.
 
 ## Validate canonical run names at reusable app boundaries
 
@@ -24,25 +44,55 @@ Local entrypoints may normalize a human-provided run name once and report the ca
 
 Batch app adapters will return succeeded only when every requested candidate succeeds, partial when successful and failed candidates are mixed, and failed when none succeed. Partial results retain successful outputs, failure records, and logs, but remain terminal non-success so downstream scientific steps never consume an incomplete candidate or score set implicitly.
 
+AF3Score preserves this contract across standalone and PPIFlow runs. Its
+postprocess stage accepts warm and newly computed successes, emits metrics for
+the usable subset, and retains per-candidate failures. A workflow may consume
+that partial publication only through an explicit partial dependency. The
+standalone CLI downloads useful metrics and reports failures before returning
+a nonzero exit status.
+
+## Key AF3Score staging by scientific input
+
+Standalone and PPIFlow AF3Score runs use the same staging helper. Its opaque
+staged-input key is derived from normalized candidate identities and content
+digests; the human run name remains display metadata. Reusing a scientifically
+meaningful run name with different files therefore cannot collide with stale
+staging from an earlier run.
+
 ## Keep PPIFlow interface-energy analysis workflow-owned
 
 PPIFlow-specific Rosetta interface-energy analysis stays in the workflow for now. The workflow owns Rosetta script generation, expected `residue_energy.csv` discovery, fixed-position derivation, and candidate identity preservation for this stage. The generic Rosetta app remains a command runner instead of growing a PPIFlow-specific workflow-compatible API until that contract proves reusable outside PPIFlow.
 
-## Preserve PPIFlow candidate sets inside static stage nodes
+## Preserve PPIFlow candidate sets inside static stage Nodes
 
-PPIFlow workflow nodes keep the DAG static but process the full candidate set inside each stage node. LigandMPNN, Partial, ReFold, DockQ preparation, Rosetta analysis, ranking, and reporting must preserve candidate identity across all derived artifacts. Nodes may narrow candidates only through explicit selector configuration, not by silently taking the first structure or relying on sorted file order.
+PPIFlow keeps a static semantic DAG while runtime-discovered candidate Tasks
+fan out inside eligible stage Nodes. LigandMPNN, Partial, ReFold, DockQ
+preparation, Rosetta analysis, ranking, and reporting preserve candidate
+identity across all derived artifacts. Nodes may narrow candidates only
+through explicit selector configuration, not by silently taking the first
+structure or relying on sorted file order.
 
-## Run expensive PPIFlow stage coordinators remotely
+## Track expensive PPIFlow work as kernel Provider Calls
 
-Expensive PPIFlow stage coordinators run as remote workflow nodes, even when their implementation mostly submits child app calls. This keeps one recoverable Modal call identity per static workflow stage, lets the stage write a durable candidate manifest, and allows retries to skip completed candidates instead of redoing or losing mixed-success work inside the orchestrator.
+The workflow coordinator submits expensive PPIFlow work through the execution
+kernel. Candidate-oriented stages use one Task per candidate, and each tracked
+provider container invokes the established app function body directly rather
+than submitting an untracked nested Modal call. AF3Score is the measured
+exception: preparation forms length-balanced batch Tasks and the kernel tracks
+each batch Provider Call. The workflow still owns candidate manifests and
+publication validation.
 
 ## Require ReFold quality metrics
 
 PPIFlow ReFold outputs include candidate-keyed quality metrics in addition to refolded structures. AlphaFold3 inference may still return its native archive, but the workflow must derive or expose a metrics table from confidence and ranking outputs so DockQ, Rosetta relax, Rank, and Report do not rely on unkeyed JSON files or structure filename ordering.
 
-## Keep PPIFlow Rosetta job coordination in the workflow
+## Keep PPIFlow Rosetta semantics in the workflow
 
-PPIFlow owns Rosetta job manifests, script and flags selection, queue setup, queue cleanup, expected outputs, and per-candidate Rosetta status. The generic Rosetta app remains a command worker so PPIFlow-specific interface-energy and relax semantics do not leak into the shared Rosetta app API before they prove reusable.
+PPIFlow owns Rosetta job manifests, script and flags selection, expected
+outputs, and per-candidate result interpretation. Generic Task admission,
+worker assignment, and Provider Call lifecycle belong to the execution
+kernel. The generic Rosetta app remains a command worker so PPIFlow-specific
+interface-energy and relax semantics do not leak into its scientific API.
 
 ## Derive PPIFlow sequence tables in the workflow
 
@@ -72,13 +122,23 @@ PPIFlow filter stages narrow the active candidate set by emitting a retained-can
 
 PPIFlow keeps rejected, failed, and skipped candidates available for reporting even though downstream scientific stages consume only retained manifests. This separates execution semantics from audit/reporting needs: filters narrow the active candidate set, while the final report can explain where candidates were lost.
 
-## Verify PPIFlow candidate outputs before retry skip
+## Verify PPIFlow candidate outputs before reuse
 
-PPIFlow remote stage coordinators verify a completed candidate's expected output files before skipping it on retry. Candidate manifest rows are durable provenance, but they do not replace artifact availability checks; if expected files are missing, the candidate is treated as incomplete and rerun or failed according to the stage status rules.
+PPIFlow validates a candidate's expected output files before completing a Task
+from cache or copying a successful publication into a Successor Execution
+Run. Candidate manifest rows are durable provenance, but they do not replace
+artifact availability checks. Expected scientific files record byte size and
+SHA-256 so same-size corruption is not reusable. Missing output authorizes new
+work only when no active or unknown predecessor ownership remains.
 
 ## Record workflow and app-volume candidate file locations
 
 PPIFlow candidate manifests record both workflow-relative artifact paths and app-volume paths when both are available. Workflow-relative paths support materialized downstream artifacts and user inspection, while app-volume paths plus volume identity support strict availability checks for app-owned durable outputs without guessing storage ownership.
+
+Supplied manifests fail closed when they cannot be parsed or validated; the
+legacy filename-derived identity fallback applies only when no manifest was
+supplied. Exact source-artifact and full-path aliases take precedence over
+basename aliases, and ambiguous basename aliases are rejected.
 
 ## Generate PPIFlow candidate ids from provenance
 
@@ -87,6 +147,21 @@ PPIFlow candidate ids are deterministic and provenance-based. Initial candidates
 ## Keep PPIFlow candidate ids out of DAG hashes
 
 PPIFlow candidate ids are runtime provenance for produced artifacts, not semantic workflow DAG configuration. Changing candidate-id helper internals is a manifest migration concern unless user-facing workflow configuration changes; candidate ids and candidate manifests must not be added to node hash payloads.
+
+Deployment-owned scientific versions that affect results do belong in the DAG
+hash. AF3Score Nodes declare the current scoring code and AlphaFold3 model
+identity through the workflow hash hook, so a Successor cannot reuse a
+predecessor under changed scoring science. Operational concurrency remains
+excluded.
+
+PPIFlow also validates every configured mutable model file against a
+code-owned SHA-256 before admitting GPU work. The lightweight validation Node
+runs once per Execution Run and is not copied from a predecessor. A Successor
+that schedules PPIFlow GPU work therefore rechecks the mounted model bytes;
+one satisfied entirely by reusable terminal publications may prune validation
+because it consumes no model. GPU functions reload the model Volume before
+using it. Downstream Nodes depend on the validation publication, and the
+expected digests remain part of the workflow's scientific identity.
 
 ## Use one-row-per-candidate PPIFlow manifests
 
@@ -104,27 +179,29 @@ PPIFlow `ranked_designs.csv` contains only retained candidates with at least one
 
 PPIFlow report generation stays a workflow-native transform that renders Markdown and HTML from materialized tables, manifests, and score artifacts. It has no expensive external runtime today, is easy to unit test, and should move to a separate app only if report rendering later needs heavyweight dependencies.
 
-## Adopt a shared run-level task budget
+## Enforce Run-level Provider Call limits in SQLite
 
-Workflow `max_parallel` remains workflow-node parallelism, not a global Modal
-container limit. Apps and workflows that submit child app calls should share a
-lightweight task-budget helper instead of each owning a queue, pod counter, or
-candidate fan-out loop. PPIFlow `candidate_concurrency`, AF3Score `num_jobs`,
-Rosetta `max_num_pods`, and BoltzGen `num_parallel_runs` become app-specific
-adapters over that shared budget.
-
-## Use shared leases for hard global limits
-
-An in-process task budget only bounds one coordinator container. A user-facing
-run-level limit on total child app calls must use a shared lease or token pool
-visible to every workflow node and app coordinator participating in the run.
-The first implementation may keep conservative per-container limits, but hard
-global enforcement should use shared leases rather than another app-local
-scheduler.
+The public workflow CLI exposes `--max-containers` and
+`--max-gpu-containers`. A workflow maps the total ceiling to its
+`max_parallel_nodes` adapter limit and to the Run's
+`max_active_provider_calls`; the GPU subset maps to
+`max_active_gpu_provider_calls`. Node parallelism and call admission remain
+independent runtime controls even when initialized from the same public value.
+The execution repository atomically enforces both call limits by counting
+nonterminal Provider Calls in one Execution Run. Obsolete per-stage container,
+pod, child-call, job, and batch limits are ignored. AF3Score derives its
+length-balanced batch count from the GPU ceiling; Rosetta derives its worker
+pool from the total ceiling. These internal topologies may lower actual fan-out
+but cannot form separate durable schedulers, shared leases, or cross-run
+resource managers.
 
 ## Split PPIFlow workflow helpers into a submodule
 
-PPIFlow-local manifest, table, staging, and coordinator helpers live under a `biomodals.workflow.ppiflow` submodule, while `ppiflow_workflow.py` remains the public workflow module discovered by the CLI and catalog. This keeps the top-level workflow module focused on DAG assembly and node contracts instead of absorbing all candidate-manifest and stage-coordinator mechanics.
+PPIFlow-local manifests, tables, staging, and focused remote task
+implementations live under `biomodals.workflow.ppiflow`, while
+`ppiflow_workflow.py` remains the public workflow module discovered by the CLI
+and catalog. This keeps the top-level module focused on DAG assembly, Node
+contracts, Modal bindings, and image/resource declarations.
 
 ## Keep PPIFlow node classes in the workflow module
 
@@ -140,15 +217,27 @@ PPIFlow helpers live under `biomodals.workflow.ppiflow` rather than `_ppiflow`. 
 
 ## No migration for old PPIFlow workflow runs
 
-The PPIFlow workflow refactor does not migrate old in-progress workflow ledgers or artifact manifests. The refactor changes candidate identity and artifact contracts; old in-progress runs should be restarted with `force`, while useful completed app-owned outputs can be reintroduced through explicit `Stage2Input`.
+The PPIFlow workflow refactor does not migrate old in-progress workflow ledgers
+or artifact manifests. Old ledgers are rejected and a new launch receives a
+fresh Execution Run ID. Useful completed app-owned outputs can be reintroduced
+through explicit `Stage2Input`; `force` is a workload-output option, not an
+execution-state migration.
 
 ## Keep PPIFlow Modal bindings in the workflow module
 
-PPIFlow Modal decorators, app registration, and app-bound remote helper functions stay in `ppiflow_workflow.py`. The `biomodals.workflow.ppiflow` submodule provides pure or near-pure helper logic for manifests, tables, staging, and coordinator mechanics so importing helper modules does not create hidden Modal app registration side effects and helper tests can run without Modal bindings.
+PPIFlow Modal bindings, app registration, images, mounts, and resource settings
+stay in `ppiflow_workflow.py`. Each binding wraps a focused implementation from
+`biomodals.workflow.ppiflow`; those modules contain no decorators or hidden app
+registration. This gives each task image a narrow, Python-compatible import
+closure while keeping the public workflow topology in one composition root.
 
-## Use stage-specific PPIFlow remote wrappers
+## Use stage-specific PPIFlow provider wrappers
 
-PPIFlow uses stage-specific Modal remote wrapper functions around shared candidate-wide coordinator helpers. Shared logic remains in `ppiflow/coordinators.py`, while separate wrapper names make logs, failures, mounts, and future resource settings easier to understand and tune per stage.
+PPIFlow uses stage-specific Modal wrappers whose granularity matches the
+kernel Task or scientifically indivisible batch. Candidate wrappers call the
+established app function body in the tracked provider container; they do not
+coordinate nested Modal fan-out. Separate function names keep logs, failures,
+mounts, and future resource settings understandable per stage.
 
 ## Mount only stage-required PPIFlow volumes
 
@@ -158,12 +247,19 @@ PPIFlow stage-specific remote wrappers mount only the workflow and app volumes n
 
 PPIFlow stage-specific remote wrappers start with the current workflow resource defaults. Separate wrappers preserve a clean path for later CPU, memory, timeout, GPU, and mount tuning, but this refactor should not guess resource settings before real stage telemetry exists.
 
-## Commit the PPIFlow refactor by phase
-
-The PPIFlow refactor should be committed in phase-sized changes rather than one large commit. Phase commits make review, bisecting, and rollback easier; pushing remains a separate explicit action.
-
 ## Prune workflow runs from terminal nodes
 
-The workflow runtime will decide run completion and resume scope from terminal workflow nodes. If every terminal node has durable completion and non-missing recorded outputs, the run succeeds without scheduling intermediate nodes, even when stale failed, running, or incomplete intermediate state remains. If some terminal nodes are incomplete, the scheduler only considers those terminals and their ancestor closure.
+The shared execution runtime decides run completion and resume scope from
+terminal workflow Nodes. If every terminal Node has durable completion and
+non-missing recorded outputs, the Run succeeds without scheduling intermediate
+Nodes, even when stale failed, running, or incomplete intermediate state
+remains. If some terminal Nodes are incomplete, the scheduler considers only
+those terminals and their ancestor closure.
 
-This keeps resume output-driven and avoids recomputing expensive intermediate work when the externally relevant workflow outputs already exist. Missing terminal artifacts invalidate completion; unknown external artifact availability continues to warn but does not force recomputation. `force=True` still discards the workflow run root before scheduling, so terminal pruning only affects non-forced resumes.
+This keeps execution result-driven and avoids recomputing expensive
+intermediate work when the externally relevant workflow outputs already exist.
+Missing terminal artifacts invalidate completion; unknown external artifact
+availability suspends the Run and admits no new work. `resume` continues a
+suspended Run without retrying failed Tasks. An explicit Successor Execution
+Run revalidates terminal publications and repairs only the missing backward
+closure.

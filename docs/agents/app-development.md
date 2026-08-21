@@ -9,8 +9,9 @@ The skill routes app work to focused references under
 
 - `quick-app.md` for the common app contract and trust boundaries.
 - `multi-module.md` for complex app structure and image source inclusion.
+- `execution-kernel.md` for durable scheduling and remote coordinator boundaries.
 - `staged-cache.md` for durable identities and publication.
-- `fanout-resume.md` for concurrency, queues, and resumption.
+- `fanout-resume.md` for concurrency, durable fan-out, and resumption.
 - `upstream-patching.md` for upstream safety and scientific equivalence.
 - `testing.md` for the app test pyramid and verification.
 

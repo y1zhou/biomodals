@@ -131,14 +131,6 @@ def _checkpoint_error(checkpoint_path: Path) -> str | None:
     return None
 
 
-def _invalid_model_files(model_dir: Path, filenames: list[str]) -> dict[str, str]:
-    invalid_files = {}
-    for filename in filenames:
-        if error := _checkpoint_error(model_dir / filename):
-            invalid_files[filename] = error
-    return invalid_files
-
-
 def _redownload_abnativ_model_files(filenames: list[str]) -> None:
     from abnativ.init import ensure_zenodo_models  # type: ignore[ty:unresolved-import]
 

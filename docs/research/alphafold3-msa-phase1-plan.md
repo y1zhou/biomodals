@@ -1,11 +1,12 @@
 # AlphaFold 3 small-BFD sharding benchmark plan
 
-Status: executed with an approved focused-sweep scope; production promotion pending
+Status: historical benchmark; production integration is governed by
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
 Plan date: 2026-07-22
 Results date: 2026-07-23
 Original campaign: `small-bfd-phase1-v1`
 Completed campaign: `small-bfd-phase1-v2`
-Implementation target: `src/biomodals/app/fold/alphafold3_msa_app.py`
+Historical implementation target: `src/biomodals/app/fold/alphafold3_msa_app.py`
 
 ## Outcome
 

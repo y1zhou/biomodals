@@ -1,23 +1,25 @@
 # AlphaFold 3 MSA database sharding for Biomodals
 
-Status: research and design recommendation
+Status: historical research superseded by
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
 Research date: 2026-07-14
 Target: `src/biomodals/app/fold/alphafold3_app.py`
 
 ## Decision summary
 
-MSA database sharding is usable with the AlphaFold 3 source commit already
-pinned by Biomodals. The safest first implementation is to add a versioned,
+At the time of this research, MSA database sharding was usable with the
+AlphaFold 3 source commit then pinned by Biomodals. The safest first
+implementation was to add a versioned,
 manifest-validated sharded database layout beside the existing monolithic
 layout, pass explicit absolute shard specifications and database Z values to
 `run_alphafold.py`, and bound shard parallelism to the CPU budget of one Modal
 container.
 
-Do not change the AlphaFold source pin merely because `CONF.version` says
-`3.0.2`. Stock AlphaFold 3 v3.0.2 has incomplete sharding support, but the
-Biomodals fork commit `987ad1c` is based on later upstream commit `5a3d6b6` and
-contains the fixes for path validation, more robust merge ordering, RNA Z
-types, and propagation of Z/domZ and maximum shard concurrency.
+The research recommended not changing the AlphaFold source pin merely because
+`CONF.version` said `3.0.2`. Stock AlphaFold 3 v3.0.2 had incomplete sharding
+support, but the Biomodals fork commit `987ad1c` was based on later upstream
+commit `5a3d6b6` and contained the fixes for path validation, more robust merge
+ordering, RNA Z types, and propagation of Z/domZ and maximum shard concurrency.
 
 The first rollout should read shards directly from the existing Modal Volume.
 Copying all shards to ephemeral SSD should be a separate measured experiment:
@@ -181,7 +183,7 @@ The feature's commit history matters more than the package version label:
 | 2026-05-06 | [`97639ff`](https://github.com/google-deepmind/alphafold3/commit/97639fff6fb22c0d9765089026fe296ee506b60a) | Forwarded the missing settings and fixed sharded RNA failure [#663](https://github.com/google-deepmind/alphafold3/issues/663). |
 | 2026-05-07 | [`eba6189`](https://github.com/google-deepmind/alphafold3/commit/eba618977e136d092ba4b986dd3fa541d2fd0241) | Corrected Nhmmer Z annotations to floating point. |
 
-`alphafold3_app.py` pins fork commit
+At the time of this research, `alphafold3_app.py` pinned fork commit
 [`987ad1cb`](https://github.com/y1zhou/alphafold3/commit/987ad1cb7d7028b6d35908cf63fe7d951d98d6b6).
 Its upstream base is
 [`5a3d6b6`](https://github.com/google-deepmind/alphafold3/commit/5a3d6b63656038fbb5285d405cd3389b190a5774),
@@ -262,10 +264,10 @@ says shard sizing depends on the database and hardware and must be benchmarked.
 | [#525](https://github.com/google-deepmind/alphafold3/issues/525) | Reports weak scaling above about eight CPUs for one Jackhmmer process and a strong dependence on fast local storage. | Prefer more independently useful shard processes over ever-larger `--cpu` for one HMMER process. |
 | [#566](https://github.com/google-deepmind/alphafold3/issues/566) | Maintainer guidance puts sequence databases, not PDB/template data, on SSD/RAM and says shard count is hardware/database dependent. | Shard the seven MSA databases, retain template fallback, and tune empirically. |
 | [#557](https://github.com/google-deepmind/alphafold3/issues/557) | Clarifies that RNA Z is nucleotide bases in megabases, not file bytes. | Store a typed value and unit in the manifest. |
-| [#561](https://github.com/google-deepmind/alphafold3/issues/561) | Early `@N` specifications failed literal path validation. | The current pin contains the fix, but command construction still needs an integration test. |
+| [#561](https://github.com/google-deepmind/alphafold3/issues/561) | Early `@N` specifications failed literal path validation. | The rollout pin contained the fix, but command construction still needed an integration test. |
 | [#610](https://github.com/google-deepmind/alphafold3/issues/610) | A user on an older checkout could not use the new flags. | Detect support from the exact commit/CLI, not the reported release string. |
 | [#618](https://github.com/google-deepmind/alphafold3/issues/618) | Maintainer describes Server database-per-machine, RAM-backed execution. | Do not attribute Server latency entirely to file sharding. |
-| [#663](https://github.com/google-deepmind/alphafold3/issues/663) | Sharded RNA failed because Nhmmer Z and maximum parallelism were not forwarded. | Pin ancestry must include `97639ff` and `eba6189`; this app's current pin does. |
+| [#663](https://github.com/google-deepmind/alphafold3/issues/663) | Sharded RNA failed because Nhmmer Z and maximum parallelism were not forwarded. | The rollout pin descended from `97639ff` and `eba6189`. |
 
 The speed figures in these threads are maintainer/user observations for their
 setups, not a public controlled benchmark over the Biomodals database snapshot,

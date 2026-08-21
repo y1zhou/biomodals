@@ -1,9 +1,10 @@
 # AlphaFold 3 small-BFD sharding Phase 1 results
 
-Status: focused Phase 1 campaign complete; production integration not started
+Status: historical benchmark results; production integration is governed by
+[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
 Results date: 2026-07-23
 Campaign: `small-bfd-phase1-v2`
-Implementation: `src/biomodals/app/fold/alphafold3_msa_app.py`
+Historical implementation: `src/biomodals/app/fold/alphafold3_msa_app.py`
 
 ## Outcome
 

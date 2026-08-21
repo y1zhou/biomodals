@@ -1,7 +1,8 @@
 # Fanout, Concurrency, and Resumption
 
-Start with static fanout. Add queues only for measured skew, dynamic discovery,
-or fine-grained retry.
+Start with local or static fanout. Use the execution kernel for durable
+multi-call scheduling, work stealing, and recovery; do not build a second
+scheduler inside the app.
 
 ## Choose the primitive
 
@@ -17,10 +18,27 @@ or fine-grained retry.
 - Use `@modal.concurrent(...)` only for thread-safe synchronous work or
   nonblocking async work. Do not stack it on a resource-saturating subprocess
   pool.
-- Use queues for work stealing, skew, discovery, or retry. Keep a durable task
-  manifest: a queue is neither source of truth nor cache lock.
+- For durable work stealing, persist the complete Task set and use the kernel's
+  SQLite pull-worker dispatch. Ready Tasks and Worker Assignments are the queue;
+  Modal Queue, Dict, locks, and markers are not execution state.
 
 ## Set one run-wide budget
+
+Expose remote-container admission only through the outer
+`biomodals app run --max-containers N --max-gpu-containers G` options.
+Coordinator-aware Local Entrypoints accept the corresponding hidden
+`max_containers` and `max_gpu_containers` values so deployed and development
+runs share one path. Resolve app defaults once and persist them as
+`max_active_provider_calls` and `max_active_gpu_provider_calls`. Do not add an
+app-specific CLI flag for remote worker, pod, batch, search, or stage counts.
+Keep scientific cardinality, shard sizes, pull-worker claim capacity, and
+in-container process/thread counts as workload arguments.
+
+Use scheduler-managed replenishment by default. A workload may pre-form
+balanced Tasks only for a demonstrated scientific or material performance
+reason. AF3Score length-balances inputs into at most the GPU call ceiling, and
+AlphaFold3 balances seeds the same way; neither exposes another concurrency
+flag.
 
 Account for nested concurrency across simultaneous branches:
 
@@ -48,10 +66,13 @@ total process slots = Σ(
 ## Make fanout resumable
 
 - Give tasks deterministic IDs and exclusive artifact/marker paths.
-- Reuse only validated completion. Publish via unique temporary, atomic replace,
-  then marker.
-- After fanout, reload, compare expected/completed sets, and retry only missing
-  or transiently failed tasks.
+- Reuse only validated completion. Publish through a unique temporary and atomic
+  replace, then publish the completion marker or manifest last.
+- Report cache/publication state as `available`, `missing`, or `unknown`. Only
+  conclusive `missing` permits work; `unknown` never permits replacement.
+- Reconcile attached work on `resume`. Do not retry conclusive Task failure or
+  create a second owner in the same Execution Run; use a compatible Successor
+  Run to retry missing work.
 - Return compact statuses or counts rather than large deterministic path lists.
 - Call `warmup_directory(...)` just before bulk reads, not metadata traversal.
 - Preserve failed diagnostics and successful siblings. Consolidate only durable

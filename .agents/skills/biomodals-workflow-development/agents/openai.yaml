@@ -1,4 +1,4 @@
 interface:
   display_name: "Biomodals Workflow Development"
   short_description: "Build Biomodals workflows and app integrations"
-  default_prompt: "Use $biomodals-workflow-development to update a Biomodals workflow or workflow-compatible app integration using the ShortMD, RFD-LigandMPNN, and PPIFlow reference patterns."
+  default_prompt: "Use $biomodals-workflow-development to create or review a Biomodals workflow with kernel-owned task scheduling and workflow-owned artifacts."

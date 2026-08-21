@@ -50,6 +50,8 @@ Validate before the first remote call and again before upstream consumption:
 - Use `AppRunLayout`. Return primitive payloads and string paths. Workflow
   functions return `AppRunResult` with `VolumePath`; reserve compressed
   `InlineBytes` for small rerunnable archives. Keep entrypoints CLI-only.
+- Key reusable staged inputs by normalized scientific content and digests, not
+  by a user-facing run name. Keep the run name as display metadata.
 - For short jobs, send bytes, work in a temporary directory, and
   `package_outputs(...)`. Use staged caches for resumable work.
 - Derive a safe default run name, build local paths with
@@ -60,16 +62,20 @@ Validate before the first remote call and again before upstream consumption:
 ## Existing helpers and references
 
 Prefer existing `biomodals.helper` APIs (`run_command`, `package_outputs`,
-`warmup_directory`, `download_files`, `hash_string`, shared local-output helpers)
-over local variants. Do not extract trivial one-use helpers.
+`warmup_directory`, `download_files`, `hash_string`, shared local-output
+helpers) over local variants. For durable artifacts, reuse
+`biomodals.helper.artifacts` readers, bounded reads, hashes, and
+content-addressed publication. Do not extract trivial one-use helpers.
 
 Use these valid relative paths as examples:
 
-- [AlphaFold3](../../../../src/biomodals/app/fold/alphafold3_app.py) and
-  [Rosetta](../../../../src/biomodals/app/bioinfo/rosetta_app.py): conventional.
+- [AlphaFold3](../../../../src/biomodals/app/fold/alphafold3_app.py): advanced
+  coordinator-aware app with documented cache and run-layout deviations.
+- [Rosetta](../../../../src/biomodals/app/bioinfo/rosetta_app.py): kernel
+  pull-worker integration.
 - [RFdiffusion](../../../../src/biomodals/app/design/rfdiffusion_app.py): durable
   workflow `VolumePath` output.
 - [LigandMPNN](../../../../src/biomodals/app/design/ligandmpnn_app.py): small
   workflow `InlineBytes` output.
 
-Set `depends_on_apps` only when composing apps through the workflow runtime.
+Set `depends_on_apps` only when composing apps into a workflow deployment.

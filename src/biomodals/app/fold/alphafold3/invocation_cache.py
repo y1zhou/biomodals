@@ -10,12 +10,6 @@ from typing import cast
 import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeReader,
-    json_bytes,
-    read_volume_bytes,
-    sha256_bytes,
-)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
     DECLARED_MODEL_IDENTITY,
@@ -56,6 +50,12 @@ from biomodals.app.fold.alphafold3.template_search import (
     TEMPLATE_IDENTITY_SCHEMA_VERSION,
     TEMPLATE_RESULT_SCHEMA_VERSION,
     template_search_parameters,
+)
+from biomodals.helper.artifacts import (
+    VolumeReader,
+    json_bytes,
+    read_volume_bytes,
+    sha256_bytes,
 )
 
 INVOCATION_IDENTITY_SCHEMA = "biomodals-alphafold3-invocation-v1"
@@ -126,6 +126,7 @@ def prepare_invocation(
     search_protein_templates: bool,
     recycle: int,
     sample: int,
+    allow_large_inference: bool = False,
 ) -> PreparedInvocation:
     """Build the exact pre-enrichment invocation identity."""
     if not isinstance(search_msa, bool):
@@ -134,7 +135,11 @@ def prepare_invocation(
         raise TypeError("search_protein_templates must be a boolean")
     validate_inference_parameters(recycle, sample)
     validated = validate_submitted_af3_input(config)
-    validate_inference_workload(validated.modelSeeds, sample)
+    validate_inference_workload(
+        validated.modelSeeds,
+        sample,
+        allow_large_inference=allow_large_inference,
+    )
     identity: dict[str, object] = {
         "schema": INVOCATION_IDENTITY_SCHEMA,
         "submitted_input": build_inference_identity_view(validated),

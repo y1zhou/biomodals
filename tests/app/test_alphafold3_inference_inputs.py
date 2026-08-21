@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any, cast
 
 import orjson
 import pytest
@@ -15,7 +16,6 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
-from biomodals.app.fold import alphafold3_app
 from biomodals.app.fold.alphafold3 import inference_inputs
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_MODEL_SEEDS,
@@ -25,9 +25,11 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     prepare_inference_run,
     serialize_af3_input,
     validate_inference_parameters,
-    validate_inference_worker_budget,
     validate_inference_workload,
     validate_upstream_af3_input,
+)
+from biomodals.app.fold.alphafold3.search_pipeline import (
+    resolve_msa_and_templates,
 )
 
 
@@ -95,8 +97,9 @@ def test_no_search_resolution_returns_a_validated_config() -> None:
         ],
     )
 
-    resolved = alphafold3_app._search_msa_and_templates(
+    resolved = resolve_msa_and_templates(
         config,
+        cast(Any, None),
         search_msa=False,
     )
 
@@ -170,7 +173,7 @@ def test_search_preflight_rejects_invalid_input_before_remote_work() -> None:
     )
 
     with pytest.raises(ValueError, match="only letters"):
-        alphafold3_app._search_msa_and_templates(config)
+        resolve_msa_and_templates(config, cast(Any, None))
 
 
 def test_upstream_preflight_bounds_expanded_entities_and_polymer_residues() -> None:
@@ -475,20 +478,18 @@ def test_inference_parameters_are_resource_bounded() -> None:
         validate_inference_parameters(101, 1)
     with pytest.raises(ValueError, match="between 1 and"):
         validate_inference_parameters(1, 101)
-    with pytest.raises(ValueError, match="between 1 and"):
-        validate_inference_worker_budget(101)
+    seeds = list(range(MAX_MODEL_SEEDS))
+    assert validate_inference_workload(seeds, 5) == MAX_SEED_SAMPLE_PAIRS
+    with pytest.raises(ValueError, match="modelSeeds × sample"):
+        validate_inference_workload(seeds, 6)
     assert (
         validate_inference_workload(
-            list(range(MAX_SEED_SAMPLE_PAIRS // 5)),
-            5,
+            seeds,
+            6,
+            allow_large_inference=True,
         )
-        == MAX_SEED_SAMPLE_PAIRS
+        == 6_000
     )
-    with pytest.raises(ValueError, match="modelSeeds × sample"):
-        validate_inference_workload(
-            list(range(MAX_SEED_SAMPLE_PAIRS // 5 + 1)),
-            5,
-        )
 
 
 def test_seed_cap_applies_to_requests_not_accumulated_serialization() -> None:

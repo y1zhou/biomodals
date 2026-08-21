@@ -25,16 +25,6 @@ from typing import IO, cast
 import orjson
 import polars as pl
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeReader,
-    json_bytes,
-    read_bounded_file_bytes,
-    read_volume_bytes,
-    require_regular_file,
-    sha256_file,
-    write_bytes_atomic,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_STAGED_INPUT_BYTES,
     PreparedInferenceRun,
@@ -52,6 +42,16 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
     load_seed_marker,
     ranked_rows,
     validate_run_id,
+)
+from biomodals.helper.artifacts import (
+    VolumeReader,
+    json_bytes,
+    read_bounded_file_bytes,
+    read_volume_bytes,
+    require_regular_file,
+    sha256_file,
+    write_bytes_atomic,
+    write_json_atomic,
 )
 from biomodals.helper.shell import run_command
 
@@ -152,7 +152,11 @@ def _validate_publication(spec: RequestPublication) -> RequestPublication:
         raise ValueError("submitted_seeds do not normalize to normalized_seeds")
     if spec.request_id != hash_sequences(run_id, list(normalized)):
         raise ValueError("request_id does not match run_id and normalized_seeds")
-    validate_inference_workload(list(normalized), spec.sample_count)
+    validate_inference_workload(
+        list(normalized),
+        spec.sample_count,
+        allow_large_inference=True,
+    )
     sanitize_af3_name(spec.display_name)
     return spec
 
@@ -720,7 +724,11 @@ def _validated_manifest_artifacts(
         or manifest.get("manifest_volume_path") != expected_manifest_path
     ):
         raise ValueError("Request manifest view identity is invalid")
-    validate_inference_workload(normalized_seeds, sample_count)
+    validate_inference_workload(
+        normalized_seeds,
+        sample_count,
+        allow_large_inference=True,
+    )
     if manifest.get("name_mapping") != {
         "canonical": canonical_name,
         "presentation": presentation_name,
@@ -795,6 +803,61 @@ def _presentation_archive_path(
     if name.startswith(canonical_name):
         name = presentation_name + name.removeprefix(canonical_name)
     return selected.parent / name
+
+
+def request_archive_member_for_role(
+    manifest: dict[str, object],
+    *,
+    role: str,
+    display_name: str,
+) -> str:
+    """Return the exact local archive member published for one result role."""
+    _, _, canonical_name, artifacts, _ = _validated_manifest_artifacts(manifest)
+    if manifest["submitted_display_name"] != display_name:
+        raise ValueError("Archive display_name does not match the request view")
+    matches = [artifact for artifact in artifacts if artifact["role"] == role]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Request manifest requires exactly one {role!r} artifact; "
+            f"found {len(matches)}"
+        )
+    presentation_name = sanitize_af3_name(display_name)
+    relative = _presentation_archive_path(
+        cast(str, matches[0]["archive_path"]),
+        canonical_name=canonical_name,
+        presentation_name=presentation_name,
+    )
+    return (PurePosixPath(presentation_name) / relative).as_posix()
+
+
+def request_manifest_artifacts_available(
+    reader: VolumeReader,
+    manifest: dict[str, object],
+) -> bool:
+    """Stream and validate every final artifact named by a request manifest."""
+    _, _, _, artifacts, _ = _validated_manifest_artifacts(manifest)
+    for artifact in artifacts:
+        volume_path = cast(str, artifact["volume_path"])
+        expected_size = cast(int, artifact["size_bytes"])
+        expected_sha256 = cast(str, artifact["sha256"])
+        size_bytes = 0
+        digest = hashlib.sha256()
+        try:
+            chunks = reader.read_file(volume_path)
+            for chunk in chunks:
+                if not isinstance(chunk, bytes):
+                    raise TypeError(
+                        f"Volume reader returned non-bytes for {volume_path}"
+                    )
+                size_bytes += len(chunk)
+                if size_bytes > expected_size:
+                    return False
+                digest.update(chunk)
+        except FileNotFoundError:
+            return False
+        if size_bytes != expected_size or digest.hexdigest() != expected_sha256:
+            return False
+    return True
 
 
 def _download_artifact(

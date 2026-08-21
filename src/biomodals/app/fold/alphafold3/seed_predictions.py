@@ -14,24 +14,15 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 import orjson
 import polars as pl
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    VolumeHandle,
-    artifact_record,
-    require_regular_file,
-    sha256_bytes,
-    utc_now,
-    validate_artifact_record,
-    write_json_atomic,
-)
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
@@ -46,6 +37,15 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     validate_inference_parameters,
     validate_inference_workload,
     validate_model_seed,
+)
+from biomodals.helper.artifacts import (
+    VolumeHandle,
+    artifact_record,
+    require_regular_file,
+    sha256_bytes,
+    utc_now,
+    validate_artifact_record,
+    write_json_atomic,
 )
 
 SEED_PREDICTION_CLAIM_DICT_NAME = "AlphaFold3-inference-claims"
@@ -70,7 +70,9 @@ _SUMMARY_ARTIFACT_FILENAMES = {
 }
 
 
-type PredictionExecutor = Callable[[Path, str, tuple[int, ...]], None]
+PredictionExecutor: TypeAlias = Callable[  # noqa: UP040 - Python 3.11 task images
+    [Path, str, tuple[int, ...]], None
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,15 +337,22 @@ def inspect_seed_predictions(
     seeds: tuple[int, ...],
     *,
     sample_count: int,
+    reload_volume: bool = True,
+    allow_large_inference: bool = False,
 ) -> list[dict[str, object]]:
     """Inspect requested seed markers without walking output artifacts."""
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     selected_seeds = tuple(_validate_seed(seed) for seed in seeds)
-    validate_inference_workload(list(selected_seeds), selected_samples)
+    validate_inference_workload(
+        list(selected_seeds),
+        selected_samples,
+        allow_large_inference=allow_large_inference,
+    )
     if len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("seed inspection inputs must be unique")
-    runtime.volume.reload()
+    if reload_volume:
+        runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
     statuses: list[dict[str, object]] = []
     for seed in selected_seeds:
@@ -383,15 +392,28 @@ def claim_seed_predictions(
     seeds: tuple[int, ...],
     *,
     sample_count: int,
+    generation_ids: Mapping[int, str] | None = None,
+    reload_volume: bool = True,
+    allow_large_inference: bool = False,
 ) -> SeedClaimPlan:
     """Reuse marked seeds and atomically claim every currently missing seed."""
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     selected_seeds = tuple(sorted(_validate_seed(seed) for seed in seeds))
-    validate_inference_workload(list(selected_seeds), selected_samples)
+    validate_inference_workload(
+        list(selected_seeds),
+        selected_samples,
+        allow_large_inference=allow_large_inference,
+    )
     if not selected_seeds or len(set(selected_seeds)) != len(selected_seeds):
         raise ValueError("claim inputs must be a non-empty unique seed set")
-    runtime.volume.reload()
+    selected_generations: dict[int, str] = {}
+    if generation_ids is not None:
+        if set(generation_ids) != set(selected_seeds):
+            raise ValueError("generation_ids must contain exactly the requested seeds")
+        selected_generations = {seed: generation_ids[seed] for seed in selected_seeds}
+    if reload_volume:
+        runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
     reused: list[int] = []
     claimed: list[ClaimedSeed] = []
@@ -412,7 +434,7 @@ def claim_seed_predictions(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_seed_claim_scope(selected_run, seed),
-                generation_id=uuid.uuid4().hex,
+                generation_id=selected_generations.get(seed, uuid.uuid4().hex),
                 identity=_seed_claim_identity(selected_run, seed),
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
@@ -429,7 +451,7 @@ def claim_seed_predictions(
         claimed.append(ClaimedSeed(seed=seed, claim=claim))
 
     owned: list[ClaimedSeed] = []
-    if claimed:
+    if claimed and reload_volume:
         runtime.volume.reload()
     for item in claimed:
         raced_marker = load_seed_marker(
@@ -960,11 +982,13 @@ def load_summary_entry(run_root: Path, run_id: str) -> SummaryEntry | None:
         or any(
             isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds
         )
-        or raw_seeds != sorted(set(raw_seeds))
     ):
         return None
+    included_seeds = cast(list[int], raw_seeds)
+    if included_seeds != sorted(set(included_seeds)):
+        return None
     best = _ranking_from_dict(marker.get("best"))
-    if best is None or best.seed not in raw_seeds:
+    if best is None or best.seed not in included_seeds:
         return None
     raw_artifacts = marker.get("artifacts")
     if not isinstance(raw_artifacts, dict):
@@ -977,7 +1001,7 @@ def load_summary_entry(run_root: Path, run_id: str) -> SummaryEntry | None:
         artifacts[role] = artifact
     return SummaryEntry(
         run_id=selected_run,
-        included_seeds=tuple(cast(list[int], raw_seeds)),
+        included_seeds=tuple(included_seeds),
         best=best,
         artifacts=artifacts,
         marker_sha256=sha256_bytes(marker_bytes),

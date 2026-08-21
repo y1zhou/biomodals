@@ -12,7 +12,7 @@ import re
 import string
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import TypeAlias, cast
 
 import orjson
 from uniaf3.schema.alphafold3 import (
@@ -25,21 +25,21 @@ from uniaf3.schema.alphafold3 import (
     AF3Template,
 )
 
-from biomodals.app.fold.alphafold3.artifacts import (
-    MAX_MSA_FIELD_BYTES,
+from biomodals.app.fold.alphafold3.profiles import (
+    ALPHAFOLD3_COMMIT,
+    ALPHAFOLD3_REPOSITORY,
+)
+from biomodals.helper.artifacts import (
     json_bytes,
     load_artifact_bytes,
     read_bounded_file_bytes,
     sha256_bytes,
 )
-from biomodals.app.fold.alphafold3.profiles import (
-    ALPHAFOLD3_COMMIT,
-    ALPHAFOLD3_REPOSITORY,
-)
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
+MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024
 STAGED_INPUT_SCHEMA_VERSION = 2
 MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES
@@ -52,12 +52,11 @@ MAX_TOTAL_POLYMER_RESIDUES = 5_120
 MAX_MODEL_SEEDS = 1000
 MAX_NUM_RECYCLES = 100
 MAX_DIFFUSION_SAMPLES = 100
-MAX_SEED_SAMPLE_PAIRS = 1000
-MAX_INFERENCE_WORKERS = 100
+MAX_SEED_SAMPLE_PAIRS = 5000
 MAX_PROTEIN_TEMPLATES = 20
 _TEXT_SIZE_CHUNK_CHARS = 1024 * 1024
 
-type _AF3Entity = AF3Protein | AF3RNA | AF3DNA | AF3Ligand
+_AF3Entity: TypeAlias = AF3Protein | AF3RNA | AF3DNA | AF3Ligand  # noqa: UP040
 
 
 @dataclass(frozen=True, slots=True)
@@ -607,24 +606,18 @@ def validate_inference_parameters(recycle: int, sample: int) -> None:
         )
 
 
-def validate_inference_worker_budget(max_num_gpus: int) -> int:
-    """Validate the GPU-worker cap before any cost-incurring remote work."""
-    if (
-        isinstance(max_num_gpus, bool)
-        or not isinstance(max_num_gpus, int)
-        or not 1 <= max_num_gpus <= MAX_INFERENCE_WORKERS
-    ):
-        raise ValueError(
-            f"max_num_gpus must be an integer between 1 and {MAX_INFERENCE_WORKERS}"
-        )
-    return max_num_gpus
-
-
-def validate_inference_workload(seeds: list[int], sample_count: int) -> int:
+def validate_inference_workload(
+    seeds: list[int],
+    sample_count: int,
+    *,
+    allow_large_inference: bool = False,
+) -> int:
     """Bound the number of durable seed/sample prediction directories."""
+    if not isinstance(allow_large_inference, bool):
+        raise TypeError("allow_large_inference must be a boolean")
     validate_inference_parameters(0, sample_count)
     prediction_count = len(normalize_model_seeds(seeds)) * sample_count
-    if prediction_count > MAX_SEED_SAMPLE_PAIRS:
+    if prediction_count > MAX_SEED_SAMPLE_PAIRS and not allow_large_inference:
         raise ValueError(
             "modelSeeds × sample must not exceed "
             f"{MAX_SEED_SAMPLE_PAIRS}, got {prediction_count}"
@@ -670,11 +663,16 @@ def prepare_inference_run(
     *,
     recycle: int,
     sample: int,
+    allow_large_inference: bool = False,
 ) -> PreparedInferenceRun:
     """Build run/request identities and every required Volume upload."""
     validate_inference_parameters(recycle, sample)
     conf = validate_submitted_af3_input(enriched_config)
-    validate_inference_workload(conf.modelSeeds, sample)
+    validate_inference_workload(
+        conf.modelSeeds,
+        sample,
+        allow_large_inference=allow_large_inference,
+    )
     submitted_seeds = tuple(conf.modelSeeds)
     normalized_seeds = normalize_model_seeds(conf.modelSeeds)
     display_name = conf.name

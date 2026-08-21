@@ -7,7 +7,7 @@ behavior can be exercised synchronously in local tests.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from uniaf3.schema.alphafold3 import AF3Config
 
@@ -39,7 +39,7 @@ from biomodals.app.fold.alphafold3.msa_search import (
 )
 from biomodals.app.fold.alphafold3.template_search import TemplateTask
 
-type SearchOutcome = dict[str, object] | Exception
+SearchOutcome: TypeAlias = dict[str, object] | Exception  # noqa: UP040
 
 
 class SearchExecutor(Protocol):

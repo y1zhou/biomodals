@@ -1,4 +1,6 @@
-"""AlphaFold3 source repo: <https://github.com/google-deepmind/alphafold3>.
+"""AlphaFold3 upstream: <https://github.com/google-deepmind/alphafold3>.
+
+Biomodals runs its pinned fork: <https://github.com/y1zhou/alphafold3>.
 
 ## Additional notes
 
@@ -19,15 +21,15 @@ separate `AlphaFold3-msa-db-sharded` Volume before running searches.
 
 Inspect the database-build plan without submitting paid work:
 
-`uv run biomodals app run alphafold3::setup_sharded_databases`
+`uv run biomodals app run --development alphafold3::setup_sharded_databases`
 
 After reviewing that plan, build all missing profiles explicitly:
 
-`uv run biomodals app run alphafold3::setup_sharded_databases --submit`
+`uv run biomodals app run --development alphafold3::setup_sharded_databases -- --submit`
 
 Run prediction and download the request-scoped archive:
 
-`uv run biomodals app run alphafold3::submit_alphafold3_task --input-json input.json --out-dir outputs`
+`uv run biomodals app run alphafold3::submit_alphafold3_task -- --input-json input.json --out-dir outputs`
 
 See <https://github.com/google-deepmind/alphafold3/tree/main/docs> for general docs.
 
@@ -38,53 +40,48 @@ See <https://github.com/google-deepmind/alphafold3/blob/main/docs/output.md>.
 
 import os
 import uuid
+import warnings
 from pathlib import Path, PurePosixPath
+from uuid import UUID
 
 import modal
 import orjson
-from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.execution_coordinator import (
+    AlphaFold3ExecutionCoordinator,
+)
+from biomodals.app.fold.alphafold3.execution_publications import (
+    publish_execution_result,
+)
+from biomodals.app.fold.alphafold3.execution_request import (
+    AlphaFold3ExecutionRequest,
+    stage_execution_request,
+)
 from biomodals.app.fold.alphafold3.inference_inputs import (
     ALPHAFOLD3_APP_VERSION,
+    MAX_SEED_SAMPLE_PAIRS,
     LoadedInferenceInput,
-    PreparedInferenceRun,
     load_staged_inference_input,
     materialize_local_input,
-    prepare_inference_run,
+    normalize_model_seeds,
     sanitize_af3_name,
-    validate_inference_parameters,
-    validate_inference_worker_budget,
-    validate_inference_workload,
 )
-from biomodals.app.fold.alphafold3.inference_pipeline import coordinate_seed_predictions
 from biomodals.app.fold.alphafold3.invocation_cache import (
-    build_invocation_receipt,
     load_invocation_manifest,
-    prepare_invocation,
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
-    ModalInferenceExecutor,
-    ModalSearchExecutor,
     execute_profile_setup,
-    publish_invocation_receipt,
-    stage_inference_run,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
     MsaArtifactReference,
     MsaAssemblyTask,
     Polymer,
-    RawSearchTask,
     SearchRuntime,
     assemble_and_publish_msas,
-    inspect_msa_cache,
     run_database_search,
     sequence_cache_relpath,
-    validate_msa_assembly_task,
-    validate_polymer_query,
-    validate_query,
-    validate_remote_search_task_count,
 )
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
@@ -109,14 +106,8 @@ from biomodals.app.fold.alphafold3.profiles import (
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     create_request_archive,
-    load_request_manifest,
     publish_request_results,
-    request_manifest_from_result,
     request_publication_from_manifest,
-)
-from biomodals.app.fold.alphafold3.search_pipeline import (
-    resolve_msa_and_templates,
-    validate_search_worker_budget,
 )
 from biomodals.app.fold.alphafold3.seed_predictions import (
     SEED_PREDICTION_CLAIM_DICT_NAME,
@@ -133,13 +124,26 @@ from biomodals.app.fold.alphafold3.template_search import (
     DEFAULT_MAX_TEMPLATE_DATE,
     TemplateRuntime,
     TemplateTask,
-    inspect_template_entries,
     run_template_search,
 )
 from biomodals.app.fold.alphafold3.upstream_inference import (
     UpstreamInferenceRuntime,
     finalize_upstream_run_summary,
     run_upstream_seed_worker,
+)
+from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    DeploymentIdentity,
+    ExecutionOverview,
+)
+from biomodals.execution.modal import (
+    ModalCallDriver,
+    development_modal_call_driver,
+    execution_coordinator_adapter,
+    execution_coordinator_identity,
+    initialize_execution_coordinator_host,
+    resolve_provider_call_limits,
+    submit_staged_execution_run,
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
@@ -173,8 +177,15 @@ SHARDED_MSA_DB_VOLUME = modal.Volume.from_name(
     create_if_missing=True,
     version=2,
 )
-_JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
+JAX_CACHE_MOUNTPOINT = PurePosixPath(f"/{CONF.name}-jax-cache")
+JAX_CACHE_VOLUME = modal.Volume.from_name(
+    JAX_CACHE_MOUNTPOINT.name,
+    create_if_missing=True,
+    version=2,
+)
 _SUMMARY_TIMEOUT_SECONDS = 3600
+_MAX_CONCURRENT_COORDINATOR_INPUTS = 8
+EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_alphafold3_task"})
 MSA_SEARCH_CLAIMS = modal.Dict.from_name(
     MSA_SEARCH_CLAIM_DICT_NAME,
     create_if_missing=True,
@@ -275,6 +286,23 @@ _INFERENCE_RUNTIME = InferenceRuntime(
 )
 
 
+def _coordinator_result(
+    result: dict[str, object],
+    execution_result_path: str | None,
+) -> dict[str, object]:
+    """Return direct output or publish a small coordinator result reference."""
+    if execution_result_path is None:
+        return result
+    return {
+        "execution_result": publish_execution_result(
+            Path(CONF.output_volume_mountpoint),
+            CONF.output_volume,
+            execution_result_path,
+            result,
+        )
+    }
+
+
 @app.function(
     image=sharding_image,
     cpu=PROFILE_BUILD_CPU,
@@ -341,57 +369,6 @@ def finalize_sharded_database_setup() -> dict[str, object]:
 ##########################################
 # MSA search functions
 ##########################################
-@app.function(
-    cpu=(0.125, 4.125),
-    memory=16384,
-    timeout=600,
-    max_containers=4,
-    volumes={
-        SearchRuntime.SHARDED_MOUNT: (
-            SHARDED_MSA_DB_VOLUME.with_mount_options(
-                read_only=True,
-                sub_path="/",
-            )
-        ),
-        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=True,
-            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
-        ),
-    },
-)
-def inspect_msa_search_cache(
-    raw_inputs: list[tuple[str, str]],
-    assembly_inputs: list[tuple[Polymer, str, bool, bool]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Prefer complete combined MSAs, then deep-check uncovered raw results."""
-    validate_remote_search_task_count(len(raw_inputs) + len(assembly_inputs))
-    raw_tasks = tuple(
-        RawSearchTask(database_id=database_id, sequence=sequence)
-        for database_id, sequence in raw_inputs
-    )
-    assembly_tasks = tuple(
-        MsaAssemblyTask(
-            polymer=polymer,
-            sequence=sequence,
-            include_unpaired=include_unpaired,
-            include_paired=include_paired,
-        )
-        for polymer, sequence, include_unpaired, include_paired in assembly_inputs
-    )
-    for task in raw_tasks:
-        validate_query(task.spec, task.sequence)
-    for task in assembly_tasks:
-        validate_msa_assembly_task(task, require_canonical=True)
-    SHARDED_MSA_DB_VOLUME.reload()
-    MSA_CACHE_VOLUME.reload()
-    return inspect_msa_cache(
-        Path(SearchRuntime.SHARDED_MOUNT),
-        Path(SearchRuntime.CACHE_MOUNT),
-        raw_tasks,
-        assembly_tasks,
-    )
-
-
 def _msa_search_runtime(
     *,
     maximum_age_seconds: int | float,
@@ -423,18 +400,26 @@ def _msa_search_runtime(
             read_only=False,
             sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
-def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
+def search_database_msa(
+    database_id: str,
+    sequence: str,
+    generation_id: str | None = None,
+    execution_result_path: str | None = None,
+) -> dict[str, object]:
     """Search one fixed sharded database with database-level resume."""
-    return run_database_search(
+    result = run_database_search(
         _msa_search_runtime(
             maximum_age_seconds=CONF.timeout + 900,
             wait_timeout_seconds=max(60, CONF.timeout - 60),
         ),
         database_id,
         sequence,
+        generation_id=generation_id,
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -452,6 +437,7 @@ def search_database_msa(database_id: str, sequence: str) -> dict[str, object]:
             read_only=False,
             sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
 def assemble_sequence_msas(
@@ -459,11 +445,13 @@ def assemble_sequence_msas(
     sequence: str,
     include_unpaired: bool,
     include_paired: bool,
+    generation_id: str | None = None,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Assemble requested fields with pinned upstream deduplication."""
     if polymer not in {"protein", "rna"}:
         raise ValueError(f"Unsupported polymer: {polymer!r}")
-    return assemble_and_publish_msas(
+    result = assemble_and_publish_msas(
         _msa_search_runtime(
             maximum_age_seconds=2700,
             wait_timeout_seconds=1740,
@@ -474,33 +462,9 @@ def assemble_sequence_msas(
             include_unpaired=include_unpaired,
             include_paired=include_paired,
         ),
+        generation_id=generation_id,
     )
-
-
-@app.function(
-    cpu=(0.125, 4.125),
-    memory=16384,
-    timeout=600,
-    max_containers=4,
-    volumes={
-        TemplateRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
-            read_only=True,
-            sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
-        ),
-    },
-)
-def inspect_protein_template_cache(
-    inputs: list[tuple[str, str, str]],
-) -> list[dict[str, object]]:
-    """Inspect canonical template markers without consuming search workers."""
-    validate_remote_search_task_count(len(inputs))
-    for sequence, _, _ in inputs:
-        validate_polymer_query("protein", sequence)
-    MSA_CACHE_VOLUME.reload()
-    return inspect_template_entries(
-        Path(TemplateRuntime.CACHE_MOUNT),
-        tuple(inputs),
-    )
+    return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -516,6 +480,7 @@ def inspect_protein_template_cache(
             read_only=False,
             sub_path=TemplateRuntime.CACHE_VOLUME_SUBPATH,
         ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
 def search_protein_templates(
@@ -524,9 +489,11 @@ def search_protein_templates(
     unpaired_msa_reference: dict[str, object] | None,
     publish_canonical: bool,
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
+    generation_id: str | None = None,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
-    return run_template_search(
+    result = run_template_search(
         TemplateRuntime(
             source_volume=AF3_MSA_DB_VOLUME,
             cache_volume=MSA_CACHE_VOLUME,
@@ -551,30 +518,9 @@ def search_protein_templates(
             publish_canonical=publish_canonical,
             max_template_date=max_template_date,
         ),
+        generation_id=generation_id,
     )
-
-
-def _search_msa_and_templates(
-    config: AF3Config,
-    *,
-    search_msa: bool = True,
-    search_templates: bool = True,
-    max_parallel_search_workers: int = 4,
-) -> AF3Config:
-    """Resolve MSA/template fields through the production Modal adapter."""
-    return resolve_msa_and_templates(
-        config,
-        ModalSearchExecutor(
-            inspect_msa_function=inspect_msa_search_cache,
-            raw_search_function=search_database_msa,
-            msa_assembly_function=assemble_sequence_msas,
-            inspect_templates_function=inspect_protein_template_cache,
-            template_search_function=search_protein_templates,
-        ),
-        search_msa=search_msa,
-        search_protein_templates=search_templates,
-        max_parallel_search_workers=max_parallel_search_workers,
-    )
+    return _coordinator_result(result, execution_result_path)
 
 
 ##########################################
@@ -612,6 +558,7 @@ def inspect_seed_prediction_cache(
     run_id: str,
     seeds: list[int],
     sample_count: int,
+    allow_large_inference: bool = False,
 ) -> list[dict[str, object]]:
     """Inspect seed markers without scanning prediction directories."""
     return inspect_seed_predictions(
@@ -619,6 +566,7 @@ def inspect_seed_prediction_cache(
         run_id,
         tuple(seeds),
         sample_count=sample_count,
+        allow_large_inference=allow_large_inference,
     )
 
 
@@ -637,6 +585,7 @@ def claim_seed_prediction_work(
     run_id: str,
     seeds: list[int],
     sample_count: int,
+    allow_large_inference: bool = False,
 ) -> dict[str, object]:
     """Reuse or atomically claim one request's currently incomplete seeds."""
     return claim_seed_predictions(
@@ -644,6 +593,7 @@ def claim_seed_prediction_work(
         run_id,
         tuple(seeds),
         sample_count=sample_count,
+        allow_large_inference=allow_large_inference,
     ).to_dict()
 
 
@@ -658,11 +608,7 @@ def claim_seed_prediction_work(
         model_ro=True,
     )
     | {
-        _JAX_CACHE_MOUNTPOINT: modal.Volume.from_name(
-            _JAX_CACHE_MOUNTPOINT.name,
-            create_if_missing=True,
-            version=2,
-        )
+        JAX_CACHE_MOUNTPOINT: JAX_CACHE_VOLUME,
     },
 )
 def run_inference_pipeline(
@@ -670,6 +616,8 @@ def run_inference_pipeline(
     request_id: str,
     staged_input_record: dict[str, object],
     claimed_seed_records: list[dict[str, object]],
+    allow_large_inference: bool = False,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Run one disjoint seed group and publish per-seed markers."""
     with guard_seed_prediction_claims(
@@ -678,19 +626,21 @@ def run_inference_pipeline(
         claimed_seed_records,
     ) as claimed_seeds:
         staged = _load_staged_request(run_id, request_id, staged_input_record)
-        return run_upstream_seed_worker(
+        result = run_upstream_seed_worker(
             UpstreamInferenceRuntime(
                 predictions=_INFERENCE_RUNTIME,
                 source_root=CONF.git_clone_dir,
                 model_root=Path(CONF.model_volume_mountpoint),
-                jax_cache_dir=Path(_JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
+                jax_cache_dir=Path(JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
             ),
             staged.config,
             run_id,
             staged.recycle,
             staged.sample_count,
             claimed_seeds,
+            allow_large_inference=allow_large_inference,
         )
+        return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -703,15 +653,17 @@ def finalize_inference_summary(
     run_id: str,
     request_id: str,
     staged_input_record: dict[str, object],
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
     staged = _load_staged_request(run_id, request_id, staged_input_record)
-    return finalize_upstream_run_summary(
+    result = finalize_upstream_run_summary(
         _INFERENCE_RUNTIME,
         staged.config,
         run_id,
         staged.sample_count,
     )
+    return _coordinator_result(result, execution_result_path)
 
 
 @app.function(
@@ -727,9 +679,10 @@ def finalize_inference_request(
     normalized_seeds: list[int],
     sample_count: int,
     display_name: str,
+    execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Publish one manifest-last view over the request's completed seeds."""
-    return publish_request_results(
+    result = publish_request_results(
         _INFERENCE_RUNTIME,
         RequestPublication(
             run_id=run_id,
@@ -740,32 +693,181 @@ def finalize_inference_request(
             display_name=display_name,
         ),
     )
+    return _coordinator_result(result, execution_result_path)
 
 
-def _predict_structures(
-    prepared: PreparedInferenceRun,
-    num_containers: int,
-    *,
-    poll_timeout: int = 30,
-) -> dict[str, object]:
-    """Reconcile predictions through the production Modal adapter."""
-    return coordinate_seed_predictions(
-        prepared,
-        ModalInferenceExecutor(
-            claim_function=claim_seed_prediction_work,
-            inspect_function=inspect_seed_prediction_cache,
-            worker_function=run_inference_pipeline,
-            summary_function=finalize_inference_summary,
-            request_function=finalize_inference_request,
+##########################################
+# Deployment-local execution coordinator
+##########################################
+
+
+@app.cls(
+    cpu=(0.125, 4.125),
+    memory=(1024, 16384),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    volumes={
+        SearchRuntime.SHARDED_MOUNT: (
+            SHARDED_MSA_DB_VOLUME.with_mount_options(
+                read_only=True,
+                sub_path="/",
+            )
         ),
-        num_containers=num_containers,
-        active_wait_timeout_seconds=MAX_TIMEOUT + 900,
-        worker_poll_timeout_seconds=poll_timeout,
+        SearchRuntime.CACHE_MOUNT: MSA_CACHE_VOLUME.with_mount_options(
+            read_only=False,
+            sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
+        ),
+        TemplateRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path="/",
+        ),
+        CONF.output_volume_mountpoint: CONF.output_volume,
+    },
+)
+@modal.concurrent(max_inputs=_MAX_CONCURRENT_COORDINATOR_INPUTS)
+class ExecutionCoordinator:
+    """Run-scoped single writer deployed with AlphaFold3's worker functions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+    development: bool = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Refresh output state before accepting lifecycle methods."""
+        initialize_execution_coordinator_host(self)
+        self._identity()
+        CONF.output_volume.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionOverview:
+        """Drive a staged root App Run until it stops."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def status(self) -> ExecutionOverview:
+        """Read this Run's durable kernel overview."""
+        return self._adapter().status()
+
+    @modal.method()
+    def cancel(self) -> ExecutionOverview:
+        """Request idempotent cancellation for this Run."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def resume(self) -> ExecutionOverview:
+        """Resume this Run without retrying conclusive failures."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Persist a validated Successor request without driving it."""
+        self._adapter().prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> ExecutionOverview:
+        """Drive one previously prepared root or Successor Run."""
+        return self._adapter().drive_prepared()
+
+    @modal.method()
+    def restart_from(
+        self,
+        predecessor_execution_run_id: str,
+        candidate_request_bytes: bytes,
+    ) -> ExecutionOverview:
+        """Create a Successor Run while inferring predecessor identity."""
+        adapter = self._adapter()
+        adapter.prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            candidate_request=AlphaFold3ExecutionRequest.from_bytes(
+                candidate_request_bytes
+            ),
+        )
+        return adapter.drive_prepared()
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Close local state without cancelling attached child calls."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _identity(self) -> tuple[UUID, DeploymentIdentity]:
+        return execution_coordinator_identity(self)
+
+    def _adapter(
+        self,
+        *,
+        development: bool | None = None,
+    ) -> AlphaFold3ExecutionCoordinator:
+        execution_run_id, deployment = self._identity()
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: AlphaFold3ExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=Path(CONF.output_volume_mountpoint),
+                output_volume=CONF.output_volume,
+                output_volume_name=CONF.output_volume_name,
+                provider_driver=_coordinator_modal_driver(development=selected_mode),
+                search_runtime=_msa_search_runtime(
+                    maximum_age_seconds=CONF.timeout + 900,
+                    wait_timeout_seconds=max(60, CONF.timeout - 60),
+                ),
+                template_runtime=TemplateRuntime(
+                    source_volume=AF3_MSA_DB_VOLUME,
+                    cache_volume=MSA_CACHE_VOLUME,
+                    claims=MSA_SEARCH_CLAIMS,
+                    container_id=_CONTAINER_INSTANCE_ID,
+                    maximum_age_seconds=CONF.timeout + 900,
+                    wait_timeout_seconds=max(60, CONF.timeout - 60),
+                ),
+                inference_runtime=_INFERENCE_RUNTIME,
+            ),
+        )
+
+
+def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
+    """Resolve exact deployed functions or current-source development handles."""
+    if not development:
+        return ModalCallDriver()
+    return development_modal_call_driver(
+        {
+            "search_database_msa": search_database_msa,
+            "assemble_sequence_msas": assemble_sequence_msas,
+            "search_protein_templates": search_protein_templates,
+            "run_inference_pipeline": run_inference_pipeline,
+            "finalize_inference_summary": finalize_inference_summary,
+            "finalize_inference_request": finalize_inference_request,
+        },
+        workload_name="AlphaFold3",
     )
 
 
 ##########################################
-# Entrypoint for ephemeral usage
+# Local entrypoints
 ##########################################
 @app.local_entrypoint()
 def setup_sharded_databases(
@@ -817,10 +919,16 @@ def submit_alphafold3_task(
     run_name: str | None = None,
     search_msa: bool = True,
     search_protein_templates: bool = True,
-    max_parallel_search_workers: int = 4,
-    max_num_gpus: int = 1,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
+    allow_large_inference: bool = False,
     recycle: int = 10,
     sample: int = 5,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+    restart_from: str | None = None,
 ) -> None:
     """Run AlphaFold3 on Modal and fetch results to `out_dir`.
 
@@ -832,100 +940,78 @@ def submit_alphafold3_task(
         search_msa: Populate missing protein and RNA MSA fields.
         search_protein_templates: Populate missing protein templates after MSA
             resolution. Non-empty caller fields are always preserved.
-        max_parallel_search_workers: Request-wide cap for database and template
-            workers. Database workers internally use 16 shards by two HMMER
-            CPUs.
-        max_num_gpus: Maximum number of disjoint seed workers to run during
-            inference.
+        max_containers: Maximum active workload containers for this Run.
+        max_gpu_containers: Maximum active GPU workload containers within the
+            total container limit.
+        allow_large_inference: Continue after warning when the request exceeds
+            the default seed/sample prediction limit. Other limits still apply.
         recycle: Number of Pairformer recycles to use during inference.
         sample: Number of diffusion samples to generate per seed.
+        use_deployed_coordinator: Target the exact deployed coordinator. The
+            `biomodals app run` client supplies this for normal runs.
+        deployment_environment: Modal Environment containing the coordinator.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric Modal deployment version.
+        restart_from: Optional predecessor Execution Run ID for a Successor Run.
 
     """
-    max_num_gpus = validate_inference_worker_budget(max_num_gpus)
-    validate_search_worker_budget(max_parallel_search_workers)
-    validate_inference_parameters(recycle, sample)
-
     conf = materialize_local_input(input_json)
-    validate_inference_workload(conf.modelSeeds, sample)
     if run_name is None:
         run_name = conf.name
     sanitize_af3_name(run_name)
     conf.name = run_name
-
-    invocation = prepare_invocation(
+    prediction_count = len(normalize_model_seeds(conf.modelSeeds)) * sample
+    if allow_large_inference and prediction_count > MAX_SEED_SAMPLE_PAIRS:
+        warnings.warn(
+            "AlphaFold3 request will create "
+            f"{prediction_count:,} seed/sample predictions, exceeding the "
+            f"default limit of {MAX_SEED_SAMPLE_PAIRS:,}; continuing because "
+            "--allow-large-inference was set.",
+            stacklevel=2,
+        )
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=4,
+        default_max_gpu_containers=1,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
+    request = AlphaFold3ExecutionRequest.prepare(
         conf,
         search_msa=search_msa,
         search_protein_templates=search_protein_templates,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
+        allow_large_inference=allow_large_inference,
         recycle=recycle,
         sample=sample,
     )
-    if manifest := load_invocation_manifest(CONF.output_volume, invocation):
-        publication = request_publication_from_manifest(manifest)
-        print(
-            "🧬 Reusing exact completed invocation: "
-            f"run_id={publication.run_id}, request_id={publication.request_id}"
-        )
-        archive_path = create_request_archive(
-            CONF.output_volume,
-            manifest,
-            output_dir=resolve_local_output_dir(out_dir),
-            display_name=run_name,
-        )
-        run_root = PurePosixPath(publication.run_id[:2]) / publication.run_id
-        print(
-            f"🧬 {CONF.name} results saved to {archive_path}. Durable seed "
-            f"predictions remain in {CONF.output_volume_name}:/{run_root}."
-        )
-        return
-
-    print(f"🧬 Resolving {CONF.name} MSA and template fields...")
-    enriched_conf = _search_msa_and_templates(
-        conf,
-        search_msa=search_msa,
-        search_templates=search_protein_templates,
-        max_parallel_search_workers=max_parallel_search_workers,
+    execution_run_id = uuid.uuid4()
+    deployment = DeploymentIdentity(
+        deployment_environment,
+        deployment_name,
+        deployment_version,
     )
-
-    enriched_conf.name = run_name
-    enriched_conf.modelSeeds = conf.modelSeeds
-    prepared = prepare_inference_run(
-        enriched_conf,
-        recycle=recycle,
-        sample=sample,
-    )
-    if prepared.submitted_seeds != prepared.normalized_seeds:
-        print(
-            "🧬 Normalized duplicate model seeds: "
-            f"{list(prepared.submitted_seeds)} -> "
-            f"{list(prepared.normalized_seeds)}"
-        )
-    publication = RequestPublication.from_prepared(prepared)
-    manifest = load_request_manifest(CONF.output_volume, publication)
-    if manifest is None:
-        stage_inference_run(CONF.output_volume, prepared)
-        print(
-            "🧬 Staged inference input: "
-            f"run_id={prepared.run_id}, request_id={prepared.request_id}"
-        )
-
-        num_seeds = len(prepared.normalized_seeds)
-        num_containers = min(max_num_gpus, num_seeds)
-        print(f"🧬 Running {CONF.name} inference pipeline with {num_containers=}...")
-        manifest = request_manifest_from_result(
-            _predict_structures(
-                prepared,
-                num_containers,
-            )
-        )
-    else:
-        print(
-            "🧬 Reusing completed request view: "
-            f"run_id={prepared.run_id}, request_id={prepared.request_id}"
-        )
-    publish_invocation_receipt(
+    predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    submit_staged_execution_run(
         CONF.output_volume,
-        build_invocation_receipt(invocation, prepared, manifest),
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        predecessor_execution_run_id=predecessor_execution_run_id,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
+        workload_name=CONF.name,
+        restart_kwargs={"candidate_request_bytes": request.to_bytes()},
     )
+    manifest = load_invocation_manifest(
+        CONF.output_volume,
+        request.invocation,
+    )
+    if manifest is None:
+        raise RuntimeError(
+            "Successful AlphaFold3 Execution Run has no invocation manifest"
+        )
+    publication = request_publication_from_manifest(manifest)
     archive_path = create_request_archive(
         CONF.output_volume,
         manifest,
@@ -934,5 +1020,6 @@ def submit_alphafold3_task(
     )
     print(
         f"🧬 {CONF.name} results saved to {archive_path}. Durable seed "
-        f"predictions remain in {CONF.output_volume_name}:/{prepared.run_root}."
+        f"predictions remain in {CONF.output_volume_name}:/"
+        f"{PurePosixPath(publication.run_id[:2]) / publication.run_id}."
     )

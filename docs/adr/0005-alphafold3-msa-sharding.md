@@ -675,7 +675,7 @@ Before remote work, a local helper resolves relative input paths against the
 input JSON's directory.
 
 The helper accepts only non-symlink regular files and performs bounded reads:
-64 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
+256 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
 each custom mmCIF or user CCD. A file that changes while being read is rejected.
 Template counts are checked before any referenced template is opened, and the
 aggregate template ceiling is enforced after each read. Large caller MSAs

@@ -14,7 +14,6 @@ from biomodals.app.fold.alphafold3.execution_plan import (
     build_alphafold3_execution_plan,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
-    MAX_STAGED_INPUT_BYTES,
     serialize_af3_input,
     validate_inference_parameters,
     validate_inference_workload,
@@ -29,7 +28,7 @@ from biomodals.execution.modal import ExecutionRequestFile
 
 EXECUTION_REQUEST_SCHEMA_VERSION = 4
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"
-MAX_EXECUTION_REQUEST_BYTES = MAX_STAGED_INPUT_BYTES
+MAX_EXECUTION_REQUEST_BYTES = 1024 * 1024 * 1024
 _REQUEST_FILE = ExecutionRequestFile(
     EXECUTION_REQUEST_FILENAME,
     MAX_EXECUTION_REQUEST_BYTES,

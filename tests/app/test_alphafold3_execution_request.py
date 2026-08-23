@@ -10,6 +10,7 @@ import orjson
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
+from biomodals.app.fold.alphafold3 import execution_request, inference_inputs
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
     load_execution_request,
@@ -84,6 +85,33 @@ def test_execution_request_round_trips_and_revalidates_identity() -> None:
     assert decoded.execution_plan == request.execution_plan
     assert decoded.max_active_provider_calls == 4
     assert decoded.allow_large_inference
+
+
+def test_execution_envelope_has_independent_metadata_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Envelope metadata should fit beyond an exact-limit staged config."""
+    request = _request()
+    config_bytes = inference_inputs.serialize_af3_input(request.config)
+    monkeypatch.setattr(
+        inference_inputs,
+        "MAX_STAGED_INPUT_BYTES",
+        len(config_bytes),
+    )
+    envelope = request.to_bytes()
+    assert len(envelope) > len(config_bytes)
+
+    monkeypatch.setattr(
+        execution_request,
+        "MAX_EXECUTION_REQUEST_BYTES",
+        len(envelope),
+    )
+    assert request.to_bytes() == envelope
+
+
+def test_execution_envelope_retains_one_gib_ceiling() -> None:
+    """The internal coordinator envelope retains its independent headroom."""
+    assert execution_request.MAX_EXECUTION_REQUEST_BYTES == 1024 * 1024 * 1024
 
 
 def test_operational_limits_do_not_change_the_scientific_plan() -> None:

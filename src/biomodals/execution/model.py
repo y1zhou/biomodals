@@ -449,6 +449,41 @@ class ActiveProviderCallCounts:
 
 
 @dataclass(frozen=True)
+class NodeTaskStatusCounts:
+    """Bounded Task lifecycle counts for one Execution Node."""
+
+    node_key: str
+    pending: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    skipped: int = 0
+
+
+@dataclass(frozen=True)
+class ProviderCallDiagnostic:
+    """One bounded Provider Call record for logs and diagnostics."""
+
+    provider_call_id: UUID
+    node_key: str
+    function_name: str
+    status: ProviderCallStatus
+    provider_call_handle_id: str | None
+    created_at: int
+    started_at: int | None
+    completed_at: int | None
+
+
+@dataclass(frozen=True)
+class ProviderCallPage:
+    """One cursor-paginated page of Provider Call diagnostics."""
+
+    calls: tuple[ProviderCallDiagnostic, ...]
+    next_cursor: UUID | None
+
+
+@dataclass(frozen=True)
 class WorkerAssignmentRecord:
     """One checkpointed pull-worker ownership decision."""
 
@@ -491,6 +526,7 @@ class ExecutionOverview:
     nodes: tuple[ExecutionNodeRecord, ...]
     representative_provider_calls: tuple[ProviderCallOverview, ...]
     active_provider_calls: ActiveProviderCallCounts
+    node_task_status_counts: tuple[NodeTaskStatusCounts, ...] = ()
 
 
 def _canonical_json_sha256(value: Any) -> str:

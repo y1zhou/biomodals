@@ -31,6 +31,7 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
+    ProviderCallPage,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -52,7 +53,7 @@ from biomodals.schema import ArtifactFile
 # Modal configs
 ##########################################
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name},
+    tags={"group": Path(__file__).parent.name, "biomodals_tool": "gromacs"},
     name="Gromacs",
     repo_url="https://github.com/gromacs/gromacs",
     version="2026.1",
@@ -913,6 +914,20 @@ class ExecutionCoordinator:
     def status(self) -> ExecutionOverview:
         """Read this Run's durable kernel snapshot."""
         return self._adapter().status()
+
+    @modal.method()
+    def provider_calls(
+        self,
+        node_key: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls for service diagnostics."""
+        return self._adapter().provider_calls(
+            node_key=node_key,
+            cursor=None if cursor is None else UUID(cursor),
+            limit=limit,
+        )
 
     @modal.method()
     def cancel(self) -> ExecutionOverview:

@@ -4,7 +4,12 @@
 
 import sqlite3
 
-from biomodals.execution import ActiveProviderCallCounts, ProviderCallStatus, RunStatus
+from biomodals.execution import (
+    ActiveProviderCallCounts,
+    NodeTaskStatusCounts,
+    ProviderCallStatus,
+    RunStatus,
+)
 
 from .provider_call_helpers import (
     GPU_BINDING,
@@ -88,7 +93,10 @@ def test_overview_preserves_lifecycle_state_without_reading_tasks() -> None:
     )
     assert overview.representative_provider_calls[0].result_envelope is None
     assert overview.active_provider_calls == ActiveProviderCallCounts(total=1, gpu=1)
-    assert all("execution_tasks" not in statement for statement in statements)
+    assert overview.node_task_status_counts == (
+        NodeTaskStatusCounts(node_key="inference", running=2),
+    )
+    assert all("scientific_payload_json" not in statement for statement in statements)
 
     repository.cancel_provider_call(
         active.call.provider_call_id,
@@ -100,3 +108,50 @@ def test_overview_preserves_lifecycle_state_without_reading_tasks() -> None:
     assert representative.submission_token == "call-1"
     assert representative.status == ProviderCallStatus.SUCCEEDED
     assert representative.result_envelope == {"path": "/outputs/seed-0"}
+
+
+def test_provider_call_page_is_bounded_and_node_scoped() -> None:
+    repository = create_repository(task_count=2)
+    persist_fixed_policy(
+        repository,
+        ("seed-0", "seed-1"),
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+    )
+    first = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="call-0",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    second = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-1",),
+        submission_token="call-1",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=111,
+    )
+    assert first is not None and second is not None
+
+    page = repository.provider_call_page(RUN_ID, node_key="inference", limit=1)
+
+    assert [call.provider_call_id for call in page.calls] == [
+        first.call.provider_call_id
+    ]
+    assert page.calls[0].function_name == GPU_BINDING.function_name
+    assert page.next_cursor == first.call.provider_call_id
+    final_page = repository.provider_call_page(
+        RUN_ID,
+        node_key="inference",
+        cursor=page.next_cursor,
+        limit=1,
+    )
+    assert [call.provider_call_id for call in final_page.calls] == [
+        second.call.provider_call_id
+    ]
+    assert final_page.next_cursor is None

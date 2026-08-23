@@ -135,6 +135,7 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
+    ProviderCallPage,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -157,7 +158,7 @@ from biomodals.helper.io import resolve_local_output_dir
 # Modal configs
 ##########################################
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name},
+    tags={"group": Path(__file__).parent.name, "biomodals_tool": "alphafold3"},
     name="AlphaFold3",
     repo_url=ALPHAFOLD3_REPOSITORY,
     repo_commit_hash=ALPHAFOLD3_COMMIT,
@@ -751,6 +752,20 @@ class ExecutionCoordinator:
     def status(self) -> ExecutionOverview:
         """Read this Run's durable kernel overview."""
         return self._adapter().status()
+
+    @modal.method()
+    def provider_calls(
+        self,
+        node_key: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls for service diagnostics."""
+        return self._adapter().provider_calls(
+            node_key=node_key,
+            cursor=None if cursor is None else UUID(cursor),
+            limit=limit,
+        )
 
     @modal.method()
     def cancel(self) -> ExecutionOverview:

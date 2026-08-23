@@ -24,6 +24,7 @@ from biomodals.execution import (
     ExecutionRuntime,
     ExecutionTaskRecord,
     ProviderBinding,
+    ProviderCallPage,
     ProviderCallSubmission,
     RunStatus,
     SqliteExecutionRepository,
@@ -760,6 +761,37 @@ class ExecutionCoordinatorLifecycle:
                     store.close()
             self._verify_overview(overview)
             return overview
+
+    def provider_calls(
+        self,
+        *,
+        node_key: str | None = None,
+        cursor: UUID | None = None,
+        limit: int = 50,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls without exposing Task payloads."""
+        with self._volume_io_lock, self._writer_lock:
+            runtime = self._runtime
+            if runtime is not None:
+                repository = runtime.store.execution
+                return repository.provider_call_page(
+                    self.execution_run_id,
+                    node_key=node_key,
+                    cursor=cursor,
+                    limit=limit,
+                )
+            store = self._run_store()
+            if not store.ledger_path.is_file():
+                raise ExecutionRunNotFoundError(str(self.execution_run_id))
+            try:
+                return store.execution.provider_call_page(
+                    self.execution_run_id,
+                    node_key=node_key,
+                    cursor=cursor,
+                    limit=limit,
+                )
+            finally:
+                store.close()
 
     def prepare_restart(
         self,

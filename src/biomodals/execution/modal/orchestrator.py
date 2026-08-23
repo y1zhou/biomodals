@@ -22,6 +22,7 @@ from biomodals.execution import (
     GraphExecutionRunStore,
     NodeStatus,
     ProviderBinding,
+    ProviderCallPage,
     TaskStatus,
 )
 from biomodals.execution.definition import ExecutionGraph
@@ -204,6 +205,36 @@ class ExecutionCoordinator:
         """Read the current kernel overview without advancing the Run."""
         with self._lock():
             return self._verified_overview()
+
+    @modal.method()
+    def provider_calls(
+        self,
+        node_key: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls for diagnostics and logs."""
+        with self._lock():
+            self._require_ledger()
+            execution_run_id, _ = self._identity()
+            runtime = getattr(self, "_runtime", None)
+            if runtime is not None:
+                return runtime.store.execution.provider_call_page(
+                    execution_run_id,
+                    node_key=node_key,
+                    cursor=None if cursor is None else UUID(cursor),
+                    limit=limit,
+                )
+            store = self._run_store()
+            try:
+                return store.execution.provider_call_page(
+                    execution_run_id,
+                    node_key=node_key,
+                    cursor=None if cursor is None else UUID(cursor),
+                    limit=limit,
+                )
+            finally:
+                store.close()
 
     @modal.method()
     def cancel(self) -> ExecutionOverview:

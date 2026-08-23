@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiofiles>=25.1.0",
     "backports-strenum>=1.3.1,<2.0 ; python_full_version < '3.11'",
-    "modal>=1.5.1",
+    "modal>=1.5.4",
     "niquests>=3.18.4",
     "orjson>=3.11.8",
     "polars[calamine,numpy,pandas,xlsxwriter]>=1.39.3",

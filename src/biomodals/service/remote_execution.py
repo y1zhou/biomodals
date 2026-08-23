@@ -92,6 +92,10 @@ class RemoteExecutionClient:
             overview = await asyncio.to_thread(call.get, timeout=0)
         except modal.exception.TimeoutError:
             return None
+        except modal.exception.NotFoundError as error:
+            raise RemoteExecutionIdentityMismatchError(
+                "Pinned root Function Call is unavailable"
+            ) from error
         except modal.exception.RemoteError as error:
             raise RemoteRootExecutionFailedError(str(error)) from error
         return self._verified(locator, overview)
@@ -169,13 +173,20 @@ class RemoteExecutionClient:
             source = call.logs.tail.aio(entries=tail_entries)
         else:
             source = call.logs.fetch.aio(since=since, until=until)
-        async for item in source:
-            yield item
+        try:
+            async for item in source:
+                yield item
+        finally:
+            close = getattr(source, "aclose", None)
+            if close is not None:
+                await close()
 
     @staticmethod
-    def _verified(
-        locator: ExecutionLocator, overview: ExecutionOverview
-    ) -> ExecutionOverview:
+    def _verified(locator: ExecutionLocator, overview: object) -> ExecutionOverview:
+        if not isinstance(overview, ExecutionOverview):
+            raise RemoteExecutionIdentityMismatchError(
+                "Remote result is not an execution overview"
+            )
         run = overview.run
         if (
             run.execution_run_id != locator.execution_run_id

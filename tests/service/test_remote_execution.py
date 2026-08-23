@@ -5,9 +5,10 @@
 from types import SimpleNamespace
 from uuid import UUID
 
+import modal
 import pytest
 
-from biomodals.execution import DeploymentIdentity
+from biomodals.execution import DeploymentIdentity, ExecutionOverview
 from biomodals.service.remote_execution import (
     ExecutionLocator,
     RemoteExecutionClient,
@@ -42,8 +43,11 @@ class RemoteMethod:
 
 
 def _overview(run_id=RUN_ID, deployment=DEPLOYMENT):
-    return SimpleNamespace(
-        run=SimpleNamespace(execution_run_id=run_id, deployment=deployment)
+    return ExecutionOverview(
+        run=SimpleNamespace(execution_run_id=run_id, deployment=deployment),
+        nodes=(),
+        representative_provider_calls=(),
+        active_provider_calls=SimpleNamespace(),
     )
 
 
@@ -75,6 +79,47 @@ async def test_every_remote_overview_must_match_the_pinned_locator(
         await client.status(LOCATOR)
     with pytest.raises(RemoteExecutionIdentityMismatchError):
         await client.cancel(LOCATOR)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("remote_result", [17, {"status": "succeeded"}])
+async def test_root_result_must_be_an_execution_overview(
+    monkeypatch,
+    remote_result,
+) -> None:
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(
+            from_id=lambda _call_id: SimpleNamespace(
+                get=lambda **_arguments: remote_result
+            )
+        ),
+    )
+
+    with pytest.raises(
+        RemoteExecutionIdentityMismatchError,
+        match="not an execution overview",
+    ):
+        await RemoteExecutionClient().poll_root(LOCATOR, "fc-root")
+
+
+@pytest.mark.anyio
+async def test_missing_root_call_is_an_unknown_remote_identity(monkeypatch) -> None:
+    def missing(**_arguments):
+        raise modal.exception.NotFoundError("expired")
+
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(
+            from_id=lambda _call_id: SimpleNamespace(get=missing),
+        ),
+    )
+
+    with pytest.raises(
+        RemoteExecutionIdentityMismatchError,
+        match="root Function Call is unavailable",
+    ):
+        await RemoteExecutionClient().poll_root(LOCATOR, "fc-expired")
 
 
 @pytest.mark.anyio
@@ -125,3 +170,36 @@ async def test_live_logs_use_one_unbounded_async_sdk_stream(monkeypatch) -> None
 
     assert entries == ["one", "two"]
     assert stream.arguments == {"timeout": None}
+
+
+@pytest.mark.anyio
+async def test_closing_live_logs_closes_the_modal_stream(monkeypatch) -> None:
+    class Source:
+        def __init__(self):
+            self.closed = False
+            self.index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.index += 1
+            return SimpleNamespace(message=f"entry-{self.index}")
+
+        async def aclose(self):
+            self.closed = True
+
+    source = Source()
+    logs = SimpleNamespace(
+        stream=SimpleNamespace(aio=lambda **_arguments: source),
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(from_id=lambda _call_id: SimpleNamespace(logs=logs)),
+    )
+    entries = RemoteExecutionClient().log_entries("fc-worker", live=True)
+
+    assert (await anext(entries)).message == "entry-1"
+    await entries.aclose()
+
+    assert source.closed is True

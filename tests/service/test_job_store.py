@@ -4,7 +4,7 @@
 
 import sqlite3
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -91,6 +91,33 @@ def test_admission_replays_identity_without_execution_tables(tmp_path: Path) -> 
 
     with pytest.raises(IdempotencyConflictError):
         _admit(store, owner, digest="b" * 64)
+
+
+def test_unstaged_jobs_select_only_queued_gromacs_requests(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    gromacs_id = uuid4()
+    store.admit_job(
+        owner_user_id=owner,
+        tool="gromacs",
+        display_name="simulation",
+        idempotency_key="gromacs-request",
+        request_digest="b" * 64,
+        modal_environment="main",
+        modal_app_name="Gromacs",
+        modal_app_version=7,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=1,
+        now=10,
+        new_job_id=gromacs_id,
+    )
+    _admit(store, owner)
+
+    assert store.unstaged_job_ids() == {gromacs_id}
+
+    store.record_launch(gromacs_id, function_call_id="fc-test", now=11)
+    assert store.unstaged_job_ids() == set()
 
 
 def test_projection_and_result_metadata_replace_atomically(tmp_path: Path) -> None:

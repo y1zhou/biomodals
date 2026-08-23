@@ -1360,7 +1360,11 @@ class ServiceStore:
         """Return Jobs whose local request may still be needed for staging."""
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT job_id FROM jobs WHERE request_staged_at IS NULL"
+                """
+                SELECT job_id FROM jobs
+                WHERE tool = 'gromacs' AND state = 'queued'
+                    AND root_function_call_id IS NULL
+                """
             ).fetchall()
         return {UUID(row[0]) for row in rows}
 

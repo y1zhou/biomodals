@@ -2,6 +2,10 @@
 
 Status: accepted.
 
+[ADR 0007](0007-api-jobs-use-remote-coordinators.md) supersedes only the
+passages that make the API service an execution host or coordinator; the
+kernel, app, workflow, and CLI decisions remain current.
+
 ## 2026-08-19 consolidation amendment
 
 The original extraction proved the Run, Node, Task, Provider Call, recovery,

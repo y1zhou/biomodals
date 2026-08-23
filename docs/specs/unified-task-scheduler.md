@@ -14,6 +14,11 @@ module-placement and caller-driven-boundary statements in this document while
 preserving the state machine, durability, cost-safety, and scientific
 publication rules defined here.
 
+[ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md) and the
+[API Tool service specification](api-tool-service.md) supersede this
+document's API-service ledger, execution-host, and coordinator passages; its
+kernel, CLI, app, and workflow contracts remain current.
+
 Implemented:
 
 - the shared model, SQLite repository, deterministic admission, fixed-batch

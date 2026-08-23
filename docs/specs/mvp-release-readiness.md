@@ -1,12 +1,15 @@
 # MVP release readiness
 
-Status: accepted
+Status: partially superseded
 
 This specification records the work that must be resolved before BioModals is
 presented as a production MVP. It covers the FastAPI service, the static
 frontend, their shared contracts, and the single-host deployment boundary.
-The review questions are resolved, and this document is the implementation
-contract for the pre-release MVP work.
+The deployment, authentication, and operational-readiness decisions remain
+applicable. [ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md) and the
+[API Tool service specification](api-tool-service.md) supersede this
+document's service execution, Job orchestration, and Tool-registration
+passages; those passages are retained only as implementation history.
 
 ## Settled constraints
 
@@ -464,24 +467,10 @@ available.
 
 ### Workload and Catalog registration
 
-Each executable API workload has one fixed descriptor owning its stable key,
-User-facing Tool name, Runtime Setting environment-variable names, and mapping
-from durable operations to public timeline stages. The descriptor also owns the
-safe default for Job-owner log visibility; missing or future descriptors default
-to Administrator-only access. Runtime configuration,
-Admin Tool rows, routing registration, and Job views consume that descriptor
-instead of carrying separate GROMACS name and stage tables. The descriptor does
-not make scientific orchestration generic: GROMACS keeps its own adapter,
-request schema, sequencing, archive builder, and tests. All executable
-workload routes use the shared `biomodals.execution` preclaim, detached spawn,
-attachment, Result Envelope, cancellation, and unknown-state transitions so
-cost-sensitive behavior cannot drift between Tools.
-
-The frontend Catalog separately includes an AlphaFold3 placeholder marked
-`WIP`. Its card is visibly muted, is not an interactive navigation target, and
-cannot submit a Job. The backend does not register an AlphaFold3 workload,
-route, Modal App, configuration row, or speculative scientific contract until
-that workflow is designed and deployed.
+This section is superseded by ADR 0007 and the API Tool service specification.
+GROMACS and AlphaFold3 are registered Tools whose deployed coordinators own
+scientific execution; the service retains only the bounded Job projection and
+service-owned metadata needed by the website.
 
 ### Durable Cancellation
 

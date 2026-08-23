@@ -1,18 +1,18 @@
 # Biomodals API service architecture
 
-Status: accepted for the department development service
+Status: partially superseded
 
 Decision date: 2026-07-16
 
-Scope: HTTP ingress and job orchestration for GROMACS, AlphaFold3, and future
-Biomodals apps and workflows
+Scope: historical API-service design with retained HTTP, authentication,
+configuration, and deployment decisions
 
-The execution details in
-[ADR 0006](../adr/0006-unified-execution-kernel.md) and the
-[unified scheduler specification](../specs/unified-task-scheduler.md) supersede
-the earlier service-only operation implementation. The HTTP, identity,
-artifact, configuration, and deployment decisions in this document remain
-service-owned.
+[ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md) and the
+[API Tool service specification](../specs/api-tool-service.md) supersede every
+service execution, Job orchestration, Tool-registration, and service-local DAG
+passage and diagram below. Those parts are historical. The HTTP, identity,
+artifact-delivery, authentication, configuration, and deployment decisions
+remain applicable.
 
 ## Decision
 

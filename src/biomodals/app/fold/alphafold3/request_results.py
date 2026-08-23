@@ -1258,6 +1258,12 @@ def create_request_archive(
             run_command(
                 [
                     "tar",
+                    "--sort=name",
+                    "--mtime=@0",
+                    "--owner=0",
+                    "--group=0",
+                    "--numeric-owner",
+                    "--format=gnu",
                     "-I",
                     "zstd -T0",
                     "-cf",

@@ -15,6 +15,11 @@ All three examples:
   name, exact App deployment version, and admission limits remain editable in
   the Admin interface, together with per-Tool Job-log visibility.
 
+The service host or container also needs GNU `tar` and `zstd` to rebuild
+AlphaFold3 Result archives from the remote output Volume. The included
+`Containerfile` installs both; native systemd deployments must install them
+through the host package manager.
+
 Replace every Modal token placeholder before starting a service. The backend
 refuses to start when either credential is missing.
 

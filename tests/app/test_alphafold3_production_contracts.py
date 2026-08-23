@@ -3208,6 +3208,14 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         "7,0,1.0",
     ]
 
+    rebuilt = create_request_archive(
+        FakeVolumeReader({volume_path: input_bytes}),
+        manifest,
+        output_dir=tmp_path / "rebuilt",
+        display_name="Readable Name",
+    )
+    assert rebuilt.read_bytes() == archive.read_bytes()
+
     assert (
         create_request_archive(
             FakeVolumeReader({}),

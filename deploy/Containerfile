@@ -5,6 +5,9 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends tar zstd \
+    && rm -rf /var/lib/apt/lists/*
 RUN uv sync --locked --no-dev --extra api --no-install-project
 
 COPY src ./src

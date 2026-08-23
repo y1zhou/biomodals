@@ -250,41 +250,37 @@ track it safely. This is distinct from `blocked`: a blocked Job has known
 scientific output and retries only recoverable finalization, while a
 state-unknown Job may still be consuming paid remote compute.
 
-A Job enters `state_unknown` when any of these kernel-owned provider
-uncertainties occurs:
+A Service Job enters `state_unknown` when remote ownership cannot be projected
+safely, including:
 
-- a direct Modal `.spawn()` may have been accepted but its Function Call ID
-  could not be durably recorded; or
-- an attached call's state or terminal result cannot be established; or
-- Cancellation cannot be confirmed for an attached call, and
-  a verified final Result cannot be recovered.
+- the durable pre-spawn fence remains after the API process is interrupted;
+- Modal may have accepted `.spawn()` without returning a Function Call ID;
+- the exact pinned deployment cannot be resolved;
+- a returned overview has another Run ID or Deployment Identity; or
+- Cancellation cannot be reconciled conclusively.
 
-An ambiguous submission outcome enters the state immediately. If the API
-process stops after durably creating a `submitting` Provider Call but before
-attaching its Function Call ID, the restarted coordinator marks that call
-`outcome_unknown` without a timeout or lease-stealing interval. No uncertainty
-automatically authorizes another Function. The Job is excluded from automatic
-service reconciliation but continues consuming User, Tool, and Global Active
-Job Limits until it is resolved.
+The service durably enters the state before calling Modal and records a root
+Function Call ID only after launch confirmation. No uncertainty automatically
+authorizes another Function. The Job is excluded from automatic service
+reconciliation but continues consuming User, Tool, and Global Active Job Limits
+until an Administrator resolves it.
 
 Owner-visible Job detail labels the state `Status unknown`, explains that an
-Administrator must review Modal, exposes `state_unknown_at`, and provides no
-Cancel, Download, or Start Again action. It does not automatically poll because
-only an Administrator mutation can resolve the state; focus, page reload, and
-manual Refresh still load the current record. The latest recorded Stage remains
-visible without a spinner or invented outcome.
+Administrator must review Modal, and provides no Cancel, Download, or Start
+Again action. It does not automatically poll because only an Administrator
+mutation can resolve the state; focus, page reload, and manual Refresh still
+load the current local record. The latest recorded Stage remains visible
+without a spinner or invented outcome.
 
-The Admin Modal page exposes a dedicated list containing only Job ID, workload,
-display name, safe run name, `state_unknown_at`, and one of the fixed reasons
-`submission_outcome_unknown`, `provider_outcome_unknown`, or
-`cancellation_outcome_unknown`. It does not expose owner identity, Input,
-Result, Function Call ID, raw provider exception, or storage path. The
-Administrator must inspect Modal and stop remote work there first when
-necessary. The only MVP resolution is a confirmed destructive `Mark failed`
-action. It records terminal `failed/compute_failed`, closes any still-open
-Stage as failed, preserves the unknown-state timestamp and reason for audit,
-and releases admission capacity. The action does not contact Modal and cannot
-be undone in the Admin panel.
+The Admin Modal page exposes a dedicated list containing Job ID, Tool, display
+name, `state_unknown_at`, reason, exact pinned Modal Environment/App/version,
+the recorded root Function Call ID, and the Administrator-only diagnostic
+message. It does not expose owner identity, Input, Result, or storage paths.
+The resolution dialog pre-fills a recorded Function Call ID. After inspecting
+the exact deployment in Modal, the Administrator explicitly chooses one safe
+outcome: resume reconciliation of an existing launch, requeue only after
+confirming no launch occurred, or request Cancellation. The service never
+automatically retries an ambiguous spawn.
 
 ### Modal configuration preflight
 

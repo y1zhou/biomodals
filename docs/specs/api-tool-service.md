@@ -1,12 +1,11 @@
 # API Tool service specification
 
-Status: in design
+Status: accepted and implemented
 
 Last updated: 2026-08-24
 
-This specification applies ADR 0007 to the FastAPI service and its frontend.
-It records accepted implementation behavior while the remaining AlphaFold3,
-logging, and billing details are being designed.
+This specification applies ADR 0007 to the implemented FastAPI service and its
+frontend.
 
 ## Responsibilities
 
@@ -63,9 +62,11 @@ Each registered Tool contributes:
 
 The shared `RemoteExecutionClient` performs exact-version coordinator
 preflight and resolution, launches Runs, polls root Function Calls, refreshes
-bounded execution status, requests cancellation, pages Provider Calls, and
-accesses their logs. Tool registrations do not contribute lifecycle callback
-bags or background reconcilers.
+bounded execution status, requests cancellation, pages Provider Calls, reads
+one selected Provider Call directly by internal ID, and accesses its logs. It
+rejects any returned overview whose Run ID or Deployment Identity differs from
+the pinned Service Job locator. Tool registrations do not contribute lifecycle
+callback bags or background reconcilers.
 
 Tool discovery remains explicit at application assembly time. There is no
 import-time plugin scan.
@@ -104,6 +105,10 @@ Function Call is active it uses the SDK's nonblocking root-call status only;
 it reads the detailed coordinator ledger after terminal root completion or an
 interactive detail/refresh request. Root-call failure is terminal rather than
 indistinguishable from an active timeout.
+An active timeout touches only `jobs.updated_at`, moving that Job behind older
+reconciliation candidates without pretending that its detailed projection was
+refreshed. This lets a bounded 100-Job pass rotate fairly without another
+scheduler cursor.
 
 The public Job states remain `queued`, `running`, `finalizing`,
 `cancel_requested`, `state_unknown`, `blocked`, `succeeded`, `partial`,
@@ -248,7 +253,10 @@ Job names are limited to 120 characters. Pairformer recycles may be zero.
 Cleanup, deletion, and the final validation claim share one short process-local
 critical section so an admitted resource cannot be removed between reload and
 claim. Reusing an idempotency key with a different validated request is a
-conflict.
+conflict while that validation remains available. After successful staging
+consumes the validation, the owner-scoped idempotency key is authoritative and
+a lost-response retry returns the existing Job without validation lookup or
+deployment preflight.
 
 Both modes create the validation resource before proceeding to the same
 confirmation page. This performs `AF3Config` parsing and the existing
@@ -443,6 +451,22 @@ deployment preflight failure before admission rejects the request without
 creating a Job. A queued Job cancelled before spawn becomes locally cancelled
 and never creates a remote Execution Run. Cancellation racing an ambiguous
 spawn retains cancellation intent and requires remote-state resolution.
+
+Owner-visible projections never copy remote status messages, Node errors,
+Modal exceptions, or storage paths. Failed Jobs use fixed service-defined
+error copy; partial Runs use one generic incomplete-results warning. Raw remote
+diagnostics remain available only through Administrator-authorized logs and
+Provider Call inspection.
+
+Live logs use one unbounded Modal SDK stream. The SDK preserves its log cursor
+while reconnecting internal RPCs and ends the stream when the Function Call
+completes. Selecting a log target performs one direct bounded coordinator read
+rather than scanning Provider Call pages.
+
+A result-preparation-blocked Job is served from its local projection. Owner
+detail and manual refresh do not wake the remote coordinator or toggle it back
+to `finalizing`; the background reconciler alone retries finalization when its
+recorded retry time is due.
 
 Large pending inputs are staged atomically outside SQLite. GROMACS uses
 `<state-dir>/pending-inputs/<job-id>/`; AlphaFold3 validations use

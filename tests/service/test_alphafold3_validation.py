@@ -59,6 +59,26 @@ def test_validation_retains_native_document_and_bounded_preview(tmp_path: Path) 
     assert store.get(validated.validation_id, owner_user_id=OWNER, now=11) is not None
 
 
+def test_validation_preview_counts_custom_inputs(tmp_path: Path) -> None:
+    store = ValidatedInputStore(tmp_path)
+    store.initialize()
+    source = tmp_path / "input.json"
+    document = orjson.loads(_document())
+    document["sequences"][0]["protein"]["unpairedMsa"] = ">query\nACDE\n"
+    document["userCCD"] = "data_custom"
+    content = orjson.dumps(document)
+    source.write_bytes(content)
+
+    validated = store.validate_and_publish(
+        source,
+        owner_user_id=OWNER,
+        digest=hashlib.sha256(content).hexdigest(),
+        settings=ValidationSettings(sample=5),
+    )
+
+    assert validated.preview["advanced_counts"]["custom_inputs"] == 2
+
+
 def test_expert_documents_reject_browser_local_paths(tmp_path: Path) -> None:
     store = ValidatedInputStore(tmp_path)
     store.initialize()

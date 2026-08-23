@@ -1,98 +1,43 @@
-"""Workload-specific HTTP submission for GROMACS jobs."""
+"""Typed GROMACS service submission."""
 
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 import time
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID, uuid4
 
 import orjson
-from fastapi import (
-    APIRouter,
-    Depends,
-    File,
-    Form,
-    Header,
-    Request,
-    UploadFile,
-)
+from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile
 
-from biomodals.app.bioinfo.gromacs_execution import (
-    concrete_gromacs_seed,
-    execution_plan,
-)
-from biomodals.execution.modal import ProviderSubmissionOutcomeUnknownError
+from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
+from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
+from biomodals.execution import DeploymentIdentity
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.gromacs.contracts import (
     MAX_SIMULATION_TIME_NS,
     GromacsJobOptions,
-    artifact_request_sha256,
     gromacs_run_name,
 )
-from biomodals.service.gromacs.execution import (
-    GromacsExecutionAdapter,
-    GromacsExecutionCoordinator,
-)
-from biomodals.service.http_contract import (
-    CodedAPIError,
-    CodedErrorResponse,
-    ErrorResponse,
-    request_id_from,
-    require_unsafe_session,
-)
-from biomodals.service.jobs import (
-    JobLifecycleLocks,
-    JobView,
-    OpenOperationLogs,
-    PreflightWorkload,
-    ReadArtifact,
-    Reconciler,
-    WorkloadRegistration,
-    can_view_job_logs,
-)
+from biomodals.service.http_contract import CodedAPIError, require_unsafe_session
+from biomodals.service.jobs import JobView
+from biomodals.service.pending import PendingRequestStore
+from biomodals.service.remote_execution import RemoteExecutionClient
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
-    JobRecord,
     ServiceStore,
     UserNotFoundError,
 )
-from biomodals.service.workloads import GROMACS_WORKLOAD
+from biomodals.service.tool_runtime import JobLifecycle
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
-LOGGER = logging.getLogger(__name__)
-
-
-class PdbInvalidResponse(CodedErrorResponse):
-    """Semantic PDB validation failure."""
-
-    code: Literal["pdb_invalid"]
-
-
-class SubmissionConflictResponse(CodedErrorResponse):
-    """Submission conflicts with idempotency or active-job state."""
-
-    code: Literal["idempotency_conflict", "active_job_limit_reached"]
-
-
-class ComputeUnavailableResponse(CodedErrorResponse):
-    """Remote compute could not accept the durable Job."""
-
-    code: Literal["compute_unavailable"]
-
-
-class SubmissionForbiddenResponse(CodedErrorResponse):
-    """Account state changed after browser Session authentication."""
-
-    code: Literal["account_disabled", "csrf_invalid", "origin_not_allowed"]
 
 
 async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
@@ -110,66 +55,24 @@ async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
         await upload.close()
     try:
         validate_pdb_content(bytes(content), max_bytes=max_bytes)
-    except ValueError as exc:
-        raise CodedAPIError(400, "pdb_invalid", str(exc)) from exc
+    except ValueError as error:
+        raise CodedAPIError(400, "pdb_invalid", str(error)) from error
     return bytes(content)
 
 
-def _filename_display_identity(filename: str | None) -> str:
-    """Return the stable filename-derived portion of a generated display name."""
-    safe_filename = (filename or "gromacs").replace("\\", "/")
-    stem = PurePosixPath(safe_filename).stem.strip() or "gromacs"
-    return re.sub(r"\s+", " ", stem)[:100]
-
-
-def _display_name(filename: str | None, supplied: str | None) -> str:
-    if supplied is not None:
-        return supplied
-    return f"{_filename_display_identity(filename)} · {datetime.now(UTC):%Y-%m-%d}"
-
-
-def _request_identity(
-    pdb_content: bytes,
-    *,
-    display_identity: str,
-    options: GromacsJobOptions,
-) -> tuple[str, str, str]:
-    parameters_json = options.model_dump_json()
-    artifact_digest = artifact_request_sha256(pdb_content, parameters_json)
-    encoded_display_identity = orjson.dumps({"display_name": display_identity})
-    digest = hashlib.sha256()
-    digest.update(bytes.fromhex(artifact_digest))
-    digest.update(encoded_display_identity)
-    return (
-        digest.hexdigest(),
-        parameters_json,
-        artifact_digest,
-    )
-
-
 def create_router(
-    adapter: GromacsExecutionAdapter,
     *,
-    lifecycle_locks: JobLifecycleLocks,
-    job_logs_supported: bool,
+    store: ServiceStore,
+    configuration: RuntimeConfiguration,
+    pending: PendingRequestStore,
+    remote: RemoteExecutionClient,
+    lifecycle: JobLifecycle,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
-    """Create the GROMACS router around an injectable compute adapter."""
+    """Create the GROMACS endpoint around shared admission and lifecycle."""
     router = APIRouter(prefix="/api/v1/gromacs", tags=["gromacs"])
 
-    @router.post(
-        "/jobs",
-        response_model=JobView,
-        response_model_exclude_none=True,
-        status_code=202,
-        responses={
-            400: {"model": PdbInvalidResponse},
-            401: {"model": ErrorResponse},
-            403: {"model": SubmissionForbiddenResponse},
-            409: {"model": SubmissionConflictResponse},
-            503: {"model": ComputeUnavailableResponse},
-        },
-    )
+    @router.post("/jobs", response_model=JobView, status_code=202)
     async def submit_job(
         request: Request,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
@@ -186,171 +89,121 @@ def create_router(
             run_pdbfixer=run_pdbfixer,
             cpu_only=cpu_only,
         )
-        normalized_supplied_name = (
-            re.sub(r"\s+", " ", display_name).strip()
-            if display_name is not None and display_name.strip()
-            else None
+        normalized_name = _display_name(pdb.filename, display_name)
+        digest = _submission_digest(pdb_content, normalized_name, options)
+        replay = store.find_idempotent_job(
+            session.principal.user_id,
+            tool="gromacs",
+            idempotency_key=str(idempotency_key),
         )
-        normalized_name = _display_name(pdb.filename, normalized_supplied_name)
-        request_hash, parameters_json, artifact_digest = _request_identity(
-            pdb_content,
-            display_identity=(
-                normalized_supplied_name or _filename_display_identity(pdb.filename)
-            ),
-            options=options,
+        if replay is not None:
+            if replay.request_digest != digest:
+                raise CodedAPIError(
+                    409,
+                    "idempotency_conflict",
+                    "Idempotency key was already used for another request",
+                )
+            return _view(replay, session, configuration)
+
+        effective = configuration.tool("gromacs")
+        deployment = DeploymentIdentity(
+            configuration.modal_environment().value,
+            effective.modal_app_name.value,
+            effective.modal_app_version.value,
         )
-        store: ServiceStore = request.app.state.store
-        configuration: RuntimeConfiguration = request.app.state.configuration
-        admission_configuration = configuration.admission_configuration("gromacs")
-        now = int(time.time())
-        new_job_id = uuid4()
-        execution_run_id = uuid4()
-        run_name = gromacs_run_name(normalized_name, new_job_id)
-        seed_run_id = str(execution_run_id)
-        plan = execution_plan(
-            cpu_only=options.cpu_only,
-            workload_run_key=run_name,
-            pdb_sha256=hashlib.sha256(pdb_content).hexdigest(),
+        await remote.preflight(deployment)
+        job_id = uuid4()
+        run_name = gromacs_run_name(normalized_name, job_id)
+        execution_request = GromacsExecutionRequest(
+            run_name=run_name,
+            pdb_content=pdb_content,
             simulation_time_ns=options.simulation_time_ns,
             run_pdbfixer=options.run_pdbfixer,
+            cpu_only=options.cpu_only,
+            num_threads=16,
+            use_openmp_threads=False,
             ld_seed=concrete_gromacs_seed(
                 -1,
-                run_identity=seed_run_id,
+                run_identity=str(job_id),
                 purpose="ld-seed",
             ),
             gen_seed=concrete_gromacs_seed(
                 -1,
-                run_identity=seed_run_id,
+                run_identity=str(job_id),
                 purpose="gen-seed",
             ),
             genion_seed=concrete_gromacs_seed(
                 0,
-                run_identity=seed_run_id,
+                run_identity=str(job_id),
                 purpose="genion-seed",
                 random_sentinel=0,
             ),
+            max_active_provider_calls=effective.max_active_provider_calls.value,
+            max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls.value,
         )
+        pending.put(job_id, execution_request.to_bytes())
         try:
             admission = store.admit_job(
                 owner_user_id=session.principal.user_id,
+                tool="gromacs",
                 display_name=normalized_name,
                 idempotency_key=str(idempotency_key),
-                request_hash=request_hash,
-                parameters_json=parameters_json,
-                artifact_request_sha256=artifact_digest,
-                configuration=admission_configuration,
-                now=now,
-                new_job_id=new_job_id,
-                execution_plan=plan,
-                execution_run_id=execution_run_id,
-                max_active_provider_calls=3,
-                max_active_gpu_provider_calls=1,
-                input_content=pdb_content,
+                request_digest=digest,
+                modal_environment=deployment.environment,
+                modal_app_name=deployment.deployment_name,
+                modal_app_version=deployment.deployment_version,
+                tool_active_job_limit=effective.active_job_limit.value,
+                global_active_job_limit=configuration.global_active_job_limit().value,
+                max_active_provider_calls=execution_request.max_active_provider_calls,
+                max_active_gpu_provider_calls=(
+                    execution_request.max_active_gpu_provider_calls
+                ),
+                now=int(time.time()),
+                new_job_id=job_id,
             )
-        except IdempotencyConflictError as exc:
-            raise CodedAPIError(409, "idempotency_conflict", str(exc)) from exc
-        except JobLimitExceededError as exc:
-            raise CodedAPIError(
-                409,
-                "active_job_limit_reached",
-                str(exc),
-            ) from exc
-        except UserNotFoundError as exc:
-            raise CodedAPIError(
-                403,
-                "account_disabled",
-                "This account cannot submit new jobs",
-            ) from exc
-
-        LOGGER.info(
-            "event=job_admission job_id=%s workload=gromacs replay=%s "
-            "stage=prepare_simulation request_id=%s",
-            admission.job.job_id,
-            not admission.created,
-            request_id_from(request),
-        )
-
+        except (IdempotencyConflictError, JobLimitExceededError) as error:
+            pending.delete(job_id)
+            raise CodedAPIError(409, "job_conflict", str(error)) from error
+        except UserNotFoundError as error:
+            pending.delete(job_id)
+            raise CodedAPIError(403, "account_disabled", str(error)) from error
         try:
-            coordinator = GromacsExecutionCoordinator(
-                store,
-                adapter,
-                lifecycle_locks=lifecycle_locks,
-            )
-            await coordinator.advance(admission.job.job_id)
-        except ProviderSubmissionOutcomeUnknownError:
-            LOGGER.warning(
-                "event=submission_outcome_unknown job_id=%s workload=gromacs "
-                "request_id=%s",
-                admission.job.job_id,
-                request_id_from(request),
-            )
-        except Exception as exc:
-            LOGGER.exception(
-                "Could not submit GROMACS job %s request_id=%s",
-                admission.job.job_id,
-                request_id_from(request),
-            )
-            raise CodedAPIError(
-                503,
-                "compute_unavailable",
-                "GROMACS compute is temporarily unavailable",
-            ) from exc
-
-        job = store.get_job_by_id(admission.job.job_id)
-        if job is None:  # pragma: no cover - admission owns the row
-            raise RuntimeError("Admitted GROMACS Job disappeared")
-        return JobView.from_record(
-            job,
-            definition=GROMACS_WORKLOAD,
-            can_view_logs=can_view_job_logs(
-                is_admin=session.principal.is_admin,
-                owner_visibility_enabled=configuration.workload(
-                    "gromacs"
-                ).job_logs_visible_to_owner.value,
-                logs_supported=job_logs_supported,
-            ),
-        )
+            job = await lifecycle.advance(admission.job.job_id)
+        except Exception:
+            job = admission.job
+        return _view(job, session, configuration)
 
     return router
 
 
-def create_registration(
-    adapter: GromacsExecutionAdapter,
-    *,
-    reconciler: Reconciler | None = None,
-    lifecycle_locks: JobLifecycleLocks | None = None,
-    read_artifact: ReadArtifact | None = None,
-    rebuild_artifact: ReadArtifact | None = None,
-    open_operation_logs: OpenOperationLogs | None = None,
-    preflight: PreflightWorkload | None = None,
-    max_pdb_bytes: int = MAX_PDB_BYTES,
-) -> WorkloadRegistration:
-    """Explicitly register GROMACS routes and lifecycle hooks."""
+def _submission_digest(
+    content: bytes,
+    display_name: str,
+    options: GromacsJobOptions,
+) -> str:
+    digest = hashlib.sha256(content)
+    digest.update(options.model_dump_json().encode())
+    digest.update(orjson.dumps({"display_name": display_name}))
+    return digest.hexdigest()
 
-    async def cancel(store: ServiceStore, job: JobRecord) -> None:
-        await GromacsExecutionCoordinator(
-            store,
-            adapter,
-            lifecycle_locks=lifecycle_locks,
-        ).cancel_job(job.job_id)
 
-    if reconciler is not None and lifecycle_locks is None:
-        raise ValueError("A reconciler must share the route lifecycle locks")
-    lifecycle_locks = lifecycle_locks or JobLifecycleLocks()
-    return WorkloadRegistration(
-        definition=GROMACS_WORKLOAD,
-        router=create_router(
-            adapter,
-            lifecycle_locks=lifecycle_locks,
-            job_logs_supported=open_operation_logs is not None,
-            max_pdb_bytes=max_pdb_bytes,
+def _display_name(filename: str | None, supplied: str | None) -> str:
+    if supplied is not None and supplied.strip():
+        return re.sub(r"\s+", " ", supplied).strip()
+    safe_filename = (filename or "gromacs").replace("\\", "/")
+    stem = PurePosixPath(safe_filename).stem.strip() or "gromacs"
+    return f"{re.sub(r'\s+', ' ', stem)[:100]} · {datetime.now(UTC):%Y-%m-%d}"
+
+
+def _view(
+    job,
+    session: AuthenticatedSession,
+    configuration: RuntimeConfiguration,
+) -> JobView:
+    return JobView.from_record(
+        job,
+        can_view_logs=(
+            session.principal.is_admin
+            or configuration.tool("gromacs").job_logs_visible_to_owner.value
         ),
-        lifecycle_locks=lifecycle_locks,
-        reconciler=reconciler,
-        cancel=cancel,
-        read_artifact=read_artifact,
-        rebuild_artifact=rebuild_artifact,
-        open_operation_logs=open_operation_logs,
-        preflight=preflight,
-        max_body_bytes=max_pdb_bytes + MAX_MULTIPART_OVERHEAD_BYTES,
     )

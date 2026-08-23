@@ -1,166 +1,138 @@
-"""Stable GROMACS service facade composed from focused boundaries."""
+"""GROMACS request staging and Result presentation for the API service."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, AsyncIterator, Callable, Mapping
-from datetime import UTC, datetime, timedelta
+import asyncio
+import hashlib
+from pathlib import PurePosixPath
+from typing import BinaryIO, cast
 
 import modal
+import orjson
 
-from biomodals.app.bioinfo.gromacs_execution import REQUIRED_FUNCTIONS
-from biomodals.execution import ProviderBinding
-from biomodals.execution.modal import AsyncModalCallDriver, ProviderCallObservation
-from biomodals.service.artifacts import ArtifactCache
-from biomodals.service.gromacs.results import (
-    ArchiveNotReadyError,
-    FinalArchive,
-    GromacsResultInvalidError,
-    ModalGromacsResults,
-    ResultIdentityMismatchError,
+from biomodals.app.bioinfo.gromacs_execution_runtime import (
+    GromacsExecutionRequest,
+    load_execution_request_from_volume,
+    stage_execution_request,
 )
-from biomodals.service.jobs import OperationLogRequest, operation_log_mode
-from biomodals.service.modal_logs import ModalCLILogSource
-from biomodals.service.store import JobOperationRecord, JobRecord
+from biomodals.execution.modal import stage_execution_launch
+from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.gromacs.archive import (
+    GROMACS_ARCHIVE_SCHEMA_VERSION,
+    write_gromacs_archive,
+)
+from biomodals.service.gromacs.contracts import GromacsJobOptions
+from biomodals.service.pending import PendingRequestStore
+from biomodals.service.store import JobRecord
+from biomodals.service.tool_runtime import PreparedResult
 
 
-class ModalGromacsAdapter:
-    """Expose compute and Result capabilities through one wiring facade."""
+class GromacsToolAdapter:
+    """Keep GROMACS request and ZIP behavior outside shared lifecycle."""
 
     def __init__(
         self,
+        pending: PendingRequestStore,
         *,
         output_volume_name: str = "Gromacs-outputs",
-        artifact_cache: ArtifactCache | None = None,
-        call_resolver: Callable[[str], modal.FunctionCall] = modal.FunctionCall.from_id,
-        function_resolver: Callable[..., modal.Function] | None = None,
-        log_source: ModalCLILogSource | None = None,
     ) -> None:
-        """Compose focused Modal compute and Result boundaries."""
-        resolved_function_resolver = function_resolver or modal.Function.from_name
+        """Bind local staging to the established GROMACS output Volume."""
+        self.pending = pending
         self.output_volume_name = output_volume_name
-        self.execution = AsyncModalCallDriver(
-            call_resolver=call_resolver,
-            function_resolver=resolved_function_resolver,
-        )
-        self.results = ModalGromacsResults(
-            output_volume_name=output_volume_name,
-            artifact_cache=artifact_cache,
-        )
-        self.logs = log_source or ModalCLILogSource()
 
-    async def resolve(self, binding: ProviderBinding) -> modal.Function:
-        """Resolve one exact deployed function for kernel dispatch."""
-        return await self.execution.resolve(binding)
-
-    async def spawn(
-        self,
-        function: modal.Function,
-        *,
-        args: tuple[object, ...],
-        kwargs: Mapping[str, object],
-    ) -> str:
-        """Spawn one kernel-preclaimed deployed function."""
-        return await self.execution.spawn(function, args=args, kwargs=kwargs)
-
-    async def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
-        """Observe one kernel-attached deployed function call."""
-        return await self.execution.observe(provider_call_handle_id)
-
-    async def preflight(
-        self,
-        app_name: str,
-        environment_name: str,
-        app_version: int,
-    ) -> None:
-        """Validate every required deployed Modal resource."""
-        volume = modal.Volume.from_name(
-            self.output_volume_name,
-            environment_name=environment_name,
-        )
+    async def stage(self, job: JobRecord) -> None:
+        """Stage one immutable request and root launch identity."""
+        content = self.pending.get(job.job_id)
+        if content is None:
+            raise FileNotFoundError("Pending GROMACS request is unavailable")
+        request = GromacsExecutionRequest.from_bytes(content)
+        volume = self._volume(job)
         await volume.hydrate.aio()
-        for function_name in REQUIRED_FUNCTIONS:
-            await self.execution.resolve(
-                ProviderBinding(
-                    environment=environment_name,
-                    app_name=app_name,
-                    app_version=app_version,
-                    function_name=function_name,
-                    uses_gpu=function_name.endswith("_gpu"),
-                )
-            )
+        await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
+        await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
 
-    async def cancel(self, provider_call_handle_id: str) -> None:
-        """Cancel one kernel-owned Modal call."""
-        await self.execution.cancel(provider_call_handle_id)
+    async def discard_pending(self, job: JobRecord) -> None:
+        """Remove the local request after both remote files were verified."""
+        self.pending.delete(job.job_id)
 
-    async def open_operation_logs(
+    async def prepare_result(
         self,
         job: JobRecord,
-        operation: JobOperationRecord,
-        selection: OperationLogRequest,
-    ) -> AsyncIterable[bytes]:
-        """Open live or historical logs for one attached Modal operation."""
-        if operation.modal_call_id is None or operation.started_at is None:
-            raise ValueError("GROMACS operation has no attached Modal call")
-        mode = operation_log_mode(operation.state)
-        if mode is None:
-            raise ValueError("GROMACS operation does not retain inspectable logs")
-        if selection.mode == "live" and mode != "live":
-            raise ValueError("A terminal GROMACS operation cannot open live logs")
-        live = selection.mode == "live"
-        started_at = datetime.fromtimestamp(operation.started_at, UTC)
-        ended_at = (
-            datetime.fromtimestamp(operation.completed_at, UTC)
-            if operation.completed_at is not None
-            else None
-        )
-        return await self.logs.open(
-            app_name=job.modal_app_name,
-            environment_name=job.modal_environment,
-            function_call_id=operation.modal_call_id,
-            follow=live,
-            since=(
-                selection.since
-                or (started_at - timedelta(seconds=1) if not live else None)
-            ),
-            until=(
-                selection.until
-                or (ended_at + timedelta(seconds=1) if ended_at is not None else None)
-            ),
-        )
-
-    async def read_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
-        """Read the authoritative published Result."""
-        async for chunk in self.results.read_artifact(job):
-            yield chunk
-
-    async def cleanup_intermediates(self, job: JobRecord) -> None:
-        """Remove rebuildable remote intermediate files."""
-        await self.results.cleanup_intermediates(job)
-
-    async def publish_archive(
-        self,
-        job: JobRecord,
+        cache: ArtifactCache,
         *,
         completed_at: int,
-    ) -> FinalArchive:
-        """Build and publish one immutable Result archive."""
-        return await self.results.publish_archive(job, completed_at=completed_at)
+    ) -> PreparedResult:
+        """Build the established deterministic end-user ZIP in local cache."""
+        volume = self._volume(job)
+        request = await asyncio.to_thread(
+            load_execution_request_from_volume,
+            volume,
+            job.job_id,
+        )
+        path = cache.staging_path(str(job.job_id))
+        try:
+            with path.open("w+b") as raw:
+                handle = cast("BinaryIO", raw)
 
-    async def rebuild_artifact(self, job: JobRecord) -> AsyncIterator[bytes]:
-        """Rebuild a published Result from authoritative remote files."""
-        async for chunk in self.results.rebuild_artifact(job):
-            yield chunk
+                async def read_file(remote_path: str):
+                    async for chunk in volume.read_file.aio(remote_path):
+                        yield chunk
 
-    async def recover_archive(self, job: JobRecord) -> FinalArchive:
-        """Recover a previously published immutable Result."""
-        return await self.results.recover_archive(job)
+                remote_mtimes: dict[str, int] = {}
+                for entry in await volume.listdir.aio(request.run_name):
+                    remote_path = PurePosixPath(entry.path).as_posix().lstrip("/")
+                    if type(entry.mtime) is not int:
+                        raise ValueError("GROMACS output metadata is invalid")
+                    remote_mtimes[remote_path] = entry.mtime
+                options = GromacsJobOptions(
+                    simulation_time_ns=request.simulation_time_ns,
+                    run_pdbfixer=request.run_pdbfixer,
+                    cpu_only=request.cpu_only,
+                )
+                built = await write_gromacs_archive(
+                    handle,
+                    run_name=request.run_name,
+                    parameters_json=options.model_dump_json(),
+                    modal_app_name=job.modal_app_name,
+                    modal_app_version=job.modal_app_version,
+                    job_id=str(job.job_id),
+                    stages_json=orjson.dumps(
+                        job.projection.get("stages", []),
+                        option=orjson.OPT_SORT_KEYS,
+                    ).decode(),
+                    started_at=job.created_at,
+                    completed_at=completed_at,
+                    read_file=read_file,
+                    remote_mtimes=remote_mtimes,
+                    run_bounded=cache.run_bounded,
+                )
+            lease = await cache.publish_staged(
+                str(job.job_id),
+                path,
+                size_bytes=built.size_bytes,
+                sha256=built.sha256,
+            )
+            lease.close()
+        finally:
+            path.unlink(missing_ok=True)
+        return PreparedResult(
+            filename=f"{request.run_name}.zip",
+            media_type="application/zip",
+            size_bytes=built.size_bytes,
+            sha256=built.sha256,
+            archive_schema=f"gromacs/{GROMACS_ARCHIVE_SCHEMA_VERSION}",
+        )
+
+    def _volume(self, job: JobRecord) -> modal.Volume:
+        return modal.Volume.from_name(
+            self.output_volume_name,
+            environment_name=job.modal_environment,
+            version=2,
+        )
 
 
-__all__ = [
-    "ArchiveNotReadyError",
-    "FinalArchive",
-    "GromacsResultInvalidError",
-    "ModalGromacsAdapter",
-    "ResultIdentityMismatchError",
-]
+def request_digest(request: GromacsExecutionRequest, display_name: str) -> str:
+    """Bind an idempotency key to immutable scientific input and UI identity."""
+    digest = hashlib.sha256(request.to_bytes())
+    digest.update(orjson.dumps({"display_name": display_name}))
+    return digest.hexdigest()

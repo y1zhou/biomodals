@@ -28,7 +28,7 @@ from biomodals.execution.modal import ExecutionRequestFile
 
 EXECUTION_REQUEST_SCHEMA_VERSION = 4
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"
-MAX_EXECUTION_REQUEST_BYTES = 64 * 1024 * 1024
+MAX_EXECUTION_REQUEST_BYTES = 256 * 1024 * 1024
 _REQUEST_FILE = ExecutionRequestFile(
     EXECUTION_REQUEST_FILENAME,
     MAX_EXECUTION_REQUEST_BYTES,
@@ -203,6 +203,16 @@ def load_execution_request(
     """Load and revalidate one request from a coordinator's mounted Volume."""
     content = _REQUEST_FILE.load(volume_root, execution_run_id)
     return AlphaFold3ExecutionRequest.from_bytes(content)
+
+
+def load_execution_request_from_volume(
+    output_volume: Any,
+    execution_run_id: UUID,
+) -> AlphaFold3ExecutionRequest:
+    """Load a staged request through the client-side Volume API."""
+    return AlphaFold3ExecutionRequest.from_bytes(
+        _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
+    )
 
 
 def persist_execution_request(

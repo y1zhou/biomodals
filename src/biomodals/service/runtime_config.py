@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from biomodals.service.config import ServiceSettings
-from biomodals.service.workloads import WorkloadDefinition
+from biomodals.service.tools import ToolDefinition
 
 if TYPE_CHECKING:
     from biomodals.service.store import ServiceStore
@@ -41,47 +41,25 @@ class EffectiveSetting[Value: (str, int, bool)]:
 
 
 @dataclass(frozen=True, slots=True)
-class WorkloadRuntimeConfiguration:
-    """Effective mutable settings for one fixed API workload."""
+class ToolRuntimeConfiguration:
+    """Effective mutable settings for one fixed API Tool."""
 
-    workload: str
+    tool: str
     modal_app_name: EffectiveSetting[str]
     modal_app_version: EffectiveSetting[int]
     active_job_limit: EffectiveSetting[int]
+    max_active_provider_calls: EffectiveSetting[int]
+    max_active_gpu_provider_calls: EffectiveSetting[int]
     job_logs_visible_to_owner: EffectiveSetting[bool]
 
 
 @dataclass(frozen=True, slots=True)
-class DatabaseOverridableSetting[Value: (str, int)]:
-    """A static fallback that a same-transaction database read may replace."""
-
-    value: Value
-    database_override_allowed: bool
-
-    def resolve(self, database_value: Value | None) -> Value:
-        """Apply a database value unless an explicit process value wins."""
-        if self.database_override_allowed and database_value is not None:
-            return database_value
-        return self.value
-
-
-@dataclass(frozen=True, slots=True)
-class JobAdmissionConfiguration:
-    """Static configuration inputs resolved with SQLite during admission."""
-
-    workload: str
-    modal_environment: DatabaseOverridableSetting[str]
-    modal_app_name: DatabaseOverridableSetting[str]
-    modal_app_version: DatabaseOverridableSetting[int]
-    workload_active_job_limit: DatabaseOverridableSetting[int]
-    global_active_job_limit: DatabaseOverridableSetting[int]
-
-
-@dataclass(frozen=True, slots=True)
-class _WorkloadDefaults:
+class _ToolDefaults:
     modal_app_name: str
     modal_app_version: int
     active_job_limit: int
+    max_active_provider_calls: int
+    max_active_gpu_provider_calls: int
 
 
 class RuntimeConfiguration:
@@ -95,19 +73,19 @@ class RuntimeConfiguration:
         store: ServiceStore,
         settings: ServiceSettings,
         *,
-        workload_definitions: Sequence[WorkloadDefinition],
+        tool_definitions: Sequence[ToolDefinition],
     ) -> None:
         """Bind live database overrides to immutable startup sources."""
         self.store = store
         self.settings = settings
-        self._workload_definitions = {
-            definition.name: definition for definition in workload_definitions
+        self._tool_definitions = {
+            definition.key: definition for definition in tool_definitions
         }
-        if len(self._workload_definitions) != len(workload_definitions):
-            raise ValueError("Workload definition names must be unique")
+        if len(self._tool_definitions) != len(tool_definitions):
+            raise ValueError("Tool definition keys must be unique")
         sources = settings.sources
-        self._workload_defaults = {
-            definition.name: _WorkloadDefaults(
+        self._tool_defaults = {
+            definition.key: _ToolDefaults(
                 modal_app_name=_nonempty(
                     sources.value(
                         definition.modal_app_name_environment,
@@ -129,32 +107,36 @@ class RuntimeConfiguration:
                     ),
                     definition.active_job_limit_environment,
                 ),
+                max_active_provider_calls=definition.default_max_active_provider_calls,
+                max_active_gpu_provider_calls=(
+                    definition.default_max_active_gpu_provider_calls
+                ),
             )
-            for definition in workload_definitions
+            for definition in tool_definitions
         }
 
-    def workload_definition(self, workload: str) -> WorkloadDefinition:
-        """Return the static descriptor for one registered workload."""
+    def tool_definition(self, tool: str) -> ToolDefinition:
+        """Return the static descriptor for one registered Tool."""
         try:
-            return self._workload_definitions[workload]
+            return self._tool_definitions[tool]
         except KeyError as exc:
-            raise ValueError(f"Unknown workload: {workload}") from exc
+            raise ValueError(f"Unknown Tool: {tool}") from exc
 
-    def workload_names(self) -> tuple[str, ...]:
-        """Return fixed workload names in their configured display order."""
-        return tuple(self._workload_defaults)
+    def tool_names(self) -> tuple[str, ...]:
+        """Return Tool keys in their configured display order."""
+        return tuple(self._tool_defaults)
 
-    def _defaults(self, workload: str) -> _WorkloadDefaults:
-        self.workload_definition(workload)
-        return self._workload_defaults[workload]
+    def _defaults(self, tool: str) -> _ToolDefaults:
+        self.tool_definition(tool)
+        return self._tool_defaults[tool]
 
-    def modal_app_name_fallback(self, workload: str) -> str:
+    def modal_app_name_fallback(self, tool: str) -> str:
         """Return the startup fallback restored by a null Admin PATCH."""
-        return self._defaults(workload).modal_app_name
+        return self._defaults(tool).modal_app_name
 
-    def modal_app_version_fallback(self, workload: str) -> int:
+    def modal_app_version_fallback(self, tool: str) -> int:
         """Return the startup version restored by a null Admin PATCH."""
-        return self._defaults(workload).modal_app_version
+        return self._defaults(tool).modal_app_version
 
     @property
     def modal_token_id(self) -> str:
@@ -184,72 +166,58 @@ class RuntimeConfiguration:
             default=self.settings.global_active_job_limit,
         )
 
-    def workload(self, workload: str) -> WorkloadRuntimeConfiguration:
-        """Resolve settings for one fixed registered workload."""
-        definition = self.workload_definition(workload)
-        defaults = self._defaults(workload)
-        stored = self.store.get_workload_configuration(workload)
-        return WorkloadRuntimeConfiguration(
-            workload=workload,
-            modal_app_name=self._workload_text_setting(
+    def tool(self, tool: str) -> ToolRuntimeConfiguration:
+        """Resolve settings for one fixed registered Tool."""
+        definition = self.tool_definition(tool)
+        defaults = self._defaults(tool)
+        stored = self.store.get_tool_configuration(tool)
+        configuration = ToolRuntimeConfiguration(
+            tool=tool,
+            modal_app_name=self._tool_text_setting(
                 environment_name=definition.modal_app_name_environment,
                 database_value=(stored.modal_app_name if stored is not None else None),
                 default=defaults.modal_app_name,
             ),
-            modal_app_version=self._workload_positive_integer_setting(
+            modal_app_version=self._tool_positive_integer_setting(
                 environment_name=definition.modal_app_version_environment,
                 database_value=(
                     stored.modal_app_version if stored is not None else None
                 ),
                 default=defaults.modal_app_version,
             ),
-            active_job_limit=self._workload_integer_setting(
+            active_job_limit=self._tool_integer_setting(
                 environment_name=definition.active_job_limit_environment,
                 database_value=(
                     stored.active_job_limit if stored is not None else None
                 ),
                 default=defaults.active_job_limit,
             ),
-            job_logs_visible_to_owner=self._workload_boolean_setting(
+            max_active_provider_calls=self._database_integer_setting(
+                database_value=(
+                    stored.max_active_provider_calls if stored is not None else None
+                ),
+                default=defaults.max_active_provider_calls,
+                positive=True,
+            ),
+            max_active_gpu_provider_calls=self._database_integer_setting(
+                database_value=(
+                    stored.max_active_gpu_provider_calls if stored is not None else None
+                ),
+                default=defaults.max_active_gpu_provider_calls,
+            ),
+            job_logs_visible_to_owner=self._tool_boolean_setting(
                 database_value=(
                     stored.job_logs_visible_to_owner if stored is not None else None
                 ),
                 default=definition.job_logs_visible_to_owner_default,
             ),
         )
-
-    def admission_configuration(self, workload: str) -> JobAdmissionConfiguration:
-        """Return static inputs; SQLite resolves mutable values atomically later."""
-        definition = self.workload_definition(workload)
-        defaults = self._defaults(workload)
-        sources = self.settings.sources
-        return JobAdmissionConfiguration(
-            workload=workload,
-            modal_environment=DatabaseOverridableSetting(
-                self.settings.modal_environment,
-                not sources.has_process_override("BIOMODALS_MODAL_ENVIRONMENT"),
-            ),
-            modal_app_name=DatabaseOverridableSetting(
-                defaults.modal_app_name,
-                not sources.has_process_override(definition.modal_app_name_environment),
-            ),
-            modal_app_version=DatabaseOverridableSetting(
-                defaults.modal_app_version,
-                not sources.has_process_override(
-                    definition.modal_app_version_environment
-                ),
-            ),
-            workload_active_job_limit=DatabaseOverridableSetting(
-                defaults.active_job_limit,
-                not sources.has_process_override(
-                    definition.active_job_limit_environment
-                ),
-            ),
-            global_active_job_limit=DatabaseOverridableSetting(
-                self.settings.global_active_job_limit,
-                not sources.has_process_override("BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT"),
-            ),
-        )
+        if (
+            configuration.max_active_gpu_provider_calls.value
+            > configuration.max_active_provider_calls.value
+        ):
+            raise ValueError("Maximum GPU containers cannot exceed total containers")
+        return configuration
 
     def update_environment(
         self,
@@ -280,17 +248,19 @@ class RuntimeConfiguration:
             )
         self.store.set_service_settings(updates)
 
-    def set_workload(
+    def set_tool(
         self,
-        workload: str,
+        tool: str,
         *,
         modal_app_name: str | None | _Unchanged = _UNCHANGED,
         modal_app_version: int | None | _Unchanged = _UNCHANGED,
         active_job_limit: int | None | _Unchanged = _UNCHANGED,
+        max_active_provider_calls: int | None | _Unchanged = _UNCHANGED,
+        max_active_gpu_provider_calls: int | None | _Unchanged = _UNCHANGED,
         job_logs_visible_to_owner: bool | None | _Unchanged = _UNCHANGED,
     ) -> None:
-        """Atomically update supplied settings for one fixed workload."""
-        definition = self.workload_definition(workload)
+        """Atomically update supplied settings for one fixed Tool."""
+        definition = self.tool_definition(tool)
         updates: dict[str, str | int | bool | None] = {}
         if not isinstance(modal_app_name, _Unchanged):
             self._ensure_editable(definition.modal_app_name_environment)
@@ -313,9 +283,24 @@ class RuntimeConfiguration:
                 if active_job_limit is None
                 else _nonnegative(active_job_limit, "Tool active job limit")
             )
+        if not isinstance(max_active_provider_calls, _Unchanged):
+            updates["max_active_provider_calls"] = (
+                None
+                if max_active_provider_calls is None
+                else _positive(max_active_provider_calls, "Maximum containers")
+            )
+        if not isinstance(max_active_gpu_provider_calls, _Unchanged):
+            updates["max_active_gpu_provider_calls"] = (
+                None
+                if max_active_gpu_provider_calls is None
+                else _nonnegative(
+                    max_active_gpu_provider_calls,
+                    "Maximum GPU containers",
+                )
+            )
         if not isinstance(job_logs_visible_to_owner, _Unchanged):
             updates["job_logs_visible_to_owner"] = job_logs_visible_to_owner
-        self.store.set_workload_configuration(workload, updates)
+        self.store.set_tool_configuration(tool, updates)
 
     def _text_setting(
         self,
@@ -342,7 +327,7 @@ class RuntimeConfiguration:
             _parse_nonnegative,
         )
 
-    def _workload_text_setting(
+    def _tool_text_setting(
         self,
         *,
         environment_name: str,
@@ -351,7 +336,7 @@ class RuntimeConfiguration:
     ) -> EffectiveSetting[str]:
         return self._setting(environment_name, database_value, default, _nonempty)
 
-    def _workload_integer_setting(
+    def _tool_integer_setting(
         self,
         *,
         environment_name: str,
@@ -365,7 +350,7 @@ class RuntimeConfiguration:
             _parse_nonnegative,
         )
 
-    def _workload_positive_integer_setting(
+    def _tool_positive_integer_setting(
         self,
         *,
         environment_name: str,
@@ -379,7 +364,7 @@ class RuntimeConfiguration:
             _parse_positive,
         )
 
-    def _workload_boolean_setting(
+    def _tool_boolean_setting(
         self,
         *,
         database_value: bool | None,
@@ -388,6 +373,21 @@ class RuntimeConfiguration:
         """Resolve a database-editable boolean over its Tool-owned default."""
         if database_value is not None:
             return EffectiveSetting(database_value, "database", True)
+        return EffectiveSetting(default, "default", True)
+
+    def _database_integer_setting(
+        self,
+        *,
+        database_value: int | None,
+        default: int,
+        positive: bool = False,
+    ) -> EffectiveSetting[int]:
+        """Resolve an administrator-only container limit."""
+        parser = _parse_positive if positive else _parse_nonnegative
+        if database_value is not None:
+            return EffectiveSetting(
+                parser(database_value, "Tool limit"), "database", True
+            )
         return EffectiveSetting(default, "default", True)
 
     def _setting[Value: (str, int)](

@@ -269,7 +269,7 @@ class ArtifactCache:
         normalized = str(UUID(job_id))
         if normalized != job_id:
             raise ValueError("job_id must be a canonical UUID")
-        return self.directory / f"{job_id}.zip"
+        return self.directory / f"{job_id}.result"
 
     def acquire(
         self,
@@ -559,7 +559,7 @@ class ArtifactCache:
         archives: list[tuple[Path, os.stat_result]] = []
         with os.scandir(self.directory) as entries:
             for entry in entries:
-                if not entry.name.endswith(".zip"):
+                if not entry.name.endswith(".result"):
                     continue
                 file_stat = entry.stat(follow_symlinks=False)
                 if stat.S_ISLNK(file_stat.st_mode):

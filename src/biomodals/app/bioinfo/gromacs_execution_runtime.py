@@ -200,6 +200,16 @@ def load_execution_request(
     )
 
 
+def load_execution_request_from_volume(
+    output_volume: Any,
+    execution_run_id: UUID,
+) -> GromacsExecutionRequest:
+    """Load a staged request through the client-side Volume API."""
+    return GromacsExecutionRequest.from_bytes(
+        _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
+    )
+
+
 class GromacsPublicationBoundary(Protocol):
     """Scientific publication operations required by the GROMACS graph."""
 

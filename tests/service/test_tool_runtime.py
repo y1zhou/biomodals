@@ -205,6 +205,12 @@ async def test_background_poll_does_not_wake_an_active_coordinator(
 
     _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
     await lifecycle.advance(JOB_ID)
+    _store.replace_projection(
+        JOB_ID,
+        state=JobState.RUNNING,
+        projection={"stages": [], "warnings": []},
+        observed_at=10**10,
+    )
 
     active = await lifecycle.advance(JOB_ID, finalize=True, background=True)
     assert active.state == JobState.RUNNING

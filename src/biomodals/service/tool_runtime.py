@@ -144,6 +144,7 @@ class JobLifecycle:
             if job.state in {JobState.RUNNING, JobState.BLOCKED}:
                 if (
                     not force_refresh
+                    and not background
                     and job.projection_observed_at is not None
                     and now - job.projection_observed_at < 60
                 ):

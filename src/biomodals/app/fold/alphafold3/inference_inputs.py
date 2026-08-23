@@ -42,6 +42,7 @@ RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
 MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024
 STAGED_INPUT_SCHEMA_VERSION = 2
 MAX_INPUT_JSON_BYTES = 256 * 1024 * 1024
+MAX_STAGED_INPUT_MARKER_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES
 MAX_STAGED_INPUT_BYTES = 256 * 1024 * 1024
 MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
@@ -792,7 +793,7 @@ def load_staged_inference_input(
             output_root,
             staged_input_record,
             marker_path,
-            max_bytes=MAX_INPUT_JSON_BYTES,
+            max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
         ),
         field_name="Staged input marker",
     )

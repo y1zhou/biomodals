@@ -82,9 +82,10 @@ def test_serialize_af3_input_emits_one_chain_type_per_sequence() -> None:
     assert document["sequences"][0]["protein"]["templates"] == []
 
 
-def test_raw_input_json_limit_is_256_mib() -> None:
-    """Standalone source files should match the API input-document ceiling."""
+def test_input_and_internal_marker_limits_are_independent() -> None:
+    """The small marker should not inherit the public input-document ceiling."""
     assert inference_inputs.MAX_INPUT_JSON_BYTES == 256 * 1024 * 1024
+    assert inference_inputs.MAX_STAGED_INPUT_MARKER_BYTES == 64 * 1024 * 1024
 
 
 def test_no_search_resolution_returns_a_validated_config() -> None:

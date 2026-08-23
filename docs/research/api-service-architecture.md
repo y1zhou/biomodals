@@ -370,15 +370,15 @@ and forbids replacement work. Reconciliation may resolve an existing call; it
 may not submit a replacement.
 
 The owner sees “Status unknown,” a generic explanation, and
-`state_unknown_at`, but no provider detail. The Admin Modal page lists the safe
-Job ID, workload, display name, run name, fixed reason, and timestamp needed for
-manual Modal review. After checking Modal and stopping remote work there when
-necessary, an Administrator may use the destructive `Mark failed` action. That
-action records a safe `compute_failed` terminal failure and releases admission
-capacity; it does not itself contact or cancel Modal. Although the kernel can
-retain and reconcile an original owner, the MVP service deliberately excludes
-`state_unknown` Jobs from automatic reconciliation and exposes no owner
-recovery action. Owners cannot force a transition or request replacement work.
+`state_unknown_at`, but no provider detail. The Admin Modal page shows the
+pinned Modal environment, App name, deployment version, diagnostic message,
+and any recorded root Function Call ID needed for manual review. An
+Administrator may attach or confirm the matching root Function Call and resume
+normal remote reconciliation, requeue only after confirming that no spawn
+occurred, or request cancellation. The service verifies the returned Execution
+Run ID and exact Deployment Identity before accepting a projection. It never
+blindly replaces ambiguous work or binds a Job to a newer deployment. Owners
+cannot force these recovery transitions.
 
 Initial admission creates the Execution Run and Job in one transaction and
 uses a stable run name made from a sanitized display-name slug plus the full

@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import importlib
+import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -3166,12 +3167,16 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     )
     view_id = cast(str, manifest["view_id"])
 
-    archive = create_request_archive(
-        FakeVolumeReader({volume_path: input_bytes}),
-        manifest,
-        output_dir=tmp_path,
-        display_name="Readable Name",
-    )
+    original_umask = os.umask(0o077)
+    try:
+        archive = create_request_archive(
+            FakeVolumeReader({volume_path: input_bytes}),
+            manifest,
+            output_dir=tmp_path,
+            display_name="Readable Name",
+        )
+    finally:
+        os.umask(original_umask)
 
     assert archive.name == f"Readable_Name_{view_id[:12]}_AlphaFold3.tar.zst"
     archived_input = "\n".join(
@@ -3208,12 +3213,16 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         "7,0,1.0",
     ]
 
-    rebuilt = create_request_archive(
-        FakeVolumeReader({volume_path: input_bytes}),
-        manifest,
-        output_dir=tmp_path / "rebuilt",
-        display_name="Readable Name",
-    )
+    original_umask = os.umask(0o022)
+    try:
+        rebuilt = create_request_archive(
+            FakeVolumeReader({volume_path: input_bytes}),
+            manifest,
+            output_dir=tmp_path / "rebuilt",
+            display_name="Readable Name",
+        )
+    finally:
+        os.umask(original_umask)
     assert rebuilt.read_bytes() == archive.read_bytes()
 
     assert (

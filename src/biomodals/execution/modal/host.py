@@ -768,6 +768,7 @@ class ExecutionCoordinatorLifecycle:
         node_key: str | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        newest_first: bool = False,
     ) -> ProviderCallPage:
         """Read one bounded page of calls without exposing Task payloads."""
         with self._volume_io_lock, self._writer_lock:
@@ -779,6 +780,7 @@ class ExecutionCoordinatorLifecycle:
                     node_key=node_key,
                     cursor=cursor,
                     limit=limit,
+                    newest_first=newest_first,
                 )
             store = self._run_store()
             if not store.ledger_path.is_file():
@@ -789,6 +791,7 @@ class ExecutionCoordinatorLifecycle:
                     node_key=node_key,
                     cursor=cursor,
                     limit=limit,
+                    newest_first=newest_first,
                 )
             finally:
                 store.close()

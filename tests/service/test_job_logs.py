@@ -8,8 +8,14 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
-from biomodals.execution import ProviderCallDiagnostic, ProviderCallStatus
-from biomodals.service.job_logs_api import _validate_window
+from biomodals.execution import (
+    DeploymentIdentity,
+    ProviderCallDiagnostic,
+    ProviderCallPage,
+    ProviderCallStatus,
+)
+from biomodals.service.job_logs_api import _stage_calls, _validate_window
+from biomodals.service.remote_execution import ExecutionLocator
 
 
 def _call(status: ProviderCallStatus) -> ProviderCallDiagnostic:
@@ -63,3 +69,39 @@ def test_historical_window_can_read_an_active_call() -> None:
         since=since,
         until=since + timedelta(minutes=10),
     )
+
+
+@pytest.mark.anyio
+async def test_stage_targets_query_only_mapped_nodes_newest_first() -> None:
+    calls = {
+        "first": _call(ProviderCallStatus.SUCCEEDED),
+        "second": _call(ProviderCallStatus.RUNNING),
+    }
+
+    class Remote:
+        requested: list[tuple[str | None, bool]] = []
+
+        async def provider_calls(
+            self,
+            _locator,
+            *,
+            node_key=None,
+            limit=50,
+            newest_first=False,
+        ):
+            self.requested.append((node_key, newest_first))
+            return ProviderCallPage((calls[node_key],), None)
+
+    remote = Remote()
+    selected = await _stage_calls(
+        remote,  # type: ignore[arg-type]
+        ExecutionLocator(
+            uuid4(),
+            DeploymentIdentity("main", "Tool", 1),
+        ),
+        node_keys=("first", "second"),
+        limit=10,
+    )
+
+    assert remote.requested == [("first", True), ("second", True)]
+    assert set(selected) == set(calls.values())

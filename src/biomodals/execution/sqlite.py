@@ -2797,11 +2797,12 @@ class SqliteExecutionRepository:
         node_key: str | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        newest_first: bool = False,
     ) -> ProviderCallPage:
         """Return one bounded Provider Call page in durable creation order."""
         if not 1 <= limit <= 100:
             raise ValueError("Provider Call page limit must be between 1 and 100")
-        cursor_rowid = 0
+        cursor_rowid: int | None = None
         if cursor is not None:
             row = self._connection.execute(
                 """
@@ -2815,7 +2816,11 @@ class SqliteExecutionRepository:
             if node_key is not None and row["node_key"] != node_key:
                 raise ValueError("Provider Call cursor does not belong to this Node")
             cursor_rowid = int(row["rowid"])
-        parameters: list[object] = [str(execution_run_id), cursor_rowid]
+        parameters: list[object] = [str(execution_run_id)]
+        cursor_filter = ""
+        if cursor_rowid is not None:
+            cursor_filter = f"AND rowid {'<' if newest_first else '>'} ?"
+            parameters.append(cursor_rowid)
         node_filter = ""
         if node_key is not None:
             node_filter = "AND node_key = ?"
@@ -2824,8 +2829,8 @@ class SqliteExecutionRepository:
         rows = self._connection.execute(
             f"""
             SELECT rowid, * FROM execution_provider_calls
-            WHERE execution_run_id = ? AND rowid > ? {node_filter}
-            ORDER BY rowid LIMIT ?
+            WHERE execution_run_id = ? {cursor_filter} {node_filter}
+            ORDER BY rowid {"DESC" if newest_first else "ASC"} LIMIT ?
             """,  # noqa: S608 - closed internal filter
             parameters,
         ).fetchall()

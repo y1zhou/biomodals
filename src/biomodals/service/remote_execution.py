@@ -104,6 +104,7 @@ class RemoteExecutionClient:
         node_key: str | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        newest_first: bool = False,
     ) -> ProviderCallPage:
         """Read one bounded page of Provider Call diagnostics."""
         try:
@@ -112,6 +113,7 @@ class RemoteExecutionClient:
                 node_key,
                 None if cursor is None else str(cursor),
                 limit,
+                newest_first,
             )
         except modal.exception.NotFoundError as error:
             raise RemoteDeploymentUnavailableError(str(error)) from error

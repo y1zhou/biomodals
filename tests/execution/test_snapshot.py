@@ -155,3 +155,19 @@ def test_provider_call_page_is_bounded_and_node_scoped() -> None:
         second.call.provider_call_id
     ]
     assert final_page.next_cursor is None
+
+    newest = repository.provider_call_page(
+        RUN_ID,
+        node_key="inference",
+        limit=1,
+        newest_first=True,
+    )
+    assert newest.calls[0].provider_call_id == second.call.provider_call_id
+    older = repository.provider_call_page(
+        RUN_ID,
+        node_key="inference",
+        cursor=newest.next_cursor,
+        limit=1,
+        newest_first=True,
+    )
+    assert older.calls[0].provider_call_id == first.call.provider_call_id

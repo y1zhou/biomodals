@@ -212,6 +212,7 @@ class ExecutionCoordinator:
         node_key: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
+        newest_first: bool = False,
     ) -> ProviderCallPage:
         """Read one bounded page of calls for diagnostics and logs."""
         with self._lock():
@@ -224,6 +225,7 @@ class ExecutionCoordinator:
                     node_key=node_key,
                     cursor=None if cursor is None else UUID(cursor),
                     limit=limit,
+                    newest_first=newest_first,
                 )
             store = self._run_store()
             try:
@@ -232,6 +234,7 @@ class ExecutionCoordinator:
                     node_key=node_key,
                     cursor=None if cursor is None else UUID(cursor),
                     limit=limit,
+                    newest_first=newest_first,
                 )
             finally:
                 store.close()

@@ -140,20 +140,11 @@ def create_job_logs_router() -> APIRouter:
                 raise HTTPException(
                     400, "Stage-filtered log targets do not use cursors"
                 )
-            pages = [
-                await remote.provider_calls(
-                    _locator(job),
-                    node_key=node_key,
-                    limit=limit,
-                )
-                for node_key in stage.node_keys
-            ]
-            calls = tuple(
-                sorted(
-                    (call for page in pages for call in page.calls),
-                    key=lambda call: (call.created_at, str(call.provider_call_id)),
-                    reverse=True,
-                )[:limit]
+            calls = await _stage_calls(
+                remote,
+                _locator(job),
+                node_keys=stage.node_keys,
+                limit=limit,
             )
             next_cursor = None
         values = [
@@ -225,6 +216,31 @@ def create_job_logs_router() -> APIRouter:
         )
 
     return router
+
+
+async def _stage_calls(
+    remote: RemoteExecutionClient,
+    locator: ExecutionLocator,
+    *,
+    node_keys: tuple[str, ...],
+    limit: int,
+) -> tuple[ProviderCallDiagnostic, ...]:
+    pages = [
+        await remote.provider_calls(
+            locator,
+            node_key=node_key,
+            limit=limit,
+            newest_first=True,
+        )
+        for node_key in node_keys
+    ]
+    return tuple(
+        sorted(
+            (call for page in pages for call in page.calls),
+            key=lambda call: (call.created_at, str(call.provider_call_id)),
+            reverse=True,
+        )[:limit]
+    )
 
 
 def _validate_window(

@@ -215,3 +215,10 @@ def test_unknown_launch_can_only_requeue_without_launch_evidence(
             function_call_id=None,
             now=16,
         )
+    cancelled = store.resolve_state_unknown(
+        JOB_ID,
+        resolution="cancel",
+        function_call_id=None,
+        now=17,
+    )
+    assert cancelled.state == JobState.CANCEL_REQUESTED

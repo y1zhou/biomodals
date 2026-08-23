@@ -145,12 +145,15 @@ class _FakeRemote:
         node_key: str | None = None,
         cursor: UUID | None = None,
         limit: int = 50,
+        newest_first: bool = False,
     ) -> ProviderCallPage:
         calls = [
             call
             for call in self._calls(locator.execution_run_id)
             if node_key is None or call.node_key == node_key
         ]
+        if newest_first:
+            calls.reverse()
         if cursor is not None:
             calls = calls[
                 next(

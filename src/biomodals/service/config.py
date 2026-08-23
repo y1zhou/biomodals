@@ -261,7 +261,7 @@ class ServiceSettings:
             reconcile_interval_seconds=_positive_float(
                 sources,
                 "BIOMODALS_RECONCILE_SECONDS",
-                10,
+                60,
             ),
             modal_token_id=sources.value("MODAL_TOKEN_ID", "").strip() or None,
             modal_token_secret=(

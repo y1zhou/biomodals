@@ -28,6 +28,10 @@ class RemoteSubmissionOutcomeUnknownError(RuntimeError):
     """A coordinator spawn may have happened without returning its call ID."""
 
 
+class RemoteRootExecutionFailedError(RuntimeError):
+    """The root coordinator call ended without returning an overview."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionLocator:
     """Exact address of one deployed Execution Run."""
@@ -74,8 +78,10 @@ class RemoteExecutionClient:
         call = modal.FunctionCall.from_id(function_call_id)
         try:
             return await asyncio.to_thread(call.get, timeout=0)
-        except (modal.exception.TimeoutError, modal.exception.RemoteError):
+        except modal.exception.TimeoutError:
             return None
+        except modal.exception.RemoteError as error:
+            raise RemoteRootExecutionFailedError(str(error)) from error
 
     async def status(self, locator: ExecutionLocator) -> ExecutionOverview:
         """Read one bounded remote execution overview."""

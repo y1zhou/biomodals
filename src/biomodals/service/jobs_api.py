@@ -89,13 +89,9 @@ def create_jobs_router(
     ) -> JobView:
         _owned(store, session, job_id)
         try:
-            job = store.request_cancel(job_id, now=_now())
+            job = await lifecycle.cancel(job_id)
         except JobNotCancellableError as error:
             raise HTTPException(409, str(error)) from error
-        if job.state == JobState.CANCELLED:
-            await lifecycle.discard_pending(job)
-        else:
-            job = await lifecycle.advance(job_id, force_refresh=True)
         return view(job, session)
 
     @router.post("/{job_id}/prepare-download")
@@ -229,9 +225,3 @@ def _response(
         media_type=media_type,
         headers=headers,
     )
-
-
-def _now() -> int:
-    import time
-
-    return int(time.time())

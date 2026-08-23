@@ -662,7 +662,7 @@ The application factory reads these settings:
 | `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Workload-wide active Job limit default |
 | `BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT` | `10` | Global active Job limit default |
 | `BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT` | `2` | Active Job limit assigned to new Users by default |
-| `BIOMODALS_RECONCILE_SECONDS` | `10` | Modal reconciliation interval |
+| `BIOMODALS_RECONCILE_SECONDS` | `60` | Modal reconciliation interval |
 | `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` | unset | Positive retention enables cleanup of published runs' intermediates |
 
 The Admin API stores editable runtime overrides for the Modal Environment,

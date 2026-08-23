@@ -48,7 +48,7 @@ def create_app(
     cache: ArtifactCache,
     allowed_origin: str,
     secure_cookies: bool,
-    reconcile_interval_seconds: float = 10,
+    reconcile_interval_seconds: float = 60,
 ) -> FastAPI:
     """Assemble explicitly registered Tools around one shared lifecycle."""
     if len(registrations) != len(tool_routers):
@@ -80,6 +80,7 @@ def create_app(
                 )
             )
         await cache.check_ready_async()
+        store.reconcile_result_cache(await cache.cached_job_ids_async())
         task = asyncio.create_task(
             reconciliation_loop(
                 lifecycle,

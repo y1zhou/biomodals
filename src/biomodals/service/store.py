@@ -216,6 +216,7 @@ class JobRecord:
     pending_validation_id: UUID | None
     state_reason: str | None
     state_message: str | None
+    result_state: str | None
     result_filename: str | None
     result_media_type: str | None
     result_size_bytes: int | None
@@ -1512,7 +1513,8 @@ class ServiceStore:
             conn.execute(
                 """
                 UPDATE jobs
-                SET root_function_call_id = ?, state = ?, updated_at = ?
+                SET root_function_call_id = ?, state = ?, updated_at = ?,
+                    state_reason = NULL, state_message = NULL
                 WHERE job_id = ?
                 """,
                 (
@@ -1526,6 +1528,15 @@ class ServiceStore:
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
             ).fetchone()
         return _job_from_row(updated)
+
+    def mark_submission_in_progress(self, job_id: UUID, *, now: int) -> JobRecord:
+        """Fence one launch attempt before making the ambiguous provider call."""
+        return self.mark_state_unknown(
+            job_id,
+            reason="submission_in_progress",
+            message="The remote launch outcome has not been confirmed",
+            now=now,
+        )
 
     def mark_request_staged(self, job_id: UUID, *, now: int) -> JobRecord:
         """Release a retained validation after verified immutable staging."""
@@ -1934,6 +1945,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         ),
         state_reason=row["state_reason"],
         state_message=row["state_message"],
+        result_state=row["result_state"],
         result_filename=row["result_filename"],
         result_media_type=row["result_media_type"],
         result_size_bytes=row["result_size_bytes"],

@@ -17,6 +17,7 @@ from biomodals.service.remote_execution import (
     ExecutionLocator,
     RemoteDeploymentUnavailableError,
     RemoteExecutionClient,
+    RemoteRootExecutionFailedError,
     RemoteSubmissionOutcomeUnknownError,
 )
 from biomodals.service.store import JobRecord, JobState, ServiceStore
@@ -84,7 +85,14 @@ class JobLifecycle:
             raise ValueError("Tool registrations must be unique")
         self._locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
 
-    async def advance(self, job_id: UUID, *, force_refresh: bool = False) -> JobRecord:
+    async def advance(
+        self,
+        job_id: UUID,
+        *,
+        force_refresh: bool = False,
+        finalize: bool = False,
+        background: bool = False,
+    ) -> JobRecord:
         """Perform at most one idempotent service-side lifecycle pass."""
         lock = self._locks.setdefault(job_id, asyncio.Lock())
         async with lock:
@@ -95,6 +103,7 @@ class JobLifecycle:
                 await registration.adapter.stage(job)
                 await registration.adapter.discard_pending(job)
                 self.store.mark_request_staged(job_id, now=now)
+                self.store.mark_submission_in_progress(job_id, now=now)
                 locator = _locator(job)
                 try:
                     call_id = await self.remote.launch(locator)
@@ -121,7 +130,11 @@ class JobLifecycle:
                         now=now,
                     )
                 return await self._observe(job, overview, registration, now=now)
-            if job.state == JobState.BLOCKED and job.result_state is not None:
+            if (
+                finalize
+                and job.state == JobState.BLOCKED
+                and job.result_state is not None
+            ):
                 return await self._finalize(
                     job,
                     registration,
@@ -136,13 +149,22 @@ class JobLifecycle:
                 ):
                     return job
                 try:
-                    overview = (
-                        await self.remote.poll_root(job.root_function_call_id)
-                        if job.root_function_call_id is not None
-                        else None
-                    )
+                    overview = None
+                    if background and job.root_function_call_id is not None:
+                        overview = await self.remote.poll_root(
+                            job.root_function_call_id
+                        )
+                        if overview is None:
+                            return job
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
+                except RemoteRootExecutionFailedError as error:
+                    return self.store.fail_job(
+                        job_id,
+                        error_code="remote_coordinator_failed",
+                        error_message=str(error),
+                        now=now,
+                    )
                 except RemoteDeploymentUnavailableError as error:
                     return self.store.mark_state_unknown(
                         job_id,
@@ -151,7 +173,7 @@ class JobLifecycle:
                         now=now,
                     )
                 return await self._observe(job, overview, registration, now=now)
-            if job.state == JobState.FINALIZING:
+            if finalize and job.state == JobState.FINALIZING:
                 return await self._finalize(
                     job,
                     registration,
@@ -159,6 +181,30 @@ class JobLifecycle:
                     now=now,
                 )
             return job
+
+    async def cancel(self, job_id: UUID) -> JobRecord:
+        """Serialize sticky cancellation with launch for one Job."""
+        lock = self._locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            job = self.store.request_cancel(job_id, now=int(time.time()))
+            if job.state == JobState.CANCELLED:
+                await self.registrations[job.tool].adapter.discard_pending(job)
+                return job
+            try:
+                overview = await self.remote.cancel(_locator(job))
+            except RemoteDeploymentUnavailableError as error:
+                return self.store.mark_state_unknown(
+                    job_id,
+                    reason="deployment_unavailable",
+                    message=str(error),
+                    now=int(time.time()),
+                )
+            return await self._observe(
+                job,
+                overview,
+                self.registrations[job.tool],
+                now=int(time.time()),
+            )
 
     async def _observe(
         self,
@@ -177,12 +223,7 @@ class JobLifecycle:
                 projection=projection,
                 now=now,
             )
-            return await self._finalize(
-                job,
-                registration,
-                result_state=result_state,
-                now=now,
-            )
+            return job
         state = {
             RunStatus.PENDING: JobState.RUNNING,
             RunStatus.RUNNING: JobState.RUNNING,
@@ -257,6 +298,7 @@ class JobLifecycle:
             or result.archive_schema != job.result_archive_schema
         ):
             raise RuntimeError("Rebuilt Result does not match its recorded identity")
+        self.store.set_result_cached(job.job_id, cached=True)
         return result
 
 
@@ -282,7 +324,11 @@ async def reconciliation_loop(
         now = int(time.time())
         for job in lifecycle.store.list_reconcilable_jobs(now=now):
             try:
-                await lifecycle.advance(job.job_id)
+                await lifecycle.advance(
+                    job.job_id,
+                    finalize=True,
+                    background=True,
+                )
             except Exception:
                 LOGGER.exception("Could not reconcile Job %s", job.job_id)
                 continue

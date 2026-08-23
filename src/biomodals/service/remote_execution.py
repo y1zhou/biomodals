@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -173,13 +174,9 @@ class RemoteExecutionClient:
             source = call.logs.tail.aio(entries=tail_entries)
         else:
             source = call.logs.fetch.aio(since=since, until=until)
-        try:
+        async with aclosing(source):
             async for item in source:
                 yield item
-        finally:
-            close = getattr(source, "aclose", None)
-            if close is not None:
-                await close()
 
     @staticmethod
     def _verified(locator: ExecutionLocator, overview: object) -> ExecutionOverview:

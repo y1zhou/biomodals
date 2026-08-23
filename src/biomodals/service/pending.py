@@ -46,6 +46,19 @@ class PendingRequestStore:
         """Delete reconstructable local staging after verified remote upload."""
         shutil.rmtree(self.directory / str(job_id), ignore_errors=True)
 
+    def cleanup_orphans(self, *, retained: set[UUID]) -> int:
+        """Remove staging directories that no admitted Job still references."""
+        removed = 0
+        for path in self.directory.iterdir():
+            try:
+                job_id = UUID(path.name)
+            except ValueError:
+                job_id = None
+            if job_id not in retained:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        return removed
+
     def usage(self) -> tuple[int, int]:
         """Return pending request count and byte size."""
         files = list(self.directory.glob("*/request.bin"))

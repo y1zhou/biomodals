@@ -73,14 +73,6 @@ class JobState(StrEnum):
     CANCELLED = "cancelled"
 
 
-class JobStateUnknownReason(StrEnum):
-    """Safe reason that remote execution can no longer be confirmed."""
-
-    SUBMISSION_OUTCOME_UNKNOWN = "submission_outcome_unknown"
-    PROVIDER_OUTCOME_UNKNOWN = "provider_outcome_unknown"
-    CANCELLATION_OUTCOME_UNKNOWN = "cancellation_outcome_unknown"
-
-
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
 _SERVICE_SCHEMA_VERSION = 6
 _ACTIVE_JOB_STATES = (
@@ -1361,6 +1353,14 @@ class ServiceStore:
                 SELECT pending_validation_id FROM jobs
                 WHERE pending_validation_id IS NOT NULL
                 """
+            ).fetchall()
+        return {UUID(row[0]) for row in rows}
+
+    def unstaged_job_ids(self) -> set[UUID]:
+        """Return Jobs whose local request may still be needed for staging."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT job_id FROM jobs WHERE request_staged_at IS NULL"
             ).fetchall()
         return {UUID(row[0]) for row in rows}
 

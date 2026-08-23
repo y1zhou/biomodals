@@ -75,3 +75,21 @@ def test_expert_documents_reject_browser_local_paths(tmp_path: Path) -> None:
             digest=hashlib.sha256(content).hexdigest(),
             settings=ValidationSettings(),
         )
+
+
+def test_claimed_validation_survives_ordinary_expiry(tmp_path: Path) -> None:
+    store = ValidatedInputStore(tmp_path)
+    store.initialize()
+    source = tmp_path / "input.json"
+    content = _document()
+    source.write_bytes(content)
+    validated = store.validate_and_publish(
+        source,
+        owner_user_id=OWNER,
+        digest=hashlib.sha256(content).hexdigest(),
+        settings=ValidationSettings(),
+        now=10,
+    )
+
+    assert store.get(validated.validation_id, owner_user_id=OWNER, now=10**9) is None
+    assert store.get_claimed(validated.validation_id, owner_user_id=OWNER) == validated

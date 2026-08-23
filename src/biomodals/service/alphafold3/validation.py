@@ -191,6 +191,19 @@ class ValidatedInputStore:
         shutil.rmtree(target)
         return True
 
+    def get_claimed(
+        self,
+        validation_id: UUID,
+        *,
+        owner_user_id: UUID,
+    ) -> ValidatedInput | None:
+        """Load an admitted validation after ordinary expiry no longer applies."""
+        try:
+            resource = self._load(self.directory / str(validation_id))
+        except FileNotFoundError:
+            return None
+        return resource if resource.owner_user_id == owner_user_id else None
+
     def delete_claimed(self, validation_id: UUID) -> None:
         """Delete one resource after the service verified remote staging."""
         shutil.rmtree(self.directory / str(validation_id), ignore_errors=True)
@@ -207,6 +220,8 @@ class ValidatedInputStore:
                 validation_id = UUID(path.name)
                 resource = self._load(path)
             except (ValueError, FileNotFoundError):
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
                 continue
             if validation_id not in claimed and now >= resource.expires_at:
                 shutil.rmtree(path, ignore_errors=True)

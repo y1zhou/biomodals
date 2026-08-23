@@ -15,6 +15,7 @@ from biomodals.execution import DeploymentIdentity, ExecutionOverview, RunStatus
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
     ExecutionLocator,
+    RemoteDeploymentUnavailableError,
     RemoteExecutionClient,
     RemoteSubmissionOutcomeUnknownError,
 )
@@ -110,7 +111,15 @@ class JobLifecycle:
                     now=now,
                 )
             if job.state == JobState.CANCEL_REQUESTED:
-                overview = await self.remote.cancel(_locator(job))
+                try:
+                    overview = await self.remote.cancel(_locator(job))
+                except RemoteDeploymentUnavailableError as error:
+                    return self.store.mark_state_unknown(
+                        job_id,
+                        reason="deployment_unavailable",
+                        message=str(error),
+                        now=now,
+                    )
                 return await self._observe(job, overview, registration, now=now)
             if job.state == JobState.BLOCKED and job.result_state is not None:
                 return await self._finalize(
@@ -126,13 +135,21 @@ class JobLifecycle:
                     and now - job.projection_observed_at < 60
                 ):
                     return job
-                overview = (
-                    await self.remote.poll_root(job.root_function_call_id)
-                    if job.root_function_call_id is not None
-                    else None
-                )
-                if overview is None:
-                    overview = await self.remote.status(_locator(job))
+                try:
+                    overview = (
+                        await self.remote.poll_root(job.root_function_call_id)
+                        if job.root_function_call_id is not None
+                        else None
+                    )
+                    if overview is None:
+                        overview = await self.remote.status(_locator(job))
+                except RemoteDeploymentUnavailableError as error:
+                    return self.store.mark_state_unknown(
+                        job_id,
+                        reason="deployment_unavailable",
+                        message=str(error),
+                        now=now,
+                    )
                 return await self._observe(job, overview, registration, now=now)
             if job.state == JobState.FINALIZING:
                 return await self._finalize(

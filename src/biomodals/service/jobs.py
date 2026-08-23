@@ -35,6 +35,7 @@ class JobStageView(BaseModel):
     ended_at: datetime | None = None
     outcome: Literal["completed", "failed", "cancelled"] | None = None
     task_counts: StageTaskCounts = Field(default_factory=StageTaskCounts)
+    running_functions: list[str] = Field(default_factory=list)
 
 
 class JobView(BaseModel):
@@ -75,6 +76,11 @@ class JobView(BaseModel):
                 task_counts=StageTaskCounts.model_validate(
                     stage.get("task_counts", {})
                 ),
+                running_functions=[
+                    str(value)
+                    for value in stage.get("running_functions", [])
+                    if isinstance(value, str)
+                ],
             )
             for stage in record.projection.get("stages", [])
             if isinstance(stage, dict) and isinstance(stage.get("code"), str)

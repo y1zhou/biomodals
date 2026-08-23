@@ -74,16 +74,22 @@ class RemoteExecutionClient:
         call = modal.FunctionCall.from_id(function_call_id)
         try:
             return await asyncio.to_thread(call.get, timeout=0)
-        except modal.exception.TimeoutError:
+        except (modal.exception.TimeoutError, modal.exception.RemoteError):
             return None
 
     async def status(self, locator: ExecutionLocator) -> ExecutionOverview:
         """Read one bounded remote execution overview."""
-        return await asyncio.to_thread(self._coordinator(locator).status.remote)
+        try:
+            return await asyncio.to_thread(self._coordinator(locator).status.remote)
+        except modal.exception.NotFoundError as error:
+            raise RemoteDeploymentUnavailableError(str(error)) from error
 
     async def cancel(self, locator: ExecutionLocator) -> ExecutionOverview:
         """Request durable cancellation from the execution authority."""
-        return await asyncio.to_thread(self._coordinator(locator).cancel.remote)
+        try:
+            return await asyncio.to_thread(self._coordinator(locator).cancel.remote)
+        except modal.exception.NotFoundError as error:
+            raise RemoteDeploymentUnavailableError(str(error)) from error
 
     async def provider_calls(
         self,
@@ -94,12 +100,15 @@ class RemoteExecutionClient:
         limit: int = 50,
     ) -> ProviderCallPage:
         """Read one bounded page of Provider Call diagnostics."""
-        return await asyncio.to_thread(
-            self._coordinator(locator).provider_calls.remote,
-            node_key,
-            None if cursor is None else str(cursor),
-            limit,
-        )
+        try:
+            return await asyncio.to_thread(
+                self._coordinator(locator).provider_calls.remote,
+                node_key,
+                None if cursor is None else str(cursor),
+                limit,
+            )
+        except modal.exception.NotFoundError as error:
+            raise RemoteDeploymentUnavailableError(str(error)) from error
 
     async def provider_call(
         self,

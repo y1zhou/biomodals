@@ -45,7 +45,7 @@ class AlphaFold3ToolAdapter:
             return
         volume = self._volume(job)
         await volume.hydrate.aio()
-        validated = self.validations.get(
+        validated = self.validations.get_claimed(
             job.pending_validation_id,
             owner_user_id=job.owner_user_id,
         )

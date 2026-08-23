@@ -82,6 +82,11 @@ def create_router(
         recycle: Annotated[int, Query(ge=1)] = 10,
         sample: Annotated[int, Query(ge=1)] = 5,
     ) -> ValidationView:
+        await asyncio.to_thread(
+            validations.cleanup_expired,
+            claimed=store.claimed_validation_ids(),
+            now=int(time.time()),
+        )
         descriptor, raw_path = tempfile.mkstemp(
             dir=validations.directory.parent,
             prefix=".alphafold3-upload-",

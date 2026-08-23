@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 
@@ -174,6 +175,11 @@ def create_deployed_app() -> FastAPI:
     pending.initialize()
     validations = ValidatedInputStore(settings.state_dir)
     validations.initialize()
+    validations.cleanup_expired(
+        claimed=store.claimed_validation_ids(),
+        now=int(time.time()),
+    )
+    pending.cleanup_orphans(retained=store.unstaged_job_ids())
     cache = ArtifactCache(settings.cache_dir / "results")
     remote = RemoteExecutionClient()
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)

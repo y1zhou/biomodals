@@ -239,10 +239,9 @@ no meaning to the API service. The frontend replaces the uploaded document's
 `name` with the required form Job name. It parses the file in the browser and
 submits ordinary JSON rather than multipart form data.
 
-The AlphaFold3 validation route accepts a maximum 256 MiB JSON document.
-Larger bodies receive `413 payload_too_large` before JSON parsing. This is an
-API-service upload limit rather than a change to the AlphaFold3 app's existing
-1 GiB CLI ceiling. The API does not add a streaming JSON parser; large Expert
+The AlphaFold3 validation route and standalone CLI accept a maximum 256 MiB
+JSON document. Larger API bodies receive `413 payload_too_large` before JSON
+parsing. The API does not add a streaming JSON parser; large Expert
 requests therefore require API-process memory above their wire size.
 The validation route streams request bytes into a temporary file, hashes them
 while writing, and runs JSON/Pydantic parsing in one bounded background worker.

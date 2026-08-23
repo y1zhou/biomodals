@@ -30,11 +30,15 @@ def _document() -> bytes:
     )
 
 
-def test_api_limit_is_256_mib_and_cli_limit_is_unchanged() -> None:
+def test_api_and_standalone_limits_are_256_mib() -> None:
     from biomodals.app.fold.alphafold3.inference_inputs import MAX_STAGED_INPUT_BYTES
+    from biomodals.app.fold.alphafold3.template_search import (
+        MAX_TEMPLATE_INSPECTION_BYTES,
+    )
 
     assert MAX_VALIDATION_BYTES == 256 * 1024 * 1024
-    assert MAX_STAGED_INPUT_BYTES == 1024 * 1024 * 1024
+    assert MAX_STAGED_INPUT_BYTES == 256 * 1024 * 1024
+    assert MAX_TEMPLATE_INSPECTION_BYTES == 1024 * 1024 * 1024
 
 
 def test_validation_retains_native_document_and_bounded_preview(tmp_path: Path) -> None:

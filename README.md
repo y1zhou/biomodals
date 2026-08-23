@@ -308,9 +308,9 @@ Session cookies.
 
 The OpenAPI document includes the shared Job routes, typed GROMACS submission,
 retained AlphaFold3 JSON validation and submission, paginated Provider Call log
-targets, and Administrator billing reports. AlphaFold3 browser validation is
-limited to 256 MiB; the standalone AlphaFold3 CLI retains its 1 GiB input
-limit. Modal billing is optional and unavailable reports never affect API
+targets, and Administrator billing reports. AlphaFold3 input documents are
+limited to 256 MiB in both browser validation and the standalone CLI. Modal
+billing is optional and unavailable reports never affect API
 readiness or Job execution.
 
 ### Create the first administrator

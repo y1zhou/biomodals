@@ -702,7 +702,7 @@ the first Modal call. The worker repeats the preflight before invoking upstream.
 
 The supported request envelope is also explicit: at most 5,120 expanded
 entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
-tasks, 1 GiB across inline template fields, and 1 GiB each for the serialized
+tasks, 1 GiB across inline template fields, and 256 MiB each for the serialized
 staged input and run-identity document. The 5,120 bounds align with the largest
 default AlphaFold 3 compilation bucket documented by the pinned upstream
 revision. The CPU coordinator checks the conservative task upper bound before

@@ -30,7 +30,6 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_LOCAL_MSA_BYTES,
-    MAX_STAGED_INPUT_BYTES,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaArtifactReference,
@@ -69,7 +68,7 @@ HMMSEARCH_N_CPU = 8
 TEMPLATE_RESULT_SCHEMA_VERSION = 1
 TEMPLATE_IDENTITY_SCHEMA_VERSION = 1
 TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
-MAX_TEMPLATE_INSPECTION_BYTES = MAX_STAGED_INPUT_BYTES
+MAX_TEMPLATE_INSPECTION_BYTES = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)

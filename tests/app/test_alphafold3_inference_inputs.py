@@ -234,6 +234,37 @@ def test_inference_staging_bounds_the_serialized_input(
         )
 
 
+def test_inference_staging_accepts_the_exact_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared standalone/API ceiling is inclusive."""
+    config = AF3Config(
+        name="exact-boundary",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(id="A", sequence="ACDE"),
+            )
+        ],
+    )
+    content = serialize_af3_input(config)
+    monkeypatch.setattr(
+        inference_inputs,
+        "MAX_STAGED_INPUT_BYTES",
+        len(content),
+    )
+
+    assert serialize_af3_input(config) == content
+
+    monkeypatch.setattr(
+        inference_inputs,
+        "MAX_STAGED_INPUT_BYTES",
+        len(content) - 1,
+    )
+    with pytest.raises(ValueError, match="staged input exceeds"):
+        serialize_af3_input(config)
+
+
 def test_inference_staging_bounds_the_run_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

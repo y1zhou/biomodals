@@ -116,7 +116,7 @@ CREATE TABLE jobs (
         CHECK (max_active_provider_calls >= 1),
     max_active_gpu_provider_calls INTEGER NOT NULL
         CHECK (
-            max_active_gpu_provider_calls >= 0
+            max_active_gpu_provider_calls >= 1
             AND max_active_gpu_provider_calls <= max_active_provider_calls
         ),
     pending_validation_id TEXT UNIQUE,
@@ -242,16 +242,6 @@ class JobRecord:
     cache_cleared_at: int | None
 
     @property
-    def workload(self) -> str:
-        """Return the temporary public-contract alias during the route cutover."""
-        return self.tool
-
-    @property
-    def execution_run_id(self) -> UUID:
-        """Service Job and remote Execution Run deliberately share one UUID."""
-        return self.job_id
-
-    @property
     def warnings(self) -> list[str]:
         """Decode owner-safe warnings from the bounded projection."""
         value = self.projection.get("warnings", [])
@@ -264,31 +254,6 @@ class JobRecord:
         if not isinstance(value, dict):
             raise ValueError("projection_json must contain a JSON object")
         return value
-
-    @property
-    def stage_history(self) -> list[JobStageRecord]:
-        """Project semantic stages cached from the remote coordinator."""
-        value = self.projection.get("stages", [])
-        if not isinstance(value, list):
-            return []
-        return [
-            JobStageRecord(
-                operation=str(stage["code"]),
-                started_at=int(stage["started_at"]),
-                completed_at=(
-                    int(stage["ended_at"])
-                    if stage.get("ended_at") is not None
-                    else None
-                ),
-                outcome=(
-                    str(stage["outcome"]) if stage.get("outcome") is not None else None
-                ),
-            )
-            for stage in value
-            if isinstance(stage, dict)
-            and isinstance(stage.get("code"), str)
-            and isinstance(stage.get("started_at"), int)
-        ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,16 +270,6 @@ class JobPageRecord:
 
     jobs: list[JobRecord]
     next_cursor: UUID | None
-
-
-@dataclass(frozen=True, slots=True)
-class JobStageRecord:
-    """One durable workload operation and its observed timing."""
-
-    operation: str
-    started_at: int
-    completed_at: int | None
-    outcome: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,7 +390,7 @@ class ServiceStore:
                         ),
                         max_active_gpu_provider_calls INTEGER CHECK (
                             max_active_gpu_provider_calls IS NULL
-                            OR max_active_gpu_provider_calls >= 0
+                            OR max_active_gpu_provider_calls >= 1
                         ),
                         job_logs_visible_to_owner INTEGER
                             CHECK (
@@ -1134,9 +1089,9 @@ class ServiceStore:
             raise ValueError("max_active_provider_calls must be positive")
         if max_active_gpu_provider_calls is not None and (
             type(max_active_gpu_provider_calls) is not int
-            or max_active_gpu_provider_calls < 0
+            or max_active_gpu_provider_calls < 1
         ):
-            raise ValueError("max_active_gpu_provider_calls must be non-negative")
+            raise ValueError("max_active_gpu_provider_calls must be positive")
         if (
             job_logs_visible_to_owner is not None
             and type(job_logs_visible_to_owner) is not bool
@@ -1262,7 +1217,7 @@ class ServiceStore:
             raise ValueError("Modal App version must be positive")
         if (
             max_active_provider_calls < 1
-            or not 0 <= max_active_gpu_provider_calls <= max_active_provider_calls
+            or not 1 <= max_active_gpu_provider_calls <= max_active_provider_calls
         ):
             raise ValueError("Provider Call limits are invalid")
         with self._transaction() as conn:

@@ -1,17 +1,11 @@
-"""GROMACS HTTP routes and Modal compute adapter."""
+"""GROMACS API Tool integration."""
 
 from biomodals.service.gromacs.contracts import GromacsJobOptions
-from biomodals.service.gromacs.execution import GromacsExecutionCoordinator
-from biomodals.service.gromacs.modal import ModalGromacsAdapter
-from biomodals.service.gromacs.router import (
-    create_registration,
-    create_router,
-)
+from biomodals.service.gromacs.modal import GromacsToolAdapter
+from biomodals.service.gromacs.router import create_router
 
 __all__ = [
     "GromacsJobOptions",
-    "GromacsExecutionCoordinator",
-    "ModalGromacsAdapter",
-    "create_registration",
+    "GromacsToolAdapter",
     "create_router",
 ]

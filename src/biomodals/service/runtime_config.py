@@ -204,6 +204,7 @@ class RuntimeConfiguration:
                     stored.max_active_gpu_provider_calls if stored is not None else None
                 ),
                 default=defaults.max_active_gpu_provider_calls,
+                positive=True,
             ),
             job_logs_visible_to_owner=self._tool_boolean_setting(
                 database_value=(
@@ -293,13 +294,35 @@ class RuntimeConfiguration:
             updates["max_active_gpu_provider_calls"] = (
                 None
                 if max_active_gpu_provider_calls is None
-                else _nonnegative(
+                else _positive(
                     max_active_gpu_provider_calls,
                     "Maximum GPU containers",
                 )
             )
         if not isinstance(job_logs_visible_to_owner, _Unchanged):
             updates["job_logs_visible_to_owner"] = job_logs_visible_to_owner
+        current = self.tool(tool)
+        defaults = self._defaults(tool)
+        total = (
+            current.max_active_provider_calls.value
+            if isinstance(max_active_provider_calls, _Unchanged)
+            else (
+                defaults.max_active_provider_calls
+                if max_active_provider_calls is None
+                else max_active_provider_calls
+            )
+        )
+        gpu = (
+            current.max_active_gpu_provider_calls.value
+            if isinstance(max_active_gpu_provider_calls, _Unchanged)
+            else (
+                defaults.max_active_gpu_provider_calls
+                if max_active_gpu_provider_calls is None
+                else max_active_gpu_provider_calls
+            )
+        )
+        if gpu > total:
+            raise ValueError("Maximum GPU containers cannot exceed total containers")
         self.store.set_tool_configuration(tool, updates)
 
     def _text_setting(

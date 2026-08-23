@@ -42,20 +42,25 @@ class AlphaFold3ToolAdapter:
     async def stage(self, job: JobRecord) -> None:
         """Stage one retained validation with its admitted provider limits."""
         if job.pending_validation_id is None:
-            raise FileNotFoundError("Pending AlphaFold3 validation is unavailable")
+            return
+        volume = self._volume(job)
+        await volume.hydrate.aio()
         validated = self.validations.get(
             job.pending_validation_id,
             owner_user_id=job.owner_user_id,
         )
         if validated is None:
-            raise FileNotFoundError("Pending AlphaFold3 validation is unavailable")
+            await asyncio.to_thread(
+                load_execution_request_from_volume,
+                volume,
+                job.job_id,
+            )
+            return
         request = await asyncio.to_thread(
             validated.request,
             max_active_provider_calls=job.max_active_provider_calls,
             max_active_gpu_provider_calls=job.max_active_gpu_provider_calls,
         )
-        volume = self._volume(job)
-        await volume.hydrate.aio()
         await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
         await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
 

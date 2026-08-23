@@ -22,7 +22,6 @@ ENVIRONMENT_KEYS = (
     "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT",
     "BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT",
     "BIOMODALS_RECONCILE_SECONDS",
-    "BIOMODALS_INTERMEDIATE_RETENTION_DAYS",
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
 )
@@ -39,7 +38,6 @@ def test_local_defaults_are_safe_and_cleanup_is_disabled(monkeypatch) -> None:
     assert settings.public_url == "http://localhost:5173"
     assert settings.secure_cookies is False
     assert settings.modal_environment == "production"
-    assert settings.intermediate_retention_days is None
 
 
 def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> None:
@@ -48,7 +46,6 @@ def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> Non
     monkeypatch.setenv("BIOMODALS_SECURE_COOKIES", "true")
     monkeypatch.setenv("BIOMODALS_PUBLIC_URL", "https://biomodals.example")
     monkeypatch.setenv("BIOMODALS_MODAL_ENVIRONMENT", "department")
-    monkeypatch.setenv("BIOMODALS_INTERMEDIATE_RETENTION_DAYS", "14")
 
     settings = ServiceSettings.from_environment()
 
@@ -56,7 +53,6 @@ def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> Non
     assert settings.cache_dir.as_posix() == "/srv/biomodals/cache"
     assert settings.secure_cookies is True
     assert settings.modal_environment == "department"
-    assert settings.intermediate_retention_days == 14
 
 
 def test_explicit_env_file_is_loaded_and_process_environment_wins(
@@ -167,7 +163,6 @@ def test_deployed_backend_refuses_to_start_without_modal_credentials(
     [
         ("BIOMODALS_CACHE_WARNING_BYTES", "0"),
         ("BIOMODALS_RECONCILE_SECONDS", "0"),
-        ("BIOMODALS_INTERMEDIATE_RETENTION_DAYS", "-1"),
     ],
 )
 def test_positive_settings_fail_closed(monkeypatch, name: str, value: str) -> None:

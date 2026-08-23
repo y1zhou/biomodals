@@ -37,11 +37,15 @@ async def _run_executor[T](
         executor,
         partial(operation, *args, **kwargs),
     )
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        await asyncio.gather(future, return_exceptions=True)
-        raise
+    cancelled = False
+    while not future.done():
+        try:
+            await asyncio.wait({future}, timeout=0.1)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return future.result()
 
 
 async def run_blocking_io[T](

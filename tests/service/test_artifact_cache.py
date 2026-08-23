@@ -93,7 +93,7 @@ def test_cache_discards_corrupt_download(tmp_path: Path) -> None:
 
 def test_cache_revalidates_an_existing_file_before_serving(tmp_path: Path) -> None:
     job_id = "11111111-1111-4111-8111-111111111111"
-    path = tmp_path / f"{job_id}.zip"
+    path = tmp_path / f"{job_id}.result"
     path.write_bytes(b"corrupt")
     cache = ArtifactCache(tmp_path)
 
@@ -132,7 +132,7 @@ def test_result_size_does_not_trigger_automatic_eviction(
     assert lease.path is not None
     assert lease.read(5) == b"large"
     assert [path.name for path in tmp_path.iterdir()] == [
-        "11111111-1111-4111-8111-111111111111.zip"
+        "11111111-1111-4111-8111-111111111111.result"
     ]
     lease.close()
 

@@ -43,11 +43,16 @@ class GromacsToolAdapter:
     async def stage(self, job: JobRecord) -> None:
         """Stage one immutable request and root launch identity."""
         content = self.pending.get(job.job_id)
-        if content is None:
-            raise FileNotFoundError("Pending GROMACS request is unavailable")
-        request = GromacsExecutionRequest.from_bytes(content)
         volume = self._volume(job)
         await volume.hydrate.aio()
+        if content is None:
+            await asyncio.to_thread(
+                load_execution_request_from_volume,
+                volume,
+                job.job_id,
+            )
+            return
+        request = GromacsExecutionRequest.from_bytes(content)
         await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
         await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
 

@@ -12,6 +12,7 @@ from fastapi import APIRouter, FastAPI, status
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService, PasswordExecutor
 from biomodals.service.auth_api import create_auth_router
+from biomodals.service.billing import BillingService
 from biomodals.service.http_contract import (
     SECURE_SESSION_COOKIE,
     SESSION_COOKIE,
@@ -118,6 +119,9 @@ def create_app(
     app.state.remote_execution = remote
     app.state.lifecycle = lifecycle
     app.state.cache = cache
+    app.state.billing = BillingService()
+    app.state.pending_requests = None
+    app.state.validated_inputs = None
     app.state.allowed_origin = allowed_origin
     app.state.session_cookie_name = session_cookie_name
     app.state.ready = False
@@ -197,7 +201,7 @@ def create_deployed_app() -> FastAPI:
         ),
     )
     auth = AuthService(store, frontend_url=settings.public_url)
-    return create_app(
+    app = create_app(
         store=store,
         auth=auth,
         configuration=configuration,
@@ -210,3 +214,6 @@ def create_deployed_app() -> FastAPI:
         secure_cookies=settings.secure_cookies,
         reconcile_interval_seconds=settings.reconcile_interval_seconds,
     )
+    app.state.pending_requests = pending
+    app.state.validated_inputs = validations
+    return app

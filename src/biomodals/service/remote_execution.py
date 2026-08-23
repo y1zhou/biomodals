@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -32,6 +32,10 @@ class RemoteRootExecutionFailedError(RuntimeError):
     """The root coordinator call ended without returning an overview."""
 
 
+class RemoteExecutionIdentityMismatchError(RuntimeError):
+    """A remote overview does not belong to the pinned service Job."""
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionLocator:
     """Exact address of one deployed Execution Run."""
@@ -54,7 +58,13 @@ class RemoteExecutionClient:
                 version=deployment.deployment_version,
             )
             await coordinator.hydrate.aio()
-            for method in ("run", "status", "cancel", "provider_calls"):
+            for method in (
+                "run",
+                "status",
+                "cancel",
+                "provider_calls",
+                "provider_call",
+            ):
                 getattr(coordinator, method)
         except Exception as error:
             raise RemoteDeploymentUnavailableError(str(error)) from error
@@ -73,29 +83,34 @@ class RemoteExecutionClient:
             )
         return str(call_id)
 
-    async def poll_root(self, function_call_id: str) -> ExecutionOverview | None:
+    async def poll_root(
+        self, locator: ExecutionLocator, function_call_id: str
+    ) -> ExecutionOverview | None:
         """Poll one root call without invoking coordinator code."""
         call = modal.FunctionCall.from_id(function_call_id)
         try:
-            return await asyncio.to_thread(call.get, timeout=0)
+            overview = await asyncio.to_thread(call.get, timeout=0)
         except modal.exception.TimeoutError:
             return None
         except modal.exception.RemoteError as error:
             raise RemoteRootExecutionFailedError(str(error)) from error
+        return self._verified(locator, overview)
 
     async def status(self, locator: ExecutionLocator) -> ExecutionOverview:
         """Read one bounded remote execution overview."""
         try:
-            return await asyncio.to_thread(self._coordinator(locator).status.remote)
+            overview = await asyncio.to_thread(self._coordinator(locator).status.remote)
         except modal.exception.NotFoundError as error:
             raise RemoteDeploymentUnavailableError(str(error)) from error
+        return self._verified(locator, overview)
 
     async def cancel(self, locator: ExecutionLocator) -> ExecutionOverview:
         """Request durable cancellation from the execution authority."""
         try:
-            return await asyncio.to_thread(self._coordinator(locator).cancel.remote)
+            overview = await asyncio.to_thread(self._coordinator(locator).cancel.remote)
         except modal.exception.NotFoundError as error:
             raise RemoteDeploymentUnavailableError(str(error)) from error
+        return self._verified(locator, overview)
 
     async def provider_calls(
         self,
@@ -125,26 +140,17 @@ class RemoteExecutionClient:
         *,
         node_key: str | None = None,
     ) -> ProviderCallDiagnostic | None:
-        """Resolve an opaque public selector through bounded remote pages."""
-        cursor: UUID | None = None
-        while True:
-            page = await self.provider_calls(
-                locator,
-                node_key=node_key,
-                cursor=cursor,
-                limit=100,
+        """Resolve one opaque public selector with a bounded coordinator read."""
+        try:
+            call = await asyncio.to_thread(
+                self._coordinator(locator).provider_call.remote,
+                str(provider_call_id),
             )
-            match = next(
-                (
-                    call
-                    for call in page.calls
-                    if call.provider_call_id == provider_call_id
-                ),
-                None,
-            )
-            if match is not None or page.next_cursor is None:
-                return match
-            cursor = page.next_cursor
+        except modal.exception.NotFoundError as error:
+            raise RemoteDeploymentUnavailableError(str(error)) from error
+        if call is not None and node_key is not None and call.node_key != node_key:
+            return None
+        return call
 
     async def log_entries(
         self,
@@ -158,17 +164,27 @@ class RemoteExecutionClient:
         """Yield SDK LogEntry objects without blocking the event loop."""
         call = modal.FunctionCall.from_id(function_call_id)
         if live:
-            source = call.logs.stream(timeout=30)
+            source = call.logs.stream.aio(timeout=None)
         elif since is None:
-            source = call.logs.tail(entries=tail_entries)
+            source = call.logs.tail.aio(entries=tail_entries)
         else:
-            source = call.logs.fetch(since=since, until=until)
-        iterator: Iterator[Any] = iter(source)
-        while True:
-            item = await asyncio.to_thread(next, iterator, None)
-            if item is None:
-                return
+            source = call.logs.fetch.aio(since=since, until=until)
+        async for item in source:
             yield item
+
+    @staticmethod
+    def _verified(
+        locator: ExecutionLocator, overview: ExecutionOverview
+    ) -> ExecutionOverview:
+        run = overview.run
+        if (
+            run.execution_run_id != locator.execution_run_id
+            or run.deployment != locator.deployment
+        ):
+            raise RemoteExecutionIdentityMismatchError(
+                "Remote overview identity does not match the pinned Job locator"
+            )
+        return overview
 
     @staticmethod
     def _coordinator(locator: ExecutionLocator) -> Any:

@@ -31,6 +31,7 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
+    ProviderCallDiagnostic,
     ProviderCallPage,
 )
 from biomodals.execution.modal import (
@@ -921,13 +922,20 @@ class ExecutionCoordinator:
         node_key: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
+        newest_first: bool = False,
     ) -> ProviderCallPage:
         """Read one bounded page of calls for service diagnostics."""
         return self._adapter().provider_calls(
             node_key=node_key,
             cursor=None if cursor is None else UUID(cursor),
             limit=limit,
+            newest_first=newest_first,
         )
+
+    @modal.method()
+    def provider_call(self, provider_call_id: str) -> ProviderCallDiagnostic | None:
+        """Read one call selected by service diagnostics."""
+        return self._adapter().provider_call(UUID(provider_call_id))
 
     @modal.method()
     def cancel(self) -> ExecutionOverview:

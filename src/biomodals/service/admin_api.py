@@ -239,6 +239,10 @@ class AdminStateUnknownJobView(BaseModel):
     tool: str
     display_name: str
     reason: str
+    diagnostic_message: str | None
+    modal_environment: str
+    modal_app_name: str
+    modal_app_version: int
     root_function_call_id: str | None
     state_unknown_at: datetime
 
@@ -455,6 +459,10 @@ def _modal_view(
                 tool=job.tool,
                 display_name=job.display_name,
                 reason=job.state_reason,
+                diagnostic_message=job.state_message,
+                modal_environment=job.modal_environment,
+                modal_app_name=job.modal_app_name,
+                modal_app_version=job.modal_app_version,
                 root_function_call_id=job.root_function_call_id,
                 state_unknown_at=datetime.fromtimestamp(job.updated_at, UTC),
             )

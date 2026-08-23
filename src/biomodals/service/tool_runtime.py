@@ -17,6 +17,7 @@ from biomodals.service.remote_execution import (
     ExecutionLocator,
     RemoteDeploymentUnavailableError,
     RemoteExecutionClient,
+    RemoteExecutionIdentityMismatchError,
     RemoteRootExecutionFailedError,
     RemoteSubmissionOutcomeUnknownError,
 )
@@ -122,6 +123,13 @@ class JobLifecycle:
             if job.state == JobState.CANCEL_REQUESTED:
                 try:
                     overview = await self.remote.cancel(_locator(job))
+                except RemoteExecutionIdentityMismatchError as error:
+                    return self.store.mark_state_unknown(
+                        job_id,
+                        reason="provider_outcome_unknown",
+                        message=str(error),
+                        now=now,
+                    )
                 except RemoteDeploymentUnavailableError as error:
                     return self.store.mark_state_unknown(
                         job_id,
@@ -130,17 +138,15 @@ class JobLifecycle:
                         now=now,
                     )
                 return await self._observe(job, overview, registration, now=now)
-            if (
-                finalize
-                and job.state == JobState.BLOCKED
-                and job.result_state is not None
-            ):
-                return await self._finalize(
-                    job,
-                    registration,
-                    result_state=JobState(job.result_state),
-                    now=now,
-                )
+            if job.state == JobState.BLOCKED and job.result_state is not None:
+                if finalize:
+                    return await self._finalize(
+                        job,
+                        registration,
+                        result_state=JobState(job.result_state),
+                        now=now,
+                    )
+                return job
             if job.state in {JobState.RUNNING, JobState.BLOCKED}:
                 if (
                     not force_refresh
@@ -153,17 +159,24 @@ class JobLifecycle:
                     overview = None
                     if background and job.root_function_call_id is not None:
                         overview = await self.remote.poll_root(
-                            job.root_function_call_id
+                            _locator(job), job.root_function_call_id
                         )
                         if overview is None:
-                            return job
+                            return self.store.touch_job(job_id, now=now)
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
-                except RemoteRootExecutionFailedError as error:
+                except RemoteRootExecutionFailedError:
                     return self.store.fail_job(
                         job_id,
                         error_code="remote_coordinator_failed",
-                        error_message=str(error),
+                        error_message="The remote execution coordinator failed",
+                        now=now,
+                    )
+                except RemoteExecutionIdentityMismatchError as error:
+                    return self.store.mark_state_unknown(
+                        job_id,
+                        reason="provider_outcome_unknown",
+                        message=str(error),
                         now=now,
                     )
                 except RemoteDeploymentUnavailableError as error:
@@ -193,6 +206,13 @@ class JobLifecycle:
                 return job
             try:
                 overview = await self.remote.cancel(_locator(job))
+            except RemoteExecutionIdentityMismatchError as error:
+                return self.store.mark_state_unknown(
+                    job_id,
+                    reason="provider_outcome_unknown",
+                    message=str(error),
+                    now=int(time.time()),
+                )
             except RemoteDeploymentUnavailableError as error:
                 return self.store.mark_state_unknown(
                     job_id,
@@ -244,17 +264,7 @@ class JobLifecycle:
             return self.store.fail_job(
                 job.job_id,
                 error_code="remote_execution_failed",
-                error_message=(
-                    overview.run.status_message
-                    or next(
-                        (
-                            node.error_message
-                            for node in overview.nodes
-                            if node.error_message
-                        ),
-                        "Remote execution failed",
-                    )
-                ),
+                error_message="Remote execution failed",
                 now=now,
             )
         return projected
@@ -297,10 +307,6 @@ class JobLifecycle:
         if job is None:
             raise LookupError(f"Job not found: {job_id}")
         return job
-
-    async def discard_pending(self, job: JobRecord) -> None:
-        """Remove a queued request cancelled before remote launch."""
-        await self.registrations[job.tool].adapter.discard_pending(job)
 
     async def restore_result(self, job: JobRecord) -> PreparedResult:
         """Rebuild a cleared local archive from its remote publication."""

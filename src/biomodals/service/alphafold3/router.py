@@ -37,6 +37,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
+    JobRecord,
     ServiceStore,
     UserNotFoundError,
 )
@@ -175,6 +176,22 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
         idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     ) -> JobView:
+        replay = store.find_idempotent_job(
+            session.principal.user_id,
+            tool="alphafold3",
+            idempotency_key=str(idempotency_key),
+        )
+        if replay is not None:
+            async with validation_lock:
+                replay = _idempotent_replay(
+                    store,
+                    validations,
+                    session,
+                    idempotency_key=idempotency_key,
+                    validation_id=body.validation_id,
+                )
+                if replay is not None:
+                    return _job_view(replay, session, configuration)
         validated = _owned_validation(validations, body.validation_id, session)
         effective = configuration.tool("alphafold3")
         deployment = DeploymentIdentity(
@@ -184,21 +201,17 @@ def create_router(
         )
         await remote.preflight(deployment)
         async with validation_lock:
-            validated = _owned_validation(validations, body.validation_id, session)
-            digest = _request_digest(validated)
-            replay = store.find_idempotent_job(
-                session.principal.user_id,
-                tool="alphafold3",
-                idempotency_key=str(idempotency_key),
+            replay = _idempotent_replay(
+                store,
+                validations,
+                session,
+                idempotency_key=idempotency_key,
+                validation_id=body.validation_id,
             )
             if replay is not None:
-                if replay.request_digest != digest:
-                    raise CodedAPIError(
-                        409,
-                        "idempotency_conflict",
-                        "Idempotency key was already used for another request",
-                    )
                 return _job_view(replay, session, configuration)
+            validated = _owned_validation(validations, body.validation_id, session)
+            digest = _request_digest(validated)
             try:
                 admission = store.admit_job(
                     owner_user_id=session.principal.user_id,
@@ -240,6 +253,35 @@ def create_router(
         return _job_view(job, session, configuration)
 
     return router
+
+
+def _idempotent_replay(
+    store: ServiceStore,
+    validations: ValidatedInputStore,
+    session: AuthenticatedSession,
+    *,
+    idempotency_key: UUID,
+    validation_id: UUID,
+) -> JobRecord | None:
+    """Return an existing Job; a consumed key is the remaining request identity."""
+    replay = store.find_idempotent_job(
+        session.principal.user_id,
+        tool="alphafold3",
+        idempotency_key=str(idempotency_key),
+    )
+    if replay is None:
+        return None
+    validated = validations.get(
+        validation_id,
+        owner_user_id=session.principal.user_id,
+    )
+    if validated is not None and replay.request_digest != _request_digest(validated):
+        raise CodedAPIError(
+            409,
+            "idempotency_conflict",
+            "Idempotency key was already used for another request",
+        )
+    return replay
 
 
 def _owned_validation(

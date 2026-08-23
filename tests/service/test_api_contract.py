@@ -1,12 +1,12 @@
 """Current browser API route and authorization contracts."""
 
-# ruff: noqa: D101,D102,D103
+# ruff: noqa: D101,D102,D103,D107
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -32,8 +32,11 @@ ORIGIN = "https://biomodals.internal"
 
 
 class Remote:
+    def __init__(self):
+        self.preflights = 0
+
     async def preflight(self, _deployment):
-        return None
+        self.preflights += 1
 
 
 class Adapter:
@@ -102,11 +105,11 @@ def _app(tmp_path: Path):
     return app
 
 
-def _session() -> AuthenticatedSession:
+def _session(user_id: UUID | None = None) -> AuthenticatedSession:
     now = 1_700_000_000
     return AuthenticatedSession(
         principal=Principal(
-            user_id=uuid4(),
+            user_id=user_id or uuid4(),
             email="scientist@example.com",
             display_name="Scientist",
             is_admin=False,
@@ -118,14 +121,14 @@ def _session() -> AuthenticatedSession:
     )
 
 
-def _request(app, method: str, path: str) -> httpx.Response:
+def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
             base_url=ORIGIN,
         ) as client:
-            return await client.request(method, path)
+            return await client.request(method, path, **kwargs)
 
     return asyncio.run(send())
 
@@ -143,6 +146,14 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
     alpha_request = document["components"]["schemas"]["AlphaFold3JobRequest"]
     assert alpha_request["required"] == ["validation_id"]
     assert alpha_request["additionalProperties"] is False
+    unknown_job = document["components"]["schemas"]["AdminStateUnknownJobView"]
+    assert {
+        "diagnostic_message",
+        "modal_environment",
+        "modal_app_name",
+        "modal_app_version",
+        "root_function_call_id",
+    } <= set(unknown_job["required"])
     recycle = next(
         parameter
         for parameter in paths["/api/v1/alphafold3/validations"]["post"]["parameters"]
@@ -180,3 +191,63 @@ def test_authenticated_routes_receive_the_principal(tmp_path: Path) -> None:
     assert principal.json()["email"] == "scientist@example.com"
     assert jobs.status_code == 200
     assert jobs.json() == {"jobs": [], "next_cursor": None}
+
+
+def test_alphafold3_lost_response_replays_after_validation_consumption(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path)
+    store = app.state.store
+    user = store.create_user(
+        email="scientist@example.com",
+        display_name="Scientist",
+        token_digest=b"setup",
+        token_expires_at=100,
+        now=1,
+        is_admin=True,
+        active_job_limit=10,
+    )
+    store.set_password_from_token(
+        b"setup",
+        password_hash="test",  # noqa: S106
+        session_token_digest=b"session",
+        csrf_digest=b"csrf",
+        now=2,
+        absolute_expires_at=1000,
+    )
+    session = _session(user.user_id)
+    idempotency_key = uuid4()
+    job_id = uuid4()
+    tool = app.state.configuration.tool("alphafold3")
+    store.admit_job(
+        owner_user_id=user.user_id,
+        tool="alphafold3",
+        display_name="prediction",
+        idempotency_key=str(idempotency_key),
+        request_digest="a" * 64,
+        modal_environment=app.state.configuration.modal_environment().value,
+        modal_app_name=tool.modal_app_name.value,
+        modal_app_version=tool.modal_app_version.value,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=1,
+        now=10,
+        new_job_id=job_id,
+    )
+
+    async def authenticated() -> AuthenticatedSession:
+        return session
+
+    app.dependency_overrides[require_unsafe_session] = authenticated
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/jobs",
+        headers={"Idempotency-Key": str(idempotency_key), "Origin": ORIGIN},
+        json={"validation_id": str(uuid4())},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["job_id"] == str(job_id)
+    assert app.state.remote_execution.preflights == 0

@@ -86,7 +86,6 @@ def test_projection_treats_cache_hits_and_partial_nodes_as_terminal() -> None:
 
     assert stages["prepare_simulation"]["outcome"] == "completed"
     assert stages["run_production"]["outcome"] == "partial"
-    assert projection["warnings"] == [
-        "One prediction could not be produced",
-        "One task failed",
-    ]
+    assert projection["warnings"] == ["Some results could not be produced"]
+    assert "One prediction" not in str(projection)
+    assert "One task failed" not in str(projection)

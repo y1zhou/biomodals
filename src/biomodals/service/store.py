@@ -1490,6 +1490,20 @@ class ServiceStore:
             ).fetchall()
         return [_job_from_row(row) for row in rows]
 
+    def touch_job(self, job_id: UUID, *, now: int) -> JobRecord:
+        """Move one unchanged Job behind older reconciliation candidates."""
+        with self._transaction() as conn:
+            conn.execute(
+                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
+                (now, str(job_id)),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+        return _job_from_row(row)
+
     def record_launch(
         self,
         job_id: UUID,

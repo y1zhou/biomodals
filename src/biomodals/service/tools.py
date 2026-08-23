@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from biomodals.execution import (
     ExecutionOverview,
     NodeStatus,
+    RunStatus,
     TaskStatus,
     WorkStatusReason,
 )
@@ -212,21 +213,18 @@ def project_overview(
             "task_counts": counts,
             "running_functions": running_functions,
         })
-    warnings = [
-        message
-        for message in [
-            overview.run.status_message,
-            *(node.error_message for node in overview.nodes),
-        ]
-        if message
-    ]
+    warnings = (
+        ["Some results could not be produced"]
+        if overview.run.status == RunStatus.PARTIAL
+        else []
+    )
     return {
         "stages": stages,
         "active_provider_calls": {
             "total": overview.active_provider_calls.total,
             "gpu": overview.active_provider_calls.gpu,
         },
-        "warnings": list(dict.fromkeys(warnings)),
+        "warnings": warnings,
     }
 
 

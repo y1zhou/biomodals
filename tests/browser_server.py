@@ -126,7 +126,9 @@ class _FakeRemote:
         self._write_stats()
         return f"fake-root-{locator.execution_run_id}"
 
-    async def poll_root(self, function_call_id: str) -> ExecutionOverview | None:
+    async def poll_root(
+        self, _locator: ExecutionLocator, function_call_id: str
+    ) -> ExecutionOverview | None:
         run_id = UUID(function_call_id.removeprefix("fake-root-"))
         return self._overview(run_id)
 

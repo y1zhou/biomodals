@@ -7,13 +7,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from biomodals.execution import ActiveProviderCallCounts, RunStatus
 from biomodals.service.artifacts import ArtifactCache
-from biomodals.service.remote_execution import RemoteRootExecutionFailedError
+from biomodals.service.remote_execution import (
+    RemoteExecutionIdentityMismatchError,
+    RemoteRootExecutionFailedError,
+)
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
     JobLifecycle,
@@ -59,7 +62,7 @@ def _store(tmp_path: Path) -> ServiceStore:
         token_expires_at=100,
         now=1,
         is_admin=True,
-        active_job_limit=10,
+        active_job_limit=200,
     )
     store.set_password_from_token(
         b"setup",
@@ -78,8 +81,8 @@ def _store(tmp_path: Path) -> ServiceStore:
         modal_environment="main",
         modal_app_name="AlphaFold3",
         modal_app_version=1,
-        tool_active_job_limit=10,
-        global_active_job_limit=10,
+        tool_active_job_limit=200,
+        global_active_job_limit=200,
         max_active_provider_calls=4,
         max_active_gpu_provider_calls=1,
         now=10,
@@ -197,7 +200,7 @@ async def test_background_poll_does_not_wake_an_active_coordinator(
         async def launch(self, _locator):
             return "fc-root"
 
-        async def poll_root(self, _function_call_id):
+        async def poll_root(self, _locator, _function_call_id):
             return None
 
         async def status(self, _locator):
@@ -214,6 +217,7 @@ async def test_background_poll_does_not_wake_an_active_coordinator(
 
     active = await lifecycle.advance(JOB_ID, finalize=True, background=True)
     assert active.state == JobState.RUNNING
+    assert active.updated_at > 10
 
 
 @pytest.mark.anyio
@@ -224,7 +228,7 @@ async def test_terminal_root_failure_is_not_treated_as_still_running(
         async def launch(self, _locator):
             return "fc-root"
 
-        async def poll_root(self, _function_call_id):
+        async def poll_root(self, _locator, _function_call_id):
             raise RemoteRootExecutionFailedError("coordinator crashed")
 
     _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
@@ -234,4 +238,129 @@ async def test_terminal_root_failure_is_not_treated_as_still_running(
     assert (failed.state, failed.error_code) == (
         JobState.FAILED,
         "remote_coordinator_failed",
+    )
+    assert failed.error_message == "The remote execution coordinator failed"
+
+
+@pytest.mark.anyio
+async def test_active_timeouts_rotate_a_bounded_reconciliation_page(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def poll_root(self, _locator, _function_call_id):
+            return None
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    first = store.get_job_by_id(JOB_ID)
+    assert first is not None
+    job_ids = {first.job_id}
+    for ordinal in range(100):
+        job_id = uuid4()
+        job_ids.add(job_id)
+        store.admit_job(
+            owner_user_id=first.owner_user_id,
+            tool="alphafold3",
+            display_name=f"prediction-{ordinal}",
+            idempotency_key=f"request-{ordinal}",
+            request_digest=f"{ordinal:064x}",
+            modal_environment="main",
+            modal_app_name="AlphaFold3",
+            modal_app_version=1,
+            tool_active_job_limit=200,
+            global_active_job_limit=200,
+            max_active_provider_calls=4,
+            max_active_gpu_provider_calls=1,
+            now=10,
+            new_job_id=job_id,
+        )
+    for job_id in job_ids:
+        store.record_launch(job_id, function_call_id=f"fc-{job_id}", now=10)
+
+    selected = store.list_reconcilable_jobs(now=10**10)
+    deferred = job_ids - {job.job_id for job in selected}
+    assert len(selected) == 100
+    assert len(deferred) == 1
+    for job in selected:
+        await lifecycle.advance(job.job_id, finalize=True, background=True)
+
+    next_page = store.list_reconcilable_jobs(now=10**10)
+    assert deferred <= {job.job_id for job in next_page}
+
+
+@pytest.mark.anyio
+async def test_result_block_does_not_wake_remote_on_owner_refresh(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def status(self, _locator):
+            raise AssertionError("blocked result delivery must stay local")
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    store.begin_finalization(
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        projection={"stages": [], "warnings": []},
+        now=20,
+    )
+    blocked = store.block_job(
+        JOB_ID,
+        category="result_preparation_failed",
+        message="cache unavailable",
+        retry_at=80,
+        now=21,
+    )
+
+    viewed = await lifecycle.advance(JOB_ID, force_refresh=True)
+    assert viewed == blocked
+
+
+@pytest.mark.anyio
+async def test_remote_failure_details_are_not_owner_visible(tmp_path: Path) -> None:
+    raw_path = "/volumes/private/scientific-output"
+
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def status(self, _locator):
+            overview = _overview(RunStatus.FAILED)
+            overview.run.status_message = f"failed reading {raw_path}"
+            overview.nodes = (
+                SimpleNamespace(
+                    node_key="inference",
+                    status=SimpleNamespace(value="failed"),
+                    status_reason=None,
+                    error_message=f"traceback at {raw_path}",
+                    started_at=10,
+                    completed_at=20,
+                ),
+            )
+            return overview
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+    failed = await lifecycle.advance(JOB_ID, force_refresh=True)
+
+    assert failed.error_message == "Remote execution failed"
+    assert raw_path not in str(failed.projection)
+    assert raw_path not in str(failed.error_message)
+
+
+@pytest.mark.anyio
+async def test_remote_identity_mismatch_becomes_state_unknown(tmp_path: Path) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def status(self, _locator):
+            raise RemoteExecutionIdentityMismatchError("wrong execution identity")
+
+    _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+    unknown = await lifecycle.advance(JOB_ID, force_refresh=True)
+
+    assert (unknown.state, unknown.state_reason, unknown.state_message) == (
+        JobState.STATE_UNKNOWN,
+        "provider_outcome_unknown",
+        "wrong execution identity",
     )

@@ -246,6 +246,8 @@ async def test_terminal_root_failure_is_not_treated_as_still_running(
 async def test_active_timeouts_rotate_a_bounded_reconciliation_page(
     tmp_path: Path,
 ) -> None:
+    same_second = 10**10
+
     class Remote:
         async def poll_root(self, _locator, _function_call_id):
             return None
@@ -270,20 +272,24 @@ async def test_active_timeouts_rotate_a_bounded_reconciliation_page(
             global_active_job_limit=200,
             max_active_provider_calls=4,
             max_active_gpu_provider_calls=1,
-            now=10,
+            now=same_second,
             new_job_id=job_id,
         )
     for job_id in job_ids:
-        store.record_launch(job_id, function_call_id=f"fc-{job_id}", now=10)
+        store.record_launch(
+            job_id,
+            function_call_id=f"fc-{job_id}",
+            now=same_second,
+        )
 
-    selected = store.list_reconcilable_jobs(now=10**10)
+    selected = store.list_reconcilable_jobs(now=same_second)
     deferred = job_ids - {job.job_id for job in selected}
     assert len(selected) == 100
     assert len(deferred) == 1
     for job in selected:
         await lifecycle.advance(job.job_id, finalize=True, background=True)
 
-    next_page = store.list_reconcilable_jobs(now=10**10)
+    next_page = store.list_reconcilable_jobs(now=same_second)
     assert deferred <= {job.job_id for job in next_page}
 
 

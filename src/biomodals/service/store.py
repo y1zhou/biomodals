@@ -1494,8 +1494,12 @@ class ServiceStore:
         """Move one unchanged Job behind older reconciliation candidates."""
         with self._transaction() as conn:
             conn.execute(
-                "UPDATE jobs SET updated_at = ? WHERE job_id = ?",
-                (now, str(job_id)),
+                """
+                UPDATE jobs SET updated_at = CASE
+                    WHEN updated_at >= ? THEN updated_at + 1 ELSE ? END
+                WHERE job_id = ?
+                """,
+                (now, now, str(job_id)),
             )
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)

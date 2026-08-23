@@ -24,6 +24,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 from biomodals.helper.artifacts import replace_bytes_atomic
 
 MAX_VALIDATION_BYTES = 256 * 1024 * 1024
+MAX_JOB_NAME_LENGTH = 120
 VALIDATION_TTL_SECONDS = 24 * 60 * 60
 
 
@@ -107,6 +108,10 @@ class ValidatedInputStore:
         document = orjson.loads(content)
         _reject_path_fields(document)
         config = AF3Config.model_validate(document)
+        if len(config.name) > MAX_JOB_NAME_LENGTH:
+            raise ValueError(
+                f"AlphaFold3 Job name exceeds {MAX_JOB_NAME_LENGTH} characters"
+            )
         normalized = orjson.loads(serialize_af3_input(config))
         prediction_count = (
             len(normalize_model_seeds(config.modelSeeds)) * settings.sample

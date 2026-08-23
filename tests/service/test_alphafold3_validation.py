@@ -59,6 +59,34 @@ def test_validation_retains_native_document_and_bounded_preview(tmp_path: Path) 
     assert store.get(validated.validation_id, owner_user_id=OWNER, now=11) is not None
 
 
+def test_validation_allows_zero_recycles_and_bounds_job_name(tmp_path: Path) -> None:
+    store = ValidatedInputStore(tmp_path)
+    store.initialize()
+    source = tmp_path / "input.json"
+    content = _document()
+    source.write_bytes(content)
+
+    validated = store.validate_and_publish(
+        source,
+        owner_user_id=OWNER,
+        digest=hashlib.sha256(content).hexdigest(),
+        settings=ValidationSettings(recycle=0),
+    )
+    assert validated.settings.recycle == 0
+
+    document = orjson.loads(content)
+    document["name"] = "x" * 121
+    oversized = orjson.dumps(document)
+    source.write_bytes(oversized)
+    with pytest.raises(ValueError, match="name exceeds 120"):
+        store.validate_and_publish(
+            source,
+            owner_user_id=OWNER,
+            digest=hashlib.sha256(oversized).hexdigest(),
+            settings=ValidationSettings(),
+        )
+
+
 def test_validation_preview_counts_custom_inputs(tmp_path: Path) -> None:
     store = ValidatedInputStore(tmp_path)
     store.initialize()

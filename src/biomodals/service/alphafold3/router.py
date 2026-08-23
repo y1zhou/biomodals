@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import sqlite3
 import tempfile
 import time
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from uuid import UUID, uuid4
 
 import orjson
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
 from biomodals.execution import DeploymentIdentity
@@ -71,7 +73,7 @@ def create_router(
 ) -> APIRouter:
     """Create AlphaFold3 validation and submission routes."""
     router = APIRouter(prefix="/api/v1/alphafold3", tags=["alphafold3"])
-    parse_lock = asyncio.Lock()
+    validation_lock = asyncio.Lock()
 
     @router.post("/validations", response_model=ValidationView, status_code=201)
     async def validate_document(
@@ -79,14 +81,9 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
         search_msa: Annotated[bool, Query()] = True,
         search_protein_templates: Annotated[bool, Query()] = True,
-        recycle: Annotated[int, Query(ge=1)] = 10,
+        recycle: Annotated[int, Query(ge=0)] = 10,
         sample: Annotated[int, Query(ge=1)] = 5,
     ) -> ValidationView:
-        await asyncio.to_thread(
-            validations.cleanup_expired,
-            claimed=store.claimed_validation_ids(),
-            now=int(time.time()),
-        )
         descriptor, raw_path = tempfile.mkstemp(
             dir=validations.directory.parent,
             prefix=".alphafold3-upload-",
@@ -115,7 +112,12 @@ def create_router(
                 sample=sample,
             )
             try:
-                async with parse_lock:
+                async with validation_lock:
+                    await asyncio.to_thread(
+                        validations.cleanup_expired,
+                        claimed=store.claimed_validation_ids(),
+                        now=int(time.time()),
+                    )
                     validated = await asyncio.to_thread(
                         validations.validate_and_publish,
                         path,
@@ -140,14 +142,14 @@ def create_router(
     async def download_document(
         validation_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_session)],
-    ) -> Response:
+    ) -> FileResponse:
         validated = _owned_validation(validations, validation_id, session)
-        return Response(
-            await asyncio.to_thread(validated.document_path.read_bytes),
+        return FileResponse(
+            validated.document_path,
             media_type="application/json",
+            filename="alphafold3-input.json",
             headers={
                 "Cache-Control": "private, no-store",
-                "Content-Disposition": 'attachment; filename="alphafold3-input.json"',
             },
         )
 
@@ -156,14 +158,15 @@ def create_router(
         validation_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
     ) -> Response:
-        if store.validation_is_claimed(validation_id):
-            raise HTTPException(409, "Validation is already claimed by a Job")
-        if not await asyncio.to_thread(
-            validations.delete,
-            validation_id,
-            owner_user_id=session.principal.user_id,
-        ):
-            raise HTTPException(404, "Validation not found")
+        async with validation_lock:
+            if store.validation_is_claimed(validation_id):
+                raise HTTPException(409, "Validation is already claimed by a Job")
+            if not await asyncio.to_thread(
+                validations.delete,
+                validation_id,
+                owner_user_id=session.principal.user_id,
+            ):
+                raise HTTPException(404, "Validation not found")
         return Response(status_code=204)
 
     @router.post("/jobs", response_model=JobView, status_code=202)
@@ -172,13 +175,6 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
         idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     ) -> JobView:
-        replay = store.find_idempotent_job(
-            session.principal.user_id,
-            tool="alphafold3",
-            idempotency_key=str(idempotency_key),
-        )
-        if replay is not None:
-            return _job_view(replay, session, configuration)
         validated = _owned_validation(validations, body.validation_id, session)
         effective = configuration.tool("alphafold3")
         deployment = DeploymentIdentity(
@@ -187,31 +183,56 @@ def create_router(
             effective.modal_app_version.value,
         )
         await remote.preflight(deployment)
-        digest = _request_digest(validated)
-        try:
-            admission = store.admit_job(
-                owner_user_id=session.principal.user_id,
+        async with validation_lock:
+            validated = _owned_validation(validations, body.validation_id, session)
+            digest = _request_digest(validated)
+            replay = store.find_idempotent_job(
+                session.principal.user_id,
                 tool="alphafold3",
-                display_name=str(validated.preview["name"]),
                 idempotency_key=str(idempotency_key),
-                request_digest=digest,
-                modal_environment=deployment.environment,
-                modal_app_name=deployment.deployment_name,
-                modal_app_version=deployment.deployment_version,
-                tool_active_job_limit=effective.active_job_limit.value,
-                global_active_job_limit=configuration.global_active_job_limit().value,
-                max_active_provider_calls=effective.max_active_provider_calls.value,
-                max_active_gpu_provider_calls=(
-                    effective.max_active_gpu_provider_calls.value
-                ),
-                now=int(time.time()),
-                new_job_id=uuid4(),
-                pending_validation_id=validated.validation_id,
             )
-        except (IdempotencyConflictError, JobLimitExceededError) as error:
-            raise CodedAPIError(409, "job_conflict", str(error)) from error
-        except UserNotFoundError as error:
-            raise CodedAPIError(403, "account_disabled", str(error)) from error
+            if replay is not None:
+                if replay.request_digest != digest:
+                    raise CodedAPIError(
+                        409,
+                        "idempotency_conflict",
+                        "Idempotency key was already used for another request",
+                    )
+                return _job_view(replay, session, configuration)
+            try:
+                admission = store.admit_job(
+                    owner_user_id=session.principal.user_id,
+                    tool="alphafold3",
+                    display_name=str(validated.preview["name"]),
+                    idempotency_key=str(idempotency_key),
+                    request_digest=digest,
+                    modal_environment=deployment.environment,
+                    modal_app_name=deployment.deployment_name,
+                    modal_app_version=deployment.deployment_version,
+                    tool_active_job_limit=effective.active_job_limit.value,
+                    global_active_job_limit=(
+                        configuration.global_active_job_limit().value
+                    ),
+                    max_active_provider_calls=(
+                        effective.max_active_provider_calls.value
+                    ),
+                    max_active_gpu_provider_calls=(
+                        effective.max_active_gpu_provider_calls.value
+                    ),
+                    now=int(time.time()),
+                    new_job_id=uuid4(),
+                    pending_validation_id=validated.validation_id,
+                )
+            except sqlite3.IntegrityError as error:
+                raise CodedAPIError(
+                    409,
+                    "validation_claimed",
+                    "Validation is already claimed by another Job",
+                ) from error
+            except (IdempotencyConflictError, JobLimitExceededError) as error:
+                raise CodedAPIError(409, "job_conflict", str(error)) from error
+            except UserNotFoundError as error:
+                raise CodedAPIError(403, "account_disabled", str(error)) from error
         try:
             job = await lifecycle.advance(admission.job.job_id)
         except Exception:

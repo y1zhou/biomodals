@@ -143,6 +143,13 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
     alpha_request = document["components"]["schemas"]["AlphaFold3JobRequest"]
     assert alpha_request["required"] == ["validation_id"]
     assert alpha_request["additionalProperties"] is False
+    recycle = next(
+        parameter
+        for parameter in paths["/api/v1/alphafold3/validations"]["post"]["parameters"]
+        if parameter["name"] == "recycle"
+    )
+    assert recycle["name"] == "recycle"
+    assert recycle["schema"]["minimum"] == 0
 
 
 def test_private_routes_require_a_session(tmp_path: Path) -> None:

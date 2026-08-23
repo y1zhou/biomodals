@@ -99,6 +99,12 @@ refreshes an active remote Run only when its projection is at least 60 seconds
 old. The explicit refresh route bypasses that freshness check while preserving
 per-Job serialization.
 
+The background reconciler runs every 60 seconds by default. While a root
+Function Call is active it uses the SDK's nonblocking root-call status only;
+it reads the detailed coordinator ledger after terminal root completion or an
+interactive detail/refresh request. Root-call failure is terminal rather than
+indistinguishable from an active timeout.
+
 The public Job states remain `queued`, `running`, `finalizing`,
 `cancel_requested`, `state_unknown`, `blocked`, `succeeded`, `partial`,
 `failed`, and `cancelled`. Before remote execution begins, an admitted Job is
@@ -156,6 +162,9 @@ archive builder without a website-specific layout. The service stages the
 resulting `{sanitized-job-name}_{view-id}_AlphaFold3.tar.zst` in its configured
 cache and records its metadata. It does not reinterpret the manifest or select
 scientific artifacts independently of the app.
+Archive members are sorted and tar ownership, time, and format metadata are
+normalized so rebuilding identical remote publications produces the recorded
+SHA-256 byte for byte.
 
 GROMACS intentionally retains its existing service-owned ZIP builder because
 the app publishes a verified directory and exact file set rather than an
@@ -235,6 +244,11 @@ while writing, and runs JSON/Pydantic parsing in one bounded background worker.
 Only successful validation atomically publishes the 24-hour resource. This
 serializes the memory-heavy parse without blocking unrelated event-loop work;
 concurrent uploads may still progress.
+Job names are limited to 120 characters. Pairformer recycles may be zero.
+Cleanup, deletion, and the final validation claim share one short process-local
+critical section so an admitted resource cannot be removed between reload and
+claim. Reusing an idempotency key with a different validated request is a
+conflict.
 
 Both modes create the validation resource before proceeding to the same
 confirmation page. This performs `AF3Config` parsing and the existing
@@ -326,6 +340,14 @@ A semantic stage may have multiple log targets. The expanded stage shows a
 compact selector labeled with function, status, and start time, preferring an
 active call and then the most recently started call. Public responses use an
 opaque log-target selector and never expose the Modal Function Call ID.
+Target lookup is stage-filtered and bounded rather than paging every Provider
+Call in the Run. Historical requests require timezone-aware start and end
+times in ascending order and use windows of at most one hour. The frontend
+reconnects a still-active stream after the SDK's bounded idle timeout.
+
+Terminal scientific observation only persists `finalizing`; the background
+reconciler performs archive preparation. Startup reconciles cache-presence
+markers with actual archives, and a verified rebuild marks the Result cached.
 
 Live reads use one Modal SDK stream each and are limited to 32 service-wide,
 four per User, and four per Job. Excess requests receive a typed `429` with a

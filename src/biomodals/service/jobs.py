@@ -33,7 +33,7 @@ class JobStageView(BaseModel):
     label: str
     started_at: datetime | None = None
     ended_at: datetime | None = None
-    outcome: Literal["completed", "failed", "cancelled"] | None = None
+    outcome: Literal["completed", "partial", "failed", "cancelled"] | None = None
     task_counts: StageTaskCounts = Field(default_factory=StageTaskCounts)
     running_functions: list[str] = Field(default_factory=list)
 

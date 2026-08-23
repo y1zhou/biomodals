@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -115,19 +115,56 @@ def create_job_logs_router() -> APIRouter:
         session: Annotated[AuthenticatedSession, Depends(require_session)],
         cursor: Annotated[UUID | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        stage_code: Annotated[str | None, Query()] = None,
     ) -> JobLogTargetsView:
         job, registration = _authorized(request, job_id, session)
         remote: RemoteExecutionClient = request.app.state.remote_execution
-        page = await remote.provider_calls(_locator(job), cursor=cursor, limit=limit)
+        stage = next(
+            (
+                stage
+                for stage in registration.definition.stages
+                if stage.code == stage_code
+            ),
+            None,
+        )
+        if stage_code is not None and stage is None:
+            raise HTTPException(404, "Job stage not found")
+        if stage is None:
+            page = await remote.provider_calls(
+                _locator(job), cursor=cursor, limit=limit
+            )
+            calls = page.calls
+            next_cursor = page.next_cursor
+        else:
+            if cursor is not None:
+                raise HTTPException(
+                    400, "Stage-filtered log targets do not use cursors"
+                )
+            pages = [
+                await remote.provider_calls(
+                    _locator(job),
+                    node_key=node_key,
+                    limit=limit,
+                )
+                for node_key in stage.node_keys
+            ]
+            calls = tuple(
+                sorted(
+                    (call for page in pages for call in page.calls),
+                    key=lambda call: (call.created_at, str(call.provider_call_id)),
+                    reverse=True,
+                )[:limit]
+            )
+            next_cursor = None
         values = [
             _target(registration.definition, call)
-            for call in page.calls
+            for call in calls
             if call.provider_call_handle_id is not None
         ]
         return JobLogTargetsView(
             job_id=job_id,
             targets=[value for value in values if value is not None],
-            next_cursor=page.next_cursor,
+            next_cursor=next_cursor,
         )
 
     @router.get(
@@ -152,7 +189,7 @@ def create_job_logs_router() -> APIRouter:
         ):
             raise HTTPException(409, "Job log target is unavailable")
         handle = call.provider_call_handle_id
-        live = not call.status.is_terminal
+        live = _validate_window(call, since=since, until=until)
         user_id = session.principal.user_id
         if live:
             await live_streams.acquire(user_id, job_id)
@@ -188,6 +225,28 @@ def create_job_logs_router() -> APIRouter:
         )
 
     return router
+
+
+def _validate_window(
+    call: ProviderCallDiagnostic,
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> bool:
+    """Validate historical bounds before response headers are committed."""
+    if since is None and until is None:
+        if call.status.is_terminal:
+            raise HTTPException(422, "Historical logs require since and until")
+        return True
+    if since is None or until is None:
+        raise HTTPException(422, "Historical logs require since and until")
+    if since.utcoffset() is None or until.utcoffset() is None:
+        raise HTTPException(422, "Historical log times must include a timezone")
+    if since >= until:
+        raise HTTPException(422, "Historical log start must be before end")
+    if until - since > timedelta(hours=1):
+        raise HTTPException(422, "Historical log window exceeds one hour")
+    return False
 
 
 def _authorized(

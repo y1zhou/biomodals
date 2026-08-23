@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from pathlib import PurePosixPath
 from typing import BinaryIO, cast
 
@@ -134,10 +133,3 @@ class GromacsToolAdapter:
             environment_name=job.modal_environment,
             version=2,
         )
-
-
-def request_digest(request: GromacsExecutionRequest, display_name: str) -> str:
-    """Bind an idempotency key to immutable scientific input and UI identity."""
-    digest = hashlib.sha256(request.to_bytes())
-    digest.update(orjson.dumps({"display_name": display_name}))
-    return digest.hexdigest()

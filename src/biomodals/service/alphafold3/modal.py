@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import tempfile
 
@@ -18,6 +17,7 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
 )
 from biomodals.app.fold.alphafold3.request_results import create_request_archive
 from biomodals.execution.modal import stage_execution_launch
+from biomodals.helper.artifacts import file_size_sha256
 from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.store import JobRecord
@@ -108,7 +108,7 @@ class AlphaFold3ToolAdapter:
                     display_name=request.config.name,
                 )
                 os.replace(archive, staging)
-            size_bytes, digest = await cache.run_bounded(_file_identity, staging)
+            size_bytes, digest = await cache.run_bounded(file_size_sha256, staging)
             lease = await cache.publish_staged(
                 str(job.job_id),
                 staging,
@@ -132,13 +132,3 @@ class AlphaFold3ToolAdapter:
             environment_name=job.modal_environment,
             version=2,
         )
-
-
-def _file_identity(path) -> tuple[int, str]:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            size += len(chunk)
-            digest.update(chunk)
-    return size, digest.hexdigest()

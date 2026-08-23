@@ -13,6 +13,7 @@ import pytest
 
 from biomodals.execution import ActiveProviderCallCounts, RunStatus
 from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.remote_execution import RemoteRootExecutionFailedError
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
     JobLifecycle,
@@ -179,3 +180,52 @@ async def test_terminal_observation_defers_result_work(tmp_path: Path) -> None:
     completed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
     assert completed.state == JobState.SUCCEEDED
     assert adapter.prepared == 1
+
+    store.reconcile_result_cache(set())
+    cleared = store.get_job_by_id(JOB_ID)
+    assert cleared is not None and cleared.cache_cleared_at is not None
+    await lifecycle.restore_result(cleared)
+    restored = store.get_job_by_id(JOB_ID)
+    assert restored is not None and restored.cache_cleared_at is None
+
+
+@pytest.mark.anyio
+async def test_background_poll_does_not_wake_an_active_coordinator(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _function_call_id):
+            return None
+
+        async def status(self, _locator):
+            raise AssertionError("active background polling must not call status")
+
+    _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+
+    active = await lifecycle.advance(JOB_ID, finalize=True, background=True)
+    assert active.state == JobState.RUNNING
+
+
+@pytest.mark.anyio
+async def test_terminal_root_failure_is_not_treated_as_still_running(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _function_call_id):
+            raise RemoteRootExecutionFailedError("coordinator crashed")
+
+    _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+
+    failed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
+    assert (failed.state, failed.error_code) == (
+        JobState.FAILED,
+        "remote_coordinator_failed",
+    )

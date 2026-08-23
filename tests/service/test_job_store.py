@@ -11,6 +11,7 @@ import pytest
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobState,
+    JobStateResolutionError,
     ServiceStore,
 )
 
@@ -158,3 +159,59 @@ def test_projection_and_result_metadata_replace_atomically(tmp_path: Path) -> No
     assert finalizing.projection == projection
     assert completed.state == JobState.SUCCEEDED
     assert completed.result_filename == "prediction.tar.zst"
+
+
+def test_unknown_launch_requires_an_explicit_safe_resolution(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.mark_submission_in_progress(JOB_ID, now=11)
+
+    with pytest.raises(JobStateResolutionError, match="Function Call ID"):
+        store.resolve_state_unknown(
+            JOB_ID,
+            resolution="resume",
+            function_call_id=None,
+            now=12,
+        )
+
+    resumed = store.resolve_state_unknown(
+        JOB_ID,
+        resolution="resume",
+        function_call_id="fc-existing",
+        now=12,
+    )
+    assert (resumed.state, resumed.root_function_call_id) == (
+        JobState.RUNNING,
+        "fc-existing",
+    )
+
+
+def test_unknown_launch_can_only_requeue_without_launch_evidence(
+    tmp_path: Path,
+) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.mark_submission_in_progress(JOB_ID, now=11)
+    requeued = store.resolve_state_unknown(
+        JOB_ID,
+        resolution="requeue",
+        function_call_id=None,
+        now=12,
+    )
+    assert requeued.state == JobState.QUEUED
+
+    store.mark_submission_in_progress(JOB_ID, now=13)
+    store.record_launch(JOB_ID, function_call_id="fc-existing", now=14)
+    store.mark_state_unknown(
+        JOB_ID,
+        reason="provider_outcome_unknown",
+        message="unknown",
+        now=15,
+    )
+    with pytest.raises(JobStateResolutionError, match="cannot be requeued"):
+        store.resolve_state_unknown(
+            JOB_ID,
+            resolution="requeue",
+            function_call_id=None,
+            now=16,
+        )

@@ -1722,8 +1722,15 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
         return _job_from_row(row)
 
-    def resolve_state_unknown(self, job_id: UUID, *, now: int) -> JobRecord:
-        """Return an unknown Job to local reconciliation after Admin review."""
+    def resolve_state_unknown(
+        self,
+        job_id: UUID,
+        *,
+        resolution: str,
+        function_call_id: str | None,
+        now: int,
+    ) -> JobRecord:
+        """Apply one explicit Administrator decision to an ambiguous launch."""
         with self._transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
@@ -1732,17 +1739,43 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             if row["state"] != JobState.STATE_UNKNOWN.value:
                 raise JobStateResolutionError("Job is not state_unknown")
-            target = (
-                JobState.CANCEL_REQUESTED
-                if row["cancel_requested_at"] is not None
-                else JobState.RUNNING
-            )
+            existing_call = row["root_function_call_id"]
+            if resolution == "resume":
+                selected_call = function_call_id or existing_call
+                if not selected_call:
+                    raise JobStateResolutionError(
+                        "Resuming requires the existing Function Call ID"
+                    )
+                target = JobState.RUNNING
+            elif resolution == "requeue":
+                if existing_call is not None:
+                    raise JobStateResolutionError(
+                        "A Job with recorded launch evidence cannot be requeued"
+                    )
+                selected_call = None
+                target = JobState.QUEUED
+            elif resolution == "cancel":
+                selected_call = existing_call
+                target = JobState.CANCEL_REQUESTED
+            else:
+                raise ValueError("Unknown state resolution")
             conn.execute(
                 """
-                UPDATE jobs SET state = ?, state_reason = NULL,
-                    state_message = NULL, updated_at = ? WHERE job_id = ?
+                UPDATE jobs SET state = ?, root_function_call_id = ?,
+                    cancel_requested_at = CASE
+                        WHEN ? = 'cancel_requested' THEN COALESCE(cancel_requested_at, ?)
+                        ELSE cancel_requested_at END,
+                    state_reason = NULL, state_message = NULL, updated_at = ?
+                WHERE job_id = ?
                 """,
-                (target.value, now, str(job_id)),
+                (
+                    target.value,
+                    selected_call,
+                    target.value,
+                    now,
+                    now,
+                    str(job_id),
+                ),
             )
             updated = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)

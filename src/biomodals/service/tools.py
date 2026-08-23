@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from biomodals.execution import ExecutionOverview, NodeStatus, TaskStatus
+from biomodals.execution import (
+    ExecutionOverview,
+    NodeStatus,
+    TaskStatus,
+    WorkStatusReason,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,12 +161,22 @@ def project_overview(
         if not selected:
             continue
         statuses = {node.status for node in selected}
+        cache_satisfied = all(
+            node.status == NodeStatus.SUCCEEDED
+            or (
+                node.status == NodeStatus.SKIPPED
+                and node.status_reason == WorkStatusReason.RESULT_ALREADY_SATISFIED
+            )
+            for node in selected
+        )
         if NodeStatus.FAILED in statuses:
             outcome = "failed"
+        elif NodeStatus.PARTIAL in statuses:
+            outcome = "partial"
+        elif cache_satisfied:
+            outcome = "completed"
         elif statuses & {NodeStatus.CANCELLED, NodeStatus.SKIPPED}:
             outcome = "cancelled"
-        elif statuses and all(status == NodeStatus.SUCCEEDED for status in statuses):
-            outcome = "completed"
         else:
             outcome = None
         counts = {status.value: 0 for status in TaskStatus}
@@ -197,13 +212,21 @@ def project_overview(
             "task_counts": counts,
             "running_functions": running_functions,
         })
+    warnings = [
+        message
+        for message in [
+            overview.run.status_message,
+            *(node.error_message for node in overview.nodes),
+        ]
+        if message
+    ]
     return {
         "stages": stages,
         "active_provider_calls": {
             "total": overview.active_provider_calls.total,
             "gpu": overview.active_provider_calls.gpu,
         },
-        "warnings": [],
+        "warnings": list(dict.fromkeys(warnings)),
     }
 
 

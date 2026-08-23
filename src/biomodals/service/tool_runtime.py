@@ -233,12 +233,30 @@ class JobLifecycle:
             RunStatus.FAILED: JobState.FAILED,
             RunStatus.CANCELLED: JobState.CANCELLED,
         }[overview.run.status]
-        return self.store.replace_projection(
+        projected = self.store.replace_projection(
             job.job_id,
             state=state,
             projection=projection,
             observed_at=now,
         )
+        if state == JobState.FAILED:
+            return self.store.fail_job(
+                job.job_id,
+                error_code="remote_execution_failed",
+                error_message=(
+                    overview.run.status_message
+                    or next(
+                        (
+                            node.error_message
+                            for node in overview.nodes
+                            if node.error_message
+                        ),
+                        "Remote execution failed",
+                    )
+                ),
+                now=now,
+            )
+        return projected
 
     async def _finalize(
         self,

@@ -52,6 +52,7 @@ BlockingCategory = Literal[
     "modal_configuration",
     "modal_unavailable",
     "result_integrity",
+    "result_preparation_failed",
 ]
 
 
@@ -238,7 +239,17 @@ class AdminStateUnknownJobView(BaseModel):
     tool: str
     display_name: str
     reason: str
+    root_function_call_id: str | None
     state_unknown_at: datetime
+
+
+class ResolveStateUnknownJobRequest(BaseModel):
+    """One explicit safe outcome after an Administrator checks Modal."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    resolution: Literal["resume", "requeue", "cancel"]
+    function_call_id: str | None = Field(default=None, max_length=200)
 
 
 class AdminModalView(BaseModel):
@@ -444,6 +455,7 @@ def _modal_view(
                 tool=job.tool,
                 display_name=job.display_name,
                 reason=job.state_reason,
+                root_function_call_id=job.root_function_call_id,
                 state_unknown_at=datetime.fromtimestamp(job.updated_at, UTC),
             )
             for job in store.list_state_unknown_jobs()
@@ -759,11 +771,21 @@ def create_admin_router() -> APIRouter:
     async def resolve_state_unknown_job(
         request: Request,
         job_id: UUID,
+        submission: ResolveStateUnknownJobRequest,
         _session: Annotated[AuthenticatedSession, Depends(require_unsafe_admin)],
     ) -> AdminModalView:
         store: ServiceStore = request.app.state.store
         try:
-            store.resolve_state_unknown(job_id, now=int(time.time()))
+            store.resolve_state_unknown(
+                job_id,
+                resolution=submission.resolution,
+                function_call_id=(
+                    submission.function_call_id.strip()
+                    if submission.function_call_id
+                    else None
+                ),
+                now=int(time.time()),
+            )
         except JobNotFoundError as exc:
             raise HTTPException(404, "Job not found") from exc
         except JobStateResolutionError as exc:
@@ -773,8 +795,9 @@ def create_admin_router() -> APIRouter:
                 "This Job no longer has unknown remote state",
             ) from exc
         LOGGER.info(
-            "event=state_unknown_resolved job_id=%s resolution=reconcile request_id=%s",
+            "event=state_unknown_resolved job_id=%s resolution=%s request_id=%s",
             job_id,
+            submission.resolution,
             request_id_from(request),
         )
         return _modal_view(request.app.state.configuration, store)

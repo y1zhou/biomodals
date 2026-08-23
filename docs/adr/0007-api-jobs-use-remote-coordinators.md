@@ -124,6 +124,11 @@ If the exact pinned deployment cannot be resolved, the Service Job becomes
 newer deployment, or infer execution state from cached projections. Refreshes
 for one Job are serialized before updating its local projection so responses
 cannot be applied out of order.
+Before calling Modal, a launch attempt is durably fenced as `state_unknown`;
+a process interruption therefore cannot cause an automatic duplicate spawn.
+An Administrator may then attach the known root Function Call and resume,
+requeue only after confirming that no spawn occurred, or request cancellation.
+Launch and cancellation use the same per-Job service lock.
 
 ## Consequences
 

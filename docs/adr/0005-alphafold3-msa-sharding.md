@@ -107,8 +107,8 @@ profile directory, or directly consumed template path is provisioned
 automatically. These readiness checks deliberately use path existence rather
 than checksumming large shared assets. The scientific worker remains the
 deeper compatibility check; a later format or content mismatch fails with an
-operator repair message naming the rejected path, worker, Modal environment,
-and Volume. It explains that automatic replacement was refused. It never
+operator repair message naming the rejected path and Volume. It explains that
+automatic replacement was refused. It never
 authorizes automatic replacement of an existing final asset.
 
 Cheap recurring readiness is distinct from publication. A newly constructed

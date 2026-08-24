@@ -30,7 +30,10 @@ from biomodals.app.fold.alphafold3.execution_runtime import (
     _result_envelope,
     alphafold3_execution_graph,
 )
-from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
+from biomodals.app.fold.alphafold3.generation_claims import (
+    GenerationClaim,
+    generation_status,
+)
 from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS, profile_root
 from biomodals.app.fold.alphafold3.seed_predictions import (
@@ -359,6 +362,49 @@ def test_environment_task_waits_without_a_call_then_reuses_publication(
     assert isinstance(reused, PreparedTaskBatch)
     assert reused.call is None
     assert tuple(reused.completed) == ("model",)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_environment_task_releases_claim_without_a_worker(
+    tmp_path: Path,
+    *,
+    cancelled: bool,
+) -> None:
+    request = _request()
+    inputs = _graph_inputs(tmp_path)
+    (tmp_path / "models" / "AlphaFold3" / "af3.bin").unlink()
+    graph = alphafold3_execution_graph(
+        request,
+        execution_run_id=RUN_ID,
+        **inputs,
+    )
+    node = cast(Any, graph.validate().nodes[PREPARE_ENVIRONMENT].node)
+    model_task = next(
+        task
+        for task in node.discover_remote_tasks(SimpleNamespace())
+        if task.task_key == "model"
+    )
+    assert not isinstance(
+        node.prepare_remote_task_batch(SimpleNamespace(), (model_task,)),
+        PreparedTaskBatch,
+    )
+
+    if cancelled:
+        node.finalize_cancelled_remote_tasks(SimpleNamespace())
+    else:
+        node.finalize_remote_tasks(
+            SimpleNamespace(),
+            {},
+            {"model": "Provider rejected submission"},
+        )
+
+    status = generation_status(
+        inputs["environment_runtime"].claims,
+        "model",
+        node._generation_id("model"),
+    )
+    assert status is not None
+    assert status["status"] == "failed"
 
 
 def test_task_result_refresh_reloads_the_template_cache(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -14,6 +15,7 @@ from biomodals.app.fold.alphafold3.environment import (
     EnvironmentRuntime,
     acquire_asset_claim,
     asset_ready,
+    fail_asset_claim_if_current,
     required_environment_assets,
 )
 from biomodals.app.fold.alphafold3.execution_planning import (
@@ -50,6 +52,8 @@ from biomodals.execution.nodes import (
     TaskProviderNode,
 )
 from biomodals.schema import AppRunResult, AppRunStatus
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -197,10 +201,42 @@ class _PrepareEnvironmentNode(TaskProviderNode):
         errors: Mapping[str, str],
     ) -> AppRunResult:
         del context, results
+        for task_key, message in errors.items():
+            asset = self._asset(task_key)
+            fail_asset_claim_if_current(
+                self.runtime,
+                asset,
+                self._generation_id(task_key),
+                detail={
+                    "asset_key": asset.key,
+                    "error_type": "ProviderCallFailed",
+                    "message": message,
+                },
+            )
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED if not errors else AppRunStatus.FAILED,
             warnings=list(errors.values()),
         )
+
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        del context
+        for asset in self._assets():
+            try:
+                fail_asset_claim_if_current(
+                    self.runtime,
+                    asset,
+                    self._generation_id(asset.key),
+                    detail={
+                        "asset_key": asset.key,
+                        "error_type": "ProviderCallCancelled",
+                    },
+                )
+            except Exception:
+                LOGGER.warning(
+                    "Could not release cancelled AlphaFold3 setup claim %s",
+                    asset.key,
+                    exc_info=True,
+                )
 
 
 @dataclass

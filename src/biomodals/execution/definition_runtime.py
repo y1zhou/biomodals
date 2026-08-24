@@ -2037,6 +2037,9 @@ class ExecutionGraphRuntime:
         if outcome is None:
             return
         if outcome == NodeStatus.CANCELLED:
+            implementation.finalize_cancelled_remote_tasks(
+                self._node_context(self._require_definition(), node_id)
+            )
             with self.store.transaction():
                 self.store.execution.reconcile_node_tasks(
                     self.execution_run_id,

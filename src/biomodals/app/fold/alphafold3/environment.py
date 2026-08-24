@@ -18,6 +18,8 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     LostGenerationError,
     acquire_generation_claim,
     finish_generation_claim,
+    generation_status,
+    latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import chain_msa_states
 from biomodals.app.fold.alphafold3.msa_search import plan_msa_resolution
@@ -216,6 +218,29 @@ def acquire_asset_claim(
         )
     except ActiveGenerationError:
         return None
+
+
+def fail_asset_claim_if_current(
+    runtime: EnvironmentRuntime,
+    asset: EnvironmentAsset,
+    generation_id: str,
+    *,
+    detail: dict[str, object],
+) -> bool:
+    """Fail this generation when it still owns an unfinished setup claim."""
+    scope = claim_scope(asset)
+    owner = latest_generation_owner(runtime.claims, scope)
+    if owner is None or owner.get("generation_id") != generation_id:
+        return False
+    if generation_status(runtime.claims, scope, generation_id) is not None:
+        return False
+    finish_generation_claim(
+        runtime.claims,
+        GenerationClaim(scope, generation_id, owner),
+        status="failed",
+        detail=detail,
+    )
+    return True
 
 
 def prepare_environment_asset(

@@ -256,8 +256,6 @@ _PROFILE_BUILDER_RUNTIME = ProfileBuilderRuntime(
     source_volume=AF3_MSA_DB_VOLUME,
     sharded_volume=SHARDED_MSA_DB_VOLUME,
     output_volume=CONF.output_volume,
-    claims=ENVIRONMENT_SETUP_CLAIMS,
-    container_id=_CONTAINER_INSTANCE_ID,
 )
 _ENVIRONMENT_RUNTIME = EnvironmentRuntime(
     model_volume=MODEL_VOLUME,

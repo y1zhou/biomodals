@@ -22,13 +22,6 @@ from typing import Any, ClassVar, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.generation_claims import (
-    ActiveGenerationError,
-    ClaimStore,
-    GenerationClaim,
-    acquire_generation_claim,
-    finish_generation_claim,
-)
 from biomodals.app.fold.alphafold3.profile_manifest import (
     current_profile_recipe,
     profile_compatibility_identity,
@@ -38,7 +31,6 @@ from biomodals.app.fold.alphafold3.profile_manifest import (
 from biomodals.app.fold.alphafold3.profiles import (
     MAX_PROFILE_IMBALANCE,
     PROFILE_SCHEMA_VERSION,
-    PROFILE_STALE_SECONDS,
     SCRATCH_ROOT,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
@@ -91,8 +83,6 @@ class ProfileBuilderRuntime:
     source_volume: VolumeHandle
     sharded_volume: VolumeHandle
     output_volume: VolumeHandle
-    claims: ClaimStore
-    container_id: str
     source_root: Path = Path(SOURCE_MOUNT)
     sharded_root: Path = Path(SHARDED_MOUNT)
     evidence_relpath: str = EVIDENCE_RELPATH
@@ -368,31 +358,6 @@ def _validate_statistics(
         "sum_len": source_sum_len,
         "maximum_residue_imbalance": maximum_imbalance,
     }
-
-
-def _acquire_profile_claim(
-    runtime: ProfileBuilderRuntime,
-    spec: DatabaseProfileSpec,
-    generation_id: str,
-) -> GenerationClaim:
-    """Append one elected generation after a terminal or stale predecessor."""
-    try:
-        return acquire_generation_claim(
-            runtime.claims,
-            scope_key=spec.profile_id,
-            generation_id=generation_id,
-            identity={
-                "profile_id": spec.profile_id,
-                "database_id": spec.database_id,
-            },
-            container_id=runtime.container_id,
-            maximum_age_seconds=PROFILE_STALE_SECONDS,
-        )
-    except ActiveGenerationError as exc:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} is already being built by generation "
-            f"{exc.owner['generation_id']!r}"
-        ) from exc
 
 
 def _hash_decompressed_zstd(
@@ -932,7 +897,6 @@ def build_profile(
             seqkit_threads=threads,
         )
 
-    claim = _acquire_profile_claim(runtime, spec, generation_id)
     staging_root = (
         runtime.sharded_root / ".staging" / f"{spec.profile_id}-{generation_id}"
     )
@@ -941,14 +905,7 @@ def build_profile(
     validation_dir = staging_root / "validation"
     payload_moved = False
     manifest_published = False
-    claim_status = "failed"
-    claim_detail: dict[str, object] = {
-        "error_type": "IncompleteProfileBuild",
-        "profile_published": False,
-    }
     try:
-        write_json_atomic(evidence_root / "claim.json", claim.owner)
-        runtime.output_volume.commit()
         runtime.sharded_volume.reload()
         if (published_root / "manifest.json").is_file():
             result = _reuse_published_profile(
@@ -961,8 +918,6 @@ def build_profile(
                 policy,
                 seqkit_threads=threads,
             )
-            claim_status = "complete"
-            claim_detail = {"manifest_sha256": result["manifest_sha256"]}
             return result
         if published_root.exists():
             orphan_root = runtime.sharded_root / ".orphaned"
@@ -1043,8 +998,6 @@ def build_profile(
             **source_result,
         }
         _write_success_evidence(runtime, evidence_root, result)
-        claim_status = "complete"
-        claim_detail = {"manifest_sha256": result["manifest_sha256"]}
         return result
     except Exception as exc:
         failure = {
@@ -1057,7 +1010,6 @@ def build_profile(
             "message": str(exc),
         }
         evidence_committed = False
-        cleanup_completed = manifest_published
         try:
             write_json_atomic(evidence_root / "failure.json", failure)
             runtime.output_volume.commit()
@@ -1075,23 +1027,9 @@ def build_profile(
                 elif staging_root.exists():
                     shutil.rmtree(staging_root)
                 runtime.sharded_volume.commit()
-                cleanup_completed = True
             except Exception as cleanup_exc:
                 exc.add_note(
                     "Could not clean the failed profile generation: "
                     f"{type(cleanup_exc).__name__}: {cleanup_exc}"
                 )
-        claim_detail = {
-            "error_type": type(exc).__name__,
-            "profile_published": manifest_published,
-            "failure_evidence_committed": evidence_committed,
-            "cleanup_completed": cleanup_completed,
-        }
         raise
-    finally:
-        finish_generation_claim(
-            runtime.claims,
-            claim,
-            status=claim_status,
-            detail=claim_detail,
-        )

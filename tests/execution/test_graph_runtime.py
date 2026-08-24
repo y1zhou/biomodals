@@ -170,6 +170,11 @@ class RemoteFanoutNode(TaskProviderNode):
         repr=False,
         metadata={"dag_hash": False},
     )
+    cancelled_finalizations: int = field(
+        default=0,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
 
     def discover_remote_tasks(
         self,
@@ -232,6 +237,10 @@ class RemoteFanoutNode(TaskProviderNode):
                 )
             ],
         )
+
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        del context
+        self.cancelled_finalizations += 1
 
 
 @dataclass
@@ -1286,7 +1295,8 @@ def test_cancel_requested_fanout_reconciles_node_cancellation(
     tmp_path: Path,
 ) -> None:
     workflow = ExecutionGraph("cancel-fanout")
-    workflow.add_node(RemoteFanoutNode(("a", "b")), id="fanout")
+    node = RemoteFanoutNode(("a", "b"))
+    workflow.add_node(node, id="fanout")
     driver = CancellingFanoutModalDriver()
     runtime = _runtime(tmp_path, workflow, driver=driver)
     runtime._initialize("cancel-fanout")
@@ -1299,6 +1309,7 @@ def test_cancel_requested_fanout_reconciles_node_cancellation(
     assert snapshot.run.status == RunStatus.CANCELLED
     assert snapshot.nodes[0].status == NodeStatus.CANCELLED
     assert {task.status for task in snapshot.tasks} == {TaskStatus.CANCELLED}
+    assert node.cancelled_finalizations == 1
 
 
 def test_unknown_workflow_prunes_call_after_terminal_publication_appears(

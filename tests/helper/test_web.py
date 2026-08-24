@@ -50,10 +50,12 @@ class FakeSession:
         head_response: FakeResponse | None = None,
         head_error: Exception | None = None,
         get_response: FakeResponse | None = None,
+        get_responses: list[FakeResponse] | None = None,
     ) -> None:
         self.head_response = head_response
         self.head_error = head_error
         self.get_response = get_response
+        self.get_responses = get_responses
         self.calls: list[tuple[str, str, dict]] = []
 
     async def head(self, url: str, **kwargs) -> FakeResponse:
@@ -66,6 +68,10 @@ class FakeSession:
 
     async def get(self, url: str, **kwargs) -> FakeResponse:
         self.calls.append(("GET", url, kwargs))
+        if self.get_responses is not None:
+            if not self.get_responses:
+                raise AssertionError("unexpected GET request")
+            return self.get_responses.pop(0)
         if self.get_response is None:
             raise AssertionError("unexpected GET request")
         return self.get_response
@@ -191,7 +197,11 @@ def test_download_file_resumes_partial_file_with_range(tmp_path: Path) -> None:
     output = tmp_path / "archive.zst.part"
     output.write_bytes(b"partial")
     head_response = FakeResponse(headers={"content-length": "11"})
-    get_response = FakeResponse(chunks=(b"rest",), status_code=206)
+    get_response = FakeResponse(
+        headers={"Content-Range": "bytes 7-10/11"},
+        chunks=(b"rest",),
+        status_code=206,
+    )
     session = FakeSession(head_response=head_response, get_response=get_response)
 
     asyncio.run(
@@ -215,7 +225,11 @@ def test_download_file_resumes_partial_file_with_range(tmp_path: Path) -> None:
 def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:
     output = tmp_path / "archive.zst.part"
     output.write_bytes(b"partial")
-    get_response = FakeResponse(chunks=(b"rest",), status_code=206)
+    get_response = FakeResponse(
+        headers={"content-range": "bytes 7-10/11"},
+        chunks=(b"rest",),
+        status_code=206,
+    )
     session = FakeSession(
         head_error=RuntimeError("HEAD unsupported"),
         get_response=get_response,
@@ -232,3 +246,67 @@ def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:
     )
 
     assert output.read_bytes() == b"partialrest"
+
+
+def test_resumable_download_restarts_after_range_not_satisfiable(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"stale-partial")
+    head_response = FakeResponse(headers={"content-length": "10"})
+    rejected = FakeResponse(status_code=416)
+    complete = FakeResponse(chunks=(b"fresh-data",))
+    session = FakeSession(
+        head_response=head_response,
+        get_responses=[rejected, complete],
+    )
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"fresh-data"
+    assert session.calls[1][2]["headers"] == {"Range": "bytes=13-"}
+    assert session.calls[2] == (
+        "GET",
+        "https://example.test/archive.zst",
+        {"stream": True},
+    )
+    assert rejected.closed is True
+
+
+def test_resumable_download_restarts_after_mismatched_content_range(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"partial")
+    head_response = FakeResponse(headers={"content-length": "11"})
+    mismatched = FakeResponse(
+        headers={"content-range": "bytes 3-10/11"},
+        chunks=(b"ignored",),
+        status_code=206,
+    )
+    complete = FakeResponse(chunks=(b"replacement",))
+    session = FakeSession(
+        head_response=head_response,
+        get_responses=[mismatched, complete],
+    )
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"replacement"
+    assert mismatched.closed is True

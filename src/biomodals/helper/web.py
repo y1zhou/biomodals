@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -68,24 +69,49 @@ async def _download_file(
         if not await _should_download(session, url, local_path, force, resume):
             return
 
-        response = None
-        try:
+        for attempt in range(2):
             offset = local_path.stat().st_size if resume and local_path.exists() else 0
-            response = await session.get(
-                url,
-                stream=True,
-                **({"headers": {"Range": f"bytes={offset}-"}} if offset else {}),
-            )
-            response.raise_for_status()
-            append = offset > 0 and getattr(response, "status_code", 200) == 206
-            with local_path.open("ab" if append else "wb") as f:
-                async for chunk in await response.iter_content():
-                    f.write(chunk)
-        finally:
-            if response is not None:
-                await response.close()
+            response = None
+            restart = False
+            try:
+                response = await session.get(
+                    url,
+                    stream=True,
+                    **({"headers": {"Range": f"bytes={offset}-"}} if offset else {}),
+                )
+                status_code = getattr(response, "status_code", 200)
+                if offset and status_code == 416:
+                    restart = True
+                else:
+                    response.raise_for_status()
+                    if offset and status_code == 206:
+                        restart = _content_range_start(response.headers) != offset
+                    if not restart:
+                        append = offset > 0 and status_code == 206
+                        with local_path.open("ab" if append else "wb") as output:
+                            async for chunk in await response.iter_content():
+                                output.write(chunk)
+                        return
+            finally:
+                if response is not None:
+                    await response.close()
+            if restart and attempt == 0:
+                local_path.unlink(missing_ok=True)
+                continue
+            raise RuntimeError("Server returned an invalid byte-range response")
     except Exception as e:
         raise RuntimeError(f"Download for {url} to {local_path} failed.") from e
+
+
+def _content_range_start(headers: Mapping[str, str]) -> int | None:
+    value = next(
+        (value for key, value in headers.items() if key.lower() == "content-range"),
+        None,
+    )
+    if value is None:
+        return None
+    match = re.fullmatch(r"bytes (\d+)-\d+/(?:\d+|\*)", value)
+    return None if match is None else int(match.group(1))
 
 
 async def _should_download(

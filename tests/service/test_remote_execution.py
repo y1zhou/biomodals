@@ -165,7 +165,10 @@ async def test_unassigned_active_provider_calls_are_presented_as_queued(
         ),
     )
 
-    queued = await RemoteExecutionClient().queued_provider_call_handles(overview)
+    queued = await RemoteExecutionClient().queued_provider_call_handles(
+        "fc-root",
+        overview,
+    )
 
     assert queued == frozenset({"fc-provider"})
 
@@ -186,14 +189,11 @@ async def test_assigned_or_uninspectable_provider_calls_default_to_running(
     )
 
     def from_id(call_id):
-        if call_id == "fc-unavailable":
-            return SimpleNamespace(
-                get_call_graph=lambda: (_ for _ in ()).throw(RuntimeError("no graph"))
-            )
+        assert call_id == "fc-root"
         return SimpleNamespace(
             get_call_graph=lambda: [
                 SimpleNamespace(
-                    function_call_id=call_id,
+                    function_call_id="fc-assigned",
                     task_id="ta-assigned",
                     status=modal.types.InputStatus.PENDING,
                 )
@@ -207,7 +207,7 @@ async def test_assigned_or_uninspectable_provider_calls_default_to_running(
 
     assert (
         await RemoteExecutionClient().queued_provider_call_handles(
-            SimpleNamespace(representative_provider_calls=calls)
+            "fc-root", SimpleNamespace(representative_provider_calls=calls)
         )
         == frozenset()
     )

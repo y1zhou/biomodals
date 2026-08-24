@@ -19,7 +19,8 @@ from biomodals.execution import (
     ProviderCallPage,
 )
 from biomodals.execution.modal import deployed_execution_coordinator
-from biomodals.execution.model import ProviderCallOverview
+
+CALL_GRAPH_TIMEOUT_SECONDS = 5.0
 
 
 class RemoteDeploymentUnavailableError(RuntimeError):
@@ -120,33 +121,34 @@ class RemoteExecutionClient:
 
     async def queued_provider_call_handles(
         self,
+        root_function_call_id: str | None,
         overview: ExecutionOverview,
     ) -> frozenset[str]:
         """Best-effort presentation hint for calls awaiting a Modal task."""
-
-        async def is_queued(call: ProviderCallOverview) -> bool:
-            handle_id = call.provider_call_handle_id
-            if not handle_id or call.status.is_terminal:
-                return False
-            try:
-                graph = await asyncio.to_thread(
-                    modal.FunctionCall.from_id(handle_id).get_call_graph
-                )
-            except Exception:
-                return False
-            return any(
-                item.function_call_id == handle_id
-                and item.status == modal.types.InputStatus.PENDING
-                and not item.task_id
-                for item in graph
-            )
-
-        calls = tuple(overview.representative_provider_calls)
-        queued = await asyncio.gather(*(is_queued(call) for call in calls))
-        return frozenset(
+        if not root_function_call_id:
+            return frozenset()
+        active_handles = {
             call.provider_call_handle_id
-            for call, waiting in zip(calls, queued, strict=True)
-            if waiting and call.provider_call_handle_id
+            for call in overview.representative_provider_calls
+            if call.provider_call_handle_id and not call.status.is_terminal
+        }
+        if not active_handles:
+            return frozenset()
+        try:
+            graph = await asyncio.wait_for(
+                asyncio.to_thread(
+                    modal.FunctionCall.from_id(root_function_call_id).get_call_graph
+                ),
+                timeout=CALL_GRAPH_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return frozenset()
+        return frozenset(
+            item.function_call_id
+            for item in graph
+            if item.function_call_id in active_handles
+            and item.status == modal.types.InputStatus.PENDING
+            and not item.task_id
         )
 
     async def provider_calls(

@@ -236,7 +236,10 @@ class JobLifecycle:
         now: int,
     ) -> JobRecord:
         queued_call_handles = (
-            await self.remote.queued_provider_call_handles(overview)
+            await self.remote.queued_provider_call_handles(
+                job.root_function_call_id,
+                overview,
+            )
             if overview.representative_provider_calls
             else frozenset()
         )

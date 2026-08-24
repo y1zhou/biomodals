@@ -90,9 +90,11 @@ media type, byte size, and digest. GROMACS may therefore publish a ZIP while
 AlphaFold3 publishes its established `.tar.zst` without conversion.
 
 AlphaFold3 Regular and Expert modes create the same validated native JSON
-resource. Regular Mode constructs a polymer-only `AF3Config` containing
-Protein, DNA, and RNA; Expert Mode loads a complete self-contained native
-AlphaFold3 JSON configuration. Job creation consumes that retained validation
+resource. Regular Mode constructs an `AF3Config` containing Protein, DNA, RNA,
+and simple Ligand entities; Ligands accept CCD codes or a SMILES string. Expert
+Mode loads a complete self-contained native AlphaFold3 JSON configuration for
+advanced fields such as modifications, covalent bonds, custom CCD definitions,
+templates, and embedded MSAs. Job creation consumes that retained validation
 without uploading the document again. The backend validates both through the
 same existing AlphaFold3 request path and does not maintain a second scientific
 input interpretation.

@@ -208,30 +208,35 @@ creating User and may be read or deleted through the corresponding routes.
 The document route exists only to download the retained native JSON without
 embedding it in the bounded validation response.
 
+The form uses one **Expert mode** toggle. Off selects the guided entity editor;
+on selects native JSON upload. Both retain the form-owned Job name and converge
+on the same server validation and confirmation flow.
+
 Regular Mode constructs a native AlphaFold3 JSON configuration from one or
-more polymer inputs. Each entity row selects Protein, DNA, or RNA and contains
-only its sequence, identical-copy count, and automatically assigned stable
-uppercase chain IDs. It shows those IDs as read-only and defaults model seeds
-to `1`. It does not expose ligands, modifications, covalent bonds, custom MSA,
-custom templates, or user-provided CCD fields.
+more entities. Each row selects Protein, DNA, RNA, or Ligand and contains an
+identical-copy count and automatically assigned uppercase chain IDs. Polymer
+rows accept sequences; Ligand rows accept either comma-separated CCD codes or
+one SMILES string. The UI shows assigned IDs as read-only and defaults model
+seeds to `1`. It does not expose modifications, covalent bonds, custom MSA,
+custom templates, or user-provided CCD definitions.
 
-The polymer editor follows the supplied AlphaFold input interaction reference.
-An empty entity is a compact horizontal row with a drag handle, an Entity type
-dropdown containing Protein, DNA, and RNA, copy count, a large **Paste sequence
-or FASTA** input, and row controls. After parsing, the same row presents the
-normalized sequence in a wrapped monospace view with residue numbers every ten
-positions. **Add entity** creates another row. Each row accepts exactly one raw
-sequence or one FASTA record; multi-record FASTA is rejected with guidance to
-add separate entities. Clicking the formatted sequence returns that row to
-edit mode. Reordering rows does not change chain IDs already assigned to an
-entity. Copies receive monotonically allocated Excel-style uppercase IDs (`A`
-through `Z`, then `AA`, `AB`, and so on). IDs are not reused within an editing
-session, so removing a copy or entity never renames another entity.
+The entity editor follows the supplied AlphaFold input interaction reference.
+An empty entity is a compact horizontal row with a right chevron, an Entity
+type dropdown, copy count, a large **Sequence or FASTA records** input, and row
+controls. After parsing, a polymer row presents the normalized sequence in a
+wrapped monospace view with residue numbers every ten positions. **Add entity**
+creates another row. A raw sequence remains one entity. A multi-record FASTA is
+expanded into one single-copy entity per record using the selected polymer
+type; each FASTA header is written to that native entity's `description` field.
+Clicking a formatted sequence returns that row to edit mode.
 
-Each row exposes only the drag handle, Entity type, Copies, sequence, assigned
-chain IDs, and a remove action. It has no overflow menu or collapse controls in
-the MVP. Changing Entity type preserves the entered sequence and revalidates
-it under the selected Protein, DNA, or RNA type.
+Chain IDs always follow the visible entity and copy order. Adding, removing,
+resizing, or reordering entities recomputes one sequential Excel-style ID
+series (`A` through `Z`, then `AA`, `AB`, and so on), closing any gaps. Changing
+between polymer types preserves the entered sequence and revalidates it under
+the selected type. Changing between a polymer and Ligand clears the
+type-specific input. Rows use explicit arrow controls for reordering and do
+not imply drag-and-drop support.
 
 Expert Mode loads one self-contained native `alphafold3` JSON object, versions
 1 through 4. Path-valued fields are rejected because browser-local paths have
@@ -305,11 +310,11 @@ sets the app's internal `allow_large_inference` value while staging. The API
 does not add a second confirmation field.
 
 The initial Expert Mode UI is an upload surface rather than a second structured
-editor for ligands, modifications, bonds, custom MSA, templates, or CCD
-content. Those values are authored in the uploaded JSON. Unmodified Protein,
-DNA, and RNA entities are also valid in uploaded Expert documents. A future
-expert editor may offer an open CCD-code combobox with suggestions rather than
-a closed built-in vocabulary.
+editor for modifications, bonds, custom MSA, templates, or custom CCD content.
+Those values are authored in the uploaded JSON. Regular Mode supports simple
+CCD-code and SMILES Ligands; all entity types are also valid in uploaded Expert
+documents. A future expert editor may offer an open CCD-code combobox with
+suggestions rather than a closed built-in vocabulary.
 
 AlphaFold3 exposes these ordered semantic stages:
 

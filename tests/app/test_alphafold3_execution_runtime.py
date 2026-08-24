@@ -213,7 +213,11 @@ def _runtime(
 
 
 def _mock_staging(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(planning_module, "stage_inference_run", lambda *args: None)
+    monkeypatch.setattr(
+        planning_module,
+        "stage_inference_run_mounted",
+        lambda *args: None,
+    )
     monkeypatch.setattr(
         planning_module,
         "load_staged_inference_input",
@@ -340,6 +344,53 @@ def test_no_search_stages_complete_without_provider_calls(
     assert {
         call.node_key for call in runtime.store.execution.list_provider_calls(RUN_ID)
     }.issubset({SEED_PREDICTIONS})
+
+
+def test_local_inference_input_is_checkpointed_before_gpu_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "claim_seed_predictions",
+        _owned_seed_claims,
+    )
+
+    class CheckingDriver(RecordingDriver):
+        staged_input_checkpointed = False
+
+        def spawn(self, function, *, args, kwargs):
+            assert self.staged_input_checkpointed
+            return super().spawn(function, args=args, kwargs=kwargs)
+
+    driver = CheckingDriver()
+    runtime, inputs = _runtime(tmp_path, driver=driver)
+    output_volume = inputs["output_volume"]
+    original_commit = output_volume.commit
+
+    def record_commit() -> None:
+        original_commit()
+        if any(tmp_path.rglob("staged-input.json")):
+            driver.staged_input_checkpointed = True
+
+    output_volume.commit = record_commit
+    runtime.attach()
+
+    _advance_until_calls(runtime, 1)
+
+    assert driver.staged_input_checkpointed is True
+    assert (
+        runtime.store.execution.get_node(
+            RUN_ID,
+            STAGE_INFERENCE,
+        ).status.value
+        == "succeeded"
+    )
 
 
 def test_seed_tasks_use_balanced_fixed_batches(

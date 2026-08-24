@@ -12,7 +12,7 @@ import re
 import string
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TypeAlias, cast
+from typing import Literal, TypeAlias, cast
 
 import orjson
 from uniaf3.schema.alphafold3 import (
@@ -33,7 +33,9 @@ from biomodals.helper.artifacts import (
     json_bytes,
     load_artifact_bytes,
     read_bounded_file_bytes,
+    replace_bytes_atomic,
     sha256_bytes,
+    sha256_file,
 )
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
@@ -101,6 +103,51 @@ class LoadedInferenceInput:
     config: AF3Config
     recycle: int
     sample_count: int
+
+
+def stage_inference_run_mounted(
+    output_root: Path,
+    prepared: PreparedInferenceRun,
+) -> None:
+    """Publish an inference input through its mounted filesystem."""
+    marker = output_root.joinpath(*prepared.staged_input.relative_path.parts)
+    marker_state = _mounted_file_state(marker, prepared.staged_input.content)
+    if marker_state == "conflict":
+        raise RuntimeError(
+            "Existing staged-input marker conflicts with the prepared request: "
+            f"{prepared.staged_input.relative_path}"
+        )
+    pending = [
+        upload
+        for upload in prepared.payload_uploads
+        if marker_state == "missing"
+        or _mounted_file_state(
+            output_root.joinpath(*upload.relative_path.parts),
+            upload.content,
+        )
+        != "match"
+    ]
+    if marker_state == "match" and not pending:
+        return
+    for upload in pending:
+        replace_bytes_atomic(
+            output_root.joinpath(*upload.relative_path.parts),
+            upload.content,
+        )
+    replace_bytes_atomic(marker, prepared.staged_input.content)
+
+
+def _mounted_file_state(
+    path: Path,
+    expected: bytes,
+) -> Literal["missing", "match", "conflict"]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return "missing"
+    if path.is_symlink() or not path.is_file() or stat.st_size != len(expected):
+        return "conflict"
+    return "match" if sha256_file(path) == sha256_bytes(expected) else "conflict"
 
 
 def sanitize_af3_name(name: str) -> str:

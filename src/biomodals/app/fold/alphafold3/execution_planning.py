@@ -35,6 +35,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
     load_staged_inference_input,
     prepare_inference_run,
+    stage_inference_run_mounted,
     validate_upstream_af3_input,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
@@ -52,10 +53,7 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
     build_invocation_receipt,
     load_invocation_manifest,
 )
-from biomodals.app.fold.alphafold3.modal_adapters import (
-    publish_invocation_receipt,
-    stage_inference_run,
-)
+from biomodals.app.fold.alphafold3.modal_adapters import publish_invocation_receipt
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
     RawSearchTask,
@@ -146,11 +144,6 @@ class AlphaFold3ExecutionPlanning:
         self._prepared_inference_cache: PreparedInferenceRun | None = None
         self._prepared_inference_error: IncompletePrerequisiteError | None = None
         self._seed_prediction_cache: dict[int, dict[str, object]] | None = None
-
-    def refresh(self, changed_nodes: Collection[str] | None = None) -> None:
-        """Refresh worker publications and invalidate dependent planning caches."""
-        self.output_volume.reload()
-        self.invalidate(changed_nodes)
 
     def invalidate(self, changed_nodes: Collection[str] | None = None) -> None:
         """Discard observations affected by newly published workload state."""
@@ -516,8 +509,7 @@ class AlphaFold3ExecutionPlanning:
     def stage_inference(self) -> AppRunResult:
         """Publish and revalidate the immutable inference input."""
         prepared = self.prepared_inference()
-        stage_inference_run(self.output_volume, prepared)
-        self.refresh({STAGE_INFERENCE})
+        stage_inference_run_mounted(self.inference_runtime.output_root, prepared)
         if self.staged_inference_observation() != AvailabilityStatus.AVAILABLE:
             raise RuntimeError("Staged AlphaFold3 input changed")
         return AppRunResult(status=AppRunStatus.SUCCEEDED)

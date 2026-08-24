@@ -350,7 +350,7 @@ def _preview(
     prediction_count: int,
 ) -> dict[str, object]:
     entities: list[dict[str, object]] = []
-    modifications = templates = ligands = custom_inputs = 0
+    modifications = templates = custom_msas = 0
     for entry in document.get("sequences", []):
         if not isinstance(entry, dict) or len(entry) != 1:
             continue
@@ -362,10 +362,9 @@ def _preview(
         sequence = raw.get("sequence", "")
         modifications += len(raw.get("modifications", []))
         templates += len(raw.get("templates", []))
-        custom_inputs += sum(
+        custom_msas += sum(
             bool(raw.get(field)) for field in ("unpairedMsa", "pairedMsa")
         )
-        ligands += int(entity_type == "ligand")
         entities.append({
             "type": entity_type,
             "ids": ids,
@@ -387,9 +386,9 @@ def _preview(
         "advanced_counts": {
             "modifications": modifications,
             "bonds": len(document.get("bondedAtomPairs", [])),
-            "ligands": ligands,
-            "templates": templates,
-            "custom_inputs": custom_inputs + int(bool(document.get("userCCD"))),
+            "custom_msas": custom_msas,
+            "custom_templates": templates,
+            "custom_ccd": int(bool(document.get("userCCD"))),
         },
         "warnings": (
             [f"This request creates {prediction_count:,} predictions."]

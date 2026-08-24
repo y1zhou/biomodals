@@ -279,9 +279,11 @@ Job submission consumes it.
 
 The preview reports Job name; entity types, IDs, copies, and polymer lengths;
 the exact seed list and count; samples and total prediction count; search and
-recycle settings; counts of modifications, bonds, ligands, custom templates,
-and custom inputs; and validation warnings. The page offers the exact parsed
-document as a JSON download but does not render or copy the whole document,
+recycle settings; separate counts of modifications, bonds, embedded custom
+MSAs, custom templates, and custom CCD definitions; and validation warnings.
+Ligands already appear in the entity list and are not counted again as an
+advanced input. The page offers the exact parsed document as a JSON download
+but does not render or copy the whole document,
 because inline MSA and template content can be large.
 
 If the request exceeds 5,000 seed/sample predictions, the required explicit

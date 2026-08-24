@@ -5,7 +5,6 @@
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 from uuid import UUID
 
 import orjson
@@ -96,7 +95,7 @@ def test_validation_allows_zero_recycles_and_bounds_job_name(tmp_path: Path) -> 
         )
 
 
-def test_validation_preview_counts_custom_inputs(tmp_path: Path) -> None:
+def test_validation_preview_separates_custom_inputs(tmp_path: Path) -> None:
     store = ValidatedInputStore(tmp_path)
     store.initialize()
     source = tmp_path / "input.json"
@@ -113,8 +112,13 @@ def test_validation_preview_counts_custom_inputs(tmp_path: Path) -> None:
         settings=ValidationSettings(sample=5),
     )
 
-    advanced_counts = cast(dict[str, int], validated.preview["advanced_counts"])
-    assert advanced_counts["custom_inputs"] == 2
+    assert validated.preview["advanced_counts"] == {
+        "modifications": 0,
+        "bonds": 0,
+        "custom_msas": 1,
+        "custom_templates": 0,
+        "custom_ccd": 1,
+    }
 
 
 def test_expert_documents_reject_browser_local_paths(tmp_path: Path) -> None:

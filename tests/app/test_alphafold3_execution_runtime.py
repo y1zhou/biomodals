@@ -339,8 +339,8 @@ def test_environment_task_waits_without_a_call_then_reuses_publication(
     assert (
         acquire_asset_claim(
             other,
-            EnvironmentAsset("model", "model"),
-            "other-generation",
+            EnvironmentAsset("model"),
+            "b" * 64,
         )
         is not None
     )

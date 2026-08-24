@@ -7,14 +7,12 @@ persistence handles it needs at runtime.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,14 +36,12 @@ from biomodals.app.fold.alphafold3.profiles import (
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
-    SourcePolicy,
     profile_root,
     record_multiset_identity,
     resolve_database_profile,
     shard_filename,
     shard_names,
     validate_seqkit_threads,
-    validate_source_policy,
 )
 from biomodals.app.fold.alphafold3.sharding import (
     compile_record_multiset_validator,
@@ -75,15 +71,12 @@ _JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 class ProfileBuilderRuntime:
     """Mounted paths and persistence handles for one builder container."""
 
-    SOURCE_MOUNT: ClassVar[str] = f"/{SOURCE_DB_VOLUME_NAME}"
     SHARDED_MOUNT: ClassVar[str] = f"/{SHARDED_DB_VOLUME_NAME}"
     EVIDENCE_RELPATH: ClassVar[str] = "msa-profile-builds"
 
     output_root: Path
-    source_volume: VolumeHandle
     sharded_volume: VolumeHandle
     output_volume: VolumeHandle
-    source_root: Path = Path(SOURCE_MOUNT)
     sharded_root: Path = Path(SHARDED_MOUNT)
     evidence_relpath: str = EVIDENCE_RELPATH
 
@@ -360,169 +353,6 @@ def _validate_statistics(
     }
 
 
-def _hash_decompressed_zstd(
-    archive_path: Path,
-    log_path: Path,
-) -> tuple[str, int]:
-    """Stream one zstd archive through SHA-256 without materializing it."""
-    zstd = require_executable("zstd")
-    argv = [zstd, "--quiet", "--decompress", "--stdout", str(archive_path)]
-    append_log(log_path, f"Running command: {shlex.join(argv)}")
-    with log_path.open("ab") as log:
-        process = subprocess.Popen(  # noqa: S603
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=log,
-        )
-        if process.stdout is None:
-            process.kill()
-            raise RuntimeError("zstd did not expose decompressed stdout")
-        digest = hashlib.sha256()
-        size_bytes = 0
-        while chunk := process.stdout.read(8 * 1024 * 1024):
-            digest.update(chunk)
-            size_bytes += len(chunk)
-        process.stdout.close()
-        returncode = process.wait()
-    if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, argv)
-    return digest.hexdigest(), size_bytes
-
-
-def _apply_source_policy(
-    runtime: ProfileBuilderRuntime,
-    spec: DatabaseProfileSpec,
-    manifest: dict[str, Any],
-    source_policy: SourcePolicy,
-    log_path: Path,
-    *,
-    seqkit_threads: int,
-) -> dict[str, object]:
-    """Retire a source only after a valid profile publication exists."""
-    policy = validate_source_policy(source_policy)
-    source_path = runtime.source_root / spec.source_filename
-    archive_path = source_path.with_name(f"{source_path.name}.zst")
-    if policy == "keep":
-        return {
-            "source_policy": policy,
-            "source_status": "kept" if source_path.is_file() else "already-retired",
-        }
-
-    source_record = manifest.get("source")
-    if not isinstance(source_record, dict):
-        raise ValueError("Validated manifest lost its source record")
-    expected_sha256 = source_record.get("sha256")
-    expected_size = source_record.get("size_bytes")
-    if not isinstance(expected_sha256, str) or not isinstance(expected_size, int):
-        raise ValueError("Validated manifest source identity is invalid")
-
-    if not source_path.is_file():
-        if policy == "compress" and archive_path.is_file():
-            archive_sha256, archive_size = _hash_decompressed_zstd(
-                archive_path,
-                log_path,
-            )
-            if (archive_sha256, archive_size) != (
-                expected_sha256,
-                expected_size,
-            ):
-                raise ValueError(
-                    f"Existing archive does not reproduce {spec.source_filename}"
-                )
-            return {
-                "source_policy": policy,
-                "source_status": "already-compressed",
-                "archive_path": str(archive_path),
-            }
-        if policy == "delete":
-            return {
-                "source_policy": policy,
-                "source_status": "already-deleted",
-            }
-        raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
-
-    if policy == "delete":
-        if (
-            source_path.stat().st_size != expected_size
-            or sha256_file(source_path) != expected_sha256
-        ):
-            raise ValueError(
-                f"Refusing to delete changed source {spec.source_filename}"
-            )
-        source_path.unlink()
-        runtime.source_volume.commit()
-        return {
-            "source_policy": policy,
-            "source_status": "deleted",
-        }
-
-    if archive_path.is_file():
-        if (
-            source_path.stat().st_size != expected_size
-            or sha256_file(source_path) != expected_sha256
-        ):
-            raise ValueError(
-                f"Refusing to replace changed source {spec.source_filename}"
-            )
-        archive_sha256, archive_size = _hash_decompressed_zstd(
-            archive_path,
-            log_path,
-        )
-        if (archive_sha256, archive_size) != (expected_sha256, expected_size):
-            raise ValueError(
-                f"Existing archive does not reproduce {spec.source_filename}"
-            )
-    else:
-        zstd = require_executable("zstd")
-        temporary_archive = archive_path.with_name(
-            f".{archive_path.name}.{uuid.uuid4().hex}.tmp"
-        )
-        argv = [
-            zstd,
-            f"-T{seqkit_threads}",
-            "--quiet",
-            "--stdout",
-            str(source_path),
-        ]
-        append_log(log_path, f"Running command: {shlex.join(argv)}")
-        try:
-            with temporary_archive.open("xb") as archive, log_path.open("ab") as log:
-                completed = subprocess.run(  # noqa: S603
-                    argv,
-                    check=False,
-                    stdout=archive,
-                    stderr=log,
-                )
-                archive.flush()
-                os.fsync(archive.fileno())
-            if completed.returncode != 0:
-                raise subprocess.CalledProcessError(completed.returncode, argv)
-            archive_sha256, archive_size = _hash_decompressed_zstd(
-                temporary_archive,
-                log_path,
-            )
-            if (archive_sha256, archive_size) != (
-                expected_sha256,
-                expected_size,
-            ):
-                raise ValueError(
-                    f"Compressed archive does not reproduce {spec.source_filename}"
-                )
-            temporary_archive.replace(archive_path)
-            runtime.source_volume.commit()
-        finally:
-            temporary_archive.unlink(missing_ok=True)
-
-    source_path.unlink()
-    runtime.source_volume.commit()
-    return {
-        "source_policy": policy,
-        "source_status": "compressed",
-        "archive_path": str(archive_path),
-        "archive_size_bytes": archive_path.stat().st_size,
-    }
-
-
 def _write_success_evidence(
     runtime: ProfileBuilderRuntime,
     evidence_root: Path,
@@ -540,25 +370,13 @@ def _reuse_published_profile(
     spec: DatabaseProfileSpec,
     published_root: Path,
     evidence_root: Path,
-    log_path: Path,
     generation_id: str,
-    source_policy: SourcePolicy,
-    *,
-    seqkit_threads: int,
 ) -> dict[str, object]:
     """Deeply validate and reuse a publication that won a setup race."""
-    manifest = validate_published_profile(
+    validate_published_profile(
         published_root,
         spec,
         verify_digests=True,
-    )
-    source_result = _apply_source_policy(
-        runtime,
-        spec,
-        manifest,
-        source_policy,
-        log_path,
-        seqkit_threads=seqkit_threads,
     )
     result = {
         "status": "reused",
@@ -567,7 +385,6 @@ def _reuse_published_profile(
         "generation_id": generation_id,
         "profile_path": str(published_root),
         "manifest_sha256": sha256_file(published_root / "manifest.json"),
-        **source_result,
     }
     _write_success_evidence(runtime, evidence_root, result)
     return result
@@ -865,16 +682,13 @@ def build_profile(
     runtime: ProfileBuilderRuntime,
     database_id: str,
     seqkit_threads: int,
-    source_policy: SourcePolicy,
     *,
-    generation_id: str | None = None,
+    generation_id: str,
+    source_path: Path,
 ) -> dict[str, object]:
-    """Build, publish, deeply validate, and optionally retire one source."""
+    """Build, publish, and deeply validate one database profile."""
     spec = resolve_database_profile(database_id)
     threads = validate_seqkit_threads(seqkit_threads)
-    policy = validate_source_policy(source_policy)
-    generation_id = uuid.uuid4().hex if generation_id is None else generation_id
-    source_path = runtime.source_root / spec.source_filename
     published_root = profile_root(runtime.sharded_root, spec)
     evidence_root = (
         runtime.output_root / runtime.evidence_relpath / spec.profile_id / generation_id
@@ -891,10 +705,7 @@ def build_profile(
             spec,
             published_root,
             evidence_root,
-            log_path,
             generation_id,
-            policy,
-            seqkit_threads=threads,
         )
 
     staging_root = (
@@ -913,19 +724,11 @@ def build_profile(
                 spec,
                 published_root,
                 evidence_root,
-                log_path,
                 generation_id,
-                policy,
-                seqkit_threads=threads,
             )
             return result
         if published_root.exists():
-            orphan_root = runtime.sharded_root / ".orphaned"
-            orphan_root.mkdir(parents=True, exist_ok=True)
-            published_root.replace(
-                orphan_root / f"{spec.profile_id}-{uuid.uuid4().hex}"
-            )
-            runtime.sharded_volume.commit()
+            shutil.rmtree(published_root)
 
         source, seqkit = _prepare_source_evidence(
             spec,
@@ -966,18 +769,10 @@ def build_profile(
         write_json_atomic(published_root / "manifest.json", manifest)
         runtime.sharded_volume.commit()
         manifest_published = True
-        published_manifest = validate_published_profile(
+        validate_published_profile(
             published_root,
             spec,
             verify_digests=True,
-        )
-        source_result = _apply_source_policy(
-            runtime,
-            spec,
-            published_manifest,
-            policy,
-            log_path,
-            seqkit_threads=threads,
         )
         result = {
             "status": "published",
@@ -995,7 +790,6 @@ def build_profile(
             "maximum_residue_imbalance": shards.statistics["maximum_residue_imbalance"],
             "recovered_records": shards.recovery_metrics["recovered_records"],
             "recovered_residues": shards.recovery_metrics["recovered_residues"],
-            **source_result,
         }
         _write_success_evidence(runtime, evidence_root, result)
         return result

@@ -253,7 +253,6 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 _CONTAINER_INSTANCE_ID = uuid.uuid4().hex
 _PROFILE_BUILDER_RUNTIME = ProfileBuilderRuntime(
     output_root=Path(CONF.output_volume_mountpoint),
-    source_volume=AF3_MSA_DB_VOLUME,
     sharded_volume=SHARDED_MSA_DB_VOLUME,
     output_volume=CONF.output_volume,
 )
@@ -303,7 +302,7 @@ def _coordinator_result(
     max_containers=PROFILE_BUILD_MAX_CONTAINERS,
     volumes={
         EnvironmentRuntime.MODEL_MOUNT: MODEL_VOLUME,
-        ProfileBuilderRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME,
+        EnvironmentRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME,
         ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
         CONF.output_volume_mountpoint: CONF.output_volume,
     },
@@ -317,12 +316,14 @@ def prepare_alphafold3_environment_asset(
         _ENVIRONMENT_RUNTIME,
         EnvironmentAsset.from_record(asset_record),
         generation_id,
-        build_profile=lambda database_id, selected_generation: build_profile(
-            _PROFILE_BUILDER_RUNTIME,
-            database_id,
-            DEFAULT_SEQKIT_THREADS,
-            "delete",
-            generation_id=selected_generation,
+        build_profile=lambda database_id, selected_generation, source_path: (
+            build_profile(
+                _PROFILE_BUILDER_RUNTIME,
+                database_id,
+                DEFAULT_SEQKIT_THREADS,
+                generation_id=selected_generation,
+                source_path=source_path,
+            )
         ),
     )
 

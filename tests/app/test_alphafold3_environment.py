@@ -23,7 +23,14 @@ from biomodals.app.fold.alphafold3.environment import (
     prepare_environment_asset,
     required_environment_assets,
 )
-from biomodals.app.fold.alphafold3.generation_claims import generation_status
+from biomodals.app.fold.alphafold3.generation_claims import (
+    finish_generation_claim,
+    generation_status,
+)
+from biomodals.app.fold.alphafold3.profiles import resolve_database_profile
+
+GENERATION_ID = "a" * 64
+OTHER_GENERATION_ID = "b" * 64
 
 
 class FakeVolume:
@@ -67,6 +74,7 @@ def _runtime(tmp_path: Path, claims: FakeClaims) -> EnvironmentRuntime:
         model_root=tmp_path / "models",
         source_root=tmp_path / "source",
         sharded_root=tmp_path / "sharded",
+        scratch_root=tmp_path / "scratch",
     )
 
 
@@ -122,7 +130,7 @@ def test_custom_msa_request_can_skip_all_search_assets() -> None:
         search_protein_templates=False,
     )
 
-    assert assets == (EnvironmentAsset("model", "model"),)
+    assert assets == (EnvironmentAsset("model"),)
 
 
 def test_readiness_checks_only_the_expected_final_path(tmp_path: Path) -> None:
@@ -131,17 +139,17 @@ def test_readiness_checks_only_the_expected_final_path(tmp_path: Path) -> None:
     model.parent.mkdir(parents=True)
     model.write_bytes(b"")
 
-    assert asset_ready(runtime, EnvironmentAsset("model", "model")) is True
+    assert asset_ready(runtime, EnvironmentAsset("model")) is True
 
 
 def test_only_one_generation_claims_a_missing_asset(tmp_path: Path) -> None:
     claims = FakeClaims()
     first_runtime = _runtime(tmp_path, claims)
     second_runtime = replace(first_runtime, container_id="other-coordinator")
-    asset = EnvironmentAsset("model", "model")
+    asset = EnvironmentAsset("model")
 
-    assert acquire_asset_claim(first_runtime, asset, "first") is not None
-    assert acquire_asset_claim(second_runtime, asset, "second") is None
+    assert acquire_asset_claim(first_runtime, asset, GENERATION_ID) is not None
+    assert acquire_asset_claim(second_runtime, asset, OTHER_GENERATION_ID) is None
 
 
 def test_worker_completes_the_coordinator_claim_for_a_reused_asset(
@@ -149,21 +157,21 @@ def test_worker_completes_the_coordinator_claim_for_a_reused_asset(
 ) -> None:
     claims = FakeClaims()
     coordinator = _runtime(tmp_path, claims)
-    asset = EnvironmentAsset("model", "model")
+    asset = EnvironmentAsset("model")
     model = coordinator.model_root / "AlphaFold3" / "af3.bin"
     model.parent.mkdir(parents=True)
     model.write_bytes(b"model")
-    assert acquire_asset_claim(coordinator, asset, "generation") is not None
+    assert acquire_asset_claim(coordinator, asset, GENERATION_ID) is not None
 
     result = prepare_environment_asset(
         replace(coordinator, container_id="worker"),
         asset,
-        "generation",
+        GENERATION_ID,
         build_profile=lambda *_arguments: {},
     )
 
     assert result == {"status": "reused", "asset_key": "model"}
-    status = generation_status(claims, "model", "generation")
+    status = generation_status(claims, "model", GENERATION_ID)
     assert status is not None
     assert status["status"] == "complete"
     assert status["asset_key"] == "model"
@@ -193,7 +201,7 @@ def test_compressed_file_is_published_only_after_decompression(
         tmp_path,
         Path("AlphaFold3/af3.bin"),
         "https://example.test/af3.bin.zst",
-        "generation",
+        GENERATION_ID,
         volume,
     )
 
@@ -201,14 +209,131 @@ def test_compressed_file_is_published_only_after_decompression(
     assert not (tmp_path / ".setup" / "af3.bin.zst.part").exists()
     assert volume.commits == 1
 
-    environment_module._prepare_compressed_file(
-        tmp_path,
-        Path("profile.fasta"),
-        "https://example.test/profile.fasta.zst",
-        "profile-generation",
-        volume,
-        commit=False,
+
+def test_profile_source_is_local_until_profile_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, FakeClaims())
+    spec = resolve_database_profile("small_bfd")
+
+    def download(urls, **kwargs):
+        del kwargs
+        [path] = urls.values()
+        Path(path).write_bytes(b"compressed")
+
+    def decompress(command, *, check):
+        assert check is True
+        Path(command[-1]).write_bytes(b">sequence\nACDE\n")
+
+    monkeypatch.setattr(environment_module, "download_files", download)
+    monkeypatch.setattr(environment_module, "require_executable", lambda name: name)
+    monkeypatch.setattr(environment_module.subprocess, "run", decompress)
+
+    source_path, partial_path = environment_module._prepare_profile_source(
+        runtime,
+        spec,
+        GENERATION_ID,
     )
 
-    assert (tmp_path / "profile.fasta").read_bytes() == b"model"
-    assert volume.commits == 1
+    assert source_path == runtime.scratch_root / GENERATION_ID / spec.source_filename
+    assert source_path.read_text() == ">sequence\nACDE\n"
+    assert partial_path.is_file()
+    assert not (runtime.source_root / spec.source_filename).exists()
+
+
+def test_successful_profile_preparation_cleans_temporary_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, FakeClaims())
+    spec = resolve_database_profile("small_bfd")
+
+    def download(urls, **kwargs):
+        del kwargs
+        [path] = urls.values()
+        Path(path).write_bytes(b"compressed")
+
+    def decompress(command, *, check):
+        assert check is True
+        Path(command[-1]).write_bytes(b">sequence\nACDE\n")
+
+    observed_source: Path | None = None
+
+    def build_profile(database_id: str, generation_id: str, source: Path):
+        nonlocal observed_source
+        assert database_id == spec.database_id
+        assert generation_id == GENERATION_ID
+        assert source.is_file()
+        observed_source = source
+        return {"status": "published"}
+
+    monkeypatch.setattr(environment_module, "download_files", download)
+    monkeypatch.setattr(environment_module, "require_executable", lambda name: name)
+    monkeypatch.setattr(environment_module.subprocess, "run", decompress)
+
+    result = prepare_environment_asset(
+        runtime,
+        EnvironmentAsset("profile", spec.database_id),
+        GENERATION_ID,
+        build_profile=build_profile,
+    )
+
+    assert result["status"] == "published"
+    assert observed_source is not None
+    assert not observed_source.exists()
+    assert not (
+        runtime.source_root / ".setup" / f"{spec.source_filename}.zst.part"
+    ).exists()
+
+
+def test_profile_cleanup_is_scoped_and_status_aware(tmp_path: Path) -> None:
+    claims = FakeClaims()
+    runtime = _runtime(tmp_path, claims)
+    spec = resolve_database_profile("small_bfd")
+    asset = EnvironmentAsset("profile", spec.database_id)
+    terminal_generation = "b" * 64
+    unknown_generation = "c" * 64
+    current_generation = "d" * 64
+
+    terminal_claim = acquire_asset_claim(runtime, asset, terminal_generation)
+    assert terminal_claim is not None
+    finish_generation_claim(
+        claims,
+        terminal_claim,
+        status="failed",
+        detail={},
+    )
+    assert acquire_asset_claim(runtime, asset, current_generation) is not None
+
+    staging = runtime.sharded_root / ".staging"
+    removable = (
+        f"{spec.profile_id}-{terminal_generation}",
+        f"{spec.profile_id}-{current_generation}",
+    )
+    for name in removable:
+        (staging / name).mkdir(parents=True)
+    retained = staging / f"{spec.profile_id}-{unknown_generation}"
+    retained.mkdir(parents=True)
+    unrelated = staging / f"other-profile-{terminal_generation}"
+    unrelated.mkdir(parents=True)
+    orphan = runtime.sharded_root / ".orphaned" / f"{spec.profile_id}-legacy"
+    orphan.mkdir(parents=True)
+
+    environment_module._cleanup_profile_workspaces(
+        runtime,
+        spec,
+        current_generation,
+    )
+
+    assert all(not (staging / name).exists() for name in removable)
+    assert retained.is_dir()
+    assert unrelated.is_dir()
+    assert not orphan.exists()
+
+
+def test_environment_generation_rejects_unsafe_path_component(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path, FakeClaims())
+
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        acquire_asset_claim(runtime, EnvironmentAsset("model"), "../generation")

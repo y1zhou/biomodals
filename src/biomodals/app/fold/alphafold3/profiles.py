@@ -61,9 +61,6 @@ VALIDATION_RELPATHS = (
     "validation/shuffler-evidence.json",
 )
 
-SourcePolicy = Literal["keep", "compress", "delete"]
-SOURCE_POLICIES: tuple[SourcePolicy, ...] = ("keep", "compress", "delete")
-
 
 def record_multiset_identity() -> dict[str, str]:
     """Return the canonical-record multiset algorithm identity."""
@@ -210,18 +207,6 @@ def validate_seqkit_threads(seqkit_threads: int) -> int:
             f"got {seqkit_threads}"
         )
     return seqkit_threads
-
-
-def validate_source_policy(source_policy: str) -> SourcePolicy:
-    """Validate the post-publication source-retirement policy."""
-    if not isinstance(source_policy, str):
-        raise TypeError("source_policy must be a string")
-    if source_policy not in SOURCE_POLICIES:
-        choices = ", ".join(SOURCE_POLICIES)
-        raise ValueError(
-            f"Unknown source_policy {source_policy!r}; expected one of {choices}"
-        )
-    return source_policy
 
 
 def shard_filename(spec: DatabaseProfileSpec, index: int) -> str:

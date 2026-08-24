@@ -20,10 +20,12 @@ class FakeResponse:
         headers: dict[str, str] | None = None,
         chunks: tuple[bytes, ...] = (),
         status_error: Exception | None = None,
+        status_code: int = 200,
     ) -> None:
         self.headers = headers or {}
         self.chunks = chunks
         self.status_error = status_error
+        self.status_code = status_code
         self.closed = False
 
     def raise_for_status(self) -> None:
@@ -183,3 +185,50 @@ def test_download_file_closes_get_for_missing_file(tmp_path: Path) -> None:
         ("GET", "https://example.test/model.bin", {"stream": True})
     ]
     assert get_response.closed is True
+
+
+def test_download_file_resumes_partial_file_with_range(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"partial")
+    head_response = FakeResponse(headers={"content-length": "11"})
+    get_response = FakeResponse(chunks=(b"rest",), status_code=206)
+    session = FakeSession(head_response=head_response, get_response=get_response)
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"partialrest"
+    assert session.calls[1] == (
+        "GET",
+        "https://example.test/archive.zst",
+        {"stream": True, "headers": {"Range": "bytes=7-"}},
+    )
+
+
+def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"partial")
+    get_response = FakeResponse(chunks=(b"rest",), status_code=206)
+    session = FakeSession(
+        head_error=RuntimeError("HEAD unsupported"),
+        get_response=get_response,
+    )
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"partialrest"

@@ -8,7 +8,11 @@ from uuid import UUID
 import modal
 import pytest
 
-from biomodals.execution import DeploymentIdentity, ExecutionOverview
+from biomodals.execution import (
+    DeploymentIdentity,
+    ExecutionOverview,
+    ProviderCallStatus,
+)
 from biomodals.service.remote_execution import (
     ExecutionLocator,
     RemoteExecutionClient,
@@ -135,6 +139,78 @@ async def test_builtin_root_poll_timeout_means_still_running(monkeypatch) -> Non
     )
 
     assert await RemoteExecutionClient().poll_root(LOCATOR, "fc-active") is None
+
+
+@pytest.mark.anyio
+async def test_unassigned_active_provider_calls_are_presented_as_queued(
+    monkeypatch,
+) -> None:
+    provider_call = SimpleNamespace(
+        provider_call_handle_id="fc-provider",
+        status=ProviderCallStatus.RUNNING,
+    )
+    overview = SimpleNamespace(representative_provider_calls=(provider_call,))
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(
+            from_id=lambda _call_id: SimpleNamespace(
+                get_call_graph=lambda: [
+                    SimpleNamespace(
+                        function_call_id="fc-provider",
+                        task_id="",
+                        status=modal.types.InputStatus.PENDING,
+                    )
+                ]
+            )
+        ),
+    )
+
+    queued = await RemoteExecutionClient().queued_provider_call_handles(overview)
+
+    assert queued == frozenset({"fc-provider"})
+
+
+@pytest.mark.anyio
+async def test_assigned_or_uninspectable_provider_calls_default_to_running(
+    monkeypatch,
+) -> None:
+    calls = (
+        SimpleNamespace(
+            provider_call_handle_id="fc-assigned",
+            status=ProviderCallStatus.RUNNING,
+        ),
+        SimpleNamespace(
+            provider_call_handle_id="fc-unavailable",
+            status=ProviderCallStatus.RUNNING,
+        ),
+    )
+
+    def from_id(call_id):
+        if call_id == "fc-unavailable":
+            return SimpleNamespace(
+                get_call_graph=lambda: (_ for _ in ()).throw(RuntimeError("no graph"))
+            )
+        return SimpleNamespace(
+            get_call_graph=lambda: [
+                SimpleNamespace(
+                    function_call_id=call_id,
+                    task_id="ta-assigned",
+                    status=modal.types.InputStatus.PENDING,
+                )
+            ]
+        )
+
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(from_id=from_id),
+    )
+
+    assert (
+        await RemoteExecutionClient().queued_provider_call_handles(
+            SimpleNamespace(representative_provider_calls=calls)
+        )
+        == frozenset()
+    )
 
 
 @pytest.mark.anyio

@@ -13,6 +13,7 @@ from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
 
 ALPHAFOLD3_EXECUTION_NODE_KEYS = (
     "stage-request-input",
+    "prepare-environment",
     "raw-database-searches",
     "combined-msa-publications",
     "protein-template-searches",
@@ -37,6 +38,7 @@ def build_alphafold3_execution_plan(
     nodes: list[NodePlan] = []
     previous: str | None = None
     empty_result_nodes = {
+        "prepare-environment",
         "raw-database-searches",
         "combined-msa-publications",
         "protein-template-searches",

@@ -493,9 +493,17 @@ def _execute_template_search(
     )
     seqres_path = source_root / PDB_SEQRES_FILENAME
     mmcif_path = source_root / MMCIF_DIRECTORY_NAME
-    require_regular_file(seqres_path)
-    if not mmcif_path.is_dir():
-        raise FileNotFoundError(f"Expected mmCIF directory: {mmcif_path}")
+    try:
+        require_regular_file(seqres_path)
+        if not mmcif_path.is_dir():
+            raise FileNotFoundError(f"Expected mmCIF directory: {mmcif_path}")
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "Existing AlphaFold3 template assets are incomplete. Remove or "
+            f"repair {seqres_path} and {mmcif_path} in the AlphaFold3-msa-db "
+            "Volume, then rerun the job; automatic setup will not replace "
+            "existing final paths."
+        ) from error
 
     contract = assert_pinned_template_contract()
     msa_config = import_module("alphafold3.data.msa_config")
@@ -516,13 +524,22 @@ def _execute_template_search(
             max_template_date=selected_date,
         ),
     )
-    template_hits = pipeline._get_protein_templates(  # noqa: SLF001
-        sequence=query,
-        input_msa_a3m=unpaired_msa,
-        run_template_search=True,
-        templates_config=template_config,
-        pdb_database_path=str(mmcif_path),
-    )
+    try:
+        template_hits = pipeline._get_protein_templates(  # noqa: SLF001
+            sequence=query,
+            input_msa_a3m=unpaired_msa,
+            run_template_search=True,
+            templates_config=template_config,
+            pdb_database_path=str(mmcif_path),
+        )
+    except Exception as error:
+        error.add_note(
+            "If AlphaFold3 reports incompatible template data, remove or repair "
+            f"{seqres_path} and {mmcif_path} in the AlphaFold3-msa-db Volume, "
+            "then rerun the job; automatic setup will not replace existing "
+            "final paths."
+        )
+        raise
     templates: list[dict[str, object]] = []
     for hit, structure in template_hits.get_hits_with_structures():
         mapping = list(hit.query_to_hit_mapping.items())

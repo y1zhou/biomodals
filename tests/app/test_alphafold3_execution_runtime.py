@@ -11,6 +11,7 @@ import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 import biomodals.app.fold.alphafold3.execution_planning as planning_module
+from biomodals.app.fold.alphafold3.environment import EnvironmentRuntime
 from biomodals.app.fold.alphafold3.execution_planning import (
     SEED_PREDICTIONS,
     STAGE_INFERENCE,
@@ -25,6 +26,7 @@ from biomodals.app.fold.alphafold3.execution_runtime import (
 )
 from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
 from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
+from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS, profile_root
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -142,6 +144,18 @@ def _graph_inputs(tmp_path: Path):
     output = FakeVolume()
     cache = FakeVolume()
     claims = FakeClaims()
+    model_root = tmp_path / "models"
+    source_root = tmp_path / "source"
+    sharded_root = tmp_path / "sharded"
+    (model_root / "AlphaFold3").mkdir(parents=True, exist_ok=True)
+    (model_root / "AlphaFold3" / "af3.bin").touch()
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "pdb_seqres_2022_09_28.fasta").touch()
+    (source_root / "mmcif_files").mkdir(exist_ok=True)
+    for spec in DATABASE_PROFILE_SPECS:
+        root = profile_root(sharded_root, spec)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "manifest.json").touch()
     return {
         "output_volume": output,
         "search_runtime": SearchRuntime(
@@ -151,7 +165,7 @@ def _graph_inputs(tmp_path: Path):
             container_id="coordinator",
             maximum_age_seconds=100,
             wait_timeout_seconds=100,
-            sharded_root=tmp_path / "sharded",
+            sharded_root=sharded_root,
             cache_root=tmp_path / "cache",
         ),
         "template_runtime": TemplateRuntime(
@@ -161,7 +175,7 @@ def _graph_inputs(tmp_path: Path):
             container_id="coordinator",
             maximum_age_seconds=100,
             wait_timeout_seconds=100,
-            source_root=tmp_path / "source",
+            source_root=source_root,
             cache_root=tmp_path / "cache",
         ),
         "inference_runtime": InferenceRuntime(
@@ -172,6 +186,16 @@ def _graph_inputs(tmp_path: Path):
             maximum_age_seconds=100,
             summary_maximum_age_seconds=100,
             wait_timeout_seconds=100,
+        ),
+        "environment_runtime": EnvironmentRuntime(
+            model_volume=cast(Any, FakeVolume()),
+            source_volume=cast(Any, FakeVolume()),
+            sharded_volume=cast(Any, FakeVolume()),
+            claims=cast(Any, claims),
+            container_id="coordinator",
+            model_root=model_root,
+            source_root=source_root,
+            sharded_root=sharded_root,
         ),
     }
 

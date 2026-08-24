@@ -126,7 +126,11 @@ as downloadable.
 A Tool Definition owns an ordered list of semantic stages. Each stage maps one
 or more kernel Node keys into one user-facing label and optional provider
 function description. The service aggregates Task status counts across mapped
-Nodes. Provider Call selection and raw Node keys are diagnostic details.
+Nodes. For an active stage, the disposable projection may expose
+`provider_state` as `queued` while Modal has accepted its Function Call but has
+not assigned a container, or `running` after assignment. Failure to obtain
+that presentation-only SDK hint defaults to `running`. Provider Call selection
+and raw Node keys are diagnostic details.
 
 ## Provider Call limits
 
@@ -321,16 +325,18 @@ suggestions rather than a closed built-in vocabulary.
 AlphaFold3 exposes these ordered semantic stages:
 
 1. Prepare input
-2. Search sequence databases
-3. Search templates
-4. Predict structures
-5. Prepare results
+2. Prepare environment
+3. Search sequence databases
+4. Search templates
+5. Predict structures
+6. Prepare results
 
 Their kernel Node mappings are:
 
 | Semantic stage | Kernel Nodes |
 | --- | --- |
 | Prepare input | `stage-request-input` |
+| Prepare environment | `prepare-environment` |
 | Search sequence databases | `raw-database-searches`, `combined-msa-publications` |
 | Search templates | `protein-template-searches` |
 | Predict structures | `stage-inference-input`, `seed-predictions` |

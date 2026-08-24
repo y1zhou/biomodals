@@ -515,9 +515,17 @@ def load_search_context(
     query = validate_query(spec, sequence)
     selected_profile_root = profile_root(sharded_root, spec)
     manifest_path = selected_profile_root / "manifest.json"
-    require_regular_file(manifest_path)
-    manifest = load_json_object(manifest_path)
-    validate_profile_manifest(manifest, spec)
+    try:
+        require_regular_file(manifest_path)
+        manifest = load_json_object(manifest_path)
+        validate_profile_manifest(manifest, spec)
+    except (OSError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Existing AlphaFold3 database profile is invalid: "
+            f"{selected_profile_root}. Remove or repair that directory in the "
+            "AlphaFold3-msa-db-sharded Volume, then rerun the job; automatic "
+            "setup will not replace a published profile."
+        ) from error
     profile_identity = profile_search_identity(manifest, spec)
     search_identity = production_search_identity(
         spec,

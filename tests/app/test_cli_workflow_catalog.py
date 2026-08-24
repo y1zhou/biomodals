@@ -136,21 +136,6 @@ def test_run_help_owns_public_deployment_flags(namespace: str) -> None:
     assert "--deployment-version" not in output
 
 
-def test_multi_entrypoint_help_separates_argument_tables() -> None:
-    result = runner.invoke(app, ["app", "help", "alphafold3"])
-    lines = [line.rstrip() for line in strip_ansi(result.output).splitlines()]
-
-    assert result.exit_code == 0
-    first_heading = lines.index("setup_sharded_databases CLI flags:")
-    second_heading = lines.index("submit_alphafold3_task CLI flags:")
-    first_table = lines[first_heading + 1 : second_heading]
-    first_nonblank = next(i for i, line in enumerate(first_table) if line)
-    last_nonblank = max(i for i, line in enumerate(first_table) if line)
-
-    assert first_table[:first_nonblank] == [""]
-    assert first_table[last_nonblank + 1 :] == ["", ""]
-
-
 @pytest.mark.parametrize("command", ["list", "ls", "l", "help", "h", "deploy", "d"])
 def test_top_level_app_compatibility_aliases_are_removed(command: str) -> None:
     result = runner.invoke(app, [command])

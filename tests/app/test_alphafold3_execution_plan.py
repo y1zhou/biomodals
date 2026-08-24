@@ -66,7 +66,8 @@ def test_alphafold3_execution_plan_preserves_the_fixed_semantic_dag() -> None:
         for node in plan.nodes
     } == {
         "stage-request-input": (),
-        "raw-database-searches": ("stage-request-input",),
+        "prepare-environment": ("stage-request-input",),
+        "raw-database-searches": ("prepare-environment",),
         "combined-msa-publications": ("raw-database-searches",),
         "protein-template-searches": ("combined-msa-publications",),
         "stage-inference-input": ("protein-template-searches",),
@@ -75,6 +76,7 @@ def test_alphafold3_execution_plan_preserves_the_fixed_semantic_dag() -> None:
         "request-publication": ("inference-summary",),
     }
     assert {node.node_key for node in plan.nodes if node.allow_empty_result} == {
+        "prepare-environment",
         "raw-database-searches",
         "combined-msa-publications",
         "protein-template-searches",

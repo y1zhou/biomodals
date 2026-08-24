@@ -83,7 +83,6 @@ from biomodals.app.fold.alphafold3.profile_builder import (
     ShardBuildEvidence,
     SourceProfileEvidence,
     build_profile_manifest,
-    plan_missing_profile_builds,
 )
 from biomodals.app.fold.alphafold3.profile_manifest import (
     current_profile_recipe,
@@ -93,9 +92,7 @@ from biomodals.app.fold.alphafold3.profile_manifest import (
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
-    COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
     COMPOSABLE_MULTISET_RECIPE_VERSION,
-    DATABASE_PROFILE_SPECS,
     DEFAULT_SEQKIT_THREADS,
     HMMER_VERSION,
     JACKHMMER_PATCH_SHA256,
@@ -436,7 +433,7 @@ class FakeVolumeReader:
         yield value[midpoint:]
 
 
-def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
+def test_profile_manifest_is_fixed() -> None:
     manifest = _profile_manifest("small_bfd")
     source, shards, validation = validate_profile_manifest(
         manifest,
@@ -446,19 +443,6 @@ def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
     assert source["num_seqs"] == 65_984_053
     assert len(shards) == 64
     assert [record["path"] for record in validation] == list(VALIDATION_RELPATHS)
-
-    inventory: dict[str, object] = {
-        "invalid_profiles": {},
-        "missing_database_ids": ["uniref90", "small_bfd"],
-    }
-    assert plan_missing_profile_builds(
-        inventory,
-        seqkit_threads=4,
-        source_policy="compress",
-    ) == (
-        ("small_bfd", 4, "compress"),
-        ("uniref90", 4, "compress"),
-    )
 
     manifest["shards"][0], manifest["shards"][1] = (
         manifest["shards"][1],
@@ -493,25 +477,6 @@ def test_profile_search_identity_excludes_build_execution_metadata() -> None:
     assert profile_search_identity(changed_shards, spec) != profile_search_identity(
         original,
         spec,
-    )
-
-
-def test_composable_profile_accepts_legacy_timing_artifact() -> None:
-    assert "validation/shuffle-stderr.log" not in VALIDATION_RELPATHS
-    assert "validation/shuffle-stderr.log" in COMPOSABLE_LEGACY_VALIDATION_RELPATHS
-    manifest = _profile_manifest("small_bfd")
-    validation = cast(dict[str, object], manifest["validation"])
-    validation["artifacts"] = [
-        _artifact(path) for path in COMPOSABLE_LEGACY_VALIDATION_RELPATHS
-    ]
-
-    _, _, artifacts = validate_profile_manifest(
-        manifest,
-        resolve_database_profile("small_bfd"),
-    )
-
-    assert [record["path"] for record in artifacts] == list(
-        COMPOSABLE_LEGACY_VALIDATION_RELPATHS
     )
 
 
@@ -1975,66 +1940,6 @@ def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
         "execution-seed-2",
     )
     assert replay == first
-
-
-def test_generation_claims_adapt_legacy_owners() -> None:
-    """A stage may preserve an append-only chain created before canonical owners."""
-    store = FakeClaimStore()
-    scope_key = "small-bfd-64-v2"
-    store.put(
-        f"claim:{scope_key}:root",
-        {
-            "profile_id": scope_key,
-            "database_id": "small_bfd",
-            "generation_id": "legacy",
-            "container_id": "old-container",
-            "started_at": "legacy-start",
-            "started_at_epoch_seconds": 1_000,
-            "maximum_age_seconds": 100,
-        },
-    )
-
-    def adapt_profile_owner(
-        selected_scope: str,
-        value: object,
-    ) -> dict[str, object]:
-        assert isinstance(value, dict)
-        legacy = cast(dict[str, object], value)
-        return {
-            "scope_key": selected_scope,
-            "generation_id": legacy["generation_id"],
-            "identity": {
-                "profile_id": legacy["profile_id"],
-                "database_id": legacy["database_id"],
-            },
-            "container_id": legacy["container_id"],
-            "started_at": legacy["started_at"],
-            "started_at_epoch_seconds": legacy["started_at_epoch_seconds"],
-            "maximum_age_seconds": legacy["maximum_age_seconds"],
-        }
-
-    successor = acquire_generation_claim(
-        store,
-        scope_key=scope_key,
-        generation_id="canonical",
-        identity={"profile_id": scope_key, "database_id": "small_bfd"},
-        container_id="new-container",
-        maximum_age_seconds=100,
-        now_epoch_seconds=1_101,
-        now_text="canonical-start",
-        owner_adapter=adapt_profile_owner,
-    )
-
-    assert successor.owner["predecessor_generation_id"] == "legacy"
-    assert successor.owner["predecessor_status"] == "abandoned"
-    assert (
-        latest_generation_owner(
-            store,
-            scope_key,
-            owner_adapter=adapt_profile_owner,
-        )
-        == successor.owner
-    )
 
 
 def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:
@@ -3561,22 +3466,3 @@ def test_request_archive_rejects_same_size_changed_bytes(tmp_path: Path) -> None
             output_dir=tmp_path,
             display_name="changed",
         )
-
-
-def test_every_fixed_profile_has_one_missing_build_input() -> None:
-    inventory: dict[str, object] = {
-        "invalid_profiles": {},
-        "missing_database_ids": [
-            spec.database_id for spec in reversed(DATABASE_PROFILE_SPECS)
-        ],
-    }
-
-    planned = plan_missing_profile_builds(
-        inventory,
-        seqkit_threads=DEFAULT_SEQKIT_THREADS,
-        source_policy="keep",
-    )
-
-    assert [database_id for database_id, _, _ in planned] == [
-        spec.database_id for spec in DATABASE_PROFILE_SPECS
-    ]

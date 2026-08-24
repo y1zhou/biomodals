@@ -112,6 +112,12 @@ ALPHAFOLD3_TOOL = ToolDefinition(
             (None,),
         ),
         ToolStageDefinition(
+            "prepare_environment",
+            "Prepare environment",
+            ("prepare-environment",),
+            ("prepare_alphafold3_environment_asset",),
+        ),
+        ToolStageDefinition(
             "search_sequence_databases",
             "Search sequence databases",
             ("raw-database-searches", "combined-msa-publications"),
@@ -142,6 +148,8 @@ ALPHAFOLD3_TOOL = ToolDefinition(
 def project_overview(
     definition: ToolDefinition,
     overview: ExecutionOverview,
+    *,
+    queued_provider_call_handles: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     """Build the bounded semantic-stage projection cached by the service."""
     nodes = {node.node_key: node for node in overview.nodes}
@@ -152,7 +160,7 @@ def project_overview(
         for counts in overview.node_task_status_counts
     }
     active_calls = {
-        call.node_key
+        call.node_key: call
         for call in overview.representative_provider_calls
         if not call.status.is_terminal
     }
@@ -193,6 +201,22 @@ def project_overview(
             )
             if node_key in active_calls and function_name is not None
         ]
+        stage_calls = [
+            active_calls[node_key]
+            for node_key in stage.node_keys
+            if node_key in active_calls
+        ]
+        provider_state = (
+            "queued"
+            if stage_calls
+            and all(
+                call.provider_call_handle_id in queued_provider_call_handles
+                for call in stage_calls
+            )
+            else "running"
+            if stage_calls
+            else None
+        )
         stages.append({
             "code": stage.code,
             "label": stage.label,
@@ -212,6 +236,7 @@ def project_overview(
             "outcome": outcome,
             "task_counts": counts,
             "running_functions": running_functions,
+            "provider_state": provider_state,
         })
     warnings = (
         ["Some results could not be produced"]

@@ -18,7 +18,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from time import time
 from typing import Any, ClassVar, cast
 
 import orjson
@@ -27,11 +26,8 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     ClaimStore,
     GenerationClaim,
-    abandon_generation_claim,
     acquire_generation_claim,
     finish_generation_claim,
-    generation_status,
-    latest_generation_owner,
 )
 from biomodals.app.fold.alphafold3.profile_manifest import (
     current_profile_recipe,
@@ -40,7 +36,6 @@ from biomodals.app.fold.alphafold3.profile_manifest import (
     validate_published_profile,
 )
 from biomodals.app.fold.alphafold3.profiles import (
-    DATABASE_PROFILE_SPECS,
     MAX_PROFILE_IMBALANCE,
     PROFILE_SCHEMA_VERSION,
     PROFILE_STALE_SECONDS,
@@ -375,72 +370,12 @@ def _validate_statistics(
     }
 
 
-def _legacy_profile_claim_key(spec: DatabaseProfileSpec) -> str:
-    return f"active:{spec.profile_id}"
-
-
-def _profile_claim_root_key(spec: DatabaseProfileSpec) -> str:
-    return f"claim:{spec.profile_id}:root"
-
-
-def _adapt_legacy_profile_owner(
-    scope_key: str,
-    value: object,
-) -> dict[str, object]:
-    if not isinstance(value, dict) or value.get("profile_id") != scope_key:
-        raise RuntimeError(f"Profile {scope_key} has an invalid legacy claim owner")
-    database_id = value.get("database_id")
-    if not isinstance(database_id, str):
-        raise RuntimeError(f"Profile {scope_key} legacy claim identity is invalid")
-    spec = resolve_database_profile(database_id)
-    if spec.profile_id != scope_key:
-        raise RuntimeError(f"Profile {scope_key} legacy claim identity is invalid")
-    return {
-        "scope_key": scope_key,
-        "generation_id": value.get("generation_id"),
-        "identity": {
-            "profile_id": scope_key,
-            "database_id": database_id,
-        },
-        "container_id": value.get("container_id"),
-        "started_at": value.get("started_at"),
-        "started_at_epoch_seconds": value.get("started_at_epoch_seconds"),
-        "maximum_age_seconds": value.get("maximum_age_seconds"),
-    }
-
-
-def _adopt_legacy_claim(
-    claims: ClaimStore,
-    spec: DatabaseProfileSpec,
-) -> None:
-    """Adopt an old active-key owner as the append-only claim root."""
-    legacy_claim = claims.get(_legacy_profile_claim_key(spec), None)
-    if legacy_claim is None:
-        return
-    legacy_owner = _adapt_legacy_profile_owner(spec.profile_id, legacy_claim)
-    root_key = _profile_claim_root_key(spec)
-    claims.put(root_key, legacy_owner, skip_if_exists=True)
-    root_owner = claims.get(root_key, None)
-    if not isinstance(root_owner, dict):
-        raise RuntimeError(f"Profile {spec.profile_id} claim root disappeared")
-    if root_owner.get("generation_id") != legacy_owner["generation_id"]:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} legacy and append-only claims conflict"
-        )
-    latest_generation_owner(
-        claims,
-        spec.profile_id,
-        owner_adapter=_adapt_legacy_profile_owner,
-    )
-
-
 def _acquire_profile_claim(
     runtime: ProfileBuilderRuntime,
     spec: DatabaseProfileSpec,
     generation_id: str,
 ) -> GenerationClaim:
     """Append one elected generation after a terminal or stale predecessor."""
-    _adopt_legacy_claim(runtime.claims, spec)
     try:
         return acquire_generation_claim(
             runtime.claims,
@@ -452,7 +387,6 @@ def _acquire_profile_claim(
             },
             container_id=runtime.container_id,
             maximum_age_seconds=PROFILE_STALE_SECONDS,
-            owner_adapter=_adapt_legacy_profile_owner,
         )
     except ActiveGenerationError as exc:
         raise RuntimeError(
@@ -967,12 +901,14 @@ def build_profile(
     database_id: str,
     seqkit_threads: int,
     source_policy: SourcePolicy,
+    *,
+    generation_id: str | None = None,
 ) -> dict[str, object]:
     """Build, publish, deeply validate, and optionally retire one source."""
     spec = resolve_database_profile(database_id)
     threads = validate_seqkit_threads(seqkit_threads)
     policy = validate_source_policy(source_policy)
-    generation_id = uuid.uuid4().hex
+    generation_id = uuid.uuid4().hex if generation_id is None else generation_id
     source_path = runtime.source_root / spec.source_filename
     published_root = profile_root(runtime.sharded_root, spec)
     evidence_root = (
@@ -982,7 +918,6 @@ def build_profile(
     evidence_root.mkdir(parents=True, exist_ok=True)
     append_log(log_path, f"Preparing profile {spec.profile_id}")
 
-    runtime.source_volume.reload()
     runtime.sharded_volume.reload()
     runtime.output_volume.reload()
     if (published_root / "manifest.json").is_file():
@@ -1160,190 +1095,3 @@ def build_profile(
             status=claim_status,
             detail=claim_detail,
         )
-
-
-def inspect_profile_registry(sharded_root: Path) -> dict[str, object]:
-    """Quickly validate fixed manifests and artifact sizes without rehashing."""
-    valid: list[str] = []
-    missing: list[str] = []
-    invalid: dict[str, dict[str, str]] = {}
-    for spec in DATABASE_PROFILE_SPECS:
-        root = profile_root(sharded_root, spec)
-        if not (root / "manifest.json").is_file():
-            missing.append(spec.database_id)
-            continue
-        try:
-            validate_published_profile(root, spec, verify_digests=False)
-        except (OSError, TypeError, ValueError) as exc:
-            invalid[spec.database_id] = {
-                "profile_id": spec.profile_id,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-            }
-        else:
-            valid.append(spec.database_id)
-    profiles_root = sharded_root / "profiles"
-    present_profile_ids = (
-        sorted(
-            path.name
-            for path in profiles_root.iterdir()
-            if path.is_dir() and not path.is_symlink()
-        )
-        if profiles_root.is_dir()
-        else []
-    )
-    selected_profile_ids = [spec.profile_id for spec in DATABASE_PROFILE_SPECS]
-    return {
-        "schema_version": 1,
-        "valid_database_ids": valid,
-        "missing_database_ids": missing,
-        "invalid_profiles": invalid,
-        "selected_profile_ids": selected_profile_ids,
-        "present_profile_ids": present_profile_ids,
-        "unselected_profile_ids": sorted(
-            set(present_profile_ids) - set(selected_profile_ids)
-        ),
-    }
-
-
-def plan_missing_profile_builds(
-    inventory: dict[str, object],
-    seqkit_threads: int,
-    source_policy: str,
-) -> tuple[tuple[str, int, SourcePolicy], ...]:
-    """Return ordered builder inputs for only missing fixed profiles."""
-    threads = validate_seqkit_threads(seqkit_threads)
-    policy = validate_source_policy(source_policy)
-    invalid = inventory.get("invalid_profiles")
-    if not isinstance(invalid, dict):
-        raise TypeError("Profile inventory has invalid failure details")
-    if invalid:
-        raise RuntimeError(
-            "Existing published profile validation failed; repair it manually "
-            f"before setup: {invalid}"
-        )
-    raw_missing = inventory.get("missing_database_ids")
-    if not isinstance(raw_missing, list) or not all(
-        isinstance(database_id, str) for database_id in raw_missing
-    ):
-        raise TypeError("Profile inventory returned invalid missing database IDs")
-    missing = {
-        database_id for database_id in raw_missing if isinstance(database_id, str)
-    }
-    selected = {spec.database_id for spec in DATABASE_PROFILE_SPECS}
-    unknown = sorted(missing - selected)
-    if unknown:
-        raise ValueError(f"Profile inventory returned unknown database IDs: {unknown}")
-    return tuple(
-        (spec.database_id, threads, policy)
-        for spec in DATABASE_PROFILE_SPECS
-        if spec.database_id in missing
-    )
-
-
-def cleanup_profile_workspace(
-    sharded_root: Path,
-    claims: ClaimStore,
-) -> dict[str, object]:
-    """Remove abandoned and unselected profiles after every builder finishes."""
-    inventory = inspect_profile_registry(sharded_root)
-    if inventory["missing_database_ids"] or inventory["invalid_profiles"]:
-        raise RuntimeError(
-            "Cannot clean profile workspace before all profiles are valid"
-        )
-    active: list[str] = []
-    for spec in DATABASE_PROFILE_SPECS:
-        _adopt_legacy_claim(claims, spec)
-        owner = latest_generation_owner(
-            claims,
-            spec.profile_id,
-            owner_adapter=_adapt_legacy_profile_owner,
-        )
-        if owner is None:
-            continue
-        generation_id = cast(str, owner["generation_id"])
-        status = generation_status(claims, spec.profile_id, generation_id)
-        if status is not None:
-            continue
-        started_at = cast(int | float, owner["started_at_epoch_seconds"])
-        age_seconds = time() - float(started_at)
-        if age_seconds <= PROFILE_STALE_SECONDS:
-            active.append(spec.profile_id)
-            continue
-        abandon_generation_claim(
-            claims,
-            GenerationClaim(
-                scope_key=spec.profile_id,
-                generation_id=generation_id,
-                owner=owner,
-            ),
-            detail={
-                "age_seconds": age_seconds,
-                "cleanup_recovery": True,
-            },
-        )
-        if generation_status(claims, spec.profile_id, generation_id) is None:
-            active.append(spec.profile_id)
-    if active:
-        raise RuntimeError(f"Cannot clean while profile claims are active: {active}")
-
-    removed_workspace: list[str] = []
-    for name in (".staging", ".orphaned"):
-        root = sharded_root / name
-        if not root.exists():
-            continue
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError(f"Expected profile workspace directory: {root}")
-        for child in sorted(root.iterdir()):
-            if child.is_symlink() or not child.is_dir():
-                raise ValueError(f"Unexpected profile workspace entry: {child}")
-            shutil.rmtree(child)
-            removed_workspace.append(child.relative_to(sharded_root).as_posix())
-        root.rmdir()
-
-    removed_profiles: list[str] = []
-    profiles_root = sharded_root / "profiles"
-    unselected = inventory["unselected_profile_ids"]
-    if not isinstance(unselected, list):
-        raise TypeError("Profile inventory has invalid unselected profile IDs")
-    for profile_id in unselected:
-        if not isinstance(profile_id, str) or Path(profile_id).name != profile_id:
-            raise ValueError(f"Unsafe unselected profile ID: {profile_id!r}")
-        root = profiles_root / profile_id
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError(f"Expected unselected profile directory: {root}")
-        shutil.rmtree(root)
-        removed_profiles.append(root.relative_to(sharded_root).as_posix())
-    return {
-        "status": "passed",
-        "removed_workspace_paths": removed_workspace,
-        "removed_unselected_profile_paths": removed_profiles,
-        "inventory": inspect_profile_registry(sharded_root),
-    }
-
-
-def finalize_profile_setup(runtime: ProfileBuilderRuntime) -> dict[str, object]:
-    """Clean the fixed profile registry and publish durable setup evidence."""
-    runtime.sharded_volume.reload()
-    runtime.output_volume.reload()
-    result = cleanup_profile_workspace(runtime.sharded_root, runtime.claims)
-    runtime.sharded_volume.commit()
-
-    setup_id = uuid.uuid4().hex
-    evidence_root = runtime.output_root / runtime.evidence_relpath / "setup" / setup_id
-    completed = result | {
-        "setup_id": setup_id,
-        "completed_at": utc_now(),
-    }
-    write_json_atomic(evidence_root / "inventory.json", completed)
-    runtime.output_volume.commit()
-    write_json_atomic(
-        evidence_root / "done.json",
-        {
-            "status": "complete",
-            "setup_id": setup_id,
-            "completed_at": utc_now(),
-        },
-    )
-    runtime.output_volume.commit()
-    return completed

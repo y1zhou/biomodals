@@ -36,6 +36,7 @@ class JobStageView(BaseModel):
     outcome: Literal["completed", "partial", "failed", "cancelled"] | None = None
     task_counts: StageTaskCounts = Field(default_factory=StageTaskCounts)
     running_functions: list[str] = Field(default_factory=list)
+    provider_state: Literal["queued", "running"] | None = None
 
 
 class JobView(BaseModel):
@@ -66,6 +67,9 @@ class JobView(BaseModel):
         can_view_logs: bool,
     ) -> JobView:
         """Decode the bounded disposable projection."""
+        raw_stages = record.projection.get("stages", [])
+        if not isinstance(raw_stages, list):
+            raw_stages = []
         stages = [
             JobStageView(
                 code=str(stage["code"]),
@@ -81,8 +85,9 @@ class JobView(BaseModel):
                     for value in stage.get("running_functions", [])
                     if isinstance(value, str)
                 ],
+                provider_state=stage.get("provider_state"),
             )
-            for stage in record.projection.get("stages", [])
+            for stage in raw_stages
             if isinstance(stage, dict) and isinstance(stage.get("code"), str)
         ]
         return cls(

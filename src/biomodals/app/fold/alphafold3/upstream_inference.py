@@ -79,22 +79,31 @@ def run_upstream_seed_worker(
         input_json_path = worker_root / "input.json"
         input_json_path.write_bytes(serialize_af3_input(config))
         print(f"💊 Running inference for {canonical_name} with seeds {list(seeds)}")
-        run_command(
-            [
-                sys.executable,
-                str(runtime.source_root / "run_alphafold.py"),
-                "--run_inference=true",
-                "--run_data_pipeline=false",
-                f"--json_path={input_json_path}",
-                f"--output_dir={worker_root}",
-                f"--model_dir={runtime.model_root}",
-                f"--jax_compilation_cache_dir={runtime.jax_cache_dir}",
-                f"--num_recycles={recycle}",
-                f"--num_diffusion_samples={sample_count}",
-            ],
-            output_mode="tee",
-            log_file=worker_root / "run.log",
-        )
+        try:
+            run_command(
+                [
+                    sys.executable,
+                    str(runtime.source_root / "run_alphafold.py"),
+                    "--run_inference=true",
+                    "--run_data_pipeline=false",
+                    f"--json_path={input_json_path}",
+                    f"--output_dir={worker_root}",
+                    f"--model_dir={runtime.model_root}",
+                    f"--jax_compilation_cache_dir={runtime.jax_cache_dir}",
+                    f"--num_recycles={recycle}",
+                    f"--num_diffusion_samples={sample_count}",
+                ],
+                output_mode="tee",
+                log_file=worker_root / "run.log",
+            )
+        except Exception as error:
+            error.add_note(
+                "If AlphaFold3 reports incompatible or unreadable model weights, "
+                f"remove or repair {runtime.model_root / 'af3.bin'} in the "
+                "biomodals-store Volume, then rerun the job; automatic setup "
+                "will not replace an existing checkpoint."
+            )
+            raise
 
     return run_seed_prediction_worker(
         runtime.predictions,

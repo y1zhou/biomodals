@@ -11,6 +11,7 @@ import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 import biomodals.execution.modal.host as host_module
+from biomodals.app.fold.alphafold3.environment import EnvironmentRuntime
 from biomodals.app.fold.alphafold3.execution_coordinator import (
     AlphaFold3ExecutionCoordinator,
 )
@@ -154,6 +155,16 @@ def _coordinator(
             maximum_age_seconds=100,
             summary_maximum_age_seconds=100,
             wait_timeout_seconds=100,
+        ),
+        environment_runtime=EnvironmentRuntime(
+            model_volume=cast(Any, FakeVolume()),
+            source_volume=cast(Any, FakeVolume()),
+            sharded_volume=cast(Any, FakeVolume()),
+            claims=claims,
+            container_id="coordinator",
+            model_root=tmp_path / "models",
+            source_root=tmp_path / "source",
+            sharded_root=tmp_path / "sharded",
         ),
         poll_interval_seconds=0,
     )

@@ -88,6 +88,7 @@ from biomodals.schema import AppRunResult, AppRunStatus
 
 (
     STAGE_REQUEST,
+    PREPARE_ENVIRONMENT,
     RAW_SEARCHES,
     MSA_ASSEMBLIES,
     TEMPLATE_SEARCHES,

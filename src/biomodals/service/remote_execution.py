@@ -19,6 +19,7 @@ from biomodals.execution import (
     ProviderCallPage,
 )
 from biomodals.execution.modal import deployed_execution_coordinator
+from biomodals.execution.model import ProviderCallOverview
 
 
 class RemoteDeploymentUnavailableError(RuntimeError):
@@ -116,6 +117,37 @@ class RemoteExecutionClient:
         except modal.exception.NotFoundError as error:
             raise RemoteDeploymentUnavailableError(str(error)) from error
         return self._verified(locator, overview)
+
+    async def queued_provider_call_handles(
+        self,
+        overview: ExecutionOverview,
+    ) -> frozenset[str]:
+        """Best-effort presentation hint for calls awaiting a Modal task."""
+
+        async def is_queued(call: ProviderCallOverview) -> bool:
+            handle_id = call.provider_call_handle_id
+            if not handle_id or call.status.is_terminal:
+                return False
+            try:
+                graph = await asyncio.to_thread(
+                    modal.FunctionCall.from_id(handle_id).get_call_graph
+                )
+            except Exception:
+                return False
+            return any(
+                item.function_call_id == handle_id
+                and item.status == modal.types.InputStatus.PENDING
+                and not item.task_id
+                for item in graph
+            )
+
+        calls = tuple(overview.representative_provider_calls)
+        queued = await asyncio.gather(*(is_queued(call) for call in calls))
+        return frozenset(
+            call.provider_call_handle_id
+            for call, waiting in zip(calls, queued, strict=True)
+            if waiting and call.provider_call_handle_id
+        )
 
     async def provider_calls(
         self,

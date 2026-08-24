@@ -17,11 +17,8 @@ ALPHAFOLD3_COMMIT = "8f8abfedb88024c631f641e9f8a282e50afb7146"
 
 SOURCE_DB_VOLUME_NAME = "AlphaFold3-msa-db"
 SHARDED_DB_VOLUME_NAME = "AlphaFold3-msa-db-sharded"
-PROFILE_BUILD_CLAIM_DICT_NAME = "AlphaFold3-msa-profile-build-claims"
 
 PROFILE_SCHEMA_VERSION = 2
-LEGACY_PROFILE_RECIPE_VERSION = 3
-ORDINAL_SHUFFLER_RECIPE_VERSION = 4
 COMPOSABLE_MULTISET_RECIPE_VERSION = 5
 PROFILE_ROOT = "profiles"
 DEFAULT_SEQKIT_THREADS = 8
@@ -55,29 +52,6 @@ JACKHMMER_PATCH_SHA256 = (
     "df9e3ae35ad1659921d96ebfca67a9616a7a467ddde2be18a56f9bd3edb38c41"
 )
 
-LEGACY_VALIDATION_RELPATHS = (
-    "validation/source-stats.tsv",
-    "validation/shard-stats.tsv",
-    "validation/shard-summary.parquet",
-    "validation/source-sum.tsv",
-    "validation/shard-sum.tsv",
-    "validation/seqkit-sum.json",
-    "validation/shuffle-stderr.log",
-    "validation/duplicate-recovery.jsonl",
-)
-ORDINAL_VALIDATION_RELPATHS = (
-    *LEGACY_VALIDATION_RELPATHS,
-    "validation/shuffler-metrics.json",
-)
-COMPOSABLE_LEGACY_VALIDATION_RELPATHS = (
-    "validation/source-stats.tsv",
-    "validation/shard-stats.tsv",
-    "validation/shard-summary.parquet",
-    "validation/record-multiset.json",
-    "validation/shuffle-stderr.log",
-    "validation/duplicate-recovery.jsonl",
-    "validation/shuffler-metrics.json",
-)
 VALIDATION_RELPATHS = (
     "validation/source-stats.tsv",
     "validation/shard-stats.tsv",
@@ -248,86 +222,6 @@ def validate_source_policy(source_policy: str) -> SourcePolicy:
             f"Unknown source_policy {source_policy!r}; expected one of {choices}"
         )
     return source_policy
-
-
-def profile_build_slot_budget(
-    builder_count: int,
-    seqkit_threads: int,
-) -> dict[str, int]:
-    """Describe the bounded process-worker fanout for one setup run."""
-    if (
-        isinstance(builder_count, bool)
-        or not isinstance(builder_count, int)
-        or not 0 <= builder_count <= PROFILE_BUILD_MAX_CONTAINERS
-    ):
-        raise ValueError(
-            "builder_count must be between 0 and "
-            f"{PROFILE_BUILD_MAX_CONTAINERS}, got {builder_count!r}"
-        )
-    threads = validate_seqkit_threads(seqkit_threads)
-    source_validator_threads = 1
-    return {
-        "builder_containers": builder_count,
-        "container_cap": PROFILE_BUILD_MAX_CONTAINERS,
-        "local_worker_threads_per_builder": threads,
-        "overlapping_source_validator_threads_per_builder": (source_validator_threads),
-        "maximum_effective_worker_slots": builder_count
-        * (threads + source_validator_threads),
-    }
-
-
-def plan_profile_setup(
-    seqkit_threads: int,
-    source_policy: str,
-    *,
-    evidence_volume_name: str,
-) -> dict[str, object]:
-    """Build the cost-free plan for every fixed production profile."""
-    threads = validate_seqkit_threads(seqkit_threads)
-    policy = validate_source_policy(source_policy)
-    if not isinstance(evidence_volume_name, str) or not evidence_volume_name:
-        raise ValueError("evidence_volume_name must be a non-empty string")
-    return {
-        "operation": "setup-sharded-databases",
-        "profiles": [
-            {
-                "database_id": spec.database_id,
-                "profile_id": spec.profile_id,
-                "source_filename": spec.source_filename,
-                "shard_count": spec.shard_count,
-                "polymer": spec.polymer,
-            }
-            for spec in DATABASE_PROFILE_SPECS
-        ],
-        "builder": {
-            "function": "build_sharded_database",
-            "seqkit_threads": threads,
-            "source_policy": policy,
-            "cpu": list(PROFILE_BUILD_CPU),
-            "memory_mib": list(BUILD_MEMORY_MIB),
-            "timeout_seconds": BUILD_TIMEOUT_SECONDS,
-        },
-        "fanout_budget": profile_build_slot_budget(
-            len(DATABASE_PROFILE_SPECS),
-            threads,
-        ),
-        "coordination": [
-            "inspect-fixed-profile-manifests",
-            "submit-all-missing-profiles-concurrently",
-            "wait-for-all-builders",
-            "final-inventory-and-workspace-cleanup",
-        ],
-        "volumes": {
-            "source": SOURCE_DB_VOLUME_NAME,
-            "shards": SHARDED_DB_VOLUME_NAME,
-            "evidence": evidence_volume_name,
-        },
-        "cleanup": {
-            "barrier": "all-selected-profiles-valid-and-no-active-claims",
-            "remove_generation_workspaces": [".staging", ".orphaned"],
-            "remove_unselected_profile_directories": True,
-        },
-    }
 
 
 def shard_filename(spec: DatabaseProfileSpec, index: int) -> str:

@@ -449,6 +449,25 @@ Workload-owned durable evidence that a Task's scientific output is complete
 and reusable.
 _Avoid_: provider success, build claim, database status alone
 
+**Environment Asset**:
+An app-owned model checkpoint, reference dataset, or immutable derived profile
+shared by compatible Execution Runs in one provider environment. Its cheap
+readiness check may be only the expected final path's existence; scientific
+operations remain responsible for detecting incompatible contents.
+_Avoid_: per-Run artifact, execution result, local service cache
+
+**Environment Setup Claim**:
+An environment-scoped writer election that prevents concurrent Runs or app
+deployments from provisioning the same missing Environment Asset. The asset's
+final path or publication—not the claim—indicates readiness.
+_Avoid_: Task ownership, completion marker, permanent setup flag
+
+**Environment Preparation Node**:
+An app-owned Execution Node whose independent Tasks provision the Environment
+Assets required by one Run. Its Tasks use normal kernel admission and Run-Level
+Provider Call Limits while sharing completed assets with other Runs.
+_Avoid_: service preflight, deployment hook, hidden provider fan-out
+
 **Execution Artifact**:
 A durable, provider-neutral record of data produced or consumed by an
 Execution Node, including its data category, storage location, exact file
@@ -501,12 +520,19 @@ A code-owned identifier for one immutable Sharded Database Profile, fixing its s
 _Avoid_: current profile, database ID, manifest digest
 
 **Profile Build Claim**:
-A minimal, append-only Modal Dict election record allowing one invocation to construct one Profile ID. Conflicts fail fast; a later explicit invocation may advance beyond a failed or conservatively stale generation.
+A minimal, append-only Modal Dict election record allowing one invocation to
+construct one Profile ID. Losing Runs keep their Tasks pending without
+submitting duplicate Provider Calls; a later invocation may advance beyond a
+failed or conservatively stale generation.
 _Avoid_: published profile, search build claim, polling lock service
 
 **Source FASTA Policy**:
-The explicit post-publication choice to keep, round-trip-verify and archivally compress, or delete an original database FASTA after its Sharded Database Profile is durably validated. A compressed source must be restored manually before another profile build.
-_Avoid_: temporary builder cleanup, shard compression, implicit retention, automatic source restore
+The post-publication choice to keep, round-trip-verify and archivally compress,
+or delete an original database FASTA after its Sharded Database Profile is
+durably validated. Automatic setup deletes reconstructable profile sources;
+template-search reference files remain available because workers read them
+directly.
+_Avoid_: temporary builder cleanup, shard compression, implicit retention
 
 **Database Search Space**:
 The full unsharded database size used by HMMER to scale hit E-values across a Sharded Database Profile. It is the exact sequence count for protein searches and the exact nucleotide count expressed in megabases for RNA searches.

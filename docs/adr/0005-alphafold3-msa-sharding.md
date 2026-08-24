@@ -76,21 +76,127 @@ record-multiset parsing, scratch sizing, and staged-file verification.
 immutable manifest and publication contract, and `profile_builder.py` owns
 construction, source policy, and cleanup. Profile preparation, MSA search,
 template search, and inference all use the append-only protocol in
-`generation_claims.py`; old profile-owner records are adapted in place.
+`generation_claims.py`.
 
-`search_pipeline.py` and `inference_pipeline.py` own request-level
-reconciliation behind narrow executor interfaces. `modal_adapters.py` owns
-Modal payload marshalling, bounded fan-out and polling, request staging, and
-the one-time profile-setup call sequence. `upstream_inference.py` owns the
-pinned AlphaFold command and upstream summary serialization. Fixed mount roots
-live on the runtime data classes that use them rather than in an app-wide
-metadata object. The remaining modules separate scientific search and
-assembly, template search, input enrichment, inference identity, seed
-publication, and request retrieval.
+`environment.py` plans and prepares only the shared assets required by a
+request. `modal_adapters.py` owns request staging and payload marshalling.
+`upstream_inference.py` owns the pinned AlphaFold command and upstream summary
+serialization. Fixed mount roots live on the runtime data classes that use
+them rather than in an app-wide metadata object. The remaining modules
+separate scientific search and assembly, template search, input enrichment,
+inference identity, seed publication, and request retrieval.
 `alphafold3_app.py` is the composition root: it binds these production modules
-to Modal resources and exposes only the three supported lifecycle components:
-one-time profile preparation, resumable MSA/template search, and AlphaFold
-inference.
+to Modal resources and exposes environment-asset preparation, resumable
+MSA/template search, and AlphaFold inference.
+
+### Automatic environment assets
+
+Every AlphaFold3 Execution Run includes one `Prepare environment`
+TaskProviderNode for the shared assets it needs. Its independent model,
+requested-profile, and optional template-reference Tasks use normal kernel
+admission and the Run's provider-call limit. It performs no hidden Modal
+fan-out. Inference requires
+`biomodals-store:/AlphaFold3/af3.bin`. MSA profile Tasks come from the request's
+actual planned Raw Database MSA work, so caller-supplied custom MSAs do not
+provision databases they eliminate. Template assets are prepared only when the
+request actually requires generated protein-template search.
+
+Setup uses the model URL documented by the pinned AlphaFold3 release and the
+database URLs from that release's `fetch_databases.sh`. A missing model file,
+profile directory, or directly consumed template path is provisioned
+automatically. These readiness checks deliberately use path existence rather
+than checksumming large shared assets. The scientific worker remains the
+deeper compatibility check; a later format or content mismatch fails with an
+operator repair message naming the rejected path, worker, Modal environment,
+and Volume. It explains that automatic replacement was refused. It never
+authorizes automatic replacement of an existing final asset.
+
+Cheap recurring readiness is distinct from publication. A newly constructed
+Sharded Database Profile still passes the existing one-time source/shard
+scientific validation before its manifest is published. Later Execution Runs
+do not repeat those scans; existence of the selected profile's final
+`manifest.json` is sufficient to skip environment setup. The marker is not
+opened, hashed, or semantically revalidated during recurring readiness checks.
+
+Environment Setup Claims elect only one writer per asset and Modal environment,
+including across concurrent Runs and deployed app versions. Claims are not
+completion evidence. Before provider submission, each Run coordinator checks
+the final path and atomically attempts the environment claim. A losing Run
+keeps its setup Task pending and submits no duplicate Provider Call. Later
+coordinator passes recheck only the final path and small claim status. A later
+setup generation is allowed when an asset is
+missing, a new Profile ID is selected, or an earlier generation failed. An
+existing manually installed model checkpoint is adopted without hashing or
+redownloading it.
+
+All setup scopes share the environment-local
+`AlphaFold3-environment-setup-claims` Modal Dict. It stores only append-only
+writer elections and terminal statuses; it never stores asset data or
+completion evidence. The implementation uses the kernel's existing prepared
+batch with no call to leave a losing Task pending without consuming a Run
+Provider Call slot or a Modal container. Successful claim history is retained,
+and there is no separate administrative claim-cleanup lifecycle.
+
+Each setup Provider Call receives a deterministic generation ID. Modal
+redelivery re-enters that generation after infrastructure interruption. A
+different generation may take over only after the owner is conclusively
+terminal or after the provider function's absolute maximum lifetime plus a
+short grace period, when that original call can no longer legally be running.
+
+Downloads first retain a fixed-URL compressed `.zst.part` file and use
+HTTP range requests to resume it. Successful download is followed by staged
+decompression and atomic publication of the final path. The compressed
+temporary file is removed after successful decompression and publication of
+the requested file. A profile source FASTA is removed separately only after
+the resulting sharded profile passes its one-time validation and publishes its
+manifest. Because the same Provider Call downloads, consumes, and deletes a
+profile source, that transient FASTA is not committed to the source Volume.
+
+A successor setup generation may adopt the fixed-URL compressed partial file
+of a conclusively terminal predecessor and continue its range download. If
+decompression rejects that temporary archive, setup removes only the partial
+archive, fails the current Run, and leaves a later explicit Run to download it
+again from zero.
+
+Downloads publish through generation-owned temporary paths. Automatic cleanup
+may remove those temporary paths but never a conflicting final asset. A
+validated sharded profile permits deletion of its reconstructable source
+FASTA. Template-search reference files remain in the source Volume because
+search workers consume them directly.
+
+The mmCIF tar stream extracts directly into a generation-owned directory on
+the mounted source Volume. After extraction completes, a same-Volume directory
+rename publishes `mmcif_files`, followed by the visibility commit. This uses
+standard mounted-filesystem operations and does not copy the extracted files a
+second time. The final directory is never committed while extraction is
+partial.
+
+A conclusive setup failure fails the current Execution Run without removing
+assets published by sibling Tasks. A later explicit Run reuses those assets
+and provisions only paths still missing. Modal may redeliver the same provider
+call after infrastructure interruption; the app adds no retry loop and does
+not create a Successor Run implicitly.
+
+An independently submitted Run that was already waiting on the failed claim
+may acquire one successor claim and perform its own authorized setup attempt.
+Likewise, cancelling the owner Run cancels its setup Provider Call normally;
+another waiting Run may take over only after that cancellation is conclusive.
+Setup work is never detached from the Run and Provider Call that own it.
+
+There is no separate public setup entrypoint or second setup implementation.
+Reusable source acquisition and profile construction are worker helpers used
+by the Environment Preparation Node.
+
+All asset Tasks use one thin decorated provider operation,
+`prepare_alphafold3_environment_asset`, with a typed model, profile, or
+template descriptor. The wrapper owns Modal mounts and resources only; focused
+helpers own acquisition and profile construction.
+
+Every non-pruned AlphaFold3 Execution Run exposes this work as `Prepare
+environment`, even when every Task immediately reuses an existing asset and
+the stage completes almost instantly. A complete terminal scientific
+publication may still prune the setup ancestor under the kernel's normal
+result-driven semantics.
 
 The temporary MSA app and benchmark campaign code were retired after the
 protein and RNA scientific gates passed. Historical measurements and oracle
@@ -153,38 +259,39 @@ mutable `current` pointer, automatic discovery, or automatic promotion.
 The manifest preserves source identity and statistics. The published profile
 does not retain a duplicate monolithic source FASTA.
 
-New builds retain structural shuffler evidence at
+Profiles retain structural shuffler evidence at
 `validation/shuffler-evidence.json`—record and byte counts, bounded-memory
 evidence, native source identity, and shuffle identities—but no timing or
 throughput summary. Successful new profiles also omit raw shuffler stderr;
-that diagnostic stream is retained only with failure evidence. The validator
-continues to accept the older `shuffler-metrics.json` and
-`shuffle-stderr.log` artifacts in already-published composable-multiset
-profiles so cleanup does not invalidate the selected databases.
+that diagnostic stream is retained only with failure evidence. Pre-release
+profile formats are not accepted; this unreleased system rebuilds them from
+the official source when the selected Profile ID changes.
 
-Rebuilding an identical specification reuses its valid publication and never
+Rebuilding an identical specification reuses its existing publication and never
 overwrites it. A builder for a new Profile ID publishes beside any existing
-profile and never mutates that prior publication. After all seven selected
-profiles validate and no builder claims remain active, the setup
-coordinator's finalization barrier removes non-selected profile directories so
-the Volume contains exactly one selected profile per logical database. This
-intentional garbage collection preserves old Search Identity and manifest
-evidence in the MSA cache, but recomputing an old Search Identity requires its
-profile to be rebuilt or manually restored first.
+profile and never mutates that prior publication. Automatic setup prepares
+only the profiles required by the request's polymer types; it does not require
+unrelated protein or RNA profiles before allowing the request to proceed.
 
 ### Profile builder
 
-The production app exposes one builder operation:
+The automatic environment worker calls the Modal-independent builder helper:
 
 ```python
-build_sharded_database(
+build_profile(
+    runtime: ProfileBuilderRuntime,
     database_id: str,
-    seqkit_threads: int = 8,
-    source_policy: Literal["keep", "compress", "delete"] = "keep",
+    seqkit_threads: int,
+    source_policy: Literal["keep", "compress", "delete"],
+    *,
+    generation_id: str | None = None,
 ) -> dict[str, object]
 ```
 
-One invocation builds one logical database. It uses `(0.125, 32.125)` CPUs,
+The thin `prepare_alphafold3_environment_asset` provider operation invokes
+this helper with the Task's deterministic generation and `source_policy` set
+to `delete`. One Provider Call builds one logical database. It uses
+`(0.125, 32.125)` CPUs,
 `(1024, 262144)` MiB requested/maximum memory, and the default 512 GiB
 ephemeral disk without requesting a larger disk.
 
@@ -306,34 +413,32 @@ builder per Profile ID with atomic Modal Dict insertion.
 The minimal claim uses append-only owner and terminal-status records by
 generation. It has no polling loop or heartbeat.
 
-An active conflict fails immediately. Normal failure records `failed`; work
+An active conflict leaves the competing environment Task pending without
+submitting a Provider Call. Normal failure records `failed`; work
 older than the maximum function lifetime plus a margin may be marked
 `abandoned`, allowing one later generation to take ownership. Claims form an
 append-only chain: terminal status fences the predecessor, and atomic insertion
 of its single successor elects the next generation. No takeover deletes or
 replaces another owner's record, so interruption at any point leaves a chain
 that a later invocation can continue. Terminal status is written from the
-builder's `finally` path. A legacy `active:{profile_id}` owner is adopted as
-the chain root on first access; it is not deleted, and a stale legacy owner can
-therefore be fenced and succeeded by the same protocol. Rollout must not
-overlap an actively starting pre-chain builder, because insertion of the old
-`active:` key and the new root are separate Dict operations; persisted legacy
-owners are supported once old-code submissions have stopped.
+builder's `finally` path. There is no pre-release claim migration path; setup
+claims begin directly with the append-only root record.
 
 Claims are never publication evidence and owner records are never deleted.
 Only a validated manifest proves completion. Different Profile IDs may build
 concurrently.
 
-The production batch entrypoint will therefore submit every missing Supported
-Database Specification concurrently. Each child invocation still builds one
-logical database and is independently bounded by its Profile Build Claim.
-The plan and submission log expose the seven-container cap, configured local
-workers, and maximum effective worker slots for the selected missing set.
+The Environment Preparation Node discovers only the missing Supported Database
+Specifications needed by the request. Each profile is one kernel Task and one
+Provider Call independently bounded by its Profile Build Claim; the app does
+not submit nested child calls. Kernel admission applies the Run's configured
+container ceiling and replenishes slots as setup Tasks complete.
 
 ### Source FASTA policy
 
-`source_policy="keep"` is the default. The source is never changed before the
-profile is committed and deeply revalidated.
+The source is never changed before the profile is committed and deeply
+revalidated. Automatic environment setup uses `source_policy="delete"` for
+reconstructable profile FASTAs.
 
 `compress` writes `<complete-source-filename>.zst` beside the source. It checks
 that decompression reproduces the recorded byte count and SHA-256 before it
@@ -347,12 +452,9 @@ profile publication.
 Compression or verification failure leaves the plain source intact. Source
 retirement is recorded and does not alter the immutable profile identity.
 
-The builder accepts only the uncompressed official source. If only its `.zst`
-archive exists, it fails with instructions to restore the source manually in a
-Modal Sandbox or equivalent environment.
-
-The app does not implement automatic restoration or an implicit full-database
-decompression.
+The builder accepts only the uncompressed official source. Automatic setup
+streams a missing pinned source from its official `.zst` URL before invoking
+the builder; an existing conflicting final source is not replaced.
 
 ### MSA cache namespace and retry boundary
 
@@ -1079,7 +1181,8 @@ The following risks are accepted:
 - a preempted database worker reruns all shards for that database;
 - an unmarked partial seed reruns in full;
 - trusted seed markers do not detect later artifact corruption;
-- model weights and template reference files rely on operator immutability;
+- existing model weights and template reference files are never replaced
+  automatically after a worker reports an incompatibility;
 - supported GPU classes may produce non-bitwise-identical cached seeds;
 - surfaced failures require another explicit request.
 
@@ -1087,7 +1190,6 @@ The initial implementation does not include:
 
 - per-shard durable retries;
 - compressed runtime shards or prediction-time SSD staging;
-- automatic source-archive restoration;
 - mutable profile aliases or automatic database upgrades;
 - normal-search shard audits;
 - automatic app-level retry loops;

@@ -235,7 +235,16 @@ class JobLifecycle:
         *,
         now: int,
     ) -> JobRecord:
-        projection = project_overview(registration.definition, overview)
+        queued_call_handles = (
+            await self.remote.queued_provider_call_handles(overview)
+            if overview.representative_provider_calls
+            else frozenset()
+        )
+        projection = project_overview(
+            registration.definition,
+            overview,
+            queued_provider_call_handles=queued_call_handles,
+        )
         if overview.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}:
             result_state = JobState(overview.run.status.value)
             job = self.store.begin_finalization(

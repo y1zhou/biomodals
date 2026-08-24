@@ -14,18 +14,13 @@ from typing import Any
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
-    COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
     COMPOSABLE_MULTISET_RECIPE_VERSION,
     HMMER_VERSION,
     JACKHMMER_PATCH_SHA256,
-    LEGACY_PROFILE_RECIPE_VERSION,
-    LEGACY_VALIDATION_RELPATHS,
     ORDINAL_SHUFFLER_PREFETCH_BYTES,
     ORDINAL_SHUFFLER_PREFETCH_RECORDS,
-    ORDINAL_SHUFFLER_RECIPE_VERSION,
     ORDINAL_SHUFFLER_SOURCE_SHA256,
     ORDINAL_SHUFFLER_VERSION,
-    ORDINAL_VALIDATION_RELPATHS,
     PROFILE_SCHEMA_VERSION,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
@@ -103,7 +98,7 @@ def current_profile_recipe(
 def _validate_recipe(
     recipe: dict[str, Any],
     spec: DatabaseProfileSpec,
-) -> tuple[int, tuple[tuple[str, ...], ...]]:
+) -> tuple[tuple[str, ...], ...]:
     """Validate one supported immutable sharding recipe."""
     if recipe.get("seqkit_version") != SEQKIT_VERSION:
         raise ValueError("Unexpected profile SeqKit version")
@@ -120,26 +115,7 @@ def _validate_recipe(
         raise ValueError("Invalid profile SeqKit threads") from exc
 
     recipe_version = recipe.get("version")
-    if recipe_version == LEGACY_PROFILE_RECIPE_VERSION:
-        if recipe.get("shuffle") != [
-            "--two-pass",
-            "--update-faidx",
-            "--tmp-dir=/tmp",
-        ]:
-            raise ValueError("Unexpected legacy profile shuffle recipe")
-        if recipe.get("duplicate_recovery") != {
-            "warning_source": "seqkit-fai-sequence-byte-offset",
-            "temporary_header_identity": "generation-unique-uuid",
-            "append_after_shuffle": True,
-            "strip_after_split": True,
-        }:
-            raise ValueError("Unexpected legacy duplicate-recovery recipe")
-        return recipe_version, (LEGACY_VALIDATION_RELPATHS,)
-
-    if recipe_version not in {
-        ORDINAL_SHUFFLER_RECIPE_VERSION,
-        COMPOSABLE_MULTISET_RECIPE_VERSION,
-    }:
+    if recipe_version != COMPOSABLE_MULTISET_RECIPE_VERSION:
         raise ValueError("Unexpected profile recipe version")
     current_recipe = current_profile_recipe(spec, seqkit_threads)
     if recipe.get("shuffle") != current_recipe["shuffle"]:
@@ -150,14 +126,9 @@ def _validate_recipe(
         raise ValueError("Unexpected native shuffler execution plan")
     if recipe.get("duplicate_recovery") != current_recipe["duplicate_recovery"]:
         raise ValueError("Unexpected occurrence-indexed duplicate policy")
-    if recipe_version == ORDINAL_SHUFFLER_RECIPE_VERSION:
-        return recipe_version, (ORDINAL_VALIDATION_RELPATHS,)
     if recipe.get("record_multiset") != current_recipe["record_multiset"]:
         raise ValueError("Unexpected composable record-multiset validator")
-    return recipe_version, (
-        VALIDATION_RELPATHS,
-        COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
-    )
+    return (VALIDATION_RELPATHS,)
 
 
 def validate_profile_manifest(
@@ -218,7 +189,7 @@ def validate_profile_manifest(
         raise ValueError("Profile recipe must be an object")
     if compatibility != profile_compatibility_identity():
         raise ValueError("Unexpected profile compatibility pin")
-    recipe_version, allowed_validation_relpaths = _validate_recipe(recipe, spec)
+    allowed_validation_relpaths = _validate_recipe(recipe, spec)
 
     if not isinstance(validation, dict) or validation.get("passed") is not True:
         raise ValueError("Profile does not declare passed validation")
@@ -228,32 +199,25 @@ def validate_profile_manifest(
         raise ValueError("Profile validation sequence count is invalid")
     if validation.get("sum_len") != source["sum_len"]:
         raise ValueError("Profile validation residue count is invalid")
-    if recipe_version in {
-        ORDINAL_SHUFFLER_RECIPE_VERSION,
-        COMPOSABLE_MULTISET_RECIPE_VERSION,
-    }:
-        if validation.get("record_occurrences_preserved") is not True:
-            raise ValueError("Profile does not preserve record occurrences")
-        if (
-            validation.get("recovered_records") != 0
-            or validation.get("recovered_residues") != 0
-            or validation.get("first_recovered_byte_offset") is not None
-            or validation.get("last_recovered_byte_offset") is not None
-        ):
-            raise ValueError("Occurrence-indexed profile declares FAI recovery")
-    if recipe_version == COMPOSABLE_MULTISET_RECIPE_VERSION:
-        if validation.get("canonical_record_multiset_match") is not True:
-            raise ValueError("Canonical source and shard record multisets differ")
-        signature_sha256 = validation.get("record_multiset_signature_sha256")
-        if (
-            not isinstance(signature_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", signature_sha256) is None
-        ):
-            raise ValueError("Invalid canonical record-multiset signature")
-        if "seqkit_sum" in validation:
-            raise ValueError(
-                "Composable-multiset profile unexpectedly declares SeqKit sum"
-            )
+    if validation.get("record_occurrences_preserved") is not True:
+        raise ValueError("Profile does not preserve record occurrences")
+    if (
+        validation.get("recovered_records") != 0
+        or validation.get("recovered_residues") != 0
+        or validation.get("first_recovered_byte_offset") is not None
+        or validation.get("last_recovered_byte_offset") is not None
+    ):
+        raise ValueError("Occurrence-indexed profile declares FAI recovery")
+    if validation.get("canonical_record_multiset_match") is not True:
+        raise ValueError("Canonical source and shard record multisets differ")
+    signature_sha256 = validation.get("record_multiset_signature_sha256")
+    if (
+        not isinstance(signature_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", signature_sha256) is None
+    ):
+        raise ValueError("Invalid canonical record-multiset signature")
+    if "seqkit_sum" in validation:
+        raise ValueError("Composable-multiset profile unexpectedly declares SeqKit sum")
     validation_artifacts = validation.get("artifacts")
     if not isinstance(validation_artifacts, list):
         raise ValueError("Profile validation artifacts must be a list")

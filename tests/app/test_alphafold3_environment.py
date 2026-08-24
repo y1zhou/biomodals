@@ -287,6 +287,47 @@ def test_successful_profile_preparation_cleans_temporary_source(
     ).exists()
 
 
+def test_failed_profile_preparation_retains_only_resumable_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, FakeClaims())
+    spec = resolve_database_profile("small_bfd")
+
+    def download(urls, **kwargs):
+        del kwargs
+        [path] = urls.values()
+        Path(path).write_bytes(b"compressed")
+
+    def decompress(command, *, check):
+        assert check is True
+        Path(command[-1]).write_bytes(b">sequence\nACDE\n")
+
+    monkeypatch.setattr(environment_module, "download_files", download)
+    monkeypatch.setattr(environment_module, "require_executable", lambda name: name)
+    monkeypatch.setattr(environment_module.subprocess, "run", decompress)
+
+    def fail_build(*_arguments):
+        raise RuntimeError("profile build failed")
+
+    with pytest.raises(RuntimeError, match="profile build failed"):
+        prepare_environment_asset(
+            runtime,
+            EnvironmentAsset("profile", spec.database_id),
+            GENERATION_ID,
+            build_profile=fail_build,
+        )
+
+    assert not (runtime.scratch_root / GENERATION_ID).exists()
+    assert (
+        runtime.source_root / ".setup" / f"{spec.source_filename}.zst.part"
+    ).is_file()
+    status = generation_status(
+        claims=runtime.claims, scope_key=spec.profile_id, generation_id=GENERATION_ID
+    )
+    assert status is not None and status["status"] == "failed"
+
+
 def test_profile_cleanup_is_scoped_and_status_aware(tmp_path: Path) -> None:
     claims = FakeClaims()
     runtime = _runtime(tmp_path, claims)

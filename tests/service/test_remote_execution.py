@@ -187,9 +187,11 @@ async def test_assigned_or_uninspectable_provider_calls_default_to_running(
             status=ProviderCallStatus.RUNNING,
         ),
     )
+    lookups = []
 
     def from_id(call_id):
         assert call_id == "fc-root"
+        lookups.append(call_id)
         return SimpleNamespace(
             get_call_graph=lambda: [
                 SimpleNamespace(
@@ -208,6 +210,37 @@ async def test_assigned_or_uninspectable_provider_calls_default_to_running(
     assert (
         await RemoteExecutionClient().queued_provider_call_handles(
             "fc-root", SimpleNamespace(representative_provider_calls=calls)
+        )
+        == frozenset()
+    )
+    assert lookups == ["fc-root"]
+
+
+@pytest.mark.anyio
+async def test_slow_call_graph_defaults_to_running(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.CALL_GRAPH_TIMEOUT_SECONDS",
+        0,
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(
+            from_id=lambda _call_id: SimpleNamespace(get_call_graph=lambda: [])
+        ),
+    )
+    overview = SimpleNamespace(
+        representative_provider_calls=(
+            SimpleNamespace(
+                provider_call_handle_id="fc-provider",
+                status=ProviderCallStatus.RUNNING,
+            ),
+        )
+    )
+
+    assert (
+        await RemoteExecutionClient().queued_provider_call_handles(
+            "fc-root",
+            overview,
         )
         == frozenset()
     )

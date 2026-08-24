@@ -33,7 +33,6 @@ from biomodals.app.fold.alphafold3.profiles import (
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
     SHARDED_DB_VOLUME_NAME,
-    SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
     profile_root,
@@ -637,8 +636,7 @@ def build_profile_manifest(
         "created_at": utc_now(),
         "generation_id": generation_id,
         "source": {
-            "volume": SOURCE_DB_VOLUME_NAME,
-            "path": spec.source_filename,
+            "filename": spec.source_filename,
             "size_bytes": source.size_bytes,
             "sha256": source.sha256,
             "num_seqs": statistics["num_seqs"],

@@ -68,13 +68,13 @@ pin change requires comparison against the new source before its results can
 reuse these scientific cache paths.
 
 Production code lives under `src/biomodals/app/fold/alphafold3/`.
-`artifacts.py` owns canonical JSON, digests, atomic publication, durable
-operation logging, and the shared Modal Volume persistence interfaces.
+`biomodals.helper.artifacts` owns canonical JSON, digests, atomic publication,
+durable operation logging, and the shared Modal Volume persistence interfaces.
 `sharding.py` owns the pinned native source assets, compilation, execution,
 record-multiset parsing, scratch sizing, and staged-file verification.
 `profiles.py` owns fixed production identities, `profile_manifest.py` owns the
 immutable manifest and publication contract, and `profile_builder.py` owns
-construction, source policy, and cleanup. Profile preparation, MSA search,
+construction and publication. Profile preparation, MSA search,
 template search, and inference all use the append-only protocol in
 `generation_claims.py`.
 
@@ -143,14 +143,13 @@ different generation may take over only after the owner is conclusively
 terminal or after the provider function's absolute maximum lifetime plus a
 short grace period, when that original call can no longer legally be running.
 
-Downloads first retain a fixed-URL compressed `.zst.part` file and use
-HTTP range requests to resume it. Successful download is followed by staged
-decompression and atomic publication of the final path. The compressed
-temporary file is removed after successful decompression and publication of
-the requested file. A profile source FASTA is removed separately only after
-the resulting sharded profile passes its one-time validation and publishes its
-manifest. Because the same Provider Call downloads, consumes, and deletes a
-profile source, that transient FASTA is not committed to the source Volume.
+Downloads first retain a fixed-URL compressed `.zst.part` file and use HTTP
+range requests to resume it. Model and template-sequence assets are staged,
+decompressed, and published atomically before their compressed temporary file
+is removed. Profile archives stay on the source Volume only while resumable
+acquisition or construction is in progress. Their plain FASTA is decompressed
+into container-local scratch and removed after profile construction; it is
+never committed to a Modal Volume.
 
 A successor setup generation may adopt the fixed-URL compressed partial file
 of a conclusively terminal predecessor and continue its range download. If
@@ -159,10 +158,10 @@ archive, fails the current Run, and leaves a later explicit Run to download it
 again from zero.
 
 Downloads publish through generation-owned temporary paths. Automatic cleanup
-may remove those temporary paths but never a conflicting final asset. A
-validated sharded profile permits deletion of its reconstructable source
-FASTA. Template-search reference files remain in the source Volume because
-search workers consume them directly.
+may remove only same-profile workspaces from the current generation or a
+terminal predecessor; it never removes another active profile workspace or a
+conflicting final asset. Template-search reference files remain in the source
+Volume because search workers consume them directly.
 
 The mmCIF tar stream extracts directly into a generation-owned directory on
 the mounted source Volume. After extraction completes, a same-Volume directory
@@ -282,23 +281,25 @@ build_profile(
     runtime: ProfileBuilderRuntime,
     database_id: str,
     seqkit_threads: int,
-    source_policy: Literal["keep", "compress", "delete"],
     *,
-    generation_id: str | None = None,
+    generation_id: str,
+    source_path: Path,
 ) -> dict[str, object]
 ```
 
 The thin `prepare_alphafold3_environment_asset` provider operation invokes
-this helper with the Task's deterministic generation and `source_policy` set
-to `delete`. One Provider Call builds one logical database. It uses
+this helper with the Task's deterministic generation and container-local
+decompressed source path. One Provider Call builds one logical database. It
+uses
 `(0.125, 32.125)` CPUs,
 `(1024, 262144)` MiB requested/maximum memory, and the default 512 GiB
 ephemeral disk without requesting a larger disk.
 
-The builder reads the official monolithic FASTA from `AlphaFold3-msa-db`. It
-writes an ephemeral source copy, the two-pass shuffled FASTA, and a compact
-occurrence-offset index under `/tmp`. It never copies the monolithic source
-into the sharded Volume.
+Environment preparation resumes the official compressed source on
+`AlphaFold3-msa-db` and decompresses it under `/tmp`. The builder writes a
+second ephemeral source copy, the two-pass shuffled FASTA, and a compact
+occurrence-offset index there. It never writes a plain monolithic source into
+a persistent Volume.
 
 Source `seqkit stats` remains serialized before shuffling. Its observed record
 count is a data dependency for exact scratch sizing and the native shuffler's
@@ -390,13 +391,10 @@ After the shard payload is committed, the builder writes the manifest last and
 deeply revalidates the published profile. On failure, it commits compact
 diagnostics before removing only that generation's partial shards.
 
-Profiles already published with the earlier SeqKit FAI recipe remain accepted
-under recipe version 3. Occurrence-indexed profiles published with the C
-shuffler and SeqKit sequence checksum remain accepted under recipe version 4.
-New builds use recipe version 5: the occurrence-indexed C shuffler and
-full-record C validator together. Existing immutable profiles are not rebuilt
-solely to revise their validation recipe; every selected profile must still
-pass the same database-search oracle before production promotion.
+Only the current recipe is accepted: the occurrence-indexed C shuffler and
+full-record C validator together. This pre-release system carries no reader or
+migration path for obsolete profile recipes; a recipe change selects a new
+Profile ID and rebuilds it from the official source.
 
 Normal search workers trust the published profile. They may read its small
 manifest for identity and Z, but they never stat, hash, walk, or run SeqKit over
@@ -420,9 +418,9 @@ older than the maximum function lifetime plus a margin may be marked
 append-only chain: terminal status fences the predecessor, and atomic insertion
 of its single successor elects the next generation. No takeover deletes or
 replaces another owner's record, so interruption at any point leaves a chain
-that a later invocation can continue. Terminal status is written from the
-builder's `finally` path. There is no pre-release claim migration path; setup
-claims begin directly with the append-only root record.
+that a later invocation can continue. Terminal status is written by the
+environment provider operation. There is no pre-release claim migration path;
+setup claims begin directly with the append-only root record.
 
 Claims are never publication evidence and owner records are never deleted.
 Only a validated manifest proves completion. Different Profile IDs may build
@@ -434,27 +432,19 @@ Provider Call independently bounded by its Profile Build Claim; the app does
 not submit nested child calls. Kernel admission applies the Run's configured
 container ceiling and replenishes slots as setup Tasks complete.
 
-### Source FASTA policy
+### Source FASTA lifecycle
 
-The source is never changed before the profile is committed and deeply
-revalidated. Automatic environment setup uses `source_policy="delete"` for
-reconstructable profile FASTAs.
+Automatic setup resumes each pinned official `.zst` URL into a fixed partial
+archive on `AlphaFold3-msa-db`. It decompresses the plain FASTA into
+generation-scoped container-local scratch and passes that path to the builder.
+Successful profile publication removes both the local source and resumable
+partial archive. Failure removes the local source but retains a usable partial
+archive for a later authorized generation. A decompression failure removes the
+rejected partial so that the next Run downloads it from zero.
 
-`compress` writes `<complete-source-filename>.zst` beside the source. It checks
-that decompression reproduces the recorded byte count and SHA-256 before it
-commits the archive and removes the plain FASTA. If that archive already
-exists, both the archive and the current plain source must match the published
-source identity before the plain source can be removed.
-
-`delete` removes the plain source only after the explicit request and successful
-profile publication.
-
-Compression or verification failure leaves the plain source intact. Source
-retirement is recorded and does not alter the immutable profile identity.
-
-The builder accepts only the uncompressed official source. Automatic setup
-streams a missing pinned source from its official `.zst` URL before invoking
-the builder; an existing conflicting final source is not replaced.
+The profile manifest records the source's identity and statistics, but the
+reconstructable plain FASTA is never durable. The immutable sharded profile is
+the only completed database-search asset.
 
 ### MSA cache namespace and retry boundary
 

@@ -116,7 +116,6 @@ class _PrepareEnvironmentNode(TaskProviderNode):
             TaskDefinition(
                 task_key=asset.key,
                 scientific_payload=asset.to_record(),
-                execution_payload={"asset_kind": asset.kind},
             )
             for asset in self._assets()
         )

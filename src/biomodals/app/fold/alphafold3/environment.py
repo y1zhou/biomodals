@@ -99,10 +99,6 @@ class EnvironmentAsset:
             database_id=cast(str | None, value.get("database_id")),
         )
 
-    def validated(self) -> EnvironmentAsset:
-        """Return this construction-validated descriptor."""
-        return self
-
 
 @dataclass(frozen=True, slots=True)
 class EnvironmentRuntime:
@@ -170,7 +166,7 @@ def required_environment_assets(
 
 def asset_path(runtime: EnvironmentRuntime, asset: EnvironmentAsset) -> Path:
     """Resolve one trusted descriptor to its final readiness path."""
-    selected = asset.validated()
+    selected = asset
     if selected.kind == "model":
         return runtime.model_root / MODEL_RELPATH
     if selected.kind == "profile":
@@ -189,7 +185,7 @@ def asset_ready(runtime: EnvironmentRuntime, asset: EnvironmentAsset) -> bool:
 
 def claim_identity(asset: EnvironmentAsset) -> dict[str, object]:
     """Return the stable identity shared by coordinator and worker claims."""
-    selected = asset.validated()
+    selected = asset
     if selected.kind == "profile":
         spec = resolve_database_profile(cast(str, selected.database_id))
         return {"profile_id": spec.profile_id, "database_id": spec.database_id}
@@ -256,7 +252,7 @@ def prepare_environment_asset(
 ) -> dict[str, object]:
     """Acquire, materialize, and publish one requested environment asset."""
     _validate_environment_generation_id(generation_id)
-    selected = asset.validated()
+    selected = asset
     runtime.volume_for(selected).reload()
     if asset_ready(runtime, selected):
         try:

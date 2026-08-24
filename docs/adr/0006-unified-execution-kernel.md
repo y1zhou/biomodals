@@ -613,6 +613,13 @@ cancellation keeps the Task `running` and the Run `state_unknown`. These rules
 make pruning close every durable work record without inventing completion or
 releasing uncertain ownership.
 
+After cancellation becomes conclusive, a Task Provider Node may run its
+best-effort `finalize_cancelled_remote_tasks` hook. This is workload cleanup,
+not provider cancellation or scientific completion: it may fence a
+workload-owned external claim but cannot change kernel Task outcomes. The
+default hook does nothing, and cleanup failure is diagnostic rather than
+authority to resubmit work.
+
 The Node, Task, and Provider Call relationship policy was accepted on
 2026-07-29. A Node is a fixed semantic DAG stage, a Task is one independently
 scheduled and validated item in that stage, and a Provider Call is one

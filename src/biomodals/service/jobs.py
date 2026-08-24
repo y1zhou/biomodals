@@ -71,24 +71,9 @@ class JobView(BaseModel):
         if not isinstance(raw_stages, list):
             raw_stages = []
         stages = [
-            JobStageView(
-                code=str(stage["code"]),
-                label=str(stage.get("label", stage["code"])),
-                started_at=_timestamp(stage.get("started_at")),
-                ended_at=_timestamp(stage.get("ended_at")),
-                outcome=stage.get("outcome"),
-                task_counts=StageTaskCounts.model_validate(
-                    stage.get("task_counts", {})
-                ),
-                running_functions=[
-                    str(value)
-                    for value in stage.get("running_functions", [])
-                    if isinstance(value, str)
-                ],
-                provider_state=stage.get("provider_state"),
-            )
+            parsed
             for stage in raw_stages
-            if isinstance(stage, dict) and isinstance(stage.get("code"), str)
+            if (parsed := _stage_from_projection(stage)) is not None
         ]
         return cls(
             job_id=record.job_id,
@@ -101,7 +86,9 @@ class JobView(BaseModel):
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),
             completed_at=_timestamp(record.completed_at),
             cancel_requested_at=_timestamp(record.cancel_requested_at),
-            warnings=record.warnings,
+            warnings=[
+                warning for warning in record.warnings if isinstance(warning, str)
+            ],
             error_code=record.error_code,
             error_message=record.error_message,
             download_url=(
@@ -110,6 +97,29 @@ class JobView(BaseModel):
                 else None
             ),
         )
+
+
+def _stage_from_projection(value: object) -> JobStageView | None:
+    if not isinstance(value, dict) or not isinstance(value.get("code"), str):
+        return None
+    functions = value.get("running_functions", [])
+    try:
+        return JobStageView(
+            code=value["code"],
+            label=str(value.get("label", value["code"])),
+            started_at=_timestamp(value.get("started_at")),
+            ended_at=_timestamp(value.get("ended_at")),
+            outcome=value.get("outcome"),
+            task_counts=StageTaskCounts.model_validate(value.get("task_counts", {})),
+            running_functions=(
+                [item for item in functions if isinstance(item, str)]
+                if isinstance(functions, list)
+                else []
+            ),
+            provider_state=value.get("provider_state"),
+        )
+    except (OverflowError, TypeError, ValueError):
+        return None
 
 
 class JobPageView(BaseModel):

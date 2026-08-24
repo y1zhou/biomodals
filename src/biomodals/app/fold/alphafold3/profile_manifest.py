@@ -24,7 +24,6 @@ from biomodals.app.fold.alphafold3.profiles import (
     PROFILE_SCHEMA_VERSION,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
-    SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
     record_multiset_identity,
@@ -160,10 +159,8 @@ def validate_profile_manifest(
     compatibility = manifest.get("compatibility")
     if not isinstance(source, dict):
         raise ValueError("Profile source must be an object")
-    if source.get("volume") != SOURCE_DB_VOLUME_NAME:
-        raise ValueError("Profile source Volume is invalid")
-    if source.get("path") != spec.source_filename:
-        raise ValueError("Profile source path is invalid")
+    if source.get("filename") != spec.source_filename:
+        raise ValueError("Profile source filename is invalid")
     if not isinstance(source.get("size_bytes"), int) or source["size_bytes"] <= 0:
         raise ValueError("Profile source size is invalid")
     if not isinstance(source.get("sha256"), str) or len(source["sha256"]) != 64:
@@ -267,7 +264,8 @@ def profile_search_identity(
             "database_id": spec.database_id,
             "polymer": spec.polymer,
             "source": {
-                key: source[key] for key in ("path", "sha256", "num_seqs", "sum_len")
+                key: source[key]
+                for key in ("filename", "sha256", "num_seqs", "sum_len")
             },
             "shards": [
                 {key: shard[key] for key in ("path", "size_bytes", "sha256")}

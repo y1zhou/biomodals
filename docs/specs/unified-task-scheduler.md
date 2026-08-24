@@ -1798,6 +1798,12 @@ These policies neither cancel already-owned work nor authorize another
 submission. A failed Task remains failed for that Execution Run; retry
 requires an explicit Successor Execution Run.
 
+Once cancellation of a Task Provider Node is conclusive, the kernel invokes
+the workload's optional `finalize_cancelled_remote_tasks` hook. The hook is a
+best-effort cleanup boundary for workload-owned external claims. It does not
+alter Task state, validate a publication, or authorize replacement work; its
+default implementation is a no-op.
+
 ## Pre-release schema policy
 
 Execution databases declare one exact kernel schema version. Unsupported

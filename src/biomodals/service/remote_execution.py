@@ -91,7 +91,7 @@ class RemoteExecutionClient:
         call = modal.FunctionCall.from_id(function_call_id)
         try:
             overview = await asyncio.to_thread(call.get, timeout=0)
-        except modal.exception.TimeoutError:
+        except (TimeoutError, modal.exception.TimeoutError):
             return None
         except modal.exception.NotFoundError as error:
             raise RemoteExecutionIdentityMismatchError(

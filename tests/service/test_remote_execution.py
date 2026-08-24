@@ -123,6 +123,21 @@ async def test_missing_root_call_is_an_unknown_remote_identity(monkeypatch) -> N
 
 
 @pytest.mark.anyio
+async def test_builtin_root_poll_timeout_means_still_running(monkeypatch) -> None:
+    def active(**_arguments):
+        raise TimeoutError
+
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(
+            from_id=lambda _call_id: SimpleNamespace(get=active),
+        ),
+    )
+
+    assert await RemoteExecutionClient().poll_root(LOCATOR, "fc-active") is None
+
+
+@pytest.mark.anyio
 async def test_provider_call_uses_one_direct_coordinator_lookup(monkeypatch) -> None:
     call_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
     expected = SimpleNamespace(node_key="inference")

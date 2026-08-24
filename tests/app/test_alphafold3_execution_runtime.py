@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -11,8 +12,13 @@ import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 import biomodals.app.fold.alphafold3.execution_planning as planning_module
-from biomodals.app.fold.alphafold3.environment import EnvironmentRuntime
+from biomodals.app.fold.alphafold3.environment import (
+    EnvironmentAsset,
+    EnvironmentRuntime,
+    acquire_asset_claim,
+)
 from biomodals.app.fold.alphafold3.execution_planning import (
+    PREPARE_ENVIRONMENT,
     SEED_PREDICTIONS,
     STAGE_INFERENCE,
     TEMPLATE_SEARCHES,
@@ -37,6 +43,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     GraphExecutionRunStore,
+    PreparedTaskBatch,
     ProviderCallStatus,
     ProviderDeploymentUnavailableError,
     RunStatus,
@@ -305,6 +312,53 @@ def test_graph_preserves_the_staged_execution_plan(tmp_path: Path) -> None:
     )
 
     assert plan == request.execution_plan
+
+
+def test_environment_task_waits_without_a_call_then_reuses_publication(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    inputs = _graph_inputs(tmp_path)
+    model_path = tmp_path / "models" / "AlphaFold3" / "af3.bin"
+    model_path.unlink()
+    graph = alphafold3_execution_graph(
+        request,
+        execution_run_id=RUN_ID,
+        **inputs,
+    )
+    node = cast(Any, graph.validate().nodes[PREPARE_ENVIRONMENT].node)
+    model_task = next(
+        task
+        for task in node.discover_remote_tasks(SimpleNamespace())
+        if task.task_key == "model"
+    )
+    other = replace(inputs["environment_runtime"], container_id="other-run")
+    assert (
+        acquire_asset_claim(
+            other,
+            EnvironmentAsset("model", "model"),
+            "other-generation",
+        )
+        is not None
+    )
+
+    waiting = node.prepare_remote_task_batch(
+        SimpleNamespace(),
+        (model_task,),
+    )
+
+    assert waiting == PreparedTaskBatch(call=None)
+
+    model_path.touch()
+    node.blocked_until.clear()
+    reused = node.prepare_remote_task_batch(
+        SimpleNamespace(),
+        (model_task,),
+    )
+
+    assert isinstance(reused, PreparedTaskBatch)
+    assert reused.call is None
+    assert tuple(reused.completed) == ("model",)
 
 
 def test_task_result_refresh_reloads_the_template_cache(tmp_path: Path) -> None:

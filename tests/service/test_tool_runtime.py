@@ -21,6 +21,7 @@ from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
     JobLifecycle,
     PreparedResult,
+    SubmissionWait,
     ToolRegistration,
 )
 from biomodals.service.tools import ALPHAFOLD3_TOOL
@@ -125,9 +126,35 @@ async def test_crash_during_spawn_is_fenced_and_never_relaunched(
         JobState.STATE_UNKNOWN,
         "submission_in_progress",
     )
-
     await lifecycle.advance(JOB_ID)
     assert remote.launches == 1
+
+
+@pytest.mark.anyio
+async def test_submission_wait_stays_queued_without_launching(tmp_path: Path) -> None:
+    class WaitingAdapter(Adapter):
+        async def stage(self, _job):
+            return SubmissionWait(
+                "waiting_for_shared_publication",
+                "Waiting for matching work",
+            )
+
+    class Remote:
+        async def launch(self, _locator):
+            raise AssertionError("waiting Job must not launch")
+
+    store, lifecycle, _adapter = _lifecycle(
+        tmp_path,
+        Remote(),
+        WaitingAdapter(),
+    )
+
+    waiting = await lifecycle.advance(JOB_ID)
+
+    assert waiting.state == JobState.QUEUED
+    assert waiting.state_reason == "waiting_for_shared_publication"
+    assert waiting.state_message == "Waiting for matching work"
+    assert waiting.next_retry_at is not None
 
 
 @pytest.mark.anyio

@@ -20,8 +20,8 @@ from biomodals.execution.modal import stage_execution_launch
 from biomodals.helper.artifacts import file_size_sha256
 from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.artifacts import ArtifactCache
-from biomodals.service.store import JobRecord
-from biomodals.service.tool_runtime import PreparedResult
+from biomodals.service.store import JobRecord, JobState, ServiceStore
+from biomodals.service.tool_runtime import PreparedResult, SubmissionWait
 
 ALPHAFOLD3_ARCHIVE_SCHEMA = "alphafold3-request/1"
 
@@ -32,15 +32,26 @@ class AlphaFold3ToolAdapter:
     def __init__(
         self,
         validations: ValidatedInputStore,
+        store: ServiceStore,
         *,
         output_volume_name: str = "AlphaFold3-outputs",
     ) -> None:
         """Bind retained inputs to the established AlphaFold3 output Volume."""
         self.validations = validations
+        self.store = store
         self.output_volume_name = output_volume_name
 
-    async def stage(self, job: JobRecord) -> None:
+    async def stage(self, job: JobRecord) -> SubmissionWait | None:
         """Stage one retained validation with its admitted provider limits."""
+        predecessors = self.store.list_preceding_jobs_for_request(job.job_id)
+        if any(_execution_may_be_active(item) for item in predecessors):
+            return SubmissionWait(
+                reason="waiting_for_shared_publication",
+                message=("Waiting for an earlier identical AlphaFold3 Job to finish"),
+            )
+        repair_execution_run_ids = tuple(
+            item.job_id for item in predecessors if _needs_incomplete_repair(item)
+        )
         if job.pending_validation_id is None:
             return
         volume = self._volume(job)
@@ -60,9 +71,11 @@ class AlphaFold3ToolAdapter:
             validated.request,
             max_active_provider_calls=job.max_active_provider_calls,
             max_active_gpu_provider_calls=job.max_active_gpu_provider_calls,
+            repair_execution_run_ids=repair_execution_run_ids,
         )
         await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
         await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
+        return None
 
     async def discard_pending(self, job: JobRecord) -> None:
         """Consume a validation only after request and launch staging succeed."""
@@ -132,3 +145,26 @@ class AlphaFold3ToolAdapter:
             environment_name=job.modal_environment,
             version=2,
         )
+
+
+def _execution_may_be_active(job: JobRecord) -> bool:
+    if job.state in {
+        JobState.QUEUED,
+        JobState.RUNNING,
+        JobState.CANCEL_REQUESTED,
+        JobState.STATE_UNKNOWN,
+    }:
+        return True
+    return job.state == JobState.BLOCKED and job.result_state is None
+
+
+def _needs_incomplete_repair(job: JobRecord) -> bool:
+    return (
+        job.state
+        in {
+            JobState.PARTIAL,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        }
+        or job.result_state == JobState.PARTIAL.value
+    )

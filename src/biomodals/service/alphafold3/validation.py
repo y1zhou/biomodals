@@ -82,6 +82,7 @@ class ValidatedInput:
         *,
         max_active_provider_calls: int,
         max_active_gpu_provider_calls: int,
+        repair_execution_run_ids: tuple[UUID, ...] = (),
     ) -> AlphaFold3ExecutionRequest:
         """Revalidate retained bytes into the app's trusted request contract."""
         config = AF3Config.model_validate_json(self.document_path.read_bytes())
@@ -94,6 +95,7 @@ class ValidatedInput:
             allow_large_inference=bool(self.preview["requires_confirmation"]),
             recycle=self.settings.recycle,
             sample=self.settings.sample,
+            repair_execution_run_ids=repair_execution_run_ids,
         )
 
 

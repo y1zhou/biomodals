@@ -1337,6 +1337,28 @@ class ServiceStore:
             ).fetchone()
         return _job_from_row(row) if row is not None else None
 
+    def list_preceding_jobs_for_request(
+        self,
+        job_id: UUID,
+    ) -> list[JobRecord]:
+        """List earlier Jobs with the same Tool request identity."""
+        with self._connection() as conn:
+            current = conn.execute(
+                "SELECT rowid, tool, request_digest FROM jobs WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if current is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE rowid < ? AND tool = ? AND request_digest = ?
+                ORDER BY rowid
+                """,
+                (current["rowid"], current["tool"], current["request_digest"]),
+            ).fetchall()
+        return [_job_from_row(row) for row in rows]
+
     def validation_is_claimed(self, validation_id: UUID) -> bool:
         """Return whether an admitted Job still depends on one validation."""
         with self._connection() as conn:
@@ -1562,10 +1584,47 @@ class ServiceStore:
             conn.execute(
                 """
                 UPDATE jobs
-                SET pending_validation_id = NULL, updated_at = ?
+                SET pending_validation_id = NULL, updated_at = ?,
+                    state_reason = NULL, state_message = NULL,
+                    next_retry_at = NULL
                 WHERE job_id = ?
                 """,
                 (now, str(job_id)),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+        return _job_from_row(row)
+
+    def defer_submission(
+        self,
+        job_id: UUID,
+        *,
+        reason: str,
+        message: str,
+        retry_at: int,
+        now: int,
+    ) -> JobRecord:
+        """Keep an unlaunched Job queued behind matching active work."""
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET state_reason = ?, state_message = ?, next_retry_at = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND state = ?
+                    AND root_function_call_id IS NULL
+                """,
+                (
+                    reason,
+                    message,
+                    retry_at,
+                    now,
+                    str(job_id),
+                    JobState.QUEUED.value,
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)

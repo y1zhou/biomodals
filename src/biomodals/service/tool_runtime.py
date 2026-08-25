@@ -38,11 +38,20 @@ class PreparedResult:
     archive_schema: str
 
 
+@dataclass(frozen=True, slots=True)
+class SubmissionWait:
+    """A service-owned reason to defer launching one remote coordinator."""
+
+    reason: str
+    message: str
+    retry_after_seconds: int = 60
+
+
 class ToolAdapter(Protocol):
     """Only the Tool-specific service operations."""
 
-    async def stage(self, job: JobRecord) -> None:
-        """Idempotently stage one admitted request."""
+    async def stage(self, job: JobRecord) -> SubmissionWait | None:
+        """Idempotently stage one admitted request or defer its launch."""
 
     async def discard_pending(self, job: JobRecord) -> None:
         """Remove request staging after verified remote publication."""
@@ -101,7 +110,15 @@ class JobLifecycle:
             registration = self.registrations[job.tool]
             now = int(time.time())
             if job.state == JobState.QUEUED and job.root_function_call_id is None:
-                await registration.adapter.stage(job)
+                waiting = await registration.adapter.stage(job)
+                if waiting is not None:
+                    return self.store.defer_submission(
+                        job_id,
+                        reason=waiting.reason,
+                        message=waiting.message,
+                        retry_at=now + waiting.retry_after_seconds,
+                        now=now,
+                    )
                 await registration.adapter.discard_pending(job)
                 self.store.mark_request_staged(job_id, now=now)
                 self.store.mark_submission_in_progress(job_id, now=now)

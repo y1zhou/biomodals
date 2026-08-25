@@ -57,6 +57,8 @@ class JobView(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     error_code: str | None = None
     error_message: str | None = None
+    state_reason: str | None = None
+    state_message: str | None = None
     download_url: str | None = None
 
     @classmethod
@@ -91,6 +93,8 @@ class JobView(BaseModel):
             ],
             error_code=record.error_code,
             error_message=record.error_message,
+            state_reason=record.state_reason,
+            state_message=record.state_message,
             download_url=(
                 f"/api/v1/jobs/{record.job_id}/download"
                 if record.state in {JobState.SUCCEEDED, JobState.PARTIAL}

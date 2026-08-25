@@ -62,6 +62,7 @@ from biomodals.execution.nodes import (
     ProviderNode,
     PullTaskProviderNode,
     PullWorkerCallSpec,
+    ResultPublicationPendingError,
     TaskDefinition,
     TaskProviderNode,
 )
@@ -151,6 +152,7 @@ __all__ = [
     "PullTaskClaim",
     "PullTaskProviderNode",
     "PullWorkerCallSpec",
+    "ResultPublicationPendingError",
     "TaskDefinition",
     "TaskProviderNode",
     "ResultProvenance",

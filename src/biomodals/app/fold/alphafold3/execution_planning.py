@@ -86,6 +86,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     PreparedTaskBatch,
     ProviderCallSpec,
+    ResultPublicationPendingError,
     TaskPlan,
 )
 from biomodals.schema import AppRunResult, AppRunStatus
@@ -538,7 +539,7 @@ class AlphaFold3ExecutionPlanning:
             return AppRunResult(status=AppRunStatus.SUCCEEDED)
         recovered = self.recover_task_result(node_key, item)
         if recovered is None:
-            raise FileNotFoundError(
+            raise ResultPublicationPendingError(
                 f"{node_key}/{item.plan.task_key} returned without a publication"
             )
         return recovered

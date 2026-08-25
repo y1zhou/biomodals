@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -21,6 +20,7 @@ from biomodals.execution import (
 from biomodals.execution.modal import deployed_execution_coordinator
 
 CALL_GRAPH_TIMEOUT_SECONDS = 5.0
+_CONCURRENT_STREAM_CLOSE = "aclose(): asynchronous generator is already running"
 
 
 class RemoteDeploymentUnavailableError(RuntimeError):
@@ -207,9 +207,18 @@ class RemoteExecutionClient:
             source = call.logs.tail.aio(entries=tail_entries)
         else:
             source = call.logs.fetch.aio(since=since, until=until)
-        async with aclosing(source):
+        try:
             async for item in source:
                 yield item
+        except RuntimeError as error:
+            if str(error) != _CONCURRENT_STREAM_CLOSE:
+                raise
+        finally:
+            try:
+                await source.aclose()
+            except RuntimeError as error:
+                if str(error) != _CONCURRENT_STREAM_CLOSE:
+                    raise
 
     @staticmethod
     def _verified(locator: ExecutionLocator, overview: object) -> ExecutionOverview:

@@ -341,3 +341,34 @@ async def test_closing_live_logs_closes_the_modal_stream(monkeypatch) -> None:
     await entries.aclose()
 
     assert source.closed is True
+
+
+@pytest.mark.anyio
+async def test_concurrent_modal_stream_cleanup_is_ignored(monkeypatch) -> None:
+    class Source:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("aclose(): asynchronous generator is already running")
+
+        async def aclose(self):
+            raise RuntimeError("aclose(): asynchronous generator is already running")
+
+    logs = SimpleNamespace(
+        stream=SimpleNamespace(aio=lambda **_arguments: Source()),
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(from_id=lambda _call_id: SimpleNamespace(logs=logs)),
+    )
+
+    entries = [
+        entry
+        async for entry in RemoteExecutionClient().log_entries(
+            "fc-worker",
+            live=True,
+        )
+    ]
+
+    assert entries == []

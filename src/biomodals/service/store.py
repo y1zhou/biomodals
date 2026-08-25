@@ -1516,6 +1516,7 @@ class ServiceStore:
             JobState.RUNNING.value,
             JobState.FINALIZING.value,
             JobState.CANCEL_REQUESTED.value,
+            JobState.STATE_UNKNOWN.value,
             JobState.BLOCKED.value,
         )
         placeholders = ", ".join("?" for _ in states)
@@ -1524,10 +1525,11 @@ class ServiceStore:
                 f"""
                 SELECT * FROM jobs
                 WHERE state IN ({placeholders})
+                  AND (state != ? OR root_function_call_id IS NOT NULL)
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY updated_at, job_id LIMIT ?
                 """,  # noqa: S608 - generated placeholders
-                (*states, now, limit),
+                (*states, JobState.STATE_UNKNOWN.value, now, limit),
             ).fetchall()
         return [_job_from_row(row) for row in rows]
 

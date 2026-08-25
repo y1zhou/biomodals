@@ -126,6 +126,7 @@ async def test_crash_during_spawn_is_fenced_and_never_relaunched(
         JobState.STATE_UNKNOWN,
         "submission_in_progress",
     )
+    assert store.list_reconcilable_jobs(now=10**10) == []
     await lifecycle.advance(JOB_ID)
     assert remote.launches == 1
 
@@ -288,6 +289,7 @@ async def test_completed_root_with_nonterminal_ledger_becomes_failed(
         message="worker outcome unknown",
         now=20,
     )
+    assert [job.job_id for job in store.list_reconcilable_jobs(now=21)] == [JOB_ID]
 
     failed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
 

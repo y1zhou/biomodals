@@ -563,12 +563,13 @@ def alphafold3_execution_graph(
         ),
     )
     previous = graph.add_node(_StageRequestNode(), id=STAGE_REQUEST)
-    previous = graph.add_node(
+    environment = graph.add_node(
         _PrepareEnvironmentNode(request, environment_runtime, execution_run_id),
         id=PREPARE_ENVIRONMENT,
         depends_on=[previous],
         allow_empty_result=True,
     )
+    previous = environment
     previous = graph.add_node(
         _AlphaFold3TaskNode(RAW_SEARCHES, planning),
         id=RAW_SEARCHES,
@@ -595,7 +596,7 @@ def alphafold3_execution_graph(
     previous = graph.add_node(
         _SeedPredictionNode(SEED_PREDICTIONS, planning),
         id=SEED_PREDICTIONS,
-        depends_on=[previous],
+        depends_on=[previous, environment],
     )
     previous = graph.add_node(
         _InferenceSummaryNode(planning),

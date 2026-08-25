@@ -71,7 +71,10 @@ def test_alphafold3_execution_plan_preserves_the_fixed_semantic_dag() -> None:
         "combined-msa-publications": ("raw-database-searches",),
         "protein-template-searches": ("combined-msa-publications",),
         "stage-inference-input": ("protein-template-searches",),
-        "seed-predictions": ("stage-inference-input",),
+        "seed-predictions": (
+            "prepare-environment",
+            "stage-inference-input",
+        ),
         "inference-summary": ("seed-predictions",),
         "request-publication": ("inference-summary",),
     }

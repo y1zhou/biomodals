@@ -95,7 +95,9 @@ Every AlphaFold3 Execution Run includes one `Prepare environment`
 TaskProviderNode for the shared assets it needs. Its independent model,
 requested-profile, and optional template-reference Tasks use normal kernel
 admission and the Run's provider-call limit. It performs no hidden Modal
-fan-out. Inference requires
+fan-out. `seed-predictions` depends directly on this Node as well as the staged
+inference input. This keeps shared-asset readiness in the result-driven
+required closure even when the staged input is already cached. Inference requires
 `biomodals-store:/AlphaFold3/af3.bin`. MSA profile Tasks come from the request's
 actual planned Raw Database MSA work, so caller-supplied custom MSAs do not
 provision databases they eliminate. Template assets are prepared only when the

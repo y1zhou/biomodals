@@ -33,6 +33,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
     SHARDED_DB_VOLUME_NAME,
+    SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
     profile_root,
@@ -399,12 +400,6 @@ def _prepare_source_evidence(
 ) -> tuple[SourceProfileEvidence, str]:
     """Validate one source FASTA, its fixed counts, and local scratch budget."""
     if not source_path.is_file():
-        archive_path = source_path.with_name(f"{source_path.name}.zst")
-        if archive_path.is_file():
-            raise FileNotFoundError(
-                f"{source_path} is archived as {archive_path}. Restore the "
-                "plain FASTA manually in a Modal Sandbox before rebuilding."
-            )
         raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
     require_regular_file(source_path)
     source_size = source_path.stat().st_size
@@ -636,7 +631,8 @@ def build_profile_manifest(
         "created_at": utc_now(),
         "generation_id": generation_id,
         "source": {
-            "filename": spec.source_filename,
+            "volume": SOURCE_DB_VOLUME_NAME,
+            "path": spec.source_filename,
             "size_bytes": source.size_bytes,
             "sha256": source.sha256,
             "num_seqs": statistics["num_seqs"],
@@ -695,7 +691,6 @@ def build_profile(
     evidence_root.mkdir(parents=True, exist_ok=True)
     append_log(log_path, f"Preparing profile {spec.profile_id}")
 
-    runtime.sharded_volume.reload()
     runtime.output_volume.reload()
     if (published_root / "manifest.json").is_file():
         return _reuse_published_profile(
@@ -715,16 +710,6 @@ def build_profile(
     payload_moved = False
     manifest_published = False
     try:
-        runtime.sharded_volume.reload()
-        if (published_root / "manifest.json").is_file():
-            result = _reuse_published_profile(
-                runtime,
-                spec,
-                published_root,
-                evidence_root,
-                generation_id,
-            )
-            return result
         if published_root.exists():
             shutil.rmtree(published_root)
 

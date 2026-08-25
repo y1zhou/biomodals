@@ -336,6 +336,7 @@ def test_profile_cleanup_is_scoped_and_status_aware(tmp_path: Path) -> None:
     terminal_generation = "b" * 64
     unknown_generation = "c" * 64
     current_generation = "d" * 64
+    abandoned_generation = "e" * 64
 
     terminal_claim = acquire_asset_claim(runtime, asset, terminal_generation)
     assert terminal_claim is not None
@@ -356,6 +357,11 @@ def test_profile_cleanup_is_scoped_and_status_aware(tmp_path: Path) -> None:
         (staging / name).mkdir(parents=True)
     retained = staging / f"{spec.profile_id}-{unknown_generation}"
     retained.mkdir(parents=True)
+    abandoned = staging / f"{spec.profile_id}-{abandoned_generation}"
+    abandoned.mkdir(parents=True)
+    claims.values[f"status:{spec.profile_id}:{abandoned_generation}"] = {
+        "status": "abandoned"
+    }
     unrelated = staging / f"other-profile-{terminal_generation}"
     unrelated.mkdir(parents=True)
     orphan = runtime.sharded_root / ".orphaned" / f"{spec.profile_id}-legacy"
@@ -369,6 +375,7 @@ def test_profile_cleanup_is_scoped_and_status_aware(tmp_path: Path) -> None:
 
     assert all(not (staging / name).exists() for name in removable)
     assert retained.is_dir()
+    assert abandoned.is_dir()
     assert unrelated.is_dir()
     assert not orphan.exists()
 

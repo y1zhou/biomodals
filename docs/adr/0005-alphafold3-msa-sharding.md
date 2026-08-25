@@ -159,9 +159,10 @@ again from zero.
 
 Downloads publish through generation-owned temporary paths. Automatic cleanup
 may remove only same-profile workspaces from the current generation or a
-terminal predecessor; it never removes another active profile workspace or a
-conflicting final asset. Template-search reference files remain in the source
-Volume because search workers consume them directly.
+conclusively complete or failed predecessor; an abandoned claim may still have
+a queued or running Provider Call. Cleanup never removes another active
+profile workspace or a conflicting final asset. Template-search reference
+files remain in the source Volume because search workers consume them directly.
 
 The mmCIF tar stream extracts directly into a generation-owned directory on
 the mounted source Volume. After extraction completes, a same-Volume directory
@@ -442,8 +443,9 @@ partial archive. Failure removes the local source but retains a usable partial
 archive for a later authorized generation. A decompression failure removes the
 rejected partial so that the next Run downloads it from zero.
 
-The profile manifest records the source's identity and statistics, but the
-reconstructable plain FASTA is never durable. The immutable sharded profile is
+The profile manifest records the source Volume and path as provenance together
+with the source identity and statistics. They do not assert that the
+reconstructable plain FASTA remains present. The immutable sharded profile is
 the only completed database-search asset.
 
 ### MSA cache namespace and retry boundary

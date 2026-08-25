@@ -357,7 +357,6 @@ def _prepare_profile_source(
         f"{DATABASE_BASE_URL}/{spec.source_filename}.zst",
         partial,
         source_path,
-        progress_name=spec.source_filename,
     )
     return source_path, partial
 
@@ -366,11 +365,9 @@ def _download_and_decompress(
     url: str,
     partial: Path,
     destination: Path,
-    *,
-    progress_name: str,
 ) -> None:
     partial.parent.mkdir(parents=True, exist_ok=True)
-    download_files({url: partial}, resume=True, progress_bar_desc=progress_name)
+    download_files({url: partial}, resume=True, progress_bar_desc=destination.name)
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(  # noqa: S603 - fixed executable and trusted paths
@@ -409,7 +406,6 @@ def _prepare_compressed_file(
         url,
         partial,
         staging,
-        progress_name=relative_path.name,
     )
     if final_path.exists():
         raise RuntimeError(
@@ -474,7 +470,7 @@ def _cleanup_profile_workspaces(
     spec: DatabaseProfileSpec,
     generation_id: str,
 ) -> None:
-    """Remove only abandoned workspaces for the currently claimed profile."""
+    """Remove only safe workspaces for the currently claimed profile."""
     staging_root = runtime.sharded_root / ".staging"
     prefix = f"{spec.profile_id}-"
     if staging_root.is_dir():
@@ -488,8 +484,7 @@ def _cleanup_profile_workspaces(
                 candidate_generation,
             )
             if candidate_generation == generation_id or (
-                status is not None
-                and status.get("status") in {"complete", "failed", "abandoned"}
+                status is not None and status.get("status") in {"complete", "failed"}
             ):
                 _remove_workspace(candidate)
 

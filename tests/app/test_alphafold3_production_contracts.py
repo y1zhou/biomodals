@@ -103,6 +103,7 @@ from biomodals.app.fold.alphafold3.profiles import (
     PROFILE_SCHEMA_VERSION,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
+    SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     record_multiset_identity,
     resolve_database_profile,
@@ -330,7 +331,8 @@ def _profile_manifest(database_id: str) -> dict[str, Any]:
         "search_space_value": spec.search_space_value,
         "search_space_unit": spec.search_space_unit,
         "source": {
-            "filename": spec.source_filename,
+            "volume": SOURCE_DB_VOLUME_NAME,
+            "path": spec.source_filename,
             "size_bytes": 1,
             "sha256": "a" * 64,
             "num_seqs": num_seqs,

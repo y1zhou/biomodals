@@ -36,6 +36,7 @@ Keep paid-work limits deliberately small during pre-release validation:
 ```dotenv
 BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT=1
 BIOMODALS_GROMACS_ACTIVE_LIMIT=1
+BIOMODALS_ALPHAFOLD3_ACTIVE_LIMIT=1
 BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=1
 ```
 
@@ -152,18 +153,22 @@ The checklist must order these actions:
    If the durable operation plan changed, confirm that no active Job from the
    prior plan remains or that the candidate explicitly supports its plan
    version.
-3. Deploy a changed GROMACS App before an API that calls its changed contract;
-   otherwise explicitly mark that paid deployment step irrelevant.
+3. Deploy every changed Tool App before an API that calls its changed contract;
+   otherwise explicitly mark that paid deployment step irrelevant. Confirm
+   that the API pins each intended exact deployment version.
 4. Start or restart the candidate API and wait for readiness before exposing
    the frontend candidate.
 5. Run only the manual smoke checks relevant to the changed surfaces. If the
    App, adapter, or effective Modal configuration changed, an Administrator
    must approve the cost and submit one smallest valid, unmistakably named
    real-Modal Job.
-6. Verify one invocation of each expected deployed Function: preparation first;
-   NVT analysis, NPT analysis, and production overlapping; production analysis
-   after production; and Result preparation only after all analyses. Then verify
-   the public timestamps, prepared download, and Result ZIP allowlist.
+6. For a changed GROMACS path, verify one invocation of each expected deployed
+   Function: preparation first; NVT analysis, NPT analysis, and production
+   overlapping; production analysis after production; and Result preparation
+   only after all analyses. Verify the public timestamps, prepared download,
+   and ZIP schema. For a changed AlphaFold3 path, verify server validation and
+   confirmation, Prepare environment, optional MSA and template searches,
+   prediction, Prepare results, and the downloadable `.tar.zst` archive.
 7. Stop on any unexpected invocation, stage, archive member, permission error,
    or configuration error. Capture the Job ID, request ID, safe stage, and
    timestamps before retrying; do not blindly resubmit paid work.

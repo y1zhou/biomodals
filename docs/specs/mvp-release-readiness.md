@@ -8,8 +8,9 @@ frontend, their shared contracts, and the single-host deployment boundary.
 The deployment, authentication, and operational-readiness decisions remain
 applicable. [ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md) and the
 [API Tool service specification](api-tool-service.md) supersede this
-document's service execution, Job orchestration, and Tool-registration
-passages; those passages are retained only as implementation history.
+document's service execution, Job orchestration, Tool-registration, and
+Job-stage/log presentation passages; those passages are retained only as
+implementation history.
 
 ## Settled constraints
 
@@ -936,9 +937,10 @@ GROMACS-only simulation action.
 
 The GROMACS overview says `Configure the simulation` and `Run in the
 background`; the latter description contains a real My Jobs link. Job detail
-labels the deployed call column `Running Function`. User-facing prose follows
-sentence case; BioModals, GROMACS, Modal, PDB, PDBFixer, API, acronyms, and
-explicit page names retain meaningful capitalization.
+shows semantic stage, status, and timestamps without a provider-function
+column. User-facing prose follows sentence case; BioModals, GROMACS, Modal,
+PDB, PDBFixer, API, acronyms, and explicit page names retain meaningful
+capitalization.
 
 The PDB file selector gives its native Choose file control visible separation
 through a light neutral rounded treatment. Drag entry changes the complete drop

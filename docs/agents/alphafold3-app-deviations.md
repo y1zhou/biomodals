@@ -18,18 +18,22 @@ automatically. Missing or structurally invalid files fail later publication,
 but other changes may be returned as current seed output. Operators must remove
 the affected seed marker and outputs before rerunning the seed.
 
-The model checkpoint and upstream template store are also treated as immutable
-operator-managed infrastructure:
+The model checkpoint and required sharded MSA profiles are automatically
+provisioned once per Modal Environment when absent. A completed checkpoint or
+profile manifest is then treated as immutable infrastructure until an operator
+explicitly repairs it:
 
 - inference identity uses a code-owned checkpoint label rather than hashing
   `af3.bin`;
-- template identity excludes inventories and digests for `pdb_seqres` and
-  `mmcif_files/`.
+- search identity excludes inventories and digests for completed sharded
+  profiles and the upstream template stores.
 
-Replacing either store in place is unsupported. A model replacement requires a
-new declared model identity or explicit removal of affected run caches. A
-template-store replacement requires explicit template-cache removal or a new
-template identity policy.
+Replacing completed assets in place is unsupported. A model replacement
+requires a new declared model identity or explicit removal of affected run
+caches. A profile or template-store replacement requires explicit cache repair
+or a new identity policy. See
+[`ADR 0005`](../adr/0005-alphafold3-msa-sharding.md) for setup coordination and
+readiness boundaries.
 
 ## Run layout
 

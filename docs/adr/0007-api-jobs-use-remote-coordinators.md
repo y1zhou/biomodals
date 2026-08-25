@@ -65,9 +65,11 @@ publication boundary. The service then owns browser archive staging,
 download-cache metadata, cleanup, and the `finalizing` and `blocked` Job states.
 These delivery states are not added to the execution kernel.
 
-Active-job configuration includes per-Tool total and GPU Provider Call limits.
-The service snapshots the effective limits at admission and supplies them to
-the remote coordinator. Later Administrator changes affect new Jobs only.
+Each Tool has one Administrator-configurable active-Job limit. At admission,
+the service snapshots a per-Run total Provider Call ceiling equal to eight
+times that limit and a GPU Provider Call ceiling equal to that limit, then
+supplies both to the remote coordinator. Later Administrator changes affect
+new Jobs only.
 
 GROMACS and AlphaFold3 adopt this topology together. Future coordinator-aware
 apps and workflows can be registered through the same service boundary without
@@ -132,10 +134,11 @@ without uploading the document again. The backend validates both through the
 same existing AlphaFold3 request path and does not maintain a second scientific
 input interpretation.
 
-Each Tool has Administrator-configurable total and GPU Provider Call limits,
-with the GPU limit no greater than the total limit. Admission snapshots both
-values into the API Tool Run. Initial unchanged defaults are `3 / 1` for
-GROMACS and `4 / 1` for AlphaFold3.
+Each Tool has one Administrator-configurable active-Job limit. Admission
+derives and snapshots the corresponding total and GPU Provider Call ceilings
+as described above. The deployed Modal App name remains startup configuration;
+Administrators may pin the exact deployment version and choose Job-log
+visibility.
 
 ## Observation and polling
 

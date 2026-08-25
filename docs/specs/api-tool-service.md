@@ -138,6 +138,9 @@ Call, or while Modal has accepted a Function Call but has not assigned a
 container. It becomes `running` after assignment. Failure to obtain the
 presentation-only SDK hint for an existing call defaults to `running`.
 Provider Call selection and raw Node keys are diagnostic details.
+The regular Job-stage table therefore shows the semantic stage, status,
+started time, and finished time without a provider-function column. Provider
+function names remain available only as diagnostic log-target metadata.
 
 ## Provider Call limits
 
@@ -381,16 +384,19 @@ AlphaFold3 initially restricts logs to Administrators.
 ## Modal billing
 
 Admin > Modal contains an Administrator-only Costs section backed by Modal's
-billing report API. It shows total workspace cost and parallel Tool and
-Environment groupings. Untagged Tool usage remains visible as **Other /
-untagged** rather than being attributed to an Environment.
+billing report API. It shows total workspace cost, the cost attributed to the
+effective Modal Environment selected under Admin > Modal > Environment, and
+parallel Tool and Environment groupings. The current-environment summary uses
+the selected report interval and displays zero when that Environment has no
+reported usage.
 
 Deployed Tool Apps carry a stable `biomodals_tool` tag (`gromacs` or
 `alphafold3`). Billing reports request this tag and use it as the only reliable
 Tool attribution key. Untagged or unknown values remain **Other / untagged**;
 historical usage from before tagging is not guessed from object
-descriptions. Existing Apps must be redeployed before future usage receives
-the tag.
+descriptions. This fallback applies only to the Tool breakdown: every billing
+row still contributes to its reported Environment total. Existing Apps must be
+redeployed before future usage receives the tag.
 
 The default interval is the current billing month. Presets include today, the
 last seven days, last 30 days, and previous month, plus a custom date range. Normal

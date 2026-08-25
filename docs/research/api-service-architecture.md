@@ -588,12 +588,10 @@ asynchronous. Cache fills use per-job coordination so unrelated downloads do
 not wait behind one large restore. This preserves the single-process
 architecture without introducing another service or task queue.
 
-The cache can be deleted or rebuilt without losing a job. Intermediate cleanup
-is disabled when `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` is unset or blank. A
-positive number enables deletion of only the workload's `<run_name>/`
-intermediate directory after the terminal ZIP has remained published for that
-many days. Final archives and shared scientific caches are outside that cleanup
-policy. [Modal: Volumes](https://modal.com/docs/guide/volumes)
+The local Result cache can be deleted or rebuilt without losing a Job. Remote
+scientific publication retention remains owned by each Tool rather than a
+service-wide intermediate-cleanup setting.
+[Modal: Volumes](https://modal.com/docs/guide/volumes)
 
 ## Local persistence and operations
 
@@ -652,7 +650,7 @@ The application factory reads these settings:
 | `MODAL_TOKEN_ID` | required | Dedicated Modal service-user token identifier |
 | `MODAL_TOKEN_SECRET` | required | Dedicated Modal service-user token secret; never returned by the API or stored in SQLite |
 | `BIOMODALS_STATE_DIR` | `.biomodals/state` | Durable SQLite directory |
-| `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable final-ZIP cache directory |
+| `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable Result-archive cache directory |
 | `BIOMODALS_CACHE_WARNING_BYTES` | `1099511627776` | Soft warning threshold for local Result staging and cache usage (1 TiB) |
 | `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | One public origin for links, exact-Origin checks, and same-origin browser access |
 | `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
@@ -661,10 +659,12 @@ The application factory reads these settings:
 | `BIOMODALS_GROMACS_APP` | `Gromacs` | Deployed GROMACS Modal App name |
 | `BIOMODALS_GROMACS_APP_VERSION` | `1` | Exact GROMACS Modal deployment version used by new Jobs |
 | `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Workload-wide active Job limit default |
+| `BIOMODALS_ALPHAFOLD3_APP` | `AlphaFold3` | Deployed AlphaFold3 Modal App name |
+| `BIOMODALS_ALPHAFOLD3_APP_VERSION` | `1` | Exact AlphaFold3 Modal deployment version used by new Jobs |
+| `BIOMODALS_ALPHAFOLD3_ACTIVE_LIMIT` | `2` | AlphaFold3-wide active Job limit default |
 | `BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT` | `10` | Global active Job limit default |
 | `BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT` | `2` | Active Job limit assigned to new Users by default |
 | `BIOMODALS_RECONCILE_SECONDS` | `60` | Modal reconciliation interval |
-| `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` | unset | Positive retention enables cleanup of published runs' intermediates |
 
 The Admin API stores editable runtime overrides for the Modal Environment,
 Tool deployment version, active-Job limit, Job-log visibility, and Global

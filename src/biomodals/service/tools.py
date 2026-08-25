@@ -113,7 +113,7 @@ ALPHAFOLD3_TOOL = ToolDefinition(
         ),
         ToolStageDefinition(
             "search_sequence_databases",
-            "Search sequence databases",
+            "Search MSAs",
             ("raw-database-searches", "combined-msa-publications"),
             ("search_database_msa", "assemble_sequence_msas"),
         ),

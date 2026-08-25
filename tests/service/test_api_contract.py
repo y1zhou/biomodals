@@ -146,6 +146,8 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
     alpha_request = document["components"]["schemas"]["AlphaFold3JobRequest"]
     assert alpha_request["required"] == ["validation_id"]
     assert alpha_request["additionalProperties"] is False
+    job_view = document["components"]["schemas"]["JobView"]
+    assert {"state_reason", "state_message"} <= set(job_view["properties"])
     unknown_job = document["components"]["schemas"]["AdminStateUnknownJobView"]
     assert {
         "diagnostic_message",

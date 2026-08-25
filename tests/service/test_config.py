@@ -16,6 +16,7 @@ ENVIRONMENT_KEYS = (
     "BIOMODALS_PUBLIC_URL",
     "BIOMODALS_SECURE_COOKIES",
     "BIOMODALS_MODAL_ENVIRONMENT",
+    "BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY",
     "BIOMODALS_GROMACS_APP",
     "BIOMODALS_GROMACS_APP_VERSION",
     "BIOMODALS_GROMACS_ACTIVE_LIMIT",
@@ -38,6 +39,7 @@ def test_local_defaults_are_safe_and_cleanup_is_disabled(monkeypatch) -> None:
     assert settings.public_url == "http://localhost:5173"
     assert settings.secure_cookies is False
     assert settings.modal_environment == "production"
+    assert settings.modal_download_concurrency == 4
 
 
 def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> None:
@@ -46,6 +48,7 @@ def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> Non
     monkeypatch.setenv("BIOMODALS_SECURE_COOKIES", "true")
     monkeypatch.setenv("BIOMODALS_PUBLIC_URL", "https://biomodals.example")
     monkeypatch.setenv("BIOMODALS_MODAL_ENVIRONMENT", "department")
+    monkeypatch.setenv("BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY", "3")
 
     settings = ServiceSettings.from_environment()
 
@@ -53,6 +56,7 @@ def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> Non
     assert settings.cache_dir.as_posix() == "/srv/biomodals/cache"
     assert settings.secure_cookies is True
     assert settings.modal_environment == "department"
+    assert settings.modal_download_concurrency == 3
 
 
 def test_explicit_env_file_is_loaded_and_process_environment_wins(
@@ -163,6 +167,7 @@ def test_deployed_backend_refuses_to_start_without_modal_credentials(
     [
         ("BIOMODALS_CACHE_WARNING_BYTES", "0"),
         ("BIOMODALS_RECONCILE_SECONDS", "0"),
+        ("BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY", "0"),
     ],
 )
 def test_positive_settings_fail_closed(monkeypatch, name: str, value: str) -> None:

@@ -187,7 +187,11 @@ def create_deployed_app() -> FastAPI:
     gromacs = ToolRegistration(GROMACS_TOOL, GromacsToolAdapter(pending))
     alphafold3 = ToolRegistration(
         ALPHAFOLD3_TOOL,
-        AlphaFold3ToolAdapter(validations, store),
+        AlphaFold3ToolAdapter(
+            validations,
+            store,
+            modal_download_concurrency=settings.modal_download_concurrency,
+        ),
     )
     registrations = (gromacs, alphafold3)
     lifecycle = JobLifecycle(store, remote, registrations, cache)

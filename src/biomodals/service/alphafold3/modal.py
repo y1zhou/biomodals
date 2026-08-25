@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+from typing import IO, Any, cast
 
 import modal
 
@@ -35,11 +36,18 @@ class AlphaFold3ToolAdapter:
         store: ServiceStore,
         *,
         output_volume_name: str = "AlphaFold3-outputs",
+        modal_download_concurrency: int = 4,
     ) -> None:
         """Bind retained inputs to the established AlphaFold3 output Volume."""
+        if (
+            isinstance(modal_download_concurrency, bool)
+            or modal_download_concurrency < 1
+        ):
+            raise ValueError("modal_download_concurrency must be a positive integer")
         self.validations = validations
         self.store = store
         self.output_volume_name = output_volume_name
+        self.modal_download_concurrency = modal_download_concurrency
 
     async def stage(self, job: JobRecord) -> SubmissionWait | None:
         """Stage one retained validation with its admitted provider limits."""
@@ -119,6 +127,11 @@ class AlphaFold3ToolAdapter:
                     manifest,
                     output_dir=directory,
                     display_name=request.config.name,
+                    download_file=lambda path, handle: self._download_file(
+                        volume,
+                        path,
+                        handle,
+                    ),
                 )
                 os.replace(archive, staging)
             size_bytes, digest = await cache.run_bounded(file_size_sha256, staging)
@@ -137,6 +150,19 @@ class AlphaFold3ToolAdapter:
             size_bytes=size_bytes,
             sha256=digest,
             archive_schema=ALPHAFOLD3_ARCHIVE_SCHEMA,
+        )
+
+    def _download_file(
+        self,
+        volume: modal.Volume,
+        path: str,
+        handle: IO[bytes],
+    ) -> int:
+        """Download one artifact with the configured per-Job concurrency."""
+        return cast(Any, volume)._read_file_into_fileobj(
+            path,
+            handle,
+            concurrency=self.modal_download_concurrency,
         )
 
     def _volume(self, job: JobRecord) -> modal.Volume:

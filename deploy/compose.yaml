@@ -11,6 +11,7 @@ services:
       BIOMODALS_STATE_DIR: /var/lib/biomodals/state
       BIOMODALS_CACHE_DIR: /var/cache/biomodals
       BIOMODALS_CACHE_WARNING_BYTES: "1099511627776"
+      BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY: "4"
       BIOMODALS_RECONCILE_SECONDS: "60"
     ports:
       - "127.0.0.1:4100:4100"

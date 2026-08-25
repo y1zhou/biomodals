@@ -12,6 +12,7 @@ Environment=BIOMODALS_SECURE_COOKIES=true
 Environment=BIOMODALS_STATE_DIR=/var/lib/biomodals/state
 Environment=BIOMODALS_CACHE_DIR=/var/cache/biomodals
 Environment=BIOMODALS_CACHE_WARNING_BYTES=1099511627776
+Environment=BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY=4
 Environment=BIOMODALS_RECONCILE_SECONDS=60
 Volume=/var/lib/biomodals/production/state:/var/lib/biomodals/state:Z
 Volume=/var/cache/biomodals/production:/var/cache/biomodals:Z

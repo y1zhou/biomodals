@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103
 
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -126,3 +127,30 @@ async def test_terminal_predecessor_authorizes_exact_claim_repair(
 
     assert await adapter.stage(current) is None
     assert captured["repair_execution_run_ids"] == (predecessor.job_id,)
+
+
+def test_modal_artifact_download_uses_configured_concurrency(tmp_path: Path) -> None:
+    store, _ = _store(tmp_path)
+    captured: dict[str, object] = {}
+
+    class Volume:
+        def _read_file_into_fileobj(self, path, handle, *, concurrency):
+            captured.update(path=path, concurrency=concurrency)
+            return handle.write(b"result")
+
+    adapter = AlphaFold3ToolAdapter(
+        SimpleNamespace(),
+        store,
+        modal_download_concurrency=4,
+    )
+    destination = BytesIO()
+
+    written = adapter._download_file(  # noqa: SLF001
+        Volume(),  # type: ignore[arg-type]
+        "results/output.cif",
+        destination,
+    )
+
+    assert written == 6
+    assert destination.getvalue() == b"result"
+    assert captured == {"path": "results/output.cif", "concurrency": 4}

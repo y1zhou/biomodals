@@ -208,6 +208,7 @@ class ServiceSettings:
     public_url: str
     secure_cookies: bool
     modal_environment: str
+    modal_download_concurrency: int
     global_active_job_limit: int
     default_user_active_job_limit: int
     reconcile_interval_seconds: float
@@ -247,6 +248,11 @@ class ServiceSettings:
                 sources,
                 "BIOMODALS_MODAL_ENVIRONMENT",
                 "production",
+            ),
+            modal_download_concurrency=_positive_integer(
+                sources,
+                "BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY",
+                4,
             ),
             global_active_job_limit=_nonnegative_integer(
                 sources,

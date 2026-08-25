@@ -657,6 +657,7 @@ The application factory reads these settings:
 | `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | One public origin for links, exact-Origin checks, and same-origin browser access |
 | `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
 | `BIOMODALS_MODAL_ENVIRONMENT` | `production` | Modal Environment default; configurable in Admin unless a process override is set |
+| `BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY` | `4` | Concurrent Modal Volume download blocks per Job |
 | `BIOMODALS_GROMACS_APP` | `Gromacs` | Deployed GROMACS Modal App name |
 | `BIOMODALS_GROMACS_APP_VERSION` | `1` | Exact GROMACS Modal deployment version used by new Jobs |
 | `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Workload-wide active Job limit default |

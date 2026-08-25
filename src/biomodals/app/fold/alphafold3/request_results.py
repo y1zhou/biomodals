@@ -16,6 +16,7 @@ import shutil
 import subprocess as sp
 import tarfile
 import uuid
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -864,31 +865,40 @@ def _download_artifact(
     reader: VolumeReader,
     artifact: dict[str, object],
     destination: Path,
+    *,
+    download_file: Callable[[str, IO[bytes]], int] | None = None,
 ) -> None:
     volume_path = cast(str, artifact["volume_path"])
     expected_size = cast(int, artifact["size_bytes"])
     expected_sha256 = cast(str, artifact["sha256"])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    digest = hashlib.sha256()
-    with destination.open("xb") as handle:
-        for chunk in reader.read_file(volume_path):
-            if not isinstance(chunk, bytes):
-                raise TypeError(f"Volume reader returned non-bytes for {volume_path}")
-            next_size = written + len(chunk)
-            if next_size > expected_size:
-                raise RuntimeError(
-                    "Downloaded size mismatch for "
-                    f"{volume_path}: more than {expected_size}"
-                )
-            handle.write(chunk)
-            digest.update(chunk)
-            written = next_size
+    if download_file is not None:
+        with destination.open("xb") as handle:
+            written = download_file(volume_path, handle)
+        observed_sha256 = sha256_file(destination)
+    else:
+        written = 0
+        digest = hashlib.sha256()
+        with destination.open("xb") as handle:
+            for chunk in reader.read_file(volume_path):
+                if not isinstance(chunk, bytes):
+                    raise TypeError(
+                        f"Volume reader returned non-bytes for {volume_path}"
+                    )
+                next_size = written + len(chunk)
+                if next_size > expected_size:
+                    raise RuntimeError(
+                        "Downloaded size mismatch for "
+                        f"{volume_path}: more than {expected_size}"
+                    )
+                handle.write(chunk)
+                digest.update(chunk)
+                written = next_size
+        observed_sha256 = digest.hexdigest()
     if written != expected_size:
         raise RuntimeError(
             f"Downloaded size mismatch for {volume_path}: {written} != {expected_size}"
         )
-    observed_sha256 = digest.hexdigest()
     if observed_sha256 != expected_sha256:
         raise RuntimeError(
             "Downloaded SHA-256 mismatch for "
@@ -1150,6 +1160,7 @@ def create_request_archive(
     *,
     output_dir: str | Path,
     display_name: str,
+    download_file: Callable[[str, IO[bytes]], int] | None = None,
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
     _, view_id, canonical_name, artifacts, ranking = _validated_manifest_artifacts(
@@ -1232,7 +1243,12 @@ def create_request_archive(
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, destination)
                 else:
-                    _download_artifact(reader, artifact, destination)
+                    _download_artifact(
+                        reader,
+                        artifact,
+                        destination,
+                        download_file=download_file,
+                    )
                     downloaded[source_identity] = destination
                 if artifact["role"] == "input":
                     input_paths.append(destination)

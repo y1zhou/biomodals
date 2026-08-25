@@ -49,13 +49,15 @@ class FakeSession:
         *,
         head_response: FakeResponse | None = None,
         head_error: Exception | None = None,
-        get_response: FakeResponse | None = None,
-        get_responses: list[FakeResponse] | None = None,
+        get_responses: FakeResponse | list[FakeResponse] | None = None,
     ) -> None:
         self.head_response = head_response
         self.head_error = head_error
-        self.get_response = get_response
-        self.get_responses = get_responses
+        self.get_responses = (
+            [get_responses]
+            if isinstance(get_responses, FakeResponse)
+            else list(get_responses or [])
+        )
         self.calls: list[tuple[str, str, dict]] = []
 
     async def head(self, url: str, **kwargs) -> FakeResponse:
@@ -68,13 +70,9 @@ class FakeSession:
 
     async def get(self, url: str, **kwargs) -> FakeResponse:
         self.calls.append(("GET", url, kwargs))
-        if self.get_responses is not None:
-            if not self.get_responses:
-                raise AssertionError("unexpected GET request")
-            return self.get_responses.pop(0)
-        if self.get_response is None:
+        if not self.get_responses:
             raise AssertionError("unexpected GET request")
-        return self.get_response
+        return self.get_responses.pop(0)
 
 
 def test_download_file_uses_head_size_check_for_cached_file(tmp_path: Path) -> None:
@@ -126,7 +124,7 @@ def test_download_file_closes_head_and_get_when_cached_size_differs(
     output.write_bytes(b"old")
     head_response = FakeResponse(headers={"content-length": "6"})
     get_response = FakeResponse(chunks=(b"new", b"bin"))
-    session = FakeSession(head_response=head_response, get_response=get_response)
+    session = FakeSession(head_response=head_response, get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -154,7 +152,7 @@ def test_download_file_force_skips_head_and_refreshes_existing_file(
     output = tmp_path / "model.bin"
     output.write_bytes(b"old")
     get_response = FakeResponse(chunks=(b"new",))
-    session = FakeSession(get_response=get_response)
+    session = FakeSession(get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -175,7 +173,7 @@ def test_download_file_force_skips_head_and_refreshes_existing_file(
 def test_download_file_closes_get_for_missing_file(tmp_path: Path) -> None:
     output = tmp_path / "model.bin"
     get_response = FakeResponse(chunks=(b"downloaded",))
-    session = FakeSession(get_response=get_response)
+    session = FakeSession(get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -202,7 +200,7 @@ def test_download_file_resumes_partial_file_with_range(tmp_path: Path) -> None:
         chunks=(b"rest",),
         status_code=206,
     )
-    session = FakeSession(head_response=head_response, get_response=get_response)
+    session = FakeSession(head_response=head_response, get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -232,7 +230,7 @@ def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:
     )
     session = FakeSession(
         head_error=RuntimeError("HEAD unsupported"),
-        get_response=get_response,
+        get_responses=get_response,
     )
 
     asyncio.run(

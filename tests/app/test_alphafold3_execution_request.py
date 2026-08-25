@@ -77,7 +77,19 @@ def _request(
 
 def test_execution_request_round_trips_and_revalidates_identity() -> None:
     """Staged state re-derives rather than trusting its invocation record."""
+    predecessor = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
     request = _request(allow_large_inference=True)
+    request = AlphaFold3ExecutionRequest.prepare(
+        request.config,
+        search_msa=request.search_msa,
+        search_protein_templates=request.search_protein_templates,
+        max_active_provider_calls=request.max_active_provider_calls,
+        max_active_gpu_provider_calls=request.max_active_gpu_provider_calls,
+        allow_large_inference=request.allow_large_inference,
+        recycle=request.recycle,
+        sample=request.sample,
+        repair_execution_run_ids=(predecessor,),
+    )
 
     decoded = AlphaFold3ExecutionRequest.from_bytes(request.to_bytes())
 
@@ -85,6 +97,7 @@ def test_execution_request_round_trips_and_revalidates_identity() -> None:
     assert decoded.execution_plan == request.execution_plan
     assert decoded.max_active_provider_calls == 4
     assert decoded.allow_large_inference
+    assert decoded.repair_execution_run_ids == (predecessor,)
 
 
 def test_execution_envelope_has_independent_metadata_headroom(

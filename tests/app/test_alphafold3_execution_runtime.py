@@ -271,10 +271,17 @@ def _owned_seed_claims(
     *,
     sample_count,
     generation_ids,
+    superseded_generation_ids,
     reload_volume,
     allow_large_inference=False,
 ):
-    del runtime, sample_count, reload_volume, allow_large_inference
+    del (
+        runtime,
+        sample_count,
+        superseded_generation_ids,
+        reload_volume,
+        allow_large_inference,
+    )
     return SeedClaimPlan(
         reused_seeds=(),
         owned=tuple(

@@ -1904,6 +1904,40 @@ def test_generation_claim_replays_the_same_live_owner() -> None:
         )
 
 
+def test_generation_claim_fences_authorized_live_predecessor() -> None:
+    store = FakeClaimStore()
+    first = acquire_generation_claim(
+        store,
+        scope_key="seed:run:1",
+        generation_id="terminal-run-task",
+        identity={"seed": 1},
+        container_id="container-a",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_000,
+        now_text="first-start",
+    )
+
+    second = acquire_generation_claim(
+        store,
+        scope_key=first.scope_key,
+        generation_id="repair-run-task",
+        identity={"seed": 1},
+        container_id="container-b",
+        maximum_age_seconds=100,
+        superseded_generation_ids=(first.generation_id,),
+        now_epoch_seconds=1_001,
+        now_text="repair-start",
+    )
+
+    assert generation_status(store, first.scope_key, first.generation_id) == {
+        "status": "abandoned",
+        "abandoned_at": "repair-start",
+        "reason": "superseded_execution_run",
+        "successor_generation_id": second.generation_id,
+    }
+    assert latest_generation_owner(store, first.scope_key) == second.owner
+
+
 def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
     """Coordinator-owned seed Tasks reacquire their live writer claims."""
     runtime = InferenceRuntime(

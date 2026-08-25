@@ -6,6 +6,7 @@ validate their stage-specific marker before reusing a publication.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from time import time
 from typing import Protocol, cast
@@ -160,6 +161,7 @@ def acquire_generation_claim(
     identity: dict[str, object],
     container_id: str,
     maximum_age_seconds: int | float,
+    superseded_generation_ids: Collection[str] = (),
     now_epoch_seconds: int | float | None = None,
     now_text: str | None = None,
 ) -> GenerationClaim:
@@ -176,6 +178,9 @@ def acquire_generation_claim(
         or maximum_age_seconds <= 0
     ):
         raise ValueError("maximum_age_seconds must be positive")
+    selected_superseded = frozenset(
+        _validate_generation_id(item) for item in superseded_generation_ids
+    )
     observed_epoch = time() if now_epoch_seconds is None else now_epoch_seconds
     if isinstance(observed_epoch, bool) or not isinstance(observed_epoch, int | float):
         raise TypeError("now_epoch_seconds must be numeric")
@@ -224,6 +229,26 @@ def acquire_generation_claim(
                 selected_generation,
                 predecessor,
             )
+        if predecessor_status is None and predecessor_generation in selected_superseded:
+            claims.put(
+                _status_key(selected_scope, predecessor_generation),
+                {
+                    "status": "abandoned",
+                    "abandoned_at": observed_text,
+                    "reason": "superseded_execution_run",
+                    "successor_generation_id": selected_generation,
+                },
+                skip_if_exists=True,
+            )
+            predecessor_status = generation_status(
+                claims,
+                selected_scope,
+                predecessor_generation,
+            )
+            if predecessor_status is None:
+                raise RuntimeError(
+                    f"Claim {selected_scope!r} superseded owner was not fenced"
+                )
         if predecessor_status is None:
             started_at = cast(
                 int | float,

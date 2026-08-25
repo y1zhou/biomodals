@@ -393,6 +393,7 @@ def claim_seed_predictions(
     *,
     sample_count: int,
     generation_ids: Mapping[int, str] | None = None,
+    superseded_generation_ids: Mapping[int, tuple[str, ...]] | None = None,
     reload_volume: bool = True,
     allow_large_inference: bool = False,
 ) -> SeedClaimPlan:
@@ -412,6 +413,15 @@ def claim_seed_predictions(
         if set(generation_ids) != set(selected_seeds):
             raise ValueError("generation_ids must contain exactly the requested seeds")
         selected_generations = {seed: generation_ids[seed] for seed in selected_seeds}
+    selected_superseded: dict[int, tuple[str, ...]] = {}
+    if superseded_generation_ids is not None:
+        if set(superseded_generation_ids) != set(selected_seeds):
+            raise ValueError(
+                "superseded_generation_ids must contain exactly the requested seeds"
+            )
+        selected_superseded = {
+            seed: superseded_generation_ids[seed] for seed in selected_seeds
+        }
     if reload_volume:
         runtime.volume.reload()
     run_root = inference_run_root(runtime.output_root, selected_run)
@@ -438,6 +448,7 @@ def claim_seed_predictions(
                 identity=_seed_claim_identity(selected_run, seed),
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=selected_superseded.get(seed, ()),
             )
         except ActiveGenerationError as exc:
             active.append(
@@ -1096,13 +1107,15 @@ def finalize_run_summary(
     *,
     sample_count: int,
     build_data_json: Callable[[tuple[int, ...]], bytes],
+    generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Serialize and marker-last publish the accumulated global run summary."""
     selected_run = validate_run_id(run_id)
     selected_samples = _validate_sample_count(sample_count)
     run_root = inference_run_root(runtime.output_root, selected_run)
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
-    generation_id = uuid.uuid4().hex
+    selected_generation = generation_id or uuid.uuid4().hex
     claim: GenerationClaim | None = None
     while claim is None:
         runtime.volume.reload()
@@ -1122,10 +1135,11 @@ def finalize_run_summary(
             claim = acquire_generation_claim(
                 runtime.claims,
                 scope_key=_summary_claim_scope(selected_run),
-                generation_id=generation_id,
+                generation_id=selected_generation,
                 identity=_summary_claim_identity(selected_run),
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.summary_maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
         except ActiveGenerationError as exc:
             remaining = deadline - time.monotonic()

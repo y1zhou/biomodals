@@ -369,6 +369,7 @@ def search_database_msa(
     database_id: str,
     sequence: str,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search one fixed sharded database with database-level resume."""
@@ -380,6 +381,7 @@ def search_database_msa(
         database_id,
         sequence,
         generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -408,6 +410,7 @@ def assemble_sequence_msas(
     include_unpaired: bool,
     include_paired: bool,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Assemble requested fields with pinned upstream deduplication."""
@@ -425,6 +428,7 @@ def assemble_sequence_msas(
             include_paired=include_paired,
         ),
         generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -452,6 +456,7 @@ def search_protein_templates(
     publish_canonical: bool,
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
@@ -481,6 +486,7 @@ def search_protein_templates(
             max_template_date=max_template_date,
         ),
         generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -616,6 +622,8 @@ def finalize_inference_summary(
     run_id: str,
     request_id: str,
     staged_input_record: dict[str, object],
+    generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
@@ -625,6 +633,8 @@ def finalize_inference_summary(
         staged.config,
         run_id,
         staged.sample_count,
+        generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 

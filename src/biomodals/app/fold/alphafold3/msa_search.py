@@ -888,6 +888,7 @@ def _wait_for_raw_claim(
     context: SearchContext,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> tuple[RawMsaEntry | None, GenerationClaim | None]:
     selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
@@ -903,6 +904,7 @@ def _wait_for_raw_claim(
                 identity=context.provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
             return None, claim
         except ActiveGenerationError as exc:
@@ -922,6 +924,7 @@ def run_database_search(
     sequence: str,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Validate/reuse or publish one resumable Raw Database MSA."""
     validate_query(resolve_database_profile(database_id), sequence)
@@ -942,6 +945,7 @@ def run_database_search(
             runtime,
             context,
             generation_id=generation_id,
+            superseded_generation_ids=superseded_generation_ids,
         )
     )
     if raced_entry is not None:
@@ -1285,6 +1289,7 @@ def assemble_and_publish_msas(
     task: MsaAssemblyTask,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Assemble requested fields and publish complete canonical combinations."""
     validate_msa_assembly_task(task)
@@ -1371,6 +1376,7 @@ def assemble_and_publish_msas(
                 identity=provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
         except ActiveGenerationError as exc:
             remaining = deadline - time.monotonic()

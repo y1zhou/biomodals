@@ -560,6 +560,7 @@ def _wait_for_template_claim(
     context: TemplateContext,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> tuple[TemplateEntry | None, GenerationClaim | None]:
     selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
@@ -575,6 +576,7 @@ def _wait_for_template_claim(
                 identity=context.provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
             return None, claim
         except ActiveGenerationError as exc:
@@ -593,6 +595,7 @@ def run_template_search(
     task: TemplateTask,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Run a request-local search or publish one canonical template result."""
     if not isinstance(task.publish_canonical, bool):
@@ -633,6 +636,7 @@ def run_template_search(
             runtime,
             context,
             generation_id=generation_id,
+            superseded_generation_ids=superseded_generation_ids,
         )
     )
     if raced_entry is not None:

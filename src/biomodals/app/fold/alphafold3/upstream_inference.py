@@ -121,6 +121,9 @@ def finalize_upstream_run_summary(
     config: AF3Config,
     run_id: str,
     sample_count: int,
+    *,
+    generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Rebuild the accumulated summary using upstream's data JSON format."""
     from alphafold3.common import (  # type: ignore[ty:unresolved-import]
@@ -141,4 +144,6 @@ def finalize_upstream_run_summary(
         run_id,
         sample_count=sample_count,
         build_data_json=build_data_json,
+        generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )

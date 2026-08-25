@@ -261,10 +261,28 @@ class AlphaFold3ExecutionPlanning:
 
     def generation_id(self, node_key: str, item: PlannedTask) -> str:
         """Bind one workload writer generation to its Execution Task."""
+        return self._generation_id(self.execution_run_id, node_key, item)
+
+    def superseded_generation_ids(
+        self,
+        node_key: str,
+        item: PlannedTask,
+    ) -> tuple[str, ...]:
+        """Identify only terminal service Runs authorized for claim repair."""
+        return tuple(
+            self._generation_id(execution_run_id, node_key, item)
+            for execution_run_id in self.request.repair_execution_run_ids
+        )
+
+    def _generation_id(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        item: PlannedTask,
+    ) -> str:
         return sha256(
             (
-                f"{self.execution_run_id}:{node_key}:"
-                f"{self.task_fingerprint(node_key, item)}"
+                f"{execution_run_id}:{node_key}:{self.task_fingerprint(node_key, item)}"
             ).encode()
         ).hexdigest()
 
@@ -277,6 +295,9 @@ class AlphaFold3ExecutionPlanning:
                 "database_id": task.database_id,
                 "sequence": task.sequence,
                 "generation_id": self.generation_id(node_key, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    node_key, item
+                ),
                 "execution_result_path": path.as_posix(),
             }
             function_name = "search_database_msa"
@@ -288,6 +309,9 @@ class AlphaFold3ExecutionPlanning:
                 "include_unpaired": task.include_unpaired,
                 "include_paired": task.include_paired,
                 "generation_id": self.generation_id(node_key, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    node_key, item
+                ),
                 "execution_result_path": path.as_posix(),
             }
             function_name = "assemble_sequence_msas"
@@ -304,6 +328,9 @@ class AlphaFold3ExecutionPlanning:
                 "publish_canonical": task.publish_canonical,
                 "max_template_date": task.max_template_date,
                 "generation_id": self.generation_id(node_key, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    node_key, item
+                ),
                 "execution_result_path": path.as_posix(),
             }
             function_name = "search_protein_templates"
@@ -357,6 +384,13 @@ class AlphaFold3ExecutionPlanning:
             sample_count=prepared.sample_count,
             generation_ids={
                 cast(int, item.value): self.generation_id(SEED_PREDICTIONS, item)
+                for item in items
+            },
+            superseded_generation_ids={
+                cast(int, item.value): self.superseded_generation_ids(
+                    SEED_PREDICTIONS,
+                    item,
+                )
                 for item in items
             },
             reload_volume=False,
@@ -549,6 +583,11 @@ class AlphaFold3ExecutionPlanning:
                 "run_id": prepared.run_id,
                 "request_id": prepared.request_id,
                 "staged_input_record": prepared.staged_input.to_record(),
+                "generation_id": self.generation_id(INFERENCE_SUMMARY, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    INFERENCE_SUMMARY,
+                    item,
+                ),
                 "execution_result_path": self.result_path(
                     INFERENCE_SUMMARY, (item,)
                 ).as_posix(),

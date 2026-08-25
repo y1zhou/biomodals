@@ -54,8 +54,7 @@ updating that cache timestamp.
 Each registered Tool contributes:
 
 - a `ToolDefinition` containing its stable key, display metadata, ordered
-  semantic stages, deployment defaults, Provider Call limits, and default log
-  visibility;
+  semantic stages, deployment defaults, and default log visibility;
 - a `ToolAdapter` that validates and stages its request and retrieves its
   published Result; and
 - a typed submission router.
@@ -131,8 +130,8 @@ do not copy remote errors.
 ## Semantic stages
 
 A Tool Definition owns an ordered list of semantic stages. Each stage maps one
-or more kernel Node keys into one user-facing label and optional provider
-function description. The service aggregates Task status counts across mapped
+or more kernel Node keys into one user-facing label. The service aggregates
+Task status counts across mapped
 Nodes. For an active stage, the disposable projection may expose
 `provider_state` as `queued` while work is pending without an assigned Provider
 Call, or while Modal has accepted a Function Call but has not assigned a
@@ -142,23 +141,15 @@ Provider Call selection and raw Node keys are diagnostic details.
 
 ## Provider Call limits
 
-Each Tool has Administrator-configurable maximum active Provider Calls and
-maximum active GPU Provider Calls. Both are positive integers and the GPU limit
-cannot exceed the total. The effective values are snapshotted during Job
-admission and supplied to the deployed coordinator. Later changes affect only
-new Jobs.
+Each Tool's active Job limit also determines the per-Job Provider Call limits
+snapshotted during admission. The total container ceiling is eight times the
+active Job limit; the GPU subset ceiling equals the active Job limit. A disabled
+Tool admits no Jobs. This keeps one capacity control in the Administrator UI
+while preserving explicit immutable limits on every admitted Job.
 
-Initial defaults preserve current behavior:
-
-| Tool | Total | GPU |
-| --- | ---: | ---: |
-| GROMACS | 3 | 1 |
-| AlphaFold3 | 4 | 1 |
-
-The Administrator Tool table keeps active Jobs and the per-User active Job
-limit separate from execution capacity. Total and GPU Provider Call limits
-share one compact **Maximum containers** column with **Total** and **GPU**
-fields. This layout refinement is lower priority than the execution behavior.
+The deployed Modal App name is startup configuration only. Changing it requires
+updating the Tool's `.env` value and restarting the API service. Administrators
+may still pin a deployment version and choose Job-log visibility per Tool.
 
 ## Result metadata
 
@@ -334,7 +325,7 @@ AlphaFold3 exposes these ordered semantic stages:
 
 1. Prepare input
 2. Prepare environment
-3. Search sequence databases
+3. Search MSAs
 4. Search templates
 5. Predict structures
 6. Prepare results
@@ -345,14 +336,14 @@ Their kernel Node mappings are:
 | --- | --- |
 | Prepare input | `stage-request-input` |
 | Prepare environment | `prepare-environment` |
-| Search sequence databases | `raw-database-searches`, `combined-msa-publications` |
+| Search MSAs | `raw-database-searches`, `combined-msa-publications` |
 | Search templates | `protein-template-searches` |
 | Predict structures | `stage-inference-input`, `seed-predictions` |
 | Prepare results | `inference-summary`, `request-publication` |
 
 Each stage may therefore aggregate several internal kernel Nodes. Provider Call
 choices remain available through diagnostics and logs. Coordinator-local Nodes
-show `N/A` as their running function and have no log target.
+have no log target.
 
 ## Job logs
 
@@ -390,18 +381,19 @@ AlphaFold3 initially restricts logs to Administrators.
 ## Modal billing
 
 Admin > Modal contains an Administrator-only Costs section backed by Modal's
-billing report API. It shows total workspace cost, Environment grouping,
-configured Tool App costs, and unmatched usage as Other workspace usage.
+billing report API. It shows total workspace cost and parallel Tool and
+Environment groupings. Untagged Tool usage remains visible as **Other /
+untagged** rather than being attributed to an Environment.
 
 Deployed Tool Apps carry a stable `biomodals_tool` tag (`gromacs` or
 `alphafold3`). Billing reports request this tag and use it as the only reliable
-Tool attribution key. Untagged or unknown values remain **Other workspace
-usage**; historical usage from before tagging is not guessed from object
+Tool attribution key. Untagged or unknown values remain **Other / untagged**;
+historical usage from before tagging is not guessed from object
 descriptions. Existing Apps must be redeployed before future usage receives
 the tag.
 
-The default interval is the current billing month. Presets include the last
-seven days, last 30 days, and previous month, plus a custom date range. Normal
+The default interval is the current billing month. Presets include today, the
+last seven days, last 30 days, and previous month, plus a custom date range. Normal
 reports use daily resolution; intervals no longer than two days may use hourly
 resolution.
 
@@ -429,11 +421,11 @@ After implementation AlphaFold3 is an available catalog Tool rather than WIP.
 
 ## Deployment validation
 
-Saving a Tool App name or deployment version validates the exact deployed
-`ExecutionCoordinator`. The coordinator must expose launch, bounded status,
-cancellation, and cursor-paginated Provider Call diagnostics. Failure names
-the missing or incompatible capability in the existing validation popup and
-does not update the setting.
+Saving a Tool deployment version validates the exact deployed
+`ExecutionCoordinator` configured by the startup App name. The coordinator
+must expose launch, bounded status, cancellation, and cursor-paginated Provider
+Call diagnostics. Failure names the missing or incompatible capability in the
+existing validation popup and does not update the setting.
 
 ## Pre-release database cutover
 

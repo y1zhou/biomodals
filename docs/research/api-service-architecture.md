@@ -667,13 +667,13 @@ The application factory reads these settings:
 | `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` | unset | Positive retention enables cleanup of published runs' intermediates |
 
 The Admin API stores editable runtime overrides for the Modal Environment,
-GROMACS App name and deployment version, Tool active-Job limit and Job-log
-visibility, and Global active-Job limit in SQLite. Process and dotenv values
-provide host defaults for fields they control; workload descriptors provide
-the remaining defaults. An explicit process variable has highest precedence
-and makes the corresponding Admin field read-only. Modal credentials remain
-process/file configuration only, and the API refuses to start unless both are
-present.
+Tool deployment version, active-Job limit, Job-log visibility, and Global
+active-Job limit in SQLite. Modal App names remain startup-only process or
+dotenv configuration. Process and dotenv values provide host defaults for
+fields they control; workload descriptors provide the remaining defaults. An
+explicit process variable has highest precedence and makes the corresponding
+Admin field read-only. Modal credentials remain process/file configuration
+only, and the API refuses to start unless both are present.
 
 That full validation belongs specifically to `biomodals api serve`. Offline
 `biomodals api admin` account commands resolve the same configuration file,

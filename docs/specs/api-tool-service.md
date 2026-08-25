@@ -2,7 +2,7 @@
 
 Status: accepted and implemented
 
-Last updated: 2026-08-24
+Last updated: 2026-08-25
 
 This specification applies ADR 0007 to the implemented FastAPI service and its
 frontend.
@@ -120,6 +120,12 @@ returns to the corresponding terminal outcome. `blocked` represents either a
 remote suspended Run requiring intervention or a recoverable service-owned
 result-delivery failure. A Job is not `succeeded` until its Result is verified
 as downloadable.
+
+An identical AlphaFold3 Job can remain `queued` before remote launch while an
+earlier matching Job may still publish the same result. Its public
+`state_reason` is `waiting_for_shared_publication`, and `state_message` provides
+the owner-safe explanation. These fields describe service lifecycle state and
+do not copy remote errors.
 
 ## Semantic stages
 
@@ -457,6 +463,21 @@ identity, the Remote Execution Client spawns the deployed coordinator, and the
 service records its root Function Call ID before returning `202`. A staging
 failure before any spawn attempt leaves the Job queued; background processing
 retries the idempotent staging and launch sequence.
+
+Before staging AlphaFold3, the adapter lists only earlier Jobs with the same
+Tool and exact request digest. If any is `queued`, `running`,
+`cancel_requested`, `state_unknown`, or remotely blocked without a terminal
+result, the new Job waits locally and retries after 60 seconds. Once none may
+still be active, failed, partial, and cancelled predecessor Job IDs are staged
+with the new request. They authorize AlphaFold3 to abandon only deterministic
+Task generations derived from those exact Execution Run IDs. The new Job's
+snapshotted Provider Call limits and other current arguments take precedence.
+Successful publications are reused through their normal markers and receipts.
+
+This policy does not add Task records to `service.sqlite3`, inspect remote
+ledgers, or coordinate independently submitted CLI Runs. It handles exact API
+resubmission only; broader partial overlap between different requests remains
+under the app's ordinary marker and conservative claim-expiry rules.
 
 If coordinator spawn may have occurred but no Function Call ID was returned,
 the Job becomes `state_unknown` with

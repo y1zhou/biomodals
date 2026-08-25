@@ -4,6 +4,8 @@ Status: accepted
 
 Decision date: 2026-08-23
 
+Last amended: 2026-08-25
+
 ## Context
 
 The first API-service implementation made FastAPI the Execution Coordinator
@@ -70,6 +72,27 @@ the remote coordinator. Later Administrator changes affect new Jobs only.
 GROMACS and AlphaFold3 adopt this topology together. Future coordinator-aware
 apps and workflows can be registered through the same service boundary without
 adding a service-local scheduler.
+
+### Exact AlphaFold3 resubmission
+
+The service uses the existing exact request digest to serialize identical
+AlphaFold3 submissions. A later Job remains `queued` with
+`state_reason=waiting_for_shared_publication` while any earlier matching Job
+may still be executing. `state_unknown` is treated as possibly active. No
+second remote coordinator is launched during that uncertainty.
+
+After every earlier matching Job is conclusively terminal, the new Job launches
+with its own current operational arguments. Failed, partial, and cancelled
+predecessor Job IDs are included as narrow workload claim-repair authorization.
+AlphaFold3 derives the predecessor generation ID for each exact Task and may
+fence only those generations. Unrelated claims remain protected, and validated
+completion markers remain the sole reuse evidence.
+
+This is not a kernel Successor and does not copy or reopen a predecessor Remote
+Run Ledger. It is an independent root Run with workload-owned repair metadata.
+The service stores no Task rows and creates no cross-Run Modal coordination
+store. Coordination is intentionally limited to exact API-submitted requests
+visible in `service.sqlite3`; independently submitted CLI Runs are not inferred.
 
 The service calls this user-facing registration a Tool. `tool` replaces
 `workload` in its HTTP and persistence vocabulary; Workload remains the

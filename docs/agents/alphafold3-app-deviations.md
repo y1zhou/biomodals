@@ -53,3 +53,10 @@ publisher. This is workload-level coordination across Execution Runs, not a
 kernel Task lease. It does not authorize retry or replacement inside one Run;
 only a new root Run or explicit compatible Successor may schedule missing work.
 Completion markers and validated publications remain the reuse authority.
+
+For exact API resubmissions, the service delays the new root Run until matching
+Service Jobs are conclusively terminal. It may then name those Execution Run
+IDs in the new request. AlphaFold3 derives and fences only their deterministic
+Task generations; unrelated or unknown owners keep the ordinary conservative
+claim behavior. This exception is service-local workload repair, not kernel
+Successor inference.

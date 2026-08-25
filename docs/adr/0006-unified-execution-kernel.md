@@ -620,6 +620,14 @@ workload-owned external claim but cannot change kernel Task outcomes. The
 default hook does nothing, and cleanup failure is diagnostic rather than
 authority to resubmit work.
 
+ADR 0007 adds a workload-specific API exception without changing kernel
+Successor semantics. A new AlphaFold3 API root Run may carry exact terminal
+Service Job IDs that authorize the app to fence only their deterministic
+external claim generations. The new Run does not read or mutate predecessor
+kernel ledgers, and active or unknown matching Service Jobs still block launch.
+This is workload claim repair, not kernel Task retry or inferred Successor
+lineage.
+
 The Node, Task, and Provider Call relationship policy was accepted on
 2026-07-29. A Node is a fixed semantic DAG stage, a Task is one independently
 scheduled and validated item in that stage, and a Provider Call is one

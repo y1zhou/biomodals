@@ -154,6 +154,10 @@ These existing decisions remain binding during the refactor:
 - A successor requires the same Workload Plan Fingerprint over normalized
   result-affecting inputs and declared scientific versions. Changed science
   requires a new root Run.
+- An exact AlphaFold3 API resubmission is still a new root Run. ADR 0007 permits
+  its app-owned claim layer to fence deterministic generations belonging to
+  conclusively terminal matching Service Jobs; it does not retry predecessor
+  kernel Tasks or infer generic Successor lineage.
 - A workflow declares the versions of its workflow-local scientific logic and
   every app or model that can affect its publications. These versions enter
   the Workload Plan Fingerprint even when a particular Node class has no
@@ -937,17 +941,16 @@ Repository scope follows the coordinator boundary:
 
 | Coordinator | Repository scope | Execution authority | Separate authority |
 | --- | --- | --- | --- |
-| API service | One long-lived `service.sqlite3` for every service-owned Job and Execution Run | Service-coordinated Nodes, Tasks, call IDs, and observed state | Users, Jobs, admission, runtime configuration, and result cache remain service-owned |
+| API service | One long-lived `service.sqlite3` for service-owned Jobs; each Tool Run keeps its remote per-run ledger | The deployed Tool coordinator owns Nodes, Tasks, Provider Calls, and recovery | Users, Jobs, admission, cached projections, runtime configuration, and result cache remain service-owned |
 | Workflow orchestrator | The existing per-run Workflow Ledger | Workflow Nodes, fan-out Tasks, calls, and recovery | Workflow artifacts and Volume synchronization remain workflow-owned |
 | Direct CLI app coordinator | One App Run Ledger in the app deployment's configured durable Volume | App Nodes, Tasks, batches, assignments, child calls, and recovery | Workload publications, scientific inputs, and outputs remain app-owned |
 | Child App Call | No separate repository; use the parent Execution Run | Work attributed to the service, workflow, or Direct CLI App Run | Function implementation, resources, and scientific publication remain app-owned |
 
-An ordinary API request therefore updates only the service database. It does
-not create a database for the called app. If the service starts a remote
-workflow orchestrator, the service repository tracks that child coordinator
-call and the workflow's existing per-run ledger tracks the internal DAG. Those
-repositories describe different scheduling levels; they do not duplicate the
-same Tasks.
+An ordinary API request first records one lean Service Job, then launches the
+deployed Tool coordinator. The Tool creates its normal remote per-run ledger;
+`service.sqlite3` stores only the locator and a bounded presentation projection,
+not another copy of its Tasks. If the service starts a workflow coordinator,
+that workflow's per-run ledger remains the sole execution authority.
 
 A Direct CLI App Run always creates its per-run ledger remotely and executes
 through a Run-Scoped Coordinator Pool, even for one direct Provider Call. The

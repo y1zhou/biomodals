@@ -223,12 +223,9 @@ class AdminModalToolView(BaseModel):
 
     tool: str
     display_name: str
-    modal_app_name: TextSettingView
     modal_app_version: IntegerSettingView
     active_jobs: int
     active_job_limit: IntegerSettingView
-    max_active_provider_calls: IntegerSettingView
-    max_active_gpu_provider_calls: IntegerSettingView
     job_logs_visible_to_owner: BooleanSettingView
 
 
@@ -338,12 +335,6 @@ class UpdateAdminModalEnvironmentRequest(BaseModel):
 class UpdateAdminModalToolRequest(BaseModel):
     """Editable per-Tool Modal configuration."""
 
-    modal_app_name: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=120,
-        description="Omit to keep unchanged; null restores the configured default.",
-    )
     modal_app_version: int | None = Field(
         default=None,
         ge=1,
@@ -356,16 +347,6 @@ class UpdateAdminModalToolRequest(BaseModel):
         default=None,
         ge=0,
         description="Omit to keep unchanged; null restores the configured default.",
-    )
-    max_active_provider_calls: int | None = Field(
-        default=None,
-        ge=1,
-        description="Maximum active workload containers for newly admitted Runs.",
-    )
-    max_active_gpu_provider_calls: int | None = Field(
-        default=None,
-        ge=1,
-        description="Maximum active GPU containers within the total limit.",
     )
     job_logs_visible_to_owner: bool | None = Field(
         default=None,
@@ -439,14 +420,9 @@ def _modal_view(
             AdminModalToolView(
                 tool=tool.tool,
                 display_name=configuration.tool_definition(tool.tool).display_name,
-                modal_app_name=_text_view(tool.modal_app_name),
                 modal_app_version=_integer_view(tool.modal_app_version),
                 active_jobs=store.count_active_jobs(tool.tool),
                 active_job_limit=_integer_view(tool.active_job_limit),
-                max_active_provider_calls=_integer_view(tool.max_active_provider_calls),
-                max_active_gpu_provider_calls=_integer_view(
-                    tool.max_active_gpu_provider_calls
-                ),
                 job_logs_visible_to_owner=_boolean_view(tool.job_logs_visible_to_owner),
             )
             for tool in (
@@ -904,20 +880,10 @@ def create_admin_router() -> APIRouter:
         registration = request.app.state.registrations.get(tool)
         if registration is None:
             raise HTTPException(404, "Tool not found")
-        provider_fields = {"modal_app_name", "modal_app_version"}
+        provider_fields = {"modal_app_version"}
         if submission.model_fields_set & provider_fields:
             effective = configuration.tool(tool)
             definition = configuration.tool_definition(tool)
-            if (
-                "modal_app_name" in submission.model_fields_set
-                and not effective.modal_app_name.editable
-            ):
-                raise CodedAPIError(
-                    409,
-                    "setting_overridden",
-                    f"{definition.modal_app_name_environment} is controlled by "
-                    "an environment variable",
-                )
             if (
                 "modal_app_version" in submission.model_fields_set
                 and not effective.modal_app_version.editable
@@ -929,18 +895,6 @@ def create_admin_router() -> APIRouter:
                     "by an environment variable",
                 )
             candidate_app_name = effective.modal_app_name.value
-            if "modal_app_name" in submission.model_fields_set:
-                candidate_app_name = (
-                    configuration.modal_app_name_fallback(tool)
-                    if submission.modal_app_name is None
-                    else submission.modal_app_name.strip()
-                )
-            if not candidate_app_name:
-                raise CodedAPIError(
-                    400,
-                    "setting_invalid",
-                    "Modal app name must not be empty",
-                )
             candidate_app_version = effective.modal_app_version.value
             if "modal_app_version" in submission.model_fields_set:
                 candidate_app_version = (

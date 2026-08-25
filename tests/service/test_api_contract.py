@@ -156,6 +156,15 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
         "modal_app_version",
         "root_function_call_id",
     } <= set(unknown_job["required"])
+    admin_tool = document["components"]["schemas"]["AdminModalToolView"]
+    update_tool = document["components"]["schemas"]["UpdateAdminModalToolRequest"]
+    removed_admin_fields = {
+        "modal_app_name",
+        "max_active_provider_calls",
+        "max_active_gpu_provider_calls",
+    }
+    assert removed_admin_fields.isdisjoint(admin_tool["properties"])
+    assert removed_admin_fields.isdisjoint(update_tool["properties"])
     recycle = next(
         parameter
         for parameter in paths["/api/v1/alphafold3/validations"]["post"]["parameters"]

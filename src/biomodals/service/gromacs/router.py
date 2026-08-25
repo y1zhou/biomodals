@@ -138,8 +138,8 @@ def create_router(
                 purpose="genion-seed",
                 random_sentinel=0,
             ),
-            max_active_provider_calls=effective.max_active_provider_calls.value,
-            max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls.value,
+            max_active_provider_calls=effective.max_active_provider_calls,
+            max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls,
         )
         pending.put(job_id, execution_request.to_bytes())
         try:

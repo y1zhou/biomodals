@@ -48,9 +48,17 @@ class ToolRuntimeConfiguration:
     modal_app_name: EffectiveSetting[str]
     modal_app_version: EffectiveSetting[int]
     active_job_limit: EffectiveSetting[int]
-    max_active_provider_calls: EffectiveSetting[int]
-    max_active_gpu_provider_calls: EffectiveSetting[int]
     job_logs_visible_to_owner: EffectiveSetting[bool]
+
+    @property
+    def max_active_provider_calls(self) -> int:
+        """Derive the per-Job total container ceiling from Tool capacity."""
+        return max(1, self.active_job_limit.value * 8)
+
+    @property
+    def max_active_gpu_provider_calls(self) -> int:
+        """Derive the per-Job GPU container ceiling from Tool capacity."""
+        return max(1, self.active_job_limit.value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,8 +66,6 @@ class _ToolDefaults:
     modal_app_name: str
     modal_app_version: int
     active_job_limit: int
-    max_active_provider_calls: int
-    max_active_gpu_provider_calls: int
 
 
 class RuntimeConfiguration:
@@ -107,10 +113,6 @@ class RuntimeConfiguration:
                     ),
                     definition.active_job_limit_environment,
                 ),
-                max_active_provider_calls=definition.default_max_active_provider_calls,
-                max_active_gpu_provider_calls=(
-                    definition.default_max_active_gpu_provider_calls
-                ),
             )
             for definition in tool_definitions
         }
@@ -129,10 +131,6 @@ class RuntimeConfiguration:
     def _defaults(self, tool: str) -> _ToolDefaults:
         self.tool_definition(tool)
         return self._tool_defaults[tool]
-
-    def modal_app_name_fallback(self, tool: str) -> str:
-        """Return the startup fallback restored by a null Admin PATCH."""
-        return self._defaults(tool).modal_app_name
 
     def modal_app_version_fallback(self, tool: str) -> int:
         """Return the startup version restored by a null Admin PATCH."""
@@ -173,9 +171,8 @@ class RuntimeConfiguration:
         stored = self.store.get_tool_configuration(tool)
         configuration = ToolRuntimeConfiguration(
             tool=tool,
-            modal_app_name=self._tool_text_setting(
+            modal_app_name=self._startup_text_setting(
                 environment_name=definition.modal_app_name_environment,
-                database_value=(stored.modal_app_name if stored is not None else None),
                 default=defaults.modal_app_name,
             ),
             modal_app_version=self._tool_positive_integer_setting(
@@ -192,20 +189,6 @@ class RuntimeConfiguration:
                 ),
                 default=defaults.active_job_limit,
             ),
-            max_active_provider_calls=self._database_integer_setting(
-                database_value=(
-                    stored.max_active_provider_calls if stored is not None else None
-                ),
-                default=defaults.max_active_provider_calls,
-                positive=True,
-            ),
-            max_active_gpu_provider_calls=self._database_integer_setting(
-                database_value=(
-                    stored.max_active_gpu_provider_calls if stored is not None else None
-                ),
-                default=defaults.max_active_gpu_provider_calls,
-                positive=True,
-            ),
             job_logs_visible_to_owner=self._tool_boolean_setting(
                 database_value=(
                     stored.job_logs_visible_to_owner if stored is not None else None
@@ -213,11 +196,6 @@ class RuntimeConfiguration:
                 default=definition.job_logs_visible_to_owner_default,
             ),
         )
-        if (
-            configuration.max_active_gpu_provider_calls.value
-            > configuration.max_active_provider_calls.value
-        ):
-            raise ValueError("Maximum GPU containers cannot exceed total containers")
         return configuration
 
     def update_environment(
@@ -253,23 +231,13 @@ class RuntimeConfiguration:
         self,
         tool: str,
         *,
-        modal_app_name: str | None | _Unchanged = _UNCHANGED,
         modal_app_version: int | None | _Unchanged = _UNCHANGED,
         active_job_limit: int | None | _Unchanged = _UNCHANGED,
-        max_active_provider_calls: int | None | _Unchanged = _UNCHANGED,
-        max_active_gpu_provider_calls: int | None | _Unchanged = _UNCHANGED,
         job_logs_visible_to_owner: bool | None | _Unchanged = _UNCHANGED,
     ) -> None:
         """Atomically update supplied settings for one fixed Tool."""
         definition = self.tool_definition(tool)
         updates: dict[str, str | int | bool | None] = {}
-        if not isinstance(modal_app_name, _Unchanged):
-            self._ensure_editable(definition.modal_app_name_environment)
-            updates["modal_app_name"] = (
-                None
-                if modal_app_name is None
-                else _nonempty(modal_app_name, "Modal app name")
-            )
         if not isinstance(modal_app_version, _Unchanged):
             self._ensure_editable(definition.modal_app_version_environment)
             updates["modal_app_version"] = (
@@ -284,45 +252,8 @@ class RuntimeConfiguration:
                 if active_job_limit is None
                 else _nonnegative(active_job_limit, "Tool active job limit")
             )
-        if not isinstance(max_active_provider_calls, _Unchanged):
-            updates["max_active_provider_calls"] = (
-                None
-                if max_active_provider_calls is None
-                else _positive(max_active_provider_calls, "Maximum containers")
-            )
-        if not isinstance(max_active_gpu_provider_calls, _Unchanged):
-            updates["max_active_gpu_provider_calls"] = (
-                None
-                if max_active_gpu_provider_calls is None
-                else _positive(
-                    max_active_gpu_provider_calls,
-                    "Maximum GPU containers",
-                )
-            )
         if not isinstance(job_logs_visible_to_owner, _Unchanged):
             updates["job_logs_visible_to_owner"] = job_logs_visible_to_owner
-        current = self.tool(tool)
-        defaults = self._defaults(tool)
-        total = (
-            current.max_active_provider_calls.value
-            if isinstance(max_active_provider_calls, _Unchanged)
-            else (
-                defaults.max_active_provider_calls
-                if max_active_provider_calls is None
-                else max_active_provider_calls
-            )
-        )
-        gpu = (
-            current.max_active_gpu_provider_calls.value
-            if isinstance(max_active_gpu_provider_calls, _Unchanged)
-            else (
-                defaults.max_active_gpu_provider_calls
-                if max_active_gpu_provider_calls is None
-                else max_active_gpu_provider_calls
-            )
-        )
-        if gpu > total:
-            raise ValueError("Maximum GPU containers cannot exceed total containers")
         self.store.set_tool_configuration(tool, updates)
 
     def _text_setting(
@@ -350,14 +281,14 @@ class RuntimeConfiguration:
             _parse_nonnegative,
         )
 
-    def _tool_text_setting(
+    def _startup_text_setting(
         self,
         *,
         environment_name: str,
-        database_value: str | None,
         default: str,
     ) -> EffectiveSetting[str]:
-        return self._setting(environment_name, database_value, default, _nonempty)
+        setting = self._setting(environment_name, None, default, _nonempty)
+        return EffectiveSetting(setting.value, setting.source, False)
 
     def _tool_integer_setting(
         self,
@@ -396,21 +327,6 @@ class RuntimeConfiguration:
         """Resolve a database-editable boolean over its Tool-owned default."""
         if database_value is not None:
             return EffectiveSetting(database_value, "database", True)
-        return EffectiveSetting(default, "default", True)
-
-    def _database_integer_setting(
-        self,
-        *,
-        database_value: int | None,
-        default: int,
-        positive: bool = False,
-    ) -> EffectiveSetting[int]:
-        """Resolve an administrator-only container limit."""
-        parser = _parse_positive if positive else _parse_nonnegative
-        if database_value is not None:
-            return EffectiveSetting(
-                parser(database_value, "Tool limit"), "database", True
-            )
         return EffectiveSetting(default, "default", True)
 
     def _setting[Value: (str, int)](

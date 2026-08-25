@@ -35,8 +35,6 @@ class ToolDefinition:
     default_modal_app_name: str
     default_modal_app_version: int
     default_active_job_limit: int
-    default_max_active_provider_calls: int
-    default_max_active_gpu_provider_calls: int
     stages: tuple[ToolStageDefinition, ...]
     job_logs_visible_to_owner_default: bool = False
 
@@ -50,8 +48,6 @@ GROMACS_TOOL = ToolDefinition(
     default_modal_app_name="Gromacs",
     default_modal_app_version=1,
     default_active_job_limit=2,
-    default_max_active_provider_calls=3,
-    default_max_active_gpu_provider_calls=1,
     stages=(
         ToolStageDefinition(
             "prepare_simulation",
@@ -102,8 +98,6 @@ ALPHAFOLD3_TOOL = ToolDefinition(
     default_modal_app_name="AlphaFold3",
     default_modal_app_version=1,
     default_active_job_limit=2,
-    default_max_active_provider_calls=4,
-    default_max_active_gpu_provider_calls=1,
     stages=(
         ToolStageDefinition(
             "prepare_input",

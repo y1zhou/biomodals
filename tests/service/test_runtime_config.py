@@ -4,8 +4,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from biomodals.service.config import ServiceSettings
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import ServiceStore
@@ -26,20 +24,29 @@ def test_registered_tool_defaults_are_explicit(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
 
     assert configuration.tool_names() == ("gromacs", "alphafold3")
-    assert configuration.tool("gromacs").max_active_provider_calls.value == 3
-    assert configuration.tool("alphafold3").max_active_provider_calls.value == 4
+    assert configuration.tool("gromacs").max_active_provider_calls == 16
+    assert configuration.tool("gromacs").max_active_gpu_provider_calls == 2
+    assert configuration.tool("alphafold3").max_active_provider_calls == 16
+    assert configuration.tool("alphafold3").max_active_gpu_provider_calls == 2
 
 
-def test_container_limits_are_atomic_and_gpu_fits_total(tmp_path: Path) -> None:
+def test_container_limits_follow_active_job_limit(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
-    configuration.set_tool(
-        "alphafold3",
-        max_active_provider_calls=12,
-        max_active_gpu_provider_calls=3,
-    )
+    configuration.set_tool("alphafold3", active_job_limit=3)
 
     effective = configuration.tool("alphafold3")
-    assert effective.max_active_provider_calls.value == 12
-    assert effective.max_active_gpu_provider_calls.value == 3
-    with pytest.raises(ValueError, match="GPU containers"):
-        configuration.set_tool("alphafold3", max_active_provider_calls=2)
+    assert effective.max_active_provider_calls == 24
+    assert effective.max_active_gpu_provider_calls == 3
+
+
+def test_modal_app_name_ignores_legacy_database_override(tmp_path: Path) -> None:
+    configuration = _configuration(tmp_path)
+    configuration.store.set_tool_configuration(
+        "gromacs",
+        {"modal_app_name": "LegacyDatabaseOverride"},
+    )
+
+    effective = configuration.tool("gromacs")
+    assert effective.modal_app_name.value == "Gromacs"
+    assert effective.modal_app_name.source == "default"
+    assert not effective.modal_app_name.editable

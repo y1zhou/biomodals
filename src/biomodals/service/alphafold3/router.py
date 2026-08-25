@@ -281,11 +281,9 @@ def create_router(
                     global_active_job_limit=(
                         configuration.global_active_job_limit().value
                     ),
-                    max_active_provider_calls=(
-                        effective.max_active_provider_calls.value
-                    ),
+                    max_active_provider_calls=(effective.max_active_provider_calls),
                     max_active_gpu_provider_calls=(
-                        effective.max_active_gpu_provider_calls.value
+                        effective.max_active_gpu_provider_calls
                     ),
                     now=int(time.time()),
                     new_job_id=uuid4(),

@@ -281,9 +281,7 @@ class AlphaFold3ExecutionPlanning:
         item: PlannedTask,
     ) -> str:
         return sha256(
-            (
-                f"{execution_run_id}:{node_key}:{self.task_fingerprint(node_key, item)}"
-            ).encode()
+            f"{execution_run_id}:{node_key}:{item.plan.task_key}".encode()
         ).hexdigest()
 
     def task_call(self, node_key: str, item: PlannedTask) -> ProviderCallSpec:

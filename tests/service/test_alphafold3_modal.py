@@ -42,13 +42,16 @@ def _admit(
     *,
     job_id: UUID,
     ordinal: int,
+    request_digest: str = "a" * 64,
+    publication_scope_digest: str = "b" * 64,
 ):
     return store.admit_job(
         owner_user_id=owner,
         tool="alphafold3",
         display_name="prediction",
         idempotency_key=f"request-{ordinal}",
-        request_digest="a" * 64,
+        request_digest=request_digest,
+        publication_scope_digest=publication_scope_digest,
         modal_environment="main",
         modal_app_name="AlphaFold3",
         modal_app_version=1,
@@ -65,8 +68,20 @@ def _admit(
 @pytest.mark.anyio
 async def test_identical_job_waits_behind_active_predecessor(tmp_path: Path) -> None:
     store, owner = _store(tmp_path)
-    _admit(store, owner, job_id=uuid4(), ordinal=1)
-    current = _admit(store, owner, job_id=uuid4(), ordinal=2)
+    _admit(
+        store,
+        owner,
+        job_id=uuid4(),
+        ordinal=1,
+        request_digest="a" * 64,
+    )
+    current = _admit(
+        store,
+        owner,
+        job_id=uuid4(),
+        ordinal=2,
+        request_digest="c" * 64,
+    )
     adapter = AlphaFold3ToolAdapter(SimpleNamespace(), store)
 
     waiting = await adapter.stage(current)

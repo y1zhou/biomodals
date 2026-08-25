@@ -154,10 +154,10 @@ These existing decisions remain binding during the refactor:
 - A successor requires the same Workload Plan Fingerprint over normalized
   result-affecting inputs and declared scientific versions. Changed science
   requires a new root Run.
-- An exact AlphaFold3 API resubmission is still a new root Run. ADR 0007 permits
-  its app-owned claim layer to fence deterministic generations belonging to
-  conclusively terminal matching Service Jobs; it does not retry predecessor
-  kernel Tasks or infer generic Successor lineage.
+- A publication-compatible AlphaFold3 API resubmission is still a new root Run.
+  ADR 0007 permits its app-owned claim layer to fence stable generations
+  belonging to conclusively terminal matching Service Jobs; it does not retry
+  predecessor kernel Tasks or infer generic Successor lineage.
 - A workflow declares the versions of its workflow-local scientific logic and
   every app or model that can affect its publications. These versions enter
   the Workload Plan Fingerprint even when a particular Node class has no

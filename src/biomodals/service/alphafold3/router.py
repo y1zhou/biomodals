@@ -273,6 +273,7 @@ def create_router(
                     display_name=str(validated.preview["name"]),
                     idempotency_key=str(idempotency_key),
                     request_digest=digest,
+                    publication_scope_digest=(validated.publication_scope_digest),
                     modal_environment=deployment.environment,
                     modal_app_name=deployment.deployment_name,
                     modal_app_version=deployment.deployment_version,

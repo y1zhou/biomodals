@@ -74,7 +74,7 @@ class JobState(StrEnum):
 
 
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 6
+_SERVICE_SCHEMA_VERSION = 7
 _ACTIVE_JOB_STATES = (
     JobState.QUEUED.value,
     JobState.RUNNING.value,
@@ -91,6 +91,7 @@ CREATE TABLE jobs (
     display_name TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     request_digest TEXT NOT NULL,
+    publication_scope_digest TEXT NOT NULL,
     modal_environment TEXT NOT NULL,
     modal_app_name TEXT NOT NULL,
     modal_app_version INTEGER NOT NULL CHECK (modal_app_version >= 1),
@@ -137,6 +138,8 @@ CREATE INDEX jobs_owner_created ON jobs(owner_user_id, created_at DESC);
 CREATE INDEX jobs_tool_state ON jobs(tool, state, created_at);
 CREATE INDEX jobs_owner_state ON jobs(owner_user_id, state, created_at);
 CREATE INDEX jobs_polling ON jobs(state, updated_at);
+CREATE INDEX jobs_publication_scope
+ON jobs(tool, publication_scope_digest, created_at);
 """
 
 
@@ -204,6 +207,7 @@ class JobRecord:
     display_name: str
     idempotency_key: str
     request_digest: str
+    publication_scope_digest: str
     state: JobState
     modal_environment: str
     modal_app_name: str
@@ -1186,6 +1190,7 @@ class ServiceStore:
         display_name: str,
         idempotency_key: str,
         request_digest: str,
+        publication_scope_digest: str | None = None,
         modal_environment: str,
         modal_app_name: str,
         modal_app_version: int,
@@ -1204,6 +1209,11 @@ class ServiceStore:
             character not in "0123456789abcdef" for character in request_digest
         ):
             raise ValueError("Request digest must be lowercase SHA-256 text")
+        selected_scope = publication_scope_digest or request_digest
+        if len(selected_scope) != 64 or any(
+            character not in "0123456789abcdef" for character in selected_scope
+        ):
+            raise ValueError("Publication scope digest must be lowercase SHA-256 text")
         if not modal_environment.strip() or not modal_app_name.strip():
             raise ValueError("Modal deployment identity must not be empty")
         if modal_app_version < 1:
@@ -1286,11 +1296,12 @@ class ServiceStore:
                 """
                 INSERT INTO jobs (
                     job_id, owner_user_id, tool, display_name, idempotency_key,
-                    request_digest, modal_environment, modal_app_name,
+                    request_digest, publication_scope_digest,
+                    modal_environment, modal_app_name,
                     modal_app_version, state, max_active_provider_calls,
                     max_active_gpu_provider_calls, pending_validation_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(job_id),
@@ -1299,6 +1310,7 @@ class ServiceStore:
                     display_name,
                     idempotency_key,
                     request_digest,
+                    selected_scope,
                     modal_environment.strip(),
                     modal_app_name.strip(),
                     modal_app_version,
@@ -1344,7 +1356,10 @@ class ServiceStore:
         """List earlier Jobs with the same Tool request identity."""
         with self._connection() as conn:
             current = conn.execute(
-                "SELECT rowid, tool, request_digest FROM jobs WHERE job_id = ?",
+                """
+                SELECT rowid, tool, publication_scope_digest
+                FROM jobs WHERE job_id = ?
+                """,
                 (str(job_id),),
             ).fetchone()
             if current is None:
@@ -1352,10 +1367,14 @@ class ServiceStore:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE rowid < ? AND tool = ? AND request_digest = ?
+                WHERE rowid < ? AND tool = ? AND publication_scope_digest = ?
                 ORDER BY rowid
                 """,
-                (current["rowid"], current["tool"], current["request_digest"]),
+                (
+                    current["rowid"],
+                    current["tool"],
+                    current["publication_scope_digest"],
+                ),
             ).fetchall()
         return [_job_from_row(row) for row in rows]
 
@@ -2039,6 +2058,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         display_name=str(row["display_name"]),
         idempotency_key=str(row["idempotency_key"]),
         request_digest=str(row["request_digest"]),
+        publication_scope_digest=str(row["publication_scope_digest"]),
         state=JobState(row["state"]),
         modal_environment=str(row["modal_environment"]),
         modal_app_name=str(row["modal_app_name"]),

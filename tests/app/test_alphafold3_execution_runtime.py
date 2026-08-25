@@ -3,6 +3,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -134,6 +135,7 @@ def _request(
     seeds: list[int] | None = None,
     max_gpu_containers: int = 1,
     search_msa: bool = False,
+    repair_execution_run_ids: tuple[UUID, ...] = (),
 ) -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
         AF3Config(
@@ -147,6 +149,7 @@ def _request(
         max_active_gpu_provider_calls=max_gpu_containers,
         recycle=10,
         sample=1,
+        repair_execution_run_ids=repair_execution_run_ids,
     )
 
 
@@ -559,6 +562,42 @@ def test_seed_tasks_use_balanced_fixed_batches(
         for call in calls
     )
     assert len(driver.spawns) == 2
+
+
+def test_seed_claim_generations_are_stable_across_plan_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_staging(monkeypatch)
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    predecessor = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    captured: dict[str, object] = {}
+
+    def claim(*args, **kwargs):
+        captured.update(kwargs)
+        return _owned_seed_claims(*args, **kwargs)
+
+    monkeypatch.setattr(planning_module, "claim_seed_predictions", claim)
+    runtime, _inputs = _runtime(
+        tmp_path,
+        request=_request(repair_execution_run_ids=(predecessor,)),
+        driver=RecordingDriver(),
+    )
+    runtime.attach()
+
+    _advance_until_calls(runtime, 1)
+
+    stable_suffix = f"{SEED_PREDICTIONS}:seed:1"
+    assert captured["generation_ids"] == {
+        1: sha256(f"{RUN_ID}:{stable_suffix}".encode()).hexdigest()
+    }
+    assert captured["superseded_generation_ids"] == {
+        1: (sha256(f"{predecessor}:{stable_suffix}".encode()).hexdigest(),)
+    }
 
 
 def test_seed_claims_follow_deployment_preflight(

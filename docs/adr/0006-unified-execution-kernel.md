@@ -621,12 +621,13 @@ default hook does nothing, and cleanup failure is diagnostic rather than
 authority to resubmit work.
 
 ADR 0007 adds a workload-specific API exception without changing kernel
-Successor semantics. A new AlphaFold3 API root Run may carry exact terminal
-Service Job IDs that authorize the app to fence only their deterministic
-external claim generations. The new Run does not read or mutate predecessor
-kernel ledgers, and active or unknown matching Service Jobs still block launch.
-This is workload claim repair, not kernel Task retry or inferred Successor
-lineage.
+Successor semantics. A new AlphaFold3 API root Run may carry terminal Service
+Job IDs from the same publication scope that authorize the app to fence only
+their deterministic external claim generations. Those generations use the
+Execution Run ID plus stable Node and Task keys rather than a deployment-plan
+fingerprint. The new Run does not read or mutate predecessor kernel ledgers,
+and active or unknown matching Service Jobs still block launch. This is
+workload claim repair, not kernel Task retry or inferred Successor lineage.
 
 The Node, Task, and Provider Call relationship policy was accepted on
 2026-07-29. A Node is a fixed semantic DAG stage, a Task is one independently

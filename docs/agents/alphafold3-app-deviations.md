@@ -54,9 +54,10 @@ kernel Task lease. It does not authorize retry or replacement inside one Run;
 only a new root Run or explicit compatible Successor may schedule missing work.
 Completion markers and validated publications remain the reuse authority.
 
-For exact API resubmissions, the service delays the new root Run until matching
-Service Jobs are conclusively terminal. It may then name those Execution Run
-IDs in the new request. AlphaFold3 derives and fences only their deterministic
-Task generations; unrelated or unknown owners keep the ordinary conservative
+For publication-compatible API resubmissions, the service delays the new root
+Run until matching Service Jobs are conclusively terminal. It may then name
+those Execution Run IDs in the new request. AlphaFold3 derives stable Task
+generations from the Execution Run ID, Node key, and Task key and fences only
+those generations; unrelated or unknown owners keep the ordinary conservative
 claim behavior. This exception is service-local workload repair, not kernel
 Successor inference.

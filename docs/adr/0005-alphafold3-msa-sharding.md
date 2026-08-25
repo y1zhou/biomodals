@@ -972,22 +972,26 @@ If no receipt exists, enrichment proceeds. Once enrichment yields `run_id` and
 skips staging and all inference-side remote calls. That invocation then
 publishes its missing receipt for future pre-enrichment hits.
 
-### Service-authorized exact-request repair
+### Service-authorized publication-scope repair
 
-An API submission with the same exact request digest waits in
+An API submission with the same publication-scope digest waits in
 `service.sqlite3` while any earlier matching Service Job may still be active.
+The scope is seed- and name-neutral but retains the biological input, search
+choices, and inference parameters. The full request digest remains separate
+for HTTP idempotency.
 Once those Jobs are conclusively terminal, the new independent root Run may
 carry failed, partial, and cancelled predecessor Execution Run IDs as repair
 authorization. For each Raw MSA, combined MSA, template, seed, or summary Task,
-the planner derives the generation IDs that those exact Runs would own. Claim
-acquisition may append an `abandoned` status only for one of those named
-generations before electing the current writer.
+the planner derives the stable generation those exact Runs would own from the
+Execution Run ID, Node key, and Task key. Claim acquisition may append an
+`abandoned` status only for one of those named generations before electing the
+current writer.
 
 This does not weaken ordinary claim exclusion: unknown or unrelated owners
 still wait for completion or conservative age-based abandonment. Completion
 markers and manifests remain reuse authority. Current request arguments,
 including operational Provider Call limits, are never recovered from the old
-Run. CLI Runs are outside this service-local exact-request policy.
+Run. CLI Runs are outside this service-local publication-scope policy.
 
 ### Seed claims and inference workers
 

@@ -213,6 +213,8 @@ def project_overview(
                 call.provider_call_handle_id in queued_provider_call_handles
                 for call in stage_calls
             )
+            else "queued"
+            if not stage_calls and counts[TaskStatus.PENDING.value] > 0
             else "running"
             if stage_calls
             else None

@@ -67,6 +67,33 @@ def test_validation_retains_native_document_and_bounded_preview(tmp_path: Path) 
     assert store.get(validated.validation_id, owner_user_id=OWNER, now=11) is not None
 
 
+def test_publication_scope_ignores_name_and_seed_selection(tmp_path: Path) -> None:
+    store = ValidatedInputStore(tmp_path)
+    store.initialize()
+    source = tmp_path / "input.json"
+    document = orjson.loads(_document())
+
+    def validate(value: dict[str, object]):
+        content = orjson.dumps(value)
+        source.write_bytes(content)
+        return store.validate_and_publish(
+            source,
+            owner_user_id=OWNER,
+            digest=hashlib.sha256(content).hexdigest(),
+            settings=ValidationSettings(sample=5),
+        )
+
+    first = validate(document)
+    document["name"] = "renamed"
+    document["modelSeeds"] = [2, 3, 4]
+    renamed = validate(document)
+    document["sequences"][0]["protein"]["sequence"] = "ACDF"
+    changed = validate(document)
+
+    assert first.publication_scope_digest == renamed.publication_scope_digest
+    assert changed.publication_scope_digest != first.publication_scope_digest
+
+
 def test_validation_allows_zero_recycles_and_bounds_job_name(tmp_path: Path) -> None:
     store = ValidatedInputStore(tmp_path)
     store.initialize()

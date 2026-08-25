@@ -20,6 +20,7 @@ from biomodals.app.fold.alphafold3.execution_request import (
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_SEED_SAMPLE_PAIRS,
     MAX_STAGED_INPUT_BYTES,
+    build_inference_identity_view,
     normalize_model_seeds,
     serialize_af3_input,
 )
@@ -76,6 +77,25 @@ class ValidatedInput:
     def document_path(self) -> Path:
         """Return the retained normalized native JSON document."""
         return self.directory / "document.json"
+
+    @property
+    def publication_scope_digest(self) -> str:
+        """Identify requests that may share incomplete remote publications."""
+        config = AF3Config.model_validate_json(self.document_path.read_bytes())
+        return sha256(
+            orjson.dumps(
+                {
+                    "input": build_inference_identity_view(config),
+                    "search_msa": self.settings.search_msa,
+                    "search_protein_templates": (
+                        self.settings.search_protein_templates
+                    ),
+                    "recycle": self.settings.recycle,
+                    "sample": self.settings.sample,
+                },
+                option=orjson.OPT_SORT_KEYS,
+            )
+        ).hexdigest()
 
     def request(
         self,

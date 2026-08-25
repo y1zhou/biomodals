@@ -91,6 +91,39 @@ def test_projection_presents_unassigned_provider_call_as_queued() -> None:
     assert stage["provider_state"] == "queued"
 
 
+def test_projection_presents_pending_remote_tasks_as_queued() -> None:
+    overview = SimpleNamespace(
+        run=SimpleNamespace(status=RunStatus.RUNNING, status_message=None),
+        nodes=(
+            SimpleNamespace(
+                node_key="collect_traj_stats:nvt_",
+                status=NodeStatus.RUNNING,
+                status_reason=None,
+                error_message=None,
+                started_at=10,
+                completed_at=None,
+            ),
+        ),
+        representative_provider_calls=(),
+        active_provider_calls=ActiveProviderCallCounts(total=0, gpu=0),
+        node_task_status_counts=(
+            SimpleNamespace(
+                node_key="collect_traj_stats:nvt_",
+                pending=1,
+                running=0,
+                succeeded=0,
+                failed=0,
+                cancelled=0,
+                skipped=0,
+            ),
+        ),
+    )
+
+    [stage] = project_overview(GROMACS_TOOL, overview)["stages"]
+
+    assert stage["provider_state"] == "queued"
+
+
 def test_projection_treats_cache_hits_and_partial_nodes_as_terminal() -> None:
     overview = SimpleNamespace(
         run=SimpleNamespace(

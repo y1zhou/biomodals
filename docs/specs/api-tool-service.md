@@ -121,8 +121,9 @@ remote suspended Run requiring intervention or a recoverable service-owned
 result-delivery failure. A Job is not `succeeded` until its Result is verified
 as downloadable.
 
-An identical AlphaFold3 Job can remain `queued` before remote launch while an
-earlier matching Job may still publish the same result. Its public
+An AlphaFold3 Job with the same seed- and name-neutral publication scope can
+remain `queued` before remote launch while an earlier matching Job may still
+publish overlapping results. Its public
 `state_reason` is `waiting_for_shared_publication`, and `state_message` provides
 the owner-safe explanation. These fields describe service lifecycle state and
 do not copy remote errors.
@@ -133,10 +134,11 @@ A Tool Definition owns an ordered list of semantic stages. Each stage maps one
 or more kernel Node keys into one user-facing label and optional provider
 function description. The service aggregates Task status counts across mapped
 Nodes. For an active stage, the disposable projection may expose
-`provider_state` as `queued` while Modal has accepted its Function Call but has
-not assigned a container, or `running` after assignment. Failure to obtain
-that presentation-only SDK hint defaults to `running`. Provider Call selection
-and raw Node keys are diagnostic details.
+`provider_state` as `queued` while work is pending without an assigned Provider
+Call, or while Modal has accepted a Function Call but has not assigned a
+container. It becomes `running` after assignment. Failure to obtain the
+presentation-only SDK hint for an existing call defaults to `running`.
+Provider Call selection and raw Node keys are diagnostic details.
 
 ## Provider Call limits
 
@@ -455,8 +457,9 @@ GROMACS submission validates its direct request. AlphaFold3 submission verifies
 that the named validation belongs to the User, remains unexpired, and has not
 already been consumed. Submission then preflights the exact Tool deployment.
 One transaction admits a queued Service Job, uses its Job ID as the Execution
-Run ID, stores the Deployment Identity, request digest, and any pending
-validation reference, and commits before any provider side effect.
+Run ID, stores the Deployment Identity, full request digest, Tool-specific
+publication-scope digest, and any pending validation reference, and commits
+before any provider side effect.
 
 After admission, the Tool Adapter stages the immutable request and launch
 identity, the Remote Execution Client spawns the deployed coordinator, and the
@@ -465,18 +468,21 @@ failure before any spawn attempt leaves the Job queued; background processing
 retries the idempotent staging and launch sequence.
 
 Before staging AlphaFold3, the adapter lists only earlier Jobs with the same
-Tool and exact request digest. If any is `queued`, `running`,
+Tool and publication-scope digest. AlphaFold3's scope excludes the Job name and
+selected seeds but retains the biological input, search choices, recycles, and
+samples per seed. If any matching Job is `queued`, `running`,
 `cancel_requested`, `state_unknown`, or remotely blocked without a terminal
 result, the new Job waits locally and retries after 60 seconds. Once none may
 still be active, failed, partial, and cancelled predecessor Job IDs are staged
 with the new request. They authorize AlphaFold3 to abandon only deterministic
-Task generations derived from those exact Execution Run IDs. The new Job's
+Task generations derived from those Execution Run IDs plus stable Node and
+Task keys. The new Job's
 snapshotted Provider Call limits and other current arguments take precedence.
 Successful publications are reused through their normal markers and receipts.
 
 This policy does not add Task records to `service.sqlite3`, inspect remote
-ledgers, or coordinate independently submitted CLI Runs. It handles exact API
-resubmission only; broader partial overlap between different requests remains
+ledgers, or coordinate independently submitted CLI Runs. It handles compatible
+API publication scopes only; broader overlap between different inputs remains
 under the app's ordinary marker and conservative claim-expiry rules.
 
 If coordinator spawn may have occurred but no Function Call ID was returned,

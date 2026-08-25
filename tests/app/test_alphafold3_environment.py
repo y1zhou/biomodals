@@ -328,6 +328,41 @@ def test_failed_profile_preparation_retains_only_resumable_archive(
     assert status is not None and status["status"] == "failed"
 
 
+def test_preempted_environment_worker_leaves_claim_resumable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedPreemption(BaseException):
+        pass
+
+    claims = FakeClaims()
+    runtime = _runtime(tmp_path, claims)
+    spec = resolve_database_profile("small_bfd")
+    monkeypatch.setattr(
+        environment_module,
+        "_prepare_profile_source",
+        lambda *args: (_ for _ in ()).throw(SimulatedPreemption()),
+    )
+
+    with pytest.raises(SimulatedPreemption):
+        prepare_environment_asset(
+            runtime,
+            EnvironmentAsset("profile", spec.database_id),
+            GENERATION_ID,
+            build_profile=lambda *args: {"status": "published"},
+        )
+
+    assert generation_status(claims, spec.profile_id, GENERATION_ID) is None
+    assert (
+        acquire_asset_claim(
+            replace(runtime, container_id="replacement"),
+            EnvironmentAsset("profile", spec.database_id),
+            GENERATION_ID,
+        )
+        is not None
+    )
+
+
 def test_profile_cleanup_is_scoped_and_status_aware(tmp_path: Path) -> None:
     claims = FakeClaims()
     runtime = _runtime(tmp_path, claims)

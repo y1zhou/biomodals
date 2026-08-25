@@ -270,8 +270,6 @@ def prepare_environment_asset(
     claim = acquire_asset_claim(runtime, selected, generation_id)
     if claim is None:
         raise RuntimeError(f"Environment asset {selected.key!r} has an active writer")
-    status = "failed"
-    detail: dict[str, object] = {"asset_key": selected.key}
     result: dict[str, object]
     try:
         runtime.volume_for(selected).reload()
@@ -324,23 +322,25 @@ def prepare_environment_asset(
         else:
             _prepare_mmcif(runtime, generation_id)
             result = {"status": "published", "asset_key": selected.key}
-        status = "complete"
-        detail = {"asset_key": selected.key, "result_status": result["status"]}
-        return result
     except Exception as exc:
-        detail = {
-            "asset_key": selected.key,
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=status,
-            detail=detail,
+            status="failed",
+            detail={
+                "asset_key": selected.key,
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
+        raise
+    finish_generation_claim(
+        runtime.claims,
+        claim,
+        status="complete",
+        detail={"asset_key": selected.key, "result_status": result["status"]},
+    )
+    return result
 
 
 def _prepare_profile_source(

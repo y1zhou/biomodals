@@ -135,10 +135,9 @@ class RemoteExecutionClient:
         if not active_handles:
             return frozenset()
         try:
+            call = modal.FunctionCall.from_id(root_function_call_id)
             graph = await asyncio.wait_for(
-                asyncio.to_thread(
-                    modal.FunctionCall.from_id(root_function_call_id).get_call_graph
-                ),
+                call.get_call_graph.aio(),
                 timeout=CALL_GRAPH_TIMEOUT_SECONDS,
             )
         except Exception:

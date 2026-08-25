@@ -252,6 +252,13 @@ class RefreshingRemoteFanoutNode(RemoteFanoutNode):
 
 
 @dataclass
+class FailingCancellationRemoteFanoutNode(RemoteFanoutNode):
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        super().finalize_cancelled_remote_tasks(context)
+        raise RuntimeError("cleanup failed")
+
+
+@dataclass
 class CallIdentityRemoteFanoutNode(RemoteFanoutNode):
     def prepare_remote_task(
         self,
@@ -1307,6 +1314,26 @@ def test_cancel_requested_fanout_reconciles_node_cancellation(
 
     snapshot = runtime.store.execution.snapshot(RUN_ID)
     assert snapshot.run.status == RunStatus.CANCELLED
+    assert snapshot.nodes[0].status == NodeStatus.CANCELLED
+    assert {task.status for task in snapshot.tasks} == {TaskStatus.CANCELLED}
+    assert node.cancelled_finalizations == 1
+
+
+def test_cancelled_tasks_reconcile_when_workload_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    workflow = ExecutionGraph("cancel-fanout-cleanup-failure")
+    node = FailingCancellationRemoteFanoutNode(("a", "b"))
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(tmp_path, workflow, driver=CancellingFanoutModalDriver())
+    runtime._initialize("cancel-fanout-cleanup-failure")
+    runtime.advance_once()
+    runtime.cancel()
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
     assert snapshot.nodes[0].status == NodeStatus.CANCELLED
     assert {task.status for task in snapshot.tasks} == {TaskStatus.CANCELLED}
     assert node.cancelled_finalizations == 1

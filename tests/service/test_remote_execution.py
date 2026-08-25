@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+import asyncio
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -44,6 +45,13 @@ class RemoteMethod:
     def remote(self, *arguments):
         self.arguments = arguments
         return self.result
+
+
+def _async_method(result):
+    async def invoke():
+        return result
+
+    return SimpleNamespace(aio=invoke)
 
 
 def _overview(run_id=RUN_ID, deployment=DEPLOYMENT):
@@ -154,13 +162,13 @@ async def test_unassigned_active_provider_calls_are_presented_as_queued(
         "biomodals.service.remote_execution.modal.FunctionCall",
         SimpleNamespace(
             from_id=lambda _call_id: SimpleNamespace(
-                get_call_graph=lambda: [
+                get_call_graph=_async_method([
                     SimpleNamespace(
                         function_call_id="fc-provider",
                         task_id="",
                         status=modal.types.InputStatus.PENDING,
                     )
-                ]
+                ])
             )
         ),
     )
@@ -193,13 +201,13 @@ async def test_assigned_or_uninspectable_provider_calls_default_to_running(
         assert call_id == "fc-root"
         lookups.append(call_id)
         return SimpleNamespace(
-            get_call_graph=lambda: [
+            get_call_graph=_async_method([
                 SimpleNamespace(
                     function_call_id="fc-assigned",
                     task_id="ta-assigned",
                     status=modal.types.InputStatus.PENDING,
                 )
-            ]
+            ])
         )
 
     monkeypatch.setattr(
@@ -218,6 +226,10 @@ async def test_assigned_or_uninspectable_provider_calls_default_to_running(
 
 @pytest.mark.anyio
 async def test_slow_call_graph_defaults_to_running(monkeypatch) -> None:
+    async def blocked():
+        await asyncio.sleep(1)
+        return []
+
     monkeypatch.setattr(
         "biomodals.service.remote_execution.CALL_GRAPH_TIMEOUT_SECONDS",
         0,
@@ -225,7 +237,9 @@ async def test_slow_call_graph_defaults_to_running(monkeypatch) -> None:
     monkeypatch.setattr(
         "biomodals.service.remote_execution.modal.FunctionCall",
         SimpleNamespace(
-            from_id=lambda _call_id: SimpleNamespace(get_call_graph=lambda: [])
+            from_id=lambda _call_id: SimpleNamespace(
+                get_call_graph=SimpleNamespace(aio=blocked)
+            )
         ),
     )
     overview = SimpleNamespace(

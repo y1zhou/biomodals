@@ -270,6 +270,37 @@ async def test_terminal_root_failure_is_not_treated_as_still_running(
 
 
 @pytest.mark.anyio
+async def test_completed_root_with_nonterminal_ledger_becomes_failed(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _locator, _function_call_id):
+            return _overview(RunStatus.STATE_UNKNOWN)
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+    store.mark_state_unknown(
+        JOB_ID,
+        reason="provider_outcome_unknown",
+        message="worker outcome unknown",
+        now=20,
+    )
+
+    failed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
+
+    assert (failed.state, failed.error_code) == (
+        JobState.FAILED,
+        "remote_execution_incomplete",
+    )
+    assert failed.error_message == (
+        "Remote execution stopped without a terminal outcome"
+    )
+
+
+@pytest.mark.anyio
 async def test_active_timeouts_rotate_a_bounded_reconciliation_page(
     tmp_path: Path,
 ) -> None:

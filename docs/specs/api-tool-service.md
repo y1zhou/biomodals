@@ -472,7 +472,10 @@ Tool and publication-scope digest. AlphaFold3's scope excludes the Job name and
 selected seeds but retains the biological input, search choices, recycles, and
 samples per seed. If any matching Job is `queued`, `running`,
 `cancel_requested`, `state_unknown`, or remotely blocked without a terminal
-result, the new Job waits locally and retries after 60 seconds. Once none may
+result, the new Job waits locally and retries after 60 seconds. A recorded root
+Function Call is polled without waking coordinator code. Once that root
+conclusively completes, a still-non-terminal remote Run status is recorded as
+a terminal service failure rather than active work. Once no predecessor may
 still be active, failed, partial, and cancelled predecessor Job IDs are staged
 with the new request. They authorize AlphaFold3 to abandon only deterministic
 Task generations derived from those Execution Run IDs plus stable Node and

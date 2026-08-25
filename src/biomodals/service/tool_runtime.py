@@ -164,7 +164,16 @@ class JobLifecycle:
                         now=now,
                     )
                 return job
-            if job.state in {JobState.RUNNING, JobState.BLOCKED}:
+            if job.state in {
+                JobState.RUNNING,
+                JobState.BLOCKED,
+                JobState.STATE_UNKNOWN,
+            }:
+                if (
+                    job.state == JobState.STATE_UNKNOWN
+                    and job.root_function_call_id is None
+                ):
+                    return job
                 if (
                     not force_refresh
                     and not background
@@ -174,12 +183,16 @@ class JobLifecycle:
                     return job
                 try:
                     overview = None
-                    if background and job.root_function_call_id is not None:
+                    root_completed = False
+                    if (
+                        background or job.state == JobState.STATE_UNKNOWN
+                    ) and job.root_function_call_id is not None:
                         overview = await self.remote.poll_root(
                             _locator(job), job.root_function_call_id
                         )
                         if overview is None:
                             return self.store.touch_job(job_id, now=now)
+                        root_completed = True
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
                 except RemoteRootExecutionFailedError:
@@ -203,7 +216,13 @@ class JobLifecycle:
                         message=str(error),
                         now=now,
                     )
-                return await self._observe(job, overview, registration, now=now)
+                return await self._observe(
+                    job,
+                    overview,
+                    registration,
+                    now=now,
+                    root_completed=root_completed,
+                )
             if finalize and job.state == JobState.FINALIZING:
                 return await self._finalize(
                     job,
@@ -251,6 +270,7 @@ class JobLifecycle:
         registration: ToolRegistration,
         *,
         now: int,
+        root_completed: bool = False,
     ) -> JobRecord:
         queued_call_handles = (
             await self.remote.queued_provider_call_handles(
@@ -265,6 +285,19 @@ class JobLifecycle:
             overview,
             queued_provider_call_handles=queued_call_handles,
         )
+        if root_completed and not overview.run.status.is_terminal:
+            self.store.replace_projection(
+                job.job_id,
+                state=JobState.FAILED,
+                projection=projection,
+                observed_at=now,
+            )
+            return self.store.fail_job(
+                job.job_id,
+                error_code="remote_execution_incomplete",
+                error_message=("Remote execution stopped without a terminal outcome"),
+                now=now,
+            )
         if overview.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}:
             result_state = JobState(overview.run.status.value)
             job = self.store.begin_finalization(

@@ -82,8 +82,12 @@ choices, recycles, and samples per seed. This lets requests with overlapping
 seed publications coordinate without treating presentation changes as new
 scientific work. A later Job remains `queued` with
 `state_reason=waiting_for_shared_publication` while any earlier matching Job
-may still be executing. `state_unknown` is treated as possibly active. No
-second remote coordinator is launched during that uncertainty.
+may still be executing. `state_unknown` is treated as possibly active until
+the recorded root Function Call conclusively completes. If that completed root
+returns a non-terminal Run status, the service records a terminal failure: the
+remote scheduler can no longer advance the Run, so it must not block repair as
+though it were still active. No second remote coordinator is launched during
+genuine uncertainty.
 
 After every earlier matching Job is conclusively terminal, the new Job launches
 with its own current operational arguments. Failed, partial, and cancelled
@@ -154,7 +158,10 @@ If the exact pinned deployment cannot be resolved, the Service Job becomes
 `state_unknown`. The service does not mark the scientific Run failed, bind to a
 newer deployment, or infer execution state from cached projections. Refreshes
 for one Job are serialized before updating its local projection so responses
-cannot be applied out of order.
+cannot be applied out of order. Reconciliation still polls a recorded root
+Function Call without waking coordinator code. A conclusive root result whose
+Run status is still non-terminal becomes `failed`, because no coordinator
+remains to make further progress; unresolved roots remain `state_unknown`.
 Before calling Modal, a launch attempt is durably fenced as `state_unknown`;
 a process interruption therefore cannot cause an automatic duplicate spawn.
 An Administrator may then attach the known root Function Call and resume,

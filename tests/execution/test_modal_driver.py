@@ -269,6 +269,20 @@ def test_driver_observes_timeout_as_running_and_retained_result_as_success() -> 
     assert observation.result == {"done": True}
 
 
+def test_driver_observes_user_exception_as_failed() -> None:
+    class Call:
+        def get(self, timeout=0):
+            assert timeout == 0
+            raise RuntimeError("worker failed")
+
+    observation = ModalCallDriver(call_resolver=lambda call_id: Call()).observe(
+        "fc-failed"
+    )
+
+    assert observation.kind == ProviderCallObservationKind.FAILED
+    assert observation.message == "worker failed"
+
+
 def test_async_driver_uses_exact_deployment_and_retained_call_handle() -> None:
     async def scenario() -> None:
         resolved: list[tuple] = []

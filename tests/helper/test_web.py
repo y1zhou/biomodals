@@ -21,11 +21,13 @@ class FakeResponse:
         chunks: tuple[bytes, ...] = (),
         status_error: Exception | None = None,
         status_code: int = 200,
+        stream_error: Exception | None = None,
     ) -> None:
         self.headers = headers or {}
         self.chunks = chunks
         self.status_error = status_error
         self.status_code = status_code
+        self.stream_error = stream_error
         self.closed = False
 
     def raise_for_status(self) -> None:
@@ -36,6 +38,8 @@ class FakeResponse:
         async def chunks():
             for chunk in self.chunks:
                 yield chunk
+            if self.stream_error is not None:
+                raise self.stream_error
 
         return chunks()
 
@@ -218,6 +222,35 @@ def test_download_file_resumes_partial_file_with_range(tmp_path: Path) -> None:
         "https://example.test/archive.zst",
         {"stream": True, "headers": {"Range": "bytes=7-"}},
     )
+
+
+def test_resumable_download_continues_after_stream_disconnect(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    interrupted = FakeResponse(
+        chunks=(b"partial",),
+        stream_error=ConnectionError("disconnected"),
+    )
+    resumed = FakeResponse(
+        headers={"Content-Range": "bytes 7-10/11"},
+        chunks=(b"rest",),
+        status_code=206,
+    )
+    session = FakeSession(get_responses=[interrupted, resumed])
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"partialrest"
+    assert session.calls[1][2]["headers"] == {"Range": "bytes=7-"}
 
 
 def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:

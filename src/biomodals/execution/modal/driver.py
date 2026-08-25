@@ -64,7 +64,11 @@ def _observation_from_error(error: Exception) -> ProviderCallObservation:
     elif isinstance(error, _CONCLUSIVE_EXECUTION_ERRORS):
         kind = ProviderCallObservationKind.FAILED
     else:
-        kind = ProviderCallObservationKind.STATE_UNKNOWN
+        # FunctionCall.get() re-raises some serialized user exceptions as
+        # their original Python type. Once Modal returns one, execution is
+        # conclusively failed; only the control-plane errors above are
+        # ambiguous.
+        kind = ProviderCallObservationKind.FAILED
     return ProviderCallObservation(kind, message=str(error))
 
 

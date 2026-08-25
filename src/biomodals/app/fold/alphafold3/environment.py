@@ -48,6 +48,7 @@ MMCIF_ARCHIVE_FILENAME = "pdb_2022_09_28_mmcif_files.tar.zst"
 ENVIRONMENT_SETUP_CLAIM_DICT_NAME = "AlphaFold3-environment-setup-claims"
 ENVIRONMENT_SETUP_TIMEOUT_SECONDS = BUILD_TIMEOUT_SECONDS
 ENVIRONMENT_SETUP_STALE_SECONDS = ENVIRONMENT_SETUP_TIMEOUT_SECONDS + 900
+ENVIRONMENT_DOWNLOAD_RETRIES = 10
 
 AssetKind = Literal["model", "profile", "template-seqres", "template-mmcif"]
 
@@ -367,7 +368,12 @@ def _download_and_decompress(
     destination: Path,
 ) -> None:
     partial.parent.mkdir(parents=True, exist_ok=True)
-    download_files({url: partial}, resume=True, progress_bar_desc=destination.name)
+    download_files(
+        {url: partial},
+        resume=True,
+        num_retries=ENVIRONMENT_DOWNLOAD_RETRIES,
+        progress_bar_desc=destination.name,
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(  # noqa: S603 - fixed executable and trusted paths
@@ -430,6 +436,7 @@ def _prepare_mmcif(runtime: EnvironmentRuntime, generation_id: str) -> None:
     download_files(
         {f"{DATABASE_BASE_URL}/{MMCIF_ARCHIVE_FILENAME}": partial},
         resume=True,
+        num_retries=ENVIRONMENT_DOWNLOAD_RETRIES,
         progress_bar_desc=MMCIF_ARCHIVE_FILENAME,
     )
     if staging_parent.exists():

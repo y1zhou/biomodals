@@ -51,7 +51,16 @@ async def _download_files(
         for url, local_file in urls.items():
             local_path = Path(local_file)
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            tasks.append(_download_file(session, url, local_path, force, resume))
+            tasks.append(
+                _download_file(
+                    session,
+                    url,
+                    local_path,
+                    force,
+                    resume,
+                    num_retries=num_retries,
+                )
+            )
 
         # run all of the downloads and await their completion
         await tqdm_asyncio.gather(*tasks, desc=progress_bar_desc)
@@ -63,13 +72,18 @@ async def _download_file(
     local_path: Path,
     force: bool,
     resume: bool = False,
+    *,
+    num_retries: int = 1,
 ):
     """Download a file asynchronously."""
     try:
         if not await _should_download(session, url, local_path, force, resume):
             return
 
-        for attempt in range(2):
+        # Session retries cannot recover a streaming response that disconnects
+        # after headers arrive. Reopen the request from the bytes already
+        # written so multi-gigabyte downloads keep their progress.
+        for attempt in range(num_retries + 1):
             offset = local_path.stat().st_size if resume and local_path.exists() else 0
             response = None
             restart = False
@@ -92,13 +106,18 @@ async def _download_file(
                             async for chunk in await response.iter_content():
                                 output.write(chunk)
                         return
+            except Exception:
+                if attempt == num_retries:
+                    raise
             finally:
                 if response is not None:
                     await response.close()
-            if restart and attempt == 0:
+            if restart:
                 local_path.unlink(missing_ok=True)
+            if attempt < num_retries:
                 continue
-            raise RuntimeError("Server returned an invalid byte-range response")
+            if restart:
+                raise RuntimeError("Server returned an invalid byte-range response")
     except Exception as e:
         raise RuntimeError(f"Download for {url} to {local_path} failed.") from e
 

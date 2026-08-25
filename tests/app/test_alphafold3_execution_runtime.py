@@ -450,6 +450,26 @@ def test_staged_inference_preserves_unknown_observations(
     assert node.planning.staged_inference_observation() == AvailabilityStatus.UNKNOWN
 
 
+def test_fresh_search_run_treats_unbuilt_results_as_missing(tmp_path: Path) -> None:
+    runtime, inputs = _runtime(tmp_path, request=_request(search_msa=True))
+    for manifest in inputs["search_runtime"].sharded_root.glob(
+        "profiles/*/manifest.json"
+    ):
+        manifest.unlink()
+
+    runtime.attach()
+    runtime.advance_once()
+
+    run = runtime.store.execution.get_run(RUN_ID)
+    assert run.status != RunStatus.SUSPENDED, (
+        run,
+        runtime.store.execution.list_nodes(RUN_ID),
+    )
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert calls
+    assert {call.node_key for call in calls} == {PREPARE_ENVIRONMENT}
+
+
 def test_no_search_stages_complete_without_provider_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

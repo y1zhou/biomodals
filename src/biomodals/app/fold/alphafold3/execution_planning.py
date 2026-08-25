@@ -61,6 +61,10 @@ from biomodals.app.fold.alphafold3.msa_search import (
     inspect_msa_cache,
     plan_msa_resolution,
 )
+from biomodals.app.fold.alphafold3.profiles import (
+    profile_root,
+    resolve_database_profile,
+)
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
     load_request_manifest,
@@ -549,7 +553,10 @@ class AlphaFold3ExecutionPlanning:
 
     def staged_inference_observation(self) -> AvailabilityStatus:
         """Observe the exact staged inference input without flattening errors."""
-        prepared = self.prepared_inference()
+        try:
+            prepared = self.prepared_inference()
+        except IncompletePrerequisiteError:
+            return AvailabilityStatus.MISSING
         root = self.inference_runtime.output_root
         if not root.is_absolute() or not root.is_dir():
             return AvailabilityStatus.UNKNOWN
@@ -595,7 +602,10 @@ class AlphaFold3ExecutionPlanning:
 
     def summary_result(self, raw_result: object | None = None) -> AppRunResult | None:
         """Validate the accumulated summary for every requested seed."""
-        prepared = self.prepared_inference()
+        try:
+            prepared = self.prepared_inference()
+        except IncompletePrerequisiteError:
+            return None
         if raw_result is not None:
             item = PlannedTask(inference_summary_task_plan(prepared), prepared)
             self._decode_result(raw_result, INFERENCE_SUMMARY, (item,))
@@ -631,6 +641,16 @@ class AlphaFold3ExecutionPlanning:
 
     def request_result(self, raw_result: object | None = None) -> AppRunResult | None:
         """Validate the request manifest and publish its invocation receipt."""
+        if raw_result is None:
+            invocation = load_invocation_manifest(
+                self.output_volume,
+                self.request.invocation,
+            )
+            available = invocation is not None and request_manifest_artifacts_available(
+                self.output_volume,
+                invocation,
+            )
+            return AppRunResult(status=AppRunStatus.SUCCEEDED) if available else None
         prepared = self.prepared_inference()
         publication = RequestPublication.from_prepared(prepared)
         manifest = load_request_manifest(self.output_volume, publication)
@@ -728,6 +748,22 @@ class AlphaFold3ExecutionPlanning:
         canonical = tuple(task for task in plan.assemblies if task.publishes_canonical)
         self.search_runtime.sharded_volume.reload()
         self.search_runtime.cache_volume.reload()
+        missing_profiles = {
+            task.database_id
+            for task in plan.raw_searches
+            if not (
+                profile_root(
+                    self.search_runtime.sharded_root,
+                    resolve_database_profile(task.database_id),
+                )
+                / "manifest.json"
+            ).is_file()
+        }
+        if missing_profiles:
+            raise IncompletePrerequisiteError(
+                "Database profiles are not prepared: "
+                + ", ".join(sorted(missing_profiles))
+            )
         raw_statuses, _ = inspect_msa_cache(
             self.search_runtime.sharded_root,
             self.search_runtime.cache_root,

@@ -10,6 +10,7 @@ import pytest
 
 from biomodals.service.store import (
     IdempotencyConflictError,
+    JobNotCancellableError,
     JobState,
     JobStateResolutionError,
     ServiceStore,
@@ -222,3 +223,40 @@ def test_unknown_launch_can_only_requeue_without_launch_evidence(
         now=17,
     )
     assert cancelled.state == JobState.CANCEL_REQUESTED
+
+
+@pytest.mark.parametrize(
+    "state",
+    [JobState.FINALIZING, JobState.STATE_UNKNOWN, JobState.BLOCKED],
+)
+def test_only_active_compute_states_accept_cancellation(
+    tmp_path: Path,
+    state: JobState,
+) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    if state == JobState.FINALIZING:
+        store.begin_finalization(
+            JOB_ID,
+            result_state=JobState.SUCCEEDED,
+            projection={},
+            now=11,
+        )
+    elif state == JobState.STATE_UNKNOWN:
+        store.mark_state_unknown(
+            JOB_ID,
+            reason="provider_outcome_unknown",
+            message="unknown",
+            now=11,
+        )
+    else:
+        store.block_job(
+            JOB_ID,
+            category="result_integrity",
+            message="blocked",
+            retry_at=None,
+            now=11,
+        )
+
+    with pytest.raises(JobNotCancellableError, match="does not accept cancellation"):
+        store.request_cancel(JOB_ID, now=12)

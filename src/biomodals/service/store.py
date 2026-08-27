@@ -1729,13 +1729,14 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
             state = JobState(row["state"])
-            if state in {
-                JobState.SUCCEEDED,
-                JobState.PARTIAL,
-                JobState.FAILED,
-                JobState.CANCELLED,
+            if state not in {
+                JobState.QUEUED,
+                JobState.RUNNING,
+                JobState.CANCEL_REQUESTED,
             }:
-                raise JobNotCancellableError(f"{state.value} Job is terminal")
+                raise JobNotCancellableError(
+                    f"{state.value} Job does not accept cancellation"
+                )
             target = (
                 JobState.CANCELLED
                 if state == JobState.QUEUED and row["root_function_call_id"] is None

@@ -4,7 +4,7 @@ Status: accepted
 
 Decision date: 2026-08-23
 
-Last amended: 2026-08-25
+Last amended: 2026-08-27
 
 ## Context
 
@@ -145,7 +145,11 @@ visibility.
 The background service polls the root Function Call every 60 seconds with
 `FunctionCall.get(timeout=0)`. This is a nonblocking provider control-plane
 query and does not invoke coordinator code. A completed call returns the final
-execution overview and triggers service-owned result finalization.
+execution overview and triggers service-owned Result finalization in that same
+background pass. One reconciliation pass advances at most four independent
+Jobs concurrently. An interactive observation may persist `finalizing` and
+return promptly; background reconciliation owns the potentially long archive
+work.
 
 Detailed progress is refreshed from `ExecutionCoordinator.status()` only while
 a Job is being viewed, when an explicit refresh is requested, or when another
@@ -170,6 +174,19 @@ a process interruption therefore cannot cause an automatic duplicate spawn.
 An Administrator may then attach the known root Function Call and resume,
 requeue only after confirming that no spawn occurred, or request cancellation.
 Launch and cancellation use the same per-Job service lock.
+
+Result restoration is likewise service-owned. Concurrent preparations for the
+same Job join one cancellation-shielded restoration task, while different Jobs
+remain independent. A rebuilt archive is published only when its size, digest,
+and archive schema match the recorded Result identity. A mismatch discards the
+candidate and moves the Job to `blocked/result_integrity` without repeatedly
+performing the same expensive automatic rebuild. A later explicit preparation
+can restore the Job after the exact bytes become available again.
+
+Public failure messages are fixed service copy. Raw coordinator failures,
+provider identifiers, and storage paths remain in Administrator-authorized
+diagnostics; streamed log records redact the selected provider-call handle even
+when it is split across SDK chunks.
 
 ## Consequences
 

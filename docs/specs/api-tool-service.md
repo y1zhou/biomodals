@@ -2,7 +2,7 @@
 
 Status: accepted and implemented
 
-Last updated: 2026-08-25
+Last updated: 2026-08-27
 
 This specification applies ADR 0007 to the implemented FastAPI service and its
 frontend.
@@ -108,6 +108,9 @@ An active timeout touches only `jobs.updated_at`, moving that Job behind older
 reconciliation candidates without pretending that its detailed projection was
 refreshed. This lets a bounded 100-Job pass rotate fairly without another
 scheduler cursor.
+Each pass advances at most four independent Jobs concurrently, regardless of
+Tool. A terminal root observation enters `finalizing` and prepares the Result
+in that same background pass rather than waiting for another interval.
 
 The public Job states remain `queued`, `running`, `finalizing`,
 `cancel_requested`, `state_unknown`, `blocked`, `succeeded`, `partial`,
@@ -366,12 +369,18 @@ active call and then the most recently started call. Public responses use an
 opaque log-target selector and never expose the Modal Function Call ID.
 Target lookup is stage-filtered and bounded rather than paging every Provider
 Call in the Run. Historical requests require timezone-aware start and end
-times in ascending order and use windows of at most one hour. The frontend
-reconnects a still-active stream after the SDK's bounded idle timeout.
+times in ascending order and use windows of at most one hour. The backend opens
+one unbounded SDK stream for a live HTTP request. Modal's SDK preserves its
+cursor while reconnecting its own RPCs; the frontend does not add a second
+polling or reconnect loop. Historical output for any started, non-active stage
+is fetched once and remains cached for the lifetime of the page.
 
-Terminal scientific observation only persists `finalizing`; the background
-reconciler performs archive preparation. Startup reconciles cache-presence
-markers with actual archives, and a verified rebuild marks the Result cached.
+An interactive terminal observation may persist `finalizing` and return
+promptly. A background terminal observation continues directly into archive
+preparation. Startup reconciles cache-presence markers with actual archives,
+and a verified rebuild marks the Result cached. `completed_at` records when
+service publication actually finishes; the stable `finalization_started_at`
+remains the timestamp used for deterministic archive provenance.
 
 Live reads use one Modal SDK stream each and are limited to 32 service-wide,
 four per User, and four per Job. Excess requests receive a typed `429` with a
@@ -507,8 +516,10 @@ rather than scanning Provider Call pages.
 
 A result-preparation-blocked Job is served from its local projection. Owner
 detail and manual refresh do not wake the remote coordinator or toggle it back
-to `finalizing`; the background reconciler alone retries finalization when its
-recorded retry time is due.
+to `finalizing`; the background reconciler alone retries transient
+finalization when its recorded retry time is due. `result_integrity` has no
+automatic retry time: an explicit download preparation may try again after an
+operator restores the authoritative remote publication.
 
 Large pending inputs are staged atomically outside SQLite. GROMACS uses
 `<state-dir>/pending-inputs/<job-id>/`; AlphaFold3 validations use

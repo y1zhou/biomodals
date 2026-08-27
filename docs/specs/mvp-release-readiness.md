@@ -322,8 +322,11 @@ own pending state and provenance.
 
 The established GROMACS App must treat each required RMSD,
 radius-of-gyration, and RMSF CSV/PNG pair as independently recoverable output.
-After an interruption, it regenerates only missing or stale members and commits
-the complete pair coherently.
+After an interruption, it regenerates only missing or stale members and writes
+the complete pair within the same worker. These files are consumed in that
+container, so no explicit `Volume.commit()`/`reload()` handshake is required;
+Modal's successful function-exit publication makes them durable for later
+containers.
 
 This is a narrow App reliability correction that benefits both the Local
 Entrypoint and API callers. The API service must not generate scientific plots,
@@ -629,10 +632,13 @@ reconciliation, and large directory scans run through one bounded artifact
 worker thread. Modal byte streaming remains asynchronous and yields between
 chunks.
 
-Cache fills coordinate with per-Job locks so one miss does not block unrelated
-downloads. This does not introduce a separate worker service or task queue. A
-large synthetic archive test must demonstrate that health, login, Job polling,
-and Cancellation remain responsive during Result validation.
+Result restoration coordinates through one cancellation-shielded task per Job
+so one miss does not block unrelated downloads and concurrent callers do not
+duplicate a rebuild. The cache itself only validates and atomically publishes
+staged archives; it does not contain a second restoration scheduler. This does
+not introduce a separate worker service or task queue. A large synthetic
+archive test must demonstrate that health, login, Job polling, and Cancellation
+remain responsive during Result validation.
 
 ### Prepared Result downloads
 
@@ -796,14 +802,13 @@ most once every five minutes rather than writing SQLite on every authenticated
 request. Expiry continues using the last persisted activity; the coalescing
 window is intentionally negligible relative to the 30-day idle lifetime.
 
-One GROMACS reconciliation pass runs at most four independent Jobs concurrently.
-Within one Job it polls every active direct call and may submit the fixed
-parallel branches described above. It creates only the fixed Job worker count,
-isolates an unexpected per-Job error so other Jobs still progress, and performs
-intermediate cleanup after the workers finish. Per-Job lifecycle locks remain
-shared across HTTP cancellation and reconciliation while in use, then leave the
-process registry automatically when no task retains them. Durable Job and
-per-stage call state remain the restart-safe source of truth.
+One service reconciliation pass runs at most four independent Jobs concurrently
+across all registered Tools. It creates only the fixed Job worker count and
+isolates an unexpected per-Job error so other Jobs still progress. A terminal
+root observation proceeds through Result finalization in that same background
+pass. Per-Job lifecycle locks remain shared across HTTP cancellation and
+reconciliation. Durable Service Jobs and authoritative remote execution ledgers
+remain the restart-safe sources of truth at their respective boundaries.
 
 ### OpenAPI contract discipline
 
@@ -825,6 +830,12 @@ declare the runtime
 session-cookie security scheme. The Password Link's
 `/set-password#token=...` SPA URL remains a tested cross-repository navigation
 contract rather than an OpenAPI operation.
+
+Streaming log responses declare `application/x-ndjson`. Result downloads
+declare their Tool-specific binary media types, `200` and `206` response
+headers, and the `416` range failure. Successful download preparation declares
+an empty `204` response. Generated frontend types must retain these exact
+shapes rather than widening them to JSON by convention.
 
 Any backend change that alters a public operation must check and, when needed,
 update OpenAPI and its tests. Any frontend change that relies on API behavior

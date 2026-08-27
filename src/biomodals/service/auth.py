@@ -81,7 +81,8 @@ class PasswordExecutor:
             raise ValueError("Password worker count must be positive")
         if queued < 0:
             raise ValueError("Password queue count must be non-negative")
-        self._capacity = BoundedSemaphore(workers + queued)
+        self._capacity_slots = workers + queued
+        self._capacity = BoundedSemaphore(self._capacity_slots)
         self._state_lock = Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=workers,
@@ -109,7 +110,9 @@ class PasswordExecutor:
         except BaseException:
             self._capacity.release()
             raise
-        return cast("_T", await asyncio.wrap_future(future))
+        while not future.done():
+            await asyncio.sleep(0.01)
+        return cast("_T", future.result())
 
     async def shutdown(self) -> None:
         """Wait for active operations, then stop and join every worker thread."""
@@ -117,7 +120,10 @@ class PasswordExecutor:
             if self._closed:
                 return
             self._closed = True
-        await asyncio.to_thread(self._executor.shutdown, wait=True)
+        for _ in range(self._capacity_slots):
+            while not self._capacity.acquire(blocking=False):
+                await asyncio.sleep(0.01)
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _ensure_open(self) -> None:
         with self._state_lock:

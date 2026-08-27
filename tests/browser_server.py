@@ -454,6 +454,7 @@ def _create_browser_app():
                 store=store,
                 configuration=configuration,
                 validations=validations,
+                adapter=registrations[1].adapter,
                 remote=remote,
                 lifecycle=lifecycle,
             ),

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterable, AsyncIterator
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 import orjson
@@ -25,6 +26,19 @@ from biomodals.service.tool_runtime import ToolRegistration
 from biomodals.service.tools import ToolDefinition
 
 LogMode = Literal["live", "historical"]
+_LOG_RESPONSE_HEADERS = {
+    "Cache-Control": {"schema": {"type": "string"}},
+    "X-Accel-Buffering": {"schema": {"type": "string", "enum": ["no"]}},
+    "X-BioModals-Log-Mode": {
+        "schema": {"type": "string", "enum": ["live", "historical"]}
+    },
+}
+
+
+@runtime_checkable
+class _AsyncClosable(Protocol):
+    async def aclose(self) -> None:
+        """Release resources owned by an asynchronous iterator."""
 
 
 class _LiveLogStreams:
@@ -160,7 +174,19 @@ def create_job_logs_router() -> APIRouter:
 
     @router.get(
         "/{job_id}/logs",
-        responses={429: {"model": CodedErrorResponse}},
+        response_class=StreamingResponse,
+        responses={
+            200: {
+                "description": "Newline-delimited JSON Provider Call logs",
+                "headers": _LOG_RESPONSE_HEADERS,
+                "content": {
+                    "application/x-ndjson": {
+                        "schema": {"type": "string"},
+                    }
+                },
+            },
+            429: {"model": CodedErrorResponse},
+        },
     )
     async def logs(
         request: Request,
@@ -173,13 +199,13 @@ def create_job_logs_router() -> APIRouter:
         job, registration = _authorized(request, job_id, session)
         remote: RemoteExecutionClient = request.app.state.remote_execution
         call = await remote.provider_call(_locator(job), target)
+        handle = call.provider_call_handle_id if call is not None else None
         if (
             call is None
-            or call.provider_call_handle_id is None
+            or handle is None
             or _target(registration.definition, call) is None
         ):
             raise HTTPException(409, "Job log target is unavailable")
-        handle = call.provider_call_handle_id
         live = _validate_window(call, since=since, until=until)
         user_id = session.principal.user_id
         if live:
@@ -206,7 +232,7 @@ def create_job_logs_router() -> APIRouter:
                     await live_streams.release(user_id, job_id)
 
         return StreamingResponse(
-            content(),
+            _redact_provider_call_id(content(), handle),
             media_type="application/x-ndjson",
             headers={
                 "Cache-Control": "private, no-store",
@@ -216,6 +242,51 @@ def create_job_logs_router() -> APIRouter:
         )
 
     return router
+
+
+async def _redact_provider_call_id(
+    stream: AsyncIterable[bytes],
+    provider_call_id: str,
+) -> AsyncIterator[bytes]:
+    """Remove a private provider identifier, including across chunk edges."""
+    secret = provider_call_id.encode()
+    replacement = b"[function-call-id-redacted]"
+    pending = b""
+    iterator = aiter(stream)
+    try:
+        async for chunk in iterator:
+            pending += chunk
+            output = bytearray()
+            while True:
+                index = pending.find(secret)
+                if index >= 0:
+                    output.extend(pending[:index])
+                    output.extend(replacement)
+                    pending = pending[index + len(secret) :]
+                    continue
+                held = next(
+                    (
+                        length
+                        for length in range(
+                            min(len(pending), len(secret) - 1),
+                            0,
+                            -1,
+                        )
+                        if pending.endswith(secret[:length])
+                    ),
+                    0,
+                )
+                safe = len(pending) - held
+                output.extend(pending[:safe])
+                pending = pending[safe:]
+                break
+            if output:
+                yield bytes(output)
+        if pending:
+            yield pending.replace(secret, replacement)
+    finally:
+        if isinstance(iterator, _AsyncClosable):
+            await iterator.aclose()
 
 
 async def _stage_calls(

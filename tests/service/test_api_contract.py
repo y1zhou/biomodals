@@ -169,6 +169,17 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
     )
     assert recycle["name"] == "recycle"
     assert recycle["schema"]["minimum"] == 0
+    logs = paths["/api/v1/jobs/{job_id}/logs"]["get"]["responses"]["200"]
+    assert set(logs["content"]) == {"application/x-ndjson"}
+    download = paths["/api/v1/jobs/{job_id}/download"]["get"]["responses"]
+    assert {"200", "206", "416"} <= set(download)
+    assert set(download["200"]["content"]) == {
+        "application/zip",
+        "application/zstd",
+    }
+    assert "Content-Range" in download["206"]["headers"]
+    prepared = paths["/api/v1/jobs/{job_id}/prepare-download"]["post"]
+    assert "204" in prepared["responses"]
 
 
 def test_private_routes_require_a_session(tmp_path: Path) -> None:

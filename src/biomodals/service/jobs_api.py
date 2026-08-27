@@ -6,12 +6,14 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease, run_blocking_io
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
+    CodedErrorResponse,
+    ErrorResponse,
     require_session,
     require_unsafe_session,
 )
@@ -29,6 +31,17 @@ from biomodals.service.tool_runtime import (
     PreparedResult,
     ResultIntegrityError,
 )
+
+_DOWNLOAD_HEADERS = {
+    "Accept-Ranges": {"schema": {"type": "string", "enum": ["bytes"]}},
+    "Content-Disposition": {"schema": {"type": "string"}},
+    "Content-Length": {"schema": {"type": "integer"}},
+    "ETag": {"schema": {"type": "string"}},
+}
+_BINARY_CONTENT = {
+    media_type: {"schema": {"type": "string", "format": "binary"}}
+    for media_type in ("application/zip", "application/zstd")
+}
 
 
 def create_jobs_router(
@@ -102,11 +115,16 @@ def create_jobs_router(
             raise HTTPException(409, str(error)) from error
         return view(job, session)
 
-    @router.post("/{job_id}/prepare-download")
+    @router.post(
+        "/{job_id}/prepare-download",
+        status_code=status.HTTP_204_NO_CONTENT,
+        response_class=Response,
+        responses={409: {"model": CodedErrorResponse}},
+    )
     async def prepare_download(
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
-    ) -> JobView:
+    ) -> Response:
         job = _owned(store, session, job_id)
         result = _require_result(job)
         lease = await cache.acquire_async(
@@ -126,9 +144,34 @@ def create_jobs_router(
         else:
             lease.close()
         cache.protect_prepared(str(job.job_id))
-        return view(_owned(store, session, job_id), session)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    @router.get("/{job_id}/download")
+    @router.get(
+        "/{job_id}/download",
+        response_class=StreamingResponse,
+        responses={
+            200: {
+                "description": "Complete Result archive",
+                "headers": _DOWNLOAD_HEADERS,
+                "content": _BINARY_CONTENT,
+            },
+            206: {
+                "description": "Requested Result archive byte range",
+                "headers": {
+                    **_DOWNLOAD_HEADERS,
+                    "Content-Range": {"schema": {"type": "string"}},
+                },
+                "content": _BINARY_CONTENT,
+            },
+            409: {"model": ErrorResponse},
+            416: {
+                "model": ErrorResponse,
+                "headers": {
+                    "Content-Range": {"schema": {"type": "string"}},
+                },
+            },
+        },
+    )
     async def download(
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_session)],

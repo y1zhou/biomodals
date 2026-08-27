@@ -14,7 +14,11 @@ from biomodals.execution import (
     ProviderCallPage,
     ProviderCallStatus,
 )
-from biomodals.service.job_logs_api import _stage_calls, _validate_window
+from biomodals.service.job_logs_api import (
+    _redact_provider_call_id,
+    _stage_calls,
+    _validate_window,
+)
 from biomodals.service.remote_execution import ExecutionLocator
 
 
@@ -69,6 +73,19 @@ def test_historical_window_can_read_an_active_call() -> None:
         since=since,
         until=since + timedelta(minutes=10),
     )
+
+
+@pytest.mark.anyio
+async def test_private_provider_call_id_is_redacted_across_chunks() -> None:
+    async def chunks():
+        yield b'{"message":"call fc-'
+        yield b'test finished"}\n'
+
+    content = b"".join([
+        chunk async for chunk in _redact_provider_call_id(chunks(), "fc-test")
+    ])
+
+    assert content == b'{"message":"call [function-call-id-redacted] finished"}\n'
 
 
 @pytest.mark.anyio

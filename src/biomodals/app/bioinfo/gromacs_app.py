@@ -874,7 +874,7 @@ def collect_traj_stats(
 ##########################################
 @app.cls(
     cpu=(0.125, 4.125),
-    memory=(1024, 16384),
+    memory=(256, 65536),
     timeout=MAX_TIMEOUT,
     max_containers=1,
     scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,

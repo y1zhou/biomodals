@@ -450,6 +450,37 @@ def test_staged_inference_preserves_unknown_observations(
     assert node.planning.staged_inference_observation() == AvailabilityStatus.UNKNOWN
 
 
+def test_prepared_inference_retries_repaired_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = alphafold3_execution_graph(
+        _request(),
+        execution_run_id=RUN_ID,
+        **_graph_inputs(tmp_path),
+    )
+    planning = cast(Any, graph.validate().nodes[STAGE_INFERENCE].node).planning
+    prepared = object()
+    attempts = 0
+
+    def prepare(*args, **kwargs):
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        if attempts == 1:
+            raise planning_module.IncompletePrerequisiteError("profiles are not ready")
+        return prepared
+
+    monkeypatch.setattr(planning, "_enriched_config", lambda: object())
+    monkeypatch.setattr(planning_module, "prepare_inference_run", prepare)
+
+    with pytest.raises(planning_module.IncompletePrerequisiteError):
+        planning.prepared_inference()
+
+    assert planning.prepared_inference() is prepared
+    assert attempts == 2
+
+
 def test_fresh_search_run_treats_unbuilt_results_as_missing(tmp_path: Path) -> None:
     runtime, inputs = _runtime(tmp_path, request=_request(search_msa=True))
     for manifest in inputs["search_runtime"].sharded_root.glob(

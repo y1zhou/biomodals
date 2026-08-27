@@ -148,7 +148,6 @@ class AlphaFold3ExecutionPlanning:
             tuple[MsaAssemblyTask, ...], tuple[dict[str, object], ...]
         ] = {}
         self._prepared_inference_cache: PreparedInferenceRun | None = None
-        self._prepared_inference_error: IncompletePrerequisiteError | None = None
         self._seed_prediction_cache: dict[int, dict[str, object]] | None = None
 
     def invalidate(self, changed_nodes: Collection[str] | None = None) -> None:
@@ -164,7 +163,6 @@ class AlphaFold3ExecutionPlanning:
             self._combined_msa_cache.clear()
         if changed & {RAW_SEARCHES, MSA_ASSEMBLIES, TEMPLATE_SEARCHES}:
             self._prepared_inference_cache = None
-            self._prepared_inference_error = None
         if changed & {
             RAW_SEARCHES,
             MSA_ASSEMBLIES,
@@ -685,18 +683,12 @@ class AlphaFold3ExecutionPlanning:
         """Build the enriched inference request once per publication epoch."""
         if self._prepared_inference_cache is not None:
             return self._prepared_inference_cache
-        if self._prepared_inference_error is not None:
-            raise self._prepared_inference_error
-        try:
-            prepared = prepare_inference_run(
-                self._enriched_config(),
-                recycle=self.request.recycle,
-                sample=self.request.sample,
-                allow_large_inference=self.request.allow_large_inference,
-            )
-        except IncompletePrerequisiteError as error:
-            self._prepared_inference_error = error
-            raise
+        prepared = prepare_inference_run(
+            self._enriched_config(),
+            recycle=self.request.recycle,
+            sample=self.request.sample,
+            allow_large_inference=self.request.allow_large_inference,
+        )
         self._prepared_inference_cache = prepared
         return prepared
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import niquests
+import pytest
 
 from biomodals.helper import web
 
@@ -251,6 +252,59 @@ def test_resumable_download_continues_after_stream_disconnect(
 
     assert output.read_bytes() == b"partialrest"
     assert session.calls[1][2]["headers"] == {"Range": "bytes=7-"}
+
+
+def test_stream_retry_budget_is_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    session = FakeSession(
+        get_responses=[
+            FakeResponse(stream_error=ConnectionError("disconnected")) for _ in range(3)
+        ]
+    )
+    delays: list[int] = []
+
+    async def record_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(web.asyncio, "sleep", record_sleep)
+
+    with pytest.raises(RuntimeError, match="Download for"):
+        asyncio.run(
+            web._download_file(
+                cast(niquests.AsyncSession, session),
+                "https://example.test/archive.zst",
+                output,
+                force=False,
+                resume=True,
+                num_retries=2,
+            )
+        )
+
+    assert [call[0] for call in session.calls] == ["GET", "GET", "GET"]
+    assert delays == [1, 2]
+
+
+def test_request_failure_uses_only_session_retry_budget(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zst.part"
+    response = FakeResponse(status_error=ConnectionError("upstream unavailable"))
+    session = FakeSession(get_responses=response)
+
+    with pytest.raises(RuntimeError, match="Download for"):
+        asyncio.run(
+            web._download_file(
+                cast(niquests.AsyncSession, session),
+                "https://example.test/archive.zst",
+                output,
+                force=False,
+                resume=True,
+                num_retries=3,
+            )
+        )
+
+    assert [call[0] for call in session.calls] == ["GET"]
 
 
 def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:

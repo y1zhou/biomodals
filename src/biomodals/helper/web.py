@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -87,6 +88,7 @@ async def _download_file(
             offset = local_path.stat().st_size if resume and local_path.exists() else 0
             response = None
             restart = False
+            stream_error: Exception | None = None
             try:
                 response = await session.get(
                     url,
@@ -102,22 +104,24 @@ async def _download_file(
                         restart = _content_range_start(response.headers) != offset
                     if not restart:
                         append = offset > 0 and status_code == 206
-                        with local_path.open("ab" if append else "wb") as output:
-                            async for chunk in await response.iter_content():
-                                output.write(chunk)
-                        return
-            except Exception:
-                if attempt == num_retries:
-                    raise
+                        try:
+                            with local_path.open("ab" if append else "wb") as output:
+                                async for chunk in await response.iter_content():
+                                    output.write(chunk)
+                        except Exception as error:
+                            stream_error = error
+                        else:
+                            return
             finally:
                 if response is not None:
                     await response.close()
             if restart:
                 local_path.unlink(missing_ok=True)
-            if attempt < num_retries:
-                continue
-            if restart:
+            if attempt == num_retries:
+                if stream_error is not None:
+                    raise stream_error
                 raise RuntimeError("Server returned an invalid byte-range response")
+            await asyncio.sleep(min(2**attempt, 10))
     except Exception as e:
         raise RuntimeError(f"Download for {url} to {local_path} failed.") from e
 

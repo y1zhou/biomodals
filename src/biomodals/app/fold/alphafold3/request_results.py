@@ -865,40 +865,52 @@ def _download_artifact(
     reader: VolumeReader,
     artifact: dict[str, object],
     destination: Path,
-    *,
-    download_file: Callable[[str, IO[bytes]], int] | None = None,
 ) -> None:
     volume_path = cast(str, artifact["volume_path"])
     expected_size = cast(int, artifact["size_bytes"])
     expected_sha256 = cast(str, artifact["sha256"])
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if download_file is not None:
-        with destination.open("xb") as handle:
-            written = download_file(volume_path, handle)
-        observed_sha256 = sha256_file(destination)
-    else:
-        written = 0
-        digest = hashlib.sha256()
-        with destination.open("xb") as handle:
-            for chunk in reader.read_file(volume_path):
-                if not isinstance(chunk, bytes):
-                    raise TypeError(
-                        f"Volume reader returned non-bytes for {volume_path}"
-                    )
-                next_size = written + len(chunk)
-                if next_size > expected_size:
-                    raise RuntimeError(
-                        "Downloaded size mismatch for "
-                        f"{volume_path}: more than {expected_size}"
-                    )
-                handle.write(chunk)
-                digest.update(chunk)
-                written = next_size
-        observed_sha256 = digest.hexdigest()
+    written = 0
+    digest = hashlib.sha256()
+    with destination.open("xb") as handle:
+        for chunk in reader.read_file(volume_path):
+            if not isinstance(chunk, bytes):
+                raise TypeError(f"Volume reader returned non-bytes for {volume_path}")
+            next_size = written + len(chunk)
+            if next_size > expected_size:
+                raise RuntimeError(
+                    "Downloaded size mismatch for "
+                    f"{volume_path}: more than {expected_size}"
+                )
+            handle.write(chunk)
+            digest.update(chunk)
+            written = next_size
+    observed_sha256 = digest.hexdigest()
     if written != expected_size:
         raise RuntimeError(
             f"Downloaded size mismatch for {volume_path}: {written} != {expected_size}"
         )
+    if observed_sha256 != expected_sha256:
+        raise RuntimeError(
+            "Downloaded SHA-256 mismatch for "
+            f"{volume_path}: {observed_sha256} != {expected_sha256}"
+        )
+
+
+def _validate_downloaded_artifact(
+    artifact: dict[str, object],
+    destination: Path,
+) -> None:
+    volume_path = cast(str, artifact["volume_path"])
+    expected_size = cast(int, artifact["size_bytes"])
+    expected_sha256 = cast(str, artifact["sha256"])
+    observed_size = destination.stat().st_size
+    if observed_size != expected_size:
+        raise RuntimeError(
+            f"Downloaded size mismatch for {volume_path}: "
+            f"{observed_size} != {expected_size}"
+        )
+    observed_sha256 = sha256_file(destination)
     if observed_sha256 != expected_sha256:
         raise RuntimeError(
             "Downloaded SHA-256 mismatch for "
@@ -1160,7 +1172,7 @@ def create_request_archive(
     *,
     output_dir: str | Path,
     display_name: str,
-    download_file: Callable[[str, IO[bytes]], int] | None = None,
+    download_files: Callable[[list[tuple[str, Path]]], None] | None = None,
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
     _, view_id, canonical_name, artifacts, ranking = _validated_manifest_artifacts(
@@ -1232,6 +1244,8 @@ def create_request_archive(
             )
             input_paths: list[Path] = []
             downloaded: dict[tuple[str, int, str], Path] = {}
+            pending_downloads: list[tuple[dict[str, object], Path]] = []
+            pending_copies: list[tuple[Path, Path]] = []
             for artifact, transformed in transformed_artifacts:
                 destination = archive_root / Path(transformed.as_posix())
                 source_identity = (
@@ -1240,18 +1254,25 @@ def create_request_archive(
                     cast(str, artifact["sha256"]),
                 )
                 if source := downloaded.get(source_identity):
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, destination)
+                    pending_copies.append((source, destination))
                 else:
-                    _download_artifact(
-                        reader,
-                        artifact,
-                        destination,
-                        download_file=download_file,
-                    )
                     downloaded[source_identity] = destination
+                    pending_downloads.append((artifact, destination))
                 if artifact["role"] == "input":
                     input_paths.append(destination)
+            if download_files is None:
+                for artifact, destination in pending_downloads:
+                    _download_artifact(reader, artifact, destination)
+            else:
+                download_files([
+                    (cast(str, artifact["volume_path"]), destination)
+                    for artifact, destination in pending_downloads
+                ])
+                for artifact, destination in pending_downloads:
+                    _validate_downloaded_artifact(artifact, destination)
+            for source, destination in pending_copies:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
             if len(input_paths) != 1:
                 raise RuntimeError(
                     "Request archive requires exactly one input artifact"

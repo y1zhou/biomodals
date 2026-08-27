@@ -3200,19 +3200,28 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         ],
     )
     view_id = cast(str, manifest["view_id"])
+    downloaded_paths: list[str] = []
+
+    def download_files(downloads: list[tuple[str, Path]]) -> None:
+        for remote_path, destination in downloads:
+            downloaded_paths.append(remote_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(input_bytes)
 
     original_umask = os.umask(0o077)
     try:
         archive = create_request_archive(
-            FakeVolumeReader({volume_path: input_bytes}),
+            FakeVolumeReader({}),
             manifest,
             output_dir=tmp_path,
             display_name="Readable Name",
+            download_files=download_files,
         )
     finally:
         os.umask(original_umask)
 
     assert archive.name == f"Readable_Name_{view_id[:12]}_AlphaFold3.tar.zst"
+    assert downloaded_paths == [volume_path]
     archived_input = "\n".join(
         run_command(
             [

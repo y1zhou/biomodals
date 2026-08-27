@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
-from typing import IO, Any, cast
 
 import modal
 
@@ -20,6 +19,7 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
 from biomodals.app.fold.alphafold3.request_results import create_request_archive
 from biomodals.execution.modal import stage_execution_launch
 from biomodals.helper.artifacts import file_size_sha256
+from biomodals.helper.modal_volume import download_modal_volume_files
 from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.store import JobRecord, JobState, ServiceStore
@@ -144,10 +144,10 @@ class AlphaFold3ToolAdapter:
                     manifest,
                     output_dir=directory,
                     display_name=request.config.name,
-                    download_file=lambda path, handle: self._download_file(
+                    download_files=lambda downloads: download_modal_volume_files(
                         volume,
-                        path,
-                        handle,
+                        downloads,
+                        concurrency=self.modal_download_concurrency,
                     ),
                 )
                 os.replace(archive, staging)
@@ -167,19 +167,6 @@ class AlphaFold3ToolAdapter:
             size_bytes=size_bytes,
             sha256=digest,
             archive_schema=ALPHAFOLD3_ARCHIVE_SCHEMA,
-        )
-
-    def _download_file(
-        self,
-        volume: modal.Volume,
-        path: str,
-        handle: IO[bytes],
-    ) -> int:
-        """Download one artifact with the configured per-Job concurrency."""
-        return cast(Any, volume)._read_file_into_fileobj(
-            path,
-            handle,
-            concurrency=self.modal_download_concurrency,
         )
 
     def _volume(self, job: JobRecord) -> modal.Volume:

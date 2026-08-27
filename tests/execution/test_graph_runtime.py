@@ -117,6 +117,16 @@ class RecoverableTextNode(CoordinatorNode):
 
 
 @dataclass
+class BrokenRecoveryTextNode(RecoverableTextNode):
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        del context
+        raise ValueError("invalid publication")
+
+
+@dataclass
 class RemoteTextNode(ProviderNode):
     text: str
     function_name: str
@@ -778,6 +788,17 @@ def test_result_node_recovers_workload_publication_without_rerunning(
     assert node.calls == 0
     assert node.commits == 0
     assert runtime.store.artifacts.load_node_result("result") is not None
+    runtime.close()
+
+
+def test_result_recovery_does_not_hide_invalid_publications(tmp_path: Path) -> None:
+    graph = ExecutionGraph("invalid-recovery")
+    graph.add_node(BrokenRecoveryTextNode("cached"), id="result")
+    runtime = _runtime(tmp_path, graph)
+
+    with pytest.raises(ValueError, match="invalid publication"):
+        runtime.run(workload_run_key="invalid-recovery")
+
     runtime.close()
 
 

@@ -1034,7 +1034,7 @@ class ExecutionGraphRuntime:
                     task_definition,
                     task.fingerprint,
                 )
-            except Exception:  # noqa: BLE001 - inconclusive workload validation
+            except OSError:
                 prepared.append((
                     task,
                     AvailabilityStatus.UNKNOWN,
@@ -2270,7 +2270,7 @@ class ExecutionGraphRuntime:
         context = self._node_context(definition, node_id)
         try:
             recovered = implementation.recover_result_publication(context)
-        except Exception:  # noqa: BLE001 - inconclusive workload validation
+        except OSError:
             return AvailabilityStatus.UNKNOWN
         if recovered is None:
             return AvailabilityStatus.MISSING
@@ -2432,7 +2432,7 @@ class ExecutionGraphRuntime:
                 task,
                 expected_fingerprint,
             )
-        except Exception:  # noqa: BLE001 - inconclusive workload validation
+        except OSError:
             return _TaskPublicationObservation(AvailabilityStatus.UNKNOWN)
         if recovered is None:
             return _TaskPublicationObservation(AvailabilityStatus.MISSING)

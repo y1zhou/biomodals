@@ -15,10 +15,8 @@ def test_valid_stage_projection_is_decoded() -> None:
         "code": "predict",
         "label": "Predict structures",
         "task_counts": {"running": 2},
-        "running_functions": ["run_inference_pipeline", 7],
         "provider_state": "running",
     })
 
     assert stage is not None
     assert stage.task_counts.running == 2
-    assert stage.running_functions == ["run_inference_pipeline"]

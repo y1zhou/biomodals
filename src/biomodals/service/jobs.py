@@ -35,7 +35,6 @@ class JobStageView(BaseModel):
     ended_at: datetime | None = None
     outcome: Literal["completed", "partial", "failed", "cancelled"] | None = None
     task_counts: StageTaskCounts = Field(default_factory=StageTaskCounts)
-    running_functions: list[str] = Field(default_factory=list)
     provider_state: Literal["queued", "running"] | None = None
 
 
@@ -108,7 +107,6 @@ class JobView(BaseModel):
 def _stage_from_projection(value: object) -> JobStageView | None:
     if not isinstance(value, dict) or not isinstance(value.get("code"), str):
         return None
-    functions = value.get("running_functions", [])
     try:
         return JobStageView(
             code=value["code"],
@@ -117,11 +115,6 @@ def _stage_from_projection(value: object) -> JobStageView | None:
             ended_at=_timestamp(value.get("ended_at")),
             outcome=value.get("outcome"),
             task_counts=StageTaskCounts.model_validate(value.get("task_counts", {})),
-            running_functions=(
-                [item for item in functions if isinstance(item, str)]
-                if isinstance(functions, list)
-                else []
-            ),
             provider_state=value.get("provider_state"),
         )
     except (OverflowError, TypeError, ValueError):

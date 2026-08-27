@@ -20,7 +20,6 @@ class ToolStageDefinition:
     code: str
     label: str
     node_keys: tuple[str, ...]
-    provider_functions: tuple[str | None, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,37 +52,31 @@ GROMACS_TOOL = ToolDefinition(
             "prepare_simulation",
             "Prepare simulation",
             ("prepare_tpr_cpu", "prepare_tpr_gpu"),
-            ("prepare_tpr_cpu", "prepare_tpr_gpu"),
         ),
         ToolStageDefinition(
             "analyze_nvt",
             "Analyze NVT",
             ("collect_traj_stats:nvt_",),
-            ("collect_traj_stats",),
         ),
         ToolStageDefinition(
             "analyze_npt",
             "Analyze NPT",
             ("collect_traj_stats:npt_",),
-            ("collect_traj_stats",),
         ),
         ToolStageDefinition(
             "run_production",
             "Run production",
-            ("production_run_cpu", "production_run_gpu"),
             ("production_run_cpu", "production_run_gpu"),
         ),
         ToolStageDefinition(
             "analyze_production",
             "Analyze production",
             ("collect_traj_stats:production_",),
-            ("collect_traj_stats",),
         ),
         ToolStageDefinition(
             "prepare_result",
             "Prepare result",
             ("prepare_result",),
-            (None,),
         ),
     ),
     job_logs_visible_to_owner_default=True,
@@ -103,37 +96,31 @@ ALPHAFOLD3_TOOL = ToolDefinition(
             "prepare_input",
             "Prepare input",
             ("stage-request-input",),
-            (None,),
         ),
         ToolStageDefinition(
             "prepare_environment",
             "Prepare environment",
             ("prepare-environment",),
-            ("prepare_alphafold3_environment_asset",),
         ),
         ToolStageDefinition(
             "search_sequence_databases",
             "Search MSAs",
             ("raw-database-searches", "combined-msa-publications"),
-            ("search_database_msa", "assemble_sequence_msas"),
         ),
         ToolStageDefinition(
             "search_templates",
             "Search templates",
             ("protein-template-searches",),
-            ("search_protein_templates",),
         ),
         ToolStageDefinition(
             "predict_structures",
             "Predict structures",
             ("stage-inference-input", "seed-predictions"),
-            (None, "run_inference_pipeline"),
         ),
         ToolStageDefinition(
             "prepare_results",
             "Prepare results",
             ("inference-summary", "request-publication"),
-            ("finalize_inference_summary", "finalize_inference_request"),
         ),
     ),
 )
@@ -186,15 +173,6 @@ def project_overview(
         for node in selected:
             for status, count in task_counts.get(node.node_key, {}).items():
                 counts[status] += count
-        running_functions = [
-            function_name
-            for node_key, function_name in zip(
-                stage.node_keys,
-                stage.provider_functions,
-                strict=True,
-            )
-            if node_key in active_calls and function_name is not None
-        ]
         stage_calls = [
             active_calls[node_key]
             for node_key in stage.node_keys
@@ -231,7 +209,6 @@ def project_overview(
             ),
             "outcome": outcome,
             "task_counts": counts,
-            "running_functions": running_functions,
             "provider_state": provider_state,
         })
     warnings = (

@@ -16,7 +16,7 @@ from biomodals.service.tools import GROMACS_TOOL, project_overview
 CALL_HANDLE = "fc-provider"
 
 
-def test_projection_names_only_active_remote_functions() -> None:
+def test_projection_marks_only_active_remote_stages() -> None:
     overview = SimpleNamespace(
         run=SimpleNamespace(status=RunStatus.RUNNING, status_message=None),
         nodes=(
@@ -51,9 +51,7 @@ def test_projection_names_only_active_remote_functions() -> None:
     projection = project_overview(GROMACS_TOOL, overview)
 
     stages = {stage["code"]: stage for stage in projection["stages"]}
-    assert stages["analyze_nvt"]["running_functions"] == ["collect_traj_stats"]
     assert stages["analyze_nvt"]["provider_state"] == "running"
-    assert stages["prepare_result"]["running_functions"] == []
     assert stages["prepare_result"]["provider_state"] is None
 
 

@@ -11,6 +11,8 @@ from typing import Protocol
 from uuid import UUID
 from weakref import WeakValueDictionary
 
+import modal.exception
+
 from biomodals.execution import DeploymentIdentity, ExecutionOverview, RunStatus
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
@@ -25,6 +27,15 @@ from biomodals.service.store import JobRecord, JobState, ServiceStore
 from biomodals.service.tools import ToolDefinition, project_overview
 
 LOGGER = logging.getLogger(__name__)
+_TRANSIENT_RESULT_ERRORS = (
+    ConnectionError,
+    TimeoutError,
+    modal.exception.ConnectionError,
+    modal.exception.InternalError,
+    modal.exception.ResourceExhaustedError,
+    modal.exception.ServiceError,
+    modal.exception.TimeoutError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,12 +356,25 @@ class JobLifecycle:
                 self.cache,
                 completed_at=job.finalization_started_at or now,
             )
-        except Exception as error:
+        except _TRANSIENT_RESULT_ERRORS:
+            LOGGER.warning(
+                "Result preparation is temporarily unavailable for Job %s",
+                job.job_id,
+                exc_info=True,
+            )
             return self.store.block_job(
                 job.job_id,
                 category="result_preparation_failed",
-                message=str(error),
+                message="Result preparation is temporarily unavailable",
                 retry_at=now + 60,
+                now=now,
+            )
+        except Exception:
+            LOGGER.exception("Could not prepare Result for Job %s", job.job_id)
+            return self.store.fail_job(
+                job.job_id,
+                error_code="result_preparation_failed",
+                error_message="The Result archive could not be prepared",
                 now=now,
             )
         return self.store.complete_job(

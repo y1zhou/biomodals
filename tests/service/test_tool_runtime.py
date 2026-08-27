@@ -32,13 +32,16 @@ JOB_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 class Adapter:
     prepared = 0
 
-    async def stage(self, _job):
+    async def stage(self, job):
+        del job
         return None
 
-    async def discard_pending(self, _job):
+    async def discard_pending(self, job):
+        del job
         return None
 
-    async def prepare_result(self, _job, cache, *, completed_at):
+    async def prepare_result(self, job, cache, *, completed_at):
+        del job, cache, completed_at
         self.prepared += 1
         return PreparedResult("result.tar.zst", "application/zstd", 1, "a" * 64, "v1")
 
@@ -134,7 +137,8 @@ async def test_crash_during_spawn_is_fenced_and_never_relaunched(
 @pytest.mark.anyio
 async def test_submission_wait_stays_queued_without_launching(tmp_path: Path) -> None:
     class WaitingAdapter(Adapter):
-        async def stage(self, _job):
+        async def stage(self, job):
+            del job
             return SubmissionWait(
                 "waiting_for_shared_publication",
                 "Waiting for matching work",
@@ -218,6 +222,60 @@ async def test_terminal_observation_defers_result_work(tmp_path: Path) -> None:
     await lifecycle.restore_result(cleared)
     restored = store.get_job_by_id(JOB_ID)
     assert restored is not None and restored.cache_cleared_at is None
+
+
+@pytest.mark.anyio
+async def test_transient_result_failure_retries_later(tmp_path: Path) -> None:
+    class UnavailableAdapter(Adapter):
+        async def prepare_result(self, job, cache, *, completed_at):
+            del job, cache, completed_at
+            raise TimeoutError("temporary outage")
+
+    store, lifecycle, _adapter = _lifecycle(
+        tmp_path,
+        SimpleNamespace(),
+        UnavailableAdapter(),
+    )
+    store.begin_finalization(
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        projection={"stages": [], "warnings": []},
+        now=20,
+    )
+
+    blocked = await lifecycle.advance(JOB_ID, finalize=True)
+
+    assert blocked.state == JobState.BLOCKED
+    assert blocked.state_message == "Result preparation is temporarily unavailable"
+    assert blocked.next_retry_at is not None
+
+
+@pytest.mark.anyio
+async def test_permanent_result_failure_does_not_retry(tmp_path: Path) -> None:
+    class InvalidAdapter(Adapter):
+        async def prepare_result(self, job, cache, *, completed_at):
+            del job, cache, completed_at
+            raise ValueError("invalid archive")
+
+    store, lifecycle, _adapter = _lifecycle(
+        tmp_path,
+        SimpleNamespace(),
+        InvalidAdapter(),
+    )
+    store.begin_finalization(
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        projection={"stages": [], "warnings": []},
+        now=20,
+    )
+
+    failed = await lifecycle.advance(JOB_ID, finalize=True)
+
+    assert (failed.state, failed.error_code) == (
+        JobState.FAILED,
+        "result_preparation_failed",
+    )
+    assert failed.error_message == "The Result archive could not be prepared"
 
 
 @pytest.mark.anyio

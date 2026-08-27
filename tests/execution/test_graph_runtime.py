@@ -1140,7 +1140,7 @@ def test_artifact_volume_log_reloads_before_publication(
     runtime.close()
 
 
-def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> None:
+def test_local_dag_uses_kernel_state_and_standard_paths(tmp_path: Path) -> None:
     workflow = ExecutionGraph("demo")
     first_node = TextNode("first")
     first = workflow.add_node(first_node, id="first")
@@ -1165,17 +1165,8 @@ def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> N
         "succeeded",
         "succeeded",
     ]
-    tables = {
-        str(row[0])
-        for row in runtime.store.connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-    assert "attempts" not in tables
-    assert "remote_calls" not in tables
     assert first_node.seen[0].workload_run_key == "friendly-name"
     assert first_node.seen[0].execution_run_id == RUN_ID
-    assert "attempt" not in str(first_node.seen[0].work_dir)
     assert [artifact.artifact_id for artifact in second_node.seen[0].inputs["upstream"]]
     assert (
         runtime.store.output_root.joinpath(

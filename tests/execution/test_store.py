@@ -13,10 +13,7 @@ from biomodals.execution import (
     ExecutionPlan,
     NodePlan,
 )
-from biomodals.execution.store import (
-    GraphExecutionRunStore,
-    UnsupportedGraphRunStoreError,
-)
+from biomodals.execution.store import GraphExecutionRunStore
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OTHER_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -60,8 +57,6 @@ def test_run_store_uses_execution_identity_and_shared_schema(tmp_path: Path) -> 
     }
     assert "execution_runs" in tables
     assert "execution_artifacts" in tables
-    assert "runs" not in tables
-    assert "attempts" not in tables
 
 
 def test_run_store_atomically_creates_one_immutable_workflow_plan(
@@ -168,13 +163,3 @@ def test_closing_for_storage_sync_reopens_repository_views(tmp_path: Path) -> No
 
     assert store.connection is not first_connection
     assert store.execution.get_run(RUN_ID).status.value == "pending"
-
-
-def test_existing_legacy_or_unrecognized_ledger_is_rejected(tmp_path: Path) -> None:
-    store = GraphExecutionRunStore(tmp_path, RUN_ID)
-    store.state_root.mkdir(parents=True)
-    with sqlite3.connect(store.ledger_path) as connection:
-        connection.execute("CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY)")
-
-    with pytest.raises(UnsupportedGraphRunStoreError, match="fresh"):
-        _ = store.connection

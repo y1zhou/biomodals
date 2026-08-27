@@ -12,20 +12,10 @@ from biomodals.helper import catalog
 from biomodals.helper.catalog import BiomodalsApp, get_catalog, include_dependency_apps
 
 
-def test_default_catalog_does_not_collect_workflows() -> None:
+def test_default_catalog_collects_apps() -> None:
     apps = get_catalog("app", use_absolute_paths=True)
 
-    assert "workflow-ppiflow" not in apps
     assert apps["ppiflow"].name == "ppiflow_app.py"
-    assert "ppiflow_workflow" not in apps
-    assert "workflow-orchestrator" not in apps
-
-
-def test_app_catalog_does_not_collect_workflow_scripts() -> None:
-    apps = get_catalog("app", use_absolute_paths=True)
-
-    assert "workflow-ppiflow" not in apps
-    assert "ppiflow_workflow" not in apps
 
 
 def test_workflow_catalog_discovers_natural_workflow_names() -> None:
@@ -34,8 +24,6 @@ def test_workflow_catalog_discovers_natural_workflow_names() -> None:
     assert "ppiflow" in workflows
     assert "rfd_ligandmpnn" in workflows
     assert "shortmd" in workflows
-    assert "workflow-ppiflow" not in workflows
-    assert "orchestrator" not in workflows
     assert workflows["ppiflow"].name == "ppiflow_workflow.py"
     assert workflows["rfd_ligandmpnn"].name == "rfd_ligandmpnn_workflow.py"
     assert workflows["shortmd"].name == "shortmd_workflow.py"

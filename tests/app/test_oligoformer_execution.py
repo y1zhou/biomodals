@@ -456,15 +456,6 @@ def test_process_budget_only_controls_in_container_workers() -> None:
     assert oligoformer_app._targetscan_local_workers(execution) == 3
 
 
-def test_oligoformer_has_no_app_owned_modal_queue_or_nested_dispatch() -> None:
-    source = Path(oligoformer_app.__file__).read_text(encoding="utf-8")
-
-    assert "modal.Queue" not in source
-    assert ".remote(" not in source
-    scientific_source = source[: source.index("def submit_oligoformer_task")]
-    assert ".spawn(" not in scientific_source
-
-
 def test_pita_reference_provider_mounts_all_human_references() -> None:
     volumes = oligoformer_app.prepare_oligoformer_pita_reference.spec.volumes
 

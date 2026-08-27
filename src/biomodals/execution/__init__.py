@@ -92,7 +92,6 @@ from biomodals.execution.store import (
     ExecutionRunStore,
     ExecutionStorageSync,
     GraphExecutionRunStore,
-    UnsupportedGraphRunStoreError,
 )
 from biomodals.schema import (
     ArtifactFile,
@@ -180,5 +179,4 @@ __all__ = [
     "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",
-    "UnsupportedGraphRunStoreError",
 ]

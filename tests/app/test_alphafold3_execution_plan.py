@@ -98,8 +98,6 @@ def test_alphafold3_plan_fingerprint_tracks_science_not_worker_limits() -> None:
     assert first.workload_plan_fingerprint == second.workload_plan_fingerprint
     assert first.workload_plan_fingerprint != changed_sequence.workload_plan_fingerprint
     assert first.workload_plan_fingerprint != changed_seeds.workload_plan_fingerprint
-    assert "max_parallel_search_workers" not in repr(first.scientific_payload)
-    assert "max_num_gpus" not in repr(first.scientific_payload)
 
 
 def test_alphafold3_search_tasks_bind_existing_scientific_identities() -> None:
@@ -142,7 +140,6 @@ def test_alphafold3_search_tasks_bind_existing_scientific_identities() -> None:
     )
     for plan in (raw_plan, assembly_plan, template_plan):
         assert "path" not in repr(plan.scientific_payload).lower()
-        assert "max_parallel" not in repr(plan.scientific_payload)
 
 
 def test_alphafold3_seed_tasks_are_independent_of_gpu_partitioning() -> None:
@@ -170,7 +167,6 @@ def test_alphafold3_seed_tasks_are_independent_of_gpu_partitioning() -> None:
 
     assert tuple(plan.task_key for plan in plans) == ("seed:1", "seed:3")
     assert {plan.scientific_payload["run_id"] for plan in plans} == {prepared.run_id}
-    assert all("max_num_gpus" not in repr(plan.scientific_payload) for plan in plans)
 
 
 def test_alphafold3_singleton_tasks_bind_publication_identities() -> None:

@@ -11,30 +11,12 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from biomodals.execution.artifact_store import (
-    EXECUTION_ARTIFACT_TABLES,
     ExecutionArtifactStore,
 )
 from biomodals.execution.sqlite import SqliteExecutionRepository
 
 LEDGER_FILENAME = "ledger.sqlite3"
 COORDINATOR_PLAN_FILENAME = "workflow-plan.pkl"
-_LEGACY_TABLES = {
-    "artifact_files",
-    "artifacts",
-    "attempts",
-    "node_inputs",
-    "node_outputs",
-    "nodes",
-    "remote_calls",
-    "runs",
-    "workflow_artifact_files",
-    "workflow_artifacts",
-    "workflow_node_inputs",
-    "workflow_node_outputs",
-    "workflow_node_results",
-    "workflow_task_outputs",
-    "workflow_task_results",
-}
 
 
 class ExecutionStorageSync(Protocol):
@@ -187,10 +169,6 @@ class ExecutionRunStore:
             connection.close()
 
 
-class UnsupportedGraphRunStoreError(RuntimeError):
-    """Raised when a graph ledger predates the execution-kernel cutover."""
-
-
 class GraphExecutionRunStore(ExecutionRunStore):
     """Own one graph Run's paths, connection, and artifact boundary."""
 
@@ -257,27 +235,9 @@ class GraphExecutionRunStore(ExecutionRunStore):
     def _initialize_additional_schema(self, connection: sqlite3.Connection) -> None:
         """Initialize execution-owned artifact tables on the connection."""
         self.output_root.mkdir(parents=True, exist_ok=True)
-        self._reject_legacy_schema(connection)
         artifacts = ExecutionArtifactStore(connection, self.execution_run_id)
         artifacts.initialize_schema()
         self._artifacts = artifacts
-
-    @staticmethod
-    def _reject_legacy_schema(connection: sqlite3.Connection) -> None:
-        tables = {
-            str(row["name"])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-        legacy = tables & _LEGACY_TABLES
-        partial_artifacts = tables & set(EXECUTION_ARTIFACT_TABLES)
-        if legacy or (
-            partial_artifacts and partial_artifacts != set(EXECUTION_ARTIFACT_TABLES)
-        ):
-            raise UnsupportedGraphRunStoreError(
-                "Unsupported pre-kernel graph ledger; initialize a fresh Execution Run"
-            )
 
     def _close(self) -> None:
         super()._close()

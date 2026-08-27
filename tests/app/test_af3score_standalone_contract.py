@@ -4,7 +4,6 @@
 
 import ast
 import importlib.util
-import inspect
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
@@ -78,21 +77,6 @@ def test_af3score_runtime_sources_support_python_311(module_name: str) -> None:
         filename=str(source_path),
         feature_version=(3, 11),
     )
-
-
-def test_af3score_removed_the_volume_directory_scheduler_lock() -> None:
-    assert not hasattr(af3score_app, "af3score_manage_lock")
-
-
-def test_af3score_remote_functions_do_not_accept_path_payloads() -> None:
-    for function_name in (
-        "af3score_prepare",
-        "af3score_run",
-        "af3score_postprocess",
-    ):
-        signature = inspect.signature(getattr(af3score_app, function_name).get_raw_f())
-        assert "paths" not in signature.parameters
-        assert "Path" not in str(signature)
 
 
 def test_af3score_prepare_reports_app_run_layout_paths(

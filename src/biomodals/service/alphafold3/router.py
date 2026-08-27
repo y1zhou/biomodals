@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
 from biomodals.execution import DeploymentIdentity
+from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.validation import (
     MAX_VALIDATION_BYTES,
     ValidatedInput,
@@ -72,6 +73,7 @@ def create_router(
     store: ServiceStore,
     configuration: RuntimeConfiguration,
     validations: ValidatedInputStore,
+    adapter: AlphaFold3ToolAdapter,
     remote: RemoteExecutionClient,
     lifecycle: JobLifecycle,
 ) -> APIRouter:
@@ -223,6 +225,31 @@ def create_router(
             ):
                 raise HTTPException(404, "Validation not found")
         return Response(status_code=204)
+
+    @router.get("/jobs/{job_id}/document")
+    async def download_job_document(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> Response:
+        job = store.get_job(session.principal.user_id, job_id)
+        if job is None or job.tool != "alphafold3":
+            raise HTTPException(404, "Job not found")
+        try:
+            document = await adapter.input_document(job)
+        except FileNotFoundError as error:
+            raise CodedAPIError(
+                404,
+                "job_input_unavailable",
+                "AlphaFold3 input is no longer available",
+            ) from error
+        return Response(
+            content=document,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "private, no-store",
+                "Content-Disposition": ('attachment; filename="alphafold3-input.json"'),
+            },
+        )
 
     @router.post("/jobs", response_model=JobView, status_code=202)
     async def submit_job(

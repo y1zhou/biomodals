@@ -154,3 +154,37 @@ def test_modal_artifact_download_uses_configured_concurrency(tmp_path: Path) -> 
     assert written == 6
     assert destination.getvalue() == b"result"
     assert captured == {"path": "results/output.cif", "concurrency": 4}
+
+
+@pytest.mark.anyio
+async def test_input_document_uses_staged_execution_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, owner = _store(tmp_path)
+    job = _admit(store, owner, job_id=uuid4(), ordinal=1)
+    volume = object()
+    validations = SimpleNamespace(get_claimed=lambda *_args, **_kwargs: None)
+    adapter = AlphaFold3ToolAdapter(validations, store)
+    monkeypatch.setattr(adapter, "_volume", lambda _job: volume)
+
+    async def to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(af3_modal.asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(
+        af3_modal,
+        "load_execution_request_from_volume",
+        lambda selected, job_id: SimpleNamespace(
+            config=(selected, job_id),
+        ),
+    )
+    monkeypatch.setattr(
+        af3_modal,
+        "serialize_af3_input",
+        lambda config: repr(config).encode(),
+    )
+
+    document = await adapter.input_document(job)
+
+    assert document == repr((volume, job.job_id)).encode()

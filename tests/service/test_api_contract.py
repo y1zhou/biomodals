@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.router import create_router as af3_router
 from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.api import create_app
@@ -69,6 +70,7 @@ def _app(tmp_path: Path):
     pending.initialize()
     validations = ValidatedInputStore(tmp_path / "validations")
     validations.initialize()
+    alphafold3_adapter = AlphaFold3ToolAdapter(validations, store)
     cache = ArtifactCache(tmp_path / "cache")
     registrations = (
         ToolRegistration(GROMACS_TOOL, Adapter()),
@@ -92,6 +94,7 @@ def _app(tmp_path: Path):
                 store=store,
                 configuration=configuration,
                 validations=validations,
+                adapter=alphafold3_adapter,
                 remote=remote,
                 lifecycle=lifecycle,
             ),
@@ -141,6 +144,7 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
     assert "/api/v1/alphafold3/validations" in paths
     assert "/api/v1/alphafold3/validations/{validation_id}/document" in paths
     assert "/api/v1/alphafold3/jobs" in paths
+    assert "/api/v1/alphafold3/jobs/{job_id}/document" in paths
     assert "/api/v1/jobs/{job_id}/refresh" in paths
     assert "/api/v1/jobs/{job_id}/download" in paths
     alpha_request = document["components"]["schemas"]["AlphaFold3JobRequest"]
@@ -172,6 +176,10 @@ def test_private_routes_require_a_session(tmp_path: Path) -> None:
     assert _request(app, "GET", "/api/v1/jobs").status_code == 401
     assert (
         _request(app, "GET", f"/api/v1/alphafold3/validations/{uuid4()}").status_code
+        == 401
+    )
+    assert (
+        _request(app, "GET", f"/api/v1/alphafold3/jobs/{uuid4()}/document").status_code
         == 401
     )
 

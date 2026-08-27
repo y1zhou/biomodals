@@ -185,14 +185,12 @@ def create_deployed_app() -> FastAPI:
     remote = RemoteExecutionClient()
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
     gromacs = ToolRegistration(GROMACS_TOOL, GromacsToolAdapter(pending))
-    alphafold3 = ToolRegistration(
-        ALPHAFOLD3_TOOL,
-        AlphaFold3ToolAdapter(
-            validations,
-            store,
-            modal_download_concurrency=settings.modal_download_concurrency,
-        ),
+    alphafold3_adapter = AlphaFold3ToolAdapter(
+        validations,
+        store,
+        modal_download_concurrency=settings.modal_download_concurrency,
     )
+    alphafold3 = ToolRegistration(ALPHAFOLD3_TOOL, alphafold3_adapter)
     registrations = (gromacs, alphafold3)
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     routers = (
@@ -207,6 +205,7 @@ def create_deployed_app() -> FastAPI:
             store=store,
             configuration=configuration,
             validations=validations,
+            adapter=alphafold3_adapter,
             remote=remote,
             lifecycle=lifecycle,
         ),

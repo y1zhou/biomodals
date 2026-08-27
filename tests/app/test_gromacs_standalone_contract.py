@@ -243,7 +243,7 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
     assert captured["cmd"][captured["cmd"].index("-i") + 1] == str(input_path)
     assert captured["cwd"] == str(run_root)
     assert captured["env"] == {"OMP_NUM_THREADS": None}
-    assert volume.commit_count == 2
+    assert volume.commit_count == 1
 
 
 def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> None:

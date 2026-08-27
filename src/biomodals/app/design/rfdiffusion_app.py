@@ -200,7 +200,6 @@ def _rfdiffusion_infer(
             log_file=log_path,
             cwd=CONF.git_clone_dir,
         )
-        CONF.output_volume.commit()
 
         # If trajectories are generated, compress them to save space.
         traj_dir = rfd_out_dir / "traj"

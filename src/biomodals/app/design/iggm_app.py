@@ -227,7 +227,6 @@ def merge_pdb_chains(
     ]
 
     log_path = layout.logs_dir / "iggm_merge_chains.log"
-    CONF.output_volume.commit()
     print("💊 Merging IgGM antigen chains...")
     try:
         run_command(cmd, output_mode="tee", log_file=log_path, cwd=CONF.git_clone_dir)
@@ -300,7 +299,6 @@ def iggm_inference(
     cmd.extend(["--output", str(output_dir)])
 
     log_path = layout.logs_dir / "iggm.log"
-    CONF.output_volume.commit()
     print("💊 Running IgGM...")
     try:
         run_command(cmd, output_mode="tee", log_file=log_path, cwd=CONF.git_clone_dir)

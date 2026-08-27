@@ -193,7 +193,6 @@ def download_boltz_models(force: bool = False) -> None:
         local_dir=boltz_download_dir,
         force_download=force,
     )
-    MODEL_VOLUME.commit()
 
     tar_mols = boltz_download_dir / "mols.tar"
     if not (boltz_download_dir / "mols").exists():
@@ -227,7 +226,6 @@ async def download_chai_models(force=False):
         f"{base_url}{dep}": chai_model_dir / dep for dep in inference_dependencies
     }
     download_files(download_tasks, progress_bar_desc="Downloading Chai models")
-    MODEL_VOLUME.commit()
 
     # Special treatment for ESM
     esm2_path = chai_model_dir / "esm2" / "traced_sdpa_esm2_t36_3B_UR50D_fp16.pt"
@@ -325,19 +323,17 @@ def prepare_abcfold2(
                 / ".cache"
                 / "rcsb",
             )
-            CONF.output_volume.commit()
 
     # Generate inputs for Boltz and Chai
     if not (out_dir_full / "boltz_models" / f"{run_id}.yaml").exists():
         _ = prepare_boltz(conf_file=yaml_path, out_dir=out_dir_full)
-        CONF.output_volume.commit()
     if not (out_dir_full / "chai_models" / f"{run_id}.yaml").exists():
         _ = prepare_chai(
             conf_file=yaml_path,
             out_dir=out_dir_full,
             ccd_lib_dir=Path(BoltzConf.model_volume_mountpoint) / "mols",
         )
-        CONF.output_volume.commit()
+    CONF.output_volume.commit()
 
     # Pull run parameters from YAML
     conf = load_params_from_run_yaml(yaml_path)

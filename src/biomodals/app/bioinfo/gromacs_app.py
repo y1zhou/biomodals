@@ -347,7 +347,6 @@ def prepare_tpr_gpu(
     input_pdb_path = work_path / f"{run_name}.pdb"
     staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
-    CONF.output_volume.commit()
 
     script_path = Path(APP_INFO.gmx_scripts) / "prepare-tpr.sh"
     if not script_path.exists():
@@ -419,7 +418,6 @@ def prepare_tpr_cpu(
     input_pdb_path = work_path / f"{run_name}.pdb"
     staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
-    CONF.output_volume.commit()
 
     script_path = Path(APP_INFO.gmx_scripts) / "prepare-tpr.sh"
     if not script_path.exists():
@@ -764,7 +762,6 @@ def collect_traj_stats(
     trajectory = xtc_file.get_structure(template)
     if not save_processed_traj:
         processed_traj_path.unlink()
-        out_vol.commit()
 
     # Get simulation time (ns) for plotting purposes
     time = xtc_file.get_time() / 1000.0
@@ -780,7 +777,6 @@ def collect_traj_stats(
         last_frame_path.unlink(missing_ok=True)  # remove outdated last frame
     if not last_frame_path.exists():
         strucio.save_structure(last_frame_path, trajectory[-1])
-        out_vol.commit()
 
     # RMSD vs. the initial frame
     rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{run_name}.png"
@@ -809,8 +805,6 @@ def collect_traj_stats(
             figure.savefig(rmsd_fig_path)
             plt.close(figure)
 
-        out_vol.commit()
-
     # Radius of gyration
     rg_fig_path = work_path / f"rg_{traj_prefix}{run_name}.png"
     rg_csv_path = rg_fig_path.with_suffix(".csv")
@@ -836,8 +830,6 @@ def collect_traj_stats(
             ax.set_ylabel("Radius of Gyration (Å)")
             figure.savefig(rg_fig_path)
             plt.close(figure)
-
-        out_vol.commit()
 
     # RMSF of each residue
     rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{run_name}.png"
@@ -873,8 +865,7 @@ def collect_traj_stats(
             figure.savefig(rmsf_fig_path)
             plt.close(figure)
 
-        out_vol.commit()
-
+    out_vol.commit()
     return str(work_path)
 
 

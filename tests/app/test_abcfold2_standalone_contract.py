@@ -123,7 +123,7 @@ def test_prepare_abcfold2_uses_hash_partitioned_app_run_root(
     assert calls["prepare_boltz"]["out_dir"] == run_root
     assert calls["prepare_chai"]["conf_file"] == run_root / f"{run_id}.yaml"
     assert calls["prepare_chai"]["out_dir"] == run_root
-    assert output_volume.commit_count == 3
+    assert output_volume.commit_count == 1
 
 
 def test_collectors_only_package_completed_seed_directories(

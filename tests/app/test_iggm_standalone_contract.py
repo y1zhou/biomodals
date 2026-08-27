@@ -53,7 +53,7 @@ def test_merge_pdb_chains_uses_app_run_layout(tmp_path: Path, monkeypatch) -> No
     assert calls["log_file"] == run_root / "logs" / "iggm_merge_chains.log"
     assert calls["cwd"] == tmp_path / "IgGM"
     assert calls["output_mode"] == "tee"
-    assert output_volume.commit_count == 2
+    assert output_volume.commit_count == 1
 
 
 def test_iggm_inference_uses_app_run_layout(tmp_path: Path, monkeypatch) -> None:
@@ -98,4 +98,4 @@ def test_iggm_inference_uses_app_run_layout(tmp_path: Path, monkeypatch) -> None
     assert (run_root / "outputs").is_dir()
     assert calls["log_file"] == run_root / "logs" / "iggm.log"
     assert calls["cmd"][-2:] == ["--output", str(run_root / "outputs")]
-    assert output_volume.commit_count == 2
+    assert output_volume.commit_count == 1

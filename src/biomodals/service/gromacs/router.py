@@ -108,7 +108,7 @@ def create_router(
         effective = configuration.tool("gromacs")
         deployment = DeploymentIdentity(
             configuration.modal_environment().value,
-            effective.modal_app_name.value,
+            effective.modal_app_name,
             effective.modal_app_version.value,
         )
         await remote.preflight(deployment)

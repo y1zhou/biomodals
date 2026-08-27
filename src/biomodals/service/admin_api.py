@@ -829,7 +829,7 @@ def create_admin_router() -> APIRouter:
                     await request.app.state.remote_execution.preflight(
                         DeploymentIdentity(
                             candidate_environment,
-                            effective.modal_app_name.value,
+                            effective.modal_app_name,
                             effective.modal_app_version.value,
                         )
                     )
@@ -894,7 +894,7 @@ def create_admin_router() -> APIRouter:
                     f"{definition.modal_app_version_environment} is controlled "
                     "by an environment variable",
                 )
-            candidate_app_name = effective.modal_app_name.value
+            candidate_app_name = effective.modal_app_name
             candidate_app_version = effective.modal_app_version.value
             if "modal_app_version" in submission.model_fields_set:
                 candidate_app_version = (

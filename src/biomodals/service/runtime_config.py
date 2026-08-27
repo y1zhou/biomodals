@@ -45,7 +45,7 @@ class ToolRuntimeConfiguration:
     """Effective mutable settings for one fixed API Tool."""
 
     tool: str
-    modal_app_name: EffectiveSetting[str]
+    modal_app_name: str
     modal_app_version: EffectiveSetting[int]
     active_job_limit: EffectiveSetting[int]
     job_logs_visible_to_owner: EffectiveSetting[bool]
@@ -171,10 +171,7 @@ class RuntimeConfiguration:
         stored = self.store.get_tool_configuration(tool)
         configuration = ToolRuntimeConfiguration(
             tool=tool,
-            modal_app_name=self._startup_text_setting(
-                environment_name=definition.modal_app_name_environment,
-                default=defaults.modal_app_name,
-            ),
+            modal_app_name=defaults.modal_app_name,
             modal_app_version=self._tool_positive_integer_setting(
                 environment_name=definition.modal_app_version_environment,
                 database_value=(
@@ -280,15 +277,6 @@ class RuntimeConfiguration:
             default,
             _parse_nonnegative,
         )
-
-    def _startup_text_setting(
-        self,
-        *,
-        environment_name: str,
-        default: str,
-    ) -> EffectiveSetting[str]:
-        setting = self._setting(environment_name, None, default, _nonempty)
-        return EffectiveSetting(setting.value, setting.source, False)
 
     def _tool_integer_setting(
         self,

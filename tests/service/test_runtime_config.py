@@ -39,14 +39,8 @@ def test_container_limits_follow_active_job_limit(tmp_path: Path) -> None:
     assert effective.max_active_gpu_provider_calls == 3
 
 
-def test_modal_app_name_ignores_legacy_database_override(tmp_path: Path) -> None:
+def test_modal_app_name_comes_from_startup_configuration(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
-    configuration.store.set_tool_configuration(
-        "gromacs",
-        {"modal_app_name": "LegacyDatabaseOverride"},
-    )
 
     effective = configuration.tool("gromacs")
-    assert effective.modal_app_name.value == "Gromacs"
-    assert effective.modal_app_name.source == "default"
-    assert not effective.modal_app_name.editable
+    assert effective.modal_app_name == "Gromacs"

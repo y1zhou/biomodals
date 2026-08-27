@@ -74,7 +74,7 @@ class JobState(StrEnum):
 
 
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 7
+_SERVICE_SCHEMA_VERSION = 8
 _ACTIVE_JOB_STATES = (
     JobState.QUEUED.value,
     JobState.RUNNING.value,
@@ -274,11 +274,8 @@ class ToolConfigurationRecord:
     """Optional database overrides for one fixed API Tool."""
 
     tool: str
-    modal_app_name: str | None
     modal_app_version: int | None
     active_job_limit: int | None
-    max_active_provider_calls: int | None
-    max_active_gpu_provider_calls: int | None
     job_logs_visible_to_owner: bool | None
 
 
@@ -373,7 +370,6 @@ class ServiceStore:
 
                     CREATE TABLE tool_settings (
                         tool TEXT PRIMARY KEY,
-                        modal_app_name TEXT,
                         modal_app_version INTEGER
                             CHECK (
                                 modal_app_version IS NULL
@@ -381,14 +377,6 @@ class ServiceStore:
                         ),
                         active_job_limit INTEGER
                             CHECK (active_job_limit IS NULL OR active_job_limit >= 0),
-                        max_active_provider_calls INTEGER CHECK (
-                            max_active_provider_calls IS NULL
-                            OR max_active_provider_calls >= 1
-                        ),
-                        max_active_gpu_provider_calls INTEGER CHECK (
-                            max_active_gpu_provider_calls IS NULL
-                            OR max_active_gpu_provider_calls >= 1
-                        ),
                         job_logs_visible_to_owner INTEGER
                             CHECK (
                                 job_logs_visible_to_owner IS NULL
@@ -1032,11 +1020,8 @@ class ServiceStore:
             return None
         return ToolConfigurationRecord(
             tool=str(row["tool"]),
-            modal_app_name=row["modal_app_name"],
             modal_app_version=row["modal_app_version"],
             active_job_limit=row["active_job_limit"],
-            max_active_provider_calls=row["max_active_provider_calls"],
-            max_active_gpu_provider_calls=row["max_active_gpu_provider_calls"],
             job_logs_visible_to_owner=(
                 bool(row["job_logs_visible_to_owner"])
                 if row["job_logs_visible_to_owner"] is not None
@@ -1047,31 +1032,21 @@ class ServiceStore:
     def set_tool_configuration(
         self,
         tool: str,
-        settings: dict[str, str | int | bool | None],
+        settings: dict[str, int | bool | None],
     ) -> None:
         """Create, update, or remove supplied Tool overrides atomically."""
         if not tool:
             raise ValueError("tool must not be empty")
         unknown = settings.keys() - {
-            "modal_app_name",
             "modal_app_version",
             "active_job_limit",
-            "max_active_provider_calls",
-            "max_active_gpu_provider_calls",
             "job_logs_visible_to_owner",
         }
         if unknown:
             raise ValueError(f"Unknown Tool settings: {', '.join(sorted(unknown))}")
-        modal_app_name = settings.get("modal_app_name")
         modal_app_version = settings.get("modal_app_version")
         active_job_limit = settings.get("active_job_limit")
-        max_active_provider_calls = settings.get("max_active_provider_calls")
-        max_active_gpu_provider_calls = settings.get("max_active_gpu_provider_calls")
         job_logs_visible_to_owner = settings.get("job_logs_visible_to_owner")
-        if modal_app_name is not None and (
-            not isinstance(modal_app_name, str) or not modal_app_name
-        ):
-            raise ValueError("modal_app_name must not be empty")
         if modal_app_version is not None and (
             type(modal_app_version) is not int or modal_app_version < 1
         ):
@@ -1080,15 +1055,6 @@ class ServiceStore:
             type(active_job_limit) is not int or active_job_limit < 0
         ):
             raise ValueError("active_job_limit must be non-negative")
-        if max_active_provider_calls is not None and (
-            type(max_active_provider_calls) is not int or max_active_provider_calls < 1
-        ):
-            raise ValueError("max_active_provider_calls must be positive")
-        if max_active_gpu_provider_calls is not None and (
-            type(max_active_gpu_provider_calls) is not int
-            or max_active_gpu_provider_calls < 1
-        ):
-            raise ValueError("max_active_gpu_provider_calls must be positive")
         if (
             job_logs_visible_to_owner is not None
             and type(job_logs_visible_to_owner) is not bool
@@ -1101,11 +1067,6 @@ class ServiceStore:
                 "SELECT * FROM tool_settings WHERE tool = ?",
                 (tool,),
             ).fetchone()
-            next_modal_app_name = (
-                row["modal_app_name"]
-                if row is not None and "modal_app_name" not in settings
-                else modal_app_name
-            )
             next_modal_app_version = (
                 row["modal_app_version"]
                 if row is not None and "modal_app_version" not in settings
@@ -1116,16 +1077,6 @@ class ServiceStore:
                 if row is not None and "active_job_limit" not in settings
                 else active_job_limit
             )
-            next_max_active_provider_calls = (
-                row["max_active_provider_calls"]
-                if row is not None and "max_active_provider_calls" not in settings
-                else max_active_provider_calls
-            )
-            next_max_active_gpu_provider_calls = (
-                row["max_active_gpu_provider_calls"]
-                if row is not None and "max_active_gpu_provider_calls" not in settings
-                else max_active_gpu_provider_calls
-            )
             next_job_logs_visible_to_owner = (
                 bool(row["job_logs_visible_to_owner"])
                 if row is not None
@@ -1134,19 +1085,8 @@ class ServiceStore:
                 else job_logs_visible_to_owner
             )
             if (
-                next_max_active_provider_calls is not None
-                and next_max_active_gpu_provider_calls is not None
-                and next_max_active_gpu_provider_calls > next_max_active_provider_calls
-            ):
-                raise ValueError(
-                    "max_active_gpu_provider_calls cannot exceed total calls"
-                )
-            if (
-                next_modal_app_name is None
-                and next_modal_app_version is None
+                next_modal_app_version is None
                 and next_active_job_limit is None
-                and next_max_active_provider_calls is None
-                and next_max_active_gpu_provider_calls is None
                 and next_job_logs_visible_to_owner is None
             ):
                 conn.execute(
@@ -1157,27 +1097,19 @@ class ServiceStore:
                 conn.execute(
                     """
                     INSERT INTO tool_settings (
-                        tool, modal_app_name, modal_app_version,
-                        active_job_limit, max_active_provider_calls,
-                        max_active_gpu_provider_calls, job_logs_visible_to_owner
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        tool, modal_app_version, active_job_limit,
+                        job_logs_visible_to_owner
+                    ) VALUES (?, ?, ?, ?)
                     ON CONFLICT(tool) DO UPDATE SET
-                        modal_app_name = excluded.modal_app_name,
                         modal_app_version = excluded.modal_app_version,
                         active_job_limit = excluded.active_job_limit,
-                        max_active_provider_calls = excluded.max_active_provider_calls,
-                        max_active_gpu_provider_calls =
-                            excluded.max_active_gpu_provider_calls,
                         job_logs_visible_to_owner =
                             excluded.job_logs_visible_to_owner
                     """,
                     (
                         tool,
-                        next_modal_app_name,
                         next_modal_app_version,
                         next_active_job_limit,
-                        next_max_active_provider_calls,
-                        next_max_active_gpu_provider_calls,
                         next_job_logs_visible_to_owner,
                     ),
                 )

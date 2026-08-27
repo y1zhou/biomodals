@@ -75,7 +75,7 @@ def create_app(
             await remote.preflight(
                 DeploymentIdentity(
                     configuration.modal_environment().value,
-                    effective.modal_app_name.value,
+                    effective.modal_app_name,
                     effective.modal_app_version.value,
                 )
             )

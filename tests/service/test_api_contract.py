@@ -237,7 +237,7 @@ def test_alphafold3_lost_response_replays_after_validation_consumption(
         idempotency_key=str(idempotency_key),
         request_digest="a" * 64,
         modal_environment=app.state.configuration.modal_environment().value,
-        modal_app_name=tool.modal_app_name.value,
+        modal_app_name=tool.modal_app_name,
         modal_app_version=tool.modal_app_version.value,
         tool_active_job_limit=10,
         global_active_job_limit=10,

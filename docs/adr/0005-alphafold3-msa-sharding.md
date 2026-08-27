@@ -938,11 +938,11 @@ retaining every seed, sample, and worker bound. The accumulated summary may
 grow beyond the default ceiling through multiple valid requests. Inference
 controls are bounded both before scheduling and again in the worker: model
 seeds are unsigned 32-bit integers, recycles are 0--100, and diffusion samples
-are 1--100. Remote GPU admission uses the Run-level `--max-gpu-containers`
-ceiling; setting it to zero prevents GPU provider calls. Seed-cache inspection
-and seed claiming repeat the default workload check unless the explicit
-override accompanies the request. Result publication repeats the hard seed and
-sample bounds before touching the output Volume.
+are 1--100. Remote GPU admission uses the positive Run-level
+`--max-gpu-containers` ceiling; AlphaFold3 requires at least one GPU-container
+slot. Seed-cache inspection and seed claiming repeat the default workload check
+unless the explicit override accompanies the request. Result publication
+repeats the hard seed and sample bounds before touching the output Volume.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
 normalized seed list. It identifies one computational seed request, not a seed

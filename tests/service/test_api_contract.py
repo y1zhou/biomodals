@@ -88,7 +88,6 @@ def _app(tmp_path: Path):
                 configuration=configuration,
                 pending=pending,
                 remote=remote,
-                lifecycle=lifecycle,
             ),
             af3_router(
                 store=store,
@@ -96,7 +95,6 @@ def _app(tmp_path: Path):
                 validations=validations,
                 adapter=alphafold3_adapter,
                 remote=remote,
-                lifecycle=lifecycle,
             ),
         ),
         remote=remote,
@@ -122,6 +120,28 @@ def _session(user_id: UUID | None = None) -> AuthenticatedSession:
         last_seen_at=now,
         absolute_expires_at=now + 3600,
     )
+
+
+def _enabled_session(app) -> AuthenticatedSession:
+    store = app.state.store
+    user = store.create_user(
+        email="scientist@example.com",
+        display_name="Scientist",
+        token_digest=b"setup",
+        token_expires_at=100,
+        now=1,
+        is_admin=True,
+        active_job_limit=10,
+    )
+    store.set_password_from_token(
+        b"setup",
+        password_hash="test",  # noqa: S106
+        session_token_digest=b"session",
+        csrf_digest=b"csrf",
+        now=2,
+        absolute_expires_at=1000,
+    )
+    return _session(user.user_id)
 
 
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
@@ -180,6 +200,40 @@ def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> Non
     assert "Content-Range" in download["206"]["headers"]
     prepared = paths["/api/v1/jobs/{job_id}/prepare-download"]["post"]
     assert "204" in prepared["responses"]
+    for path in ("/api/v1/gromacs/jobs", "/api/v1/alphafold3/jobs"):
+        assert paths[path]["post"]["responses"]["202"]["description"] == (
+            "Job durably admitted for asynchronous staging and launch"
+        )
+
+
+def test_submission_returns_after_durable_admission(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+
+    async def authenticated() -> AuthenticatedSession:
+        return session
+
+    app.dependency_overrides[require_unsafe_session] = authenticated
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/gromacs/jobs",
+        headers={"Idempotency-Key": str(uuid4()), "Origin": ORIGIN},
+        files={
+            "pdb": (
+                "input.pdb",
+                b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\nEND\n",
+                "chemical/x-pdb",
+            )
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["state"] == "queued"
+    job = app.state.store.get_job_by_id(UUID(response.json()["job_id"]))
+    assert job is not None
+    assert (job.state.value, job.root_function_call_id) == ("queued", None)
+    assert app.state.reconcile_wakeup.is_set()
 
 
 def test_private_routes_require_a_session(tmp_path: Path) -> None:
@@ -221,29 +275,12 @@ def test_alphafold3_lost_response_replays_after_validation_consumption(
 ) -> None:
     app = _app(tmp_path)
     store = app.state.store
-    user = store.create_user(
-        email="scientist@example.com",
-        display_name="Scientist",
-        token_digest=b"setup",
-        token_expires_at=100,
-        now=1,
-        is_admin=True,
-        active_job_limit=10,
-    )
-    store.set_password_from_token(
-        b"setup",
-        password_hash="test",  # noqa: S106
-        session_token_digest=b"session",
-        csrf_digest=b"csrf",
-        now=2,
-        absolute_expires_at=1000,
-    )
-    session = _session(user.user_id)
+    session = _enabled_session(app)
     idempotency_key = uuid4()
     job_id = uuid4()
     tool = app.state.configuration.tool("alphafold3")
     store.admit_job(
-        owner_user_id=user.user_id,
+        owner_user_id=session.principal.user_id,
         tool="alphafold3",
         display_name="prediction",
         idempotency_key=str(idempotency_key),

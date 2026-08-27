@@ -64,6 +64,7 @@ def create_app(
         raise ValueError("allowed_origin must be an exact origin without a slash")
     session_cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
     password_executor = PasswordExecutor()
+    reconcile_wakeup = asyncio.Event()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -86,6 +87,7 @@ def create_app(
                 lifecycle,
                 interval_seconds=reconcile_interval_seconds,
                 stop=stop,
+                wake=reconcile_wakeup,
             ),
             name="biomodals-job-reconciler",
         )
@@ -96,6 +98,7 @@ def create_app(
         finally:
             app.state.ready = False
             stop.set()
+            reconcile_wakeup.set()
             await task
             await password_executor.shutdown()
             await cache.shutdown()
@@ -120,6 +123,7 @@ def create_app(
     }
     app.state.remote_execution = remote
     app.state.lifecycle = lifecycle
+    app.state.reconcile_wakeup = reconcile_wakeup
     app.state.cache = cache
     app.state.billing = BillingService()
     app.state.pending_requests = None
@@ -199,7 +203,6 @@ def create_deployed_app() -> FastAPI:
             configuration=configuration,
             pending=pending,
             remote=remote,
-            lifecycle=lifecycle,
         ),
         af3_router(
             store=store,
@@ -207,7 +210,6 @@ def create_deployed_app() -> FastAPI:
             validations=validations,
             adapter=alphafold3_adapter,
             remote=remote,
-            lifecycle=lifecycle,
         ),
     )
     auth = AuthService(store, frontend_url=settings.public_url)

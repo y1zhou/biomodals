@@ -522,6 +522,7 @@ async def reconciliation_loop(
     *,
     interval_seconds: float,
     stop: asyncio.Event,
+    wake: asyncio.Event,
 ) -> None:
     """Retry bounded service work; remote coordinators keep executing alone."""
     while not stop.is_set():
@@ -542,10 +543,13 @@ async def reconciliation_loop(
         async with asyncio.TaskGroup() as tasks:
             for job in lifecycle.store.list_reconcilable_jobs(now=now):
                 tasks.create_task(reconcile(job, semaphore))
+        if stop.is_set():
+            break
         try:
-            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+            await asyncio.wait_for(wake.wait(), timeout=interval_seconds)
         except TimeoutError:
             pass
+        wake.clear()
 
 
 def _recorded_result(job: JobRecord) -> PreparedResult:

@@ -468,11 +468,14 @@ Run ID, stores the Deployment Identity, full request digest, Tool-specific
 publication-scope digest, and any pending validation reference, and commits
 before any provider side effect.
 
-After admission, the Tool Adapter stages the immutable request and launch
-identity, the Remote Execution Client spawns the deployed coordinator, and the
-service records its root Function Call ID before returning `202`. A staging
-failure before any spawn attempt leaves the Job queued; background processing
-retries the idempotent staging and launch sequence.
+After admission, the service returns the queued Job with `202` and wakes the
+bounded background reconciler. The Tool Adapter then stages the immutable
+request and launch identity, the Remote Execution Client spawns the deployed
+coordinator, and the service records its root Function Call ID. The ordinary
+60-second reconciliation interval remains a retry fallback; a newly admitted
+Job does not wait for it. A staging failure before any spawn attempt leaves the
+Job queued, and background processing retries the idempotent staging and launch
+sequence.
 
 Before staging AlphaFold3, the adapter lists only earlier Jobs with the same
 Tool and publication-scope digest. AlphaFold3's scope excludes the Job name and

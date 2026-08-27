@@ -234,10 +234,12 @@ Stage selectors and access their live or historical provider logs for any Job,
 but it cannot inspect Input, download Result, cancel work, or retrieve a
 provider call identifier.
 
-The submit route atomically persists the Job and Execution Run, commits that
-durable state, advances one scheduling wave, and returns `202`. Execution
-SQLite keeps immutable Nodes and Tasks plus Dispatch Batches and Provider Calls
-for actual work. Before any `.spawn()`, one atomic preclaim creates a
+The submit route preflights the exact deployment, atomically persists the
+queued Service Job and retained Input reference, commits that durable state,
+returns `202`, and wakes the background reconciler. The remote coordinator then
+creates the Execution Run and advances scheduling. Execution SQLite keeps
+immutable Nodes and Tasks plus Dispatch Batches and Provider Calls for actual
+work. Before any `.spawn()`, one atomic preclaim creates a
 `submitting` Provider Call, assigns its Tasks, and crosses the service
 transaction boundary. Only the caller that created that row receives an
 in-process one-time authorization to spawn. A successful spawn durably attaches

@@ -45,7 +45,6 @@ from biomodals.service.store import (
     ServiceStore,
     UserNotFoundError,
 )
-from biomodals.service.tool_runtime import JobLifecycle
 
 
 class ValidationView(BaseModel):
@@ -75,7 +74,6 @@ def create_router(
     validations: ValidatedInputStore,
     adapter: AlphaFold3ToolAdapter,
     remote: RemoteExecutionClient,
-    lifecycle: JobLifecycle,
 ) -> APIRouter:
     """Create AlphaFold3 validation and submission routes."""
     router = APIRouter(prefix="/api/v1/alphafold3", tags=["alphafold3"])
@@ -251,8 +249,14 @@ def create_router(
             },
         )
 
-    @router.post("/jobs", response_model=JobView, status_code=202)
+    @router.post(
+        "/jobs",
+        response_model=JobView,
+        response_description="Job durably admitted for asynchronous staging and launch",
+        status_code=202,
+    )
     async def submit_job(
+        request: Request,
         body: AlphaFold3JobRequest,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
         idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
@@ -326,11 +330,8 @@ def create_router(
                 raise CodedAPIError(409, "job_conflict", str(error)) from error
             except UserNotFoundError as error:
                 raise CodedAPIError(403, "account_disabled", str(error)) from error
-        try:
-            job = await lifecycle.advance(admission.job.job_id)
-        except Exception:
-            job = admission.job
-        return _job_view(job, session, configuration)
+        request.app.state.reconcile_wakeup.set()
+        return _job_view(admission.job, session, configuration)
 
     return router
 

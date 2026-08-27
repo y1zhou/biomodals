@@ -34,7 +34,6 @@ from biomodals.service.store import (
     ServiceStore,
     UserNotFoundError,
 )
-from biomodals.service.tool_runtime import JobLifecycle
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
@@ -66,13 +65,17 @@ def create_router(
     configuration: RuntimeConfiguration,
     pending: PendingRequestStore,
     remote: RemoteExecutionClient,
-    lifecycle: JobLifecycle,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
-    """Create the GROMACS endpoint around shared admission and lifecycle."""
+    """Create the GROMACS endpoint around shared admission."""
     router = APIRouter(prefix="/api/v1/gromacs", tags=["gromacs"])
 
-    @router.post("/jobs", response_model=JobView, status_code=202)
+    @router.post(
+        "/jobs",
+        response_model=JobView,
+        response_description="Job durably admitted for asynchronous staging and launch",
+        status_code=202,
+    )
     async def submit_job(
         request: Request,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
@@ -167,11 +170,8 @@ def create_router(
         except UserNotFoundError as error:
             pending.delete(job_id)
             raise CodedAPIError(403, "account_disabled", str(error)) from error
-        try:
-            job = await lifecycle.advance(admission.job.job_id)
-        except Exception:
-            job = admission.job
-        return _view(job, session, configuration)
+        request.app.state.reconcile_wakeup.set()
+        return _view(admission.job, session, configuration)
 
     return router
 

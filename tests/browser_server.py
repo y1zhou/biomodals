@@ -456,7 +456,6 @@ def _create_browser_app():
                 configuration=configuration,
                 pending=pending,
                 remote=remote,
-                lifecycle=lifecycle,
             ),
             af3_router(
                 store=store,
@@ -464,7 +463,6 @@ def _create_browser_app():
                 validations=validations,
                 adapter=registrations[1].adapter,
                 remote=remote,
-                lifecycle=lifecycle,
             ),
         ),
         remote=remote,

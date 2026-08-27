@@ -140,6 +140,14 @@ as described above. The deployed Modal App name remains startup configuration;
 Administrators may pin the exact deployment version and choose Job-log
 visibility.
 
+Submission preflights the exact deployment, durably admits a queued Service
+Job and its retained Input reference, then returns `202` without waiting for
+remote staging or launch. Admission wakes the existing bounded background
+reconciler immediately. The configured 60-second interval remains a retry and
+repair fallback rather than routine submission latency. This keeps HTTP
+acceptance independent of Modal launch time while preserving one launch owner
+and the reconciler's four-Job concurrency bound.
+
 ## Observation and polling
 
 The background service polls the root Function Call every 60 seconds with

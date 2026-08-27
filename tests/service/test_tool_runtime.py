@@ -361,9 +361,47 @@ async def test_reconciliation_processes_at_most_four_jobs_concurrently() -> None
         cast(JobLifecycle, Lifecycle()),
         interval_seconds=60,
         stop=stop,
+        wake=asyncio.Event(),
     )
 
     assert maximum == 4
+
+
+@pytest.mark.anyio
+async def test_reconciliation_wakes_for_a_newly_admitted_job() -> None:
+    stop = asyncio.Event()
+    wake = asyncio.Event()
+    first_scan = asyncio.Event()
+    processed = asyncio.Event()
+    jobs: list[SimpleNamespace] = []
+
+    class Store:
+        def list_reconcilable_jobs(self, *, now):
+            del now
+            first_scan.set()
+            return tuple(jobs)
+
+    class Lifecycle:
+        store = Store()
+
+        async def advance(self, _job_id, *, finalize, background):
+            assert finalize and background
+            processed.set()
+            stop.set()
+
+    task = asyncio.create_task(
+        reconciliation_loop(
+            cast(JobLifecycle, Lifecycle()),
+            interval_seconds=60,
+            stop=stop,
+            wake=wake,
+        )
+    )
+    await asyncio.wait_for(first_scan.wait(), timeout=1)
+    jobs.append(SimpleNamespace(job_id=uuid4()))
+    wake.set()
+    await asyncio.wait_for(processed.wait(), timeout=1)
+    await task
 
 
 @pytest.mark.anyio

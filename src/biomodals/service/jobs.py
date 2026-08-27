@@ -60,6 +60,7 @@ class JobView(BaseModel):
     state_reason: str | None = None
     state_message: str | None = None
     download_url: str | None = None
+    result_size_bytes: int | None = Field(default=None, ge=1)
 
     @classmethod
     def from_record(
@@ -100,6 +101,7 @@ class JobView(BaseModel):
                 if record.state in {JobState.SUCCEEDED, JobState.PARTIAL}
                 else None
             ),
+            result_size_bytes=record.result_size_bytes,
         )
 
 

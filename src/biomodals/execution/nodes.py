@@ -12,10 +12,6 @@ from biomodals.execution.model import AvailabilityStatus
 from biomodals.schema import AppRunResult, ExecutionArtifact
 
 
-class ResultPublicationPendingError(RuntimeError):
-    """Signal that a provider publication is still becoming visible."""
-
-
 @dataclass(frozen=True)
 class NodeRunContext:
     """Workload-owned inputs and stable paths for one Execution Node Task."""

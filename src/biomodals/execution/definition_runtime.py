@@ -58,7 +58,6 @@ from biomodals.execution.nodes import (
     PullTaskProviderNode,
     PullWorkerCallSpec,
     ResultNode,
-    ResultPublicationPendingError,
     TaskDefinition,
     TaskProviderNode,
 )
@@ -82,7 +81,6 @@ from biomodals.execution.store import (
 from biomodals.schema import AppRunResult, AppRunStatus, ExecutionArtifact, VolumePath
 
 _TASK_KEY = "node"
-RESULT_PUBLICATION_GRACE_SECONDS = 60
 
 
 class _UnavailableProviderDriver:
@@ -1140,14 +1138,6 @@ class ExecutionGraphRuntime:
                 result = AppRunResult.model_validate(
                     node.process_remote_result(raw_result, metadata)
                 )
-            except ResultPublicationPendingError as error:
-                if self._awaiting_result_publication(call):
-                    return
-                self._fail_task(
-                    node_id,
-                    f"Provider result publication did not become visible: {error}",
-                )
-                return
             except Exception as error:
                 self._fail_task(node_id, f"Could not decode provider result: {error}")
                 return
@@ -1210,16 +1200,6 @@ class ExecutionGraphRuntime:
                 task_key: AppRunResult.model_validate(result)
                 for task_key, result in decoded.items()
             }
-        except ResultPublicationPendingError as error:
-            if self._awaiting_result_publication(call):
-                return
-            for task in unfinished:
-                self._fail_discovered_task(
-                    node_id,
-                    task.task_key,
-                    f"Provider result publication did not become visible: {error}",
-                )
-            return
         except Exception as error:
             for task in unfinished:
                 self._fail_discovered_task(
@@ -1238,13 +1218,6 @@ class ExecutionGraphRuntime:
                 task.task_key,
                 results[task.task_key],
             )
-
-    def _awaiting_result_publication(self, call: ProviderCallRecord) -> bool:
-        completed_at = call.completed_at
-        return (
-            completed_at is not None
-            and self._now() - completed_at < RESULT_PUBLICATION_GRACE_SECONDS
-        )
 
     def _start_ready_nodes(self, definition: ExecutionDefinition) -> None:
         with self.store.synchronize():

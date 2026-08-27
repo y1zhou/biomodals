@@ -605,6 +605,10 @@ before joining them to mounted paths.
 When a caller waits for a remote function that committed created, copied, or
 deleted files in a mounted Volume, reload that same Volume before reading,
 selecting, materializing, or validating those paths in the caller.
+Treat the successful reload as the visibility boundary: a missing or invalid
+publication is a workload failure, not a reason for an unobserved propagation
+delay. Add a grace period or repeated reload only after reproducing a provider
+contract failure.
 
 ## DAG Construction
 

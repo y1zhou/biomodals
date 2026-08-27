@@ -94,6 +94,10 @@ locks, checkpoints, or lifecycle classes.
 
 - Commit a Volume explicitly when another container can act on or consume the
   new state. Reload before that other container reads it.
+- Treat a completed explicit commit followed by a successful reload as the
+  visibility boundary. If the expected publication is then missing or invalid,
+  fail validation; add a visibility grace period only for a reproduced provider
+  failure that contradicts this contract.
 - Do not commit merely so later code in the same container can see its own
   writes, and do not commit after every file mutation. Modal performs periodic
   commits automatically.

@@ -21,7 +21,6 @@ from biomodals.execution import (
     NodeStatus,
     ProviderCallStatus,
     ProviderDeploymentUnavailableError,
-    ResultPublicationPendingError,
     RunStatus,
     RunStatusReason,
     TaskStatus,
@@ -250,17 +249,6 @@ class RefreshingRemoteFanoutNode(RemoteFanoutNode):
 
     def refresh_result_storage(self) -> None:
         self.refreshes += 1
-
-
-@dataclass
-class DelayedPublicationFanoutNode(RemoteFanoutNode):
-    decode_attempts: int = field(default=0, metadata={"dag_hash": False})
-
-    def process_remote_task_result(self, task_key, result, metadata):
-        self.decode_attempts += 1
-        if self.decode_attempts == 1:
-            raise ResultPublicationPendingError("shared volume is converging")
-        return super().process_remote_task_result(task_key, result, metadata)
 
 
 @dataclass
@@ -1460,24 +1448,6 @@ def test_remote_task_node_discovers_and_publishes_independent_tasks(
     assert {
         artifact.artifact_id for artifact in downstream.seen[0].inputs["candidates"]
     }.issuperset(task_artifact_ids)
-
-
-def test_remote_task_result_waits_for_publication_visibility(tmp_path: Path) -> None:
-    workflow = ExecutionGraph("delayed-publication")
-    node = DelayedPublicationFanoutNode(("alpha",))
-    workflow.add_node(node, id="fanout")
-    runtime = _runtime(
-        tmp_path,
-        workflow,
-        driver=FanoutModalDriver(),
-        max_calls=1,
-        max_gpu_calls=0,
-    )
-
-    result = runtime.run(workload_run_key="delayed-publication")
-
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert node.decode_attempts == 2
 
 
 def test_remote_task_storage_scopes_do_not_collide_after_path_sanitization(

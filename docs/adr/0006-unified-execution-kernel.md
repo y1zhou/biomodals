@@ -915,6 +915,14 @@ initial reload; a workload runtime does not immediately reload the same Volume
 again. SQLite stays open for local-only commits and is closed only across an
 explicit Volume commit or reload.
 
+The cross-container publication boundary was clarified on 2026-08-27. A
+writer's completed explicit Volume commit followed by a reader's successful
+reload is authoritative: the reader sees the latest committed state. If the
+expected publication is missing or invalid after that reload, result decoding
+fails normally. The kernel does not add a speculative propagation delay,
+repeated reload loop, or special pending-publication state. Such a workaround
+requires a reproduced provider-contract failure rather than a synthetic test.
+
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by
 the Execution Run and the pinned containing app or workflow deployment

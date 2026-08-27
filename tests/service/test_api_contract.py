@@ -21,6 +21,7 @@ from biomodals.service.auth import (
     Principal,
 )
 from biomodals.service.config import ServiceSettings
+from biomodals.service.gromacs import router as gromacs_routes
 from biomodals.service.gromacs.router import create_router as gromacs_router
 from biomodals.service.http_contract import require_session, require_unsafe_session
 from biomodals.service.pending import PendingRequestStore
@@ -234,6 +235,75 @@ def test_submission_returns_after_durable_admission(tmp_path: Path) -> None:
     assert job is not None
     assert (job.state.value, job.root_function_call_id) == ("queued", None)
     assert app.state.reconcile_wakeup.is_set()
+
+
+def test_generated_display_date_does_not_change_replay(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+    key = uuid4()
+
+    async def authenticated() -> AuthenticatedSession:
+        return session
+
+    app.dependency_overrides[require_unsafe_session] = authenticated
+    names = iter(("input · 2026-08-27", "input · 2026-08-28"))
+    monkeypatch.setattr(gromacs_routes, "_display_name", lambda *_args: next(names))
+    request = {
+        "headers": {"Idempotency-Key": str(key), "Origin": ORIGIN},
+        "files": {
+            "pdb": (
+                "input.pdb",
+                b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\nEND\n",
+                "chemical/x-pdb",
+            )
+        },
+    }
+
+    first = _request(app, "POST", "/api/v1/gromacs/jobs", **request)
+    replay = _request(app, "POST", "/api/v1/gromacs/jobs", **request)
+
+    assert replay.status_code == 202
+    assert replay.json()["job_id"] == first.json()["job_id"]
+    assert replay.json()["display_name"] == "input · 2026-08-27"
+
+
+def test_losing_gromacs_admission_discards_staging(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+    key = uuid4()
+
+    async def authenticated() -> AuthenticatedSession:
+        return session
+
+    app.dependency_overrides[require_unsafe_session] = authenticated
+    request = {
+        "headers": {"Idempotency-Key": str(key), "Origin": ORIGIN},
+        "files": {
+            "pdb": (
+                "input.pdb",
+                b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\nEND\n",
+                "chemical/x-pdb",
+            )
+        },
+    }
+    first = _request(app, "POST", "/api/v1/gromacs/jobs", **request)
+    pending = PendingRequestStore(tmp_path / "pending")
+    pending.delete(UUID(first.json()["job_id"]))
+    monkeypatch.setattr(
+        app.state.store, "find_idempotent_job", lambda *_args, **_kwargs: None
+    )
+
+    replay = _request(app, "POST", "/api/v1/gromacs/jobs", **request)
+
+    assert replay.status_code == 202
+    assert replay.json()["job_id"] == first.json()["job_id"]
+    assert pending.usage() == (0, 0)
 
 
 def test_private_routes_require_a_session(tmp_path: Path) -> None:

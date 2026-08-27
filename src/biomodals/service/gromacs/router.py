@@ -93,7 +93,12 @@ def create_router(
             cpu_only=cpu_only,
         )
         normalized_name = _display_name(pdb.filename, display_name)
-        digest = _submission_digest(pdb_content, normalized_name, options)
+        digest_name = (
+            normalized_name
+            if display_name is not None and display_name.strip()
+            else _filename_stem(pdb.filename)
+        )
+        digest = _submission_digest(pdb_content, digest_name, options)
         replay = store.find_idempotent_job(
             session.principal.user_id,
             tool="gromacs",
@@ -170,6 +175,8 @@ def create_router(
         except UserNotFoundError as error:
             pending.delete(job_id)
             raise CodedAPIError(403, "account_disabled", str(error)) from error
+        if not admission.created:
+            pending.delete(job_id)
         request.app.state.reconcile_wakeup.set()
         return _view(admission.job, session, configuration)
 
@@ -190,9 +197,14 @@ def _submission_digest(
 def _display_name(filename: str | None, supplied: str | None) -> str:
     if supplied is not None and supplied.strip():
         return re.sub(r"\s+", " ", supplied).strip()
+    return f"{_filename_stem(filename)} · {datetime.now(UTC):%Y-%m-%d}"
+
+
+def _filename_stem(filename: str | None) -> str:
+    """Return the stable generated-name component used for request identity."""
     safe_filename = (filename or "gromacs").replace("\\", "/")
     stem = PurePosixPath(safe_filename).stem.strip() or "gromacs"
-    return f"{re.sub(r'\s+', ' ', stem)[:100]} · {datetime.now(UTC):%Y-%m-%d}"
+    return re.sub(r"\s+", " ", stem)[:100]
 
 
 def _view(

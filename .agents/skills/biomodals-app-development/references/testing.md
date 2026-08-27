@@ -23,6 +23,13 @@ force races; artifact/marker preemption; identity changes; cold/warm caches.
 Prefer behavior over source searches; reserve source guards for textual
 contracts such as a pinned patch preimage.
 
+Keep tests aligned with the maintained contract. When a change removes a
+field, flag, alias, compatibility path, or implementation, delete its tests in
+the same change and cover the replacement behavior directly. Do not preserve
+history with assertions that the retired symbol or value remains absent.
+Reserve absence assertions for enduring boundaries such as secret redaction,
+path containment, and an intentionally private public API surface.
+
 ## Output assertions
 
 - Parse tables with Polars; assert schema/types/rows/nulls/unique IDs/joins/order

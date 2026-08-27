@@ -345,8 +345,8 @@ after every same-container state or file mutation.
 
 The persisted `workflow-plan.pkl` is trusted internal state tied to the exact
 deployment. A reopened Run must match its Workload Plan Fingerprint, Workload
-Run Key, and Deployment Identity. Old pre-kernel workflow ledgers are rejected;
-there is no compatibility facade or migration.
+Run Key, and Deployment Identity. Pre-kernel workflow ledgers are unsupported
+and are not migrated; initialize a fresh Execution Run instead.
 
 ## Modal Preemption
 
@@ -660,3 +660,10 @@ new included-app nodes so accidental deployed-app lookup regressions are caught.
 Use fake `ProviderDriver` instances and deterministic function-name-to-handle maps at the
 coordinator boundary. The production Node contract remains primitive and names
 the exact function; it does not carry Modal objects.
+
+Keep tests aligned with the maintained contract. When a change removes a
+field, flag, alias, compatibility path, or implementation, delete its tests in
+the same change and test the replacement behavior directly. Do not turn the
+retired design into an absence assertion. Reserve absence assertions for
+enduring boundaries such as secret redaction, path containment, and an
+intentionally private public API surface.

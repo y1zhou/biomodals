@@ -148,6 +148,8 @@ class ValidatedInputStore:
         validation_id: UUID | None = None,
     ) -> ValidatedInput:
         """Apply the existing app validator, then atomically publish a resource."""
+        if settings.search_protein_templates and not settings.search_msa:
+            raise ValueError("Protein template search requires MSA search")
         size = source.stat().st_size
         if not 0 < size <= MAX_VALIDATION_BYTES:
             raise ValueError("AlphaFold3 document has an invalid size")

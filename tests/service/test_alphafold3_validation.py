@@ -122,6 +122,25 @@ def test_validation_allows_zero_recycles_and_bounds_job_name(tmp_path: Path) -> 
         )
 
 
+def test_template_search_requires_msa_search(tmp_path: Path) -> None:
+    store = ValidatedInputStore(tmp_path)
+    store.initialize()
+    source = tmp_path / "input.json"
+    content = _document()
+    source.write_bytes(content)
+
+    with pytest.raises(ValueError, match="template search requires MSA search"):
+        store.validate_and_publish(
+            source,
+            owner_user_id=OWNER,
+            digest=hashlib.sha256(content).hexdigest(),
+            settings=ValidationSettings(
+                search_msa=False,
+                search_protein_templates=True,
+            ),
+        )
+
+
 def test_validation_preview_separates_custom_inputs(tmp_path: Path) -> None:
     store = ValidatedInputStore(tmp_path)
     store.initialize()

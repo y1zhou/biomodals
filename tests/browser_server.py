@@ -130,10 +130,18 @@ class _FakeRemote:
         self, _locator: ExecutionLocator, function_call_id: str
     ) -> ExecutionOverview | None:
         run_id = UUID(function_call_id.removeprefix("fake-root-"))
-        return self._overview(run_id)
+        overview = self._overview(run_id)
+        return overview if overview.run.status.is_terminal else None
 
     async def status(self, locator: ExecutionLocator) -> ExecutionOverview:
         return self._overview(locator.execution_run_id)
+
+    async def queued_provider_call_handles(
+        self,
+        _root_function_call_id: str | None,
+        _overview: ExecutionOverview,
+    ) -> frozenset[str]:
+        return frozenset()
 
     async def cancel(self, locator: ExecutionLocator) -> ExecutionOverview:
         self.cancelled.add(locator.execution_run_id)

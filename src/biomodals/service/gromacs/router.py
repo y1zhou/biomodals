@@ -94,9 +94,9 @@ def create_router(
         )
         normalized_name = _display_name(pdb.filename, display_name)
         digest_name = (
-            normalized_name
+            f"supplied:{normalized_name}"
             if display_name is not None and display_name.strip()
-            else _filename_stem(pdb.filename)
+            else f"generated:{_filename_stem(pdb.filename)}"
         )
         digest = _submission_digest(pdb_content, digest_name, options)
         replay = store.find_idempotent_job(

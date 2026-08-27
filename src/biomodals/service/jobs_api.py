@@ -103,7 +103,11 @@ def create_jobs_router(
         job = await lifecycle.advance(job_id, force_refresh=True)
         return view(job, session)
 
-    @router.post("/{job_id}/cancel", status_code=status.HTTP_202_ACCEPTED)
+    @router.post(
+        "/{job_id}/cancel",
+        status_code=status.HTTP_202_ACCEPTED,
+        responses={409: {"model": CodedErrorResponse}},
+    )
     async def cancel_job(
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
@@ -112,7 +116,7 @@ def create_jobs_router(
         try:
             job = await lifecycle.cancel(job_id)
         except JobNotCancellableError as error:
-            raise HTTPException(409, str(error)) from error
+            raise CodedAPIError(409, "job_not_cancellable", str(error)) from error
         return view(job, session)
 
     @router.post(

@@ -34,7 +34,6 @@ from biomodals.app.fold.alphafold3 import (
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     GenerationClaim,
-    abandon_generation_claim,
     acquire_generation_claim,
     finish_generation_claim,
     generation_status,
@@ -1948,17 +1947,6 @@ def test_generation_claims_fence_active_and_terminal_writers() -> None:
 
     assert latest_generation_owner(store, first.scope_key) == second.owner
     assert second.owner["predecessor_status"] == "complete"
-    abandon_generation_claim(
-        store,
-        second,
-        detail={"cleanup_recovery": True},
-        now_text="second-abandoned",
-    )
-    assert generation_status(store, second.scope_key, second.generation_id) == {
-        "status": "abandoned",
-        "finished_at": "second-abandoned",
-        "cleanup_recovery": True,
-    }
 
 
 def test_generation_claim_replays_the_same_live_owner() -> None:

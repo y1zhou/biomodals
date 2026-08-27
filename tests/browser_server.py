@@ -358,17 +358,17 @@ class _FakeAdapter:
     ) -> PreparedResult:
         del completed_at
         digest = hashlib.sha256(self.archive).hexdigest()
-
-        async def chunks():
-            yield self.archive
-
-        lease = await cache.store(
-            str(job.job_id),
-            size_bytes=len(self.archive),
-            sha256=digest,
-            chunks=chunks(),
-        )
-        lease.close()
+        staging = cache.staging_path(str(job.job_id))
+        staging.write_bytes(self.archive)
+        try:
+            await cache.publish_staged(
+                str(job.job_id),
+                staging,
+                size_bytes=len(self.archive),
+                sha256=digest,
+            )
+        finally:
+            staging.unlink(missing_ok=True)
         return PreparedResult(
             "result.zip",
             "application/zip",

@@ -370,20 +370,3 @@ def finish_generation_claim(
         detail=detail,
         now_text=now_text,
     )
-
-
-def abandon_generation_claim(
-    claims: ClaimStore,
-    claim: GenerationClaim,
-    *,
-    detail: dict[str, object],
-    now_text: str | None = None,
-) -> None:
-    """Fence a conservatively stale generation for cleanup or replacement."""
-    _record_terminal_status(
-        claims,
-        claim,
-        status="abandoned",
-        detail=detail,
-        now_text=now_text,
-    )

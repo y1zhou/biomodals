@@ -1968,16 +1968,6 @@ class ServiceStore:
                 raise JobNotFoundError(f"Job not found: {job_id}")
         return _job_from_row(row)
 
-    def list_intermediate_cleanup_candidates(
-        self,
-        *,
-        completed_before: int,
-        limit: int = 100,
-    ) -> list[JobRecord]:
-        """Remote scientific outputs are never service cache-cleanup candidates."""
-        del completed_before, limit
-        return []
-
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)

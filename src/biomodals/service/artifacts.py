@@ -9,7 +9,7 @@ import os
 import re
 import stat
 import time
-from collections.abc import AsyncIterable, Callable
+from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -20,7 +20,6 @@ from uuid import UUID, uuid4
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
-_WRITE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _PREPARED_ARTIFACT_SECONDS = 60
 
 
@@ -139,7 +138,6 @@ class ArtifactCache:
         self._active: dict[str, int] = {}
         self._prepared_until: dict[str, float] = {}
         self._verified: dict[str, tuple[int, str, int, int, int, int]] = {}
-        self._fill_tasks: dict[str, asyncio.Task[None]] = {}
         self._state_lock = Lock()
         self._closed = False
         self._worker = ThreadPoolExecutor(
@@ -321,103 +319,6 @@ class ArtifactCache:
             os.close(descriptor)
             raise
 
-    async def store(
-        self,
-        job_id: str,
-        *,
-        size_bytes: int,
-        sha256: str,
-        chunks: AsyncIterable[bytes],
-    ) -> ArtifactLease:
-        """Join one cancellation-safe, per-Job cache fill and lease its result."""
-        self._validate_metadata(size_bytes=size_bytes, sha256=sha256)
-        existing = await self.acquire_async(
-            job_id,
-            size_bytes=size_bytes,
-            sha256=sha256,
-        )
-        if existing is not None:
-            return existing
-
-        with self._state_lock:
-            if self._closed:
-                raise RuntimeError("Artifact cache is closed")
-            task = self._fill_tasks.get(job_id)
-            if task is not None and task.done():
-                self._fill_tasks.pop(job_id, None)
-                task = None
-            if task is None:
-                task = asyncio.create_task(
-                    self._fill(
-                        job_id,
-                        size_bytes=size_bytes,
-                        sha256=sha256,
-                        chunks=chunks,
-                    ),
-                    name=f"biomodals-artifact-fill-{job_id}",
-                )
-                self._fill_tasks[job_id] = task
-                task.add_done_callback(
-                    lambda completed, fill_job_id=job_id: self._fill_finished(
-                        fill_job_id,
-                        completed,
-                    )
-                )
-            # Every waiter protects the publication until it has either
-            # acquired its own descriptor lease or stopped waiting.
-            self._active[job_id] = self._active.get(job_id, 0) + 1
-        try:
-            await asyncio.shield(task)
-            lease = await self.acquire_async(
-                job_id,
-                size_bytes=size_bytes,
-                sha256=sha256,
-            )
-            if lease is None:  # pragma: no cover - protected fill invariant
-                raise ArtifactIntegrityError("Published cache entry disappeared")
-            return lease
-        finally:
-            self._release(job_id)
-
-    async def _fill(
-        self,
-        job_id: str,
-        *,
-        size_bytes: int,
-        sha256: str,
-        chunks: AsyncIterable[bytes],
-    ) -> None:
-        """Stream one remote artifact into a private staging file."""
-        temporary = self.staging_path(job_id)
-        descriptor: int | None = None
-        written = 0
-        try:
-            descriptor = os.open(temporary, _WRITE_FLAGS, 0o600)
-            async for chunk in chunks:
-                written += len(chunk)
-                if written > size_bytes:
-                    raise ArtifactIntegrityError(
-                        "Downloaded artifact exceeded its recorded size"
-                    )
-                await self.run_bounded(self._write_all, descriptor, chunk)
-            if written != size_bytes:
-                raise ArtifactIntegrityError(
-                    "Downloaded artifact failed its integrity check"
-                )
-            await self.run_bounded(
-                self._publish_descriptor,
-                job_id,
-                temporary,
-                descriptor,
-                size_bytes,
-                sha256,
-                False,
-            )
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            temporary.unlink(missing_ok=True)
-
     def staging_path(self, job_id: str) -> Path:
         """Allocate a unique path counted as active Result staging."""
         self._path(job_id)
@@ -442,7 +343,6 @@ class ArtifactCache:
                 descriptor,
                 size_bytes,
                 sha256,
-                False,
             )
         finally:
             os.close(descriptor)
@@ -471,7 +371,6 @@ class ArtifactCache:
         descriptor: int,
         size_bytes: int,
         sha256: str,
-        lease: bool,
     ) -> None:
         """Verify one staged descriptor and publish it without a path race."""
         if not self._matches(
@@ -492,8 +391,6 @@ class ArtifactCache:
                 size_bytes,
                 sha256,
             )
-            if lease:
-                self._active[job_id] = self._active.get(job_id, 0) + 1
 
     def _open_staging(self, path: Path) -> int:
         if path.parent != self.directory or not path.name.endswith(".part"):
@@ -502,13 +399,6 @@ class ArtifactCache:
         if descriptor is None:
             raise ArtifactIntegrityError("Staged artifact is unavailable")
         return descriptor
-
-    def _fill_finished(self, job_id: str, task: asyncio.Task[None]) -> None:
-        if not task.cancelled():
-            task.exception()
-        with self._state_lock:
-            if self._fill_tasks.get(job_id) is task:
-                self._fill_tasks.pop(job_id, None)
 
     def _open(self, path: Path) -> int | None:
         try:
@@ -594,9 +484,7 @@ class ArtifactCache:
                 if stat.S_ISREG(file_stat.st_mode):
                     staging.append(file_stat)
         with self._state_lock:
-            protected = (
-                set(self._active) | set(self._fill_tasks) | self._prepared_locked()
-            )
+            protected = set(self._active) | self._prepared_locked()
         reclaimable = [
             file_stat for path, file_stat in archives if path.stem not in protected
         ]
@@ -622,11 +510,7 @@ class ArtifactCache:
         for path, file_stat in self._archives():
             job_id = path.stem
             with self._state_lock:
-                if (
-                    self._active.get(job_id, 0)
-                    or job_id in self._fill_tasks
-                    or job_id in self._prepared_locked()
-                ):
+                if self._active.get(job_id, 0) or job_id in self._prepared_locked():
                     continue
                 if self._unlink_if_same(path, file_stat):
                     self._verified.pop(job_id, None)
@@ -647,9 +531,6 @@ class ArtifactCache:
         """Finish queued artifact work and stop the single worker thread."""
         with self._state_lock:
             self._closed = True
-            fills = tuple(self._fill_tasks.values())
-        if fills:
-            await asyncio.gather(*fills, return_exceptions=True)
         self._worker.shutdown(wait=True, cancel_futures=True)
 
     def cached_job_ids(self) -> set[str]:
@@ -659,13 +540,6 @@ class ArtifactCache:
     async def cached_job_ids_async(self) -> set[str]:
         """Scan cache membership on the bounded artifact worker."""
         return await self.run_bounded(self.cached_job_ids)
-
-    @staticmethod
-    def _write_all(descriptor: int, content: bytes) -> None:
-        view = memoryview(content)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
 
     @staticmethod
     def _validate_metadata(*, size_bytes: int, sha256: str) -> None:

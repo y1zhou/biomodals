@@ -5282,7 +5282,6 @@ def _run_oligoformer_postprocess_locked(
     if off_target:
         for stem in refreshed_plan.output_stems:
             _cleanup_off_target_transients(layout.prep_dir / "off_target" / stem)
-        CONF.output_volume.commit()
     return _package_output_tables(output_dir, refreshed_plan.output_stems)
 
 

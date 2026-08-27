@@ -1255,7 +1255,6 @@ def finalize_run_summary(
         if entry is None:
             raise RuntimeError("Published run summary failed validation")
         shutil.rmtree(staging_root, ignore_errors=True)
-        runtime.volume.commit()
         terminal_status = "complete"
         terminal_detail = {
             "publication": "published",

@@ -705,7 +705,6 @@ def run_template_search(
         if entry is None:
             raise RuntimeError("Published template result failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        runtime.cache_volume.commit()
         terminal_status = "complete"
         terminal_detail = {
             "publication": "published",

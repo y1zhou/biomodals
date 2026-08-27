@@ -1020,7 +1020,6 @@ def run_database_search(
         if entry is None:
             raise RuntimeError("Published Raw Database MSA failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        runtime.cache_volume.commit()
         terminal_status = "complete"
         terminal_detail = {
             "publication": "published",
@@ -1436,7 +1435,6 @@ def assemble_and_publish_msas(
         if reusable is None:
             raise RuntimeError("Published combined MSA failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        runtime.cache_volume.commit()
         terminal_status = "complete"
         terminal_detail = {
             "publication": "published",

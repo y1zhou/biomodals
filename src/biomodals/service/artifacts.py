@@ -430,7 +430,7 @@ class ArtifactCache:
         *,
         size_bytes: int,
         sha256: str,
-    ) -> ArtifactLease:
+    ) -> None:
         """Verify and atomically adopt a locally built Result archive."""
         self._validate_metadata(size_bytes=size_bytes, sha256=sha256)
         descriptor = self._open_staging(path)
@@ -442,17 +442,27 @@ class ArtifactCache:
                 descriptor,
                 size_bytes,
                 sha256,
-                True,
+                False,
             )
-            return ArtifactLease(
-                descriptor,
-                path=self._path(job_id),
-                cache=self,
-                job_id=job_id,
-            )
-        except BaseException:
+        finally:
             os.close(descriptor)
-            raise
+
+    async def discard_async(self, job_id: str) -> None:
+        """Remove one unleased cache entry after failed identity verification."""
+        await self.run_bounded(self.discard, job_id)
+
+    def discard(self, job_id: str) -> None:
+        """Remove one unleased cache entry after failed identity verification."""
+        path = self._path(job_id)
+        try:
+            file_stat = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        with self._state_lock:
+            if self._active.get(job_id, 0):
+                raise RuntimeError("Cannot discard an active Result archive")
+            self._verified.pop(job_id, None)
+        self._unlink_if_same(path, file_stat)
 
     def _publish_descriptor(
         self,

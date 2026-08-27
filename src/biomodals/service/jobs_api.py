@@ -10,7 +10,11 @@ from fastapi.responses import StreamingResponse
 
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease, run_blocking_io
 from biomodals.service.auth import AuthenticatedSession
-from biomodals.service.http_contract import require_session, require_unsafe_session
+from biomodals.service.http_contract import (
+    CodedAPIError,
+    require_session,
+    require_unsafe_session,
+)
 from biomodals.service.jobs import JobPageView, JobView
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
@@ -20,7 +24,11 @@ from biomodals.service.store import (
     JobState,
     ServiceStore,
 )
-from biomodals.service.tool_runtime import JobLifecycle
+from biomodals.service.tool_runtime import (
+    JobLifecycle,
+    PreparedResult,
+    ResultIntegrityError,
+)
 
 
 def create_jobs_router(
@@ -100,18 +108,25 @@ def create_jobs_router(
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
     ) -> JobView:
         job = _owned(store, session, job_id)
-        _require_result(job)
+        result = _require_result(job)
         lease = await cache.acquire_async(
             str(job.job_id),
-            size_bytes=job.result_size_bytes,
-            sha256=job.result_sha256,
+            size_bytes=result.size_bytes,
+            sha256=result.sha256,
         )
         if lease is None:
-            await lifecycle.restore_result(job)
+            try:
+                await lifecycle.restore_result(job)
+            except ResultIntegrityError as error:
+                raise CodedAPIError(
+                    status.HTTP_409_CONFLICT,
+                    "result_invalid",
+                    "The published Result could not be restored exactly",
+                ) from error
         else:
             lease.close()
         cache.protect_prepared(str(job.job_id))
-        return view(job, session)
+        return view(_owned(store, session, job_id), session)
 
     @router.get("/{job_id}/download")
     async def download(
@@ -120,20 +135,20 @@ def create_jobs_router(
         range_header: Annotated[str | None, Header(alias="Range")] = None,
     ) -> StreamingResponse:
         job = _owned(store, session, job_id)
-        _require_result(job)
+        result = _require_result(job)
         lease = await cache.acquire_async(
             str(job.job_id),
-            size_bytes=job.result_size_bytes,
-            sha256=job.result_sha256,
+            size_bytes=result.size_bytes,
+            sha256=result.sha256,
         )
         if lease is None:
             raise HTTPException(409, "Result must be prepared before download")
         return _response(
             lease,
-            filename=job.result_filename,
-            media_type=job.result_media_type,
-            size_bytes=job.result_size_bytes,
-            sha256=job.result_sha256,
+            filename=result.filename,
+            media_type=result.media_type,
+            size_bytes=result.size_bytes,
+            sha256=result.sha256,
             range_header=range_header,
         )
 
@@ -151,15 +166,23 @@ def _owned(
     return job
 
 
-def _require_result(job: JobRecord) -> None:
+def _require_result(job: JobRecord) -> PreparedResult:
     if (
         job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}
         or job.result_filename is None
         or job.result_media_type is None
         or job.result_size_bytes is None
         or job.result_sha256 is None
+        or job.result_archive_schema is None
     ):
         raise HTTPException(409, "Result is not ready")
+    return PreparedResult(
+        filename=job.result_filename,
+        media_type=job.result_media_type,
+        size_bytes=job.result_size_bytes,
+        sha256=job.result_sha256,
+        archive_schema=job.result_archive_schema,
+    )
 
 
 def _response(

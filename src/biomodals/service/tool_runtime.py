@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import time
 from collections.abc import Sequence
@@ -36,6 +37,12 @@ _TRANSIENT_RESULT_ERRORS = (
     modal.exception.ServiceError,
     modal.exception.TimeoutError,
 )
+_RECOVERABLE_STORAGE_ERRNOS = frozenset({errno.EDQUOT, errno.ENOSPC})
+_RECONCILIATION_CONCURRENCY = 4
+
+
+class ResultIntegrityError(RuntimeError):
+    """An exact previously published Result could not be restored."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +112,7 @@ class JobLifecycle:
         if len(self.registrations) != len(registrations):
             raise ValueError("Tool registrations must be unique")
         self._locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
+        self._restore_tasks: dict[UUID, asyncio.Task[PreparedResult]] = {}
 
     async def advance(
         self,
@@ -136,11 +144,12 @@ class JobLifecycle:
                 locator = _locator(job)
                 try:
                     call_id = await self.remote.launch(locator)
-                except RemoteSubmissionOutcomeUnknownError as error:
+                except RemoteSubmissionOutcomeUnknownError:
+                    LOGGER.warning("Remote launch outcome is unknown", exc_info=True)
                     return self.store.mark_state_unknown(
                         job_id,
                         reason="submission_outcome_unknown",
-                        message=str(error),
+                        message="The remote launch outcome could not be confirmed",
                         now=now,
                     )
                 return self.store.record_launch(
@@ -151,18 +160,22 @@ class JobLifecycle:
             if job.state == JobState.CANCEL_REQUESTED:
                 try:
                     overview = await self.remote.cancel(_locator(job))
-                except RemoteExecutionIdentityMismatchError as error:
+                except RemoteExecutionIdentityMismatchError:
+                    LOGGER.warning(
+                        "Remote execution identity is unknown", exc_info=True
+                    )
                     return self.store.mark_state_unknown(
                         job_id,
                         reason="provider_outcome_unknown",
-                        message=str(error),
+                        message="The remote execution identity could not be confirmed",
                         now=now,
                     )
-                except RemoteDeploymentUnavailableError as error:
+                except RemoteDeploymentUnavailableError:
+                    LOGGER.warning("Remote deployment is unavailable", exc_info=True)
                     return self.store.mark_state_unknown(
                         job_id,
                         reason="deployment_unavailable",
-                        message=str(error),
+                        message="The deployed Tool could not be reached",
                         now=now,
                     )
                 return await self._observe(job, overview, registration, now=now)
@@ -172,7 +185,6 @@ class JobLifecycle:
                         job,
                         registration,
                         result_state=JobState(job.result_state),
-                        now=now,
                     )
                 return job
             if job.state in {
@@ -213,18 +225,22 @@ class JobLifecycle:
                         error_message="The remote execution coordinator failed",
                         now=now,
                     )
-                except RemoteExecutionIdentityMismatchError as error:
+                except RemoteExecutionIdentityMismatchError:
+                    LOGGER.warning(
+                        "Remote execution identity is unknown", exc_info=True
+                    )
                     return self.store.mark_state_unknown(
                         job_id,
                         reason="provider_outcome_unknown",
-                        message=str(error),
+                        message="The remote execution identity could not be confirmed",
                         now=now,
                     )
-                except RemoteDeploymentUnavailableError as error:
+                except RemoteDeploymentUnavailableError:
+                    LOGGER.warning("Remote deployment is unavailable", exc_info=True)
                     return self.store.mark_state_unknown(
                         job_id,
                         reason="deployment_unavailable",
-                        message=str(error),
+                        message="The deployed Tool could not be reached",
                         now=now,
                     )
                 return await self._observe(
@@ -233,13 +249,13 @@ class JobLifecycle:
                     registration,
                     now=now,
                     root_completed=root_completed,
+                    finalize=finalize,
                 )
             if finalize and job.state == JobState.FINALIZING:
                 return await self._finalize(
                     job,
                     registration,
                     result_state=JobState(job.result_state or JobState.SUCCEEDED),
-                    now=now,
                 )
             return job
 
@@ -253,18 +269,20 @@ class JobLifecycle:
                 return job
             try:
                 overview = await self.remote.cancel(_locator(job))
-            except RemoteExecutionIdentityMismatchError as error:
+            except RemoteExecutionIdentityMismatchError:
+                LOGGER.warning("Remote execution identity is unknown", exc_info=True)
                 return self.store.mark_state_unknown(
                     job_id,
                     reason="provider_outcome_unknown",
-                    message=str(error),
+                    message="The remote execution identity could not be confirmed",
                     now=int(time.time()),
                 )
-            except RemoteDeploymentUnavailableError as error:
+            except RemoteDeploymentUnavailableError:
+                LOGGER.warning("Remote deployment is unavailable", exc_info=True)
                 return self.store.mark_state_unknown(
                     job_id,
                     reason="deployment_unavailable",
-                    message=str(error),
+                    message="The deployed Tool could not be reached",
                     now=int(time.time()),
                 )
             return await self._observe(
@@ -282,6 +300,7 @@ class JobLifecycle:
         *,
         now: int,
         root_completed: bool = False,
+        finalize: bool = False,
     ) -> JobRecord:
         queued_call_handles = (
             await self.remote.queued_provider_call_handles(
@@ -317,6 +336,12 @@ class JobLifecycle:
                 projection=projection,
                 now=now,
             )
+            if finalize:
+                return await self._finalize(
+                    job,
+                    registration,
+                    result_state=result_state,
+                )
             return job
         state = {
             RunStatus.PENDING: JobState.RUNNING,
@@ -348,15 +373,15 @@ class JobLifecycle:
         registration: ToolRegistration,
         *,
         result_state: JobState,
-        now: int,
     ) -> JobRecord:
         try:
             result = await registration.adapter.prepare_result(
                 job,
                 self.cache,
-                completed_at=job.finalization_started_at or now,
+                completed_at=job.finalization_started_at or int(time.time()),
             )
         except _TRANSIENT_RESULT_ERRORS:
+            now = int(time.time())
             LOGGER.warning(
                 "Result preparation is temporarily unavailable for Job %s",
                 job.job_id,
@@ -369,7 +394,30 @@ class JobLifecycle:
                 retry_at=now + 60,
                 now=now,
             )
+        except OSError as error:
+            now = int(time.time())
+            if error.errno in _RECOVERABLE_STORAGE_ERRNOS:
+                LOGGER.warning(
+                    "Local Result storage is temporarily unavailable for Job %s",
+                    job.job_id,
+                    exc_info=True,
+                )
+                return self.store.block_job(
+                    job.job_id,
+                    category="result_preparation_failed",
+                    message="Result preparation is temporarily unavailable",
+                    retry_at=now + 60,
+                    now=now,
+                )
+            LOGGER.exception("Could not prepare Result for Job %s", job.job_id)
+            return self.store.fail_job(
+                job.job_id,
+                error_code="result_preparation_failed",
+                error_message="The Result archive could not be prepared",
+                now=now,
+            )
         except Exception:
+            now = int(time.time())
             LOGGER.exception("Could not prepare Result for Job %s", job.job_id)
             return self.store.fail_job(
                 job.job_id,
@@ -385,7 +433,7 @@ class JobLifecycle:
             result_size_bytes=result.size_bytes,
             result_sha256=result.sha256,
             result_archive_schema=result.archive_schema,
-            now=now,
+            now=int(time.time()),
         )
 
     def _required_job(self, job_id: UUID) -> JobRecord:
@@ -395,7 +443,32 @@ class JobLifecycle:
         return job
 
     async def restore_result(self, job: JobRecord) -> PreparedResult:
-        """Rebuild a cleared local archive from its remote publication."""
+        """Join one cancellation-safe exact Result restoration per Job."""
+        task = self._restore_tasks.get(job.job_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._restore_result(job.job_id),
+                name=f"biomodals-result-restore-{job.job_id}",
+            )
+            self._restore_tasks[job.job_id] = task
+            task.add_done_callback(
+                lambda completed, job_id=job.job_id: self._restore_finished(
+                    job_id, completed
+                )
+            )
+        return await asyncio.shield(task)
+
+    async def _restore_result(self, job_id: UUID) -> PreparedResult:
+        job = self._required_job(job_id)
+        recorded = _recorded_result(job)
+        lease = await self.cache.acquire_async(
+            str(job_id),
+            size_bytes=recorded.size_bytes,
+            sha256=recorded.sha256,
+        )
+        if lease is not None:
+            lease.close()
+            return recorded
         result = await self.registrations[job.tool].adapter.prepare_result(
             job,
             self.cache,
@@ -408,9 +481,29 @@ class JobLifecycle:
             or result.sha256 != job.result_sha256
             or result.archive_schema != job.result_archive_schema
         ):
-            raise RuntimeError("Rebuilt Result does not match its recorded identity")
-        self.store.set_result_cached(job.job_id, cached=True)
+            await self.cache.discard_async(str(job.job_id))
+            self.store.block_job(
+                job.job_id,
+                category="result_integrity",
+                message="The published Result could not be restored exactly",
+                retry_at=None,
+                now=int(time.time()),
+            )
+            raise ResultIntegrityError(
+                "Rebuilt Result does not match its recorded identity"
+            )
+        self.store.restore_result_cached(job.job_id, now=int(time.time()))
         return result
+
+    def _restore_finished(
+        self,
+        job_id: UUID,
+        task: asyncio.Task[PreparedResult],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+        if self._restore_tasks.get(job_id) is task:
+            self._restore_tasks.pop(job_id, None)
 
 
 def _locator(job: JobRecord) -> ExecutionLocator:
@@ -433,17 +526,41 @@ async def reconciliation_loop(
     """Retry bounded service work; remote coordinators keep executing alone."""
     while not stop.is_set():
         now = int(time.time())
-        for job in lifecycle.store.list_reconcilable_jobs(now=now):
-            try:
-                await lifecycle.advance(
-                    job.job_id,
-                    finalize=True,
-                    background=True,
-                )
-            except Exception:
-                LOGGER.exception("Could not reconcile Job %s", job.job_id)
-                continue
+        semaphore = asyncio.Semaphore(_RECONCILIATION_CONCURRENCY)
+
+        async def reconcile(job: JobRecord, gate: asyncio.Semaphore) -> None:
+            async with gate:
+                try:
+                    await lifecycle.advance(
+                        job.job_id,
+                        finalize=True,
+                        background=True,
+                    )
+                except Exception:
+                    LOGGER.exception("Could not reconcile Job %s", job.job_id)
+
+        async with asyncio.TaskGroup() as tasks:
+            for job in lifecycle.store.list_reconcilable_jobs(now=now):
+                tasks.create_task(reconcile(job, semaphore))
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
         except TimeoutError:
             pass
+
+
+def _recorded_result(job: JobRecord) -> PreparedResult:
+    if (
+        job.result_filename is None
+        or job.result_media_type is None
+        or job.result_size_bytes is None
+        or job.result_sha256 is None
+        or job.result_archive_schema is None
+    ):
+        raise ResultIntegrityError("Job has no complete recorded Result identity")
+    return PreparedResult(
+        filename=job.result_filename,
+        media_type=job.result_media_type,
+        size_bytes=job.result_size_bytes,
+        sha256=job.result_sha256,
+        archive_schema=job.result_archive_schema,
+    )

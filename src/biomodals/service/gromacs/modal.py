@@ -110,13 +110,12 @@ class GromacsToolAdapter:
                     remote_mtimes=remote_mtimes,
                     run_bounded=cache.run_bounded,
                 )
-            lease = await cache.publish_staged(
+            await cache.publish_staged(
                 str(job.job_id),
                 path,
                 size_bytes=built.size_bytes,
                 sha256=built.sha256,
             )
-            lease.close()
         finally:
             path.unlink(missing_ok=True)
         return PreparedResult(

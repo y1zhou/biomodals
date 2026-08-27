@@ -152,13 +152,12 @@ class AlphaFold3ToolAdapter:
                 )
                 os.replace(archive, staging)
             size_bytes, digest = await cache.run_bounded(file_size_sha256, staging)
-            lease = await cache.publish_staged(
+            await cache.publish_staged(
                 str(job.job_id),
                 staging,
                 size_bytes=size_bytes,
                 sha256=digest,
             )
-            lease.close()
         finally:
             staging.unlink(missing_ok=True)
         return PreparedResult(

@@ -504,6 +504,40 @@ class ServiceStore:
                 (int(cached), str(job_id)),
             )
 
+    def restore_result_cached(self, job_id: UUID, *, now: int) -> JobRecord:
+        """Restore exact cached bytes and any prior completed Job state."""
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET cache_cleared_at = NULL,
+                    state = CASE
+                        WHEN state = ? AND blocking_category = 'result_integrity'
+                        THEN result_state ELSE state END,
+                    blocked_at = CASE
+                        WHEN blocking_category = 'result_integrity' THEN NULL
+                        ELSE blocked_at END,
+                    state_message = CASE
+                        WHEN blocking_category = 'result_integrity' THEN NULL
+                        ELSE state_message END,
+                    next_retry_at = CASE
+                        WHEN blocking_category = 'result_integrity' THEN NULL
+                        ELSE next_retry_at END,
+                    blocking_category = CASE
+                        WHEN blocking_category = 'result_integrity' THEN NULL
+                        ELSE blocking_category END,
+                    updated_at = ?
+                WHERE job_id = ?
+                """,
+                (JobState.BLOCKED.value, now, str(job_id)),
+            )
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+        return _job_from_row(row)
+
     def mark_result_cache_cleared(self, job_ids: tuple[str, ...]) -> None:
         """Exclude explicitly removed archives from future cached-size views."""
         if not job_ids:
@@ -1458,10 +1492,18 @@ class ServiceStore:
                 SELECT * FROM jobs
                 WHERE state IN ({placeholders})
                   AND (state != ? OR root_function_call_id IS NOT NULL)
+                  AND NOT (state = ? AND blocking_category = 'result_integrity'
+                           AND next_retry_at IS NULL)
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY updated_at, job_id LIMIT ?
                 """,  # noqa: S608 - generated placeholders
-                (*states, JobState.STATE_UNKNOWN.value, now, limit),
+                (
+                    *states,
+                    JobState.STATE_UNKNOWN.value,
+                    JobState.BLOCKED.value,
+                    now,
+                    limit,
+                ),
             ).fetchall()
         return [_job_from_row(row) for row in rows]
 

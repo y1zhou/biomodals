@@ -5,13 +5,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from biomodals.execution import ActiveProviderCallCounts, RunStatus
+from biomodals.service import tool_runtime
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
     RemoteExecutionIdentityMismatchError,
@@ -21,8 +24,10 @@ from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
     JobLifecycle,
     PreparedResult,
+    ResultIntegrityError,
     SubmissionWait,
     ToolRegistration,
+    reconciliation_loop,
 )
 from biomodals.service.tools import ALPHAFOLD3_TOOL
 
@@ -225,6 +230,143 @@ async def test_terminal_observation_defers_result_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_background_terminal_observation_finalizes_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _locator, _call_id):
+            return _overview(RunStatus.SUCCEEDED)
+
+        async def queued_provider_call_handles(self, _call_id, _overview):
+            return frozenset()
+
+    store, lifecycle, adapter = _lifecycle(tmp_path, Remote())
+    store.record_launch(JOB_ID, function_call_id="fc-root", now=20)
+    clock = iter((100, 200))
+    monkeypatch.setattr(tool_runtime.time, "time", lambda: next(clock))
+
+    completed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
+
+    assert completed.state == JobState.SUCCEEDED
+    assert completed.finalization_started_at == 100
+    assert completed.completed_at == 200
+    assert adapter.prepared == 1
+
+
+@pytest.mark.anyio
+async def test_result_restoration_is_shared_and_integrity_failure_blocks(
+    tmp_path: Path,
+) -> None:
+    class MismatchAdapter(Adapter):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        mismatch = True
+
+        async def prepare_result(self, job, cache, *, completed_at):
+            del job, cache, completed_at
+            self.prepared += 1
+            self.entered.set()
+            await self.release.wait()
+            return (
+                PreparedResult(
+                    "different.tar.zst",
+                    "application/zstd",
+                    2,
+                    "b" * 64,
+                    "v2",
+                )
+                if self.mismatch
+                else PreparedResult(
+                    "result.tar.zst",
+                    "application/zstd",
+                    1,
+                    "a" * 64,
+                    "v1",
+                )
+            )
+
+    adapter = MismatchAdapter()
+    store, lifecycle, _adapter = _lifecycle(tmp_path, SimpleNamespace(), adapter)
+    store.complete_job(
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        result_filename="result.tar.zst",
+        result_media_type="application/zstd",
+        result_size_bytes=1,
+        result_sha256="a" * 64,
+        result_archive_schema="v1",
+        now=20,
+    )
+    job = store.get_job_by_id(JOB_ID)
+    assert job is not None
+
+    first = asyncio.create_task(lifecycle.restore_result(job))
+    await adapter.entered.wait()
+    second = asyncio.create_task(lifecycle.restore_result(job))
+    adapter.release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert adapter.prepared == 1
+    assert all(isinstance(result, ResultIntegrityError) for result in results)
+    blocked = store.get_job_by_id(JOB_ID)
+    assert blocked is not None
+    assert (blocked.state, blocked.blocking_category) == (
+        JobState.BLOCKED,
+        "result_integrity",
+    )
+    assert store.list_reconcilable_jobs(now=10**10) == []
+
+    adapter.mismatch = False
+    await lifecycle.restore_result(blocked)
+    restored = store.get_job_by_id(JOB_ID)
+    assert restored is not None
+    assert (restored.state, restored.blocking_category) == (
+        JobState.SUCCEEDED,
+        None,
+    )
+
+
+@pytest.mark.anyio
+async def test_reconciliation_processes_at_most_four_jobs_concurrently() -> None:
+    stop = asyncio.Event()
+    active = 0
+    maximum = 0
+    completed = 0
+    jobs = [SimpleNamespace(job_id=uuid4()) for _ in range(8)]
+
+    class Store:
+        def list_reconcilable_jobs(self, *, now):
+            del now
+            return jobs
+
+    class Lifecycle:
+        store = Store()
+
+        async def advance(self, _job_id, *, finalize, background):
+            nonlocal active, maximum, completed
+            assert finalize and background
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            completed += 1
+            if completed == len(jobs):
+                stop.set()
+
+    await reconciliation_loop(
+        cast(JobLifecycle, Lifecycle()),
+        interval_seconds=60,
+        stop=stop,
+    )
+
+    assert maximum == 4
+
+
+@pytest.mark.anyio
 async def test_transient_result_failure_retries_later(tmp_path: Path) -> None:
     class UnavailableAdapter(Adapter):
         async def prepare_result(self, job, cache, *, completed_at):
@@ -276,6 +418,33 @@ async def test_permanent_result_failure_does_not_retry(tmp_path: Path) -> None:
         "result_preparation_failed",
     )
     assert failed.error_message == "The Result archive could not be prepared"
+
+
+@pytest.mark.anyio
+async def test_storage_exhaustion_blocks_result_preparation(tmp_path: Path) -> None:
+    class FullDiskAdapter(Adapter):
+        async def prepare_result(self, job, cache, *, completed_at):
+            del job, cache, completed_at
+            raise OSError(errno.ENOSPC, "disk full")
+
+    store, lifecycle, _adapter = _lifecycle(
+        tmp_path,
+        SimpleNamespace(),
+        FullDiskAdapter(),
+    )
+    store.begin_finalization(
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        projection={"stages": [], "warnings": []},
+        now=20,
+    )
+
+    blocked = await lifecycle.advance(JOB_ID, finalize=True)
+
+    assert (blocked.state, blocked.blocking_category) == (
+        JobState.BLOCKED,
+        "result_preparation_failed",
+    )
 
 
 @pytest.mark.anyio
@@ -486,5 +655,5 @@ async def test_remote_identity_mismatch_becomes_state_unknown(tmp_path: Path) ->
     assert (unknown.state, unknown.state_reason, unknown.state_message) == (
         JobState.STATE_UNKNOWN,
         "provider_outcome_unknown",
-        "wrong execution identity",
+        "The remote execution identity could not be confirmed",
     )

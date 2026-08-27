@@ -365,6 +365,12 @@ record diagnostics, but they do not fail, reassign, or retry a Task. Pull-worker
 claims and completions use stable request IDs so a lost response can be replayed
 without creating a new assignment.
 
+Worker code must likewise let `InputCancellation` escape without recording a
+terminal workload failure. It inherits from `BaseException`, so terminalize
+only ordinary caught `Exception` failures. Keep generation-scoped Volume
+staging rerunnable and reserve `finally` for cleanup that cannot prevent the
+same provider input from being redelivered.
+
 Remote workflow code should:
 
 - split large work into independently identified Tasks where scientifically

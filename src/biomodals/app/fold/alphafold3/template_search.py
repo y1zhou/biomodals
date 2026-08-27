@@ -652,16 +652,18 @@ def run_template_search(
         / claim.generation_id
     )
     log_path = generation_root / "run.log"
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.cache_volume.reload()
         if entry := load_template_entry(context):
-            terminal_status = "complete"
-            terminal_detail = {
-                "publication": "raced",
-                "done_sha256": entry.done_sha256,
-            }
+            finish_generation_claim(
+                runtime.claims,
+                claim,
+                status="complete",
+                detail={
+                    "publication": "raced",
+                    "done_sha256": entry.done_sha256,
+                },
+            )
             return entry.summary("reused")
         append_log(
             log_path,
@@ -705,11 +707,15 @@ def run_template_search(
         if entry is None:
             raise RuntimeError("Published template result failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "done_sha256": entry.done_sha256,
-        }
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="complete",
+            detail={
+                "publication": "published",
+                "done_sha256": entry.done_sha256,
+            },
+        )
         return entry.summary("published")
     except Exception as exc:
         append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
@@ -724,15 +730,13 @@ def run_template_search(
             },
         )
         runtime.cache_volume.commit()
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
+        raise

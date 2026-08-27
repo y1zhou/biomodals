@@ -966,16 +966,18 @@ def run_database_search(
         / claim.generation_id
     )
     log_path = generation_root / "run.log"
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.cache_volume.reload()
         if entry := load_raw_msa(context):
-            terminal_status = "complete"
-            terminal_detail = {
-                "publication": "raced",
-                "done_sha256": entry.done_sha256,
-            }
+            finish_generation_claim(
+                runtime.claims,
+                claim,
+                status="complete",
+                detail={
+                    "publication": "raced",
+                    "done_sha256": entry.done_sha256,
+                },
+            )
             return entry.summary("reused")
         append_log(
             log_path,
@@ -1020,11 +1022,15 @@ def run_database_search(
         if entry is None:
             raise RuntimeError("Published Raw Database MSA failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "done_sha256": entry.done_sha256,
-        }
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="complete",
+            detail={
+                "publication": "published",
+                "done_sha256": entry.done_sha256,
+            },
+        )
         return entry.summary("published")
     except Exception as exc:
         append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
@@ -1040,18 +1046,16 @@ def run_database_search(
             },
         )
         runtime.cache_volume.commit()
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
+        raise
 
 
 def _required_database_ids(task: MsaAssemblyTask) -> tuple[str, ...]:
@@ -1394,13 +1398,15 @@ def assemble_and_publish_msas(
         / cast(str, provenance["combined_identity"])
         / claim.generation_id
     )
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.cache_volume.reload()
         if reusable := _load_combined_msa(sequence_root, provenance, task):
-            terminal_status = "complete"
-            terminal_detail = {"publication": "raced"}
+            finish_generation_claim(
+                runtime.claims,
+                claim,
+                status="complete",
+                detail={"publication": "raced"},
+            )
             return _combined_msa_result("reused", task, provenance, *reusable)
         filenames = {
             "unpairedMsa": "unpaired.a3m",
@@ -1435,22 +1441,24 @@ def assemble_and_publish_msas(
         if reusable is None:
             raise RuntimeError("Published combined MSA failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "combined_identity": provenance["combined_identity"],
-        }
-        return _combined_msa_result("published", task, provenance, *reusable)
-    except Exception as exc:
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="complete",
+            detail={
+                "publication": "published",
+                "combined_identity": provenance["combined_identity"],
+            },
         )
+        return _combined_msa_result("published", task, provenance, *reusable)
+    except Exception as exc:
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        raise

@@ -1703,6 +1703,101 @@ def test_template_search_rejects_oversized_result_before_publication(
     assert not (context.sequence_root / "templates.done.json").exists()
 
 
+def test_template_search_redelivers_same_generation_after_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_id = "generation"
+    claims = FakeClaimStore()
+    monkeypatch.setattr(
+        template_search,
+        "_resolve_template_msa",
+        lambda runtime, task: ">query\nACDE\n",
+    )
+    monkeypatch.setattr(
+        template_search,
+        "_execute_template_search",
+        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    runtime = TemplateRuntime(
+        source_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        cache_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=claims,
+        container_id="test",
+        maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+        source_root=tmp_path / "source",
+        cache_root=tmp_path,
+    )
+    task = TemplateTask(
+        sequence="ACDE",
+        unpaired_msa=None,
+        unpaired_msa_reference=MsaArtifactReference.from_content(
+            msa_search.sequence_cache_relpath("protein", "ACDE") / "unpaired.a3m",
+            b">query\nACDE\n",
+        ),
+        publish_canonical=True,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        template_search.run_template_search(
+            runtime,
+            task,
+            generation_id=generation_id,
+        )
+
+    context = build_template_context(
+        tmp_path,
+        task.sequence,
+        task.unpaired_msa_sha256,
+        task.max_template_date,
+    )
+    assert (
+        generation_status(
+            claims,
+            f"template:Protein:{context.sequence_hash}",
+            generation_id,
+        )
+        is None
+    )
+
+    templates = [
+        {
+            "mmcif": "data_template\n#\n",
+            "queryIndices": [0],
+            "templateIndices": [0],
+        }
+    ]
+    monkeypatch.setattr(
+        template_search,
+        "_execute_template_search",
+        lambda *args: (templates, {"contract": "pinned"}),
+    )
+
+    result = template_search.run_template_search(
+        runtime,
+        task,
+        generation_id=generation_id,
+    )
+
+    assert result["status"] == "published"
+    assert result["templates"] == templates
+    assert (
+        generation_status(
+            claims,
+            f"template:Protein:{context.sequence_hash}",
+            generation_id,
+        )["status"]
+        == "complete"
+    )
+
+
 def test_template_cache_inspection_bounds_aggregate_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

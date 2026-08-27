@@ -545,14 +545,14 @@ def guard_seed_prediction_claims(
     run_id: str,
     claimed_seed_records: list[dict[str, object]],
 ) -> Iterator[tuple[ClaimedSeed, ...]]:
-    """Make every valid worker claim terminal when its invocation fails."""
+    """Fail claims for ordinary errors while preserving Modal redelivery."""
     claimed_seeds = _validate_claimed_seeds(
         run_id,
         tuple(claimed_seed_from_dict(record) for record in claimed_seed_records),
     )
     try:
         yield claimed_seeds
-    except BaseException as exc:
+    except Exception as exc:
         for item in claimed_seeds:
             try:
                 if (
@@ -1150,8 +1150,6 @@ def finalize_run_summary(
                 ) from exc
             time.sleep(min(runtime.claim_poll_seconds, remaining))
 
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.volume.reload()
         markers = collect_seed_markers(
@@ -1165,11 +1163,15 @@ def finalize_run_summary(
         existing = load_summary_entry(run_root, selected_run)
         if existing is not None:
             if existing.included_seeds == included_seeds:
-                terminal_status = "complete"
-                terminal_detail = {
-                    "publication": "raced",
-                    "marker_sha256": existing.marker_sha256,
-                }
+                finish_generation_claim(
+                    runtime.claims,
+                    claim,
+                    status="complete",
+                    detail={
+                        "publication": "raced",
+                        "marker_sha256": existing.marker_sha256,
+                    },
+                )
                 return existing.summary("reused")
             if not set(existing.included_seeds).issubset(included_seeds):
                 raise RuntimeError(
@@ -1255,23 +1257,25 @@ def finalize_run_summary(
         if entry is None:
             raise RuntimeError("Published run summary failed validation")
         shutil.rmtree(staging_root, ignore_errors=True)
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "marker_sha256": entry.marker_sha256,
-            "included_seeds": list(entry.included_seeds),
-        }
-        return entry.summary("published")
-    except Exception as exc:
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="complete",
+            detail={
+                "publication": "published",
+                "marker_sha256": entry.marker_sha256,
+                "included_seeds": list(entry.included_seeds),
+            },
         )
+        return entry.summary("published")
+    except Exception as exc:
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        raise

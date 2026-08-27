@@ -858,6 +858,32 @@ def test_inference_worker_fails_claim_when_staged_input_loading_fails(
     assert status["phase"] == "inference-worker"
 
 
+def test_inference_worker_leaves_claim_open_when_container_is_interrupted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_id = "a" * 64
+    claimed_seed = _claimed_seed(run_id, 42)
+    claims = _install_claim_runtime(monkeypatch, tmp_path, claimed_seed)
+
+    with pytest.raises(KeyboardInterrupt):
+        with guard_seed_prediction_claims(
+            alphafold3_app._INFERENCE_RUNTIME,
+            run_id,
+            [claimed_seed.to_dict()],
+        ):
+            raise KeyboardInterrupt
+
+    assert (
+        generation_status(
+            claims,
+            claimed_seed.claim.scope_key,
+            claimed_seed.claim.generation_id,
+        )
+        is None
+    )
+
+
 def test_inference_worker_preserves_claim_already_completed_by_inner_worker(
     tmp_path: Path,
     monkeypatch,

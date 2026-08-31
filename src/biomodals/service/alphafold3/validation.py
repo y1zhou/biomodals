@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import orjson
@@ -27,6 +28,25 @@ from biomodals.helper.artifacts import replace_bytes_atomic
 MAX_VALIDATION_BYTES = MAX_STAGED_INPUT_BYTES
 MAX_JOB_NAME_LENGTH = 120
 VALIDATION_TTL_SECONDS = 24 * 60 * 60
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationLimits:
+    """Local retention limits for validated AlphaFold3 inputs."""
+
+    max_user_count: int = 8
+    max_user_bytes: int = 1024**3
+    max_total_count: int = 64
+    max_total_bytes: int = 8 * 1024**3
+    min_free_bytes: int = 1024**3
+
+
+class ValidationLimitExceededError(RuntimeError):
+    """Retained validation count or byte capacity is exhausted."""
+
+
+class ValidationStorageLowError(RuntimeError):
+    """The state filesystem cannot safely retain another validation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +100,15 @@ class ValidatedInput:
 class ValidatedInputStore:
     """Atomically retain successful validations in the configured state dir."""
 
-    def __init__(self, state_directory: Path) -> None:
+    def __init__(
+        self,
+        state_directory: Path,
+        *,
+        limits: ValidationLimits | None = None,
+    ) -> None:
         """Place validation resources below the service state directory."""
         self.directory = state_directory / "validated-inputs"
+        self.limits = limits if limits is not None else ValidationLimits()
 
     def initialize(self) -> None:
         """Create private validation storage."""
@@ -103,6 +129,7 @@ class ValidatedInputStore:
         size = source.stat().st_size
         if not 0 < size <= MAX_VALIDATION_BYTES:
             raise ValueError("AlphaFold3 document has an invalid size")
+        self.require_capacity(owner_user_id, additional_bytes=size)
         content = source.read_bytes()
         if sha256(content).hexdigest() != digest:
             raise ValueError("AlphaFold3 document digest changed during validation")
@@ -132,32 +159,33 @@ class ValidatedInputStore:
         staging = self.directory / f".{selected_id}.tmp"
         if target.exists() or staging.exists():
             raise FileExistsError(f"Validation already exists: {selected_id}")
+        document_content = orjson.dumps(normalized)
+        preview = _preview(normalized, settings, prediction_count)
+        metadata_content = orjson.dumps(
+            {
+                "validation_id": str(selected_id),
+                "owner_user_id": str(owner_user_id),
+                "digest": digest,
+                "created_at": created_at,
+                "expires_at": created_at + VALIDATION_TTL_SECONDS,
+                "settings": {
+                    "search_msa": settings.search_msa,
+                    "search_protein_templates": settings.search_protein_templates,
+                    "recycle": settings.recycle,
+                    "sample": settings.sample,
+                },
+                "preview": preview,
+            },
+            option=orjson.OPT_SORT_KEYS,
+        )
+        self.require_capacity(
+            owner_user_id,
+            additional_bytes=len(document_content) + len(metadata_content),
+        )
         staging.mkdir(mode=0o700)
         try:
-            replace_bytes_atomic(staging / "document.json", orjson.dumps(normalized))
-            preview = _preview(normalized, settings, prediction_count)
-            replace_bytes_atomic(
-                staging / "metadata.json",
-                orjson.dumps(
-                    {
-                        "validation_id": str(selected_id),
-                        "owner_user_id": str(owner_user_id),
-                        "digest": digest,
-                        "created_at": created_at,
-                        "expires_at": created_at + VALIDATION_TTL_SECONDS,
-                        "settings": {
-                            "search_msa": settings.search_msa,
-                            "search_protein_templates": (
-                                settings.search_protein_templates
-                            ),
-                            "recycle": settings.recycle,
-                            "sample": settings.sample,
-                        },
-                        "preview": preview,
-                    },
-                    option=orjson.OPT_SORT_KEYS,
-                ),
-            )
+            replace_bytes_atomic(staging / "document.json", document_content)
+            replace_bytes_atomic(staging / "metadata.json", metadata_content)
             os.replace(staging, target)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
@@ -236,16 +264,56 @@ class ValidatedInputStore:
 
     def usage(self) -> tuple[int, int]:
         """Return retained validation count and bytes for Admin storage views."""
-        files = [
-            path
-            for directory in self.directory.iterdir()
-            if directory.is_dir() and not directory.name.startswith(".")
-            for path in directory.iterdir()
-            if path.is_file()
-        ]
-        return len({path.parent for path in files}), sum(
-            path.stat().st_size for path in files
-        )
+        return self._usage()
+
+    def require_free_space(self, additional_bytes: int = 0) -> None:
+        """Reject writes that would consume the state filesystem reserve."""
+        if (
+            shutil.disk_usage(self.directory).free - additional_bytes
+            < self.limits.min_free_bytes
+        ):
+            raise ValidationStorageLowError(
+                "AlphaFold3 validation storage has insufficient free space"
+            )
+
+    def require_capacity(
+        self,
+        owner_user_id: UUID,
+        *,
+        additional_bytes: int,
+    ) -> None:
+        """Reject a validation before parsing when retention is full."""
+        total_count, total_bytes = self._usage()
+        user_count, user_bytes = self._usage(owner_user_id=owner_user_id)
+        if (
+            total_count >= self.limits.max_total_count
+            or total_bytes + additional_bytes > self.limits.max_total_bytes
+            or user_count >= self.limits.max_user_count
+            or user_bytes + additional_bytes > self.limits.max_user_bytes
+        ):
+            raise ValidationLimitExceededError(
+                "AlphaFold3 validation retention limit reached; delete an existing "
+                "validation or retry after it expires"
+            )
+        self.require_free_space(additional_bytes)
+
+    def _usage(self, *, owner_user_id: UUID | None = None) -> tuple[int, int]:
+        count = 0
+        size = 0
+        for directory in self.directory.iterdir():
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            try:
+                resource = self._load(directory)
+            except (FileNotFoundError, KeyError, TypeError, ValueError):
+                continue
+            if owner_user_id is not None and resource.owner_user_id != owner_user_id:
+                continue
+            count += 1
+            size += sum(
+                path.stat().st_size for path in directory.iterdir() if path.is_file()
+            )
+        return count, size
 
     @staticmethod
     def _load(directory: Path) -> ValidatedInput:
@@ -277,7 +345,7 @@ def _reject_path_fields(value: object) -> None:
 
 
 def _preview(
-    document: dict[str, object],
+    document: dict[str, Any],
     settings: ValidationSettings,
     prediction_count: int,
 ) -> dict[str, object]:

@@ -243,11 +243,13 @@ The AlphaFold3 validation route and standalone CLI accept a maximum 256 MiB
 JSON document. Larger API bodies receive `413 payload_too_large` before JSON
 parsing. The API does not add a streaming JSON parser; large Expert
 requests therefore require API-process memory above their wire size.
-The validation route streams request bytes into a temporary file, hashes them
-while writing, and runs JSON/Pydantic parsing in one bounded background worker.
-Only successful validation atomically publishes the 24-hour resource. This
-serializes the memory-heavy parse without blocking unrelated event-loop work;
-concurrent uploads may still progress.
+The validation route admits at most two uploads at a time, streams request bytes
+into temporary files, hashes them while writing, and runs JSON/Pydantic parsing
+in one bounded background worker. Only successful validation atomically publishes the
+24-hour resource. Retention is bounded to eight resources and 1 GiB per User,
+64 resources and 8 GiB service-wide, while preserving at least 1 GiB of free
+space on the state filesystem. Capacity exhaustion returns a typed `429` or
+`507` before the memory-heavy parse.
 Job names are limited to 120 characters. Pairformer recycles may be zero.
 Cleanup, deletion, and the final validation claim share one short process-local
 critical section so an admitted resource cannot be removed between reload and

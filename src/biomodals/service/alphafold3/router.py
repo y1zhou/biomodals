@@ -23,11 +23,14 @@ from biomodals.service.alphafold3.validation import (
     MAX_VALIDATION_BYTES,
     ValidatedInput,
     ValidatedInputStore,
+    ValidationLimitExceededError,
     ValidationSettings,
+    ValidationStorageLowError,
 )
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
+    CodedErrorResponse,
     require_session,
     require_unsafe_session,
 )
@@ -74,9 +77,18 @@ def create_router(
 ) -> APIRouter:
     """Create AlphaFold3 validation and submission routes."""
     router = APIRouter(prefix="/api/v1/alphafold3", tags=["alphafold3"])
+    upload_slots = asyncio.Semaphore(2)
     validation_lock = asyncio.Lock()
 
-    @router.post("/validations", response_model=ValidationView, status_code=201)
+    @router.post(
+        "/validations",
+        response_model=ValidationView,
+        status_code=201,
+        responses={
+            429: {"model": CodedErrorResponse},
+            507: {"model": CodedErrorResponse},
+        },
+    )
     async def validate_document(
         request: Request,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
@@ -85,51 +97,93 @@ def create_router(
         recycle: Annotated[int, Query(ge=0)] = 10,
         sample: Annotated[int, Query(ge=1)] = 5,
     ) -> ValidationView:
-        descriptor, raw_path = tempfile.mkstemp(
-            dir=validations.directory.parent,
-            prefix=".alphafold3-upload-",
-        )
-        path = Path(raw_path)
-        digest = hashlib.sha256()
-        size = 0
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    if size > MAX_VALIDATION_BYTES:
-                        raise CodedAPIError(
-                            413,
-                            "payload_too_large",
-                            "AlphaFold3 JSON exceeds 256 MiB",
-                        )
-                    digest.update(chunk)
-                    handle.write(chunk)
-            if size == 0:
-                raise CodedAPIError(400, "document_invalid", "JSON body is empty")
-            settings = ValidationSettings(
-                search_msa=search_msa,
-                search_protein_templates=search_protein_templates,
-                recycle=recycle,
-                sample=sample,
+        async with upload_slots:
+            async with validation_lock:
+                await asyncio.to_thread(
+                    validations.cleanup_expired,
+                    claimed=store.claimed_validation_ids(),
+                    now=int(time.time()),
+                )
+                try:
+                    validations.require_capacity(
+                        session.principal.user_id,
+                        additional_bytes=1,
+                    )
+                except ValidationLimitExceededError as error:
+                    raise CodedAPIError(
+                        429,
+                        "validation_limit",
+                        str(error),
+                    ) from error
+                except ValidationStorageLowError as error:
+                    raise CodedAPIError(
+                        507,
+                        "validation_storage_low",
+                        str(error),
+                    ) from error
+            descriptor, raw_path = tempfile.mkstemp(
+                dir=validations.directory.parent,
+                prefix=".alphafold3-upload-",
             )
+            path = Path(raw_path)
+            digest = hashlib.sha256()
+            size = 0
             try:
-                async with validation_lock:
-                    await asyncio.to_thread(
-                        validations.cleanup_expired,
-                        claimed=store.claimed_validation_ids(),
-                        now=int(time.time()),
+                with os.fdopen(descriptor, "wb") as handle:
+                    validations.require_free_space()
+                    next_space_check = 8 * 1024 * 1024
+                    async for chunk in request.stream():
+                        size += len(chunk)
+                        if size > MAX_VALIDATION_BYTES:
+                            raise CodedAPIError(
+                                413,
+                                "payload_too_large",
+                                "AlphaFold3 JSON exceeds 256 MiB",
+                            )
+                        if size >= next_space_check:
+                            validations.require_free_space(len(chunk))
+                            next_space_check = size + 8 * 1024 * 1024
+                        digest.update(chunk)
+                        handle.write(chunk)
+                if size == 0:
+                    raise CodedAPIError(
+                        400,
+                        "document_invalid",
+                        "JSON body is empty",
                     )
-                    validated = await asyncio.to_thread(
-                        validations.validate_and_publish,
-                        path,
-                        owner_user_id=session.principal.user_id,
-                        digest=digest.hexdigest(),
-                        settings=settings,
-                    )
-            except (TypeError, ValueError, orjson.JSONDecodeError) as error:
-                raise CodedAPIError(400, "document_invalid", str(error)) from error
-        finally:
-            path.unlink(missing_ok=True)
+                settings = ValidationSettings(
+                    search_msa=search_msa,
+                    search_protein_templates=search_protein_templates,
+                    recycle=recycle,
+                    sample=sample,
+                )
+                try:
+                    async with validation_lock:
+                        validated = await asyncio.to_thread(
+                            validations.validate_and_publish,
+                            path,
+                            owner_user_id=session.principal.user_id,
+                            digest=digest.hexdigest(),
+                            settings=settings,
+                        )
+                except ValidationLimitExceededError as error:
+                    raise CodedAPIError(429, "validation_limit", str(error)) from error
+                except ValidationStorageLowError as error:
+                    raise CodedAPIError(
+                        507,
+                        "validation_storage_low",
+                        str(error),
+                    ) from error
+                except (TypeError, ValueError, orjson.JSONDecodeError) as error:
+                    raise CodedAPIError(400, "document_invalid", str(error)) from error
+            except ValidationStorageLowError as error:
+                raise CodedAPIError(
+                    507,
+                    "validation_storage_low",
+                    str(error),
+                ) from error
+            finally:
+                path.unlink(missing_ok=True)
         return _validation_view(validated)
 
     @router.get("/validations/{validation_id}", response_model=ValidationView)

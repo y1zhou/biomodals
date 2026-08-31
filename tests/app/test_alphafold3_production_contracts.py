@@ -8,6 +8,7 @@ import datetime
 import hashlib
 import importlib
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -3202,7 +3203,7 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     view_id = cast(str, manifest["view_id"])
     downloaded_paths: list[str] = []
 
-    def download_files(downloads: list[tuple[str, Path]]) -> None:
+    def download_files(downloads: Iterable[tuple[str, Path]]) -> None:
         for remote_path, destination in downloads:
             downloaded_paths.append(remote_path)
             destination.parent.mkdir(parents=True, exist_ok=True)

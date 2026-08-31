@@ -16,7 +16,7 @@ import shutil
 import subprocess as sp
 import tarfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -1172,7 +1172,7 @@ def create_request_archive(
     *,
     output_dir: str | Path,
     display_name: str,
-    download_files: Callable[[list[tuple[str, Path]]], None] | None = None,
+    download_files: Callable[[Iterable[tuple[str, Path]]], None] | None = None,
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
     _, view_id, canonical_name, artifacts, ranking = _validated_manifest_artifacts(
@@ -1242,10 +1242,12 @@ def create_request_archive(
                 archive_root / f"{presentation_name}_ranking_scores.csv",
                 ranking_csv,
             )
-            input_paths: list[Path] = []
-            downloaded: dict[tuple[str, int, str], Path] = {}
-            pending_downloads: list[tuple[dict[str, object], Path]] = []
-            pending_copies: list[tuple[Path, Path]] = []
+            input_path: Path | None = None
+            input_count = 0
+            downloaded: dict[
+                tuple[str, int, str],
+                tuple[dict[str, object], Path],
+            ] = {}
             for artifact, transformed in transformed_artifacts:
                 destination = archive_root / Path(transformed.as_posix())
                 source_identity = (
@@ -1253,32 +1255,38 @@ def create_request_archive(
                     cast(int, artifact["size_bytes"]),
                     cast(str, artifact["sha256"]),
                 )
-                if source := downloaded.get(source_identity):
-                    pending_copies.append((source, destination))
-                else:
-                    downloaded[source_identity] = destination
-                    pending_downloads.append((artifact, destination))
+                downloaded.setdefault(source_identity, (artifact, destination))
                 if artifact["role"] == "input":
-                    input_paths.append(destination)
+                    input_path = destination
+                    input_count += 1
             if download_files is None:
-                for artifact, destination in pending_downloads:
+                for artifact, destination in downloaded.values():
                     _download_artifact(reader, artifact, destination)
             else:
-                download_files([
+                download_files(
                     (cast(str, artifact["volume_path"]), destination)
-                    for artifact, destination in pending_downloads
-                ])
-                for artifact, destination in pending_downloads:
+                    for artifact, destination in downloaded.values()
+                )
+                for artifact, destination in downloaded.values():
                     _validate_downloaded_artifact(artifact, destination)
-            for source, destination in pending_copies:
+            for artifact, transformed in transformed_artifacts:
+                destination = archive_root / Path(transformed.as_posix())
+                source_identity = (
+                    cast(str, artifact["volume_path"]),
+                    cast(int, artifact["size_bytes"]),
+                    cast(str, artifact["sha256"]),
+                )
+                source = downloaded[source_identity][1]
+                if source == destination:
+                    continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
-            if len(input_paths) != 1:
+            if input_count != 1 or input_path is None:
                 raise RuntimeError(
                     "Request archive requires exactly one input artifact"
                 )
             _rewrite_downloaded_input(
-                input_paths[0],
+                input_path,
                 display_name=display_name,
             )
             _record_archive_artifacts(

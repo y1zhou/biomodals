@@ -38,3 +38,23 @@ def test_download_modal_volume_files_limits_parallel_files(tmp_path: Path) -> No
     assert [path.read_text() for _, path in downloads] == [
         f"remote/{index}" for index in range(5)
     ]
+
+
+def test_download_modal_volume_files_bounds_live_tasks(tmp_path: Path) -> None:
+    """Large lazy inputs create only the configured worker tasks."""
+    maximum_tasks = 0
+
+    class DownloadMethod:
+        async def aio(self, path, handle, **_kwargs):
+            nonlocal maximum_tasks
+            maximum_tasks = max(maximum_tasks, len(asyncio.all_tasks()))
+            await asyncio.sleep(0)
+            return handle.write(path.encode())
+
+    class Volume:
+        _read_file_into_fileobj = DownloadMethod()
+
+    downloads = ((f"remote/{index}", tmp_path / str(index)) for index in range(500))
+    download_modal_volume_files(Volume(), downloads, concurrency=4)
+
+    assert maximum_tasks <= 5

@@ -17,38 +17,43 @@ def download_modal_volume_files(
     """Download selected Volume files with one shared concurrency limit."""
     if isinstance(concurrency, bool) or concurrency < 1:
         raise ValueError("concurrency must be a positive integer")
-    selected = tuple(downloads)
-    if selected:
-        asyncio.run(_download_modal_volume_files(volume, selected, concurrency))
+    asyncio.run(_download_modal_volume_files(volume, downloads, concurrency))
 
 
 async def _download_modal_volume_files(
     volume: object,
-    downloads: tuple[tuple[str, Path], ...],
+    downloads: Iterable[tuple[str, Path]],
     concurrency: int,
 ) -> None:
-    file_semaphore = asyncio.Semaphore(concurrency)
     download_semaphore = asyncio.Semaphore(concurrency)
     rpc_semaphore = asyncio.Semaphore(concurrency)
     read_file = cast(Any, volume)._read_file_into_fileobj.aio
+    pending = iter(downloads)
 
     async def download(remote_path: str, destination: Path) -> None:
         complete = False
         try:
-            async with file_semaphore:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with destination.open("xb") as handle:
-                    await read_file(
-                        remote_path,
-                        handle,
-                        download_semaphore=download_semaphore,
-                        rpc_semaphore=rpc_semaphore,
-                    )
-                complete = True
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("xb") as handle:
+                await read_file(
+                    remote_path,
+                    handle,
+                    download_semaphore=download_semaphore,
+                    rpc_semaphore=rpc_semaphore,
+                )
+            complete = True
         finally:
             if not complete:
                 destination.unlink(missing_ok=True)
 
-    await asyncio.gather(
-        *(download(remote_path, destination) for remote_path, destination in downloads)
-    )
+    async def worker() -> None:
+        while True:
+            try:
+                remote_path, destination = next(pending)
+            except StopIteration:
+                return
+            await download(remote_path, destination)
+
+    async with asyncio.TaskGroup() as tasks:
+        for _ in range(concurrency):
+            tasks.create_task(worker())

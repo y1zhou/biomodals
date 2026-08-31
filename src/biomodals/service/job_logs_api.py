@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -13,13 +14,65 @@ from pydantic import BaseModel, ConfigDict
 
 from biomodals.execution import ProviderCallDiagnostic
 from biomodals.service.auth import AuthenticatedSession
-from biomodals.service.http_contract import require_session
+from biomodals.service.http_contract import CodedAPIError, require_session
 from biomodals.service.remote_execution import ExecutionLocator, RemoteExecutionClient
 from biomodals.service.store import JobRecord, ServiceStore
 from biomodals.service.tool_runtime import ToolRegistration
 from biomodals.service.tools import ToolDefinition
 
 LogMode = Literal["live", "historical"]
+
+
+class _LiveLogStreams:
+    """Bound concurrent live SDK streams without limiting historical reads."""
+
+    def __init__(
+        self,
+        *,
+        global_limit: int = 32,
+        user_limit: int = 4,
+        job_limit: int = 4,
+    ) -> None:
+        self._global_limit = global_limit
+        self._user_limit = user_limit
+        self._job_limit = job_limit
+        self._lock = asyncio.Lock()
+        self._total = 0
+        self._users: dict[UUID, int] = {}
+        self._jobs: dict[UUID, int] = {}
+
+    async def acquire(self, user_id: UUID, job_id: UUID) -> None:
+        """Reserve one live stream or reject the request before it starts."""
+        async with self._lock:
+            if (
+                self._total >= self._global_limit
+                or self._users.get(user_id, 0) >= self._user_limit
+                or self._jobs.get(job_id, 0) >= self._job_limit
+            ):
+                raise CodedAPIError(
+                    429,
+                    "log_stream_limit",
+                    "Too many live log streams are open; close one and retry",
+                    headers={"Retry-After": "5"},
+                )
+            self._total += 1
+            self._users[user_id] = self._users.get(user_id, 0) + 1
+            self._jobs[job_id] = self._jobs.get(job_id, 0) + 1
+
+    async def release(self, user_id: UUID, job_id: UUID) -> None:
+        """Release one live stream and discard empty counter entries."""
+        async with self._lock:
+            self._total -= 1
+            self._decrement(self._users, user_id)
+            self._decrement(self._jobs, job_id)
+
+    @staticmethod
+    def _decrement(counts: dict[UUID, int], key: UUID) -> None:
+        remaining = counts[key] - 1
+        if remaining:
+            counts[key] = remaining
+        else:
+            del counts[key]
 
 
 class JobLogTargetView(BaseModel):
@@ -49,6 +102,7 @@ class JobLogTargetsView(BaseModel):
 def create_job_logs_router() -> APIRouter:
     """Create owner- and Administrator-authorized SDK log routes."""
     router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
+    live_streams = _LiveLogStreams()
 
     @router.get("/{job_id}/log-targets", response_model=JobLogTargetsView)
     async def targets(
@@ -90,23 +144,31 @@ def create_job_logs_router() -> APIRouter:
             or _target(registration.definition, call) is None
         ):
             raise HTTPException(409, "Job log target is unavailable")
+        handle = call.provider_call_handle_id
         live = not call.status.is_terminal
+        user_id = session.principal.user_id
+        if live:
+            await live_streams.acquire(user_id, job_id)
 
         async def content():
-            async for entry in remote.log_entries(
-                call.provider_call_handle_id,
-                live=live,
-                since=since,
-                until=until,
-            ):
-                yield orjson.dumps(
-                    {
-                        "timestamp": entry.timestamp.isoformat(),
-                        "message": entry.message,
-                        "source": entry.source,
-                    },
-                    option=orjson.OPT_APPEND_NEWLINE,
-                )
+            try:
+                async for entry in remote.log_entries(
+                    handle,
+                    live=live,
+                    since=since,
+                    until=until,
+                ):
+                    yield orjson.dumps(
+                        {
+                            "timestamp": entry.timestamp.isoformat(),
+                            "message": entry.message,
+                            "source": entry.source,
+                        },
+                        option=orjson.OPT_APPEND_NEWLINE,
+                    )
+            finally:
+                if live:
+                    await live_streams.release(user_id, job_id)
 
         return StreamingResponse(
             content(),

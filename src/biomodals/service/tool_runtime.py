@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
+from weakref import WeakValueDictionary
 
 from biomodals.execution import DeploymentIdentity, ExecutionOverview, RunStatus
 from biomodals.service.artifacts import ArtifactCache
@@ -80,7 +81,7 @@ class JobLifecycle:
         }
         if len(self.registrations) != len(registrations):
             raise ValueError("Tool registrations must be unique")
-        self._locks: dict[UUID, asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
 
     async def advance(self, job_id: UUID, *, force_refresh: bool = False) -> JobRecord:
         """Perform at most one idempotent service-side lifecycle pass."""

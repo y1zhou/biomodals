@@ -327,6 +327,10 @@ compact selector labeled with function, status, and start time, preferring an
 active call and then the most recently started call. Public responses use an
 opaque log-target selector and never expose the Modal Function Call ID.
 
+Live reads use one Modal SDK stream each and are limited to 32 service-wide,
+four per User, and four per Job. Excess requests receive a typed `429` with a
+short `Retry-After`; historical window reads do not consume these permits.
+
 Tool configuration controls whether logs are Administrator-only or also
 available to the owning User. GROMACS initially allows owner access;
 AlphaFold3 initially restricts logs to Administrators.

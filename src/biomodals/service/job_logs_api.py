@@ -14,7 +14,11 @@ from pydantic import BaseModel, ConfigDict
 
 from biomodals.execution import ProviderCallDiagnostic
 from biomodals.service.auth import AuthenticatedSession
-from biomodals.service.http_contract import CodedAPIError, require_session
+from biomodals.service.http_contract import (
+    CodedAPIError,
+    CodedErrorResponse,
+    require_session,
+)
 from biomodals.service.remote_execution import ExecutionLocator, RemoteExecutionClient
 from biomodals.service.store import JobRecord, ServiceStore
 from biomodals.service.tool_runtime import ToolRegistration
@@ -126,7 +130,10 @@ def create_job_logs_router() -> APIRouter:
             next_cursor=page.next_cursor,
         )
 
-    @router.get("/{job_id}/logs")
+    @router.get(
+        "/{job_id}/logs",
+        responses={429: {"model": CodedErrorResponse}},
+    )
     async def logs(
         request: Request,
         job_id: UUID,

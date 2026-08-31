@@ -370,7 +370,7 @@ opaque log-target selector and never expose the Modal Function Call ID.
 Target lookup is stage-filtered and bounded rather than paging every Provider
 Call in the Run. Historical requests require timezone-aware start and end
 times in ascending order and use windows of at most one hour. The backend opens
-one unbounded SDK stream for a live HTTP request. Modal's SDK preserves its
+one SDK stream for each admitted live HTTP request. Modal's SDK preserves its
 cursor while reconnecting its own RPCs; the frontend does not add a second
 polling or reconnect loop. Historical output for any started, non-active stage
 is fetched once and remains cached for the lifetime of the page.
@@ -512,10 +512,10 @@ error copy; partial Runs use one generic incomplete-results warning. Raw remote
 diagnostics remain available only through Administrator-authorized logs and
 Provider Call inspection.
 
-Live logs use one unbounded Modal SDK stream. The SDK preserves its log cursor
-while reconnecting internal RPCs and ends the stream when the Function Call
-completes. Selecting a log target performs one direct bounded coordinator read
-rather than scanning Provider Call pages.
+Each admitted live log read uses one Modal SDK stream. The SDK preserves its
+log cursor while reconnecting internal RPCs and ends the stream when the
+Function Call completes. Selecting a log target performs one direct bounded
+coordinator read rather than scanning Provider Call pages.
 
 A result-preparation-blocked Job is served from its local projection. Owner
 detail and manual refresh do not wake the remote coordinator or toggle it back

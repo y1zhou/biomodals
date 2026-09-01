@@ -85,11 +85,13 @@ seed publications coordinate without treating presentation changes as new
 scientific work. A later Job remains `queued` with
 `state_reason=waiting_for_shared_publication` while any earlier matching Job
 may still be executing. `state_unknown` is treated as possibly active until
-the recorded root Function Call conclusively completes. If that completed root
-returns a non-terminal Run status, the service records a terminal failure: the
-remote scheduler can no longer advance the Run, so it must not block repair as
-though it were still active. No second remote coordinator is launched during
-genuine uncertainty.
+the recorded root Function Call conclusively completes. A completed root with
+a durable nonterminal Run does not make that Run failed: `suspended` projects
+as recoverable `blocked`, while `state_unknown` remains unknown. Either state
+continues to block overlapping publication repair until an explicit refresh or
+Administrator action resumes the exact pinned Run and obtains a new root call,
+or the Run reaches a conclusive terminal state. No second coordinator is
+launched automatically during genuine uncertainty.
 
 After every earlier matching Job is conclusively terminal, the new Job launches
 with its own current operational arguments. Failed, partial, and cancelled

@@ -495,12 +495,14 @@ samples per seed. If any matching Job is `queued`, `running`,
 `cancel_requested`, `state_unknown`, or remotely blocked without a terminal
 result, the new Job waits locally and retries after 60 seconds. A recorded root
 Function Call is polled without waking coordinator code. Once that root
-conclusively completes, a still-non-terminal remote Run status is recorded as
-a terminal service failure rather than active work. Once no predecessor may
+conclusively completes, the durable remote Run status remains authoritative.
+`suspended` projects as recoverable `blocked`, and `state_unknown` remains
+unknown; either state continues to block overlapping repair until explicit
+same-Run recovery or a conclusive terminal outcome. Once no predecessor may
 still be active, failed, partial, and cancelled predecessor Job IDs are staged
 with the new request. They authorize AlphaFold3 to abandon only deterministic
-Task generations derived from those Execution Run IDs plus stable Node and
-Task keys. The new Job's
+Task generations derived from those Execution Run IDs plus stable Node and Task
+keys. The new Job's
 snapshotted Provider Call limits and other current arguments take precedence.
 Successful publications are reused through their normal markers and receipts.
 

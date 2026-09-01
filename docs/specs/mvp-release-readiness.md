@@ -242,9 +242,10 @@ absent. Existing terminal `error_code` and `error_message` fields remain
 exclusive to failed Jobs. The Admin Modal page exposes only aggregate blocked
 counts grouped by safe Blocking Category and the oldest blocked age; it exposes
 no owner identity, Job identifier, Input, Result, raw provider detail, or
-storage path. A service-facing explicit resume control is outside the unified
-kernel refactor; until a host supplies one, recovery is an operator action
-rather than an automatic loop.
+storage path. The earlier absence of a service-facing resume control is
+superseded by ADR 0007: an explicit authenticated refresh or Administrator
+resume action now starts `ExecutionCoordinator.resume()` for the exact pinned
+Run. Background reconciliation still never resumes it automatically.
 
 ### Unknown remote execution state
 

@@ -17,7 +17,7 @@ from biomodals.execution import (
 from biomodals.service.job_logs_api import (
     _redact_provider_call_id,
     _stage_calls,
-    _validate_window,
+    _validate_window_parameters,
 )
 from biomodals.service.remote_execution import ExecutionLocator
 
@@ -36,11 +36,7 @@ def _call(status: ProviderCallStatus) -> ProviderCallDiagnostic:
 
 
 def test_live_log_stream_needs_no_historical_window() -> None:
-    assert _validate_window(
-        _call(ProviderCallStatus.RUNNING),
-        since=None,
-        until=None,
-    )
+    assert _validate_window_parameters(since=None, until=None)
 
 
 @pytest.mark.parametrize(
@@ -58,18 +54,13 @@ def test_historical_log_window_is_complete_aware_ordered_and_bounded(
     until: datetime | None,
 ) -> None:
     with pytest.raises(HTTPException) as captured:
-        _validate_window(
-            _call(ProviderCallStatus.SUCCEEDED),
-            since=since,
-            until=until,
-        )
+        _validate_window_parameters(since=since, until=until)
     assert captured.value.status_code == 422
 
 
 def test_historical_window_can_read_an_active_call() -> None:
     since = datetime.now(UTC)
-    assert not _validate_window(
-        _call(ProviderCallStatus.RUNNING),
+    assert not _validate_window_parameters(
         since=since,
         until=since + timedelta(minutes=10),
     )

@@ -214,7 +214,8 @@ def create_job_logs_router() -> APIRouter:
                 or _target(registration.definition, call) is None
             ):
                 raise HTTPException(409, "Job log target is unavailable")
-            _validate_window(call, since=since, until=until)
+            if live and call.status.is_terminal:
+                raise HTTPException(422, "Historical logs require since and until")
         except BaseException:
             await streams.release(user_id, job_id)
             raise
@@ -319,21 +320,6 @@ async def _stage_calls(
             reverse=True,
         )[:limit]
     )
-
-
-def _validate_window(
-    call: ProviderCallDiagnostic,
-    *,
-    since: datetime | None,
-    until: datetime | None,
-) -> bool:
-    """Validate historical bounds before response headers are committed."""
-    live = _validate_window_parameters(since=since, until=until)
-    if live:
-        if call.status.is_terminal:
-            raise HTTPException(422, "Historical logs require since and until")
-        return True
-    return False
 
 
 def _validate_window_parameters(

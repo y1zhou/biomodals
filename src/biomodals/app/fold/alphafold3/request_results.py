@@ -2,8 +2,7 @@
 
 Durable prediction files remain canonical and seed-addressed on the output
 Volume. This module publishes a small request view over exactly the requested
-seeds, then downloads only that manifest-declared view and restores the
-caller's presentation name in the local archive.
+seeds, then downloads only that manifest-declared presentation view.
 """
 
 from __future__ import annotations
@@ -244,47 +243,24 @@ def _artifact_record(
     return record
 
 
-def _presentation_input_bytes(value: bytes, *, display_name: str) -> bytes:
-    """Return canonical archive input bytes with the caller's display name."""
-    try:
-        document = orjson.loads(value)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError("Staged AlphaFold input is invalid JSON") from exc
-    if not isinstance(document, dict):
-        raise TypeError("Staged AlphaFold input must be a JSON object")
-    document["name"] = display_name
-    return json_bytes(document)
-
-
 def _input_artifact_record(
     *,
     source: Path,
     output_root: Path,
     volume_path: Path,
     archive_path: str | PurePosixPath,
-    display_name: str,
 ) -> dict[str, object]:
-    """Describe staged and presentation-rewritten input bytes."""
-    require_regular_file(source)
-    source_bytes = source.read_bytes()
-    record: dict[str, object] = {
-        "role": "input",
-        "volume_path": _volume_relative_path(output_root, volume_path).as_posix(),
-        "archive_path": _safe_archive_path(archive_path).as_posix(),
-        "size_bytes": len(source_bytes),
-        "sha256": hashlib.sha256(source_bytes).hexdigest(),
-    }
-    archive_bytes = _presentation_input_bytes(
-        source_bytes,
-        display_name=display_name,
+    """Describe a presentation-ready input without loading it into memory."""
+    record = _artifact_record(
+        source=source,
+        output_root=output_root,
+        volume_path=volume_path,
+        archive_path=archive_path,
+        role="input",
     )
-    record["archive_size_bytes"] = len(archive_bytes)
-    record["archive_sha256"] = hashlib.sha256(archive_bytes).hexdigest()
+    record["archive_size_bytes"] = record["size_bytes"]
+    record["archive_sha256"] = record["sha256"]
     return record
-
-
-def _request_input_path(run_root: Path, request_id: str) -> Path:
-    return run_root / "requests" / request_id / "input.json"
 
 
 def _request_view_root(
@@ -479,7 +455,7 @@ def publish_request_results(
         spec.display_name,
     )
     request_root = _request_view_root(run_root, spec.request_id, view_id)
-    input_path = _request_input_path(run_root, spec.request_id)
+    input_path = run_root / "requests" / spec.request_id / "presentation-input.json"
     require_regular_file(input_path)
     manifest_path = request_root / "manifest.json"
     if manifest := _reusable_request_manifest(
@@ -513,7 +489,6 @@ def publish_request_results(
             output_root=runtime.output_root,
             volume_path=input_path,
             archive_path=f"{canonical_name}_data.json",
-            display_name=spec.display_name,
         ),
     ]
     artifacts.extend(
@@ -911,20 +886,6 @@ def _validate_downloaded_artifact(
         )
 
 
-def _rewrite_downloaded_input(
-    input_path: Path,
-    *,
-    display_name: str,
-) -> None:
-    write_bytes_atomic(
-        input_path,
-        _presentation_input_bytes(
-            input_path.read_bytes(),
-            display_name=display_name,
-        ),
-    )
-
-
 def _ranking_csv_bytes(rows: tuple[RankingRow, ...]) -> bytes:
     value = pl.DataFrame({
         "seed": [row.seed for row in rows],
@@ -977,7 +938,7 @@ def _record_archive_artifacts(
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
     archive_root: Path,
 ) -> None:
-    """Bind downloaded source identities and the rewritten input bytes."""
+    """Bind downloaded source identities to their archived bytes."""
     local_artifacts = cast(list[dict[str, object]], local_manifest["artifacts"])
     for local_artifact, (artifact, transformed) in zip(
         local_artifacts,
@@ -994,7 +955,7 @@ def _record_archive_artifacts(
             )
             if observed != expected:
                 raise RuntimeError(
-                    "Rewritten AlphaFold input does not match its request manifest"
+                    "Archived AlphaFold input does not match its request manifest"
                 )
         else:
             local_artifact["archive_size_bytes"] = artifact["size_bytes"]
@@ -1278,10 +1239,6 @@ def create_request_archive(
                 raise RuntimeError(
                     "Request archive requires exactly one input artifact"
                 )
-            _rewrite_downloaded_input(
-                input_path,
-                display_name=display_name,
-            )
             _record_archive_artifacts(
                 local_manifest,
                 transformed_artifacts,

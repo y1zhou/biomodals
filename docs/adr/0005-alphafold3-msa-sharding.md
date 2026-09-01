@@ -1134,8 +1134,9 @@ durable Volume files remain unchanged.
 
 Downloads hash each chunk while writing and stop before a chunk would exceed
 the manifest-declared size. Unchanged archive members reuse that verified
-source size and digest; only the locally rewritten input is read again for its
-presentation-specific identity.
+source size and digest. The high-memory input-preparation path stages both the
+canonical inference input and a presentation-name copy, so the bounded result
+finalizer never parses or duplicates the enriched JSON in memory.
 
 The archive includes every requested seed/sample directory, optional embeddings
 and distograms, locally generated request ranking and best aliases, enriched
@@ -1145,9 +1146,9 @@ directory.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each
-archive-local artifact after input rewriting. The durable request-view manifest
-records the rewritten input's expected size and digest when the view is
-published. Existing archives are therefore streamed locally once and reused
+archive-local artifact. The durable request-view manifest records the staged
+presentation input's expected size and digest when the view is published.
+Existing archives are therefore streamed locally once and reused
 only when their exact member set, presentation manifest, and all payload
 digests match the current request; the staged input is not reread from the
 Modal Volume. Changing both a payload and its embedded digest therefore does

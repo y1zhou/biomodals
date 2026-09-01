@@ -300,7 +300,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.2.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "typer", specifier = ">=0.20.0" },
-    { name = "uniaf3", specifier = ">=0.2.1", index = "https://pypi.org/simple" },
+    { name = "uniaf3", specifier = "==0.2.1", index = "https://pypi.org/simple" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.51.0,<1" },
 ]
 provides-extras = ["api"]

@@ -11,6 +11,7 @@ import hashlib
 import re
 import string
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypeAlias, cast
 
@@ -42,7 +43,8 @@ ALPHAFOLD3_APP_VERSION = "3.0.2"
 # TODO: Derive this identity from the verified environment-asset manifest so
 # replacement checkpoint bytes cannot retain the same inference cache key.
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
-RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
+RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v4"
+UNIAF3_VERSION = version("uniaf3")
 MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024
 STAGED_INPUT_SCHEMA_VERSION = 2
 MAX_INPUT_JSON_BYTES = 256 * 1024 * 1024
@@ -687,6 +689,7 @@ def _run_identity(
         "app_version": ALPHAFOLD3_APP_VERSION,
         "alphafold_repository": ALPHAFOLD3_REPOSITORY,
         "alphafold_commit": ALPHAFOLD3_COMMIT,
+        "uniaf3_version": UNIAF3_VERSION,
     }
     run_id = hash_sequences(
         identity_view,
@@ -753,6 +756,11 @@ def prepare_inference_run(
         relative_path=input_path,
         content=input_bytes,
     )
+    staged_conf.name = display_name
+    presentation_input = VolumeUpload(
+        relative_path=(run_root / "requests" / request_id / "presentation-input.json"),
+        content=serialize_af3_input(staged_conf),
+    )
     staged_input = VolumeUpload(
         relative_path=run_root / "requests" / request_id / "staged-input.json",
         content=json_bytes({
@@ -762,6 +770,7 @@ def prepare_inference_run(
             "request_id": request_id,
             "identity": identity_upload.to_record(),
             "input": input_upload.to_record(),
+            "presentation_input": presentation_input.to_record(),
         }),
     )
 
@@ -774,7 +783,7 @@ def prepare_inference_run(
         normalized_seeds=normalized_seeds,
         recycle=recycle,
         sample_count=sample,
-        payload_uploads=(identity_upload, input_upload),
+        payload_uploads=(identity_upload, input_upload, presentation_input),
         staged_input=staged_input,
     )
 

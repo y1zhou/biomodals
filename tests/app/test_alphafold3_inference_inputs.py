@@ -310,6 +310,7 @@ def test_run_identity_hashes_large_text_while_input_remains_runnable(
     identity = orjson.loads(uploads["identity.json"])
     identity_input = identity["input"]
 
+    assert identity["app"]["uniaf3_version"] == "0.2.1"
     assert unpaired_msa.encode() not in uploads["identity.json"]
     assert user_ccd.encode() not in uploads["identity.json"]
     assert identity_input["sequences"][0]["protein"]["unpairedMsa"] == {
@@ -325,10 +326,13 @@ def test_run_identity_hashes_large_text_while_input_remains_runnable(
         "size_bytes": len(user_ccd),
     }
     runnable = AF3Config.model_validate_json(uploads["input.json"])
+    presentation = AF3Config.model_validate_json(uploads["presentation-input.json"])
     protein = runnable.sequences[0].protein
     assert protein is not None
     assert protein.unpairedMsa == unpaired_msa
     assert runnable.userCCD == user_ccd
+    assert presentation.name == "compact-identity"
+    assert presentation.modelSeeds == runnable.modelSeeds
 
 
 def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:

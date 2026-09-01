@@ -294,19 +294,12 @@ def _input_artifact_record(
     }
 
 
-def _staged_input_record(
-    run_root: Path,
+def _parse_staged_input_record(
+    content: bytes,
     publication: RequestPublication,
 ) -> dict[str, object]:
-    """Load the immutable input record bound by the staged-request marker."""
-    marker_path = run_root / "requests" / publication.request_id / "staged-input.json"
-    marker = orjson.loads(
-        read_bounded_file_bytes(
-            marker_path,
-            field_name="Staged AlphaFold input marker",
-            max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
-        )
-    )
+    """Validate and return the input record from a staged-request marker."""
+    marker = orjson.loads(content)
     if (
         not isinstance(marker, dict)
         or marker.get("schema_version") != STAGED_INPUT_SCHEMA_VERSION
@@ -317,6 +310,34 @@ def _staged_input_record(
     ):
         raise RuntimeError("Staged AlphaFold input marker is invalid")
     return cast(dict[str, object], marker["input"])
+
+
+def _staged_input_marker_path(
+    publication: RequestPublication,
+) -> PurePosixPath:
+    return (
+        PurePosixPath(publication.run_id[:2])
+        / publication.run_id
+        / "requests"
+        / publication.request_id
+        / "staged-input.json"
+    )
+
+
+def _staged_input_record(
+    output_root: Path,
+    publication: RequestPublication,
+) -> dict[str, object]:
+    """Load the immutable input record through the mounted Volume."""
+    marker_path = output_root.joinpath(*_staged_input_marker_path(publication).parts)
+    return _parse_staged_input_record(
+        read_bounded_file_bytes(
+            marker_path,
+            field_name="Staged AlphaFold input marker",
+            max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
+        ),
+        publication,
+    )
 
 
 def _input_name_markers(
@@ -549,6 +570,14 @@ def load_request_manifest(
     )
     if content is None:
         return None
+    marker_content = read_volume_bytes(
+        reader,
+        _staged_input_marker_path(spec).as_posix(),
+        max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
+    )
+    if marker_content is None:
+        return None
+    expected_input_record = _parse_staged_input_record(marker_content, spec)
     try:
         manifest = orjson.loads(content)
     except orjson.JSONDecodeError as exc:
@@ -560,6 +589,7 @@ def load_request_manifest(
         source=path,
         spec=spec,
         view_id=path.parent.name,
+        expected_input_record=expected_input_record,
     )
 
 
@@ -579,7 +609,7 @@ def publish_request_results(
     request_root = _request_view_root(run_root, spec.request_id, view_id)
     input_path = run_root / "requests" / spec.request_id / "input.json"
     require_regular_file(input_path)
-    expected_input_record = _staged_input_record(run_root, spec)
+    expected_input_record = _staged_input_record(runtime.output_root, spec)
     manifest_path = request_root / "manifest.json"
     if manifest := _reusable_request_manifest(
         path=manifest_path,

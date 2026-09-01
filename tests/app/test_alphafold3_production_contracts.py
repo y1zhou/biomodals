@@ -2810,15 +2810,51 @@ def test_completed_request_manifest_loads_without_a_remote_worker() -> None:
         ],
     )
     manifest_path = request_manifest_path(publication).as_posix()
+    staged_marker_path = (
+        f"{run_id[:2]}/{run_id}/requests/{publication.request_id}/staged-input.json"
+    )
+    staged_marker = json_bytes({
+        "schema_version": STAGED_INPUT_SCHEMA_VERSION,
+        "status": "complete",
+        "run_id": run_id,
+        "request_id": publication.request_id,
+        "input": {
+            "path": input_path,
+            "size_bytes": len(input_bytes),
+            "sha256": hashlib.sha256(input_bytes).hexdigest(),
+        },
+    })
 
     assert (
         load_request_manifest(
-            FakeVolumeReader({manifest_path: json_bytes(manifest)}),
+            FakeVolumeReader({
+                manifest_path: json_bytes(manifest),
+                staged_marker_path: staged_marker,
+            }),
             publication,
         )
         == manifest
     )
     assert load_request_manifest(FakeVolumeReader({}), publication) is None
+
+    mismatched_manifest = orjson.loads(json_bytes(manifest))
+    input_artifact = next(
+        artifact
+        for artifact in mismatched_manifest["artifacts"]
+        if artifact["role"] == "input"
+    )
+    input_artifact["sha256"] = "0" * 64
+    with pytest.raises(
+        RuntimeError,
+        match="Existing request view input does not match its staged marker",
+    ):
+        load_request_manifest(
+            FakeVolumeReader({
+                manifest_path: json_bytes(mismatched_manifest),
+                staged_marker_path: staged_marker,
+            }),
+            publication,
+        )
 
 
 def test_request_manifest_requires_presentation_input_identity() -> None:

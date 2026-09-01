@@ -55,6 +55,7 @@ from biomodals.app.fold.alphafold3.inference_pipeline import (
     coordinate_seed_predictions,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
+    MsaAssemblyResolution,
     apply_msa_resolution,
     chain_msa_states,
     plan_template_searches,
@@ -613,6 +614,56 @@ def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
     assert template_plan.chain_indices_by_identity == {
         template_plan.tasks[0].template_identity: (0, 1)
     }
+
+
+@pytest.mark.parametrize(
+    ("unpaired_msa", "paired_msa", "templates", "msa_tasks", "template_tasks"),
+    [
+        (None, None, None, True, None),
+        (None, None, [], True, 0),
+        ("", "", None, False, 1),
+        ("", "", [], False, 0),
+        (">query\nACDE\n", "", None, False, 1),
+        (">query\nACDE\n", "", [], False, 0),
+    ],
+)
+def test_evidence_presence_controls_search_planning(
+    unpaired_msa: str | None,
+    paired_msa: str | None,
+    templates: list[AF3Template] | None,
+    msa_tasks: bool,
+    template_tasks: int | None,
+) -> None:
+    """Planning must preserve AlphaFold3 null versus explicit-empty semantics."""
+    config = AF3Config(
+        name="evidence-matrix",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa=unpaired_msa,
+                    pairedMsa=paired_msa,
+                    templates=templates,
+                )
+            )
+        ],
+    )
+    states = chain_msa_states(config)
+    msa_plan = plan_msa_resolution(states)
+
+    assert bool(msa_plan.raw_searches) is msa_tasks
+    if template_tasks is None:
+        return
+    template_plan = plan_template_searches(
+        config,
+        states,
+        MsaAssemblyResolution({}, {}),
+    )
+    assert len(template_plan.tasks) == template_tasks
+    if unpaired_msa == "" and template_tasks:
+        assert template_plan.tasks[0].unpaired_msa == ">query\nACDE\n"
 
 
 def test_template_task_computes_immutable_identities_once(
@@ -2216,6 +2267,8 @@ def test_staged_input_rederives_identity_and_preserves_inline_templates(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[
                             AF3Template(
                                 mmcif="data_inline\n#\n",
@@ -2409,6 +2462,8 @@ def test_inference_staging_bounds_all_inline_templates(
                 protein=AF3Protein(
                     id="A",
                     sequence="ACDE",
+                    unpairedMsa="",
+                    pairedMsa="",
                     templates=[
                         AF3Template(
                             mmcif=content,
@@ -2444,6 +2499,8 @@ def test_staged_input_rechecks_the_inline_template_total(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[
                             AF3Template(
                                 mmcif=content,
@@ -2487,6 +2544,8 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[template],
                     )
                 )
@@ -2567,6 +2626,8 @@ def test_inference_staging_rejects_unmaterialized_template_paths() -> None:
                         protein=AF3Protein(
                             id="A",
                             sequence="ACDE",
+                            unpairedMsa="",
+                            pairedMsa="",
                             templates=[
                                 AF3Template(
                                     mmcifPath="template.cif",
@@ -2594,6 +2655,8 @@ def test_inference_staging_rejects_empty_inline_templates() -> None:
                         protein=AF3Protein(
                             id="A",
                             sequence="ACDE",
+                            unpairedMsa="",
+                            pairedMsa="",
                             templates=[
                                 AF3Template(
                                     mmcif="",

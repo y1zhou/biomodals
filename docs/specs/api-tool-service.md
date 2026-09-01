@@ -313,6 +313,11 @@ Both modes expose the following settings in a collapsed Advanced section:
 DNA entities require neither search. The confirmation page states which
 entity types each enabled search setting actually affects.
 
+Expert documents retain AlphaFold3's evidence-state semantics from UniAF3
+0.2.1: null or omitted MSA/templates request the enabled searches, whereas
+empty MSA strings and an empty template list explicitly disable those evidence
+sources. Paired and unpaired Protein MSA states must be supplied together.
+
 When normalized seed count multiplied by diffusion samples exceeds 5,000, the
 frontend displays the prediction count and requires explicit confirmation.
 The validation response marks that condition. Calling the Job-creation route

@@ -380,6 +380,7 @@ def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:
                         id="A",
                         sequence="ACDE",
                         unpairedMsaPath=msa_path,
+                        pairedMsa="",
                     )
                 )
             ],
@@ -436,6 +437,8 @@ def _write_path_backed_template_input(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[
                             AF3Template(
                                 mmcifPath=template_path.name,

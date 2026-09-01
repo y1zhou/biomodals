@@ -133,6 +133,28 @@ def test_custom_msa_request_can_skip_all_search_assets() -> None:
     assert assets == (EnvironmentAsset("model"),)
 
 
+def test_explicitly_empty_templates_skip_template_assets() -> None:
+    config = _config(
+        AF3SequenceEntry(
+            protein=AF3Protein(
+                id="A",
+                sequence="ACDE",
+                unpairedMsa="",
+                pairedMsa="",
+                templates=[],
+            )
+        )
+    )
+
+    assets = required_environment_assets(
+        config,
+        search_msa=True,
+        search_protein_templates=True,
+    )
+
+    assert assets == (EnvironmentAsset("model"),)
+
+
 def test_readiness_checks_only_the_expected_final_path(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, FakeClaims())
     model = runtime.model_root / "AlphaFold3" / "af3.bin"

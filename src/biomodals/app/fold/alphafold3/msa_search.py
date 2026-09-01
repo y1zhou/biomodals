@@ -439,8 +439,12 @@ def raw_result_relpath(
 
 
 def field_is_populated(inline_value: str | None, path_value: str | None) -> bool:
-    """Return whether a caller supplied a non-empty inline or path value."""
-    return bool(inline_value) or bool(path_value)
+    """Return whether a caller supplied inline or path evidence.
+
+    AlphaFold 3 uses an empty inline MSA as an explicit MSA-free request, so
+    presence must not be inferred from truthiness.
+    """
+    return inline_value is not None or path_value is not None
 
 
 def plan_msa_resolution(chains: tuple[ChainMsaState, ...]) -> MsaResolutionPlan:

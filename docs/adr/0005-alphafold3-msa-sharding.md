@@ -625,9 +625,9 @@ The production entrypoint exposes `search_msa` and
 
 | MSA search | Template search | Field behavior |
 | --- | --- | --- |
-| On | On | Preserve non-empty fields and populate every missing MSA and protein template field. |
-| On | Off | Populate missing MSAs, preserve non-empty templates, and set missing or null protein templates to `[]`. |
-| Off | Either | Run no searches, preserve supplied fields, set missing MSAs to `""`, and set missing or null protein templates to `[]`. |
+| On | On | Preserve every supplied field, including explicit empty values, and populate only null or omitted evidence. |
+| On | Off | Populate null or omitted MSAs, preserve supplied templates, and set null or omitted protein templates to `[]`. |
+| Off | Either | Run no searches, preserve supplied fields, set null or omitted MSAs to `""`, and set null or omitted protein templates to `[]`. |
 
 With MSA search enabled, fields resolve independently:
 
@@ -636,7 +636,12 @@ With MSA search enabled, fields resolve independently:
 - missing RNA unpaired MSA uses RFam, RNAcentral, and NT-RNA;
 - requested missing protein templates run after unpaired-MSA resolution.
 
-A non-empty field suppresses only the searches needed for that field. The app
+UniAF3 0.2.1 preserves the upstream three-state evidence contract. Null or
+omitted evidence requests search, while `unpairedMsa: ""`, `pairedMsa: ""`,
+and `templates: []` explicitly disable that evidence. Paired and unpaired MSA
+states must be supplied together. When both MSA fields are explicitly empty but
+templates remain null, the CPU template-search planner constructs the upstream
+single-query A3M and searches templates without scheduling MSA workers. The app
 does not run unnecessary canonical searches merely to populate the cache.
 
 ### Historical search worker topology

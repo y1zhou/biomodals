@@ -148,7 +148,7 @@ def resolve_msa_and_templates(
             protein = conf.sequences[state.chain_index].protein
             if protein is None:
                 raise RuntimeError("Protein MSA state no longer matches its chain")
-            if not protein.templates:
+            if protein.templates is None:
                 possible_template_tasks += 1
     task_count = len(plan.raw_searches) + len(plan.assemblies) + possible_template_tasks
     validate_remote_search_task_count(task_count)

@@ -300,7 +300,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.2.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
     { name = "typer", specifier = ">=0.20.0" },
-    { name = "uniaf3", specifier = ">=0.2.0" },
+    { name = "uniaf3", specifier = ">=0.2.1", index = "https://pypi.org/simple" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.51.0,<1" },
 ]
 provides-extras = ["api"]
@@ -1414,7 +1414,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" }
 dependencies = [
-    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "ptyprocess" },
 ]
 sdist = { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -2186,8 +2186,8 @@ wheels = [
 
 [[package]]
 name = "uniaf3"
-version = "0.2.0"
-source = { registry = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" }
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
     { name = "gemmi" },
@@ -2201,9 +2201,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/0f/5a/40e18b188a73e01787aaf8665e673c825f5404dfdad824e1ece11d46e9fa/uniaf3-0.2.0.tar.gz", hash = "sha256:d4a5fb1fb4e289b2476d173c879d3f8ada820378809eeb6e57584503227fd727", size = 1937470, upload-time = "2026-04-13T05:23:18.751Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ce/bf/e2b893e6e0aa2e6835a6fde171f14be09f2d8cadd563eee1991b58574d83/uniaf3-0.2.1.tar.gz", hash = "sha256:296a1e5b60cdbd433db63d6d5e2ad17d4e1f266bc24bbab45200bbfc05e1c029", size = 1937619, upload-time = "2026-09-01T03:41:21.725Z" }
 wheels = [
-    { url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/05/4f/2e0e52ff93aa3ecd4e4cf9095b6b289049cd9423d8af9e9d5cb62d2b535e/uniaf3-0.2.0-py3-none-any.whl", hash = "sha256:6af42cc524b540165577d106a0ca41eb1074abb5d4c8c9151f3ba0f08e47c0c0", size = 1951164, upload-time = "2026-04-13T05:23:17.393Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/98/711c1b95859a19d94f67d33b8917c3676c6504ca8457af7a54cb33f72413/uniaf3-0.2.1-py3-none-any.whl", hash = "sha256:0c8f065a05757946f64336846564458e9465dbdefd029f654802036cf5068d9b", size = 1951390, upload-time = "2026-09-01T03:41:20.085Z" },
 ]
 
 [[package]]

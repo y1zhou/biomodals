@@ -147,6 +147,7 @@ def test_validation_preview_separates_custom_inputs(tmp_path: Path) -> None:
     source = tmp_path / "input.json"
     document = orjson.loads(_document())
     document["sequences"][0]["protein"]["unpairedMsa"] = ">query\nACDE\n"
+    document["sequences"][0]["protein"]["pairedMsa"] = ""
     document["userCCD"] = "data_custom"
     content = orjson.dumps(document)
     source.write_bytes(content)

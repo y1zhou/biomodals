@@ -153,7 +153,7 @@ def required_environment_assets(
         search_msa
         and search_protein_templates
         and any(
-            entry.protein is not None and not entry.protein.templates
+            entry.protein is not None and entry.protein.templates is None
             for entry in config.sequences
         )
     )

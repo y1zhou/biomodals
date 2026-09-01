@@ -239,7 +239,7 @@ def _validate_polymer(entity_name: str, entity: AF3Protein | AF3RNA | AF3DNA) ->
 
 
 def _validate_template_count(protein: AF3Protein, chain_index: int) -> None:
-    if len(protein.templates) > MAX_PROTEIN_TEMPLATES:
+    if len(protein.templates or ()) > MAX_PROTEIN_TEMPLATES:
         raise ValueError(
             f"sequences[{chain_index}].protein.templates exceeds "
             f"AlphaFold 3's {MAX_PROTEIN_TEMPLATES}-template limit"
@@ -259,7 +259,7 @@ def _validate_inline_inputs(config: AF3Config) -> None:
                         max_bytes=MAX_LOCAL_MSA_BYTES,
                     )
             _validate_template_count(protein, chain_index)
-            for template_index, template in enumerate(protein.templates):
+            for template_index, template in enumerate(protein.templates or ()):
                 field_name = (
                     f"sequences[{chain_index}].protein.templates[{template_index}]"
                 )
@@ -516,7 +516,7 @@ def materialize_local_input(config_path: str | Path) -> AF3Config:
                 field_name=f"sequences[{chain_index}].protein",
                 max_bytes=MAX_LOCAL_MSA_BYTES,
             )
-            for template_index, template in enumerate(protein.templates):
+            for template_index, template in enumerate(protein.templates or ()):
                 template_bytes += _materialize_template(
                     template,
                     input_root=input_root,
@@ -600,6 +600,8 @@ def build_inference_identity_view(conf: AF3Config) -> dict[str, object]:
                     field_name=f"protein.{field_name}",
                 )
             raw_templates = protein_view.get("templates")
+            if raw_templates is None:
+                continue
             if not isinstance(raw_templates, list):
                 raise RuntimeError("Validated AlphaFold template list is invalid")
             identity_templates: list[dict[str, object]] = []

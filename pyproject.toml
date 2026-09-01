@@ -17,7 +17,7 @@ dependencies = [
     "rich>=14.2.0",
     "tqdm>=4.67.3",
     "typer>=0.20.0",
-    "uniaf3>=0.2.0",
+    "uniaf3>=0.2.1",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +50,14 @@ dev = [
 extend-exclude = ["logs/*", "data/*"]
 extend-include = ["*.ipynb"]
 line-length = 88
+
+[tool.uv.sources]
+uniaf3 = { index = "pypi" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
 
 [tool.ruff.format]
 preview = true

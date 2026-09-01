@@ -66,7 +66,7 @@ SEARCH_IDENTITY_SCHEMA_VERSION = 1
 RAW_RESULT_SCHEMA_VERSION = 1
 COMBINED_RESULT_SCHEMA_VERSION = 1
 SEARCH_ADAPTER_VERSION = "af3-sharded-msa-v1"
-NHMMER_SHARDED_MERGE_ORDER = "reported-evalue-descending-bit-score-name-v1"
+NHMMER_SHARDED_MERGE_ORDER = "reported-evalue-descending-bit-score-name-occurrence-v2"
 
 JACKHMMER_BINARY_PATH = "/hmmer/bin/jackhmmer"
 NHMMER_BINARY_PATH = "/hmmer/bin/nhmmer"
@@ -654,10 +654,16 @@ def merge_nhmmer_results_by_reported_score(
     if len({result.e_value for result in results}) != 1:
         raise ValueError("Nhmmer shard results have different E-value thresholds")
 
-    tblout_by_id: dict[str, str] = {}
-    for result in results:
+    def iter_shard_rows(result: Any):
+        """Pair A3M hits with same-shard tblout rows by occurrence.
+
+        RNA databases may repeat textual identifiers. Pairing within each
+        shard preserves distinct occurrences and their reported scores instead
+        of aliasing every duplicate to one global dictionary entry.
+        """
         if result.tblout is None:
             raise ValueError("Nhmmer shard result is missing tblout")
+        tblout_by_id: dict[str, list[str]] = {}
         for line in result.tblout.splitlines():
             if not line or line.startswith("#"):
                 continue
@@ -665,21 +671,22 @@ def merge_nhmmer_results_by_reported_score(
             if len(fields) < 14:
                 raise ValueError(f"Invalid Nhmmer tblout row: {line!r}")
             hit_id = f"{fields[0]}/{fields[6]}-{fields[7]}"
-            tblout_by_id[hit_id] = line
-
-    def iter_shard_rows(a3m: str):
-        records = iter(module.parsers.lazy_parse_fasta_string(a3m))
+            tblout_by_id.setdefault(hit_id, []).append(line)
+        tblout_rows = {hit_id: iter(lines) for hit_id, lines in tblout_by_id.items()}
+        records = iter(module.parsers.lazy_parse_fasta_string(result.a3m))
         next(records)
         for aligned_sequence, description in records:
             name = description.partition(" ")[0]
-            if tblout_line := tblout_by_id.get(name):
+            if rows := tblout_rows.get(name):
+                tblout_line = next(rows, None)
+            else:
+                tblout_line = None
+            if tblout_line is not None:
                 yield aligned_sequence, description, tblout_line, name
 
     top_rows = heapq.nsmallest(
         max_sequences - 1,
-        itertools.chain.from_iterable(
-            iter_shard_rows(result.a3m) for result in results
-        ),
+        itertools.chain.from_iterable(iter_shard_rows(result) for result in results),
         key=nhmmer_reported_score_sort_key,
     )
     merged_a3m = [f">query\n{results[0].target_sequence}"]

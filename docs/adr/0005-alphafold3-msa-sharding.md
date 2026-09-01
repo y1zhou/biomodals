@@ -753,6 +753,12 @@ inside exact equal-score groups are scientifically equivalent.
 Every selected RNA profile must pass against the exact pinned AlphaFold and
 HMMER behavior before production uses it.
 
+The Nhmmer adapter pairs A3M hits with `tblout` rows inside their originating
+shard and by identifier occurrence before global ranking. Duplicate textual
+identifiers therefore retain their own reported scores instead of aliasing to
+the last row under that name. This occurrence rule is part of the versioned RNA
+search identity.
+
 ### Enriched input boundary
 
 The Biomodals coordinator is the complete CPU data stage. It fails closed when

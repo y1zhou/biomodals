@@ -1114,7 +1114,9 @@ def test_search_identity_matches_upstream_constructor_arguments(
                 "length_cutoff": 50,
                 "filter_f3": 0.02,
             },
-            "sharded_merge_order": "reported-evalue-descending-bit-score-name-v1",
+            "sharded_merge_order": (
+                "reported-evalue-descending-bit-score-name-occurrence-v2"
+            ),
         }
     assert scientific_search_parameters(spec) == expected_identity
 
@@ -1236,12 +1238,12 @@ def test_template_identity_matches_upstream_constructor_arguments(
     }
 
 
-def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
+def test_rna_shards_merge_duplicate_occurrences_by_reported_score() -> None:
     assert (
         scientific_search_parameters(resolve_database_profile("rfam"))[
             "sharded_merge_order"
         ]
-        == "reported-evalue-descending-bit-score-name-v1"
+        == "reported-evalue-descending-bit-score-name-occurrence-v2"
     )
 
     @dataclass
@@ -1275,16 +1277,29 @@ def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
     results = (
         Result(
             target_sequence="ACGU",
-            a3m=">query\nACGU\n>hitB/1-4 second\nACGU\n",
+            a3m=(
+                ">query\nACGU\n"
+                ">duplicate/1-4 within-high\nACGU\n"
+                ">duplicate/1-4 within-low\nACGU\n"
+                ">hitB/1-4 second\nACGU\n"
+            ),
             e_value=1e-3,
-            tblout=tblout("hitB", 50.0),
+            tblout="\n".join((
+                tblout("duplicate", 100.0),
+                tblout("duplicate", 1.0),
+                tblout("hitB", 50.0),
+            )),
         ),
         Result(
             target_sequence="ACGU",
-            a3m=(">query\nACGU\n>hitC/1-4 third\nACGU\n>hitA/1-4 first\nACGU\n"),
+            a3m=(
+                ">query\nACGU\n"
+                ">duplicate/1-4 cross-shard\nACGU\n"
+                ">hitA/1-4 first\nACGU\n"
+            ),
             e_value=1e-3,
             tblout="\n".join((
-                tblout("hitC", 10.0, "1e-2"),
+                tblout("duplicate", 80.0),
                 tblout("hitA", 50.0),
             )),
         ),
@@ -1293,15 +1308,17 @@ def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
     merged = merge_nhmmer_results_by_reported_score(
         module,
         results,
-        max_sequences=3,
+        max_sequences=4,
     )
 
     assert merged.a3m.splitlines() == [
         ">query",
         "ACGU",
-        ">hitA/1-4 first",
+        ">duplicate/1-4 within-high",
         "ACGU",
-        ">hitB/1-4 second",
+        ">duplicate/1-4 cross-shard",
+        "ACGU",
+        ">hitA/1-4 first",
         "ACGU",
     ]
 

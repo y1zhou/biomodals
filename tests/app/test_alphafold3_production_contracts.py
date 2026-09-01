@@ -3172,6 +3172,47 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     assert volume.reload_count == 2
     assert volume.commit_count == 2
 
+    second_view_root = (
+        run_root
+        / "requests"
+        / request_id
+        / "views"
+        / cast(str, second_manifest["view_id"])
+    )
+    mismatched_manifest = orjson.loads(
+        (second_view_root / "manifest.json").read_bytes()
+    )
+    mismatched_input = next(
+        artifact
+        for artifact in mismatched_manifest["artifacts"]
+        if artifact["role"] == "input"
+    )
+    mismatched_input["sha256"] = "0" * 64
+    (second_view_root / "manifest.json").write_bytes(json_bytes(mismatched_manifest))
+    with pytest.raises(
+        RuntimeError,
+        match="Existing request view input does not match its staged marker",
+    ):
+        publish_request_results(
+            InferenceRuntime(
+                output_root=tmp_path,
+                volume=cast(Any, volume),
+                claims=FakeClaimStore(),
+                container_id="test",
+                maximum_age_seconds=100,
+                summary_maximum_age_seconds=100,
+                wait_timeout_seconds=100,
+            ),
+            RequestPublication(
+                run_id=run_id,
+                request_id=request_id,
+                submitted_seeds=(seed,),
+                normalized_seeds=(seed,),
+                sample_count=1,
+                display_name="Another Name",
+            ),
+        )
+
     input_path.write_bytes(input_path.read_bytes().replace(b"ACDE", b"ACDF"))
     with pytest.raises(
         RuntimeError,

@@ -473,11 +473,25 @@ def _matching_request_manifest(
     source: str | Path | PurePosixPath,
     spec: RequestPublication,
     view_id: str,
+    expected_input_record: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if not isinstance(manifest, dict):
         raise RuntimeError(f"Existing request view manifest is invalid: {source}")
     selected = cast(dict[str, object], manifest)
-    _validated_manifest_artifacts(selected)
+    _, _, _, artifacts, _ = _validated_manifest_artifacts(selected)
+    if expected_input_record is not None:
+        input_artifact = next(
+            artifact for artifact in artifacts if artifact["role"] == "input"
+        )
+        published_input_record = {
+            "path": input_artifact["volume_path"],
+            "size_bytes": input_artifact["size_bytes"],
+            "sha256": input_artifact["sha256"],
+        }
+        if published_input_record != expected_input_record:
+            raise RuntimeError(
+                "Existing request view input does not match its staged marker"
+            )
     expected = {
         "run_id": spec.run_id,
         "request_id": spec.request_id,
@@ -502,6 +516,7 @@ def _reusable_request_manifest(
     path: Path,
     spec: RequestPublication,
     view_id: str,
+    expected_input_record: dict[str, object],
 ) -> dict[str, object] | None:
     if not path.is_file():
         return None
@@ -516,6 +531,7 @@ def _reusable_request_manifest(
         source=path,
         spec=spec,
         view_id=view_id,
+        expected_input_record=expected_input_record,
     )
 
 
@@ -569,6 +585,7 @@ def publish_request_results(
         path=manifest_path,
         spec=spec,
         view_id=view_id,
+        expected_input_record=expected_input_record,
     ):
         return manifest
 

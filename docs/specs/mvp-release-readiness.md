@@ -517,7 +517,7 @@ compression method, requires each source-backed member's exact `0x5455`
 modification-time field and matching ZIP/DOS fallback, and requires fixed
 timestamps on service-generated members in both the local ZIP headers and the
 central directory. The `0x5455` field is a signed 32-bit Unix timestamp, so
-schema 4 rejects source modification times after `2038-01-19T03:14:07Z`; a
+schema 5 rejects source modification times after `2038-01-19T03:14:07Z`; a
 later schema must define a validated, interoperable 64-bit replacement before
 that boundary.
 
@@ -533,9 +533,10 @@ current writer by assumption.
 
 The GROMACS Result ZIP has exactly three top-level entries or namespaces:
 `input.pdb`, `outputs/`, and `metadata/`. `outputs/` contains the files useful
-to an end User: the no-PBC trajectory, centered structure, production topology
-and parameters, and each CSV/PNG analysis pair. Debugging and verification
-documents live under `metadata/`, including normalized parameters, safe
+to an end User: the no-PBC trajectory, production energy file, centered
+structure, production topology and parameters, and the NVT, NPT, and
+production CSV/PNG analysis pairs. Debugging and verification documents live
+under `metadata/`, including normalized parameters, safe
 provenance, the service run log, manifest, and checksums. No such document is
 left loose at the archive root.
 
@@ -569,9 +570,9 @@ manifest enumerates the exact optional members included.
 This remains an explicit allowlist. The metadata directory must not become a
 recursive dump of provider state, working files, credentials, internal paths,
 database records, or raw exceptions. It excludes equilibration trajectories,
-`.trr`, `.edr`, `.cpt`, and intermediate `.tpr` and structure files. Deeper
-diagnosis uses the authoritative Modal Volume rather than expanding every User
-download.
+`.trr`, `.cpt`, equilibration energy files, and intermediate `.tpr` and
+structure files. Deeper diagnosis uses the authoritative Modal Volume rather
+than expanding every User download.
 
 On a local cache miss, the backend first restores the published Modal ZIP and
 completion marker. If either is missing or corrupt, it deterministically

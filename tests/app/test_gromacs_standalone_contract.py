@@ -77,6 +77,7 @@ def test_gromacs_declares_workflow_expected_files() -> None:
     ]
     assert [(item.path, item.role) for item in production] == [
         ("production_demo-rep1.xtc", "trajectory"),
+        ("production_demo-rep1.edr", "production_energy"),
         ("production_demo-rep1.tpr", "production_topology"),
         ("production_demo-rep1_nopbc_centered.pdb", "centered_structure"),
         ("rmsd_production_demo-rep1.csv", "rmsd"),

@@ -476,7 +476,7 @@ times after `2038-01-19T03:14:07Z` instead of emitting an ambiguous value that
 some extractors interpret as pre-1970. A future archive schema must select and
 validate a broadly interoperable 64-bit timestamp representation before that
 boundary. Service-generated `metadata/` members retain a fixed timestamp. The
-schema-v4 validator requires the stored compression method, exact source
+schema-v5 validator requires the stored compression method, exact source
 timestamp field shape, matching DOS fallback, and fixed generated timestamps
 in both the local headers and central directory. Unchanged Volume contents and
 modification times therefore reproduce the same archive bytes, size, and
@@ -489,9 +489,10 @@ API-specific registry or Function is added to the GROMACS App.
 The ZIP has exactly three top-level entries or namespaces:
 
 - `input.pdb` is the exact submitted structure;
-- `outputs/` contains the processed no-PBC production trajectory, centered
-  structure, production topology and parameters, plus RMSD,
-  radius-of-gyration, and RMSF CSV/PNG pairs; and
+- `outputs/` contains the processed no-PBC production trajectory, production
+  energy file, centered structure, production topology and parameters, plus
+  NVT, NPT, and production RMSD, radius-of-gyration, and RMSF CSV/PNG pairs;
+  and
 - `metadata/` contains the normalized parameters, safe provenance,
   service-generated run log, manifest, checksums, and any other explicitly
   allowed debugging document that is not useful at the top level.
@@ -516,10 +517,10 @@ their exact membership in the manifest, but do not fail an otherwise valid
 Result when they are absent.
 
 No metadata document remains loose at the archive root. The allowlist excludes
-the larger raw production trajectory and does not recursively package
-equilibration outputs, the working directory, credentials, internal storage
-paths, databases, raw provider exceptions, or large shared caches. It also
-excludes equilibration trajectories, `.trr`, `.edr`, `.cpt`, and intermediate
+the larger raw production trajectory and does not recursively package the
+working directory, credentials, internal storage paths, databases, raw
+provider exceptions, or large shared caches. It also excludes equilibration
+trajectories, `.trr`, `.cpt`, equilibration energy files, and intermediate
 `.tpr` and structure files; deeper diagnosis uses the authoritative Modal
 Volume.
 

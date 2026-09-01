@@ -455,7 +455,10 @@ class GromacsPublications:
         if node_key == NPT_ANALYSIS:
             return analysis("npt_")
         if node_key.startswith("production_run_"):
-            return (root / f"production_{name}.xtc",)
+            return (
+                root / f"production_{name}.xtc",
+                root / f"production_{name}.edr",
+            )
         if node_key == PRODUCTION_ANALYSIS:
             return analysis("production_") + (
                 root / f"production_{name}_nopbc.xtc",
@@ -469,6 +472,7 @@ class GromacsPublications:
                 + (
                     root / "production.mdp",
                     root / f"production_{name}.tpr",
+                    root / f"production_{name}.edr",
                     root / f"production_{name}_nopbc.xtc",
                     root / f"production_{name}_nopbc_centered.pdb",
                 )

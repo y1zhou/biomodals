@@ -75,20 +75,25 @@ CENTERED_PDB = PDB + b"END\n"
 
 def _remote_files() -> dict[str, bytes]:
     prefix = f"production_{RUN_NAME}"
-    return {
+    files = {
         f"{RUN_NAME}/{RUN_NAME}.pdb": PDB,
         f"{RUN_NAME}/production.mdp": b"integrator = md\n",
         f"{RUN_NAME}/{prefix}.xtc": b"full trajectory",
         f"{RUN_NAME}/{prefix}_nopbc.xtc": XTC,
         f"{RUN_NAME}/{prefix}.tpr": TPR,
+        f"{RUN_NAME}/{prefix}.edr": b"GROMACS energy data",
         f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": CENTERED_PDB,
-        f"{RUN_NAME}/rmsd_{prefix}.csv": b"time_ns,rmsd\n0.0,0.1\n",
-        f"{RUN_NAME}/rmsd_{prefix}.png": PNG,
-        f"{RUN_NAME}/rg_{prefix}.csv": b"time_ns,rg\n0.0,1.2\n",
-        f"{RUN_NAME}/rg_{prefix}.png": PNG,
-        f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue_index,rmsf\n1,0.2\n",
-        f"{RUN_NAME}/rmsf_{prefix}.png": PNG,
     }
+    for analysis_prefix in (f"nvt_{RUN_NAME}", f"npt_{RUN_NAME}", prefix):
+        files.update({
+            f"{RUN_NAME}/rmsd_{analysis_prefix}.csv": b"time_ns,rmsd\n0.0,0.1\n",
+            f"{RUN_NAME}/rmsd_{analysis_prefix}.png": PNG,
+            f"{RUN_NAME}/rg_{analysis_prefix}.csv": b"time_ns,rg\n0.0,1.2\n",
+            f"{RUN_NAME}/rg_{analysis_prefix}.png": PNG,
+            f"{RUN_NAME}/rmsf_{analysis_prefix}.csv": b"residue_index,rmsf\n1,0.2\n",
+            f"{RUN_NAME}/rmsf_{analysis_prefix}.png": PNG,
+        })
+    return files
 
 
 def _mtimes_for_files(remote_files: dict[str, bytes]) -> dict[str, int]:
@@ -177,13 +182,15 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         assert archive.read("input.pdb") == PDB
         assert f"outputs/{prefix}.xtc" not in archive.namelist()
         assert archive.read(f"outputs/{prefix}_nopbc.xtc") == XTC
-        assert archive.read(f"outputs/rmsd_{prefix}.png") == PNG
-        assert archive.read(f"outputs/rg_{prefix}.png") == PNG
-        assert archive.read(f"outputs/rmsf_{prefix}.png") == PNG
+        assert archive.read(f"outputs/{prefix}.edr") == b"GROMACS energy data"
+        for analysis_prefix in (f"nvt_{RUN_NAME}", f"npt_{RUN_NAME}", prefix):
+            assert archive.read(f"outputs/rmsd_{analysis_prefix}.png") == PNG
+            assert archive.read(f"outputs/rg_{analysis_prefix}.png") == PNG
+            assert archive.read(f"outputs/rmsf_{analysis_prefix}.png") == PNG
         assert archive.read("metadata/parameters.json") == PARAMETERS.encode()
         provenance = orjson.loads(archive.read("metadata/provenance.json"))
-        assert provenance["archive_schema_version"] == 4
-        assert GROMACS_ARCHIVE_SCHEMA_VERSION == 4
+        assert provenance["archive_schema_version"] == 5
+        assert GROMACS_ARCHIVE_SCHEMA_VERSION == 5
         assert provenance["modal_app_version"] == 17
         assert provenance["software_version"] == "GROMACS 2026.1"
         assert {name.split("/", 1)[0] for name in archive.namelist()} == {
@@ -336,7 +343,7 @@ def test_service_preserves_remote_file_modification_times() -> None:
             assert info.extra == struct.pack("<HHBI", 0x5455, 5, 1, mtime)
 
 
-def test_archive_validator_enforces_schema_four_zip_metadata() -> None:
+def test_archive_validator_enforces_schema_five_zip_metadata() -> None:
     archive_bytes, _result = _build_archive()
 
     def deflate(info: zipfile.ZipInfo) -> None:

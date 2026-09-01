@@ -98,6 +98,7 @@ def production_workflow_files(run_name: str) -> list[ArtifactFile]:
     prefix = f"production_{run_name}"
     return [
         ArtifactFile(path=f"{prefix}.xtc", role="trajectory"),
+        ArtifactFile(path=f"{prefix}.edr", role="production_energy"),
         ArtifactFile(path=f"{prefix}.tpr", role="production_topology"),
         ArtifactFile(path=f"{prefix}_nopbc_centered.pdb", role="centered_structure"),
         ArtifactFile(path=f"rmsd_{prefix}.csv", role="rmsd"),

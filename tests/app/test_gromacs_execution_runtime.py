@@ -103,6 +103,7 @@ class CompletingDriver:
             return
         if function_name.startswith("production_run_"):
             (self.root / f"production_{self.run_name}.xtc").write_bytes(b"xtc")
+            (self.root / f"production_{self.run_name}.edr").write_bytes(b"edr")
             return
         prefix = str(kwargs["traj_prefix"])
         for metric in ("rmsd", "rg", "rmsf"):
@@ -372,6 +373,7 @@ def test_terminal_publication_covers_required_user_outputs(tmp_path: Path) -> No
 
     assert {
         "production.mdp",
+        f"production_{request.run_name}.edr",
         f"production_{request.run_name}.tpr",
         f"production_{request.run_name}_nopbc.xtc",
         f"production_{request.run_name}_nopbc_centered.pdb",

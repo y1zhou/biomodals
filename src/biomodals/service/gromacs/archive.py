@@ -64,7 +64,42 @@ class BuiltGromacsArchive:
     sha256: str
 
 
-GROMACS_ARCHIVE_SCHEMA_VERSION = 4
+class _HashingWriter:
+    """Count and hash one non-seekable ZIP stream while it is written."""
+
+    def __init__(self, destination: BinaryIO) -> None:
+        self.destination = destination
+        self.size_bytes = 0
+        self.digest = hashlib.sha256()
+
+    def write(self, content: bytes) -> int:
+        written = self.destination.write(content)
+        self.digest.update(memoryview(content)[:written])
+        self.size_bytes += written
+        return written
+
+    def tell(self) -> int:
+        return self.size_bytes
+
+    def flush(self) -> None:
+        self.destination.flush()
+
+    def seekable(self) -> bool:
+        return False
+
+
+GROMACS_ARCHIVE_SCHEMA_VERSION = 5
+
+
+def _analysis_output_files(prefix: str, *, stage: str) -> list[tuple[str, str]]:
+    return [
+        (f"outputs/rmsd_{prefix}.csv", f"{stage}_rmsd"),
+        (f"outputs/rmsd_{prefix}.png", f"{stage}_rmsd_plot"),
+        (f"outputs/rg_{prefix}.csv", f"{stage}_radius_of_gyration"),
+        (f"outputs/rg_{prefix}.png", f"{stage}_radius_of_gyration_plot"),
+        (f"outputs/rmsf_{prefix}.csv", f"{stage}_rmsf"),
+        (f"outputs/rmsf_{prefix}.png", f"{stage}_rmsf_plot"),
+    ]
 
 
 def _required_output_files(run_name: str) -> list[tuple[str, str]]:
@@ -73,13 +108,11 @@ def _required_output_files(run_name: str) -> list[tuple[str, str]]:
         ("outputs/production.mdp", "production_parameters"),
         (f"outputs/{prefix}_nopbc.xtc", "trajectory"),
         (f"outputs/{prefix}.tpr", "production_topology"),
+        (f"outputs/{prefix}.edr", "production_energy"),
         (f"outputs/{prefix}_nopbc_centered.pdb", "centered_structure"),
-        (f"outputs/rmsd_{prefix}.csv", "rmsd"),
-        (f"outputs/rmsd_{prefix}.png", "rmsd_plot"),
-        (f"outputs/rg_{prefix}.csv", "radius_of_gyration"),
-        (f"outputs/rg_{prefix}.png", "radius_of_gyration_plot"),
-        (f"outputs/rmsf_{prefix}.csv", "rmsf"),
-        (f"outputs/rmsf_{prefix}.png", "rmsf_plot"),
+        *_analysis_output_files(f"nvt_{run_name}", stage="nvt"),
+        *_analysis_output_files(f"npt_{run_name}", stage="npt"),
+        *_analysis_output_files(prefix, stage="production"),
     ]
 
 
@@ -325,18 +358,23 @@ def _validate_required_formats(archive: zipfile.ZipFile, run_name: str) -> None:
         raise ValueError("GROMACS production topology is invalid")
     _tpr_software_version(tpr_prefix)
 
-    csv_contracts = (
-        (f"outputs/rmsd_{prefix}.csv", ("time_ns", "rmsd")),
-        (f"outputs/rg_{prefix}.csv", ("time_ns", "rg")),
-        (f"outputs/rmsf_{prefix}.csv", ("residue_index", "rmsf")),
+    analysis_prefixes = (f"nvt_{run_name}", f"npt_{run_name}", prefix)
+    csv_contracts = tuple(
+        (f"outputs/{metric}_{analysis_prefix}.csv", header)
+        for analysis_prefix in analysis_prefixes
+        for metric, header in (
+            ("rmsd", ("time_ns", "rmsd")),
+            ("rg", ("time_ns", "rg")),
+            ("rmsf", ("residue_index", "rmsf")),
+        )
     )
     for name, header in csv_contracts:
         _validate_csv_member(archive, name, header=header)
 
     for name in (
-        f"outputs/rmsd_{prefix}.png",
-        f"outputs/rg_{prefix}.png",
-        f"outputs/rmsf_{prefix}.png",
+        f"outputs/{metric}_{analysis_prefix}.png"
+        for analysis_prefix in analysis_prefixes
+        for metric in ("rmsd", "rg", "rmsf")
     ):
         _validate_png_member(archive, name)
 
@@ -574,6 +612,7 @@ async def _write_remote(
     name: str,
     role: str,
     run_bounded: RunBounded | None,
+    prefix: bytearray | None = None,
 ) -> dict[str, str | int]:
     return await _write_remote_chunks(
         archive,
@@ -582,6 +621,7 @@ async def _write_remote(
         name=name,
         role=role,
         run_bounded=run_bounded,
+        prefix=prefix,
     )
 
 
@@ -593,6 +633,7 @@ async def _write_remote_chunks(
     name: str,
     role: str,
     run_bounded: RunBounded | None,
+    prefix: bytearray | None = None,
 ) -> dict[str, str | int]:
     digest = hashlib.sha256()
     size_bytes = 0
@@ -608,6 +649,8 @@ async def _write_remote_chunks(
 
         async for chunk in chunks:
             size_bytes += len(chunk)
+            if prefix is not None and len(prefix) < 128:
+                prefix.extend(chunk[: 128 - len(prefix)])
             if run_bounded is None:
                 write_chunk(chunk)
             else:
@@ -722,7 +765,11 @@ async def write_gromacs_archive(
     ).encode()
 
     records: list[dict[str, str | int]] = []
-    with zipfile.ZipFile(binary_handle, mode="w", allowZip64=True) as archive:
+    topology_prefix = bytearray()
+    writer = _HashingWriter(binary_handle)
+    with zipfile.ZipFile(
+        cast("BinaryIO", writer), mode="w", allowZip64=True
+    ) as archive:
         if run_bounded is None:
             input_record = _write_bytes(
                 archive,
@@ -743,6 +790,11 @@ async def write_gromacs_archive(
         records.append(input_record)
         for name, role in _required_output_files(run_name):
             remote_path = f"{run_name}/{PurePosixPath(name).name}"
+            capture_prefix = (
+                topology_prefix
+                if name == f"outputs/production_{run_name}.tpr"
+                else None
+            )
             records.append(
                 await _write_remote(
                     archive,
@@ -752,10 +804,10 @@ async def write_gromacs_archive(
                     name=name,
                     role=role,
                     run_bounded=run_bounded,
+                    prefix=capture_prefix,
                 )
             )
-        topology_name = f"outputs/production_{run_name}.tpr"
-        software_version = _tpr_software_version(_read_prefix(archive, topology_name))
+        software_version = _tpr_software_version(bytes(topology_prefix))
         provenance_bytes = (
             orjson.dumps(
                 {
@@ -821,37 +873,24 @@ async def write_gromacs_archive(
         )
 
     if run_bounded is None:
-        validated, size_bytes, sha256 = _validate_and_measure(
+        validated = _validate_gromacs_archive(
             binary_handle,
-            run_name,
+            run_name=run_name,
+            verify_member_digests=False,
         )
     else:
-        validated, size_bytes, sha256 = await run_bounded(
-            _validate_and_measure,
+        validated = await run_bounded(
+            _validate_gromacs_archive,
             binary_handle,
-            run_name,
+            run_name=run_name,
+            verify_member_digests=False,
         )
+    binary_handle.seek(0)
     return BuiltGromacsArchive(
         request_sha256=validated.request_sha256,
-        size_bytes=size_bytes,
-        sha256=sha256,
+        size_bytes=writer.size_bytes,
+        sha256=writer.digest.hexdigest(),
     )
-
-
-def _validate_and_measure(
-    handle: BinaryIO,
-    run_name: str,
-) -> tuple[ValidatedGromacsArchive, int, str]:
-    """Validate and hash a complete archive in one bounded worker task."""
-    validated = validate_gromacs_archive(handle, run_name=run_name)
-    handle.seek(0)
-    digest = hashlib.sha256()
-    size_bytes = 0
-    while chunk := handle.read(_CHUNK_SIZE):
-        size_bytes += len(chunk)
-        digest.update(chunk)
-    handle.seek(0)
-    return validated, size_bytes, digest.hexdigest()
 
 
 def _manifest_records(document: object) -> list[dict[str, object]]:
@@ -875,6 +914,20 @@ def validate_gromacs_archive(
     run_name: str,
 ) -> ValidatedGromacsArchive:
     """Validate exact members, CRCs, manifest records, and checksums."""
+    return _validate_gromacs_archive(
+        handle,
+        run_name=run_name,
+        verify_member_digests=True,
+    )
+
+
+def _validate_gromacs_archive(
+    handle: object,
+    *,
+    run_name: str,
+    verify_member_digests: bool,
+) -> ValidatedGromacsArchive:
+    """Validate one archive, optionally trusting hashes made while writing."""
     binary_handle = cast("BinaryIO", handle)
     binary_handle.seek(0)
     try:
@@ -935,7 +988,12 @@ def validate_gromacs_archive(
                     or any(character not in "0123456789abcdef" for character in sha256)
                 ):
                     raise ValueError("GROMACS archive manifest record is invalid")
-                actual = _member_digest(archive, archive.getinfo(name))
+                info = archive.getinfo(name)
+                actual = (
+                    _member_digest(archive, info)
+                    if verify_member_digests
+                    else (info.file_size, sha256)
+                )
                 if actual != (size_bytes, sha256):
                     raise ValueError(
                         f"GROMACS archive member does not match manifest: {name}"

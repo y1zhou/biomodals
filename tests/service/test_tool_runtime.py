@@ -206,6 +206,9 @@ async def test_terminal_observation_defers_result_work(tmp_path: Path) -> None:
         async def launch(self, _locator):
             return "fc-root"
 
+        async def poll_root(self, _locator, _call_id):
+            return _overview(RunStatus.SUCCEEDED)
+
         async def status(self, _locator):
             return _overview(RunStatus.SUCCEEDED)
 
@@ -546,16 +549,25 @@ async def test_explicit_refresh_resumes_suspended_remote_execution(
     tmp_path: Path,
 ) -> None:
     class Remote:
+        resume_count = 0
+
         async def launch(self, _locator):
             return "fc-root"
+
+        async def poll_root(self, _locator, call_id):
+            if call_id == "fc-resume":
+                return None
+            return _overview(RunStatus.SUSPENDED)
 
         async def status(self, _locator):
             return _overview(RunStatus.SUSPENDED)
 
         async def resume(self, _locator):
+            self.resume_count += 1
             return "fc-resume"
 
-    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    remote = Remote()
+    store, lifecycle, _adapter = _lifecycle(tmp_path, remote)
     await lifecycle.advance(JOB_ID)
 
     resumed = await lifecycle.advance(JOB_ID, force_refresh=True)
@@ -564,6 +576,11 @@ async def test_explicit_refresh_resumes_suspended_remote_execution(
         JobState.RUNNING,
         "fc-resume",
     )
+
+    still_running = await lifecycle.advance(JOB_ID, force_refresh=True)
+
+    assert still_running.root_function_call_id == "fc-resume"
+    assert remote.resume_count == 1
 
 
 @pytest.mark.anyio
@@ -677,6 +694,21 @@ async def test_remote_failure_details_are_not_owner_visible(tmp_path: Path) -> N
         async def launch(self, _locator):
             return "fc-root"
 
+        async def poll_root(self, _locator, _call_id):
+            overview = _overview(RunStatus.FAILED)
+            overview.run.status_message = f"failed reading {raw_path}"
+            overview.nodes = (
+                SimpleNamespace(
+                    node_key="inference",
+                    status=SimpleNamespace(value="failed"),
+                    status_reason=None,
+                    error_message=f"traceback at {raw_path}",
+                    started_at=10,
+                    completed_at=20,
+                ),
+            )
+            return overview
+
         async def status(self, _locator):
             overview = _overview(RunStatus.FAILED)
             overview.run.status_message = f"failed reading {raw_path}"
@@ -706,6 +738,9 @@ async def test_remote_identity_mismatch_becomes_state_unknown(tmp_path: Path) ->
     class Remote:
         async def launch(self, _locator):
             return "fc-root"
+
+        async def poll_root(self, _locator, _call_id):
+            raise RemoteExecutionIdentityMismatchError("wrong execution identity")
 
         async def status(self, _locator):
             raise RemoteExecutionIdentityMismatchError("wrong execution identity")

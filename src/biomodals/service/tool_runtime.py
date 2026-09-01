@@ -206,7 +206,9 @@ class JobLifecycle:
                 try:
                     overview = None
                     if (
-                        background or job.state == JobState.STATE_UNKNOWN
+                        background
+                        or force_refresh
+                        or job.state == JobState.STATE_UNKNOWN
                     ) and job.root_function_call_id is not None:
                         overview = await self.remote.poll_root(
                             _locator(job), job.root_function_call_id

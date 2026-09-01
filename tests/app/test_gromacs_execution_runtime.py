@@ -380,6 +380,35 @@ def test_terminal_publication_covers_required_user_outputs(tmp_path: Path) -> No
     } <= paths
 
 
+def test_production_invalidation_removes_the_checkpoint_output_set(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    publications = _publications(tmp_path, request, FakeClaims(), RUN_ID)
+    root = request.run_root(tmp_path)
+    root.mkdir()
+    prefix = f"production_{request.run_name}"
+    output_names = (
+        f"{prefix}.xtc",
+        f"{prefix}.edr",
+        f"{prefix}.cpt",
+        f"{prefix}_prev.cpt",
+        f"{prefix}.log",
+        f"{prefix}.gro",
+        f"{prefix}.trr",
+        f"{prefix}.tng",
+    )
+    for name in output_names:
+        (root / name).write_bytes(b"partial")
+    topology = root / f"{prefix}.tpr"
+    topology.write_bytes(b"tpr")
+
+    publications.invalidate("production_run_gpu")
+
+    assert not any((root / name).exists() for name in output_names)
+    assert topology.read_bytes() == b"tpr"
+
+
 @pytest.mark.parametrize(
     ("missing_name", "repair_function"),
     [

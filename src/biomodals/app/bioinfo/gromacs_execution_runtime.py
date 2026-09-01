@@ -430,8 +430,16 @@ class GromacsPublications:
         )
 
     def invalidate(self, node_key: str) -> None:
-        """Remove digest-invalid outputs before authorizing repair."""
-        for path in self.node_paths(node_key):
+        """Remove digest-invalid outputs and their checkpoint-bound siblings."""
+        paths = list(self.node_paths(node_key))
+        if node_key.startswith("production_run_"):
+            root = self.request.run_root(self.output_root)
+            prefix = root / f"production_{self.request.run_name}"
+            paths.extend(
+                Path(f"{prefix}{suffix}")
+                for suffix in (".cpt", "_prev.cpt", ".log", ".gro", ".trr", ".tng")
+            )
+        for path in paths:
             path.unlink(missing_ok=True)
         self.publication_path(node_key).unlink(missing_ok=True)
 

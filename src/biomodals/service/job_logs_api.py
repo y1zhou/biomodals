@@ -201,18 +201,23 @@ def create_job_logs_router() -> APIRouter:
     ) -> StreamingResponse:
         job, registration = _authorized(request, job_id, session)
         remote: RemoteExecutionClient = request.app.state.remote_execution
-        call = await remote.provider_call(_locator(job), target)
-        handle = call.provider_call_handle_id if call is not None else None
-        if (
-            call is None
-            or handle is None
-            or _target(registration.definition, call) is None
-        ):
-            raise HTTPException(409, "Job log target is unavailable")
-        live = _validate_window(call, since=since, until=until)
+        live = _validate_window_parameters(since=since, until=until)
         user_id = session.principal.user_id
         streams = live_streams if live else historical_streams
         await streams.acquire(user_id, job_id)
+        try:
+            call = await remote.provider_call(_locator(job), target)
+            handle = call.provider_call_handle_id if call is not None else None
+            if (
+                call is None
+                or handle is None
+                or _target(registration.definition, call) is None
+            ):
+                raise HTTPException(409, "Job log target is unavailable")
+            _validate_window(call, since=since, until=until)
+        except BaseException:
+            await streams.release(user_id, job_id)
+            raise
 
         async def content():
             try:
@@ -323,9 +328,21 @@ def _validate_window(
     until: datetime | None,
 ) -> bool:
     """Validate historical bounds before response headers are committed."""
-    if since is None and until is None:
+    live = _validate_window_parameters(since=since, until=until)
+    if live:
         if call.status.is_terminal:
             raise HTTPException(422, "Historical logs require since and until")
+        return True
+    return False
+
+
+def _validate_window_parameters(
+    *,
+    since: datetime | None,
+    until: datetime | None,
+) -> bool:
+    """Validate request-only bounds before reserving remote log access."""
+    if since is None and until is None:
         return True
     if since is None or until is None:
         raise HTTPException(422, "Historical logs require since and until")

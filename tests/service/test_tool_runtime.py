@@ -18,7 +18,6 @@ from biomodals.service import tool_runtime
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
     RemoteExecutionIdentityMismatchError,
-    RemoteRootExecutionFailedError,
 )
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
@@ -511,28 +510,6 @@ async def test_background_poll_does_not_wake_an_active_coordinator(
     active = await lifecycle.advance(JOB_ID, finalize=True, background=True)
     assert active.state == JobState.RUNNING
     assert active.updated_at > 10
-
-
-@pytest.mark.anyio
-async def test_terminal_root_failure_is_not_treated_as_still_running(
-    tmp_path: Path,
-) -> None:
-    class Remote:
-        async def launch(self, _locator):
-            return "fc-root"
-
-        async def poll_root(self, _locator, _function_call_id):
-            raise RemoteRootExecutionFailedError("coordinator crashed")
-
-    _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
-    await lifecycle.advance(JOB_ID)
-
-    failed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
-    assert (failed.state, failed.error_code) == (
-        JobState.FAILED,
-        "remote_coordinator_failed",
-    )
-    assert failed.error_message == "The remote execution coordinator failed"
 
 
 @pytest.mark.anyio

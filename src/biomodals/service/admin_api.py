@@ -761,7 +761,7 @@ def create_admin_router() -> APIRouter:
     ) -> AdminModalView:
         store: ServiceStore = request.app.state.store
         try:
-            store.resolve_state_unknown(
+            await request.app.state.lifecycle.resolve_state_unknown(
                 job_id,
                 resolution=submission.resolution,
                 function_call_id=(
@@ -769,7 +769,6 @@ def create_admin_router() -> APIRouter:
                     if submission.function_call_id
                     else None
                 ),
-                now=int(time.time()),
             )
             if submission.resolution == "resume":
                 await request.app.state.lifecycle.advance(

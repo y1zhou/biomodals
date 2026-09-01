@@ -31,10 +31,6 @@ class RemoteSubmissionOutcomeUnknownError(RuntimeError):
     """A coordinator spawn may have happened without returning its call ID."""
 
 
-class RemoteRootExecutionFailedError(RuntimeError):
-    """The root coordinator call ended without returning an overview."""
-
-
 class RemoteExecutionIdentityMismatchError(RuntimeError):
     """A remote overview does not belong to the pinned service Job."""
 
@@ -108,8 +104,10 @@ class RemoteExecutionClient:
             raise RemoteExecutionIdentityMismatchError(
                 "Pinned root Function Call is unavailable"
             ) from error
-        except modal.exception.RemoteError as error:
-            raise RemoteRootExecutionFailedError(str(error)) from error
+        except modal.exception.RemoteError:
+            # The root call can raise after durably suspending the Run. The
+            # coordinator ledger, not Modal's call result, owns terminality.
+            return await self.status(locator)
         return self._verified(locator, overview)
 
     async def status(self, locator: ExecutionLocator) -> ExecutionOverview:

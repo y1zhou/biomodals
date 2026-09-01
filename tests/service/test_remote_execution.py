@@ -177,6 +177,29 @@ async def test_builtin_root_poll_timeout_means_still_running(monkeypatch) -> Non
 
 
 @pytest.mark.anyio
+async def test_root_error_returns_the_durable_coordinator_status(monkeypatch) -> None:
+    durable = _overview()
+
+    def failed(**_arguments):
+        raise modal.exception.RemoteError("coordinator suspended")
+
+    coordinator = SimpleNamespace(status=RemoteMethod(durable))
+    monkeypatch.setattr(
+        RemoteExecutionClient,
+        "_coordinator",
+        staticmethod(lambda _locator: coordinator),
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall",
+        SimpleNamespace(
+            from_id=lambda _call_id: SimpleNamespace(get=failed),
+        ),
+    )
+
+    assert await RemoteExecutionClient().poll_root(LOCATOR, "fc-failed") is durable
+
+
+@pytest.mark.anyio
 async def test_unassigned_active_provider_calls_are_presented_as_queued(
     monkeypatch,
 ) -> None:

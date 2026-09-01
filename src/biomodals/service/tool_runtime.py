@@ -21,7 +21,6 @@ from biomodals.service.remote_execution import (
     RemoteDeploymentUnavailableError,
     RemoteExecutionClient,
     RemoteExecutionIdentityMismatchError,
-    RemoteRootExecutionFailedError,
     RemoteSubmissionOutcomeUnknownError,
 )
 from biomodals.service.store import JobRecord, JobState, ServiceStore
@@ -216,13 +215,6 @@ class JobLifecycle:
                             return self.store.touch_job(job_id, now=now)
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
-                except RemoteRootExecutionFailedError:
-                    return self.store.fail_job(
-                        job_id,
-                        error_code="remote_coordinator_failed",
-                        error_message="The remote execution coordinator failed",
-                        now=now,
-                    )
                 except RemoteExecutionIdentityMismatchError:
                     LOGGER.warning(
                         "Remote execution identity is unknown", exc_info=True
@@ -256,6 +248,23 @@ class JobLifecycle:
                     result_state=JobState(job.result_state or JobState.SUCCEEDED),
                 )
             return job
+
+    async def resolve_state_unknown(
+        self,
+        job_id: UUID,
+        *,
+        resolution: str,
+        function_call_id: str | None,
+    ) -> JobRecord:
+        """Serialize an Administrator resolution with every Job side effect."""
+        lock = self._locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            return self.store.resolve_state_unknown(
+                job_id,
+                resolution=resolution,
+                function_call_id=function_call_id,
+                now=int(time.time()),
+            )
 
     async def cancel(self, job_id: UUID) -> JobRecord:
         """Serialize sticky cancellation with launch for one Job."""

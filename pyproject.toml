@@ -54,10 +54,13 @@ line-length = 88
 [tool.uv.sources]
 uniaf3 = { index = "pypi" }
 
+[tool.uv]
+required-version = "==0.12.8"
+
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
-explicit = true
+default = true
 
 [tool.ruff.format]
 preview = true

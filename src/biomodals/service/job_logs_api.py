@@ -41,16 +41,18 @@ class _AsyncClosable(Protocol):
         """Release resources owned by an asynchronous iterator."""
 
 
-class _LiveLogStreams:
-    """Bound concurrent live SDK streams without limiting historical reads."""
+class _LogStreams:
+    """Bound one class of concurrent Modal SDK log streams."""
 
     def __init__(
         self,
         *,
+        mode: LogMode,
         global_limit: int = 32,
         user_limit: int = 4,
         job_limit: int = 4,
     ) -> None:
+        self._mode = mode
         self._global_limit = global_limit
         self._user_limit = user_limit
         self._job_limit = job_limit
@@ -60,7 +62,7 @@ class _LiveLogStreams:
         self._jobs: dict[UUID, int] = {}
 
     async def acquire(self, user_id: UUID, job_id: UUID) -> None:
-        """Reserve one live stream or reject the request before it starts."""
+        """Reserve one stream or reject the request before it starts."""
         async with self._lock:
             if (
                 self._total >= self._global_limit
@@ -70,7 +72,7 @@ class _LiveLogStreams:
                 raise CodedAPIError(
                     429,
                     "log_stream_limit",
-                    "Too many live log streams are open; close one and retry",
+                    f"Too many {self._mode} log streams are open; close one and retry",
                     headers={"Retry-After": "5"},
                 )
             self._total += 1
@@ -78,7 +80,7 @@ class _LiveLogStreams:
             self._jobs[job_id] = self._jobs.get(job_id, 0) + 1
 
     async def release(self, user_id: UUID, job_id: UUID) -> None:
-        """Release one live stream and discard empty counter entries."""
+        """Release one stream and discard empty counter entries."""
         async with self._lock:
             self._total -= 1
             self._decrement(self._users, user_id)
@@ -120,7 +122,8 @@ class JobLogTargetsView(BaseModel):
 def create_job_logs_router() -> APIRouter:
     """Create owner- and Administrator-authorized SDK log routes."""
     router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
-    live_streams = _LiveLogStreams()
+    live_streams = _LogStreams(mode="live")
+    historical_streams = _LogStreams(mode="historical")
 
     @router.get("/{job_id}/log-targets", response_model=JobLogTargetsView)
     async def targets(
@@ -208,8 +211,8 @@ def create_job_logs_router() -> APIRouter:
             raise HTTPException(409, "Job log target is unavailable")
         live = _validate_window(call, since=since, until=until)
         user_id = session.principal.user_id
-        if live:
-            await live_streams.acquire(user_id, job_id)
+        streams = live_streams if live else historical_streams
+        await streams.acquire(user_id, job_id)
 
         async def content():
             try:
@@ -228,8 +231,7 @@ def create_job_logs_router() -> APIRouter:
                         option=orjson.OPT_APPEND_NEWLINE,
                     )
             finally:
-                if live:
-                    await live_streams.release(user_id, job_id)
+                await streams.release(user_id, job_id)
 
         return StreamingResponse(
             _redact_provider_call_id(content(), handle),

@@ -377,11 +377,14 @@ active call and then the most recently started call. Public responses use an
 opaque log-target selector and never expose the Modal Function Call ID.
 Target lookup is stage-filtered and bounded rather than paging every Provider
 Call in the Run. Historical requests require timezone-aware start and end
-times in ascending order and use windows of at most one hour. The backend opens
-one SDK stream for each admitted live HTTP request. Modal's SDK preserves its
-cursor while reconnecting its own RPCs; the frontend does not add a second
-polling or reconnect loop. Historical output for any started, non-active stage
-is fetched once and remains cached for the lifetime of the page.
+times in ascending order and use windows of at most one hour. Live and
+historical reads have separate global, per-User, and per-Job admission pools,
+so either mode has bounded SDK fan-out and historical reads cannot consume
+live-stream capacity. The backend opens one SDK stream for each admitted HTTP
+request. Modal's SDK preserves its cursor while reconnecting its own RPCs; the
+frontend does not add a second polling or reconnect loop. Historical output for
+any started, non-active stage is fetched once and remains cached for the
+lifetime of the page.
 
 An interactive terminal observation may persist `finalizing` and return
 promptly. A background terminal observation continues directly into archive
@@ -520,8 +523,9 @@ error copy; partial Runs use one generic incomplete-results warning. Raw remote
 diagnostics remain available only through Administrator-authorized logs and
 Provider Call inspection.
 
-Each admitted live log read uses one Modal SDK stream. The SDK preserves its
-log cursor while reconnecting internal RPCs and ends the stream when the
+Each admitted log read uses one Modal SDK stream. Live and historical reads use
+independent global, per-User, and per-Job admission pools. The SDK preserves a
+live cursor while reconnecting internal RPCs and ends the stream when the
 Function Call completes. Selecting a log target performs one direct bounded
 coordinator read rather than scanning Provider Call pages.
 

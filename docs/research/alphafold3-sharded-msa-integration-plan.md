@@ -697,8 +697,8 @@ output Volume or archive.
 
 Each streamed artifact must match the manifest-declared byte size and SHA-256.
 At publication, the durable request-view manifest additionally records the
-expected size and digest of the presentation-ready input staged alongside the
-canonical inference input. An existing
+expected size and digest after a bounded streaming substitution of the
+canonical input's deterministic top-level name. An existing
 archive is therefore reused without rereading the staged input from the Modal
 Volume when one local streamed pass validates its exact member set, embedded
 manifest, and all payload digests. A corrupt, stale, or otherwise mismatched
@@ -980,13 +980,13 @@ size and SHA-256, and restores upstream's exact sanitized display-name prefix
 in downloaded basenames. The durable request input uses the canonical
 `af3-{run_id[:16]}` name and inline template content, so callers with the same
 scientific input and seeds upload identical bytes even when their display names
-or original inline/path template representations differ. Input preparation also
-stages a request-scoped copy with the caller display name for result publication;
-the finalizer never reparses the enriched input. The resulting
+or original inline/path template representations differ. The finalizer derives
+the presentation digest through a bounded streaming name substitution and never
+reparses or duplicates the enriched input. The resulting
 `{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after its exact member set and embedded
 presentation manifest validate, including every archive-local payload digest.
-The request-view publisher persists the staged presentation input digest once.
+The request-view publisher persists the derived presentation input digest once.
 Before reusing an existing archive, the client reads only the local archive and
 requires all archive digests to equal their published records. Updating a
 corrupt payload and its embedded digest together therefore still fails. A

@@ -2,7 +2,8 @@
 
 Durable prediction files remain canonical and seed-addressed on the output
 Volume. This module publishes a small request view over exactly the requested
-seeds, then downloads only that manifest-declared presentation view.
+seeds, then downloads only that manifest-declared view and restores the
+caller's presentation name with bounded streaming I/O.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import shutil
 import subprocess as sp
 import tarfile
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -57,6 +58,7 @@ REQUEST_MANIFEST_SCHEMA_VERSION = 5
 REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v2"
 
 _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
+_CHUNK_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,18 +251,93 @@ def _input_artifact_record(
     output_root: Path,
     volume_path: Path,
     archive_path: str | PurePosixPath,
+    canonical_name: str,
+    display_name: str,
 ) -> dict[str, object]:
-    """Describe a presentation-ready input without loading it into memory."""
-    record = _artifact_record(
-        source=source,
-        output_root=output_root,
-        volume_path=volume_path,
-        archive_path=archive_path,
-        role="input",
+    """Hash canonical and presentation input identities in one bounded pass."""
+    require_regular_file(source)
+    source_marker, archive_marker = _input_name_markers(
+        canonical_name=canonical_name,
+        display_name=display_name,
     )
-    record["archive_size_bytes"] = record["size_bytes"]
-    record["archive_sha256"] = record["sha256"]
-    return record
+    source_digest = hashlib.sha256()
+    archive_digest = hashlib.sha256()
+    size_bytes = 0
+
+    def observe_source(chunk: bytes) -> None:
+        nonlocal size_bytes
+        source_digest.update(chunk)
+        size_bytes += len(chunk)
+
+    with source.open("rb") as handle:
+        for chunk in _presentation_input_chunks(
+            handle,
+            source_marker=source_marker,
+            archive_marker=archive_marker,
+            observe_source=observe_source,
+        ):
+            archive_digest.update(chunk)
+    if source.stat().st_size != size_bytes:
+        raise RuntimeError("Staged AlphaFold input changed while it was hashed")
+    return {
+        "role": "input",
+        "volume_path": _volume_relative_path(output_root, volume_path).as_posix(),
+        "archive_path": _safe_archive_path(archive_path).as_posix(),
+        "size_bytes": size_bytes,
+        "sha256": source_digest.hexdigest(),
+        "archive_size_bytes": size_bytes - len(source_marker) + len(archive_marker),
+        "archive_sha256": archive_digest.hexdigest(),
+    }
+
+
+def _input_name_markers(
+    *,
+    canonical_name: str,
+    display_name: str,
+) -> tuple[bytes, bytes]:
+    """Return exact deterministic top-level name field encodings."""
+    prefix = b'\n  "name": '
+    return (
+        prefix + orjson.dumps(canonical_name) + b",\n",
+        prefix + orjson.dumps(display_name) + b",\n",
+    )
+
+
+def _presentation_input_chunks(
+    source: IO[bytes],
+    *,
+    source_marker: bytes,
+    archive_marker: bytes,
+    observe_source: Callable[[bytes], None] | None = None,
+) -> Iterator[bytes]:
+    """Replace one input name while retaining only one bounded carry buffer."""
+    pending = b""
+    replaced = False
+    for chunk in iter(lambda: source.read(_CHUNK_SIZE), b""):
+        if observe_source is not None:
+            observe_source(chunk)
+        if replaced:
+            yield chunk
+            continue
+        pending += chunk
+        index = pending.find(source_marker)
+        if index >= 0:
+            yield pending[:index]
+            yield archive_marker
+            pending = pending[index + len(source_marker) :]
+            if pending:
+                yield pending
+            pending = b""
+            replaced = True
+            continue
+        safe_size = len(pending) - len(source_marker) + 1
+        if safe_size > 0:
+            yield pending[:safe_size]
+            pending = pending[safe_size:]
+    if not replaced:
+        raise ValueError("Staged AlphaFold input has the wrong canonical name")
+    if pending:
+        yield pending
 
 
 def _request_view_root(
@@ -455,7 +532,7 @@ def publish_request_results(
         spec.display_name,
     )
     request_root = _request_view_root(run_root, spec.request_id, view_id)
-    input_path = run_root / "requests" / spec.request_id / "presentation-input.json"
+    input_path = run_root / "requests" / spec.request_id / "input.json"
     require_regular_file(input_path)
     manifest_path = request_root / "manifest.json"
     if manifest := _reusable_request_manifest(
@@ -489,6 +566,8 @@ def publish_request_results(
             output_root=runtime.output_root,
             volume_path=input_path,
             archive_path=f"{canonical_name}_data.json",
+            canonical_name=canonical_name,
+            display_name=spec.display_name,
         ),
     ]
     artifacts.extend(
@@ -886,6 +965,31 @@ def _validate_downloaded_artifact(
         )
 
 
+def _rewrite_downloaded_input(
+    input_path: Path,
+    *,
+    canonical_name: str,
+    display_name: str,
+) -> None:
+    """Stream one deterministic top-level name substitution to a new file."""
+    source_marker, archive_marker = _input_name_markers(
+        canonical_name=canonical_name,
+        display_name=display_name,
+    )
+    temporary = input_path.with_name(f".{input_path.name}.{uuid.uuid4().hex}.partial")
+    try:
+        with input_path.open("rb") as source, temporary.open("xb") as destination:
+            for chunk in _presentation_input_chunks(
+                source,
+                source_marker=source_marker,
+                archive_marker=archive_marker,
+            ):
+                destination.write(chunk)
+        os.replace(temporary, input_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _ranking_csv_bytes(rows: tuple[RankingRow, ...]) -> bytes:
     value = pl.DataFrame({
         "seed": [row.seed for row in rows],
@@ -1239,6 +1343,11 @@ def create_request_archive(
                 raise RuntimeError(
                     "Request archive requires exactly one input artifact"
                 )
+            _rewrite_downloaded_input(
+                input_path,
+                canonical_name=canonical_name,
+                display_name=display_name,
+            )
             _record_archive_artifacts(
                 local_manifest,
                 transformed_artifacts,

@@ -3018,12 +3018,12 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     request_id = hash_sequences(run_id, [seed])
     canonical_name = canonical_output_name(run_id)
     run_root = tmp_path / run_id[:2] / run_id
-    input_path = run_root / "requests" / request_id / "presentation-input.json"
+    input_path = run_root / "requests" / request_id / "input.json"
     input_path.parent.mkdir(parents=True)
     input_path.write_bytes(
         serialize_af3_input(
             AF3Config(
-                name="Readable Name",
+                name=canonical_name,
                 modelSeeds=[seed],
                 sequences=[
                     AF3SequenceEntry(
@@ -3102,7 +3102,11 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     input_artifact = next(
         artifact for artifact in artifacts if artifact["role"] == "input"
     )
-    presentation_bytes = input_path.read_bytes()
+    presentation_bytes = input_path.read_bytes().replace(
+        orjson.dumps(canonical_name),
+        orjson.dumps("Readable Name"),
+        1,
+    )
     assert input_artifact["archive_size_bytes"] == len(presentation_bytes)
     assert (
         input_artifact["archive_sha256"]
@@ -3121,6 +3125,37 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     )
     assert volume.reload_count == 1
     assert volume.commit_count == 1
+
+    second_manifest = publish_request_results(
+        InferenceRuntime(
+            output_root=tmp_path,
+            volume=cast(Any, volume),
+            claims=FakeClaimStore(),
+            container_id="test",
+            maximum_age_seconds=100,
+            summary_maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+        ),
+        RequestPublication(
+            run_id=run_id,
+            request_id=request_id,
+            submitted_seeds=(seed,),
+            normalized_seeds=(seed,),
+            sample_count=1,
+            display_name="Another Name",
+        ),
+    )
+    second_artifacts = cast(list[dict[str, object]], second_manifest["artifacts"])
+    second_input = next(
+        artifact for artifact in second_artifacts if artifact["role"] == "input"
+    )
+
+    assert second_manifest["view_id"] != manifest["view_id"]
+    assert second_input["volume_path"] == input_artifact["volume_path"]
+    assert second_input["sha256"] == input_artifact["sha256"]
+    assert second_input["archive_sha256"] != input_artifact["archive_sha256"]
+    assert volume.reload_count == 2
+    assert volume.commit_count == 2
 
 
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
@@ -3145,10 +3180,12 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
             ],
         )
     )
-    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/presentation-input.json"
-    presentation_document = orjson.loads(input_bytes)
-    presentation_document["name"] = "Readable Name"
-    presentation_input = json_bytes(presentation_document)
+    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
+    presentation_input = input_bytes.replace(
+        orjson.dumps(canonical_name),
+        orjson.dumps("Readable Name"),
+        1,
+    )
     manifest = _request_manifest(
         run_id=run_id,
         submitted_seeds=normalized_seeds,
@@ -3158,8 +3195,8 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
                 "role": "input",
                 "volume_path": volume_path,
                 "archive_path": f"{canonical_name}_data.json",
-                "size_bytes": len(presentation_input),
-                "sha256": hashlib.sha256(presentation_input).hexdigest(),
+                "size_bytes": len(input_bytes),
+                "sha256": hashlib.sha256(input_bytes).hexdigest(),
                 "archive_size_bytes": len(presentation_input),
                 "archive_sha256": hashlib.sha256(presentation_input).hexdigest(),
             }
@@ -3172,7 +3209,7 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         for remote_path, destination in downloads:
             downloaded_paths.append(remote_path)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(presentation_input)
+            destination.write_bytes(input_bytes)
 
     original_umask = os.umask(0o077)
     try:
@@ -3225,7 +3262,7 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     original_umask = os.umask(0o022)
     try:
         rebuilt = create_request_archive(
-            FakeVolumeReader({volume_path: presentation_input}),
+            FakeVolumeReader({volume_path: input_bytes}),
             manifest,
             output_dir=tmp_path / "rebuilt",
             display_name="Readable Name",

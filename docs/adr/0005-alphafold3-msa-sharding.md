@@ -867,8 +867,9 @@ ceilings. A caller therefore cannot publish outputs under one run while
 supplying another run's input.
 
 This canonical inline representation is staged-input schema version 2 and
-run-identity schema v3. The versioned invocation/run identities prevent older
-path-backed staged inputs from colliding with this layout.
+run-identity schema v4. Run identity binds the exact installed UniAF3 version;
+the versioned invocation/run identities prevent older path-backed staged inputs
+from colliding with this layout.
 
 After preparation, recycle and diffusion-sample counts are read only from the
 prepared/staged request. Coordinator and executor APIs do not accept duplicate
@@ -1134,9 +1135,10 @@ durable Volume files remain unchanged.
 
 Downloads hash each chunk while writing and stop before a chunk would exceed
 the manifest-declared size. Unchanged archive members reuse that verified
-source size and digest. The high-memory input-preparation path stages both the
-canonical inference input and a presentation-name copy, so the bounded result
-finalizer never parses or duplicates the enriched JSON in memory.
+source size and digest. The bounded finalizer streams the canonical enriched
+input once and calculates both its source digest and the digest after replacing
+the deterministic top-level name field. It never parses or duplicates the
+enriched JSON in memory.
 
 The archive includes every requested seed/sample directory, optional embeddings
 and distograms, locally generated request ranking and best aliases, enriched
@@ -1146,8 +1148,8 @@ directory.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each
-archive-local artifact. The durable request-view manifest records the staged
-presentation input's expected size and digest when the view is published.
+archive-local artifact. The durable request-view manifest records the expected
+size and digest of the streamed name substitution when the view is published.
 Existing archives are therefore streamed locally once and reused
 only when their exact member set, presentation manifest, and all payload
 digests match the current request; the staged input is not reread from the

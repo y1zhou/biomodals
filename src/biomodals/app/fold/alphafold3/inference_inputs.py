@@ -756,11 +756,6 @@ def prepare_inference_run(
         relative_path=input_path,
         content=input_bytes,
     )
-    staged_conf.name = display_name
-    presentation_input = VolumeUpload(
-        relative_path=(run_root / "requests" / request_id / "presentation-input.json"),
-        content=serialize_af3_input(staged_conf),
-    )
     staged_input = VolumeUpload(
         relative_path=run_root / "requests" / request_id / "staged-input.json",
         content=json_bytes({
@@ -770,7 +765,6 @@ def prepare_inference_run(
             "request_id": request_id,
             "identity": identity_upload.to_record(),
             "input": input_upload.to_record(),
-            "presentation_input": presentation_input.to_record(),
         }),
     )
 
@@ -783,7 +777,7 @@ def prepare_inference_run(
         normalized_seeds=normalized_seeds,
         recycle=recycle,
         sample_count=sample,
-        payload_uploads=(identity_upload, input_upload, presentation_input),
+        payload_uploads=(identity_upload, input_upload),
         staged_input=staged_input,
     )
 

@@ -983,9 +983,10 @@ scientific input and seeds upload identical bytes even when their display names
 or original inline/path template representations differ. The finalizer derives
 the presentation digest through a bounded streaming name substitution and never
 reparses or duplicates the enriched input. The resulting
-`{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
+`{presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after its exact member set and embedded
 presentation manifest validate, including every archive-local payload digest.
+The view ID binds the request ID, submitted seed order, and display name.
 The request-view publisher persists the derived presentation input digest once.
 Before reusing an existing archive, the client reads only the local archive and
 requires all archive digests to equal their published records. Updating a

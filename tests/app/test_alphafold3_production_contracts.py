@@ -41,6 +41,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_MODEL_SEEDS,
+    STAGED_INPUT_SCHEMA_VERSION,
     PreparedInferenceRun,
     VolumeUpload,
     hash_sequences,
@@ -3039,6 +3040,20 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
             )
         )
     )
+    staged_marker = input_path.with_name("staged-input.json")
+    staged_marker.write_bytes(
+        json_bytes({
+            "schema_version": STAGED_INPUT_SCHEMA_VERSION,
+            "status": "complete",
+            "run_id": run_id,
+            "request_id": request_id,
+            "input": {
+                "path": input_path.relative_to(tmp_path).as_posix(),
+                "size_bytes": input_path.stat().st_size,
+                "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+            },
+        })
+    )
     outputs_root = run_root / "outputs"
     sample_root = outputs_root / f"seed-{seed}_sample-0"
     sample_root.mkdir(parents=True)
@@ -3156,6 +3171,31 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     assert second_input["archive_sha256"] != input_artifact["archive_sha256"]
     assert volume.reload_count == 2
     assert volume.commit_count == 2
+
+    input_path.write_bytes(input_path.read_bytes().replace(b"ACDE", b"ACDF"))
+    with pytest.raises(
+        RuntimeError,
+        match="Staged AlphaFold input does not match its marker",
+    ):
+        publish_request_results(
+            InferenceRuntime(
+                output_root=tmp_path,
+                volume=cast(Any, volume),
+                claims=FakeClaimStore(),
+                container_id="test",
+                maximum_age_seconds=100,
+                summary_maximum_age_seconds=100,
+                wait_timeout_seconds=100,
+            ),
+            RequestPublication(
+                run_id=run_id,
+                request_id=request_id,
+                submitted_seeds=(seed,),
+                normalized_seeds=(seed,),
+                sample_count=1,
+                display_name="Changed Input",
+            ),
+        )
 
 
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:

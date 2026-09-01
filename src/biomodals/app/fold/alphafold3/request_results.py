@@ -27,6 +27,8 @@ import orjson
 import polars as pl
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    MAX_STAGED_INPUT_MARKER_BYTES,
+    STAGED_INPUT_SCHEMA_VERSION,
     PreparedInferenceRun,
     hash_sequences,
     normalize_model_seeds,
@@ -46,6 +48,7 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 from biomodals.helper.artifacts import (
     VolumeReader,
     json_bytes,
+    read_bounded_file_bytes,
     read_volume_bytes,
     require_regular_file,
     sha256_file,
@@ -253,6 +256,7 @@ def _input_artifact_record(
     archive_path: str | PurePosixPath,
     canonical_name: str,
     display_name: str,
+    expected_record: dict[str, object],
 ) -> dict[str, object]:
     """Hash canonical and presentation input identities in one bounded pass."""
     require_regular_file(source)
@@ -262,32 +266,57 @@ def _input_artifact_record(
     )
     source_digest = hashlib.sha256()
     archive_digest = hashlib.sha256()
-    size_bytes = 0
-
-    def observe_source(chunk: bytes) -> None:
-        nonlocal size_bytes
-        source_digest.update(chunk)
-        size_bytes += len(chunk)
+    size_bytes = source.stat().st_size
 
     with source.open("rb") as handle:
         for chunk in _presentation_input_chunks(
             handle,
             source_marker=source_marker,
             archive_marker=archive_marker,
-            observe_source=observe_source,
+            observe_source=source_digest.update,
         ):
             archive_digest.update(chunk)
-    if source.stat().st_size != size_bytes:
-        raise RuntimeError("Staged AlphaFold input changed while it was hashed")
-    return {
-        "role": "input",
-        "volume_path": _volume_relative_path(output_root, volume_path).as_posix(),
-        "archive_path": _safe_archive_path(archive_path).as_posix(),
+    source_record = {
+        "path": _volume_relative_path(output_root, volume_path).as_posix(),
         "size_bytes": size_bytes,
         "sha256": source_digest.hexdigest(),
+    }
+    if source_record != expected_record:
+        raise RuntimeError("Staged AlphaFold input does not match its marker")
+    return {
+        "role": "input",
+        "volume_path": source_record["path"],
+        "archive_path": _safe_archive_path(archive_path).as_posix(),
+        "size_bytes": size_bytes,
+        "sha256": source_record["sha256"],
         "archive_size_bytes": size_bytes - len(source_marker) + len(archive_marker),
         "archive_sha256": archive_digest.hexdigest(),
     }
+
+
+def _staged_input_record(
+    run_root: Path,
+    publication: RequestPublication,
+) -> dict[str, object]:
+    """Load the immutable input record bound by the staged-request marker."""
+    marker_path = run_root / "requests" / publication.request_id / "staged-input.json"
+    marker = orjson.loads(
+        read_bounded_file_bytes(
+            marker_path,
+            field_name="Staged AlphaFold input marker",
+            max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
+        )
+    )
+    if (
+        not isinstance(marker, dict)
+        or marker.get("schema_version") != STAGED_INPUT_SCHEMA_VERSION
+        or marker.get("status") != "complete"
+        or marker.get("run_id") != publication.run_id
+        or marker.get("request_id") != publication.request_id
+        or not isinstance(marker.get("input"), dict)
+    ):
+        raise RuntimeError("Staged AlphaFold input marker is invalid")
+    return cast(dict[str, object], marker["input"])
 
 
 def _input_name_markers(
@@ -534,6 +563,7 @@ def publish_request_results(
     request_root = _request_view_root(run_root, spec.request_id, view_id)
     input_path = run_root / "requests" / spec.request_id / "input.json"
     require_regular_file(input_path)
+    expected_input_record = _staged_input_record(run_root, spec)
     manifest_path = request_root / "manifest.json"
     if manifest := _reusable_request_manifest(
         path=manifest_path,
@@ -568,6 +598,7 @@ def publish_request_results(
             archive_path=f"{canonical_name}_data.json",
             canonical_name=canonical_name,
             display_name=spec.display_name,
+            expected_record=expected_input_record,
         ),
     ]
     artifacts.extend(

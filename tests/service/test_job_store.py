@@ -225,6 +225,30 @@ def test_unknown_launch_can_only_requeue_without_launch_evidence(
     assert cancelled.state == JobState.CANCEL_REQUESTED
 
 
+def test_explicit_resume_replaces_completed_root_call(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.record_launch(JOB_ID, function_call_id="fc-root", now=11)
+    store.replace_projection(
+        JOB_ID,
+        state=JobState.BLOCKED,
+        projection={"stages": [], "warnings": []},
+        observed_at=12,
+    )
+
+    resumed = store.record_resume(
+        JOB_ID,
+        previous_function_call_id="fc-root",
+        function_call_id="fc-resume",
+        now=13,
+    )
+
+    assert (resumed.state, resumed.root_function_call_id) == (
+        JobState.RUNNING,
+        "fc-resume",
+    )
+
+
 @pytest.mark.parametrize(
     "state",
     [JobState.FINALIZING, JobState.STATE_UNKNOWN, JobState.BLOCKED],

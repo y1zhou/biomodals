@@ -51,6 +51,7 @@ BlockingCategory = Literal[
     "local_storage",
     "modal_configuration",
     "modal_unavailable",
+    "remote_execution_suspended",
     "result_integrity",
     "result_preparation_failed",
 ]
@@ -770,6 +771,11 @@ def create_admin_router() -> APIRouter:
                 ),
                 now=int(time.time()),
             )
+            if submission.resolution == "resume":
+                await request.app.state.lifecycle.advance(
+                    job_id,
+                    force_refresh=True,
+                )
         except JobNotFoundError as exc:
             raise HTTPException(404, "Job not found") from exc
         except JobStateResolutionError as exc:

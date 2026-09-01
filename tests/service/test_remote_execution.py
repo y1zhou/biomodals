@@ -47,6 +47,14 @@ class RemoteMethod:
         return self.result
 
 
+class SpawnMethod:
+    def __init__(self, call_id):
+        self.call_id = call_id
+
+    def spawn(self):
+        return SimpleNamespace(object_id=self.call_id)
+
+
 def _async_method(result):
     async def invoke():
         return result
@@ -61,6 +69,25 @@ def _overview(run_id=RUN_ID, deployment=DEPLOYMENT):
         representative_provider_calls=(),
         active_provider_calls=SimpleNamespace(),
     )
+
+
+@pytest.mark.anyio
+async def test_launch_and_resume_return_distinct_root_call_evidence(
+    monkeypatch,
+) -> None:
+    coordinator = SimpleNamespace(
+        run=SpawnMethod("fc-run"),
+        resume=SpawnMethod("fc-resume"),
+    )
+    monkeypatch.setattr(
+        RemoteExecutionClient,
+        "_coordinator",
+        staticmethod(lambda _locator: coordinator),
+    )
+    client = RemoteExecutionClient()
+
+    assert await client.launch(LOCATOR) == "fc-run"
+    assert await client.resume(LOCATOR) == "fc-resume"
 
 
 @pytest.mark.anyio

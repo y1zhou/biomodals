@@ -63,6 +63,7 @@ class RemoteExecutionClient:
             await coordinator.hydrate.aio()
             for method in (
                 "run",
+                "resume",
                 "status",
                 "cancel",
                 "provider_calls",
@@ -74,9 +75,17 @@ class RemoteExecutionClient:
 
     async def launch(self, locator: ExecutionLocator) -> str:
         """Spawn one staged root Run and return durable launch evidence."""
-        coordinator = self._coordinator(locator)
+        return await self._spawn_root(self._coordinator(locator).run)
+
+    async def resume(self, locator: ExecutionLocator) -> str:
+        """Spawn explicit recovery for one suspended or unknown Run."""
+        return await self._spawn_root(self._coordinator(locator).resume)
+
+    @staticmethod
+    async def _spawn_root(method: Any) -> str:
+        """Spawn one coordinator method and require its durable call handle."""
         try:
-            call = await asyncio.to_thread(coordinator.run.spawn)
+            call = await asyncio.to_thread(method.spawn)
             call_id = call.object_id
         except Exception as error:
             raise RemoteSubmissionOutcomeUnknownError(str(error)) from error

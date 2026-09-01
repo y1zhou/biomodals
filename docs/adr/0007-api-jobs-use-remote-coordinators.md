@@ -174,9 +174,13 @@ If the exact pinned deployment cannot be resolved, the Service Job becomes
 newer deployment, or infer execution state from cached projections. Refreshes
 for one Job are serialized before updating its local projection so responses
 cannot be applied out of order. Reconciliation still polls a recorded root
-Function Call without waking coordinator code. A conclusive root result whose
-Run status is still non-terminal becomes `failed`, because no coordinator
-remains to make further progress; unresolved roots remain `state_unknown`.
+Function Call without waking coordinator code. A conclusive root result
+preserves the durable Run status: `suspended` becomes a recoverable `blocked`
+Service Job and `state_unknown` remains `state_unknown`. Background
+reconciliation never resumes either state blindly. An explicit authenticated
+refresh or Administrator resume action spawns `ExecutionCoordinator.resume()`
+on the exact pinned deployment and records the replacement root Function Call
+before normal observation resumes.
 Before calling Modal, a launch attempt is durably fenced as `state_unknown`;
 a process interruption therefore cannot cause an automatic duplicate spawn.
 An Administrator may then attach the known root Function Call and resume,

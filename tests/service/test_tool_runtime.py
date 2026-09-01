@@ -536,7 +536,7 @@ async def test_terminal_root_failure_is_not_treated_as_still_running(
 
 
 @pytest.mark.anyio
-async def test_completed_root_with_nonterminal_ledger_becomes_failed(
+async def test_completed_root_preserves_unknown_ledger_state(
     tmp_path: Path,
 ) -> None:
     class Remote:
@@ -556,14 +556,61 @@ async def test_completed_root_with_nonterminal_ledger_becomes_failed(
     )
     assert [job.job_id for job in store.list_reconcilable_jobs(now=21)] == [JOB_ID]
 
-    failed = await lifecycle.advance(JOB_ID, finalize=True, background=True)
+    unknown = await lifecycle.advance(JOB_ID, finalize=True, background=True)
 
-    assert (failed.state, failed.error_code) == (
-        JobState.FAILED,
-        "remote_execution_incomplete",
+    assert (unknown.state, unknown.state_reason) == (
+        JobState.STATE_UNKNOWN,
+        "remote_execution_state_unknown",
     )
-    assert failed.error_message == (
-        "Remote execution stopped without a terminal outcome"
+
+
+@pytest.mark.anyio
+async def test_explicit_refresh_resumes_suspended_remote_execution(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def status(self, _locator):
+            return _overview(RunStatus.SUSPENDED)
+
+        async def resume(self, _locator):
+            return "fc-resume"
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+
+    resumed = await lifecycle.advance(JOB_ID, force_refresh=True)
+
+    assert (resumed.state, resumed.root_function_call_id) == (
+        JobState.RUNNING,
+        "fc-resume",
+    )
+
+
+@pytest.mark.anyio
+async def test_background_observation_does_not_resume_suspended_execution(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _locator, _function_call_id):
+            return _overview(RunStatus.SUSPENDED)
+
+        async def resume(self, _locator):
+            raise AssertionError("background reconciliation must not resume")
+
+    _store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+
+    blocked = await lifecycle.advance(JOB_ID, finalize=True, background=True)
+
+    assert (blocked.state, blocked.blocking_category) == (
+        JobState.BLOCKED,
+        "remote_execution_suspended",
     )
 
 

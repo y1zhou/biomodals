@@ -1564,6 +1564,47 @@ class ServiceStore:
             ).fetchone()
         return _job_from_row(updated)
 
+    def record_resume(
+        self,
+        job_id: UUID,
+        *,
+        previous_function_call_id: str,
+        function_call_id: str,
+        now: int,
+    ) -> JobRecord:
+        """Replace one completed root call with explicit resume evidence."""
+        if not previous_function_call_id or not function_call_id:
+            raise ValueError("Function Call IDs must not be empty")
+        with self._transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET root_function_call_id = ?, state = ?, updated_at = ?,
+                    state_reason = NULL, state_message = NULL,
+                    blocked_at = NULL, blocking_category = NULL,
+                    next_retry_at = NULL
+                WHERE job_id = ? AND root_function_call_id = ?
+                    AND state IN (?, ?)
+                """,
+                (
+                    function_call_id,
+                    JobState.RUNNING.value,
+                    now,
+                    str(job_id),
+                    previous_function_call_id,
+                    JobState.BLOCKED.value,
+                    JobState.STATE_UNKNOWN.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JobStateResolutionError(
+                    "Job is no longer awaiting remote recovery"
+                )
+            updated = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+        return _job_from_row(updated)
+
     def mark_submission_in_progress(self, job_id: UUID, *, now: int) -> JobRecord:
         """Fence one launch attempt before making the ambiguous provider call."""
         return self.mark_state_unknown(

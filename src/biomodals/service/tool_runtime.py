@@ -206,7 +206,6 @@ class JobLifecycle:
                     return job
                 try:
                     overview = None
-                    root_completed = False
                     if (
                         background or job.state == JobState.STATE_UNKNOWN
                     ) and job.root_function_call_id is not None:
@@ -215,7 +214,6 @@ class JobLifecycle:
                         )
                         if overview is None:
                             return self.store.touch_job(job_id, now=now)
-                        root_completed = True
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
                 except RemoteRootExecutionFailedError:
@@ -248,8 +246,8 @@ class JobLifecycle:
                     overview,
                     registration,
                     now=now,
-                    root_completed=root_completed,
                     finalize=finalize,
+                    resume_recoverable=force_refresh,
                 )
             if finalize and job.state == JobState.FINALIZING:
                 return await self._finalize(
@@ -299,8 +297,8 @@ class JobLifecycle:
         registration: ToolRegistration,
         *,
         now: int,
-        root_completed: bool = False,
         finalize: bool = False,
+        resume_recoverable: bool = False,
     ) -> JobRecord:
         queued_call_handles = (
             await self.remote.queued_provider_call_handles(
@@ -315,19 +313,6 @@ class JobLifecycle:
             overview,
             queued_provider_call_handles=queued_call_handles,
         )
-        if root_completed and not overview.run.status.is_terminal:
-            self.store.replace_projection(
-                job.job_id,
-                state=JobState.FAILED,
-                projection=projection,
-                observed_at=now,
-            )
-            return self.store.fail_job(
-                job.job_id,
-                error_code="remote_execution_incomplete",
-                error_message=("Remote execution stopped without a terminal outcome"),
-                now=now,
-            )
         if overview.run.status in {RunStatus.SUCCEEDED, RunStatus.PARTIAL}:
             result_state = JobState(overview.run.status.value)
             job = self.store.begin_finalization(
@@ -358,6 +343,42 @@ class JobLifecycle:
             projection=projection,
             observed_at=now,
         )
+        if overview.run.status == RunStatus.SUSPENDED:
+            projected = self.store.block_job(
+                job.job_id,
+                category="remote_execution_suspended",
+                message="Remote execution is suspended and can be resumed",
+                retry_at=None,
+                now=now,
+            )
+        elif overview.run.status == RunStatus.STATE_UNKNOWN:
+            projected = self.store.mark_state_unknown(
+                job.job_id,
+                reason="remote_execution_state_unknown",
+                message="Remote execution requires explicit reconciliation",
+                now=now,
+            )
+        if (
+            resume_recoverable
+            and overview.run.status in {RunStatus.SUSPENDED, RunStatus.STATE_UNKNOWN}
+            and job.root_function_call_id is not None
+        ):
+            try:
+                call_id = await self.remote.resume(_locator(job))
+            except RemoteSubmissionOutcomeUnknownError:
+                LOGGER.warning("Remote resume outcome is unknown", exc_info=True)
+                return self.store.mark_state_unknown(
+                    job.job_id,
+                    reason="resume_outcome_unknown",
+                    message="The remote resume outcome could not be confirmed",
+                    now=now,
+                )
+            return self.store.record_resume(
+                job.job_id,
+                previous_function_call_id=job.root_function_call_id,
+                function_call_id=call_id,
+                now=now,
+            )
         if state == JobState.FAILED:
             return self.store.fail_job(
                 job.job_id,

@@ -39,6 +39,8 @@ from biomodals.helper.artifacts import (
 )
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
+# TODO: Derive this identity from the verified environment-asset manifest so
+# replacement checkpoint bytes cannot retain the same inference cache key.
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
 RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
 MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024

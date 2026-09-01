@@ -240,6 +240,8 @@ def template_search_identity(
     max_template_date: str,
 ) -> str:
     """Hash the scientific identity of one protein template search."""
+    # TODO: Include the verified seqres/mmCIF asset-manifest identity so a
+    # replacement template corpus cannot reuse results from another snapshot.
     validate_query(resolve_database_profile("uniref90"), sequence)
     if re.fullmatch(r"[0-9a-f]{64}", unpaired_msa_sha256) is None:
         raise ValueError("unpaired_msa_sha256 must be a lowercase SHA-256 digest")

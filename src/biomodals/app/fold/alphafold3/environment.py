@@ -180,6 +180,8 @@ def asset_path(runtime: EnvironmentRuntime, asset: EnvironmentAsset) -> Path:
 
 def asset_ready(runtime: EnvironmentRuntime, asset: EnvironmentAsset) -> bool:
     """Perform the intentionally cheap recurring readiness check."""
+    # TODO: Replace pathname readiness for model/template assets with a small
+    # versioned manifest verified once when the asset is installed.
     path = asset_path(runtime, asset)
     return path.is_dir() if asset.kind == "template-mmcif" else path.is_file()
 

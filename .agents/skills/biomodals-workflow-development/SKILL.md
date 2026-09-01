@@ -61,6 +61,8 @@ Tasks, focused task-image runtimes, and PPIFlow-specific stage wiring.
   with the app-development skill.
 - Keep the kernel interface deep. Add shared behavior for repeated app and
   workflow needs, not one-off workflow conveniences.
+- When similar functions serve different workflow roles, document each role's
+  behavior and rationale in its docstring or the owning design document.
 
 ## Verification
 

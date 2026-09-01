@@ -177,8 +177,8 @@ These existing decisions remain binding during the refactor:
   changed input or simulation setting requires another run name. Preparation
   is reusable only when the input PDB and every NVT, NPT, and production file
   required by downstream Nodes validates against its publication marker. The
-  terminal result validates the production MDP and TPR, no-PBC trajectory,
-  centered structure, and every declared analysis table and plot.
+  terminal result validates the production MDP, TPR, energy file, no-PBC
+  trajectory, centered structure, and every declared analysis table and plot.
 - Before writing an incomplete GROMACS directory, the adapter atomically
   claims its human run name in a workload-scoped Modal Dict. The Volume marker
   records the elected Execution Run but never acts as a file lock. Matching

@@ -513,7 +513,7 @@ publication retries and later reconstruction never substitute their current
 time. Together with fixed ZIP metadata and ordered members, unchanged remote
 outputs must therefore reproduce the same bytes, size, and SHA-256 digest.
 Every archive member uses ZIP's stored method so byte identity does not depend
-on the host zlib implementation. Schema-v4 validation rejects any other
+on the host zlib implementation. Schema-v5 validation rejects any other
 compression method, requires each source-backed member's exact `0x5455`
 modification-time field and matching ZIP/DOS fallback, and requires fixed
 timestamps on service-generated members in both the local ZIP headers and the

@@ -131,7 +131,7 @@ def resolve_msa_and_templates(
     search_protein_templates: bool = True,
     max_parallel_search_workers: int = 4,
 ) -> AF3Config:
-    """Populate missing MSA/template fields through one validated deep seam."""
+    """Populate null evidence while preserving explicit empty/supplied fields."""
     worker_budget = validate_search_worker_budget(max_parallel_search_workers)
     conf = validate_submitted_af3_input(config)
     serialize_af3_input(conf)

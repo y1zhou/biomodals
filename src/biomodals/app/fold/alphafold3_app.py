@@ -898,7 +898,8 @@ def submit_alphafold3_task(
             Defaults to `name` in the AF3 JSON config.
         search_msa: Populate missing protein and RNA MSA fields.
         search_protein_templates: Populate missing protein templates after MSA
-            resolution. Non-empty caller fields are always preserved.
+            resolution. Caller-supplied fields, including explicit empty
+            evidence, are always preserved.
         max_containers: Maximum active workload containers for this Run.
         max_gpu_containers: Maximum active GPU workload containers within the
             total container limit.

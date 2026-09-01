@@ -27,7 +27,6 @@ import orjson
 import polars as pl
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
-    MAX_STAGED_INPUT_BYTES,
     PreparedInferenceRun,
     hash_sequences,
     normalize_model_seeds,
@@ -47,7 +46,6 @@ from biomodals.app.fold.alphafold3.seed_predictions import (
 from biomodals.helper.artifacts import (
     VolumeReader,
     json_bytes,
-    read_bounded_file_bytes,
     read_volume_bytes,
     require_regular_file,
     sha256_file,
@@ -267,11 +265,8 @@ def _input_artifact_record(
     display_name: str,
 ) -> dict[str, object]:
     """Describe staged and presentation-rewritten input bytes."""
-    source_bytes = read_bounded_file_bytes(
-        source,
-        field_name="Staged AlphaFold input",
-        max_bytes=MAX_STAGED_INPUT_BYTES,
-    )
+    require_regular_file(source)
+    source_bytes = source.read_bytes()
     record: dict[str, object] = {
         "role": "input",
         "volume_path": _volume_relative_path(output_root, volume_path).as_posix(),
@@ -767,8 +762,6 @@ def _validated_manifest_artifacts(
         ):
             raise ValueError(f"Invalid request artifact: {raw_artifact!r}")
         if role == "input":
-            if size_bytes > MAX_STAGED_INPUT_BYTES:
-                raise ValueError("Request input artifact exceeds its byte limit")
             archive_size_bytes = raw_artifact.get("archive_size_bytes")
             archive_sha256 = raw_artifact.get("archive_sha256")
             if (

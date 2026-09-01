@@ -48,7 +48,7 @@ STAGED_INPUT_SCHEMA_VERSION = 2
 MAX_INPUT_JSON_BYTES = 256 * 1024 * 1024
 MAX_STAGED_INPUT_MARKER_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES
-MAX_STAGED_INPUT_BYTES = 256 * 1024 * 1024
+MAX_RUN_IDENTITY_BYTES = 256 * 1024 * 1024
 MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
 MAX_TEMPLATE_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_USER_CCD_BYTES = 64 * 1024 * 1024
@@ -356,12 +356,7 @@ def validate_submitted_af3_input(config: AF3Config) -> AF3Config:
 
 def serialize_af3_input(config: AF3Config) -> bytes:
     """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
-    content = validate_upstream_af3_input(config).to_json(exclude_unset=False).encode()
-    if len(content) > MAX_STAGED_INPUT_BYTES:
-        raise ValueError(
-            f"staged input exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
-        )
-    return content
+    return validate_upstream_af3_input(config).to_json(exclude_unset=False).encode()
 
 
 def hash_sequences(*fragments: object) -> str:
@@ -746,9 +741,9 @@ def prepare_inference_run(
     input_path = run_root / "requests" / request_id / "input.json"
     input_bytes = serialize_af3_input(staged_conf)
     identity_bytes = json_bytes(identity_document)
-    if len(identity_bytes) > MAX_STAGED_INPUT_BYTES:
+    if len(identity_bytes) > MAX_RUN_IDENTITY_BYTES:
         raise ValueError(
-            f"run identity exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
+            f"run identity exceeds the {MAX_RUN_IDENTITY_BYTES}-byte limit"
         )
     identity_upload = VolumeUpload(
         relative_path=identity_path,
@@ -863,7 +858,7 @@ def load_staged_inference_input(
             output_root,
             marker.get("identity"),
             identity_path,
-            max_bytes=MAX_STAGED_INPUT_BYTES,
+            max_bytes=MAX_RUN_IDENTITY_BYTES,
         ),
         field_name="Run identity document",
     )
@@ -871,7 +866,6 @@ def load_staged_inference_input(
         output_root,
         marker.get("input"),
         input_path,
-        max_bytes=MAX_STAGED_INPUT_BYTES,
     )
     config = validate_upstream_af3_input(AF3Config.model_validate_json(input_bytes))
     if config.name != f"af3-{validated_run_id[:16]}":

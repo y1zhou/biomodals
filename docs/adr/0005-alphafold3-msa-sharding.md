@@ -809,14 +809,18 @@ the first Modal call. The worker repeats the preflight before invoking upstream.
 
 The supported request envelope is also explicit: at most 5,120 expanded
 entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
-tasks, 1 GiB across inline template fields, and 256 MiB each for the serialized
-staged input and run-identity document. The 5,120 bounds align with the largest
-default AlphaFold 3 compilation bucket documented by the pinned upstream
-revision. The CPU coordinator checks the conservative task upper bound before
-cache inspection. The directly callable MSA/template workers repeat the
-5,120-residue query, 512-task inspection, and canonical assembly-shape checks
-before accessing mounted Volumes. Inference workers likewise repeat all
-staged-artifact byte checks when loading from the output Volume.
+tasks, 1 GiB across inline template fields, and 256 MiB for the compact
+run-identity document. The caller's 256 MiB input limit is an upload and local
+file-read guard; it does not cap the enriched inference document after generated
+MSAs and templates have been added. That document remains content-bound by its
+published artifact record. The 5,120 bounds align with the largest default
+AlphaFold 3 compilation bucket documented by the pinned upstream revision. The
+CPU coordinator checks the conservative task upper bound before cache
+inspection. The directly callable MSA/template workers repeat the 5,120-residue
+query, 512-task inspection, and canonical assembly-shape checks before
+accessing mounted Volumes. Inference workers repeat the bounded marker and
+identity reads and verify the content-bound input artifact when loading from
+the output Volume.
 
 For each mmCIF, the identity representation substitutes the full content digest
 while retaining `queryIndices` and `templateIndices`. Caller inline and

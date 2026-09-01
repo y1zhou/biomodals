@@ -257,6 +257,9 @@ The AlphaFold3 validation route and standalone CLI accept a maximum 256 MiB
 JSON document. Larger API bodies receive `413 payload_too_large` before JSON
 parsing. The API does not add a streaming JSON parser; large Expert
 requests therefore require API-process memory above their wire size.
+This limit applies to caller-supplied JSON only. It does not cap the enriched
+inference document after CPU workers add generated MSAs and templates; that
+document is verified against its content-bound remote artifact record instead.
 The validation route admits at most two uploads at a time, streams request bytes
 into temporary files, hashes them while writing, and runs JSON/Pydantic parsing
 in one bounded background worker. Only successful validation atomically publishes the

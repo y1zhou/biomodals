@@ -103,14 +103,9 @@ def test_execution_request_round_trips_and_revalidates_identity() -> None:
 def test_execution_envelope_has_independent_metadata_headroom(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Envelope metadata should fit beyond an exact-limit staged config."""
+    """The internal envelope has an independent serialization ceiling."""
     request = _request()
     config_bytes = inference_inputs.serialize_af3_input(request.config)
-    monkeypatch.setattr(
-        inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
-        len(config_bytes),
-    )
     envelope = request.to_bytes()
     assert len(envelope) > len(config_bytes)
 

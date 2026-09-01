@@ -18,15 +18,15 @@ from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
+    MAX_INPUT_JSON_BYTES,
     MAX_SEED_SAMPLE_PAIRS,
-    MAX_STAGED_INPUT_BYTES,
     build_inference_identity_view,
     normalize_model_seeds,
     serialize_af3_input,
 )
 from biomodals.helper.artifacts import replace_bytes_atomic
 
-MAX_VALIDATION_BYTES = MAX_STAGED_INPUT_BYTES
+MAX_VALIDATION_BYTES = MAX_INPUT_JSON_BYTES
 MAX_JOB_NAME_LENGTH = 120
 VALIDATION_TTL_SECONDS = 24 * 60 * 60
 

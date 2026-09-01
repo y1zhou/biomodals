@@ -210,72 +210,11 @@ def test_upstream_preflight_bounds_expanded_entities_and_polymer_residues() -> N
         validate_upstream_af3_input(too_many_residues)
 
 
-def test_inference_staging_bounds_the_serialized_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The final request JSON should be bounded before Volume publication."""
-    monkeypatch.setattr(inference_inputs, "MAX_STAGED_INPUT_BYTES", 128)
-    config = AF3Config(
-        name="bounded-staging",
-        modelSeeds=[1],
-        sequences=[
-            AF3SequenceEntry(
-                protein=AF3Protein(
-                    id="A",
-                    sequence="ACDE",
-                    unpairedMsa=">query\nACDE\n",
-                    pairedMsa="",
-                    templates=[],
-                )
-            )
-        ],
-    )
-
-    with pytest.raises(ValueError, match="staged input exceeds the 128-byte limit"):
-        prepare_inference_run(
-            config,
-            recycle=1,
-            sample=1,
-        )
-
-
-def test_inference_staging_accepts_the_exact_byte_limit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The shared standalone/API ceiling is inclusive."""
-    config = AF3Config(
-        name="exact-boundary",
-        modelSeeds=[1],
-        sequences=[
-            AF3SequenceEntry(
-                protein=AF3Protein(id="A", sequence="ACDE"),
-            )
-        ],
-    )
-    content = serialize_af3_input(config)
-    monkeypatch.setattr(
-        inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
-        len(content),
-    )
-
-    assert serialize_af3_input(config) == content
-
-    monkeypatch.setattr(
-        inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
-        len(content) - 1,
-    )
-    with pytest.raises(ValueError, match="staged input exceeds"):
-        serialize_af3_input(config)
-
-
 def test_inference_staging_bounds_the_run_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The durable identity document should share the staged-input ceiling."""
+    """The compact durable identity document should retain its own ceiling."""
     config = AF3Config(
         name="bounded-identity",
         modelSeeds=[1],
@@ -303,7 +242,7 @@ def test_inference_staging_bounds_the_run_identity(
     )
     monkeypatch.setattr(
         inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
+        "MAX_RUN_IDENTITY_BYTES",
         len(identity_upload.content) - 1,
     )
 
@@ -313,6 +252,30 @@ def test_inference_staging_bounds_the_run_identity(
             recycle=1,
             sample=1,
         )
+
+
+def test_generated_evidence_is_not_limited_by_upload_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller upload limit must not cap the enriched inference document."""
+    config = AF3Config(
+        name="generated-evidence",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa=">query\nACDE\n",
+                    pairedMsa="",
+                    templates=[],
+                )
+            )
+        ],
+    )
+    monkeypatch.setattr(inference_inputs, "MAX_INPUT_JSON_BYTES", 1)
+
+    assert len(serialize_af3_input(config)) > 1
 
 
 def test_run_identity_hashes_large_text_while_input_remains_runnable(

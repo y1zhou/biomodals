@@ -34,14 +34,14 @@ def _document() -> bytes:
     )
 
 
-def test_api_and_standalone_limits_are_256_mib() -> None:
-    from biomodals.app.fold.alphafold3.inference_inputs import MAX_STAGED_INPUT_BYTES
+def test_api_and_standalone_upload_limits_are_256_mib() -> None:
+    from biomodals.app.fold.alphafold3.inference_inputs import MAX_INPUT_JSON_BYTES
     from biomodals.app.fold.alphafold3.template_search import (
         MAX_TEMPLATE_INSPECTION_BYTES,
     )
 
     assert MAX_VALIDATION_BYTES == 256 * 1024 * 1024
-    assert MAX_STAGED_INPUT_BYTES == 256 * 1024 * 1024
+    assert MAX_INPUT_JSON_BYTES == 256 * 1024 * 1024
     assert MAX_TEMPLATE_INSPECTION_BYTES == 1024 * 1024 * 1024
 
 

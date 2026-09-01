@@ -2376,51 +2376,6 @@ def test_staged_input_accepts_a_symlinked_volume_mount(tmp_path: Path) -> None:
     assert loaded.config.modelSeeds == [1]
 
 
-def test_staged_input_rechecks_the_serialized_input_limit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output_root = tmp_path / "output"
-    prepared = prepare_inference_run(
-        AF3Config(
-            name="bounded-reload",
-            modelSeeds=[1],
-            sequences=[
-                AF3SequenceEntry(
-                    protein=AF3Protein(
-                        id="A",
-                        sequence="ACDE",
-                        unpairedMsa=">query\nACDE\n",
-                        pairedMsa="",
-                        templates=[],
-                    )
-                )
-            ],
-        ),
-        recycle=1,
-        sample=1,
-    )
-    _materialize_prepared_run(output_root, prepared)
-    input_upload = next(
-        upload
-        for upload in prepared.payload_uploads
-        if upload.relative_path.name == "input.json"
-    )
-    monkeypatch.setattr(
-        inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
-        len(input_upload.content) - 1,
-    )
-
-    with pytest.raises(ValueError, match="Staged artifact is too large"):
-        load_staged_inference_input(
-            output_root,
-            run_id=prepared.run_id,
-            request_id=prepared.request_id,
-            staged_input_record=prepared.staged_input.to_record(),
-        )
-
-
 def test_staged_input_rechecks_the_run_identity_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2453,7 +2408,7 @@ def test_staged_input_rechecks_the_run_identity_limit(
     )
     monkeypatch.setattr(
         inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
+        "MAX_RUN_IDENTITY_BYTES",
         len(identity_upload.content) - 1,
     )
 
@@ -3170,62 +3125,6 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     assert volume.commit_count == 1
 
 
-def test_request_publication_bounds_input_before_artifact_hashing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = "d" * 64
-    seed = 7
-    request_id = hash_sequences(run_id, [seed])
-    run_root = tmp_path / run_id[:2] / run_id
-    input_path = run_root / "requests" / request_id / "input.json"
-    input_path.parent.mkdir(parents=True)
-    input_path.write_bytes(b"{}")
-    marker_path = run_root / ".markers" / "seeds" / f"{seed}.json"
-    marker_path.parent.mkdir(parents=True)
-    marker_path.write_bytes(
-        orjson.dumps({
-            "schema_version": SEED_MARKER_SCHEMA_VERSION,
-            "status": "complete",
-            "run_id": run_id,
-            "seed": seed,
-            "sample_count": 1,
-            "generation_id": "generation",
-            "rankings": [{"seed": seed, "sample_index": 0, "ranking_score": 0.9}],
-        })
-    )
-    monkeypatch.setattr(request_results, "MAX_STAGED_INPUT_BYTES", 1)
-    monkeypatch.setattr(
-        request_results,
-        "_artifact_record",
-        lambda **kwargs: pytest.fail("oversized staged input reached artifact hashing"),
-    )
-
-    with pytest.raises(ValueError, match="Staged AlphaFold input exceeds"):
-        publish_request_results(
-            InferenceRuntime(
-                output_root=tmp_path,
-                volume=cast(
-                    Any,
-                    SimpleNamespace(reload=lambda: None, commit=lambda: None),
-                ),
-                claims=FakeClaimStore(),
-                container_id="test",
-                maximum_age_seconds=100,
-                summary_maximum_age_seconds=100,
-                wait_timeout_seconds=100,
-            ),
-            RequestPublication(
-                run_id=run_id,
-                request_id=request_id,
-                submitted_seeds=(seed,),
-                normalized_seeds=(seed,),
-                sample_count=1,
-                display_name="Readable Name",
-            ),
-        )
-
-
 def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
     run_id = "d" * 64
     normalized_seeds = [7]
@@ -3490,43 +3389,6 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
             manifest,
             output_dir=tmp_path,
             display_name="partial",
-        )
-
-
-def test_request_archive_rejects_oversized_input_before_download(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = "e" * 64
-    normalized_seeds = [9]
-    request_id = hash_sequences(run_id, normalized_seeds)
-    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
-    manifest = _request_manifest(
-        run_id=run_id,
-        submitted_seeds=normalized_seeds,
-        display_name="oversized",
-        artifacts=[
-            {
-                "role": "input",
-                "volume_path": volume_path,
-                "archive_path": f"{canonical_output_name(run_id)}_data.json",
-                "size_bytes": 5,
-                "sha256": hashlib.sha256(b"12345").hexdigest(),
-            }
-        ],
-    )
-    monkeypatch.setattr(request_results, "MAX_STAGED_INPUT_BYTES", 4)
-
-    class NoReadVolume:
-        def read_file(self, path: str):
-            pytest.fail(f"oversized input reached Volume download: {path}")
-
-    with pytest.raises(ValueError, match="Request input artifact exceeds"):
-        create_request_archive(
-            cast(Any, NoReadVolume()),
-            manifest,
-            output_dir=tmp_path,
-            display_name="oversized",
         )
 
 

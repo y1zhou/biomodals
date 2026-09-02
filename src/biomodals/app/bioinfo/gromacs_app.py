@@ -258,7 +258,7 @@ biotite_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
-    .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
+    .uv_pip_install("biotite", "numpy", "scipy", "matplotlib")
     .pipe(patch_image_for_helper)
     .add_local_python_source(
         "biomodals.app.bioinfo.gromacs_execution",

@@ -1,6 +1,6 @@
 ; https://manual.gromacs.org/documentation/current/user-guide/mdp-options.html
 title                = NPT equilibration
-define               = -DPOSRES    ; position restrain the protein
+define               = -DFLEXIBLE ; use the flexible-water topology
 
 ; Run parameters
 integrator           = md     ; leap-frog integrator

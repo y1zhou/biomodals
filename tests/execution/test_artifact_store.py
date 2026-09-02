@@ -191,7 +191,6 @@ def test_schema_contains_shared_execution_and_execution_artifacts_only() -> None
 
     assert EXPECTED_EXECUTION_TABLES.issubset(tables)
     assert set(EXECUTION_ARTIFACT_TABLES).issubset(tables)
-    assert not {"runs", "nodes", "attempts", "remote_calls"} & tables
 
 
 def test_artifact_publications_are_scoped_to_one_execution_run() -> None:

@@ -24,6 +24,8 @@ from biomodals.execution import (
     ExecutionRuntime,
     ExecutionTaskRecord,
     ProviderBinding,
+    ProviderCallDiagnostic,
+    ProviderCallPage,
     ProviderCallSubmission,
     RunStatus,
     SqliteExecutionRepository,
@@ -760,6 +762,73 @@ class ExecutionCoordinatorLifecycle:
                     store.close()
             self._verify_overview(overview)
             return overview
+
+    def provider_calls(
+        self,
+        *,
+        node_key: str | None = None,
+        cursor: UUID | None = None,
+        limit: int = 50,
+        newest_first: bool = False,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls without exposing Task payloads."""
+        with self._volume_io_lock, self._writer_lock:
+            runtime = self._runtime
+            if runtime is not None:
+                repository = runtime.store.execution
+                return repository.provider_call_page(
+                    self.execution_run_id,
+                    node_key=node_key,
+                    cursor=cursor,
+                    limit=limit,
+                    newest_first=newest_first,
+                )
+            store = self._run_store()
+            if not store.ledger_path.is_file():
+                raise ExecutionRunNotFoundError(str(self.execution_run_id))
+            try:
+                return store.execution.provider_call_page(
+                    self.execution_run_id,
+                    node_key=node_key,
+                    cursor=cursor,
+                    limit=limit,
+                    newest_first=newest_first,
+                )
+            finally:
+                store.close()
+
+    def provider_call(self, provider_call_id: UUID) -> ProviderCallDiagnostic | None:
+        """Read one Provider Call by its internal identifier."""
+        with self._volume_io_lock, self._writer_lock:
+            runtime = self._runtime
+            store = None if runtime is not None else self._run_store()
+            try:
+                if store is not None and not store.ledger_path.is_file():
+                    raise ExecutionRunNotFoundError(str(self.execution_run_id))
+                repository = (
+                    runtime.store.execution if runtime is not None else store.execution
+                )
+                try:
+                    call = repository.get_provider_call(
+                        provider_call_id, include_task_keys=False
+                    )
+                except LookupError:
+                    return None
+                if call.execution_run_id != self.execution_run_id:
+                    return None
+                return ProviderCallDiagnostic(
+                    provider_call_id=call.provider_call_id,
+                    node_key=call.node_key,
+                    function_name=call.binding.function_name,
+                    status=call.status,
+                    provider_call_handle_id=call.provider_call_handle_id,
+                    created_at=call.created_at,
+                    started_at=call.started_at,
+                    completed_at=call.completed_at,
+                )
+            finally:
+                if store is not None:
+                    store.close()
 
     def prepare_restart(
         self,

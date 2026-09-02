@@ -1,18 +1,19 @@
-"""FastAPI application assembly for the Biomodals control plane."""
+"""FastAPI assembly for the Biomodals service control plane."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, status
+from fastapi import APIRouter, FastAPI, status
 
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService, PasswordExecutor
 from biomodals.service.auth_api import create_auth_router
-from biomodals.service.config import ServiceSettings
+from biomodals.service.billing import BillingService
 from biomodals.service.http_contract import (
     SECURE_SESSION_COOKIE,
     SESSION_COOKIE,
@@ -21,11 +22,16 @@ from biomodals.service.http_contract import (
     document_contract_headers,
     install_http_contract,
 )
-from biomodals.service.jobs import WorkloadRegistration, reconciliation_loop
 from biomodals.service.jobs_api import create_jobs_router
 from biomodals.service.operations_api import create_operations_router
+from biomodals.service.remote_execution import RemoteExecutionClient
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import ServiceStore
+from biomodals.service.tool_runtime import (
+    JobLifecycle,
+    ToolRegistration,
+    reconciliation_loop,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,77 +41,67 @@ def create_app(
     store: ServiceStore,
     auth: AuthService,
     configuration: RuntimeConfiguration,
-    workloads: Sequence[WorkloadRegistration],
+    registrations: Sequence[ToolRegistration],
+    tool_routers: Sequence[APIRouter],
+    remote: RemoteExecutionClient,
+    lifecycle: JobLifecycle,
+    cache: ArtifactCache,
     allowed_origin: str,
     secure_cookies: bool,
-    cache: ArtifactCache | None = None,
-    reconcile_interval_seconds: float = 10,
+    reconcile_interval_seconds: float = 60,
 ) -> FastAPI:
-    """Assemble one control plane from explicitly registered workloads."""
-    registrations = {workload.name: workload for workload in workloads}
-    if len(registrations) != len(workloads):
-        raise ValueError("Workload names must be unique")
-    configured_definitions = tuple(
-        configuration.workload_definition(name)
-        for name in configuration.workload_names()
-    )
-    if configured_definitions != tuple(workload.definition for workload in workloads):
-        raise ValueError("Runtime workload definitions must match registrations")
+    """Assemble explicitly registered Tools around one shared lifecycle."""
+    if len(registrations) != len(tool_routers):
+        raise ValueError("Every Tool registration requires one typed router")
+    if (
+        tuple(item.definition.key for item in registrations)
+        != configuration.tool_names()
+    ):
+        raise ValueError("Runtime Tool definitions must match registrations")
     if reconcile_interval_seconds <= 0:
         raise ValueError("reconcile_interval_seconds must be positive")
-    if any(workload.max_body_bytes < 1 for workload in workloads):
-        raise ValueError("Workload body limits must be positive")
-    if cache is None and any(
-        workload.read_artifact is not None for workload in workloads
-    ):
-        raise ValueError("A verified artifact cache is required for downloads")
     if not allowed_origin or allowed_origin.endswith("/"):
         raise ValueError("allowed_origin must be an exact origin without a slash")
     session_cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
     password_executor = PasswordExecutor()
+    reconcile_wakeup = asyncio.Event()
 
     @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = asyncio.Event()
-        task: asyncio.Task[None] | None = None
-        for workload in workloads:
-            if workload.preflight is None:
-                continue
-            effective = configuration.workload(workload.name)
-            await workload.preflight(
-                effective.modal_app_name.value,
-                configuration.modal_environment().value,
-                effective.modal_app_version.value,
+        for registration in registrations:
+            effective = configuration.tool(registration.definition.key)
+            from biomodals.execution import DeploymentIdentity
+
+            await remote.preflight(
+                DeploymentIdentity(
+                    configuration.modal_environment().value,
+                    effective.modal_app_name,
+                    effective.modal_app_version.value,
+                )
             )
-        if cache is not None:
-            store.reconcile_result_cache(await cache.cached_job_ids_async())
-        if any(workload.reconciler is not None for workload in workloads):
-            task = asyncio.create_task(
-                reconciliation_loop(
-                    workloads,
-                    interval_seconds=reconcile_interval_seconds,
-                    stop=stop,
-                ),
-                name="biomodals-job-reconciler",
-            )
-        _app.state.reconciler_task = task
-        _app.state.ready = True
-        LOGGER.info("event=readiness_changed ready=true")
+        await cache.check_ready_async()
+        store.reconcile_result_cache(await cache.cached_job_ids_async())
+        task = asyncio.create_task(
+            reconciliation_loop(
+                lifecycle,
+                interval_seconds=reconcile_interval_seconds,
+                stop=stop,
+                wake=reconcile_wakeup,
+            ),
+            name="biomodals-job-reconciler",
+        )
+        app.state.reconciler_task = task
+        app.state.ready = True
         try:
             yield
         finally:
-            _app.state.ready = False
-            LOGGER.info("event=readiness_changed ready=false")
+            app.state.ready = False
             stop.set()
-            try:
-                if task is not None:
-                    await task
-            finally:
-                try:
-                    await password_executor.shutdown()
-                finally:
-                    if cache is not None:
-                        await cache.shutdown()
+            reconcile_wakeup.set()
+            await task
+            await password_executor.shutdown()
+            await cache.shutdown()
 
     app = FastAPI(
         title="Biomodals API",
@@ -122,20 +118,20 @@ def create_app(
     app.state.store = store
     app.state.auth = auth
     app.state.configuration = configuration
+    app.state.registrations = {
+        registration.definition.key: registration for registration in registrations
+    }
+    app.state.remote_execution = remote
+    app.state.lifecycle = lifecycle
+    app.state.reconcile_wakeup = reconcile_wakeup
+    app.state.cache = cache
+    app.state.billing = BillingService()
+    app.state.pending_requests = None
+    app.state.validated_inputs = None
     app.state.allowed_origin = allowed_origin
     app.state.session_cookie_name = session_cookie_name
-    app.state.workloads = registrations
-    app.state.cache = cache
     app.state.ready = False
-    app.state.reconciler_task = None
-
-    install_http_contract(
-        app,
-        max_body_bytes=max(
-            (workload.max_body_bytes for workload in workloads),
-            default=1024 * 1024,
-        ),
-    )
+    install_http_contract(app, max_body_bytes=256 * 1024 * 1024)
     app.include_router(create_operations_router(store=store, cache=cache))
     app.include_router(
         create_auth_router(
@@ -148,13 +144,13 @@ def create_app(
     app.include_router(
         create_jobs_router(
             store=store,
-            workloads=registrations,
             configuration=configuration,
+            lifecycle=lifecycle,
             cache=cache,
         )
     )
-    for workload in workloads:
-        app.include_router(workload.router)
+    for router in tool_routers:
+        app.include_router(router)
 
     from biomodals.service.admin_api import create_admin_router
     from biomodals.service.job_logs_api import create_job_logs_router
@@ -166,52 +162,70 @@ def create_app(
 
 
 def create_deployed_app() -> FastAPI:
-    """Create the local Linux service backed by deployed Modal compute Apps."""
+    """Create the Linux service backed by exact deployed Modal coordinators."""
+    from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
+    from biomodals.service.alphafold3.router import create_router as af3_router
+    from biomodals.service.alphafold3.validation import ValidatedInputStore
+    from biomodals.service.config import ServiceSettings
+    from biomodals.service.gromacs.modal import GromacsToolAdapter
+    from biomodals.service.gromacs.router import create_router as gromacs_router
+    from biomodals.service.pending import PendingRequestStore
+    from biomodals.service.tools import ALPHAFOLD3_TOOL, GROMACS_TOOL, TOOLS
+
     settings = ServiceSettings.from_environment()
     settings.install_modal_credentials()
-
-    from biomodals.service.gromacs import (
-        GromacsExecutionCoordinator,
-        ModalGromacsAdapter,
-        create_registration,
-    )
-    from biomodals.service.jobs import JobLifecycleLocks
-
     store = ServiceStore(settings.database_path)
     store.initialize()
-    auth = AuthService(store, frontend_url=settings.public_url)
+    pending = PendingRequestStore(settings.state_dir)
+    pending.initialize()
+    validations = ValidatedInputStore(settings.state_dir)
+    validations.initialize()
+    validations.cleanup_expired(
+        claimed=store.claimed_validation_ids(),
+        now=int(time.time()),
+    )
+    pending.cleanup_orphans(retained=store.unstaged_job_ids())
     cache = ArtifactCache(settings.cache_dir / "results")
-    adapter = ModalGromacsAdapter(
-        artifact_cache=cache,
-    )
-    lifecycle_locks = JobLifecycleLocks()
-    registration = create_registration(
-        adapter,
-        reconciler=GromacsExecutionCoordinator(
-            store,
-            adapter,
-            lifecycle_locks=lifecycle_locks,
-            intermediate_retention_days=settings.intermediate_retention_days,
-        ),
-        lifecycle_locks=lifecycle_locks,
-        read_artifact=adapter.read_artifact,
-        rebuild_artifact=adapter.rebuild_artifact,
-        open_operation_logs=adapter.open_operation_logs,
-        preflight=adapter.preflight,
-    )
-    workloads = [registration]
-    configuration = RuntimeConfiguration(
+    remote = RemoteExecutionClient()
+    configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
+    gromacs = ToolRegistration(GROMACS_TOOL, GromacsToolAdapter(pending))
+    alphafold3_adapter = AlphaFold3ToolAdapter(
+        validations,
         store,
-        settings,
-        workload_definitions=[workload.definition for workload in workloads],
+        modal_download_concurrency=settings.modal_download_concurrency,
     )
-    return create_app(
+    alphafold3 = ToolRegistration(ALPHAFOLD3_TOOL, alphafold3_adapter)
+    registrations = (gromacs, alphafold3)
+    lifecycle = JobLifecycle(store, remote, registrations, cache)
+    routers = (
+        gromacs_router(
+            store=store,
+            configuration=configuration,
+            pending=pending,
+            remote=remote,
+        ),
+        af3_router(
+            store=store,
+            configuration=configuration,
+            validations=validations,
+            adapter=alphafold3_adapter,
+            remote=remote,
+        ),
+    )
+    auth = AuthService(store, frontend_url=settings.public_url)
+    app = create_app(
         store=store,
         auth=auth,
         configuration=configuration,
-        workloads=workloads,
+        registrations=registrations,
+        tool_routers=routers,
+        remote=remote,
+        lifecycle=lifecycle,
+        cache=cache,
         allowed_origin=settings.public_url,
         secure_cookies=settings.secure_cookies,
-        cache=cache,
         reconcile_interval_seconds=settings.reconcile_interval_seconds,
     )
+    app.state.pending_requests = pending
+    app.state.validated_inputs = validations
+    return app

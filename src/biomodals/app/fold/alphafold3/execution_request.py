@@ -26,9 +26,9 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
 from biomodals.execution import ExecutionPlan
 from biomodals.execution.modal import ExecutionRequestFile
 
-EXECUTION_REQUEST_SCHEMA_VERSION = 4
+EXECUTION_REQUEST_SCHEMA_VERSION = 5
 EXECUTION_REQUEST_FILENAME = "alphafold3-request.json"
-MAX_EXECUTION_REQUEST_BYTES = 64 * 1024 * 1024
+MAX_EXECUTION_REQUEST_BYTES = 1024 * 1024 * 1024
 _REQUEST_FILE = ExecutionRequestFile(
     EXECUTION_REQUEST_FILENAME,
     MAX_EXECUTION_REQUEST_BYTES,
@@ -49,6 +49,7 @@ class AlphaFold3ExecutionRequest:
     allow_large_inference: bool
     recycle: int
     sample: int
+    repair_execution_run_ids: tuple[UUID, ...]
 
     @classmethod
     def prepare(
@@ -62,6 +63,7 @@ class AlphaFold3ExecutionRequest:
         allow_large_inference: bool = False,
         recycle: int,
         sample: int,
+        repair_execution_run_ids: tuple[UUID, ...] = (),
     ) -> AlphaFold3ExecutionRequest:
         """Validate one local request and bind its existing invocation identity."""
         validated = validate_submitted_af3_input(config)
@@ -94,6 +96,10 @@ class AlphaFold3ExecutionRequest:
             sample=sample,
             allow_large_inference=allow_large_inference,
         )
+        if any(not isinstance(item, UUID) for item in repair_execution_run_ids):
+            raise TypeError("AlphaFold3 repair Execution Run IDs must be UUIDs")
+        if len(set(repair_execution_run_ids)) != len(repair_execution_run_ids):
+            raise ValueError("AlphaFold3 repair Execution Run IDs must be unique")
         return cls(
             config=validated,
             invocation=invocation,
@@ -104,6 +110,7 @@ class AlphaFold3ExecutionRequest:
             allow_large_inference=allow_large_inference,
             recycle=recycle,
             sample=sample,
+            repair_execution_run_ids=repair_execution_run_ids,
         )
 
     @property
@@ -128,6 +135,9 @@ class AlphaFold3ExecutionRequest:
                 "allow_large_inference": self.allow_large_inference,
                 "recycle": self.recycle,
                 "sample": self.sample,
+                "repair_execution_run_ids": [
+                    str(item) for item in self.repair_execution_run_ids
+                ],
             },
             option=orjson.OPT_SORT_KEYS,
         )
@@ -170,6 +180,10 @@ class AlphaFold3ExecutionRequest:
             allow_large_inference=_required_bool(value, "allow_large_inference"),
             recycle=_required_int(value, "recycle"),
             sample=_required_int(value, "sample"),
+            repair_execution_run_ids=_required_uuid_tuple(
+                value,
+                "repair_execution_run_ids",
+            ),
         )
         raw_invocation = value.get("invocation")
         if (
@@ -205,6 +219,16 @@ def load_execution_request(
     return AlphaFold3ExecutionRequest.from_bytes(content)
 
 
+def load_execution_request_from_volume(
+    output_volume: Any,
+    execution_run_id: UUID,
+) -> AlphaFold3ExecutionRequest:
+    """Load a staged request through the client-side Volume API."""
+    return AlphaFold3ExecutionRequest.from_bytes(
+        _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
+    )
+
+
 def persist_execution_request(
     volume_root: str | Path,
     execution_run_id: UUID,
@@ -230,3 +254,18 @@ def _required_int(value: dict[object, object], key: str) -> int:
     if isinstance(selected, bool) or not isinstance(selected, int):
         raise TypeError(f"{key} must be an integer")
     return cast(int, selected)
+
+
+def _required_uuid_tuple(
+    value: dict[object, object],
+    key: str,
+) -> tuple[UUID, ...]:
+    selected = value.get(key)
+    if not isinstance(selected, list) or any(
+        not isinstance(item, str) for item in selected
+    ):
+        raise TypeError(f"{key} must be a list of UUID strings")
+    try:
+        return tuple(UUID(item) for item in selected)
+    except ValueError as error:
+        raise ValueError(f"{key} contains an invalid UUID") from error

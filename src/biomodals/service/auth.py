@@ -81,7 +81,6 @@ class PasswordExecutor:
             raise ValueError("Password worker count must be positive")
         if queued < 0:
             raise ValueError("Password queue count must be non-negative")
-        self._workers = workers
         self._capacity_slots = workers + queued
         self._capacity = BoundedSemaphore(self._capacity_slots)
         self._state_lock = Lock()

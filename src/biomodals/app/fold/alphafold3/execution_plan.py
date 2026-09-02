@@ -13,6 +13,7 @@ from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
 
 ALPHAFOLD3_EXECUTION_NODE_KEYS = (
     "stage-request-input",
+    "prepare-environment",
     "raw-database-searches",
     "combined-msa-publications",
     "protein-template-searches",
@@ -37,17 +38,24 @@ def build_alphafold3_execution_plan(
     nodes: list[NodePlan] = []
     previous: str | None = None
     empty_result_nodes = {
+        "prepare-environment",
         "raw-database-searches",
         "combined-msa-publications",
         "protein-template-searches",
     }
     for node_key in ALPHAFOLD3_EXECUTION_NODE_KEYS:
+        dependencies = (NodeDependency(previous),) if previous is not None else ()
+        if node_key == "seed-predictions":
+            # A cached staged input does not prove that shared model weights
+            # still exist. Keep environment readiness in the required closure.
+            dependencies = (
+                NodeDependency("prepare-environment"),
+                *dependencies,
+            )
         nodes.append(
             NodePlan(
                 node_key=node_key,
-                dependencies=(
-                    (NodeDependency(previous),) if previous is not None else ()
-                ),
+                dependencies=dependencies,
                 allow_empty_result=node_key in empty_result_nodes,
             )
         )

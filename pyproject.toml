@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiofiles>=25.1.0",
     "backports-strenum>=1.3.1,<2.0 ; python_full_version < '3.11'",
-    "modal>=1.5.1",
+    "modal>=1.5.4",
     "niquests>=3.18.4",
     "orjson>=3.11.8",
     "polars[calamine,numpy,pandas,xlsxwriter]>=1.39.3",
@@ -17,7 +17,7 @@ dependencies = [
     "rich>=14.2.0",
     "tqdm>=4.67.3",
     "typer>=0.20.0",
-    "uniaf3>=0.2.0",
+    "uniaf3==0.2.1",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +50,17 @@ dev = [
 extend-exclude = ["logs/*", "data/*"]
 extend-include = ["*.ipynb"]
 line-length = 88
+
+[tool.uv.sources]
+uniaf3 = { index = "pypi" }
+
+[tool.uv]
+required-version = ">=0.12,<0.13"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
 [tool.ruff.format]
 preview = true

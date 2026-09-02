@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from biomodals.app.fold.alphafold3.environment import EnvironmentRuntime
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
     load_execution_request,
@@ -41,6 +42,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
         search_runtime: SearchRuntime,
         template_runtime: TemplateRuntime,
         inference_runtime: InferenceRuntime,
+        environment_runtime: EnvironmentRuntime,
         poll_interval_seconds: float = 1.0,
     ) -> None:
         """Capture only the host resources needed by this deployment adapter."""
@@ -61,6 +63,7 @@ class AlphaFold3ExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
         self.search_runtime = search_runtime
         self.template_runtime = template_runtime
         self.inference_runtime = inference_runtime
+        self.environment_runtime = environment_runtime
 
     def _graph(
         self,
@@ -75,4 +78,5 @@ class AlphaFold3ExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
             search_runtime=self.search_runtime,
             template_runtime=self.template_runtime,
             inference_runtime=self.inference_runtime,
+            environment_runtime=self.environment_runtime,
         )

@@ -31,6 +31,8 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
+    ProviderCallDiagnostic,
+    ProviderCallPage,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -52,7 +54,7 @@ from biomodals.schema import ArtifactFile
 # Modal configs
 ##########################################
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name},
+    tags={"group": Path(__file__).parent.name, "biomodals_tool": "gromacs"},
     name="Gromacs",
     repo_url="https://github.com/gromacs/gromacs",
     version="2026.1",
@@ -96,6 +98,7 @@ def production_workflow_files(run_name: str) -> list[ArtifactFile]:
     prefix = f"production_{run_name}"
     return [
         ArtifactFile(path=f"{prefix}.xtc", role="trajectory"),
+        ArtifactFile(path=f"{prefix}.edr", role="production_energy"),
         ArtifactFile(path=f"{prefix}.tpr", role="production_topology"),
         ArtifactFile(path=f"{prefix}_nopbc_centered.pdb", role="centered_structure"),
         ArtifactFile(path=f"rmsd_{prefix}.csv", role="rmsd"),
@@ -255,7 +258,7 @@ biotite_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
-    .uv_pip_install("biotite", "numpy", "scipy", "seaborn", "matplotlib")
+    .uv_pip_install("biotite", "numpy", "scipy", "matplotlib")
     .pipe(patch_image_for_helper)
     .add_local_python_source(
         "biomodals.app.bioinfo.gromacs_execution",
@@ -345,7 +348,6 @@ def prepare_tpr_gpu(
     input_pdb_path = work_path / f"{run_name}.pdb"
     staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
-    CONF.output_volume.commit()
 
     script_path = Path(APP_INFO.gmx_scripts) / "prepare-tpr.sh"
     if not script_path.exists():
@@ -417,7 +419,6 @@ def prepare_tpr_cpu(
     input_pdb_path = work_path / f"{run_name}.pdb"
     staged_input_pdb_path.write_bytes(pdb_content)
     input_pdb_path.write_bytes(pdb_content)
-    CONF.output_volume.commit()
 
     script_path = Path(APP_INFO.gmx_scripts) / "prepare-tpr.sh"
     if not script_path.exists():
@@ -762,7 +763,6 @@ def collect_traj_stats(
     trajectory = xtc_file.get_structure(template)
     if not save_processed_traj:
         processed_traj_path.unlink()
-        out_vol.commit()
 
     # Get simulation time (ns) for plotting purposes
     time = xtc_file.get_time() / 1000.0
@@ -778,7 +778,6 @@ def collect_traj_stats(
         last_frame_path.unlink(missing_ok=True)  # remove outdated last frame
     if not last_frame_path.exists():
         strucio.save_structure(last_frame_path, trajectory[-1])
-        out_vol.commit()
 
     # RMSD vs. the initial frame
     rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{run_name}.png"
@@ -807,8 +806,6 @@ def collect_traj_stats(
             figure.savefig(rmsd_fig_path)
             plt.close(figure)
 
-        out_vol.commit()
-
     # Radius of gyration
     rg_fig_path = work_path / f"rg_{traj_prefix}{run_name}.png"
     rg_csv_path = rg_fig_path.with_suffix(".csv")
@@ -834,8 +831,6 @@ def collect_traj_stats(
             ax.set_ylabel("Radius of Gyration (Å)")
             figure.savefig(rg_fig_path)
             plt.close(figure)
-
-        out_vol.commit()
 
     # RMSF of each residue
     rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{run_name}.png"
@@ -871,8 +866,7 @@ def collect_traj_stats(
             figure.savefig(rmsf_fig_path)
             plt.close(figure)
 
-        out_vol.commit()
-
+    out_vol.commit()
     return str(work_path)
 
 
@@ -881,7 +875,7 @@ def collect_traj_stats(
 ##########################################
 @app.cls(
     cpu=(0.125, 4.125),
-    memory=(1024, 16384),
+    memory=(256, 65536),
     timeout=MAX_TIMEOUT,
     max_containers=1,
     scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
@@ -913,6 +907,27 @@ class ExecutionCoordinator:
     def status(self) -> ExecutionOverview:
         """Read this Run's durable kernel snapshot."""
         return self._adapter().status()
+
+    @modal.method()
+    def provider_calls(
+        self,
+        node_key: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        newest_first: bool = False,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls for service diagnostics."""
+        return self._adapter().provider_calls(
+            node_key=node_key,
+            cursor=None if cursor is None else UUID(cursor),
+            limit=limit,
+            newest_first=newest_first,
+        )
+
+    @modal.method()
+    def provider_call(self, provider_call_id: str) -> ProviderCallDiagnostic | None:
+        """Read one call selected by service diagnostics."""
+        return self._adapter().provider_call(UUID(provider_call_id))
 
     @modal.method()
     def cancel(self) -> ExecutionOverview:

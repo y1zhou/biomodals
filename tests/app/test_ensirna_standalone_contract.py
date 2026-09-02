@@ -121,8 +121,6 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     source = Path(ensirna_app.__file__).read_text(encoding="utf-8")
 
     assert 'from_registry("rosettacommons/rosetta:serial-420"' in source
-    assert ".debian_slim(" not in source
-    assert "tanwenchong/ensirna:v2" not in source
     assert '"MAMBA_ROOT_PREFIX": APP_INFO.mamba_root' in source
     assert '"PATH": APP_INFO.mamba_bin_path' in source
     assert ensirna_app.APP_INFO.mamba_lib_path == "/root/micromamba/lib"
@@ -148,8 +146,6 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert "run_ensirna_inference" in source
     assert "MODEL_VOLUME.commit()" in source
     assert "download_files(" in source
-    assert "curl -fL --retry" not in source
-    assert "micromamba create" not in source
     assert ".micromamba_install(" in source
     assert "viennarna=2.6.4-0" in source
     assert ".uv_pip_install(*APP_INFO.pip_packages)" in source
@@ -157,7 +153,6 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert "https://download.pytorch.org/whl/cu118" in source
     assert "rna-fm" in source
     assert "ENSIRNA_RNAFM_DEVICE" in source
-    assert "ENSIRNA_PDB_CORES" not in source
     assert '"--num-cores"' in source
     assert "cpu=(0.125, 32.125)" in source
     assert '"data.dataset"' in source
@@ -174,12 +169,6 @@ def test_runtime_image_uses_rosetta_base_build() -> None:
     assert (
         "volumes=CONF.mounts(output_volume=True, model_volume=True)" in preprocess_block
     )
-    finalize_block = source[
-        source.index("def ensirna_finalize_prepared_inputs") : source.index(
-            "def ensirna_preprocess_dataset"
-        )
-    ]
-    assert '"data.dataset"' not in finalize_block
 
 
 def test_runtime_patch_contract_pins_sources_and_compiles_both_modules(

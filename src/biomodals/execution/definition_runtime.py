@@ -1034,7 +1034,7 @@ class ExecutionGraphRuntime:
                     task_definition,
                     task.fingerprint,
                 )
-            except Exception:  # noqa: BLE001 - inconclusive workload validation
+            except OSError:
                 prepared.append((
                     task,
                     AvailabilityStatus.UNKNOWN,
@@ -1114,8 +1114,7 @@ class ExecutionGraphRuntime:
             if isinstance(node, TaskProviderNode):
                 self._publish_provider_task_results(
                     node_id,
-                    call.task_keys,
-                    envelope,
+                    call,
                     node,
                 )
                 return
@@ -1149,10 +1148,11 @@ class ExecutionGraphRuntime:
     def _publish_provider_task_results(
         self,
         node_id: str,
-        task_keys: tuple[str, ...],
-        envelope: object,
+        call: ProviderCallRecord,
         node: TaskProviderNode,
     ) -> None:
+        task_keys = call.task_keys
+        envelope = call.result_envelope
         with self.store.synchronize():
             tasks = tuple(
                 self.store.execution.get_task(
@@ -2037,12 +2037,17 @@ class ExecutionGraphRuntime:
         if outcome is None:
             return
         if outcome == NodeStatus.CANCELLED:
-            with self.store.transaction():
-                self.store.execution.reconcile_node_tasks(
-                    self.execution_run_id,
-                    node_id,
-                    now=self._now(),
+            try:
+                implementation.finalize_cancelled_remote_tasks(
+                    self._node_context(self._require_definition(), node_id)
                 )
+            finally:
+                with self.store.transaction():
+                    self.store.execution.reconcile_node_tasks(
+                        self.execution_run_id,
+                        node_id,
+                        now=self._now(),
+                    )
             return
 
         with self.store.synchronize():
@@ -2265,7 +2270,7 @@ class ExecutionGraphRuntime:
         context = self._node_context(definition, node_id)
         try:
             recovered = implementation.recover_result_publication(context)
-        except Exception:  # noqa: BLE001 - inconclusive workload validation
+        except OSError:
             return AvailabilityStatus.UNKNOWN
         if recovered is None:
             return AvailabilityStatus.MISSING
@@ -2427,7 +2432,7 @@ class ExecutionGraphRuntime:
                 task,
                 expected_fingerprint,
             )
-        except Exception:  # noqa: BLE001 - inconclusive workload validation
+        except OSError:
             return _TaskPublicationObservation(AvailabilityStatus.UNKNOWN)
         if recovered is None:
             return _TaskPublicationObservation(AvailabilityStatus.MISSING)

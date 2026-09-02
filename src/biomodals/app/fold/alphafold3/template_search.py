@@ -30,7 +30,6 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_LOCAL_MSA_BYTES,
-    MAX_STAGED_INPUT_BYTES,
 )
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaArtifactReference,
@@ -69,7 +68,7 @@ HMMSEARCH_N_CPU = 8
 TEMPLATE_RESULT_SCHEMA_VERSION = 1
 TEMPLATE_IDENTITY_SCHEMA_VERSION = 1
 TEMPLATE_ADAPTER_VERSION = "af3-protein-template-v1"
-MAX_TEMPLATE_INSPECTION_BYTES = MAX_STAGED_INPUT_BYTES
+MAX_TEMPLATE_INSPECTION_BYTES = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +240,8 @@ def template_search_identity(
     max_template_date: str,
 ) -> str:
     """Hash the scientific identity of one protein template search."""
+    # TODO: Include the verified seqres/mmCIF asset-manifest identity so a
+    # replacement template corpus cannot reuse results from another snapshot.
     validate_query(resolve_database_profile("uniref90"), sequence)
     if re.fullmatch(r"[0-9a-f]{64}", unpaired_msa_sha256) is None:
         raise ValueError("unpaired_msa_sha256 must be a lowercase SHA-256 digest")
@@ -494,9 +495,17 @@ def _execute_template_search(
     )
     seqres_path = source_root / PDB_SEQRES_FILENAME
     mmcif_path = source_root / MMCIF_DIRECTORY_NAME
-    require_regular_file(seqres_path)
-    if not mmcif_path.is_dir():
-        raise FileNotFoundError(f"Expected mmCIF directory: {mmcif_path}")
+    try:
+        require_regular_file(seqres_path)
+        if not mmcif_path.is_dir():
+            raise FileNotFoundError(f"Expected mmCIF directory: {mmcif_path}")
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "Existing AlphaFold3 template assets are incomplete. Remove or "
+            f"repair {seqres_path} and {mmcif_path} in the AlphaFold3-msa-db "
+            "Volume, then rerun the job; automatic setup will not replace "
+            "existing final paths."
+        ) from error
 
     contract = assert_pinned_template_contract()
     msa_config = import_module("alphafold3.data.msa_config")
@@ -517,13 +526,22 @@ def _execute_template_search(
             max_template_date=selected_date,
         ),
     )
-    template_hits = pipeline._get_protein_templates(  # noqa: SLF001
-        sequence=query,
-        input_msa_a3m=unpaired_msa,
-        run_template_search=True,
-        templates_config=template_config,
-        pdb_database_path=str(mmcif_path),
-    )
+    try:
+        template_hits = pipeline._get_protein_templates(  # noqa: SLF001
+            sequence=query,
+            input_msa_a3m=unpaired_msa,
+            run_template_search=True,
+            templates_config=template_config,
+            pdb_database_path=str(mmcif_path),
+        )
+    except Exception as error:
+        error.add_note(
+            "If AlphaFold3 reports incompatible template data, remove or repair "
+            f"{seqres_path} and {mmcif_path} in the AlphaFold3-msa-db Volume, "
+            "then rerun the job; automatic setup will not replace existing "
+            "final paths."
+        )
+        raise
     templates: list[dict[str, object]] = []
     for hit, structure in template_hits.get_hits_with_structures():
         mapping = list(hit.query_to_hit_mapping.items())
@@ -544,6 +562,7 @@ def _wait_for_template_claim(
     context: TemplateContext,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> tuple[TemplateEntry | None, GenerationClaim | None]:
     selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
@@ -559,6 +578,7 @@ def _wait_for_template_claim(
                 identity=context.provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
             return None, claim
         except ActiveGenerationError as exc:
@@ -577,6 +597,7 @@ def run_template_search(
     task: TemplateTask,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Run a request-local search or publish one canonical template result."""
     if not isinstance(task.publish_canonical, bool):
@@ -617,6 +638,7 @@ def run_template_search(
             runtime,
             context,
             generation_id=generation_id,
+            superseded_generation_ids=superseded_generation_ids,
         )
     )
     if raced_entry is not None:
@@ -632,16 +654,18 @@ def run_template_search(
         / claim.generation_id
     )
     log_path = generation_root / "run.log"
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.cache_volume.reload()
         if entry := load_template_entry(context):
-            terminal_status = "complete"
-            terminal_detail = {
-                "publication": "raced",
-                "done_sha256": entry.done_sha256,
-            }
+            finish_generation_claim(
+                runtime.claims,
+                claim,
+                status="complete",
+                detail={
+                    "publication": "raced",
+                    "done_sha256": entry.done_sha256,
+                },
+            )
             return entry.summary("reused")
         append_log(
             log_path,
@@ -685,12 +709,15 @@ def run_template_search(
         if entry is None:
             raise RuntimeError("Published template result failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        runtime.cache_volume.commit()
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "done_sha256": entry.done_sha256,
-        }
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="complete",
+            detail={
+                "publication": "published",
+                "done_sha256": entry.done_sha256,
+            },
+        )
         return entry.summary("published")
     except Exception as exc:
         append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
@@ -705,15 +732,13 @@ def run_template_search(
             },
         )
         runtime.cache_volume.commit()
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
+        raise

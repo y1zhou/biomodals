@@ -236,10 +236,12 @@ Durable state follows the coordinator that owns the run:
 | --- | --- |
 | Direct CLI app run | One remote, per-run app ledger |
 | CLI workflow run | One remote, per-run workflow ledger |
-| FastAPI service | Shared execution tables inside `service.sqlite3` |
+| FastAPI service Job | The deployed Tool coordinator's remote per-run ledger |
 
-The local CLI does not create an execution database. Provider workers also do
-not write SQLite; their owning coordinator records observations and outcomes.
+The local CLI and FastAPI service do not create execution databases. Provider
+workers also do not write SQLite; their owning coordinator records observations
+and outcomes. The service keeps only a lean Job locator and a bounded cached
+projection for responsive web pages.
 
 For the complete model, see
 [ADR 0006](docs/adr/0006-unified-execution-kernel.md) and the
@@ -248,12 +250,14 @@ For the complete model, see
 ## Web API
 
 The optional FastAPI service is a single-host control plane for the BioModals
-web interface. It currently exposes the GROMACS MD simulation and is designed
-to add more workload adapters without changing account or Job routes.
+web interface. It exposes GROMACS MD simulation and AlphaFold3 structure
+prediction through the same account and Job routes.
 
-The service owns Users, Sessions, Jobs, runtime settings, Result staging, and
-the mapping from a web Job to its kernel Execution Run. It calls established,
-separately deployed Modal functions; it is not a Modal web endpoint.
+The service owns Users, Sessions, lean Job locators and projections, runtime
+settings, retained AlphaFold3 validation resources, and Result staging. Each
+Job points to an exact deployed Tool coordinator, which remains the sole
+execution authority. `service.sqlite3` deliberately contains no execution
+kernel tables, input documents, provider calls, or billing reports.
 
 The browser application lives in the
 [biomodals-frontend repository](https://github.com/y1zhou/biomodals-frontend).
@@ -261,12 +265,13 @@ It uses same-origin `/api` requests and generated OpenAPI types.
 
 ### Local API development
 
-Install the API dependencies and deploy the GROMACS app in the Modal
-Environment selected by the development configuration:
+Install the API dependencies and deploy both API Tools in the Modal Environment
+selected by the development configuration:
 
 ```bash
 uv sync --extra api
 uv run biomodals app deploy gromacs --env production
+uv run biomodals app deploy alphafold3 --env production
 ```
 
 Copy [`.env.example`](.env.example), replace both Modal token placeholders,
@@ -300,6 +305,15 @@ Session cookies.
 
 `BIOMODALS_SECURE_COOKIES` defaults to `false` for local HTTP. Set it to
 `true` behind the production HTTPS reverse proxy.
+
+The OpenAPI document includes the shared Job routes, typed GROMACS submission,
+retained AlphaFold3 JSON validation and submission, paginated Provider Call log
+targets, and Administrator billing reports. AlphaFold3 input documents are
+limited to 256 MiB in both browser validation and the standalone CLI. Modal
+validation retention also has fixed per-User and service-wide count and byte
+budgets so uploads cannot exhaust the state filesystem. Modal billing is
+optional and unavailable reports never affect API
+readiness or Job execution.
 
 ### Create the first administrator
 

@@ -63,13 +63,11 @@ def test_cli_loads_hyphenated_workflow_aliases() -> None:
     assert workflow.module == "biomodals.workflow.rfd_ligandmpnn_workflow"
 
 
-def test_workflow_list_command_shows_workflow_names_without_legacy_prefix() -> None:
+def test_workflow_list_command_shows_workflow_names() -> None:
     result = runner.invoke(app, ["workflow", "list", "--short"])
 
     assert result.exit_code == 0
     assert "ppiflow" in result.output
-    assert "workflow-ppiflow" not in result.output
-    assert "orchestrator" not in result.output
 
 
 def test_app_list_command_is_namespaced() -> None:
@@ -132,31 +130,6 @@ def test_run_help_owns_public_deployment_flags(namespace: str) -> None:
     assert "--deployment-name" in output
     assert "--version" in output
     assert "--restart-from" in output
-    assert "--deployment-environment" not in output
-    assert "--deployment-version" not in output
-
-
-def test_multi_entrypoint_help_separates_argument_tables() -> None:
-    result = runner.invoke(app, ["app", "help", "alphafold3"])
-    lines = [line.rstrip() for line in strip_ansi(result.output).splitlines()]
-
-    assert result.exit_code == 0
-    first_heading = lines.index("setup_sharded_databases CLI flags:")
-    second_heading = lines.index("submit_alphafold3_task CLI flags:")
-    first_table = lines[first_heading + 1 : second_heading]
-    first_nonblank = next(i for i, line in enumerate(first_table) if line)
-    last_nonblank = max(i for i, line in enumerate(first_table) if line)
-
-    assert first_table[:first_nonblank] == [""]
-    assert first_table[last_nonblank + 1 :] == ["", ""]
-
-
-@pytest.mark.parametrize("command", ["list", "ls", "l", "help", "h", "deploy", "d"])
-def test_top_level_app_compatibility_aliases_are_removed(command: str) -> None:
-    result = runner.invoke(app, [command])
-
-    assert result.exit_code == 2
-    assert f"No such command '{command}'" in strip_ansi(result.output)
 
 
 def test_app_deploy_command_is_namespaced() -> None:

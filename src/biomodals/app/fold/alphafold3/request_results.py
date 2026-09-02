@@ -3,7 +3,7 @@
 Durable prediction files remain canonical and seed-addressed on the output
 Volume. This module publishes a small request view over exactly the requested
 seeds, then downloads only that manifest-declared view and restores the
-caller's presentation name in the local archive.
+caller's presentation name with bounded streaming I/O.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import shutil
 import subprocess as sp
 import tarfile
 import uuid
+from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -26,7 +27,8 @@ import orjson
 import polars as pl
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
-    MAX_STAGED_INPUT_BYTES,
+    MAX_STAGED_INPUT_MARKER_BYTES,
+    STAGED_INPUT_SCHEMA_VERSION,
     PreparedInferenceRun,
     hash_sequences,
     normalize_model_seeds,
@@ -59,6 +61,7 @@ REQUEST_MANIFEST_SCHEMA_VERSION = 5
 REQUEST_VIEW_IDENTITY_SCHEMA = "biomodals-alphafold3-request-view-v2"
 
 _ARCHIVE_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
+_CHUNK_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,50 +248,146 @@ def _artifact_record(
     return record
 
 
-def _presentation_input_bytes(value: bytes, *, display_name: str) -> bytes:
-    """Return canonical archive input bytes with the caller's display name."""
-    try:
-        document = orjson.loads(value)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError("Staged AlphaFold input is invalid JSON") from exc
-    if not isinstance(document, dict):
-        raise TypeError("Staged AlphaFold input must be a JSON object")
-    document["name"] = display_name
-    return json_bytes(document)
-
-
 def _input_artifact_record(
     *,
     source: Path,
     output_root: Path,
     volume_path: Path,
     archive_path: str | PurePosixPath,
+    canonical_name: str,
     display_name: str,
+    expected_record: dict[str, object],
 ) -> dict[str, object]:
-    """Describe staged and presentation-rewritten input bytes."""
-    source_bytes = read_bounded_file_bytes(
-        source,
-        field_name="Staged AlphaFold input",
-        max_bytes=MAX_STAGED_INPUT_BYTES,
-    )
-    record: dict[str, object] = {
-        "role": "input",
-        "volume_path": _volume_relative_path(output_root, volume_path).as_posix(),
-        "archive_path": _safe_archive_path(archive_path).as_posix(),
-        "size_bytes": len(source_bytes),
-        "sha256": hashlib.sha256(source_bytes).hexdigest(),
-    }
-    archive_bytes = _presentation_input_bytes(
-        source_bytes,
+    """Hash canonical and presentation input identities in one bounded pass."""
+    require_regular_file(source)
+    source_marker, archive_marker = _input_name_markers(
+        canonical_name=canonical_name,
         display_name=display_name,
     )
-    record["archive_size_bytes"] = len(archive_bytes)
-    record["archive_sha256"] = hashlib.sha256(archive_bytes).hexdigest()
-    return record
+    source_digest = hashlib.sha256()
+    archive_digest = hashlib.sha256()
+    size_bytes = source.stat().st_size
+
+    with source.open("rb") as handle:
+        for chunk in _presentation_input_chunks(
+            handle,
+            source_marker=source_marker,
+            archive_marker=archive_marker,
+            observe_source=source_digest.update,
+        ):
+            archive_digest.update(chunk)
+    source_record = {
+        "path": _volume_relative_path(output_root, volume_path).as_posix(),
+        "size_bytes": size_bytes,
+        "sha256": source_digest.hexdigest(),
+    }
+    if source_record != expected_record:
+        raise RuntimeError("Staged AlphaFold input does not match its marker")
+    return {
+        "role": "input",
+        "volume_path": source_record["path"],
+        "archive_path": _safe_archive_path(archive_path).as_posix(),
+        "size_bytes": size_bytes,
+        "sha256": source_record["sha256"],
+        "archive_size_bytes": size_bytes - len(source_marker) + len(archive_marker),
+        "archive_sha256": archive_digest.hexdigest(),
+    }
 
 
-def _request_input_path(run_root: Path, request_id: str) -> Path:
-    return run_root / "requests" / request_id / "input.json"
+def _parse_staged_input_record(
+    content: bytes,
+    publication: RequestPublication,
+) -> dict[str, object]:
+    """Validate and return the input record from a staged-request marker."""
+    marker = orjson.loads(content)
+    if (
+        not isinstance(marker, dict)
+        or marker.get("schema_version") != STAGED_INPUT_SCHEMA_VERSION
+        or marker.get("status") != "complete"
+        or marker.get("run_id") != publication.run_id
+        or marker.get("request_id") != publication.request_id
+        or not isinstance(marker.get("input"), dict)
+    ):
+        raise RuntimeError("Staged AlphaFold input marker is invalid")
+    return cast(dict[str, object], marker["input"])
+
+
+def _staged_input_marker_path(
+    publication: RequestPublication,
+) -> PurePosixPath:
+    return (
+        PurePosixPath(publication.run_id[:2])
+        / publication.run_id
+        / "requests"
+        / publication.request_id
+        / "staged-input.json"
+    )
+
+
+def _staged_input_record(
+    output_root: Path,
+    publication: RequestPublication,
+) -> dict[str, object]:
+    """Load the immutable input record through the mounted Volume."""
+    marker_path = output_root.joinpath(*_staged_input_marker_path(publication).parts)
+    return _parse_staged_input_record(
+        read_bounded_file_bytes(
+            marker_path,
+            field_name="Staged AlphaFold input marker",
+            max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
+        ),
+        publication,
+    )
+
+
+def _input_name_markers(
+    *,
+    canonical_name: str,
+    display_name: str,
+) -> tuple[bytes, bytes]:
+    """Return exact deterministic top-level name field encodings."""
+    prefix = b'\n  "name": '
+    return (
+        prefix + orjson.dumps(canonical_name) + b",\n",
+        prefix + orjson.dumps(display_name) + b",\n",
+    )
+
+
+def _presentation_input_chunks(
+    source: IO[bytes],
+    *,
+    source_marker: bytes,
+    archive_marker: bytes,
+    observe_source: Callable[[bytes], None] | None = None,
+) -> Iterator[bytes]:
+    """Replace one input name while retaining only one bounded carry buffer."""
+    pending = b""
+    replaced = False
+    for chunk in iter(lambda: source.read(_CHUNK_SIZE), b""):
+        if observe_source is not None:
+            observe_source(chunk)
+        if replaced:
+            yield chunk
+            continue
+        pending += chunk
+        index = pending.find(source_marker)
+        if index >= 0:
+            yield pending[:index]
+            yield archive_marker
+            pending = pending[index + len(source_marker) :]
+            if pending:
+                yield pending
+            pending = b""
+            replaced = True
+            continue
+        safe_size = len(pending) - len(source_marker) + 1
+        if safe_size > 0:
+            yield pending[:safe_size]
+            pending = pending[safe_size:]
+    if not replaced:
+        raise ValueError("Staged AlphaFold input has the wrong canonical name")
+    if pending:
+        yield pending
 
 
 def _request_view_root(
@@ -395,11 +494,25 @@ def _matching_request_manifest(
     source: str | Path | PurePosixPath,
     spec: RequestPublication,
     view_id: str,
+    expected_input_record: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if not isinstance(manifest, dict):
         raise RuntimeError(f"Existing request view manifest is invalid: {source}")
     selected = cast(dict[str, object], manifest)
-    _validated_manifest_artifacts(selected)
+    _, _, _, artifacts, _ = _validated_manifest_artifacts(selected)
+    if expected_input_record is not None:
+        input_artifact = next(
+            artifact for artifact in artifacts if artifact["role"] == "input"
+        )
+        published_input_record = {
+            "path": input_artifact["volume_path"],
+            "size_bytes": input_artifact["size_bytes"],
+            "sha256": input_artifact["sha256"],
+        }
+        if published_input_record != expected_input_record:
+            raise RuntimeError(
+                "Existing request view input does not match its staged marker"
+            )
     expected = {
         "run_id": spec.run_id,
         "request_id": spec.request_id,
@@ -424,6 +537,7 @@ def _reusable_request_manifest(
     path: Path,
     spec: RequestPublication,
     view_id: str,
+    expected_input_record: dict[str, object],
 ) -> dict[str, object] | None:
     if not path.is_file():
         return None
@@ -438,6 +552,7 @@ def _reusable_request_manifest(
         source=path,
         spec=spec,
         view_id=view_id,
+        expected_input_record=expected_input_record,
     )
 
 
@@ -455,6 +570,14 @@ def load_request_manifest(
     )
     if content is None:
         return None
+    marker_content = read_volume_bytes(
+        reader,
+        _staged_input_marker_path(spec).as_posix(),
+        max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
+    )
+    if marker_content is None:
+        return None
+    expected_input_record = _parse_staged_input_record(marker_content, spec)
     try:
         manifest = orjson.loads(content)
     except orjson.JSONDecodeError as exc:
@@ -466,6 +589,7 @@ def load_request_manifest(
         source=path,
         spec=spec,
         view_id=path.parent.name,
+        expected_input_record=expected_input_record,
     )
 
 
@@ -483,13 +607,15 @@ def publish_request_results(
         spec.display_name,
     )
     request_root = _request_view_root(run_root, spec.request_id, view_id)
-    input_path = _request_input_path(run_root, spec.request_id)
+    input_path = run_root / "requests" / spec.request_id / "input.json"
     require_regular_file(input_path)
+    expected_input_record = _staged_input_record(runtime.output_root, spec)
     manifest_path = request_root / "manifest.json"
     if manifest := _reusable_request_manifest(
         path=manifest_path,
         spec=spec,
         view_id=view_id,
+        expected_input_record=expected_input_record,
     ):
         return manifest
 
@@ -517,7 +643,9 @@ def publish_request_results(
             output_root=runtime.output_root,
             volume_path=input_path,
             archive_path=f"{canonical_name}_data.json",
+            canonical_name=canonical_name,
             display_name=spec.display_name,
+            expected_record=expected_input_record,
         ),
     ]
     artifacts.extend(
@@ -766,8 +894,6 @@ def _validated_manifest_artifacts(
         ):
             raise ValueError(f"Invalid request artifact: {raw_artifact!r}")
         if role == "input":
-            if size_bytes > MAX_STAGED_INPUT_BYTES:
-                raise ValueError("Request input artifact exceeds its byte limit")
             archive_size_bytes = raw_artifact.get("archive_size_bytes")
             archive_sha256 = raw_artifact.get("archive_sha256")
             if (
@@ -884,11 +1010,32 @@ def _download_artifact(
             handle.write(chunk)
             digest.update(chunk)
             written = next_size
+    observed_sha256 = digest.hexdigest()
     if written != expected_size:
         raise RuntimeError(
             f"Downloaded size mismatch for {volume_path}: {written} != {expected_size}"
         )
-    observed_sha256 = digest.hexdigest()
+    if observed_sha256 != expected_sha256:
+        raise RuntimeError(
+            "Downloaded SHA-256 mismatch for "
+            f"{volume_path}: {observed_sha256} != {expected_sha256}"
+        )
+
+
+def _validate_downloaded_artifact(
+    artifact: dict[str, object],
+    destination: Path,
+) -> None:
+    volume_path = cast(str, artifact["volume_path"])
+    expected_size = cast(int, artifact["size_bytes"])
+    expected_sha256 = cast(str, artifact["sha256"])
+    observed_size = destination.stat().st_size
+    if observed_size != expected_size:
+        raise RuntimeError(
+            f"Downloaded size mismatch for {volume_path}: "
+            f"{observed_size} != {expected_size}"
+        )
+    observed_sha256 = sha256_file(destination)
     if observed_sha256 != expected_sha256:
         raise RuntimeError(
             "Downloaded SHA-256 mismatch for "
@@ -899,15 +1046,26 @@ def _download_artifact(
 def _rewrite_downloaded_input(
     input_path: Path,
     *,
+    canonical_name: str,
     display_name: str,
 ) -> None:
-    write_bytes_atomic(
-        input_path,
-        _presentation_input_bytes(
-            input_path.read_bytes(),
-            display_name=display_name,
-        ),
+    """Stream one deterministic top-level name substitution to a new file."""
+    source_marker, archive_marker = _input_name_markers(
+        canonical_name=canonical_name,
+        display_name=display_name,
     )
+    temporary = input_path.with_name(f".{input_path.name}.{uuid.uuid4().hex}.partial")
+    try:
+        with input_path.open("rb") as source, temporary.open("xb") as destination:
+            for chunk in _presentation_input_chunks(
+                source,
+                source_marker=source_marker,
+                archive_marker=archive_marker,
+            ):
+                destination.write(chunk)
+        os.replace(temporary, input_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _ranking_csv_bytes(rows: tuple[RankingRow, ...]) -> bytes:
@@ -962,7 +1120,7 @@ def _record_archive_artifacts(
     transformed_artifacts: list[tuple[dict[str, object], PurePosixPath]],
     archive_root: Path,
 ) -> None:
-    """Bind downloaded source identities and the rewritten input bytes."""
+    """Bind downloaded source identities to their archived bytes."""
     local_artifacts = cast(list[dict[str, object]], local_manifest["artifacts"])
     for local_artifact, (artifact, transformed) in zip(
         local_artifacts,
@@ -979,7 +1137,7 @@ def _record_archive_artifacts(
             )
             if observed != expected:
                 raise RuntimeError(
-                    "Rewritten AlphaFold input does not match its request manifest"
+                    "Archived AlphaFold input does not match its request manifest"
                 )
         else:
             local_artifact["archive_size_bytes"] = artifact["size_bytes"]
@@ -1150,6 +1308,7 @@ def create_request_archive(
     *,
     output_dir: str | Path,
     display_name: str,
+    download_files: Callable[[Iterable[tuple[str, Path]]], None] | None = None,
 ) -> Path:
     """Download one request view and create a validated local ``.tar.zst``."""
     _, view_id, canonical_name, artifacts, ranking = _validated_manifest_artifacts(
@@ -1219,8 +1378,12 @@ def create_request_archive(
                 archive_root / f"{presentation_name}_ranking_scores.csv",
                 ranking_csv,
             )
-            input_paths: list[Path] = []
-            downloaded: dict[tuple[str, int, str], Path] = {}
+            input_path: Path | None = None
+            input_count = 0
+            downloaded: dict[
+                tuple[str, int, str],
+                tuple[dict[str, object], Path],
+            ] = {}
             for artifact, transformed in transformed_artifacts:
                 destination = archive_root / Path(transformed.as_posix())
                 source_identity = (
@@ -1228,20 +1391,39 @@ def create_request_archive(
                     cast(int, artifact["size_bytes"]),
                     cast(str, artifact["sha256"]),
                 )
-                if source := downloaded.get(source_identity):
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, destination)
-                else:
-                    _download_artifact(reader, artifact, destination)
-                    downloaded[source_identity] = destination
+                downloaded.setdefault(source_identity, (artifact, destination))
                 if artifact["role"] == "input":
-                    input_paths.append(destination)
-            if len(input_paths) != 1:
+                    input_path = destination
+                    input_count += 1
+            if download_files is None:
+                for artifact, destination in downloaded.values():
+                    _download_artifact(reader, artifact, destination)
+            else:
+                download_files(
+                    (cast(str, artifact["volume_path"]), destination)
+                    for artifact, destination in downloaded.values()
+                )
+                for artifact, destination in downloaded.values():
+                    _validate_downloaded_artifact(artifact, destination)
+            for artifact, transformed in transformed_artifacts:
+                destination = archive_root / Path(transformed.as_posix())
+                source_identity = (
+                    cast(str, artifact["volume_path"]),
+                    cast(int, artifact["size_bytes"]),
+                    cast(str, artifact["sha256"]),
+                )
+                source = downloaded[source_identity][1]
+                if source == destination:
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            if input_count != 1 or input_path is None:
                 raise RuntimeError(
                     "Request archive requires exactly one input artifact"
                 )
             _rewrite_downloaded_input(
-                input_paths[0],
+                input_path,
+                canonical_name=canonical_name,
                 display_name=display_name,
             )
             _record_archive_artifacts(
@@ -1258,8 +1440,15 @@ def create_request_archive(
             run_command(
                 [
                     "tar",
+                    "--sort=name",
+                    "--mtime=@0",
+                    "--owner=0",
+                    "--group=0",
+                    "--numeric-owner",
+                    "--mode=u+rwX,go+rX,go-w",
+                    "--format=gnu",
                     "-I",
-                    "zstd -T0",
+                    "zstd -T4",
                     "-cf",
                     str(temporary_archive),
                     "--",

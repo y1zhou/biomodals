@@ -82,6 +82,12 @@ def test_serialize_af3_input_emits_one_chain_type_per_sequence() -> None:
     assert document["sequences"][0]["protein"]["templates"] == []
 
 
+def test_input_and_internal_marker_limits_are_independent() -> None:
+    """The small marker should not inherit the public input-document ceiling."""
+    assert inference_inputs.MAX_INPUT_JSON_BYTES == 256 * 1024 * 1024
+    assert inference_inputs.MAX_STAGED_INPUT_MARKER_BYTES == 64 * 1024 * 1024
+
+
 def test_no_search_resolution_returns_a_validated_config() -> None:
     """The local coordinator should keep models typed until remote staging."""
     config = AF3Config(
@@ -204,41 +210,11 @@ def test_upstream_preflight_bounds_expanded_entities_and_polymer_residues() -> N
         validate_upstream_af3_input(too_many_residues)
 
 
-def test_inference_staging_bounds_the_serialized_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The final request JSON should be bounded before Volume publication."""
-    monkeypatch.setattr(inference_inputs, "MAX_STAGED_INPUT_BYTES", 128)
-    config = AF3Config(
-        name="bounded-staging",
-        modelSeeds=[1],
-        sequences=[
-            AF3SequenceEntry(
-                protein=AF3Protein(
-                    id="A",
-                    sequence="ACDE",
-                    unpairedMsa=">query\nACDE\n",
-                    pairedMsa="",
-                    templates=[],
-                )
-            )
-        ],
-    )
-
-    with pytest.raises(ValueError, match="staged input exceeds the 128-byte limit"):
-        prepare_inference_run(
-            config,
-            recycle=1,
-            sample=1,
-        )
-
-
 def test_inference_staging_bounds_the_run_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The durable identity document should share the staged-input ceiling."""
+    """The compact durable identity document should retain its own ceiling."""
     config = AF3Config(
         name="bounded-identity",
         modelSeeds=[1],
@@ -266,7 +242,7 @@ def test_inference_staging_bounds_the_run_identity(
     )
     monkeypatch.setattr(
         inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
+        "MAX_RUN_IDENTITY_BYTES",
         len(identity_upload.content) - 1,
     )
 
@@ -276,6 +252,30 @@ def test_inference_staging_bounds_the_run_identity(
             recycle=1,
             sample=1,
         )
+
+
+def test_generated_evidence_is_not_limited_by_upload_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller upload limit must not cap the enriched inference document."""
+    config = AF3Config(
+        name="generated-evidence",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa=">query\nACDE\n",
+                    pairedMsa="",
+                    templates=[],
+                )
+            )
+        ],
+    )
+    monkeypatch.setattr(inference_inputs, "MAX_INPUT_JSON_BYTES", 1)
+
+    assert len(serialize_af3_input(config)) > 1
 
 
 def test_run_identity_hashes_large_text_while_input_remains_runnable(
@@ -310,6 +310,7 @@ def test_run_identity_hashes_large_text_while_input_remains_runnable(
     identity = orjson.loads(uploads["identity.json"])
     identity_input = identity["input"]
 
+    assert identity["app"]["uniaf3_version"] == "0.2.1"
     assert unpaired_msa.encode() not in uploads["identity.json"]
     assert user_ccd.encode() not in uploads["identity.json"]
     assert identity_input["sequences"][0]["protein"]["unpairedMsa"] == {
@@ -343,6 +344,7 @@ def _write_path_backed_msa_input(tmp_path: Path, msa_path: str) -> Path:
                         id="A",
                         sequence="ACDE",
                         unpairedMsaPath=msa_path,
+                        pairedMsa="",
                     )
                 )
             ],
@@ -399,6 +401,8 @@ def _write_path_backed_template_input(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[
                             AF3Template(
                                 mmcifPath=template_path.name,

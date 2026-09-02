@@ -5,7 +5,7 @@
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from time import sleep
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,6 +20,7 @@ from biomodals.execution import (
     ExecutionPlan,
     ExecutionRuntime,
     NodePlan,
+    ProviderCallStatus,
     RunStatus,
     TaskPlan,
     drive_execution_run,
@@ -451,6 +452,35 @@ def test_request_bytes_persist_atomically_and_remain_immutable(tmp_path: Path) -
     assert REQUEST_FILE.persist(tmp_path, RUN_ID, b"request") == path
     with pytest.raises(RuntimeError, match="immutable"):
         REQUEST_FILE.persist(tmp_path, RUN_ID, b"changed")
+
+
+def test_coordinator_reads_one_provider_call_without_scanning_pages() -> None:
+    """A selected log call is one indexed lookup, not paginated scanning."""
+    call_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    repository = SimpleNamespace(
+        get_provider_call=lambda selected, include_task_keys: SimpleNamespace(
+            provider_call_id=selected,
+            execution_run_id=RUN_ID,
+            node_key="inference",
+            binding=SimpleNamespace(function_name="predict"),
+            status=ProviderCallStatus.RUNNING,
+            provider_call_handle_id="fc-worker",
+            created_at=10,
+            started_at=11,
+            completed_at=None,
+        )
+    )
+    coordinator = object.__new__(ExecutionCoordinatorLifecycle)
+    coordinator.execution_run_id = RUN_ID
+    coordinator._volume_io_lock = RLock()
+    coordinator._writer_lock = RLock()
+    coordinator._runtime = SimpleNamespace(store=SimpleNamespace(execution=repository))
+
+    diagnostic = coordinator.provider_call(call_id)
+
+    assert diagnostic is not None
+    assert diagnostic.provider_call_id == call_id
+    assert diagnostic.provider_call_handle_id == "fc-worker"
 
 
 def test_execution_launch_identity_is_immutable(tmp_path: Path) -> None:

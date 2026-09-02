@@ -4,28 +4,14 @@ Biomodals runs its pinned fork: <https://github.com/y1zhou/alphafold3>.
 
 ## Additional notes
 
-This app provides the AlphaFold3 runtime and a separate, plan-only-by-default
-entrypoint for building its fixed sharded genetic-database profiles. Follow
-upstream's instructions to acquire the model weights and source databases:
+This app automatically prepares the model and reference assets required by
+each request before running its fixed execution graph.
 
 <https://github.com/google-deepmind/alphafold3#obtaining-model-parameters>
 
 <https://github.com/google-deepmind/alphafold3/blob/main/docs/installation.md#obtaining-genetic-databases>
 
-The model checkpoint must be available at `/AlphaFold3/af3.bin` in the
-`biomodals-store` Volume. Put the upstream genetic database files in
-`AlphaFold3-msa-db`, then use `setup_sharded_databases` to populate the
-separate `AlphaFold3-msa-db-sharded` Volume before running searches.
-
 ## Examples
-
-Inspect the database-build plan without submitting paid work:
-
-`uv run biomodals app run --development alphafold3::setup_sharded_databases`
-
-After reviewing that plan, build all missing profiles explicitly:
-
-`uv run biomodals app run --development alphafold3::setup_sharded_databases -- --submit`
 
 Run prediction and download the request-scoped archive:
 
@@ -45,9 +31,15 @@ from pathlib import Path, PurePosixPath
 from uuid import UUID
 
 import modal
-import orjson
 
 from biomodals.app.config import AppConfig
+from biomodals.app.fold.alphafold3.environment import (
+    ENVIRONMENT_SETUP_CLAIM_DICT_NAME,
+    ENVIRONMENT_SETUP_TIMEOUT_SECONDS,
+    EnvironmentAsset,
+    EnvironmentRuntime,
+    prepare_environment_asset,
+)
 from biomodals.app.fold.alphafold3.execution_coordinator import (
     AlphaFold3ExecutionCoordinator,
 )
@@ -70,9 +62,6 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 from biomodals.app.fold.alphafold3.invocation_cache import (
     load_invocation_manifest,
 )
-from biomodals.app.fold.alphafold3.modal_adapters import (
-    execute_profile_setup,
-)
 from biomodals.app.fold.alphafold3.msa_search import (
     MSA_SEARCH_CLAIM_DICT_NAME,
     MsaArtifactReference,
@@ -86,22 +75,16 @@ from biomodals.app.fold.alphafold3.msa_search import (
 from biomodals.app.fold.alphafold3.profile_builder import (
     ProfileBuilderRuntime,
     build_profile,
-    finalize_profile_setup,
-    inspect_profile_registry,
 )
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
     BUILD_MEMORY_MIB,
-    BUILD_TIMEOUT_SECONDS,
     DEFAULT_SEQKIT_THREADS,
-    PROFILE_BUILD_CLAIM_DICT_NAME,
     PROFILE_BUILD_CPU,
     PROFILE_BUILD_MAX_CONTAINERS,
     SEQKIT_VERSION,
     SHARDED_DB_VOLUME_NAME,
-    SourcePolicy,
-    plan_profile_setup,
 )
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
@@ -135,6 +118,8 @@ from biomodals.execution import (
     COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     DeploymentIdentity,
     ExecutionOverview,
+    ProviderCallDiagnostic,
+    ProviderCallPage,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -149,6 +134,7 @@ from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import (
     AF3_MSA_DB_VOLUME,
     MAX_TIMEOUT,
+    MODEL_VOLUME,
     MSA_CACHE_VOLUME,
 )
 from biomodals.helper.io import resolve_local_output_dir
@@ -157,7 +143,7 @@ from biomodals.helper.io import resolve_local_output_dir
 # Modal configs
 ##########################################
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name},
+    tags={"group": Path(__file__).parent.name, "biomodals_tool": "alphafold3"},
     name="AlphaFold3",
     repo_url=ALPHAFOLD3_REPOSITORY,
     repo_commit_hash=ALPHAFOLD3_COMMIT,
@@ -188,6 +174,10 @@ _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_alphafold3_task"})
 MSA_SEARCH_CLAIMS = modal.Dict.from_name(
     MSA_SEARCH_CLAIM_DICT_NAME,
+    create_if_missing=True,
+)
+ENVIRONMENT_SETUP_CLAIMS = modal.Dict.from_name(
+    ENVIRONMENT_SETUP_CLAIM_DICT_NAME,
     create_if_missing=True,
 )
 
@@ -263,13 +253,14 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 _CONTAINER_INSTANCE_ID = uuid.uuid4().hex
 _PROFILE_BUILDER_RUNTIME = ProfileBuilderRuntime(
     output_root=Path(CONF.output_volume_mountpoint),
-    source_volume=AF3_MSA_DB_VOLUME,
     sharded_volume=SHARDED_MSA_DB_VOLUME,
     output_volume=CONF.output_volume,
-    claims=modal.Dict.from_name(
-        PROFILE_BUILD_CLAIM_DICT_NAME,
-        create_if_missing=True,
-    ),
+)
+_ENVIRONMENT_RUNTIME = EnvironmentRuntime(
+    model_volume=MODEL_VOLUME,
+    source_volume=AF3_MSA_DB_VOLUME,
+    sharded_volume=SHARDED_MSA_DB_VOLUME,
+    claims=ENVIRONMENT_SETUP_CLAIMS,
     container_id=_CONTAINER_INSTANCE_ID,
 )
 _INFERENCE_RUNTIME = InferenceRuntime(
@@ -307,63 +298,34 @@ def _coordinator_result(
     image=sharding_image,
     cpu=PROFILE_BUILD_CPU,
     memory=BUILD_MEMORY_MIB,
-    timeout=BUILD_TIMEOUT_SECONDS,
+    timeout=ENVIRONMENT_SETUP_TIMEOUT_SECONDS,
     max_containers=PROFILE_BUILD_MAX_CONTAINERS,
     volumes={
-        ProfileBuilderRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME,
+        EnvironmentRuntime.MODEL_MOUNT: MODEL_VOLUME,
+        EnvironmentRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME,
         ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
         CONF.output_volume_mountpoint: CONF.output_volume,
     },
 )
-def build_sharded_database(
-    database_id: str,
-    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
-    source_policy: SourcePolicy = "keep",
+def prepare_alphafold3_environment_asset(
+    asset_record: dict[str, object],
+    generation_id: str,
 ) -> dict[str, object]:
-    """Build one fixed immutable database profile."""
-    return build_profile(
-        _PROFILE_BUILDER_RUNTIME,
-        database_id,
-        seqkit_threads,
-        source_policy,
-    )
-
-
-@app.function(
-    image=sharding_image,
-    cpu=0.125,
-    memory=1024,
-    timeout=600,
-    max_containers=1,
-    volumes={
-        ProfileBuilderRuntime.SHARDED_MOUNT: (
-            SHARDED_MSA_DB_VOLUME.with_mount_options(
-                read_only=True,
-                sub_path="/",
+    """Prepare one model, database profile, or template-reference asset."""
+    return prepare_environment_asset(
+        _ENVIRONMENT_RUNTIME,
+        EnvironmentAsset.from_record(asset_record),
+        generation_id,
+        build_profile=lambda database_id, selected_generation, source_path: (
+            build_profile(
+                _PROFILE_BUILDER_RUNTIME,
+                database_id,
+                DEFAULT_SEQKIT_THREADS,
+                generation_id=selected_generation,
+                source_path=source_path,
             )
         ),
-    },
-)
-def inspect_sharded_database_profiles() -> dict[str, object]:
-    """Inspect all fixed profile manifests without expensive digest scans."""
-    SHARDED_MSA_DB_VOLUME.reload()
-    return inspect_profile_registry(Path(ProfileBuilderRuntime.SHARDED_MOUNT))
-
-
-@app.function(
-    image=sharding_image,
-    cpu=0.125,
-    memory=1024,
-    timeout=600,
-    max_containers=1,
-    volumes={
-        ProfileBuilderRuntime.SHARDED_MOUNT: SHARDED_MSA_DB_VOLUME,
-        CONF.output_volume_mountpoint: CONF.output_volume,
-    },
-)
-def finalize_sharded_database_setup() -> dict[str, object]:
-    """Clean abandoned and unselected profiles after all builders complete."""
-    return finalize_profile_setup(_PROFILE_BUILDER_RUNTIME)
+    )
 
 
 ##########################################
@@ -407,6 +369,7 @@ def search_database_msa(
     database_id: str,
     sequence: str,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search one fixed sharded database with database-level resume."""
@@ -418,6 +381,7 @@ def search_database_msa(
         database_id,
         sequence,
         generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -446,6 +410,7 @@ def assemble_sequence_msas(
     include_unpaired: bool,
     include_paired: bool,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Assemble requested fields with pinned upstream deduplication."""
@@ -463,6 +428,7 @@ def assemble_sequence_msas(
             include_paired=include_paired,
         ),
         generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -490,6 +456,7 @@ def search_protein_templates(
     publish_canonical: bool,
     max_template_date: str = DEFAULT_MAX_TEMPLATE_DATE,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Search templates from one resolved protein unpaired MSA."""
@@ -519,6 +486,7 @@ def search_protein_templates(
             max_template_date=max_template_date,
         ),
         generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -606,6 +574,7 @@ def claim_seed_prediction_work(
         output_volume=True,
         model_volume=True,
         model_ro=True,
+        model_mount_subdir=False,
     )
     | {
         JAX_CACHE_MOUNTPOINT: JAX_CACHE_VOLUME,
@@ -630,7 +599,7 @@ def run_inference_pipeline(
             UpstreamInferenceRuntime(
                 predictions=_INFERENCE_RUNTIME,
                 source_root=CONF.git_clone_dir,
-                model_root=Path(CONF.model_volume_mountpoint),
+                model_root=Path(CONF.model_volume_mountpoint) / CONF.name,
                 jax_cache_dir=Path(JAX_CACHE_MOUNTPOINT) / ALPHAFOLD3_COMMIT,
             ),
             staged.config,
@@ -653,6 +622,8 @@ def finalize_inference_summary(
     run_id: str,
     request_id: str,
     staged_input_record: dict[str, object],
+    generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
     execution_result_path: str | None = None,
 ) -> dict[str, object]:
     """Rebuild the non-regressing accumulated run summary."""
@@ -662,6 +633,8 @@ def finalize_inference_summary(
         staged.config,
         run_id,
         staged.sample_count,
+        generation_id=generation_id,
+        superseded_generation_ids=superseded_generation_ids,
     )
     return _coordinator_result(result, execution_result_path)
 
@@ -703,7 +676,7 @@ def finalize_inference_request(
 
 @app.cls(
     cpu=(0.125, 4.125),
-    memory=(1024, 16384),
+    memory=(256, 65536),
     timeout=MAX_TIMEOUT,
     max_containers=1,
     scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
@@ -719,6 +692,10 @@ def finalize_inference_request(
             sub_path=SearchRuntime.CACHE_VOLUME_SUBPATH,
         ),
         TemplateRuntime.SOURCE_MOUNT: AF3_MSA_DB_VOLUME.with_mount_options(
+            read_only=True,
+            sub_path="/",
+        ),
+        EnvironmentRuntime.MODEL_MOUNT: MODEL_VOLUME.with_mount_options(
             read_only=True,
             sub_path="/",
         ),
@@ -751,6 +728,27 @@ class ExecutionCoordinator:
     def status(self) -> ExecutionOverview:
         """Read this Run's durable kernel overview."""
         return self._adapter().status()
+
+    @modal.method()
+    def provider_calls(
+        self,
+        node_key: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        newest_first: bool = False,
+    ) -> ProviderCallPage:
+        """Read one bounded page of calls for service diagnostics."""
+        return self._adapter().provider_calls(
+            node_key=node_key,
+            cursor=None if cursor is None else UUID(cursor),
+            limit=limit,
+            newest_first=newest_first,
+        )
+
+    @modal.method()
+    def provider_call(self, provider_call_id: str) -> ProviderCallDiagnostic | None:
+        """Read one call selected by service diagnostics."""
+        return self._adapter().provider_call(UUID(provider_call_id))
 
     @modal.method()
     def cancel(self) -> ExecutionOverview:
@@ -845,6 +843,7 @@ class ExecutionCoordinator:
                     wait_timeout_seconds=max(60, CONF.timeout - 60),
                 ),
                 inference_runtime=_INFERENCE_RUNTIME,
+                environment_runtime=_ENVIRONMENT_RUNTIME,
             ),
         )
 
@@ -855,6 +854,9 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
         return ModalCallDriver()
     return development_modal_call_driver(
         {
+            "prepare_alphafold3_environment_asset": (
+                prepare_alphafold3_environment_asset
+            ),
             "search_database_msa": search_database_msa,
             "assemble_sequence_msas": assemble_sequence_msas,
             "search_protein_templates": search_protein_templates,
@@ -869,49 +871,6 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
 ##########################################
 # Local entrypoints
 ##########################################
-@app.local_entrypoint()
-def setup_sharded_databases(
-    seqkit_threads: int = DEFAULT_SEQKIT_THREADS,
-    source_policy: str = "keep",
-    submit: bool = False,
-) -> None:
-    """Plan or build every missing fixed sharded database profile.
-
-    Args:
-        seqkit_threads: SeqKit/native-helper threads per builder, default 8.
-        source_policy: Post-publication source action: keep, compress, or delete.
-        submit: Submit Modal work. Defaults to false and only prints the plan.
-    """
-    plan = plan_profile_setup(
-        seqkit_threads,
-        source_policy,
-        evidence_volume_name=CONF.output_volume_name,
-    )
-    print(
-        orjson.dumps(
-            plan,
-            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
-        ).decode()
-    )
-    if not submit:
-        print("🧬 Plan only; no Modal function was submitted.")
-        return
-
-    summary = execute_profile_setup(
-        inspect_sharded_database_profiles,
-        build_sharded_database,
-        finalize_sharded_database_setup,
-        seqkit_threads=seqkit_threads,
-        source_policy=source_policy,
-    )
-    print(
-        orjson.dumps(
-            summary,
-            option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
-        ).decode()
-    )
-
-
 @app.local_entrypoint()
 def submit_alphafold3_task(
     input_json: str,
@@ -939,7 +898,8 @@ def submit_alphafold3_task(
             Defaults to `name` in the AF3 JSON config.
         search_msa: Populate missing protein and RNA MSA fields.
         search_protein_templates: Populate missing protein templates after MSA
-            resolution. Non-empty caller fields are always preserved.
+            resolution. Caller-supplied fields, including explicit empty
+            evidence, are always preserved.
         max_containers: Maximum active workload containers for this Run.
         max_gpu_containers: Maximum active GPU workload containers within the
             total container limit.

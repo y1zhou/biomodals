@@ -11,26 +11,35 @@ All three examples:
   proxy;
 - use `https://biomodals.example.com` as the browser origin;
 - keep durable SQLite state separate from the rebuildable Result cache; and
-- contain only boot-critical process settings, so the Modal Environment, App
-  name, exact App deployment version, and admission limits remain editable in
-  the Admin interface, together with per-Tool Job-log visibility.
+- contain only boot-critical process settings. Modal App names are startup-only
+  configuration and require a restart after changes. Unless an explicit
+  process override makes a field read-only, the Admin interface can change the
+  Modal Environment, exact App deployment versions, admission limits, and
+  per-Tool Job-log visibility.
+
+The service host or container also needs GNU `tar` and `zstd` to rebuild
+AlphaFold3 Result archives from the remote output Volume. The included
+`Containerfile` installs both; native systemd deployments must install them
+through the host package manager.
 
 Replace every Modal token placeholder before starting a service. The backend
 refuses to start when either credential is missing.
 
-A fresh database initially uses the built-in `Gromacs` App version `1`. Before
-allowing a real Submission, run the following command to identify the intended
-deployment, then save its positive version in Admin → Modal → Tools:
+A fresh database initially uses the built-in `Gromacs` and `AlphaFold3` App
+names at version `1`. Startup resolves the exact configured deployment of both
+Tools before reporting ready. Identify both intended deployments, then save
+their positive versions in Admin → Modal → Tools:
 
 ```console
 modal app history Gromacs --env <environment> --json
+modal app history AlphaFold3 --env <environment> --json
 ```
 
-The production examples deliberately do not set that
-value as a process environment variable, because doing so would make the Admin
-field read-only. Startup preflight must succeed against the initial fallback;
-if a deployment does not retain version `1`, supply the intended version from a
-private `BIOMODALS_API_CONF_ENV` file for first boot, then keep it as the
+The production examples deliberately do not set those deployment versions as
+process environment variables, because doing so would make the Admin fields
+read-only. Startup preflight must succeed for both initial fallbacks. If
+either deployment does not retain version `1`, supply its intended version from
+a private `BIOMODALS_API_CONF_ENV` file for first boot, then keep it as the
 database-overridable configured default.
 
 ## Native systemd

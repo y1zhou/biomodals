@@ -1166,13 +1166,6 @@ def test_execution_config_rejects_cpu_envelope_overrides(field_name: str):
         _execution_config(**{field_name: 33})
 
 
-def test_runtime_image_does_not_bake_oligoformer_tuning_environment():
-    source = Path(oligoformer_app.__file__).read_text(encoding="utf-8")
-
-    assert 'os.environ.get("OLIGOFORMER_' not in source
-    assert "tuning_env_names" not in source
-
-
 def test_off_target_manifest_detects_corrupt_evidence_before_cleanup(tmp_path: Path):
     raw_dir = tmp_path / "run" / "prepare" / "off_target" / "target"
     raw_dir.mkdir(parents=True)
@@ -2500,27 +2493,6 @@ def test_package_output_tables_requires_all_final_tables(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError, match="target_ranked.txt"):
         oligoformer_app._package_output_tables(output_dir, ("target",))
-
-
-def test_read_efficacy_output_preserves_legacy_float_format(tmp_path: Path):
-    efficacy_path = tmp_path / "target.txt"
-    efficacy_path.write_text(
-        "pos\tsense\tsiRNA\tefficacy\tfunc_filter\tfilter\n"
-        "14\tA\tU\t0.9193557665348053\t4\t4\n"
-        "18\tC\tG\t0.9641572347879409\t4\t4\n",
-        encoding="utf-8",
-    )
-
-    result = oligoformer_app._read_efficacy_output(efficacy_path)
-    oligoformer_app._write_final_outputs(result, tmp_path / "outputs", "target")
-
-    assert (tmp_path / "outputs" / "target.txt").read_text(
-        encoding="utf-8"
-    ).splitlines() == [
-        "pos\tsense\tsiRNA\tefficacy\tfunc_filter\tfilter",
-        "14\tA\tU\t0.9193557665348052\t4\t4",
-        "18\tC\tG\t0.9641572347879408\t4\t4",
-    ]
 
 
 def test_download_oligoformer_models_writes_to_model_volume(

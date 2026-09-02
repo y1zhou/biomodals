@@ -66,7 +66,7 @@ SEARCH_IDENTITY_SCHEMA_VERSION = 1
 RAW_RESULT_SCHEMA_VERSION = 1
 COMBINED_RESULT_SCHEMA_VERSION = 1
 SEARCH_ADAPTER_VERSION = "af3-sharded-msa-v1"
-NHMMER_SHARDED_MERGE_ORDER = "reported-evalue-descending-bit-score-name-v1"
+NHMMER_SHARDED_MERGE_ORDER = "reported-evalue-descending-bit-score-name-occurrence-v2"
 
 JACKHMMER_BINARY_PATH = "/hmmer/bin/jackhmmer"
 NHMMER_BINARY_PATH = "/hmmer/bin/nhmmer"
@@ -439,8 +439,12 @@ def raw_result_relpath(
 
 
 def field_is_populated(inline_value: str | None, path_value: str | None) -> bool:
-    """Return whether a caller supplied a non-empty inline or path value."""
-    return bool(inline_value) or bool(path_value)
+    """Return whether a caller supplied inline or path evidence.
+
+    AlphaFold 3 uses an empty inline MSA as an explicit MSA-free request, so
+    presence must not be inferred from truthiness.
+    """
+    return inline_value is not None or path_value is not None
 
 
 def plan_msa_resolution(chains: tuple[ChainMsaState, ...]) -> MsaResolutionPlan:
@@ -515,9 +519,17 @@ def load_search_context(
     query = validate_query(spec, sequence)
     selected_profile_root = profile_root(sharded_root, spec)
     manifest_path = selected_profile_root / "manifest.json"
-    require_regular_file(manifest_path)
-    manifest = load_json_object(manifest_path)
-    validate_profile_manifest(manifest, spec)
+    try:
+        require_regular_file(manifest_path)
+        manifest = load_json_object(manifest_path)
+        validate_profile_manifest(manifest, spec)
+    except (OSError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Existing AlphaFold3 database profile is invalid: "
+            f"{selected_profile_root}. Remove or repair that directory in the "
+            "AlphaFold3-msa-db-sharded Volume, then rerun the job; automatic "
+            "setup will not replace a published profile."
+        ) from error
     profile_identity = profile_search_identity(manifest, spec)
     search_identity = production_search_identity(
         spec,
@@ -642,10 +654,16 @@ def merge_nhmmer_results_by_reported_score(
     if len({result.e_value for result in results}) != 1:
         raise ValueError("Nhmmer shard results have different E-value thresholds")
 
-    tblout_by_id: dict[str, str] = {}
-    for result in results:
+    def iter_shard_rows(result: Any):
+        """Pair A3M hits with same-shard tblout rows by occurrence.
+
+        RNA databases may repeat textual identifiers. Pairing within each
+        shard preserves distinct occurrences and their reported scores instead
+        of aliasing every duplicate to one global dictionary entry.
+        """
         if result.tblout is None:
             raise ValueError("Nhmmer shard result is missing tblout")
+        tblout_by_id: dict[str, list[str]] = {}
         for line in result.tblout.splitlines():
             if not line or line.startswith("#"):
                 continue
@@ -653,21 +671,22 @@ def merge_nhmmer_results_by_reported_score(
             if len(fields) < 14:
                 raise ValueError(f"Invalid Nhmmer tblout row: {line!r}")
             hit_id = f"{fields[0]}/{fields[6]}-{fields[7]}"
-            tblout_by_id[hit_id] = line
-
-    def iter_shard_rows(a3m: str):
-        records = iter(module.parsers.lazy_parse_fasta_string(a3m))
+            tblout_by_id.setdefault(hit_id, []).append(line)
+        tblout_rows = {hit_id: iter(lines) for hit_id, lines in tblout_by_id.items()}
+        records = iter(module.parsers.lazy_parse_fasta_string(result.a3m))
         next(records)
         for aligned_sequence, description in records:
             name = description.partition(" ")[0]
-            if tblout_line := tblout_by_id.get(name):
+            if rows := tblout_rows.get(name):
+                tblout_line = next(rows, None)
+            else:
+                tblout_line = None
+            if tblout_line is not None:
                 yield aligned_sequence, description, tblout_line, name
 
     top_rows = heapq.nsmallest(
         max_sequences - 1,
-        itertools.chain.from_iterable(
-            iter_shard_rows(result.a3m) for result in results
-        ),
+        itertools.chain.from_iterable(iter_shard_rows(result) for result in results),
         key=nhmmer_reported_score_sort_key,
     )
     merged_a3m = [f">query\n{results[0].target_sequence}"]
@@ -880,6 +899,7 @@ def _wait_for_raw_claim(
     context: SearchContext,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> tuple[RawMsaEntry | None, GenerationClaim | None]:
     selected_generation = generation_id or uuid.uuid4().hex
     deadline = time.monotonic() + float(runtime.wait_timeout_seconds)
@@ -895,6 +915,7 @@ def _wait_for_raw_claim(
                 identity=context.provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
             return None, claim
         except ActiveGenerationError as exc:
@@ -914,6 +935,7 @@ def run_database_search(
     sequence: str,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Validate/reuse or publish one resumable Raw Database MSA."""
     validate_query(resolve_database_profile(database_id), sequence)
@@ -934,6 +956,7 @@ def run_database_search(
             runtime,
             context,
             generation_id=generation_id,
+            superseded_generation_ids=superseded_generation_ids,
         )
     )
     if raced_entry is not None:
@@ -954,16 +977,18 @@ def run_database_search(
         / claim.generation_id
     )
     log_path = generation_root / "run.log"
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.cache_volume.reload()
         if entry := load_raw_msa(context):
-            terminal_status = "complete"
-            terminal_detail = {
-                "publication": "raced",
-                "done_sha256": entry.done_sha256,
-            }
+            finish_generation_claim(
+                runtime.claims,
+                claim,
+                status="complete",
+                detail={
+                    "publication": "raced",
+                    "done_sha256": entry.done_sha256,
+                },
+            )
             return entry.summary("reused")
         append_log(
             log_path,
@@ -1008,12 +1033,15 @@ def run_database_search(
         if entry is None:
             raise RuntimeError("Published Raw Database MSA failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        runtime.cache_volume.commit()
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "done_sha256": entry.done_sha256,
-        }
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="complete",
+            detail={
+                "publication": "published",
+                "done_sha256": entry.done_sha256,
+            },
+        )
         return entry.summary("published")
     except Exception as exc:
         append_log(log_path, f"Failed with {type(exc).__name__}: {exc}")
@@ -1029,18 +1057,16 @@ def run_database_search(
             },
         )
         runtime.cache_volume.commit()
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
         )
+        raise
 
 
 def _required_database_ids(task: MsaAssemblyTask) -> tuple[str, ...]:
@@ -1277,6 +1303,7 @@ def assemble_and_publish_msas(
     task: MsaAssemblyTask,
     *,
     generation_id: str | None = None,
+    superseded_generation_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Assemble requested fields and publish complete canonical combinations."""
     validate_msa_assembly_task(task)
@@ -1363,6 +1390,7 @@ def assemble_and_publish_msas(
                 identity=provenance,
                 container_id=runtime.container_id,
                 maximum_age_seconds=runtime.maximum_age_seconds,
+                superseded_generation_ids=superseded_generation_ids,
             )
         except ActiveGenerationError as exc:
             remaining = deadline - time.monotonic()
@@ -1381,13 +1409,15 @@ def assemble_and_publish_msas(
         / cast(str, provenance["combined_identity"])
         / claim.generation_id
     )
-    terminal_status = "failed"
-    terminal_detail: dict[str, object] = {}
     try:
         runtime.cache_volume.reload()
         if reusable := _load_combined_msa(sequence_root, provenance, task):
-            terminal_status = "complete"
-            terminal_detail = {"publication": "raced"}
+            finish_generation_claim(
+                runtime.claims,
+                claim,
+                status="complete",
+                detail={"publication": "raced"},
+            )
             return _combined_msa_result("reused", task, provenance, *reusable)
         filenames = {
             "unpairedMsa": "unpaired.a3m",
@@ -1422,23 +1452,24 @@ def assemble_and_publish_msas(
         if reusable is None:
             raise RuntimeError("Published combined MSA failed validation")
         shutil.rmtree(generation_root, ignore_errors=True)
-        runtime.cache_volume.commit()
-        terminal_status = "complete"
-        terminal_detail = {
-            "publication": "published",
-            "combined_identity": provenance["combined_identity"],
-        }
-        return _combined_msa_result("published", task, provenance, *reusable)
-    except Exception as exc:
-        terminal_detail = {
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
         finish_generation_claim(
             runtime.claims,
             claim,
-            status=terminal_status,
-            detail=terminal_detail,
+            status="complete",
+            detail={
+                "publication": "published",
+                "combined_identity": provenance["combined_identity"],
+            },
         )
+        return _combined_msa_result("published", task, provenance, *reusable)
+    except Exception as exc:
+        finish_generation_claim(
+            runtime.claims,
+            claim,
+            status="failed",
+            detail={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+        raise

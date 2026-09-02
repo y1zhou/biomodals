@@ -1,18 +1,18 @@
 # Biomodals API service architecture
 
-Status: accepted for the department development service
+Status: partially superseded
 
 Decision date: 2026-07-16
 
-Scope: HTTP ingress and job orchestration for GROMACS, AlphaFold3, and future
-Biomodals apps and workflows
+Scope: historical API-service design with retained HTTP, authentication,
+configuration, and deployment decisions
 
-The execution details in
-[ADR 0006](../adr/0006-unified-execution-kernel.md) and the
-[unified scheduler specification](../specs/unified-task-scheduler.md) supersede
-the earlier service-only operation implementation. The HTTP, identity,
-artifact, configuration, and deployment decisions in this document remain
-service-owned.
+[ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md) and the
+[API Tool service specification](../specs/api-tool-service.md) supersede every
+service execution, Job orchestration, Tool-registration, and service-local DAG
+passage and diagram below. Those parts are historical. The HTTP, identity,
+artifact-delivery, authentication, configuration, and deployment decisions
+remain applicable.
 
 ## Decision
 
@@ -234,10 +234,12 @@ Stage selectors and access their live or historical provider logs for any Job,
 but it cannot inspect Input, download Result, cancel work, or retrieve a
 provider call identifier.
 
-The submit route atomically persists the Job and Execution Run, commits that
-durable state, advances one scheduling wave, and returns `202`. Execution
-SQLite keeps immutable Nodes and Tasks plus Dispatch Batches and Provider Calls
-for actual work. Before any `.spawn()`, one atomic preclaim creates a
+The submit route preflights the exact deployment, atomically persists the
+queued Service Job and retained Input reference, commits that durable state,
+returns `202`, and wakes the background reconciler. The remote coordinator then
+creates the Execution Run and advances scheduling. Execution SQLite keeps
+immutable Nodes and Tasks plus Dispatch Batches and Provider Calls for actual
+work. Before any `.spawn()`, one atomic preclaim creates a
 `submitting` Provider Call, assigns its Tasks, and crosses the service
 transaction boundary. Only the caller that created that row receives an
 in-process one-time authorization to spawn. A successful spawn durably attaches
@@ -370,15 +372,15 @@ and forbids replacement work. Reconciliation may resolve an existing call; it
 may not submit a replacement.
 
 The owner sees “Status unknown,” a generic explanation, and
-`state_unknown_at`, but no provider detail. The Admin Modal page lists the safe
-Job ID, workload, display name, run name, fixed reason, and timestamp needed for
-manual Modal review. After checking Modal and stopping remote work there when
-necessary, an Administrator may use the destructive `Mark failed` action. That
-action records a safe `compute_failed` terminal failure and releases admission
-capacity; it does not itself contact or cancel Modal. Although the kernel can
-retain and reconcile an original owner, the MVP service deliberately excludes
-`state_unknown` Jobs from automatic reconciliation and exposes no owner
-recovery action. Owners cannot force a transition or request replacement work.
+`state_unknown_at`, but no provider detail. The Admin Modal page shows the
+pinned Modal environment, App name, deployment version, diagnostic message,
+and any recorded root Function Call ID needed for manual review. An
+Administrator may attach or confirm the matching root Function Call and resume
+normal remote reconciliation, requeue only after confirming that no spawn
+occurred, or request cancellation. The service verifies the returned Execution
+Run ID and exact Deployment Identity before accepting a projection. It never
+blindly replaces ambiguous work or binds a Job to a newer deployment. Owners
+cannot force these recovery transitions.
 
 Initial admission creates the Execution Run and Job in one transaction and
 uses a stable run name made from a sanitized display-name slug plus the full
@@ -474,7 +476,7 @@ times after `2038-01-19T03:14:07Z` instead of emitting an ambiguous value that
 some extractors interpret as pre-1970. A future archive schema must select and
 validate a broadly interoperable 64-bit timestamp representation before that
 boundary. Service-generated `metadata/` members retain a fixed timestamp. The
-schema-v4 validator requires the stored compression method, exact source
+schema-v5 validator requires the stored compression method, exact source
 timestamp field shape, matching DOS fallback, and fixed generated timestamps
 in both the local headers and central directory. Unchanged Volume contents and
 modification times therefore reproduce the same archive bytes, size, and
@@ -487,9 +489,10 @@ API-specific registry or Function is added to the GROMACS App.
 The ZIP has exactly three top-level entries or namespaces:
 
 - `input.pdb` is the exact submitted structure;
-- `outputs/` contains the processed no-PBC production trajectory, centered
-  structure, production topology and parameters, plus RMSD,
-  radius-of-gyration, and RMSF CSV/PNG pairs; and
+- `outputs/` contains the processed no-PBC production trajectory, production
+  energy file, centered structure, production topology and parameters, plus
+  NVT, NPT, and production RMSD, radius-of-gyration, and RMSF CSV/PNG pairs;
+  and
 - `metadata/` contains the normalized parameters, safe provenance,
   service-generated run log, manifest, checksums, and any other explicitly
   allowed debugging document that is not useful at the top level.
@@ -514,10 +517,10 @@ their exact membership in the manifest, but do not fail an otherwise valid
 Result when they are absent.
 
 No metadata document remains loose at the archive root. The allowlist excludes
-the larger raw production trajectory and does not recursively package
-equilibration outputs, the working directory, credentials, internal storage
-paths, databases, raw provider exceptions, or large shared caches. It also
-excludes equilibration trajectories, `.trr`, `.edr`, `.cpt`, and intermediate
+the larger raw production trajectory and does not recursively package the
+working directory, credentials, internal storage paths, databases, raw
+provider exceptions, or large shared caches. It also excludes equilibration
+trajectories, `.trr`, `.cpt`, equilibration energy files, and intermediate
 `.tpr` and structure files; deeper diagnosis uses the authoritative Modal
 Volume.
 
@@ -588,12 +591,10 @@ asynchronous. Cache fills use per-job coordination so unrelated downloads do
 not wait behind one large restore. This preserves the single-process
 architecture without introducing another service or task queue.
 
-The cache can be deleted or rebuilt without losing a job. Intermediate cleanup
-is disabled when `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` is unset or blank. A
-positive number enables deletion of only the workload's `<run_name>/`
-intermediate directory after the terminal ZIP has remained published for that
-many days. Final archives and shared scientific caches are outside that cleanup
-policy. [Modal: Volumes](https://modal.com/docs/guide/volumes)
+The local Result cache can be deleted or rebuilt without losing a Job. Remote
+scientific publication retention remains owned by each Tool rather than a
+service-wide intermediate-cleanup setting.
+[Modal: Volumes](https://modal.com/docs/guide/volumes)
 
 ## Local persistence and operations
 
@@ -652,27 +653,30 @@ The application factory reads these settings:
 | `MODAL_TOKEN_ID` | required | Dedicated Modal service-user token identifier |
 | `MODAL_TOKEN_SECRET` | required | Dedicated Modal service-user token secret; never returned by the API or stored in SQLite |
 | `BIOMODALS_STATE_DIR` | `.biomodals/state` | Durable SQLite directory |
-| `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable final-ZIP cache directory |
+| `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable Result-archive cache directory |
 | `BIOMODALS_CACHE_WARNING_BYTES` | `1099511627776` | Soft warning threshold for local Result staging and cache usage (1 TiB) |
 | `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | One public origin for links, exact-Origin checks, and same-origin browser access |
 | `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
 | `BIOMODALS_MODAL_ENVIRONMENT` | `production` | Modal Environment default; configurable in Admin unless a process override is set |
+| `BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY` | `4` | Concurrent Modal Volume download blocks per Job |
 | `BIOMODALS_GROMACS_APP` | `Gromacs` | Deployed GROMACS Modal App name |
 | `BIOMODALS_GROMACS_APP_VERSION` | `1` | Exact GROMACS Modal deployment version used by new Jobs |
 | `BIOMODALS_GROMACS_ACTIVE_LIMIT` | `2` | Workload-wide active Job limit default |
+| `BIOMODALS_ALPHAFOLD3_APP` | `AlphaFold3` | Deployed AlphaFold3 Modal App name |
+| `BIOMODALS_ALPHAFOLD3_APP_VERSION` | `1` | Exact AlphaFold3 Modal deployment version used by new Jobs |
+| `BIOMODALS_ALPHAFOLD3_ACTIVE_LIMIT` | `2` | AlphaFold3-wide active Job limit default |
 | `BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT` | `10` | Global active Job limit default |
 | `BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT` | `2` | Active Job limit assigned to new Users by default |
-| `BIOMODALS_RECONCILE_SECONDS` | `10` | Modal reconciliation interval |
-| `BIOMODALS_INTERMEDIATE_RETENTION_DAYS` | unset | Positive retention enables cleanup of published runs' intermediates |
+| `BIOMODALS_RECONCILE_SECONDS` | `60` | Modal reconciliation interval |
 
 The Admin API stores editable runtime overrides for the Modal Environment,
-GROMACS App name and deployment version, Tool active-Job limit and Job-log
-visibility, and Global active-Job limit in SQLite. Process and dotenv values
-provide host defaults for fields they control; workload descriptors provide
-the remaining defaults. An explicit process variable has highest precedence
-and makes the corresponding Admin field read-only. Modal credentials remain
-process/file configuration only, and the API refuses to start unless both are
-present.
+Tool deployment version, active-Job limit, Job-log visibility, and Global
+active-Job limit in SQLite. Modal App names remain startup-only process or
+dotenv configuration. Process and dotenv values provide host defaults for
+fields they control; workload descriptors provide the remaining defaults. An
+explicit process variable has highest precedence and makes the corresponding
+Admin field read-only. Modal credentials remain process/file configuration
+only, and the API refuses to start unless both are present.
 
 That full validation belongs specifically to `biomodals api serve`. Offline
 `biomodals api admin` account commands resolve the same configuration file,

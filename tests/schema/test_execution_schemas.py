@@ -131,7 +131,6 @@ def test_inline_bytes_round_trip() -> None:
     assert loaded.outputs[0].storage.data == b"hello\n"
     assert loaded.outputs[0].storage.filename == "report.txt"
     assert "aGVsbG8K" in dumped
-    assert "archive_format" not in InlineBytes.model_fields
 
 
 def test_inline_bytes_allows_zstd_binary_data_round_trip() -> None:
@@ -169,11 +168,6 @@ def test_inline_bytes_uses_pydantic_json_bytes_config() -> None:
     assert InlineBytes.model_config["val_json_bytes"] == "base64"
     assert "_wA=" in dumped
     assert loaded.data == b"\xff\x00"
-
-
-def test_inline_bytes_rejects_unknown_fields() -> None:
-    with pytest.raises(ValidationError, match="archive_format"):
-        InlineBytes(data=b"text", filename="archive.zip", archive_format="zip")  # type: ignore[ty:unknown-argument]
 
 
 def test_volume_path_rejects_absolute_and_traversal_paths() -> None:

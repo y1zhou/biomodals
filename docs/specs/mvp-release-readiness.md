@@ -1,12 +1,16 @@
 # MVP release readiness
 
-Status: accepted
+Status: partially superseded
 
 This specification records the work that must be resolved before BioModals is
 presented as a production MVP. It covers the FastAPI service, the static
 frontend, their shared contracts, and the single-host deployment boundary.
-The review questions are resolved, and this document is the implementation
-contract for the pre-release MVP work.
+The deployment, authentication, and operational-readiness decisions remain
+applicable. [ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md) and the
+[API Tool service specification](api-tool-service.md) supersede this
+document's service execution, Job orchestration, Tool-registration, and
+Job-stage/log presentation passages; those passages are retained only as
+implementation history.
 
 ## Settled constraints
 
@@ -238,9 +242,10 @@ absent. Existing terminal `error_code` and `error_message` fields remain
 exclusive to failed Jobs. The Admin Modal page exposes only aggregate blocked
 counts grouped by safe Blocking Category and the oldest blocked age; it exposes
 no owner identity, Job identifier, Input, Result, raw provider detail, or
-storage path. A service-facing explicit resume control is outside the unified
-kernel refactor; until a host supplies one, recovery is an operator action
-rather than an automatic loop.
+storage path. The earlier absence of a service-facing resume control is
+superseded by ADR 0007: an explicit authenticated refresh or Administrator
+resume action now starts `ExecutionCoordinator.resume()` for the exact pinned
+Run. Background reconciliation still never resumes it automatically.
 
 ### Unknown remote execution state
 
@@ -250,41 +255,37 @@ track it safely. This is distinct from `blocked`: a blocked Job has known
 scientific output and retries only recoverable finalization, while a
 state-unknown Job may still be consuming paid remote compute.
 
-A Job enters `state_unknown` when any of these kernel-owned provider
-uncertainties occurs:
+A Service Job enters `state_unknown` when remote ownership cannot be projected
+safely, including:
 
-- a direct Modal `.spawn()` may have been accepted but its Function Call ID
-  could not be durably recorded; or
-- an attached call's state or terminal result cannot be established; or
-- Cancellation cannot be confirmed for an attached call, and
-  a verified final Result cannot be recovered.
+- the durable pre-spawn fence remains after the API process is interrupted;
+- Modal may have accepted `.spawn()` without returning a Function Call ID;
+- the exact pinned deployment cannot be resolved;
+- a returned overview has another Run ID or Deployment Identity; or
+- Cancellation cannot be reconciled conclusively.
 
-An ambiguous submission outcome enters the state immediately. If the API
-process stops after durably creating a `submitting` Provider Call but before
-attaching its Function Call ID, the restarted coordinator marks that call
-`outcome_unknown` without a timeout or lease-stealing interval. No uncertainty
-automatically authorizes another Function. The Job is excluded from automatic
-service reconciliation but continues consuming User, Tool, and Global Active
-Job Limits until it is resolved.
+The service durably enters the state before calling Modal and records a root
+Function Call ID only after launch confirmation. No uncertainty automatically
+authorizes another Function. The Job is excluded from automatic service
+reconciliation but continues consuming User, Tool, and Global Active Job Limits
+until an Administrator resolves it.
 
 Owner-visible Job detail labels the state `Status unknown`, explains that an
-Administrator must review Modal, exposes `state_unknown_at`, and provides no
-Cancel, Download, or Start Again action. It does not automatically poll because
-only an Administrator mutation can resolve the state; focus, page reload, and
-manual Refresh still load the current record. The latest recorded Stage remains
-visible without a spinner or invented outcome.
+Administrator must review Modal, and provides no Cancel, Download, or Start
+Again action. It does not automatically poll because only an Administrator
+mutation can resolve the state; focus, page reload, and manual Refresh still
+load the current local record. The latest recorded Stage remains visible
+without a spinner or invented outcome.
 
-The Admin Modal page exposes a dedicated list containing only Job ID, workload,
-display name, safe run name, `state_unknown_at`, and one of the fixed reasons
-`submission_outcome_unknown`, `provider_outcome_unknown`, or
-`cancellation_outcome_unknown`. It does not expose owner identity, Input,
-Result, Function Call ID, raw provider exception, or storage path. The
-Administrator must inspect Modal and stop remote work there first when
-necessary. The only MVP resolution is a confirmed destructive `Mark failed`
-action. It records terminal `failed/compute_failed`, closes any still-open
-Stage as failed, preserves the unknown-state timestamp and reason for audit,
-and releases admission capacity. The action does not contact Modal and cannot
-be undone in the Admin panel.
+The Admin Modal page exposes a dedicated list containing Job ID, Tool, display
+name, `state_unknown_at`, reason, exact pinned Modal Environment/App/version,
+the recorded root Function Call ID, and the Administrator-only diagnostic
+message. It does not expose owner identity, Input, Result, or storage paths.
+The resolution dialog pre-fills a recorded Function Call ID. After inspecting
+the exact deployment in Modal, the Administrator explicitly chooses one safe
+outcome: resume reconciliation of an existing launch, requeue only after
+confirming no launch occurred, or request Cancellation. The service never
+automatically retries an ambiguous spawn.
 
 ### Modal configuration preflight
 
@@ -322,8 +323,11 @@ own pending state and provenance.
 
 The established GROMACS App must treat each required RMSD,
 radius-of-gyration, and RMSF CSV/PNG pair as independently recoverable output.
-After an interruption, it regenerates only missing or stale members and commits
-the complete pair coherently.
+After an interruption, it regenerates only missing or stale members and writes
+the complete pair within the same worker. These files are consumed in that
+container, so no explicit `Volume.commit()`/`reload()` handshake is required;
+Modal's successful function-exit publication makes them durable for later
+containers.
 
 This is a narrow App reliability correction that benefits both the Local
 Entrypoint and API callers. The API service must not generate scientific plots,
@@ -468,24 +472,10 @@ available.
 
 ### Workload and Catalog registration
 
-Each executable API workload has one fixed descriptor owning its stable key,
-User-facing Tool name, Runtime Setting environment-variable names, and mapping
-from durable operations to public timeline stages. The descriptor also owns the
-safe default for Job-owner log visibility; missing or future descriptors default
-to Administrator-only access. Runtime configuration,
-Admin Tool rows, routing registration, and Job views consume that descriptor
-instead of carrying separate GROMACS name and stage tables. The descriptor does
-not make scientific orchestration generic: GROMACS keeps its own adapter,
-request schema, sequencing, archive builder, and tests. All executable
-workload routes use the shared `biomodals.execution` preclaim, detached spawn,
-attachment, Result Envelope, cancellation, and unknown-state transitions so
-cost-sensitive behavior cannot drift between Tools.
-
-The frontend Catalog separately includes an AlphaFold3 placeholder marked
-`WIP`. Its card is visibly muted, is not an interactive navigation target, and
-cannot submit a Job. The backend does not register an AlphaFold3 workload,
-route, Modal App, configuration row, or speculative scientific contract until
-that workflow is designed and deployed.
+This section is superseded by ADR 0007 and the API Tool service specification.
+GROMACS and AlphaFold3 are registered Tools whose deployed coordinators own
+scientific execution; the service retains only the bounded Job projection and
+service-owned metadata needed by the website.
 
 ### Durable Cancellation
 
@@ -523,12 +513,12 @@ publication retries and later reconstruction never substitute their current
 time. Together with fixed ZIP metadata and ordered members, unchanged remote
 outputs must therefore reproduce the same bytes, size, and SHA-256 digest.
 Every archive member uses ZIP's stored method so byte identity does not depend
-on the host zlib implementation. Schema-v4 validation rejects any other
+on the host zlib implementation. Schema-v5 validation rejects any other
 compression method, requires each source-backed member's exact `0x5455`
 modification-time field and matching ZIP/DOS fallback, and requires fixed
 timestamps on service-generated members in both the local ZIP headers and the
 central directory. The `0x5455` field is a signed 32-bit Unix timestamp, so
-schema 4 rejects source modification times after `2038-01-19T03:14:07Z`; a
+schema 5 rejects source modification times after `2038-01-19T03:14:07Z`; a
 later schema must define a validated, interoperable 64-bit replacement before
 that boundary.
 
@@ -544,9 +534,10 @@ current writer by assumption.
 
 The GROMACS Result ZIP has exactly three top-level entries or namespaces:
 `input.pdb`, `outputs/`, and `metadata/`. `outputs/` contains the files useful
-to an end User: the no-PBC trajectory, centered structure, production topology
-and parameters, and each CSV/PNG analysis pair. Debugging and verification
-documents live under `metadata/`, including normalized parameters, safe
+to an end User: the no-PBC trajectory, production energy file, centered
+structure, production topology and parameters, and the NVT, NPT, and
+production CSV/PNG analysis pairs. Debugging and verification documents live
+under `metadata/`, including normalized parameters, safe
 provenance, the service run log, manifest, and checksums. No such document is
 left loose at the archive root.
 
@@ -580,9 +571,9 @@ manifest enumerates the exact optional members included.
 This remains an explicit allowlist. The metadata directory must not become a
 recursive dump of provider state, working files, credentials, internal paths,
 database records, or raw exceptions. It excludes equilibration trajectories,
-`.trr`, `.edr`, `.cpt`, and intermediate `.tpr` and structure files. Deeper
-diagnosis uses the authoritative Modal Volume rather than expanding every User
-download.
+`.trr`, `.cpt`, equilibration energy files, and intermediate `.tpr` and
+structure files. Deeper diagnosis uses the authoritative Modal Volume rather
+than expanding every User download.
 
 On a local cache miss, the backend first restores the published Modal ZIP and
 completion marker. If either is missing or corrupt, it deterministically
@@ -643,10 +634,13 @@ reconciliation, and large directory scans run through one bounded artifact
 worker thread. Modal byte streaming remains asynchronous and yields between
 chunks.
 
-Cache fills coordinate with per-Job locks so one miss does not block unrelated
-downloads. This does not introduce a separate worker service or task queue. A
-large synthetic archive test must demonstrate that health, login, Job polling,
-and Cancellation remain responsive during Result validation.
+Result restoration coordinates through one cancellation-shielded task per Job
+so one miss does not block unrelated downloads and concurrent callers do not
+duplicate a rebuild. The cache itself only validates and atomically publishes
+staged archives; it does not contain a second restoration scheduler. This does
+not introduce a separate worker service or task queue. A large synthetic
+archive test must demonstrate that health, login, Job polling, and Cancellation
+remain responsive during Result validation.
 
 ### Prepared Result downloads
 
@@ -810,14 +804,13 @@ most once every five minutes rather than writing SQLite on every authenticated
 request. Expiry continues using the last persisted activity; the coalescing
 window is intentionally negligible relative to the 30-day idle lifetime.
 
-One GROMACS reconciliation pass runs at most four independent Jobs concurrently.
-Within one Job it polls every active direct call and may submit the fixed
-parallel branches described above. It creates only the fixed Job worker count,
-isolates an unexpected per-Job error so other Jobs still progress, and performs
-intermediate cleanup after the workers finish. Per-Job lifecycle locks remain
-shared across HTTP cancellation and reconciliation while in use, then leave the
-process registry automatically when no task retains them. Durable Job and
-per-stage call state remain the restart-safe source of truth.
+One service reconciliation pass runs at most four independent Jobs concurrently
+across all registered Tools. It creates only the fixed Job worker count and
+isolates an unexpected per-Job error so other Jobs still progress. A terminal
+root observation proceeds through Result finalization in that same background
+pass. Per-Job lifecycle locks remain shared across HTTP cancellation and
+reconciliation. Durable Service Jobs and authoritative remote execution ledgers
+remain the restart-safe sources of truth at their respective boundaries.
 
 ### OpenAPI contract discipline
 
@@ -839,6 +832,12 @@ declare the runtime
 session-cookie security scheme. The Password Link's
 `/set-password#token=...` SPA URL remains a tested cross-repository navigation
 contract rather than an OpenAPI operation.
+
+Streaming log responses declare `application/x-ndjson`. Result downloads
+declare their Tool-specific binary media types, `200` and `206` response
+headers, and the `416` range failure. Successful download preparation declares
+an empty `204` response. Generated frontend types must retain these exact
+shapes rather than widening them to JSON by convention.
 
 Any backend change that alters a public operation must check and, when needed,
 update OpenAPI and its tests. Any frontend change that relies on API behavior
@@ -951,9 +950,10 @@ GROMACS-only simulation action.
 
 The GROMACS overview says `Configure the simulation` and `Run in the
 background`; the latter description contains a real My Jobs link. Job detail
-labels the deployed call column `Running Function`. User-facing prose follows
-sentence case; BioModals, GROMACS, Modal, PDB, PDBFixer, API, acronyms, and
-explicit page names retain meaningful capitalization.
+shows semantic stage, status, and timestamps without a provider-function
+column. User-facing prose follows sentence case; BioModals, GROMACS, Modal,
+PDB, PDBFixer, API, acronyms, and explicit page names retain meaningful
+capitalization.
 
 The PDB file selector gives its native Choose file control visible separation
 through a light neutral rounded treatment. Drag entry changes the complete drop

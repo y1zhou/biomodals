@@ -6,6 +6,10 @@ Historical note: the experiments below use the former
 `max_parallel_search_workers` and `max_num_gpus` names. Current launches use
 the run-wide `--max-containers` and `--max-gpu-containers` CLI options defined
 by ADR 0006; the measurements and scientific conclusions remain applicable.
+The former manual `setup_sharded_databases` entrypoint and its all-profile
+fan-out were subsequently superseded by ADR 0005's request-scoped automatic
+`Prepare environment` Node. Descriptions of that entrypoint below are retained
+only as implementation history and are not current operating instructions.
 
 Scope: this document records the experiments that matured the sharding method
 and its integration into `src/biomodals/app/fold/alphafold3_app.py` and the
@@ -501,16 +505,17 @@ The local entrypoint exposes:
 ```python
 search_msa: bool = True
 search_protein_templates: bool = True
-max_parallel_search_workers: int = 4
+max_containers: int | None = None
+max_gpu_containers: int | None = None
 ```
 
 Behavior is:
 
 | MSA | Templates | Resolution |
 | --- | --- | --- |
-| on | on | preserve non-empty fields; populate every missing MSA and protein template field |
-| on | off | populate missing MSAs; preserve non-empty templates and set missing/null templates to `[]` |
-| off | either | run no searches; preserve supplied fields, set missing MSAs to `""`, and missing/null protein templates to `[]` |
+| on | on | preserve every supplied field, including explicit empty evidence; populate null or omitted MSA and protein-template fields |
+| on | off | populate null or omitted MSAs; preserve supplied templates and set null or omitted templates to `[]` |
+| off | either | run no searches; preserve supplied fields, set null or omitted MSAs to `""`, and set null or omitted templates to `[]` |
 
 Resolve fields independently:
 
@@ -692,7 +697,8 @@ output Volume or archive.
 
 Each streamed artifact must match the manifest-declared byte size and SHA-256.
 At publication, the durable request-view manifest additionally records the
-expected size and digest of the presentation-rewritten input. An existing
+expected size and digest after a bounded streaming substitution of the
+canonical input's deterministic top-level name. An existing
 archive is therefore reused without rereading the staged input from the Modal
 Volume when one local streamed pass validates its exact member set, embedded
 manifest, and all payload digests. A corrupt, stale, or otherwise mismatched
@@ -866,21 +872,25 @@ The local materialization and identity seam now lives in
 relative path against the input JSON, inlines protein/RNA MSA, custom CCD, and
 template mmCIF content, clears those path fields, and rejects ambiguous
 inline/path pairs.
-It accepts only non-symlink regular files and bounds reads to 64 MiB for input
-JSON/custom mmCIF/user CCD and 512 MiB for each path-backed MSA. It checks the
-template count before opening referenced files, enforces the aggregate limit
-after each read, and rejects empty template content.
+It accepts only non-symlink regular files and bounds reads to 256 MiB for the
+caller input JSON, 64 MiB for each custom mmCIF or user CCD, and 512 MiB for
+each path-backed MSA. It checks the template count before opening referenced
+files, enforces the aggregate limit after each read, and rejects empty template
+content. The 256 MiB caller-input limit does not cap the enriched inference
+document after generated evidence is attached.
 
 Before the first Modal call, the same seam mirrors upstream's structural checks
-that UniAF3 0.2.0 does not enforce: safe nonempty names, unique uppercase chain
-IDs, letter-only polymer sequences, modification-code prefix rules, at most 20
-protein templates, and nonempty unsigned 32-bit model seeds. Inference workers
-repeat this preflight before launching upstream. A request is capped at 1,000
-model seeds, while the accumulated summary may exceed that total across
-requests. The seed/sample fan-out is capped at 5,000 by default; an explicit
-large-inference override warns before allowing a larger request. Recycles,
-diffusion samples, and GPU workers are bounded at 0--100, 1--100, and 1--100
-respectively; the inference worker repeats the recycle and sample checks.
+that remain app-owned beyond UniAF3 0.2.1: safe nonempty names, unique uppercase
+chain IDs, letter-only polymer sequences, modification-code prefix rules, at
+most 20 protein templates, and nonempty unsigned 32-bit model seeds. UniAF3
+0.2.1 itself preserves null, explicit-empty, and populated evidence states.
+Inference workers repeat the app preflight before launching upstream. A request
+is capped at 1,000 model seeds, while the accumulated summary may exceed that
+total across requests. The seed/sample fan-out is capped at 5,000 by default;
+an explicit large-inference override warns before allowing a larger request.
+Recycles and diffusion samples are bounded at 0--100 and 1--100 respectively;
+the inference worker repeats those checks. The run-wide GPU-container cap must
+be positive for this GPU workload and cannot exceed the total container cap.
 
 After enrichment, the module validates and explicitly dumps the complete
 input, removes only `name` and `modelSeeds`, and represents every inline
@@ -970,12 +980,14 @@ size and SHA-256, and restores upstream's exact sanitized display-name prefix
 in downloaded basenames. The durable request input uses the canonical
 `af3-{run_id[:16]}` name and inline template content, so callers with the same
 scientific input and seeds upload identical bytes even when their display names
-or original inline/path template representations differ. Only the downloaded
-input copy changes its display name. The resulting
-`{presentation_name}_{request_id[:12]}_AlphaFold3.tar.zst` is created through a
+or original inline/path template representations differ. The finalizer derives
+the presentation digest through a bounded streaming name substitution and never
+reparses or duplicates the enriched input. The resulting
+`{presentation_name}_{view_id[:12]}_AlphaFold3.tar.zst` is created through a
 temporary path and promoted only after its exact member set and embedded
 presentation manifest validate, including every archive-local payload digest.
-The request-view publisher derives and persists the rewritten input digest once.
+The view ID binds the request ID, submitted seed order, and display name.
+The request-view publisher persists the derived presentation input digest once.
 Before reusing an existing archive, the client reads only the local archive and
 requires all archive digests to equal their published records. Updating a
 corrupt payload and its embedded digest together therefore still fails. A

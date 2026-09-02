@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import niquests
+import pytest
 
 from biomodals.helper import web
 
@@ -20,10 +21,14 @@ class FakeResponse:
         headers: dict[str, str] | None = None,
         chunks: tuple[bytes, ...] = (),
         status_error: Exception | None = None,
+        status_code: int = 200,
+        stream_error: Exception | None = None,
     ) -> None:
         self.headers = headers or {}
         self.chunks = chunks
         self.status_error = status_error
+        self.status_code = status_code
+        self.stream_error = stream_error
         self.closed = False
 
     def raise_for_status(self) -> None:
@@ -34,6 +39,8 @@ class FakeResponse:
         async def chunks():
             for chunk in self.chunks:
                 yield chunk
+            if self.stream_error is not None:
+                raise self.stream_error
 
         return chunks()
 
@@ -47,11 +54,15 @@ class FakeSession:
         *,
         head_response: FakeResponse | None = None,
         head_error: Exception | None = None,
-        get_response: FakeResponse | None = None,
+        get_responses: FakeResponse | list[FakeResponse] | None = None,
     ) -> None:
         self.head_response = head_response
         self.head_error = head_error
-        self.get_response = get_response
+        self.get_responses = (
+            [get_responses]
+            if isinstance(get_responses, FakeResponse)
+            else list(get_responses or [])
+        )
         self.calls: list[tuple[str, str, dict]] = []
 
     async def head(self, url: str, **kwargs) -> FakeResponse:
@@ -64,9 +75,9 @@ class FakeSession:
 
     async def get(self, url: str, **kwargs) -> FakeResponse:
         self.calls.append(("GET", url, kwargs))
-        if self.get_response is None:
+        if not self.get_responses:
             raise AssertionError("unexpected GET request")
-        return self.get_response
+        return self.get_responses.pop(0)
 
 
 def test_download_file_uses_head_size_check_for_cached_file(tmp_path: Path) -> None:
@@ -118,7 +129,7 @@ def test_download_file_closes_head_and_get_when_cached_size_differs(
     output.write_bytes(b"old")
     head_response = FakeResponse(headers={"content-length": "6"})
     get_response = FakeResponse(chunks=(b"new", b"bin"))
-    session = FakeSession(head_response=head_response, get_response=get_response)
+    session = FakeSession(head_response=head_response, get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -146,7 +157,7 @@ def test_download_file_force_skips_head_and_refreshes_existing_file(
     output = tmp_path / "model.bin"
     output.write_bytes(b"old")
     get_response = FakeResponse(chunks=(b"new",))
-    session = FakeSession(get_response=get_response)
+    session = FakeSession(get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -167,7 +178,7 @@ def test_download_file_force_skips_head_and_refreshes_existing_file(
 def test_download_file_closes_get_for_missing_file(tmp_path: Path) -> None:
     output = tmp_path / "model.bin"
     get_response = FakeResponse(chunks=(b"downloaded",))
-    session = FakeSession(get_response=get_response)
+    session = FakeSession(get_responses=get_response)
 
     asyncio.run(
         web._download_file(
@@ -183,3 +194,204 @@ def test_download_file_closes_get_for_missing_file(tmp_path: Path) -> None:
         ("GET", "https://example.test/model.bin", {"stream": True})
     ]
     assert get_response.closed is True
+
+
+def test_download_file_resumes_partial_file_with_range(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"partial")
+    head_response = FakeResponse(headers={"content-length": "11"})
+    get_response = FakeResponse(
+        headers={"Content-Range": "bytes 7-10/11"},
+        chunks=(b"rest",),
+        status_code=206,
+    )
+    session = FakeSession(head_response=head_response, get_responses=get_response)
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"partialrest"
+    assert session.calls[1] == (
+        "GET",
+        "https://example.test/archive.zst",
+        {"stream": True, "headers": {"Range": "bytes=7-"}},
+    )
+
+
+def test_resumable_download_continues_after_stream_disconnect(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    interrupted = FakeResponse(
+        chunks=(b"partial",),
+        stream_error=ConnectionError("disconnected"),
+    )
+    resumed = FakeResponse(
+        headers={"Content-Range": "bytes 7-10/11"},
+        chunks=(b"rest",),
+        status_code=206,
+    )
+    session = FakeSession(get_responses=[interrupted, resumed])
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"partialrest"
+    assert session.calls[1][2]["headers"] == {"Range": "bytes=7-"}
+
+
+def test_stream_retry_budget_is_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    session = FakeSession(
+        get_responses=[
+            FakeResponse(stream_error=ConnectionError("disconnected")) for _ in range(3)
+        ]
+    )
+    delays: list[int] = []
+
+    async def record_sleep(delay: int) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(web.asyncio, "sleep", record_sleep)
+
+    with pytest.raises(RuntimeError, match="Download for"):
+        asyncio.run(
+            web._download_file(
+                cast(niquests.AsyncSession, session),
+                "https://example.test/archive.zst",
+                output,
+                force=False,
+                resume=True,
+                num_retries=2,
+            )
+        )
+
+    assert [call[0] for call in session.calls] == ["GET", "GET", "GET"]
+    assert delays == [1, 2]
+
+
+def test_request_failure_uses_only_session_retry_budget(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zst.part"
+    response = FakeResponse(status_error=ConnectionError("upstream unavailable"))
+    session = FakeSession(get_responses=response)
+
+    with pytest.raises(RuntimeError, match="Download for"):
+        asyncio.run(
+            web._download_file(
+                cast(niquests.AsyncSession, session),
+                "https://example.test/archive.zst",
+                output,
+                force=False,
+                resume=True,
+                num_retries=3,
+            )
+        )
+
+    assert [call[0] for call in session.calls] == ["GET"]
+
+
+def test_resumable_download_tries_get_when_head_fails(tmp_path: Path) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"partial")
+    get_response = FakeResponse(
+        headers={"content-range": "bytes 7-10/11"},
+        chunks=(b"rest",),
+        status_code=206,
+    )
+    session = FakeSession(
+        head_error=RuntimeError("HEAD unsupported"),
+        get_responses=get_response,
+    )
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"partialrest"
+
+
+def test_resumable_download_restarts_after_range_not_satisfiable(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"stale-partial")
+    head_response = FakeResponse(headers={"content-length": "10"})
+    rejected = FakeResponse(status_code=416)
+    complete = FakeResponse(chunks=(b"fresh-data",))
+    session = FakeSession(
+        head_response=head_response,
+        get_responses=[rejected, complete],
+    )
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"fresh-data"
+    assert session.calls[1][2]["headers"] == {"Range": "bytes=13-"}
+    assert session.calls[2] == (
+        "GET",
+        "https://example.test/archive.zst",
+        {"stream": True},
+    )
+    assert rejected.closed is True
+
+
+def test_resumable_download_restarts_after_mismatched_content_range(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "archive.zst.part"
+    output.write_bytes(b"partial")
+    head_response = FakeResponse(headers={"content-length": "11"})
+    mismatched = FakeResponse(
+        headers={"content-range": "bytes 3-10/11"},
+        chunks=(b"ignored",),
+        status_code=206,
+    )
+    complete = FakeResponse(chunks=(b"replacement",))
+    session = FakeSession(
+        head_response=head_response,
+        get_responses=[mismatched, complete],
+    )
+
+    asyncio.run(
+        web._download_file(
+            cast(niquests.AsyncSession, session),
+            "https://example.test/archive.zst",
+            output,
+            force=False,
+            resume=True,
+        )
+    )
+
+    assert output.read_bytes() == b"replacement"
+    assert mismatched.closed is True

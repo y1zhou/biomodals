@@ -66,15 +66,20 @@ def test_alphafold3_execution_plan_preserves_the_fixed_semantic_dag() -> None:
         for node in plan.nodes
     } == {
         "stage-request-input": (),
-        "raw-database-searches": ("stage-request-input",),
+        "prepare-environment": ("stage-request-input",),
+        "raw-database-searches": ("prepare-environment",),
         "combined-msa-publications": ("raw-database-searches",),
         "protein-template-searches": ("combined-msa-publications",),
         "stage-inference-input": ("protein-template-searches",),
-        "seed-predictions": ("stage-inference-input",),
+        "seed-predictions": (
+            "prepare-environment",
+            "stage-inference-input",
+        ),
         "inference-summary": ("seed-predictions",),
         "request-publication": ("inference-summary",),
     }
     assert {node.node_key for node in plan.nodes if node.allow_empty_result} == {
+        "prepare-environment",
         "raw-database-searches",
         "combined-msa-publications",
         "protein-template-searches",
@@ -93,8 +98,6 @@ def test_alphafold3_plan_fingerprint_tracks_science_not_worker_limits() -> None:
     assert first.workload_plan_fingerprint == second.workload_plan_fingerprint
     assert first.workload_plan_fingerprint != changed_sequence.workload_plan_fingerprint
     assert first.workload_plan_fingerprint != changed_seeds.workload_plan_fingerprint
-    assert "max_parallel_search_workers" not in repr(first.scientific_payload)
-    assert "max_num_gpus" not in repr(first.scientific_payload)
 
 
 def test_alphafold3_search_tasks_bind_existing_scientific_identities() -> None:
@@ -137,7 +140,6 @@ def test_alphafold3_search_tasks_bind_existing_scientific_identities() -> None:
     )
     for plan in (raw_plan, assembly_plan, template_plan):
         assert "path" not in repr(plan.scientific_payload).lower()
-        assert "max_parallel" not in repr(plan.scientific_payload)
 
 
 def test_alphafold3_seed_tasks_are_independent_of_gpu_partitioning() -> None:
@@ -165,7 +167,6 @@ def test_alphafold3_seed_tasks_are_independent_of_gpu_partitioning() -> None:
 
     assert tuple(plan.task_key for plan in plans) == ("seed:1", "seed:3")
     assert {plan.scientific_payload["run_id"] for plan in plans} == {prepared.run_id}
-    assert all("max_num_gpus" not in repr(plan.scientific_payload) for plan in plans)
 
 
 def test_alphafold3_singleton_tasks_bind_publication_identities() -> None:

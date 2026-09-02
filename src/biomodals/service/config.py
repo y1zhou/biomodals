@@ -66,19 +66,6 @@ def _nonnegative_integer(
     return value
 
 
-def _optional_positive_integer(
-    sources: ConfigurationSources,
-    name: str,
-) -> int | None:
-    raw_value = sources.value(name, "")
-    if not raw_value.strip():
-        return None
-    value = int(raw_value)
-    if value < 1:
-        raise ValueError(f"{name} must be at least 1 when configured")
-    return value
-
-
 def _positive_float(
     sources: ConfigurationSources,
     name: str,
@@ -221,10 +208,10 @@ class ServiceSettings:
     public_url: str
     secure_cookies: bool
     modal_environment: str
+    modal_download_concurrency: int
     global_active_job_limit: int
     default_user_active_job_limit: int
     reconcile_interval_seconds: float
-    intermediate_retention_days: int | None
     modal_token_id: str | None
     modal_token_secret: str | None = field(repr=False)
 
@@ -262,6 +249,11 @@ class ServiceSettings:
                 "BIOMODALS_MODAL_ENVIRONMENT",
                 "production",
             ),
+            modal_download_concurrency=_positive_integer(
+                sources,
+                "BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY",
+                4,
+            ),
             global_active_job_limit=_nonnegative_integer(
                 sources,
                 "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT",
@@ -275,11 +267,7 @@ class ServiceSettings:
             reconcile_interval_seconds=_positive_float(
                 sources,
                 "BIOMODALS_RECONCILE_SECONDS",
-                10,
-            ),
-            intermediate_retention_days=_optional_positive_integer(
-                sources,
-                "BIOMODALS_INTERMEDIATE_RETENTION_DAYS",
+                60,
             ),
             modal_token_id=sources.value("MODAL_TOKEN_ID", "").strip() or None,
             modal_token_secret=(

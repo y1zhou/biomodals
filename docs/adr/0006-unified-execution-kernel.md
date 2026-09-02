@@ -2,6 +2,10 @@
 
 Status: accepted.
 
+[ADR 0007](0007-api-jobs-use-remote-coordinators.md) supersedes only the
+passages that make the API service an execution host or coordinator; the
+kernel, app, workflow, and CLI decisions remain current.
+
 ## 2026-08-19 consolidation amendment
 
 The original extraction proved the Run, Node, Task, Provider Call, recovery,
@@ -609,6 +613,22 @@ cancellation keeps the Task `running` and the Run `state_unknown`. These rules
 make pruning close every durable work record without inventing completion or
 releasing uncertain ownership.
 
+After cancellation becomes conclusive, a Task Provider Node may run its
+best-effort `finalize_cancelled_remote_tasks` hook. This is workload cleanup,
+not provider cancellation or scientific completion: it may fence a
+workload-owned external claim but cannot change kernel Task outcomes. The
+default hook does nothing, and cleanup failure is diagnostic rather than
+authority to resubmit work.
+
+ADR 0007 adds a workload-specific API exception without changing kernel
+Successor semantics. A new AlphaFold3 API root Run may carry terminal Service
+Job IDs from the same publication scope that authorize the app to fence only
+their deterministic external claim generations. Those generations use the
+Execution Run ID plus stable Node and Task keys rather than a deployment-plan
+fingerprint. The new Run does not read or mutate predecessor kernel ledgers,
+and active or unknown matching Service Jobs still block launch. This is
+workload claim repair, not kernel Task retry or inferred Successor lineage.
+
 The Node, Task, and Provider Call relationship policy was accepted on
 2026-07-29. A Node is a fixed semantic DAG stage, a Task is one independently
 scheduled and validated item in that stage, and a Provider Call is one
@@ -894,6 +914,14 @@ Volume results do not trigger a blanket reload. The coordinator host owns the
 initial reload; a workload runtime does not immediately reload the same Volume
 again. SQLite stays open for local-only commits and is closed only across an
 explicit Volume commit or reload.
+
+The cross-container publication boundary was clarified on 2026-08-27. A
+writer's completed explicit Volume commit followed by a reader's successful
+reload is authoritative: the reader sees the latest committed state. If the
+expected publication is missing or invalid after that reload, result decoding
+fails normally. The kernel does not add a speculative propagation delay,
+repeated reload loop, or special pending-publication state. Such a workaround
+requires a reproduced provider-contract failure rather than a synthetic test.
 
 The single-writer topology was accepted on 2026-07-29. A Volume-backed remote
 coordinator runs in a parameterized, run-scoped provider pool identified by

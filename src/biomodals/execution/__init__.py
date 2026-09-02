@@ -10,6 +10,7 @@ from biomodals.execution.artifact_availability import (
 from biomodals.execution.artifacts import (
     ContentBoundFileSet,
     inline_json_result,
+    parse_content_bound_file_set,
     republish_execution_artifact,
 )
 from biomodals.execution.coordinator import (
@@ -38,7 +39,10 @@ from biomodals.execution.model import (
     NodeDependency,
     NodePlan,
     NodeStatus,
+    NodeTaskStatusCounts,
     ProviderBinding,
+    ProviderCallDiagnostic,
+    ProviderCallPage,
     ProviderCallRecord,
     ProviderCallStatus,
     PullTaskClaim,
@@ -89,7 +93,6 @@ from biomodals.execution.store import (
     ExecutionRunStore,
     ExecutionStorageSync,
     GraphExecutionRunStore,
-    UnsupportedGraphRunStoreError,
 )
 from biomodals.schema import (
     ArtifactFile,
@@ -129,6 +132,7 @@ __all__ = [
     "NodeRunContext",
     "NodePlan",
     "NodeStatus",
+    "NodeTaskStatusCounts",
     "ProviderCallStatus",
     "ProviderCallObservation",
     "ProviderCallObservationKind",
@@ -139,6 +143,8 @@ __all__ = [
     "ProviderDriver",
     "ProviderSubmissionOutcomeUnknownError",
     "ProviderCallRecord",
+    "ProviderCallDiagnostic",
+    "ProviderCallPage",
     "ProviderCallSpec",
     "PreparedTaskBatch",
     "ProviderNode",
@@ -166,6 +172,7 @@ __all__ = [
     "form_pull_worker_candidates",
     "inline_json_result",
     "mounted_volume_checker",
+    "parse_content_bound_file_set",
     "propagated_skip_node_keys",
     "ready_node_keys",
     "required_node_keys",
@@ -174,5 +181,4 @@ __all__ = [
     "resume_execution_run",
     "terminal_run_outcome",
     "UnsupportedExecutionSchemaVersionError",
-    "UnsupportedGraphRunStoreError",
 ]

@@ -1,8 +1,6 @@
-"""Service metadata and embedded execution-repository contracts."""
+"""Lean Service Job persistence contracts."""
 
-# ruff: noqa: D103,S105
-
-from __future__ import annotations
+# ruff: noqa: D103
 
 import sqlite3
 from pathlib import Path
@@ -10,405 +8,279 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from biomodals.execution import (
-    AvailabilityStatus,
-    ExecutionPlan,
-    NodePlan,
-    RunStatus,
-    RunStatusReason,
-)
-from biomodals.execution.sqlite import SqliteExecutionRepository
-from biomodals.service.auth import AuthService
-from biomodals.service.runtime_config import (
-    DatabaseOverridableSetting,
-    JobAdmissionConfiguration,
-)
 from biomodals.service.store import (
     IdempotencyConflictError,
-    JobCursorError,
-    JobLimitExceededError,
     JobNotCancellableError,
     JobState,
+    JobStateResolutionError,
     ServiceStore,
-    UserNotFoundError,
 )
 
+JOB_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
-def make_store(tmp_path: Path) -> tuple[ServiceStore, UUID, UUID]:
+
+def _store(tmp_path: Path) -> tuple[ServiceStore, UUID]:
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
-    auth = AuthService(store, frontend_url="https://biomodals.internal")
-    for email, admin in (
-        ("alice@example.com", True),
-        ("bob@example.com", False),
-    ):
-        link = auth.create_user(
-            email,
-            display_name=email.partition("@")[0].title(),
-            is_admin=admin,
-        )
-        auth.set_password(
-            link.url.partition("#token=")[2],
-            "correct horse battery staple",
-        )
-    alice = store.get_user_by_email("alice@example.com")
-    bob = store.get_user_by_email("bob@example.com")
-    assert alice is not None and bob is not None
-    return store, alice.user_id, bob.user_id
+    user = store.create_user(
+        email="admin@example.com",
+        display_name="Admin",
+        token_digest=b"setup",
+        token_expires_at=100,
+        now=1,
+        is_admin=True,
+        active_job_limit=10,
+    )
+    store.set_password_from_token(
+        b"setup",
+        password_hash="test",  # noqa: S106
+        session_token_digest=b"session",
+        csrf_digest=b"csrf",
+        now=2,
+        absolute_expires_at=1000,
+    )
+    return store, user.user_id
 
 
-def test_service_schema_indexes_active_job_joins(tmp_path: Path) -> None:
-    store, _alice, _bob = make_store(tmp_path)
+def _admit(store: ServiceStore, owner: UUID, *, digest: str = "a" * 64):
+    return store.admit_job(
+        owner_user_id=owner,
+        tool="alphafold3",
+        display_name="prediction",
+        idempotency_key="idempotency",
+        request_digest=digest,
+        modal_environment="main",
+        modal_app_name="AlphaFold3",
+        modal_app_version=7,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=1,
+        now=10,
+        new_job_id=JOB_ID,
+    )
 
+
+def test_schema_contains_only_six_service_tables(tmp_path: Path) -> None:
+    store, _owner = _store(tmp_path)
     with sqlite3.connect(store.path) as connection:
-        indexes = {
+        tables = {
             row[0]
             for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'"
-            )
-        }
-
-    assert "execution_runs_status_idx" in indexes
-    assert "jobs_owner_execution" in indexes
-    assert "jobs_workload_execution" in indexes
-
-
-def configuration(
-    workload: str = "gromacs",
-    *,
-    workload_limit: int = 10,
-    global_limit: int = 20,
-) -> JobAdmissionConfiguration:
-    return JobAdmissionConfiguration(
-        workload=workload,
-        modal_environment=DatabaseOverridableSetting("production", False),
-        modal_app_name=DatabaseOverridableSetting("Gromacs", False),
-        modal_app_version=DatabaseOverridableSetting(7, False),
-        workload_active_job_limit=DatabaseOverridableSetting(
-            workload_limit,
-            False,
-        ),
-        global_active_job_limit=DatabaseOverridableSetting(global_limit, False),
-    )
-
-
-def admit(
-    store: ServiceStore,
-    owner_user_id: UUID,
-    *,
-    key: str,
-    workload: str = "gromacs",
-    request_hash: str = "a" * 64,
-    user_limit: int = 2,
-    workload_limit: int = 10,
-    global_limit: int = 20,
-    job_id: UUID | None = None,
-    run_id: UUID | None = None,
-    input_content: bytes | None = None,
-):
-    store.update_user(
-        owner_user_id,
-        active_job_limit=user_limit,
-        now=99,
-    )
-    job_id = job_id or uuid4()
-    run_id = run_id or uuid4()
-    plan = ExecutionPlan(
-        workload_name=workload,
-        workload_run_key=f"run-{job_id.hex}",
-        nodes=(NodePlan(node_key="compute"),),
-        scientific_payload={"request_hash": request_hash},
-    )
-    return store.admit_job(
-        owner_user_id=owner_user_id,
-        display_name="Protein simulation",
-        idempotency_key=key,
-        request_hash=request_hash,
-        parameters_json='{"simulation_time_ns":5}',
-        artifact_request_sha256="b" * 64,
-        configuration=configuration(
-            workload,
-            workload_limit=workload_limit,
-            global_limit=global_limit,
-        ),
-        execution_plan=plan,
-        execution_run_id=run_id,
-        max_active_provider_calls=3,
-        max_active_gpu_provider_calls=1,
-        now=100,
-        new_job_id=job_id,
-        input_content=input_content,
-    )
-
-
-def fail_run(store: ServiceStore, run_id: UUID, *, now: int = 200) -> None:
-    with store.execution_repository() as repository:
-        repository.transition_run(
-            run_id,
-            RunStatus.FAILED,
-            reason=RunStatusReason.REQUIRED_WORK_FAILED,
-            message="test failure",
-            now=now,
-        )
-
-
-def succeed_run(store: ServiceStore, run_id: UUID, *, now: int = 200) -> None:
-    with store.execution_repository() as repository:
-        repository.record_node_result_observation(
-            run_id,
-            "compute",
-            AvailabilityStatus.AVAILABLE,
-            now=now,
-        )
-        repository.finalize_run_from_results(run_id, now=now)
-
-
-def test_service_schema_embeds_execution_without_a_second_stage_ledger(
-    tmp_path: Path,
-) -> None:
-    store, _alice, _bob = make_store(tmp_path)
-
-    with sqlite3.connect(store.path) as conn:
-        tables = {
-            str(row[0])
-            for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        job_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)")}
-
-    assert "execution_runs" in tables
-    assert "execution_nodes" in tables
-    assert "execution_provider_calls" in tables
-    assert "job_operations" not in tables
-    assert "state" not in job_columns
-    assert "execution_run_id" in job_columns
-
-
-def test_readiness_checks_existing_schema_without_creating_state(
-    tmp_path: Path,
-) -> None:
-    missing = ServiceStore(tmp_path / "missing" / "service.sqlite3")
-    with pytest.raises(RuntimeError, match="unavailable"):
-        missing.check_ready()
-    assert not missing.path.exists()
-
-    store, _alice, _bob = make_store(tmp_path)
-    store.check_ready()
-
-
-def test_service_rejects_a_stale_embedded_execution_schema(tmp_path: Path) -> None:
-    store, _alice, _bob = make_store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
-        connection.execute(
-            "UPDATE execution_schema SET version = 3 WHERE singleton = 1"
-        )
-
-    with pytest.raises(RuntimeError, match="execution schema version 3"):
-        store.initialize()
-    with pytest.raises(RuntimeError, match="execution schema is unavailable"):
-        store.check_ready()
-
-
-def test_admission_atomically_links_job_run_and_staged_input(tmp_path: Path) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    job_id = UUID("11111111-1111-4111-8111-111111111111")
-    run_id = UUID("22222222-2222-4222-8222-222222222222")
-
-    admitted = admit(
-        store,
-        alice,
-        key="one",
-        job_id=job_id,
-        run_id=run_id,
-        input_content=b"ATOM\n",
-    )
-
-    assert admitted.created is True
-    assert admitted.job.execution_run_id == run_id
-    assert admitted.job.state == JobState.QUEUED
-    assert admitted.job.modal_environment == "production"
-    assert admitted.job.modal_app_name == "Gromacs"
-    assert admitted.job.modal_app_version == 7
-    assert admitted.job.run_name == f"run-{job_id.hex}"
-    assert store.load_job_input(job_id) == b"ATOM\n"
-    with store.execution_repository() as repository:
-        assert repository.get_run(run_id).plan.workload_name == "gromacs"
-
-
-def test_admission_rolls_back_job_and_run_together(tmp_path: Path) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    run_id = uuid4()
-    job_id = uuid4()
-    with pytest.raises(ValueError, match="workload"):
-        store.admit_job(
-            owner_user_id=alice,
-            display_name="Mismatch",
-            idempotency_key="mismatch",
-            request_hash="a" * 64,
-            parameters_json="{}",
-            configuration=configuration("gromacs"),
-            execution_plan=ExecutionPlan(
-                workload_name="other",
-                nodes=(NodePlan(node_key="compute"),),
-            ),
-            execution_run_id=run_id,
-            max_active_provider_calls=1,
-            max_active_gpu_provider_calls=0,
-            now=100,
-            new_job_id=job_id,
-        )
-    assert store.get_job_by_id(job_id) is None
-    with store.execution_repository() as repository:
-        with pytest.raises(LookupError):
-            repository.get_run(run_id)
-
-
-def test_idempotency_is_owner_scoped_and_never_creates_a_second_run(
-    tmp_path: Path,
-) -> None:
-    store, alice, bob = make_store(tmp_path)
-    first = admit(store, alice, key="same")
-    replay = admit(store, alice, key="same")
-    other_owner = admit(store, bob, key="same")
-
-    assert replay.created is False
-    assert replay.job.job_id == first.job.job_id
-    assert replay.job.execution_run_id == first.job.execution_run_id
-    assert other_owner.job.job_id != first.job.job_id
-    with pytest.raises(IdempotencyConflictError):
-        admit(store, alice, key="same", request_hash="c" * 64)
-
-
-def test_disabled_owner_cannot_replay_admission(tmp_path: Path) -> None:
-    store, _alice, bob = make_store(tmp_path)
-    admit(store, bob, key="one")
-    store.update_user(bob, active=False, now=101)
-
-    with pytest.raises(UserNotFoundError):
-        admit(store, bob, key="one")
-
-
-def test_active_limits_are_derived_from_execution_runs(tmp_path: Path) -> None:
-    store, alice, bob = make_store(tmp_path)
-    first = admit(store, alice, key="one", user_limit=1)
-    with pytest.raises(JobLimitExceededError, match="User"):
-        admit(store, alice, key="two", user_limit=1)
-
-    assert first.job.execution_run_id is not None
-    fail_run(store, first.job.execution_run_id)
-    second = admit(store, alice, key="two", user_limit=1)
-    assert second.created is True
-
-    with pytest.raises(JobLimitExceededError, match="Tool"):
-        admit(store, bob, key="three", workload_limit=1)
-
-
-def test_job_queries_and_cursor_never_cross_owner_boundaries(tmp_path: Path) -> None:
-    store, alice, bob = make_store(tmp_path)
-    first = admit(store, alice, key="one")
-    second = admit(store, alice, key="two")
-    hidden = admit(store, bob, key="three")
-
-    assert store.get_job(alice, hidden.job.job_id) is None
-    assert {job.job_id for job in store.list_jobs(alice)} == {
-        first.job.job_id,
-        second.job.job_id,
+    assert tables == {
+        "users",
+        "password_tokens",
+        "sessions",
+        "service_settings",
+        "tool_settings",
+        "jobs",
     }
-    page = store.list_jobs_page(alice, limit=1)
-    assert len(page.jobs) == 1
-    assert page.next_cursor is not None
-    with pytest.raises(JobCursorError):
-        store.list_jobs_page(alice, limit=1, cursor=hidden.job.job_id)
 
 
-def test_job_list_loads_execution_overviews_in_one_batch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    admit(store, alice, key="one")
-    admit(store, alice, key="two")
-    original = SqliteExecutionRepository.overviews
-    calls: list[tuple[UUID, ...]] = []
+def test_admission_replays_identity_without_execution_tables(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    created = _admit(store, owner)
+    replay = _admit(store, owner)
 
-    def record_overviews(self, execution_run_ids):
-        run_ids = tuple(execution_run_ids)
-        calls.append(run_ids)
-        return original(self, run_ids)
+    assert created.created is True
+    assert replay.created is False
+    assert replay.job.job_id == JOB_ID
+    assert replay.job.tool == "alphafold3"
+    assert replay.job.root_function_call_id is None
 
-    monkeypatch.setattr(SqliteExecutionRepository, "overviews", record_overviews)
-    monkeypatch.setattr(
-        SqliteExecutionRepository,
-        "snapshot",
-        lambda *_args, **_kwargs: pytest.fail("job lists must not load full snapshots"),
+    with pytest.raises(IdempotencyConflictError):
+        _admit(store, owner, digest="b" * 64)
+
+
+def test_unstaged_jobs_select_only_queued_gromacs_requests(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    gromacs_id = uuid4()
+    store.admit_job(
+        owner_user_id=owner,
+        tool="gromacs",
+        display_name="simulation",
+        idempotency_key="gromacs-request",
+        request_digest="b" * 64,
+        modal_environment="main",
+        modal_app_name="Gromacs",
+        modal_app_version=7,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=1,
+        now=10,
+        new_job_id=gromacs_id,
     )
+    _admit(store, owner)
 
-    jobs = store.list_jobs(alice)
+    assert store.unstaged_job_ids() == {gromacs_id}
 
-    assert len(jobs) == 2
-    assert len(calls) == 1
-    assert len(calls[0]) == 2
-
-
-def test_cancellation_audit_and_execution_intent_are_atomic(tmp_path: Path) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    admitted = admit(store, alice, key="one")
-    assert admitted.job.execution_run_id is not None
-
-    requested = store.request_cancel(alice, admitted.job.job_id, now=150)
-    with store.execution_repository() as repository:
-        run = repository.get_run(admitted.job.execution_run_id)
-
-    assert requested.state == JobState.CANCEL_REQUESTED
-    assert requested.cancel_requested_at == 150
-    assert run.status == RunStatus.CANCEL_REQUESTED
-
-    fail_run(store, admitted.job.execution_run_id)
-    with pytest.raises(JobNotCancellableError):
-        store.request_cancel(alice, admitted.job.job_id, now=200)
+    store.record_launch(gromacs_id, function_call_id="fc-test", now=11)
+    assert store.unstaged_job_ids() == set()
 
 
-def test_result_metadata_and_delivery_block_are_service_owned(tmp_path: Path) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    admitted = admit(store, alice, key="one")
-    assert admitted.job.execution_run_id is not None
-    succeed_run(store, admitted.job.execution_run_id)
-
-    finalizing = store.get_job_by_id(admitted.job.job_id)
-    assert finalizing is not None and finalizing.state == JobState.FINALIZING
+def test_projection_and_result_metadata_replace_atomically(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.record_launch(JOB_ID, function_call_id="fc-test", now=11)
+    projection = {
+        "stages": [
+            {
+                "code": "predict_structures",
+                "label": "Predict structures",
+                "started_at": 11,
+                "ended_at": 12,
+                "outcome": "completed",
+                "task_counts": {"succeeded": 5},
+            }
+        ],
+        "warnings": [],
+    }
+    finalizing = store.begin_finalization(
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        projection=projection,
+        now=12,
+    )
     completed = store.complete_job(
-        admitted.job.job_id,
-        state=JobState.PARTIAL,
-        result_volume_name="outputs",
-        result_volume_path="result.zip",
-        result_filename="result.zip",
-        result_size_bytes=100,
-        result_sha256="d" * 64,
-        result_archive_schema_version=1,
-        now=201,
-    )
-    assert completed.state == JobState.PARTIAL
-    blocked = store.block_job(
-        admitted.job.job_id,
-        category="result_integrity",
-        previous_state=JobState.PARTIAL,
-        now=202,
-        next_retry_at=302,
-    )
-    assert blocked.state == JobState.BLOCKED
-    assert blocked.result_previous_state == JobState.PARTIAL
-
-
-def test_temporary_inputs_can_be_removed_after_remote_staging(tmp_path: Path) -> None:
-    store, alice, _bob = make_store(tmp_path)
-    admitted = admit(
-        store,
-        alice,
-        key="one",
-        input_content=b"ATOM\n",
+        JOB_ID,
+        result_state=JobState.SUCCEEDED,
+        result_filename="prediction.tar.zst",
+        result_media_type="application/zstd",
+        result_size_bytes=123,
+        result_sha256="c" * 64,
+        result_archive_schema="alphafold3-request/1",
+        now=13,
     )
 
-    assert store.load_job_input(admitted.job.job_id) == b"ATOM\n"
-    store.clear_job_input(admitted.job.job_id)
-    assert store.load_job_input(admitted.job.job_id) is None
+    assert finalizing.state == JobState.FINALIZING
+    assert finalizing.projection == projection
+    assert completed.state == JobState.SUCCEEDED
+    assert completed.result_filename == "prediction.tar.zst"
+
+
+def test_unknown_launch_requires_an_explicit_safe_resolution(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.mark_submission_in_progress(JOB_ID, now=11)
+
+    with pytest.raises(JobStateResolutionError, match="Function Call ID"):
+        store.resolve_state_unknown(
+            JOB_ID,
+            resolution="resume",
+            function_call_id=None,
+            now=12,
+        )
+
+    resumed = store.resolve_state_unknown(
+        JOB_ID,
+        resolution="resume",
+        function_call_id="fc-existing",
+        now=12,
+    )
+    assert (resumed.state, resumed.root_function_call_id) == (
+        JobState.RUNNING,
+        "fc-existing",
+    )
+
+
+def test_unknown_launch_can_only_requeue_without_launch_evidence(
+    tmp_path: Path,
+) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.mark_submission_in_progress(JOB_ID, now=11)
+    requeued = store.resolve_state_unknown(
+        JOB_ID,
+        resolution="requeue",
+        function_call_id=None,
+        now=12,
+    )
+    assert requeued.state == JobState.QUEUED
+
+    store.mark_submission_in_progress(JOB_ID, now=13)
+    store.record_launch(JOB_ID, function_call_id="fc-existing", now=14)
+    store.mark_state_unknown(
+        JOB_ID,
+        reason="provider_outcome_unknown",
+        message="unknown",
+        now=15,
+    )
+    with pytest.raises(JobStateResolutionError, match="cannot be requeued"):
+        store.resolve_state_unknown(
+            JOB_ID,
+            resolution="requeue",
+            function_call_id=None,
+            now=16,
+        )
+    cancelled = store.resolve_state_unknown(
+        JOB_ID,
+        resolution="cancel",
+        function_call_id=None,
+        now=17,
+    )
+    assert cancelled.state == JobState.CANCEL_REQUESTED
+
+
+def test_explicit_resume_replaces_completed_root_call(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.record_launch(JOB_ID, function_call_id="fc-root", now=11)
+    store.replace_projection(
+        JOB_ID,
+        state=JobState.BLOCKED,
+        projection={"stages": [], "warnings": []},
+        observed_at=12,
+    )
+
+    resumed = store.record_resume(
+        JOB_ID,
+        previous_function_call_id="fc-root",
+        function_call_id="fc-resume",
+        now=13,
+    )
+
+    assert (resumed.state, resumed.root_function_call_id) == (
+        JobState.RUNNING,
+        "fc-resume",
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [JobState.FINALIZING, JobState.STATE_UNKNOWN, JobState.BLOCKED],
+)
+def test_only_active_compute_states_accept_cancellation(
+    tmp_path: Path,
+    state: JobState,
+) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    if state == JobState.FINALIZING:
+        store.begin_finalization(
+            JOB_ID,
+            result_state=JobState.SUCCEEDED,
+            projection={},
+            now=11,
+        )
+    elif state == JobState.STATE_UNKNOWN:
+        store.mark_state_unknown(
+            JOB_ID,
+            reason="provider_outcome_unknown",
+            message="unknown",
+            now=11,
+        )
+    else:
+        store.block_job(
+            JOB_ID,
+            category="result_integrity",
+            message="blocked",
+            retry_at=None,
+            now=11,
+        )
+
+    with pytest.raises(JobNotCancellableError, match="does not accept cancellation"):
+        store.request_cancel(JOB_ID, now=12)

@@ -6,18 +6,14 @@ validate their stage-specific marker before reusing a publication.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Collection
 from dataclasses import dataclass
 from time import time
-from typing import Protocol, TypeAlias, cast
+from typing import Protocol, cast
 
 from biomodals.helper.artifacts import utc_now
 
 _TERMINAL_STATUSES = frozenset({"complete", "failed", "abandoned"})
-
-ClaimOwnerAdapter: TypeAlias = Callable[  # noqa: UP040 - Python 3.11 task images
-    [str, object], dict[str, object]
-]
 
 
 class ClaimStore(Protocol):
@@ -91,13 +87,8 @@ def _validate_generation_id(generation_id: str) -> str:
 def _validate_owner(
     scope_key: str,
     value: object,
-    owner_adapter: ClaimOwnerAdapter | None,
 ) -> dict[str, object]:
     candidate = value
-    if (
-        not isinstance(candidate, dict) or candidate.get("scope_key") != scope_key
-    ) and owner_adapter is not None:
-        candidate = owner_adapter(scope_key, value)
     if not isinstance(candidate, dict) or candidate.get("scope_key") != scope_key:
         raise RuntimeError(f"Claim {scope_key!r} has an invalid owner")
     generation_id = candidate.get("generation_id")
@@ -121,8 +112,6 @@ def _validate_owner(
 def latest_generation_owner(
     claims: ClaimStore,
     scope_key: str,
-    *,
-    owner_adapter: ClaimOwnerAdapter | None = None,
 ) -> dict[str, object] | None:
     """Follow append-only successors to the current generation owner."""
     selected_scope = _validate_scope_key(scope_key)
@@ -131,7 +120,7 @@ def latest_generation_owner(
         return None
     seen: set[str] = set()
     while True:
-        owner = _validate_owner(selected_scope, current, owner_adapter)
+        owner = _validate_owner(selected_scope, current)
         generation_id = cast(str, owner["generation_id"])
         if generation_id in seen:
             raise RuntimeError(f"Claim {selected_scope!r} contains a cycle")
@@ -172,9 +161,9 @@ def acquire_generation_claim(
     identity: dict[str, object],
     container_id: str,
     maximum_age_seconds: int | float,
+    superseded_generation_ids: Collection[str] = (),
     now_epoch_seconds: int | float | None = None,
     now_text: str | None = None,
-    owner_adapter: ClaimOwnerAdapter | None = None,
 ) -> GenerationClaim:
     """Elect a writer after fencing a terminal or conservatively stale owner."""
     selected_scope = _validate_scope_key(scope_key)
@@ -189,6 +178,9 @@ def acquire_generation_claim(
         or maximum_age_seconds <= 0
     ):
         raise ValueError("maximum_age_seconds must be positive")
+    selected_superseded = frozenset(
+        _validate_generation_id(item) for item in superseded_generation_ids
+    )
     observed_epoch = time() if now_epoch_seconds is None else now_epoch_seconds
     if isinstance(observed_epoch, bool) or not isinstance(observed_epoch, int | float):
         raise TypeError("now_epoch_seconds must be numeric")
@@ -212,7 +204,6 @@ def acquire_generation_claim(
         predecessor = latest_generation_owner(
             claims,
             selected_scope,
-            owner_adapter=owner_adapter,
         )
         if predecessor is None:
             raise RuntimeError(f"Claim {selected_scope!r} root disappeared")
@@ -238,6 +229,26 @@ def acquire_generation_claim(
                 selected_generation,
                 predecessor,
             )
+        if predecessor_status is None and predecessor_generation in selected_superseded:
+            claims.put(
+                _status_key(selected_scope, predecessor_generation),
+                {
+                    "status": "abandoned",
+                    "abandoned_at": observed_text,
+                    "reason": "superseded_execution_run",
+                    "successor_generation_id": selected_generation,
+                },
+                skip_if_exists=True,
+            )
+            predecessor_status = generation_status(
+                claims,
+                selected_scope,
+                predecessor_generation,
+            )
+            if predecessor_status is None:
+                raise RuntimeError(
+                    f"Claim {selected_scope!r} superseded owner was not fenced"
+                )
         if predecessor_status is None:
             started_at = cast(
                 int | float,
@@ -288,14 +299,11 @@ def acquire_generation_claim(
 def assert_generation_current(
     claims: ClaimStore,
     claim: GenerationClaim,
-    *,
-    owner_adapter: ClaimOwnerAdapter | None = None,
 ) -> None:
     """Fail closed unless ``claim`` remains the live latest generation."""
     owner = latest_generation_owner(
         claims,
         claim.scope_key,
-        owner_adapter=owner_adapter,
     )
     if owner is None or owner.get("generation_id") != claim.generation_id:
         raise LostGenerationError(
@@ -359,23 +367,6 @@ def finish_generation_claim(
         claims,
         claim,
         status=status,
-        detail=detail,
-        now_text=now_text,
-    )
-
-
-def abandon_generation_claim(
-    claims: ClaimStore,
-    claim: GenerationClaim,
-    *,
-    detail: dict[str, object],
-    now_text: str | None = None,
-) -> None:
-    """Fence a conservatively stale generation for cleanup or replacement."""
-    _record_terminal_status(
-        claims,
-        claim,
-        status="abandoned",
         detail=detail,
         now_text=now_text,
     )

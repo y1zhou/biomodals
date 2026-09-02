@@ -18,13 +18,19 @@ from threading import Event, Thread
 import orjson
 import pytest
 
-from biomodals.service.artifacts import ArtifactCache, ArtifactSourceMissingError
+from biomodals.schema import ArtifactFile
+from biomodals.service.artifacts import (
+    ArtifactCache,
+    ArtifactIntegrityError,
+    ArtifactSourceMissingError,
+)
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     BuiltGromacsArchive,
     validate_gromacs_archive,
     write_gromacs_archive,
 )
+from biomodals.service.gromacs.contracts import artifact_request_sha256
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
@@ -75,30 +81,54 @@ CENTERED_PDB = PDB + b"END\n"
 
 def _remote_files() -> dict[str, bytes]:
     prefix = f"production_{RUN_NAME}"
-    return {
+    files = {
         f"{RUN_NAME}/{RUN_NAME}.pdb": PDB,
         f"{RUN_NAME}/production.mdp": b"integrator = md\n",
         f"{RUN_NAME}/{prefix}.xtc": b"full trajectory",
         f"{RUN_NAME}/{prefix}_nopbc.xtc": XTC,
         f"{RUN_NAME}/{prefix}.tpr": TPR,
+        f"{RUN_NAME}/{prefix}.edr": b"GROMACS energy data",
         f"{RUN_NAME}/{prefix}_nopbc_centered.pdb": CENTERED_PDB,
-        f"{RUN_NAME}/rmsd_{prefix}.csv": b"time_ns,rmsd\n0.0,0.1\n",
-        f"{RUN_NAME}/rmsd_{prefix}.png": PNG,
-        f"{RUN_NAME}/rg_{prefix}.csv": b"time_ns,rg\n0.0,1.2\n",
-        f"{RUN_NAME}/rg_{prefix}.png": PNG,
-        f"{RUN_NAME}/rmsf_{prefix}.csv": b"residue_index,rmsf\n1,0.2\n",
-        f"{RUN_NAME}/rmsf_{prefix}.png": PNG,
     }
+    for analysis_prefix in (f"nvt_{RUN_NAME}", f"npt_{RUN_NAME}", prefix):
+        files.update({
+            f"{RUN_NAME}/rmsd_{analysis_prefix}.csv": b"time_ns,rmsd\n0.0,0.1\n",
+            f"{RUN_NAME}/rmsd_{analysis_prefix}.png": PNG,
+            f"{RUN_NAME}/rg_{analysis_prefix}.csv": b"time_ns,rg\n0.0,1.2\n",
+            f"{RUN_NAME}/rg_{analysis_prefix}.png": PNG,
+            f"{RUN_NAME}/rmsf_{analysis_prefix}.csv": b"residue_index,rmsf\n1,0.2\n",
+            f"{RUN_NAME}/rmsf_{analysis_prefix}.png": PNG,
+        })
+    return files
 
 
 def _mtimes_for_files(remote_files: dict[str, bytes]) -> dict[str, int]:
     return dict.fromkeys(remote_files, 1_700_000_000)
 
 
+def _published_files(
+    remote_files: dict[str, bytes] | None = None,
+) -> tuple[ArtifactFile, ...]:
+    files = _remote_files() if remote_files is None else remote_files
+    baseline = _remote_files()
+    input_path = f"{RUN_NAME}/{RUN_NAME}.pdb"
+    full_trajectory = f"{RUN_NAME}/production_{RUN_NAME}.xtc"
+    return tuple(
+        ArtifactFile(
+            path=path.removeprefix(f"{RUN_NAME}/"),
+            size_bytes=len(files[path]),
+            content_sha256=hashlib.sha256(files[path]).hexdigest(),
+        )
+        for path in baseline
+        if path not in {input_path, full_trajectory}
+    )
+
+
 def _build_archive(
     *,
     remote_files: dict[str, bytes] | None = None,
     remote_mtimes: dict[str, int] | None = None,
+    published_files: tuple[ArtifactFile, ...] | None = None,
 ) -> tuple[bytes, BuiltGromacsArchive]:
     files = _remote_files() if remote_files is None else remote_files
 
@@ -126,6 +156,10 @@ def _build_archive(
             read_file=read_file,
             remote_mtimes=(
                 _mtimes_for_files(files) if remote_mtimes is None else remote_mtimes
+            ),
+            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            published_files=(
+                _published_files(files) if published_files is None else published_files
             ),
         )
     )
@@ -177,13 +211,15 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         assert archive.read("input.pdb") == PDB
         assert f"outputs/{prefix}.xtc" not in archive.namelist()
         assert archive.read(f"outputs/{prefix}_nopbc.xtc") == XTC
-        assert archive.read(f"outputs/rmsd_{prefix}.png") == PNG
-        assert archive.read(f"outputs/rg_{prefix}.png") == PNG
-        assert archive.read(f"outputs/rmsf_{prefix}.png") == PNG
+        assert archive.read(f"outputs/{prefix}.edr") == b"GROMACS energy data"
+        for analysis_prefix in (f"nvt_{RUN_NAME}", f"npt_{RUN_NAME}", prefix):
+            assert archive.read(f"outputs/rmsd_{analysis_prefix}.png") == PNG
+            assert archive.read(f"outputs/rg_{analysis_prefix}.png") == PNG
+            assert archive.read(f"outputs/rmsf_{analysis_prefix}.png") == PNG
         assert archive.read("metadata/parameters.json") == PARAMETERS.encode()
         provenance = orjson.loads(archive.read("metadata/provenance.json"))
-        assert provenance["archive_schema_version"] == 4
-        assert GROMACS_ARCHIVE_SCHEMA_VERSION == 4
+        assert provenance["archive_schema_version"] == 5
+        assert GROMACS_ARCHIVE_SCHEMA_VERSION == 5
         assert provenance["modal_app_version"] == 17
         assert provenance["software_version"] == "GROMACS 2026.1"
         assert {name.split("/", 1)[0] for name in archive.namelist()} == {
@@ -191,6 +227,26 @@ def test_service_packages_established_remote_files_deterministically() -> None:
             "outputs",
             "metadata",
         }
+
+
+def test_service_rejects_input_that_differs_from_staged_request() -> None:
+    remote_files = _remote_files()
+    remote_files[f"{RUN_NAME}/{RUN_NAME}.pdb"] = PDB + b"END\n"
+
+    with pytest.raises(ArtifactIntegrityError, match="staged request"):
+        _build_archive(remote_files=remote_files)
+
+
+def test_service_rejects_output_changed_after_publication() -> None:
+    remote_files = _remote_files()
+    published_files = _published_files(remote_files)
+    remote_files[f"{RUN_NAME}/production.mdp"] += b"nstxout = 1\n"
+
+    with pytest.raises(ArtifactIntegrityError, match="after publication"):
+        _build_archive(
+            remote_files=remote_files,
+            published_files=published_files,
+        )
 
 
 @pytest.mark.parametrize(
@@ -253,6 +309,8 @@ def test_archive_writes_do_not_block_the_event_loop(
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(files),
+                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                published_files=_published_files(files),
                 run_bounded=cache.run_bounded,
             )
             await observer
@@ -319,6 +377,8 @@ def test_service_preserves_remote_file_modification_times() -> None:
             completed_at=2,
             read_file=read_file,
             remote_mtimes=remote_mtimes,
+            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            published_files=_published_files(remote_files),
         )
     )
 
@@ -336,7 +396,7 @@ def test_service_preserves_remote_file_modification_times() -> None:
             assert info.extra == struct.pack("<HHBI", 0x5455, 5, 1, mtime)
 
 
-def test_archive_validator_enforces_schema_four_zip_metadata() -> None:
+def test_archive_validator_enforces_schema_five_zip_metadata() -> None:
     archive_bytes, _result = _build_archive()
 
     def deflate(info: zipfile.ZipInfo) -> None:
@@ -502,6 +562,8 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(remote_files),
+                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                published_files=_published_files(remote_files),
             )
         )
 
@@ -538,6 +600,8 @@ def test_large_centered_structure_and_diagnostics_stream_without_a_size_cap() ->
             completed_at=2,
             read_file=read_file,
             remote_mtimes=_mtimes_for_files(remote_files),
+            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            published_files=_published_files(remote_files),
         )
     )
 
@@ -575,5 +639,7 @@ def test_missing_required_remote_output_has_a_distinct_failure() -> None:
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(remote_files),
+                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                published_files=_published_files(),
             )
         )

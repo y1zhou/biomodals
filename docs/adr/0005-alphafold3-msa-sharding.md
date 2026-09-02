@@ -68,29 +68,137 @@ pin change requires comparison against the new source before its results can
 reuse these scientific cache paths.
 
 Production code lives under `src/biomodals/app/fold/alphafold3/`.
-`artifacts.py` owns canonical JSON, digests, atomic publication, durable
-operation logging, and the shared Modal Volume persistence interfaces.
+`biomodals.helper.artifacts` owns canonical JSON, digests, atomic publication,
+durable operation logging, and the shared Modal Volume persistence interfaces.
 `sharding.py` owns the pinned native source assets, compilation, execution,
 record-multiset parsing, scratch sizing, and staged-file verification.
 `profiles.py` owns fixed production identities, `profile_manifest.py` owns the
 immutable manifest and publication contract, and `profile_builder.py` owns
-construction, source policy, and cleanup. Profile preparation, MSA search,
+construction and publication. Profile preparation, MSA search,
 template search, and inference all use the append-only protocol in
-`generation_claims.py`; old profile-owner records are adapted in place.
+`generation_claims.py`.
 
-`search_pipeline.py` and `inference_pipeline.py` own request-level
-reconciliation behind narrow executor interfaces. `modal_adapters.py` owns
-Modal payload marshalling, bounded fan-out and polling, request staging, and
-the one-time profile-setup call sequence. `upstream_inference.py` owns the
-pinned AlphaFold command and upstream summary serialization. Fixed mount roots
-live on the runtime data classes that use them rather than in an app-wide
-metadata object. The remaining modules separate scientific search and
-assembly, template search, input enrichment, inference identity, seed
-publication, and request retrieval.
+`environment.py` plans and prepares only the shared assets required by a
+request. `modal_adapters.py` owns request staging and payload marshalling.
+`upstream_inference.py` owns the pinned AlphaFold command and upstream summary
+serialization. Fixed mount roots live on the runtime data classes that use
+them rather than in an app-wide metadata object. The remaining modules
+separate scientific search and assembly, template search, input enrichment,
+inference identity, seed publication, and request retrieval.
 `alphafold3_app.py` is the composition root: it binds these production modules
-to Modal resources and exposes only the three supported lifecycle components:
-one-time profile preparation, resumable MSA/template search, and AlphaFold
-inference.
+to Modal resources and exposes environment-asset preparation, resumable
+MSA/template search, and AlphaFold inference.
+
+### Automatic environment assets
+
+Every AlphaFold3 Execution Run includes one `Prepare environment`
+TaskProviderNode for the shared assets it needs. Its independent model,
+requested-profile, and optional template-reference Tasks use normal kernel
+admission and the Run's provider-call limit. It performs no hidden Modal
+fan-out. `seed-predictions` depends directly on this Node as well as the staged
+inference input. This keeps shared-asset readiness in the result-driven
+required closure even when the staged input is already cached. Inference requires
+`biomodals-store:/AlphaFold3/af3.bin`. MSA profile Tasks come from the request's
+actual planned Raw Database MSA work, so caller-supplied custom MSAs do not
+provision databases they eliminate. Template assets are prepared only when the
+request actually requires generated protein-template search.
+
+Setup uses the model URL documented by the pinned AlphaFold3 release and the
+database URLs from that release's `fetch_databases.sh`. A missing model file,
+profile directory, or directly consumed template path is provisioned
+automatically. These readiness checks deliberately use path existence rather
+than checksumming large shared assets. The scientific worker remains the
+deeper compatibility check; a later format or content mismatch fails with an
+operator repair message naming the rejected path and Volume. It explains that
+automatic replacement was refused. It never
+authorizes automatic replacement of an existing final asset.
+
+Cheap recurring readiness is distinct from publication. A newly constructed
+Sharded Database Profile still passes the existing one-time source/shard
+scientific validation before its manifest is published. Later Execution Runs
+do not repeat those scans; existence of the selected profile's final
+`manifest.json` is sufficient to skip environment setup. The marker is not
+opened, hashed, or semantically revalidated during recurring readiness checks.
+
+Environment Setup Claims elect only one writer per asset and Modal environment,
+including across concurrent Runs and deployed app versions. Claims are not
+completion evidence. Before provider submission, each Run coordinator checks
+the final path and atomically attempts the environment claim. A losing Run
+keeps its setup Task pending and submits no duplicate Provider Call. Later
+coordinator passes recheck only the final path and small claim status. A later
+setup generation is allowed when an asset is
+missing, a new Profile ID is selected, or an earlier generation failed. An
+existing manually installed model checkpoint is adopted without hashing or
+redownloading it.
+
+All setup scopes share the environment-local
+`AlphaFold3-environment-setup-claims` Modal Dict. It stores only append-only
+writer elections and terminal statuses; it never stores asset data or
+completion evidence. The implementation uses the kernel's existing prepared
+batch with no call to leave a losing Task pending without consuming a Run
+Provider Call slot or a Modal container. Successful claim history is retained,
+and there is no separate administrative claim-cleanup lifecycle.
+
+Each setup Provider Call receives a deterministic generation ID. Modal
+redelivery re-enters that generation after infrastructure interruption. A
+different generation may take over only after the owner is conclusively
+terminal or after the provider function's absolute maximum lifetime plus a
+short grace period, when that original call can no longer legally be running.
+
+Downloads first retain a fixed-URL compressed `.zst.part` file and use HTTP
+range requests to resume it. Model and template-sequence assets are staged,
+decompressed, and published atomically before their compressed temporary file
+is removed. Profile archives stay on the source Volume only while resumable
+acquisition or construction is in progress. Their plain FASTA is decompressed
+into container-local scratch and removed after profile construction; it is
+never committed to a Modal Volume.
+
+A successor setup generation may adopt the fixed-URL compressed partial file
+of a conclusively terminal predecessor and continue its range download. If
+decompression rejects that temporary archive, setup removes only the partial
+archive, fails the current Run, and leaves a later explicit Run to download it
+again from zero.
+
+Downloads publish through generation-owned temporary paths. Automatic cleanup
+may remove only same-profile workspaces from the current generation or a
+conclusively complete or failed predecessor; an abandoned claim may still have
+a queued or running Provider Call. Cleanup never removes another active
+profile workspace or a conflicting final asset. Template-search reference
+files remain in the source Volume because search workers consume them directly.
+
+The mmCIF tar stream extracts directly into a generation-owned directory on
+the mounted source Volume. After extraction completes, a same-Volume directory
+rename publishes `mmcif_files`, followed by the visibility commit. This uses
+standard mounted-filesystem operations and does not copy the extracted files a
+second time. The final directory is never committed while extraction is
+partial.
+
+A conclusive setup failure fails the current Execution Run without removing
+assets published by sibling Tasks. A later explicit Run reuses those assets
+and provisions only paths still missing. Modal may redeliver the same provider
+call after infrastructure interruption; the app adds no retry loop and does
+not create a Successor Run implicitly.
+
+An independently submitted Run that was already waiting on the failed claim
+may acquire one successor claim and perform its own authorized setup attempt.
+Likewise, cancelling the owner Run cancels its setup Provider Call normally;
+another waiting Run may take over only after that cancellation is conclusive.
+Setup work is never detached from the Run and Provider Call that own it.
+
+There is no separate public setup entrypoint or second setup implementation.
+Reusable source acquisition and profile construction are worker helpers used
+by the Environment Preparation Node.
+
+All asset Tasks use one thin decorated provider operation,
+`prepare_alphafold3_environment_asset`, with a typed model, profile, or
+template descriptor. The wrapper owns Modal mounts and resources only; focused
+helpers own acquisition and profile construction.
+
+Every non-pruned AlphaFold3 Execution Run exposes this work as `Prepare
+environment`, even when every Task immediately reuses an existing asset and
+the stage completes almost instantly. A complete terminal scientific
+publication may still prune the setup ancestor under the kernel's normal
+result-driven semantics.
 
 The temporary MSA app and benchmark campaign code were retired after the
 protein and RNA scientific gates passed. Historical measurements and oracle
@@ -153,45 +261,48 @@ mutable `current` pointer, automatic discovery, or automatic promotion.
 The manifest preserves source identity and statistics. The published profile
 does not retain a duplicate monolithic source FASTA.
 
-New builds retain structural shuffler evidence at
+Profiles retain structural shuffler evidence at
 `validation/shuffler-evidence.json`—record and byte counts, bounded-memory
 evidence, native source identity, and shuffle identities—but no timing or
 throughput summary. Successful new profiles also omit raw shuffler stderr;
-that diagnostic stream is retained only with failure evidence. The validator
-continues to accept the older `shuffler-metrics.json` and
-`shuffle-stderr.log` artifacts in already-published composable-multiset
-profiles so cleanup does not invalidate the selected databases.
+that diagnostic stream is retained only with failure evidence. Pre-release
+profile formats are not accepted; this unreleased system rebuilds them from
+the official source when the selected Profile ID changes.
 
-Rebuilding an identical specification reuses its valid publication and never
+Rebuilding an identical specification reuses its existing publication and never
 overwrites it. A builder for a new Profile ID publishes beside any existing
-profile and never mutates that prior publication. After all seven selected
-profiles validate and no builder claims remain active, the setup
-coordinator's finalization barrier removes non-selected profile directories so
-the Volume contains exactly one selected profile per logical database. This
-intentional garbage collection preserves old Search Identity and manifest
-evidence in the MSA cache, but recomputing an old Search Identity requires its
-profile to be rebuilt or manually restored first.
+profile and never mutates that prior publication. Automatic setup prepares
+only the profiles required by the request's polymer types; it does not require
+unrelated protein or RNA profiles before allowing the request to proceed.
 
 ### Profile builder
 
-The production app exposes one builder operation:
+The automatic environment worker calls the Modal-independent builder helper:
 
 ```python
-build_sharded_database(
+build_profile(
+    runtime: ProfileBuilderRuntime,
     database_id: str,
-    seqkit_threads: int = 8,
-    source_policy: Literal["keep", "compress", "delete"] = "keep",
+    seqkit_threads: int,
+    *,
+    generation_id: str,
+    source_path: Path,
 ) -> dict[str, object]
 ```
 
-One invocation builds one logical database. It uses `(0.125, 32.125)` CPUs,
+The thin `prepare_alphafold3_environment_asset` provider operation invokes
+this helper with the Task's deterministic generation and container-local
+decompressed source path. One Provider Call builds one logical database. It
+uses
+`(0.125, 32.125)` CPUs,
 `(1024, 262144)` MiB requested/maximum memory, and the default 512 GiB
 ephemeral disk without requesting a larger disk.
 
-The builder reads the official monolithic FASTA from `AlphaFold3-msa-db`. It
-writes an ephemeral source copy, the two-pass shuffled FASTA, and a compact
-occurrence-offset index under `/tmp`. It never copies the monolithic source
-into the sharded Volume.
+Environment preparation resumes the official compressed source on
+`AlphaFold3-msa-db` and decompresses it under `/tmp`. The builder writes a
+second ephemeral source copy, the two-pass shuffled FASTA, and a compact
+occurrence-offset index there. It never writes a plain monolithic source into
+a persistent Volume.
 
 Source `seqkit stats` remains serialized before shuffling. Its observed record
 count is a data dependency for exact scratch sizing and the native shuffler's
@@ -283,13 +394,10 @@ After the shard payload is committed, the builder writes the manifest last and
 deeply revalidates the published profile. On failure, it commits compact
 diagnostics before removing only that generation's partial shards.
 
-Profiles already published with the earlier SeqKit FAI recipe remain accepted
-under recipe version 3. Occurrence-indexed profiles published with the C
-shuffler and SeqKit sequence checksum remain accepted under recipe version 4.
-New builds use recipe version 5: the occurrence-indexed C shuffler and
-full-record C validator together. Existing immutable profiles are not rebuilt
-solely to revise their validation recipe; every selected profile must still
-pass the same database-search oracle before production promotion.
+Only the current recipe is accepted: the occurrence-indexed C shuffler and
+full-record C validator together. This pre-release system carries no reader or
+migration path for obsolete profile recipes; a recipe change selects a new
+Profile ID and rebuilds it from the official source.
 
 Normal search workers trust the published profile. They may read its small
 manifest for identity and Z, but they never stat, hash, walk, or run SeqKit over
@@ -306,53 +414,41 @@ builder per Profile ID with atomic Modal Dict insertion.
 The minimal claim uses append-only owner and terminal-status records by
 generation. It has no polling loop or heartbeat.
 
-An active conflict fails immediately. Normal failure records `failed`; work
+An active conflict leaves the competing environment Task pending without
+submitting a Provider Call. Normal failure records `failed`; work
 older than the maximum function lifetime plus a margin may be marked
 `abandoned`, allowing one later generation to take ownership. Claims form an
 append-only chain: terminal status fences the predecessor, and atomic insertion
 of its single successor elects the next generation. No takeover deletes or
 replaces another owner's record, so interruption at any point leaves a chain
-that a later invocation can continue. Terminal status is written from the
-builder's `finally` path. A legacy `active:{profile_id}` owner is adopted as
-the chain root on first access; it is not deleted, and a stale legacy owner can
-therefore be fenced and succeeded by the same protocol. Rollout must not
-overlap an actively starting pre-chain builder, because insertion of the old
-`active:` key and the new root are separate Dict operations; persisted legacy
-owners are supported once old-code submissions have stopped.
+that a later invocation can continue. Terminal status is written by the
+environment provider operation. There is no pre-release claim migration path;
+setup claims begin directly with the append-only root record.
 
 Claims are never publication evidence and owner records are never deleted.
 Only a validated manifest proves completion. Different Profile IDs may build
 concurrently.
 
-The production batch entrypoint will therefore submit every missing Supported
-Database Specification concurrently. Each child invocation still builds one
-logical database and is independently bounded by its Profile Build Claim.
-The plan and submission log expose the seven-container cap, configured local
-workers, and maximum effective worker slots for the selected missing set.
+The Environment Preparation Node discovers only the missing Supported Database
+Specifications needed by the request. Each profile is one kernel Task and one
+Provider Call independently bounded by its Profile Build Claim; the app does
+not submit nested child calls. Kernel admission applies the Run's configured
+container ceiling and replenishes slots as setup Tasks complete.
 
-### Source FASTA policy
+### Source FASTA lifecycle
 
-`source_policy="keep"` is the default. The source is never changed before the
-profile is committed and deeply revalidated.
+Automatic setup resumes each pinned official `.zst` URL into a fixed partial
+archive on `AlphaFold3-msa-db`. It decompresses the plain FASTA into
+generation-scoped container-local scratch and passes that path to the builder.
+Successful profile publication removes both the local source and resumable
+partial archive. Failure removes the local source but retains a usable partial
+archive for a later authorized generation. A decompression failure removes the
+rejected partial so that the next Run downloads it from zero.
 
-`compress` writes `<complete-source-filename>.zst` beside the source. It checks
-that decompression reproduces the recorded byte count and SHA-256 before it
-commits the archive and removes the plain FASTA. If that archive already
-exists, both the archive and the current plain source must match the published
-source identity before the plain source can be removed.
-
-`delete` removes the plain source only after the explicit request and successful
-profile publication.
-
-Compression or verification failure leaves the plain source intact. Source
-retirement is recorded and does not alter the immutable profile identity.
-
-The builder accepts only the uncompressed official source. If only its `.zst`
-archive exists, it fails with instructions to restore the source manually in a
-Modal Sandbox or equivalent environment.
-
-The app does not implement automatic restoration or an implicit full-database
-decompression.
+The profile manifest records the source Volume and path as provenance together
+with the source identity and statistics. They do not assert that the
+reconstructable plain FASTA remains present. The immutable sharded profile is
+the only completed database-search asset.
 
 ### MSA cache namespace and retry boundary
 
@@ -529,9 +625,9 @@ The production entrypoint exposes `search_msa` and
 
 | MSA search | Template search | Field behavior |
 | --- | --- | --- |
-| On | On | Preserve non-empty fields and populate every missing MSA and protein template field. |
-| On | Off | Populate missing MSAs, preserve non-empty templates, and set missing or null protein templates to `[]`. |
-| Off | Either | Run no searches, preserve supplied fields, set missing MSAs to `""`, and set missing or null protein templates to `[]`. |
+| On | On | Preserve every supplied field, including explicit empty values, and populate only null or omitted evidence. |
+| On | Off | Populate null or omitted MSAs, preserve supplied templates, and set null or omitted protein templates to `[]`. |
+| Off | Either | Run no searches, preserve supplied fields, set null or omitted MSAs to `""`, and set null or omitted protein templates to `[]`. |
 
 With MSA search enabled, fields resolve independently:
 
@@ -540,7 +636,12 @@ With MSA search enabled, fields resolve independently:
 - missing RNA unpaired MSA uses RFam, RNAcentral, and NT-RNA;
 - requested missing protein templates run after unpaired-MSA resolution.
 
-A non-empty field suppresses only the searches needed for that field. The app
+UniAF3 0.2.1 preserves the upstream three-state evidence contract. Null or
+omitted evidence requests search, while `unpairedMsa: ""`, `pairedMsa: ""`,
+and `templates: []` explicitly disable that evidence. Paired and unpaired MSA
+states must be supplied together. When both MSA fields are explicitly empty but
+templates remain null, the CPU template-search planner constructs the upstream
+single-query A3M and searches templates without scheduling MSA workers. The app
 does not run unnecessary canonical searches merely to populate the cache.
 
 ### Historical search worker topology
@@ -652,6 +753,12 @@ inside exact equal-score groups are scientifically equivalent.
 Every selected RNA profile must pass against the exact pinned AlphaFold and
 HMMER behavior before production uses it.
 
+The Nhmmer adapter pairs A3M hits with `tblout` rows inside their originating
+shard and by identifier occurrence before global ranking. Duplicate textual
+identifiers therefore retain their own reported scores instead of aliasing to
+the last row under that name. This occurrence rule is part of the versioned RNA
+search identity.
+
 ### Enriched input boundary
 
 The Biomodals coordinator is the complete CPU data stage. It fails closed when
@@ -675,7 +782,7 @@ Before remote work, a local helper resolves relative input paths against the
 input JSON's directory.
 
 The helper accepts only non-symlink regular files and performs bounded reads:
-64 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
+256 MiB for the input JSON, 512 MiB for each path-backed MSA, and 64 MiB for
 each custom mmCIF or user CCD. A file that changes while being read is rejected.
 Template counts are checked before any referenced template is opened, and the
 aggregate template ceiling is enforced after each read. Large caller MSAs
@@ -702,14 +809,18 @@ the first Modal call. The worker repeats the preflight before invoking upstream.
 
 The supported request envelope is also explicit: at most 5,120 expanded
 entities, 5,120 total polymer residues, 512 derived CPU search/assembly/template
-tasks, 1 GiB across inline template fields, and 1 GiB each for the serialized
-staged input and run-identity document. The 5,120 bounds align with the largest
-default AlphaFold 3 compilation bucket documented by the pinned upstream
-revision. The CPU coordinator checks the conservative task upper bound before
-cache inspection. The directly callable MSA/template workers repeat the
-5,120-residue query, 512-task inspection, and canonical assembly-shape checks
-before accessing mounted Volumes. Inference workers likewise repeat all
-staged-artifact byte checks when loading from the output Volume.
+tasks, 1 GiB across inline template fields, and 256 MiB for the compact
+run-identity document. The caller's 256 MiB input limit is an upload and local
+file-read guard; it does not cap the enriched inference document after generated
+MSAs and templates have been added. That document remains content-bound by its
+published artifact record. The 5,120 bounds align with the largest default
+AlphaFold 3 compilation bucket documented by the pinned upstream revision. The
+CPU coordinator checks the conservative task upper bound before cache
+inspection. The directly callable MSA/template workers repeat the 5,120-residue
+query, 512-task inspection, and canonical assembly-shape checks before
+accessing mounted Volumes. Inference workers repeat the bounded marker and
+identity reads and verify the content-bound input artifact when loading from
+the output Volume.
 
 For each mmCIF, the identity representation substitutes the full content digest
 while retaining `queryIndices` and `templateIndices`. Caller inline and
@@ -756,8 +867,9 @@ ceilings. A caller therefore cannot publish outputs under one run while
 supplying another run's input.
 
 This canonical inline representation is staged-input schema version 2 and
-run-identity schema v3. The versioned invocation/run identities prevent older
-path-backed staged inputs from colliding with this layout.
+run-identity schema v4. Run identity binds the exact installed UniAF3 version;
+the versioned invocation/run identities prevent older path-backed staged inputs
+from colliding with this layout.
 
 After preparation, recycle and diffusion-sample counts are read only from the
 prepared/staged request. Coordinator and executor APIs do not accept duplicate
@@ -842,11 +954,11 @@ retaining every seed, sample, and worker bound. The accumulated summary may
 grow beyond the default ceiling through multiple valid requests. Inference
 controls are bounded both before scheduling and again in the worker: model
 seeds are unsigned 32-bit integers, recycles are 0--100, and diffusion samples
-are 1--100. Remote GPU admission uses the Run-level `--max-gpu-containers`
-ceiling; setting it to zero prevents GPU provider calls. Seed-cache inspection
-and seed claiming repeat the default workload check unless the explicit
-override accompanies the request. Result publication repeats the hard seed and
-sample bounds before touching the output Volume.
+are 1--100. Remote GPU admission uses the positive Run-level
+`--max-gpu-containers` ceiling; AlphaFold3 requires at least one GPU-container
+slot. Seed-cache inspection and seed claiming repeat the default workload check
+unless the explicit override accompanies the request. Result publication
+repeats the hard seed and sample bounds before touching the output Volume.
 
 `request_id` is derived with `hash_sequences` from `run_id` and the canonical
 normalized seed list. It identifies one computational seed request, not a seed
@@ -877,6 +989,27 @@ If no receipt exists, enrichment proceeds. Once enrichment yields `run_id` and
 `request_id`, a valid existing request manifest is the second fast path: it
 skips staging and all inference-side remote calls. That invocation then
 publishes its missing receipt for future pre-enrichment hits.
+
+### Service-authorized publication-scope repair
+
+An API submission with the same publication-scope digest waits in
+`service.sqlite3` while any earlier matching Service Job may still be active.
+The scope is seed- and name-neutral but retains the biological input, search
+choices, and inference parameters. The full request digest remains separate
+for HTTP idempotency.
+Once those Jobs are conclusively terminal, the new independent root Run may
+carry failed, partial, and cancelled predecessor Execution Run IDs as repair
+authorization. For each Raw MSA, combined MSA, template, seed, or summary Task,
+the planner derives the stable generation those exact Runs would own from the
+Execution Run ID, Node key, and Task key. Claim acquisition may append an
+`abandoned` status only for one of those named generations before electing the
+current writer.
+
+This does not weaken ordinary claim exclusion: unknown or unrelated owners
+still wait for completion or conservative age-based abandonment. Completion
+markers and manifests remain reuse authority. Current request arguments,
+including operational Provider Call limits, are never recovered from the old
+Run. CLI Runs are outside this service-local publication-scope policy.
 
 ### Seed claims and inference workers
 
@@ -1002,8 +1135,10 @@ durable Volume files remain unchanged.
 
 Downloads hash each chunk while writing and stop before a chunk would exceed
 the manifest-declared size. Unchanged archive members reuse that verified
-source size and digest; only the locally rewritten input is read again for its
-presentation-specific identity.
+source size and digest. The bounded finalizer streams the canonical enriched
+input once and calculates both its source digest and the digest after replacing
+the deterministic top-level name field. It never parses or duplicates the
+enriched JSON in memory.
 
 The archive includes every requested seed/sample directory, optional embeddings
 and distograms, locally generated request ranking and best aliases, enriched
@@ -1013,9 +1148,9 @@ directory.
 
 Each streamed artifact must match both its declared byte size and SHA-256.
 The embedded presentation manifest also records the size and SHA-256 of each
-archive-local artifact after input rewriting. The durable request-view manifest
-records the rewritten input's expected size and digest when the view is
-published. Existing archives are therefore streamed locally once and reused
+archive-local artifact. The durable request-view manifest records the expected
+size and digest of the streamed name substitution when the view is published.
+Existing archives are therefore streamed locally once and reused
 only when their exact member set, presentation manifest, and all payload
 digests match the current request; the staged input is not reread from the
 Modal Volume. Changing both a payload and its embedded digest therefore does
@@ -1079,7 +1214,8 @@ The following risks are accepted:
 - a preempted database worker reruns all shards for that database;
 - an unmarked partial seed reruns in full;
 - trusted seed markers do not detect later artifact corruption;
-- model weights and template reference files rely on operator immutability;
+- existing model weights and template reference files are never replaced
+  automatically after a worker reports an incompatibility;
 - supported GPU classes may produce non-bitwise-identical cached seeds;
 - surfaced failures require another explicit request.
 
@@ -1087,7 +1223,6 @@ The initial implementation does not include:
 
 - per-shard durable retries;
 - compressed runtime shards or prediction-time SSD staging;
-- automatic source-archive restoration;
 - mutable profile aliases or automatic database upgrades;
 - normal-search shard audits;
 - automatic app-level retry loops;

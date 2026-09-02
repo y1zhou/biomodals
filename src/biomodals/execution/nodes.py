@@ -285,6 +285,10 @@ class TaskProviderNode(ResultNode):
         """Build the Node publication after every discovered Task is terminal."""
         raise NotImplementedError
 
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        """Release workload-owned state after conclusive Task cancellation."""
+        del context
+
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Prevent bypassing the kernel's Task discovery and call ownership."""
         raise RuntimeError("Task Provider Nodes must use the kernel")

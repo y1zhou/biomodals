@@ -66,6 +66,9 @@ Prefer existing `biomodals.helper` APIs (`run_command`, `package_outputs`,
 helpers) over local variants. For durable artifacts, reuse
 `biomodals.helper.artifacts` readers, bounded reads, hashes, and
 content-addressed publication. Do not extract trivial one-use helpers.
+When similar helpers serve different scientific or workflow roles, explain
+the distinct behavior and rationale in their docstrings or the owning design
+document; a shared implementation does not make their contracts identical.
 
 Use these valid relative paths as examples:
 

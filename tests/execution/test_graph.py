@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, fields
 
 import pytest
 
-import biomodals.workflow as workflow_api
 from biomodals.execution import ExecutionPlanMetadata, NodeAggregationPolicy
 from biomodals.execution.definition import NodeHandle
 from biomodals.execution.definition_plan import execution_plan, node_task_plan
@@ -50,9 +49,8 @@ def test_selector_input_creates_data_dependency() -> None:
     assert downstream.node_id == "score"
 
 
-def test_node_handle_exposes_only_node_id_and_selector_api() -> None:
+def test_node_handle_exposes_node_id() -> None:
     assert [field.name for field in fields(NodeHandle)] == ["node_id"]
-    assert not hasattr(workflow_api, "NodeOutputRef")
 
 
 def test_depends_on_creates_control_edge() -> None:

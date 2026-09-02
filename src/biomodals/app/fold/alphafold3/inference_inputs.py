@@ -11,8 +11,9 @@ import hashlib
 import re
 import string
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path, PurePosixPath
-from typing import TypeAlias, cast
+from typing import Literal, TypeAlias, cast
 
 import orjson
 from uniaf3.schema.alphafold3 import (
@@ -33,17 +34,23 @@ from biomodals.helper.artifacts import (
     json_bytes,
     load_artifact_bytes,
     read_bounded_file_bytes,
+    replace_bytes_atomic,
     sha256_bytes,
+    sha256_file,
 )
 
 ALPHAFOLD3_APP_VERSION = "3.0.2"
+# TODO: Derive this identity from the verified environment-asset manifest so
+# replacement checkpoint bytes cannot retain the same inference cache key.
 DECLARED_MODEL_IDENTITY = "AlphaFold3/af3.bin:v1"
-RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v3"
+RUN_IDENTITY_SCHEMA = "biomodals-alphafold3-inference-run-v4"
+UNIAF3_VERSION = version("uniaf3")
 MAX_MSA_FIELD_BYTES = 512 * 1024 * 1024
 STAGED_INPUT_SCHEMA_VERSION = 2
-MAX_INPUT_JSON_BYTES = 64 * 1024 * 1024
+MAX_INPUT_JSON_BYTES = 256 * 1024 * 1024
+MAX_STAGED_INPUT_MARKER_BYTES = 64 * 1024 * 1024
 MAX_LOCAL_MSA_BYTES = MAX_MSA_FIELD_BYTES
-MAX_STAGED_INPUT_BYTES = 1024 * 1024 * 1024
+MAX_RUN_IDENTITY_BYTES = 256 * 1024 * 1024
 MAX_TEMPLATE_BYTES = 64 * 1024 * 1024
 MAX_TEMPLATE_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_USER_CCD_BYTES = 64 * 1024 * 1024
@@ -100,6 +107,51 @@ class LoadedInferenceInput:
     config: AF3Config
     recycle: int
     sample_count: int
+
+
+def stage_inference_run_mounted(
+    output_root: Path,
+    prepared: PreparedInferenceRun,
+) -> None:
+    """Publish an inference input through its mounted filesystem."""
+    marker = output_root.joinpath(*prepared.staged_input.relative_path.parts)
+    marker_state = _mounted_file_state(marker, prepared.staged_input.content)
+    if marker_state == "conflict":
+        raise RuntimeError(
+            "Existing staged-input marker conflicts with the prepared request: "
+            f"{prepared.staged_input.relative_path}"
+        )
+    pending = [
+        upload
+        for upload in prepared.payload_uploads
+        if marker_state == "missing"
+        or _mounted_file_state(
+            output_root.joinpath(*upload.relative_path.parts),
+            upload.content,
+        )
+        != "match"
+    ]
+    if marker_state == "match" and not pending:
+        return
+    for upload in pending:
+        replace_bytes_atomic(
+            output_root.joinpath(*upload.relative_path.parts),
+            upload.content,
+        )
+    replace_bytes_atomic(marker, prepared.staged_input.content)
+
+
+def _mounted_file_state(
+    path: Path,
+    expected: bytes,
+) -> Literal["missing", "match", "conflict"]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return "missing"
+    if path.is_symlink() or not path.is_file() or stat.st_size != len(expected):
+        return "conflict"
+    return "match" if sha256_file(path) == sha256_bytes(expected) else "conflict"
 
 
 def sanitize_af3_name(name: str) -> str:
@@ -191,7 +243,7 @@ def _validate_polymer(entity_name: str, entity: AF3Protein | AF3RNA | AF3DNA) ->
 
 
 def _validate_template_count(protein: AF3Protein, chain_index: int) -> None:
-    if len(protein.templates) > MAX_PROTEIN_TEMPLATES:
+    if len(protein.templates or ()) > MAX_PROTEIN_TEMPLATES:
         raise ValueError(
             f"sequences[{chain_index}].protein.templates exceeds "
             f"AlphaFold 3's {MAX_PROTEIN_TEMPLATES}-template limit"
@@ -211,7 +263,7 @@ def _validate_inline_inputs(config: AF3Config) -> None:
                         max_bytes=MAX_LOCAL_MSA_BYTES,
                     )
             _validate_template_count(protein, chain_index)
-            for template_index, template in enumerate(protein.templates):
+            for template_index, template in enumerate(protein.templates or ()):
                 field_name = (
                     f"sequences[{chain_index}].protein.templates[{template_index}]"
                 )
@@ -306,12 +358,7 @@ def validate_submitted_af3_input(config: AF3Config) -> AF3Config:
 
 def serialize_af3_input(config: AF3Config) -> bytes:
     """Serialize one config in the strict upstream AlphaFold 3 JSON shape."""
-    content = validate_upstream_af3_input(config).to_json(exclude_unset=False).encode()
-    if len(content) > MAX_STAGED_INPUT_BYTES:
-        raise ValueError(
-            f"staged input exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
-        )
-    return content
+    return validate_upstream_af3_input(config).to_json(exclude_unset=False).encode()
 
 
 def hash_sequences(*fragments: object) -> str:
@@ -468,7 +515,7 @@ def materialize_local_input(config_path: str | Path) -> AF3Config:
                 field_name=f"sequences[{chain_index}].protein",
                 max_bytes=MAX_LOCAL_MSA_BYTES,
             )
-            for template_index, template in enumerate(protein.templates):
+            for template_index, template in enumerate(protein.templates or ()):
                 template_bytes += _materialize_template(
                     template,
                     input_root=input_root,
@@ -552,6 +599,8 @@ def build_inference_identity_view(conf: AF3Config) -> dict[str, object]:
                     field_name=f"protein.{field_name}",
                 )
             raw_templates = protein_view.get("templates")
+            if raw_templates is None:
+                continue
             if not isinstance(raw_templates, list):
                 raise RuntimeError("Validated AlphaFold template list is invalid")
             identity_templates: list[dict[str, object]] = []
@@ -640,6 +689,7 @@ def _run_identity(
         "app_version": ALPHAFOLD3_APP_VERSION,
         "alphafold_repository": ALPHAFOLD3_REPOSITORY,
         "alphafold_commit": ALPHAFOLD3_COMMIT,
+        "uniaf3_version": UNIAF3_VERSION,
     }
     run_id = hash_sequences(
         identity_view,
@@ -694,9 +744,9 @@ def prepare_inference_run(
     input_path = run_root / "requests" / request_id / "input.json"
     input_bytes = serialize_af3_input(staged_conf)
     identity_bytes = json_bytes(identity_document)
-    if len(identity_bytes) > MAX_STAGED_INPUT_BYTES:
+    if len(identity_bytes) > MAX_RUN_IDENTITY_BYTES:
         raise ValueError(
-            f"run identity exceeds the {MAX_STAGED_INPUT_BYTES}-byte limit"
+            f"run identity exceeds the {MAX_RUN_IDENTITY_BYTES}-byte limit"
         )
     identity_upload = VolumeUpload(
         relative_path=identity_path,
@@ -792,7 +842,7 @@ def load_staged_inference_input(
             output_root,
             staged_input_record,
             marker_path,
-            max_bytes=MAX_INPUT_JSON_BYTES,
+            max_bytes=MAX_STAGED_INPUT_MARKER_BYTES,
         ),
         field_name="Staged input marker",
     )
@@ -811,7 +861,7 @@ def load_staged_inference_input(
             output_root,
             marker.get("identity"),
             identity_path,
-            max_bytes=MAX_STAGED_INPUT_BYTES,
+            max_bytes=MAX_RUN_IDENTITY_BYTES,
         ),
         field_name="Run identity document",
     )
@@ -819,7 +869,6 @@ def load_staged_inference_input(
         output_root,
         marker.get("input"),
         input_path,
-        max_bytes=MAX_STAGED_INPUT_BYTES,
     )
     config = validate_upstream_af3_input(AF3Config.model_validate_json(input_bytes))
     if config.name != f"af3-{validated_run_id[:16]}":

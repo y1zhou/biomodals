@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
+from time import monotonic
 from typing import Any, cast
 from uuid import UUID
 
+from biomodals.app.fold.alphafold3.environment import (
+    EnvironmentAsset,
+    EnvironmentRuntime,
+    acquire_asset_claim,
+    asset_ready,
+    fail_asset_claim_if_current,
+    required_environment_assets,
+)
 from biomodals.app.fold.alphafold3.execution_planning import (
     INFERENCE_SUMMARY,
     MSA_ASSEMBLIES,
+    PREPARE_ENVIRONMENT,
     RAW_SEARCHES,
     REQUEST_PUBLICATION,
     SEED_PREDICTIONS,
@@ -41,6 +53,8 @@ from biomodals.execution.nodes import (
 )
 from biomodals.schema import AppRunResult, AppRunStatus
 
+LOGGER = logging.getLogger(__name__)
+
 
 @dataclass
 class _StageRequestNode(CoordinatorNode):
@@ -55,6 +69,173 @@ class _StageRequestNode(CoordinatorNode):
         context: NodeRunContext,
     ) -> AppRunResult | None:
         return self.run(context)
+
+
+@dataclass
+class _PrepareEnvironmentNode(TaskProviderNode):
+    """Provision only the shared assets required by this request."""
+
+    request: AlphaFold3ExecutionRequest = field(
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+    runtime: EnvironmentRuntime = field(repr=False, metadata={"dag_hash": False})
+    execution_run_id: UUID = field(metadata={"dag_hash": False})
+    blocked_until: dict[str, float] = field(
+        default_factory=dict,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+
+    def _assets(self) -> tuple[EnvironmentAsset, ...]:
+        return required_environment_assets(
+            self.request.config,
+            search_msa=self.request.search_msa,
+            search_protein_templates=self.request.search_protein_templates,
+        )
+
+    def _asset(self, task_key: str) -> EnvironmentAsset:
+        try:
+            return next(asset for asset in self._assets() if asset.key == task_key)
+        except StopIteration as error:
+            raise RuntimeError(
+                "Persisted environment asset identity changed"
+            ) from error
+
+    def _generation_id(self, task_key: str) -> str:
+        return sha256(
+            f"{self.execution_run_id}:{PREPARE_ENVIRONMENT}:{task_key}".encode()
+        ).hexdigest()
+
+    def discover_remote_tasks(
+        self,
+        context: NodeRunContext,
+    ) -> tuple[TaskDefinition, ...]:
+        del context
+        return tuple(
+            TaskDefinition(
+                task_key=asset.key,
+                scientific_payload=asset.to_record(),
+            )
+            for asset in self._assets()
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
+        del context
+        asset = self._asset(task.task_key)
+        return ProviderCallSpec(
+            function_name="prepare_alphafold3_environment_asset",
+            uses_gpu=False,
+            kwargs={
+                "asset_record": asset.to_record(),
+                "generation_id": self._generation_id(asset.key),
+            },
+            runtime_image_key="alphafold3-environment-setup",
+        )
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec | PreparedTaskBatch:
+        if len(tasks) != 1:
+            raise ValueError("Environment assets are submitted independently")
+        task = tasks[0]
+        asset = self._asset(task.task_key)
+        if monotonic() < self.blocked_until.get(asset.key, 0):
+            return PreparedTaskBatch(call=None)
+        self.runtime.volume_for(asset).reload()
+        if asset_ready(self.runtime, asset):
+            return PreparedTaskBatch(
+                call=None,
+                completed={task.task_key: AppRunResult(status=AppRunStatus.SUCCEEDED)},
+            )
+        claim = acquire_asset_claim(
+            self.runtime,
+            asset,
+            self._generation_id(asset.key),
+        )
+        if claim is None:
+            self.blocked_until[asset.key] = monotonic() + 30
+            return PreparedTaskBatch(call=None)
+        self.blocked_until.pop(asset.key, None)
+        return self.prepare_remote_task(context, task)
+
+    def process_remote_task_result(
+        self,
+        task_key: str,
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> AppRunResult:
+        del metadata
+        value = cast(dict[str, object], result)
+        if value.get("asset_key") != task_key or value.get("status") not in {
+            "published",
+            "reused",
+        }:
+            raise RuntimeError(f"Invalid environment setup result: {result!r}")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def recover_remote_task_result(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+        expected_fingerprint: str,
+    ) -> AppRunResult | None:
+        del context, expected_fingerprint
+        asset = self._asset(task.task_key)
+        self.runtime.volume_for(asset).reload()
+        if not asset_ready(self.runtime, asset):
+            return None
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        del context, results
+        for task_key, message in errors.items():
+            asset = self._asset(task_key)
+            fail_asset_claim_if_current(
+                self.runtime,
+                asset,
+                self._generation_id(task_key),
+                detail={
+                    "asset_key": asset.key,
+                    "error_type": "ProviderCallFailed",
+                    "message": message,
+                },
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED if not errors else AppRunStatus.FAILED,
+            warnings=list(errors.values()),
+        )
+
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        del context
+        for asset in self._assets():
+            try:
+                fail_asset_claim_if_current(
+                    self.runtime,
+                    asset,
+                    self._generation_id(asset.key),
+                    detail={
+                        "asset_key": asset.key,
+                        "error_type": "ProviderCallCancelled",
+                    },
+                )
+            except Exception:
+                LOGGER.warning(
+                    "Could not release cancelled AlphaFold3 setup claim %s",
+                    asset.key,
+                    exc_info=True,
+                )
 
 
 @dataclass
@@ -362,6 +543,7 @@ def alphafold3_execution_graph(
     search_runtime: SearchRuntime,
     template_runtime: TemplateRuntime,
     inference_runtime: InferenceRuntime,
+    environment_runtime: EnvironmentRuntime,
 ) -> ExecutionGraph:
     """Build AlphaFold3's staged search, inference, and publication graph."""
     planning = AlphaFold3ExecutionPlanning(
@@ -381,6 +563,13 @@ def alphafold3_execution_graph(
         ),
     )
     previous = graph.add_node(_StageRequestNode(), id=STAGE_REQUEST)
+    environment = graph.add_node(
+        _PrepareEnvironmentNode(request, environment_runtime, execution_run_id),
+        id=PREPARE_ENVIRONMENT,
+        depends_on=[previous],
+        allow_empty_result=True,
+    )
+    previous = environment
     previous = graph.add_node(
         _AlphaFold3TaskNode(RAW_SEARCHES, planning),
         id=RAW_SEARCHES,
@@ -407,7 +596,7 @@ def alphafold3_execution_graph(
     previous = graph.add_node(
         _SeedPredictionNode(SEED_PREDICTIONS, planning),
         id=SEED_PREDICTIONS,
-        depends_on=[previous],
+        depends_on=[previous, environment],
     )
     previous = graph.add_node(
         _InferenceSummaryNode(planning),

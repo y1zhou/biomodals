@@ -2,6 +2,8 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
+from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -11,7 +13,13 @@ import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
 import biomodals.app.fold.alphafold3.execution_planning as planning_module
+from biomodals.app.fold.alphafold3.environment import (
+    EnvironmentAsset,
+    EnvironmentRuntime,
+    acquire_asset_claim,
+)
 from biomodals.app.fold.alphafold3.execution_planning import (
+    PREPARE_ENVIRONMENT,
     SEED_PREDICTIONS,
     STAGE_INFERENCE,
     TEMPLATE_SEARCHES,
@@ -23,8 +31,12 @@ from biomodals.app.fold.alphafold3.execution_runtime import (
     _result_envelope,
     alphafold3_execution_graph,
 )
-from biomodals.app.fold.alphafold3.generation_claims import GenerationClaim
+from biomodals.app.fold.alphafold3.generation_claims import (
+    GenerationClaim,
+    generation_status,
+)
 from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
+from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS, profile_root
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -35,6 +47,7 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     GraphExecutionRunStore,
+    PreparedTaskBatch,
     ProviderCallStatus,
     ProviderDeploymentUnavailableError,
     RunStatus,
@@ -122,6 +135,7 @@ def _request(
     seeds: list[int] | None = None,
     max_gpu_containers: int = 1,
     search_msa: bool = False,
+    repair_execution_run_ids: tuple[UUID, ...] = (),
 ) -> AlphaFold3ExecutionRequest:
     return AlphaFold3ExecutionRequest.prepare(
         AF3Config(
@@ -135,6 +149,7 @@ def _request(
         max_active_gpu_provider_calls=max_gpu_containers,
         recycle=10,
         sample=1,
+        repair_execution_run_ids=repair_execution_run_ids,
     )
 
 
@@ -142,6 +157,18 @@ def _graph_inputs(tmp_path: Path):
     output = FakeVolume()
     cache = FakeVolume()
     claims = FakeClaims()
+    model_root = tmp_path / "models"
+    source_root = tmp_path / "source"
+    sharded_root = tmp_path / "sharded"
+    (model_root / "AlphaFold3").mkdir(parents=True, exist_ok=True)
+    (model_root / "AlphaFold3" / "af3.bin").touch()
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "pdb_seqres_2022_09_28.fasta").touch()
+    (source_root / "mmcif_files").mkdir(exist_ok=True)
+    for spec in DATABASE_PROFILE_SPECS:
+        root = profile_root(sharded_root, spec)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "manifest.json").touch()
     return {
         "output_volume": output,
         "search_runtime": SearchRuntime(
@@ -151,7 +178,7 @@ def _graph_inputs(tmp_path: Path):
             container_id="coordinator",
             maximum_age_seconds=100,
             wait_timeout_seconds=100,
-            sharded_root=tmp_path / "sharded",
+            sharded_root=sharded_root,
             cache_root=tmp_path / "cache",
         ),
         "template_runtime": TemplateRuntime(
@@ -161,7 +188,7 @@ def _graph_inputs(tmp_path: Path):
             container_id="coordinator",
             maximum_age_seconds=100,
             wait_timeout_seconds=100,
-            source_root=tmp_path / "source",
+            source_root=source_root,
             cache_root=tmp_path / "cache",
         ),
         "inference_runtime": InferenceRuntime(
@@ -172,6 +199,16 @@ def _graph_inputs(tmp_path: Path):
             maximum_age_seconds=100,
             summary_maximum_age_seconds=100,
             wait_timeout_seconds=100,
+        ),
+        "environment_runtime": EnvironmentRuntime(
+            model_volume=cast(Any, FakeVolume()),
+            source_volume=cast(Any, FakeVolume()),
+            sharded_volume=cast(Any, FakeVolume()),
+            claims=cast(Any, claims),
+            container_id="coordinator",
+            model_root=model_root,
+            source_root=source_root,
+            sharded_root=sharded_root,
         ),
     }
 
@@ -213,7 +250,11 @@ def _runtime(
 
 
 def _mock_staging(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(planning_module, "stage_inference_run", lambda *args: None)
+    monkeypatch.setattr(
+        planning_module,
+        "stage_inference_run_mounted",
+        lambda *args: None,
+    )
     monkeypatch.setattr(
         planning_module,
         "load_staged_inference_input",
@@ -233,10 +274,17 @@ def _owned_seed_claims(
     *,
     sample_count,
     generation_ids,
+    superseded_generation_ids,
     reload_volume,
     allow_large_inference=False,
 ):
-    del runtime, sample_count, reload_volume, allow_large_inference
+    del (
+        runtime,
+        sample_count,
+        superseded_generation_ids,
+        reload_volume,
+        allow_large_inference,
+    )
     return SeedClaimPlan(
         reused_seeds=(),
         owned=tuple(
@@ -279,6 +327,96 @@ def test_graph_preserves_the_staged_execution_plan(tmp_path: Path) -> None:
     assert plan == request.execution_plan
 
 
+def test_environment_task_waits_without_a_call_then_reuses_publication(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    inputs = _graph_inputs(tmp_path)
+    model_path = tmp_path / "models" / "AlphaFold3" / "af3.bin"
+    model_path.unlink()
+    graph = alphafold3_execution_graph(
+        request,
+        execution_run_id=RUN_ID,
+        **inputs,
+    )
+    node = cast(Any, graph.validate().nodes[PREPARE_ENVIRONMENT].node)
+    model_task = next(
+        task
+        for task in node.discover_remote_tasks(SimpleNamespace())
+        if task.task_key == "model"
+    )
+    other = replace(inputs["environment_runtime"], container_id="other-run")
+    assert (
+        acquire_asset_claim(
+            other,
+            EnvironmentAsset("model"),
+            "b" * 64,
+        )
+        is not None
+    )
+
+    waiting = node.prepare_remote_task_batch(
+        SimpleNamespace(),
+        (model_task,),
+    )
+
+    assert waiting == PreparedTaskBatch(call=None)
+
+    model_path.touch()
+    node.blocked_until.clear()
+    reused = node.prepare_remote_task_batch(
+        SimpleNamespace(),
+        (model_task,),
+    )
+
+    assert isinstance(reused, PreparedTaskBatch)
+    assert reused.call is None
+    assert tuple(reused.completed) == ("model",)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_environment_task_releases_claim_without_a_worker(
+    tmp_path: Path,
+    *,
+    cancelled: bool,
+) -> None:
+    request = _request()
+    inputs = _graph_inputs(tmp_path)
+    (tmp_path / "models" / "AlphaFold3" / "af3.bin").unlink()
+    graph = alphafold3_execution_graph(
+        request,
+        execution_run_id=RUN_ID,
+        **inputs,
+    )
+    node = cast(Any, graph.validate().nodes[PREPARE_ENVIRONMENT].node)
+    model_task = next(
+        task
+        for task in node.discover_remote_tasks(SimpleNamespace())
+        if task.task_key == "model"
+    )
+    assert not isinstance(
+        node.prepare_remote_task_batch(SimpleNamespace(), (model_task,)),
+        PreparedTaskBatch,
+    )
+
+    if cancelled:
+        node.finalize_cancelled_remote_tasks(SimpleNamespace())
+    else:
+        node.finalize_remote_tasks(
+            SimpleNamespace(),
+            {},
+            {"model": "Provider rejected submission"},
+        )
+
+    status = generation_status(
+        inputs["environment_runtime"].claims,
+        "model",
+        node._generation_id("model"),
+    )
+    assert status is not None
+    assert status["status"] == "failed"
+
+
 def test_task_result_refresh_reloads_the_template_cache(tmp_path: Path) -> None:
     inputs = _graph_inputs(tmp_path)
     graph = alphafold3_execution_graph(
@@ -312,6 +450,57 @@ def test_staged_inference_preserves_unknown_observations(
     assert node.planning.staged_inference_observation() == AvailabilityStatus.UNKNOWN
 
 
+def test_prepared_inference_retries_repaired_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = alphafold3_execution_graph(
+        _request(),
+        execution_run_id=RUN_ID,
+        **_graph_inputs(tmp_path),
+    )
+    planning = cast(Any, graph.validate().nodes[STAGE_INFERENCE].node).planning
+    prepared = object()
+    attempts = 0
+
+    def prepare(*args, **kwargs):
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        if attempts == 1:
+            raise planning_module.IncompletePrerequisiteError("profiles are not ready")
+        return prepared
+
+    monkeypatch.setattr(planning, "_enriched_config", lambda: object())
+    monkeypatch.setattr(planning_module, "prepare_inference_run", prepare)
+
+    with pytest.raises(planning_module.IncompletePrerequisiteError):
+        planning.prepared_inference()
+
+    assert planning.prepared_inference() is prepared
+    assert attempts == 2
+
+
+def test_fresh_search_run_treats_unbuilt_results_as_missing(tmp_path: Path) -> None:
+    runtime, inputs = _runtime(tmp_path, request=_request(search_msa=True))
+    for manifest in inputs["search_runtime"].sharded_root.glob(
+        "profiles/*/manifest.json"
+    ):
+        manifest.unlink()
+
+    runtime.attach()
+    runtime.advance_once()
+
+    run = runtime.store.execution.get_run(RUN_ID)
+    assert run.status != RunStatus.SUSPENDED, (
+        run,
+        runtime.store.execution.list_nodes(RUN_ID),
+    )
+    calls = runtime.store.execution.list_provider_calls(RUN_ID)
+    assert calls
+    assert {call.node_key for call in calls} == {PREPARE_ENVIRONMENT}
+
+
 def test_no_search_stages_complete_without_provider_calls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -340,6 +529,53 @@ def test_no_search_stages_complete_without_provider_calls(
     assert {
         call.node_key for call in runtime.store.execution.list_provider_calls(RUN_ID)
     }.issubset({SEED_PREDICTIONS})
+
+
+def test_local_inference_input_is_checkpointed_before_gpu_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    monkeypatch.setattr(
+        planning_module,
+        "claim_seed_predictions",
+        _owned_seed_claims,
+    )
+
+    class CheckingDriver(RecordingDriver):
+        staged_input_checkpointed = False
+
+        def spawn(self, function, *, args, kwargs):
+            assert self.staged_input_checkpointed
+            return super().spawn(function, args=args, kwargs=kwargs)
+
+    driver = CheckingDriver()
+    runtime, inputs = _runtime(tmp_path, driver=driver)
+    output_volume = inputs["output_volume"]
+    original_commit = output_volume.commit
+
+    def record_commit() -> None:
+        original_commit()
+        if any(tmp_path.rglob("staged-input.json")):
+            driver.staged_input_checkpointed = True
+
+    output_volume.commit = record_commit
+    runtime.attach()
+
+    _advance_until_calls(runtime, 1)
+
+    assert driver.staged_input_checkpointed is True
+    assert (
+        runtime.store.execution.get_node(
+            RUN_ID,
+            STAGE_INFERENCE,
+        ).status.value
+        == "succeeded"
+    )
 
 
 def test_seed_tasks_use_balanced_fixed_batches(
@@ -377,6 +613,42 @@ def test_seed_tasks_use_balanced_fixed_batches(
         for call in calls
     )
     assert len(driver.spawns) == 2
+
+
+def test_seed_claim_generations_are_stable_across_plan_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_staging(monkeypatch)
+    monkeypatch.setattr(
+        planning_module,
+        "inspect_seed_predictions",
+        _missing_seed_statuses,
+    )
+    predecessor = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    captured: dict[str, object] = {}
+
+    def claim(*args, **kwargs):
+        captured.update(kwargs)
+        return _owned_seed_claims(*args, **kwargs)
+
+    monkeypatch.setattr(planning_module, "claim_seed_predictions", claim)
+    runtime, _inputs = _runtime(
+        tmp_path,
+        request=_request(repair_execution_run_ids=(predecessor,)),
+        driver=RecordingDriver(),
+    )
+    runtime.attach()
+
+    _advance_until_calls(runtime, 1)
+
+    stable_suffix = f"{SEED_PREDICTIONS}:seed:1"
+    assert captured["generation_ids"] == {
+        1: sha256(f"{RUN_ID}:{stable_suffix}".encode()).hexdigest()
+    }
+    assert captured["superseded_generation_ids"] == {
+        1: (sha256(f"{predecessor}:{stable_suffix}".encode()).hexdigest(),)
+    }
 
 
 def test_seed_claims_follow_deployment_preflight(

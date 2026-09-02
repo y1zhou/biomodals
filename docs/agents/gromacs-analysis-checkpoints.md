@@ -11,7 +11,11 @@ repair a missing plot without changing the standalone CLI contract or
 recomputing completed molecular dynamics. The exception is narrow:
 
 - it does not reuse outputs across run names or Inputs;
-- a missing or stale member is regenerated and the pair is committed together;
+- a missing or stale member is regenerated and the pair is written together by
+  one worker;
+- no explicit Volume commit/reload is added when the next consumer is the same
+  container; successful function exit provides the later-container publication
+  boundary;
 - the API structurally validates every required CSV and PNG before publishing a
   successful Result; and
 - no new GROMACS cache stage may copy this timestamp-only contract.

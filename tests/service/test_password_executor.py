@@ -13,12 +13,18 @@ import httpx
 import pytest
 
 from biomodals.service.api import create_app
+from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService, IssuedSession, Principal
 from biomodals.service.config import ServiceSettings
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import ServiceStore
+from biomodals.service.tool_runtime import JobLifecycle
 
 ORIGIN = "https://biomodals.internal"
+
+
+class Remote:
+    pass
 
 
 @pytest.mark.parametrize(
@@ -76,15 +82,23 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
         return IssuedSession("session", "csrf", principal)
 
     monkeypatch.setattr(auth, auth_method, slow_password_operation)
+    settings = ServiceSettings.from_environment({})
+    cache = ArtifactCache(tmp_path / "cache")
+    remote = Remote()
+    lifecycle = JobLifecycle(store, remote, (), cache)
     app = create_app(
         store=store,
         auth=auth,
         configuration=RuntimeConfiguration(
             store,
-            ServiceSettings.from_environment({}),
-            workload_definitions=[],
+            settings,
+            tool_definitions=(),
         ),
-        workloads=[],
+        registrations=(),
+        tool_routers=(),
+        remote=remote,
+        lifecycle=lifecycle,
+        cache=cache,
         allowed_origin=ORIGIN,
         secure_cookies=True,
     )

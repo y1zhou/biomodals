@@ -5282,7 +5282,6 @@ def _run_oligoformer_postprocess_locked(
     if off_target:
         for stem in refreshed_plan.output_stems:
             _cleanup_off_target_transients(layout.prep_dir / "off_target" / stem)
-        CONF.output_volume.commit()
     return _package_output_tables(output_dir, refreshed_plan.output_stems)
 
 
@@ -5613,7 +5612,7 @@ def publish_oligoformer_outputs(
 ##########################################
 @app.cls(
     cpu=(0.125, 4.125),
-    memory=(1024, 16384),
+    memory=(256, 65536),
     timeout=MAX_TIMEOUT,
     max_containers=1,
     scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,

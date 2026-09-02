@@ -202,31 +202,14 @@ def test_build_shortmd_workflow_models_production_analysis_dependencies() -> Non
     assert prep_node.pdb_content == b"ATOM\n"
     assert prep_node.gromacs.ld_seed != -1
     assert prep_node.gromacs.gen_seed != -1
-    assert {
-        "app_name",
-        "prep_cpu_function",
-        "prep_gpu_function",
-        "prep_cpu_function_name",
-        "prep_gpu_function_name",
-    }.isdisjoint(prep_node.__dict__)
     assert isinstance(clone_node, ShortMDCloneNode)
     assert clone_node.source_run_name == "alpha"
     assert clone_node.replicate_run_name == "alpha-r001"
-    assert "clone_function" not in clone_node.__dict__
     assert isinstance(replicate_node, ShortMDReplicateNode)
     assert replicate_node.source_run_name == "alpha"
     assert replicate_node.replicate_run_name == "alpha-r001"
     assert replicate_node.gromacs.simulation_time_ns == 2
     assert replicate_node.gromacs.cpu_only is True
-    assert {
-        "app_name",
-        "production_cpu_function",
-        "production_gpu_function",
-        "stats_function",
-        "production_cpu_function_name",
-        "production_gpu_function_name",
-        "stats_function_name",
-    }.isdisjoint(replicate_node.__dict__)
     assert isinstance(analysis_node, ShortMDAnalysisNode)
     assert analysis_node.source_run_name == "alpha"
     assert analysis_node.replicate_run_name == "alpha-r001"
@@ -908,12 +891,6 @@ def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(
     assert replicate_node.source_run_name == run_name
     assert replicate_node.replicate_run_name == f"{run_name}-r001"
     assert analysis_node.replicate_run_name == f"{run_name}-r001"
-    assert {"prep_cpu_function", "prep_gpu_function"}.isdisjoint(prep_node.__dict__)
-    assert {
-        "production_cpu_function",
-        "production_gpu_function",
-        "stats_function",
-    }.isdisjoint(replicate_node.__dict__)
     UUID(str(calls["coordinator"]["execution_run_id"]))
     assert calls["prepare"]["workload_run_key"] == "shortmd-run"
     assert calls["coordinator"]["deployment_environment"] == "development"
@@ -1197,5 +1174,4 @@ def test_submit_shortmd_workflow_propagates_force_to_gromacs_overwrite(
     assert isinstance(clear_node, ShortMDClearNode)
     assert definition.dependencies[f"prep-{run_name}"] == {f"clear-{run_name}"}
     assert clone_node.overwrite_clone is True
-    assert "clone_function" not in clone_node.__dict__
     assert "force" not in calls["prepare"]

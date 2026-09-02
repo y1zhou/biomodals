@@ -321,12 +321,13 @@ run-scoped remote coordinators. It owns Modal request staging, launch lineage,
 Volume-backed ledgers, synchronization, and shared CLI submission mechanics.
 _Avoid_: Execution Kernel, workload app, universal deployed coordinator
 
-**App Run Ledger**:
-The physical per-run SQLite Execution State Repository for a Direct CLI App
-Run, stored at
-`.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in that app
-deployment's configured durable Volume.
-_Avoid_: scientific output directory, Workflow Ledger, shared execution Volume
+**Remote Run Ledger**:
+The physical per-run SQLite Execution State Repository owned by a deployed app
+or workflow's Run-Scoped Coordinator Pool. It is stored at
+`.biomodals/execution/runs/<execution-run-id>/ledger.sqlite3` in that
+deployment's configured durable Volume whether the Run was submitted by the
+CLI or the API service.
+_Avoid_: Service Job database, scientific output directory, shared execution Volume
 
 **Execution Coordinator**:
 The logical scheduling authority that serializes transitions in an Execution
@@ -368,6 +369,15 @@ An explicit CLI version wins; otherwise the provider integration resolves and
 pins the deployment once.
 _Avoid_: floating latest handle, semantic app version, source revision alone
 
+**Execution Locator**:
+The durable pair of Execution Run ID and exact Deployment Identity needed to
+reconstruct a deployed Run-Scoped Coordinator Pool. A root coordinator
+Function Call ID may accompany it as submission evidence and a diagnostic, but
+is not the Run's identity or primary address.
+An API Tool Run deliberately uses the same UUID for its Service Job ID and
+Execution Run ID, but that UUID alone is not a remote locator.
+_Avoid_: Job ID alone, latest deployment, Function Call ID alone, ledger path
+
 **Deployed CLI Run**:
 A top-level app or workflow Execution Run submitted by the Biomodals CLI to an
 exact Deployment Identity. It may be observed or resumed across local CLI
@@ -382,6 +392,13 @@ Run; `--restart-from <execution-run-id>` explicitly creates a Successor
 Execution Run and is a convenience over the generic restart command.
 _Avoid_: Child App Call, local scheduler, API Job
 
+**API Tool Run**:
+A top-level Execution Run submitted by the API service to the exact deployed
+coordinator of one registered Tool. Its Remote Run Ledger is the sole
+authoritative execution state; the Service Job stores only its Execution
+Locator and a bounded Job State Projection.
+_Avoid_: service-local Execution Run, Child App Call, duplicate scheduler ledger
+
 **Development CLI Run**:
 An explicitly requested source-backed app or workflow run using an ephemeral
 Modal deployment. It may use the remote kernel but promises no
@@ -394,15 +411,62 @@ result delivery, and presentation that refers to an Execution Run without
 persisting a duplicate compute state.
 _Avoid_: Execution Run, Task, provider call
 
+**Tool**:
+A user-facing scientific capability registered with the API service, such as
+GROMACS MD simulation or AlphaFold3 structure prediction. A Tool owns its
+typed submission and Result contract and selects one deployed app or workflow;
+the selected execution plan remains a Workload in kernel vocabulary.
+_Avoid_: Workload, Modal App, individual provider function
+
+**Tool Definition**:
+The static service metadata for one Tool: stable key, display name, ordered
+semantic stages, default deployment and limits, and log-visibility default.
+_Avoid_: scientific request parser, runtime client, dynamic plugin
+
+**Tool Adapter**:
+The narrow service integration that validates and stages one Tool's scientific
+request and retrieves its published Result. Shared remote execution lifecycle,
+status, cancellation, logs, and deployment lookup do not belong here.
+_Avoid_: Execution Coordinator, per-Tool reconciler, generic artifact framework
+
+**Remote Execution Client**:
+The shared service-side Modal integration that launches and addresses deployed
+coordinators, polls root Function Calls, refreshes bounded status, cancels Runs,
+lists Provider Calls, and retrieves their logs. It operates on Execution
+Locators and contains no Tool-specific scientific input or output logic.
+_Avoid_: Tool Adapter, Execution Coordinator, service scheduler
+
 **Job State Projection**:
-The user-facing Job state and timeline derived from an Execution Run together
-with Service Job result-delivery metadata.
-_Avoid_: persisted scheduler state, duplicate task status
+The bounded, locally persisted user-facing status, semantic-stage timeline,
+and per-stage Task counts most recently observed from an Execution Run,
+combined with Service Job result-delivery metadata. It accelerates Job lists
+and survives temporary provider unavailability, but never authorizes
+execution, cancellation, or retry.
+_Avoid_: persisted scheduler state, copied Tasks, copied Provider Calls
 
 **Workload Publication**:
 Workload-owned durable evidence that a Task's scientific output is complete
 and reusable.
 _Avoid_: provider success, build claim, database status alone
+
+**Environment Asset**:
+An app-owned model checkpoint, reference dataset, or immutable derived profile
+shared by compatible Execution Runs in one provider environment. Its cheap
+readiness check may be only the expected final path's existence; scientific
+operations remain responsible for detecting incompatible contents.
+_Avoid_: per-Run artifact, execution result, local service cache
+
+**Environment Setup Claim**:
+An environment-scoped writer election that prevents concurrent Runs or app
+deployments from provisioning the same missing Environment Asset. The asset's
+final path or publication—not the claim—indicates readiness.
+_Avoid_: Task ownership, completion marker, permanent setup flag
+
+**Environment Preparation Node**:
+An app-owned Execution Node whose independent Tasks provision the Environment
+Assets required by one Run. Its Tasks use normal kernel admission and Run-Level
+Provider Call Limits while sharing completed assets with other Runs.
+_Avoid_: service preflight, deployment hook, hidden provider fan-out
 
 **Execution Artifact**:
 A durable, provider-neutral record of data produced or consumed by an
@@ -456,12 +520,19 @@ A code-owned identifier for one immutable Sharded Database Profile, fixing its s
 _Avoid_: current profile, database ID, manifest digest
 
 **Profile Build Claim**:
-A minimal, append-only Modal Dict election record allowing one invocation to construct one Profile ID. Conflicts fail fast; a later explicit invocation may advance beyond a failed or conservatively stale generation.
+A minimal, append-only Modal Dict election record allowing one invocation to
+construct one Profile ID. Losing Runs keep their Tasks pending without
+submitting duplicate Provider Calls; a later invocation may advance beyond a
+failed or conservatively stale generation.
 _Avoid_: published profile, search build claim, polling lock service
 
 **Source FASTA Policy**:
-The explicit post-publication choice to keep, round-trip-verify and archivally compress, or delete an original database FASTA after its Sharded Database Profile is durably validated. A compressed source must be restored manually before another profile build.
-_Avoid_: temporary builder cleanup, shard compression, implicit retention, automatic source restore
+The post-publication choice to keep, round-trip-verify and archivally compress,
+or delete an original database FASTA after its Sharded Database Profile is
+durably validated. Automatic setup deletes reconstructable profile sources;
+template-search reference files remain available because workers read them
+directly.
+_Avoid_: temporary builder cleanup, shard compression, implicit retention
 
 **Database Search Space**:
 The full unsharded database size used by HMMER to scale hit E-values across a Sharded Database Profile. It is the exact sequence count for protein searches and the exact nucleotide count expressed in megabases for RNA searches.

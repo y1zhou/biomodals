@@ -14,7 +14,7 @@ from biomodals.app.bioinfo.gromacs_execution import (
     operation_task_plan,
 )
 from biomodals.execution import ProviderBinding
-from biomodals.service.workloads import GROMACS_WORKLOAD
+from biomodals.service.tools import GROMACS_TOOL
 
 
 def test_preparation_fans_out_and_production_analysis_joins_production() -> None:
@@ -56,9 +56,16 @@ def test_every_planned_operation_has_public_stage_metadata(
     )
 
     for operation_name in plan.node_keys[:-1]:
-        stage = GROMACS_WORKLOAD.stage(operation_name)
+        stage = next(
+            (
+                stage
+                for stage in GROMACS_TOOL.stages
+                if operation_name in stage.node_keys
+            ),
+            None,
+        )
         assert stage is not None
-        assert stage.function_name in REQUIRED_FUNCTIONS
+        assert operation_name.split(":", 1)[0] in REQUIRED_FUNCTIONS
 
 
 def test_invocations_reproduce_the_established_modal_function_contract() -> None:

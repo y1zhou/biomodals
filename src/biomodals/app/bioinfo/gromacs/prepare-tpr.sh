@@ -270,7 +270,6 @@ fi
 # NVT
 if [ ! -f "${workdir}/nvt_${sample_id}.gro" ]; then
   cp "${SCRIPT_PATH}/gmx_mdp/nvt.mdp" "${workdir}/"
-  sed -i 's/= -DPOSRES/=-DFLEXIBLE/g' "${workdir}/nvt.mdp"
   sed -i -E "s/^(ld-seed[[:space:]]*=)[^;]*/\1 ${ld_seed}/" "${workdir}/nvt.mdp"
   sed -i -E "s/^(gen-seed[[:space:]]*=)[^;]*/\1 ${gen_seed}/" "${workdir}/nvt.mdp"
   "${gmx_exe}" grompp \
@@ -285,7 +284,6 @@ fi
 # NPT
 if [ ! -f "${workdir}/npt_${sample_id}.gro" ]; then
   cp "${SCRIPT_PATH}/gmx_mdp/npt.mdp" "${workdir}/"
-  sed -i 's/= -DPOSRES/=-DFLEXIBLE/g' "${workdir}/npt.mdp"
   sed -i -E "s/^(ld-seed[[:space:]]*=)[^;]*/\1 ${ld_seed}/" "${workdir}/npt.mdp"
   "${gmx_exe}" grompp \
     -f "${workdir}/npt.mdp" \

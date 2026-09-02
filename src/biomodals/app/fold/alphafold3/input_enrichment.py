@@ -72,7 +72,7 @@ def fill_missing_msa_for_inference(config: AF3Config) -> AF3Config:
                 protein.pairedMsaPath,
             ):
                 protein.pairedMsa = ""
-            if not protein.templates:
+            if protein.templates is None:
                 protein.templates = []
         elif (rna := entry.rna) is not None and not field_is_populated(
             rna.unpairedMsa,
@@ -224,7 +224,7 @@ def apply_msa_resolution(
             if not state.paired_present:
                 protein.pairedMsa = fields["pairedMsa"]
                 protein.pairedMsaPath = None
-            if not search_protein_templates and not protein.templates:
+            if not search_protein_templates and protein.templates is None:
                 protein.templates = []
         elif (rna := entry.rna) is not None and not state.unpaired_present:
             rna.unpairedMsa = fields["unpairedMsa"]
@@ -238,16 +238,28 @@ def _resolved_msa_text(
     *,
     field_name: str,
 ) -> str:
-    if inline_value and path_value:
+    if inline_value is not None and path_value is not None:
         raise ValueError(f"{field_name} cannot set both inline and path forms")
-    if inline_value:
+    if inline_value is not None:
         return inline_value
-    if path_value:
+    if path_value is not None:
         value = Path(path_value).read_text()
         if not value:
             raise ValueError(f"{field_name} path is empty: {path_value}")
         return value
     raise ValueError(f"{field_name} is unresolved")
+
+
+def _template_search_msa(sequence: str, resolved_unpaired_msa: str) -> str:
+    """Return template-search input for supplied MSA evidence.
+
+    The upstream data pipeline turns an explicit empty MSA into a one-query
+    alignment before template search. Reproduce that CPU-side behavior here so
+    inference workers remain limited to model inference.
+    """
+    if resolved_unpaired_msa:
+        return resolved_unpaired_msa
+    return f">query\n{sequence}\n"
 
 
 def plan_template_searches(
@@ -264,19 +276,20 @@ def plan_template_searches(
         protein = config.sequences[state.chain_index].protein
         if protein is None:
             raise RuntimeError("Protein MSA state no longer matches its chain")
-        if protein.templates:
+        if protein.templates is not None:
             continue
         reference = resolution.unpaired_references.get(("protein", state.sequence))
         publish_canonical = not state.unpaired_present and reference is not None
-        unpaired_msa = (
-            None
-            if publish_canonical
-            else _resolved_msa_text(
-                protein.unpairedMsa,
-                protein.unpairedMsaPath,
-                field_name=f"sequences[{state.chain_index}].protein.unpairedMsa",
+        unpaired_msa = None
+        if not publish_canonical:
+            unpaired_msa = _template_search_msa(
+                state.sequence,
+                _resolved_msa_text(
+                    protein.unpairedMsa,
+                    protein.unpairedMsaPath,
+                    field_name=(f"sequences[{state.chain_index}].protein.unpairedMsa"),
+                ),
             )
-        )
         candidate = TemplateTask(
             sequence=state.sequence,
             unpaired_msa=unpaired_msa,

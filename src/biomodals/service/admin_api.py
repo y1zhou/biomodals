@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
@@ -35,7 +36,6 @@ from biomodals.service.runtime_config import (
 from biomodals.service.store import (
     JobNotFoundError,
     JobStateResolutionError,
-    JobStateUnknownReason,
     LastActiveAdminError,
     ServiceStore,
     UserAlreadyExistsError,
@@ -51,7 +51,9 @@ BlockingCategory = Literal[
     "local_storage",
     "modal_configuration",
     "modal_unavailable",
+    "remote_execution_suspended",
     "result_integrity",
+    "result_preparation_failed",
 ]
 
 
@@ -218,11 +220,10 @@ class AdminModalEnvironmentView(BaseModel):
 
 
 class AdminModalToolView(BaseModel):
-    """One fixed workload's deployment and admission state."""
+    """One fixed Tool's deployment, admission, and execution limits."""
 
-    workload: str
+    tool: str
     display_name: str
-    modal_app_name: TextSettingView
     modal_app_version: IntegerSettingView
     active_jobs: int
     active_job_limit: IntegerSettingView
@@ -233,11 +234,24 @@ class AdminStateUnknownJobView(BaseModel):
     """Safe Job identity needed for manual Modal review."""
 
     job_id: UUID
-    workload: str
+    tool: str
     display_name: str
-    run_name: str | None
-    reason: JobStateUnknownReason
+    reason: str
+    diagnostic_message: str | None
+    modal_environment: str
+    modal_app_name: str
+    modal_app_version: int
+    root_function_call_id: str | None
     state_unknown_at: datetime
+
+
+class ResolveStateUnknownJobRequest(BaseModel):
+    """One explicit safe outcome after an Administrator checks Modal."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    resolution: Literal["resume", "requeue", "cancel"]
+    function_call_id: str | None = Field(default=None, max_length=200)
 
 
 class AdminModalView(BaseModel):
@@ -247,6 +261,25 @@ class AdminModalView(BaseModel):
     tools: list[AdminModalToolView]
     state_unknown_jobs: list[AdminStateUnknownJobView]
     blocked_jobs: list[AdminBlockedJobsView]
+
+
+class AdminCostGroupView(BaseModel):
+    """One Modal billing attribution group."""
+
+    name: str
+    cost: Decimal
+
+
+class AdminCostsView(BaseModel):
+    """One explicit workspace billing interval."""
+
+    start: datetime
+    end: datetime
+    resolution: Literal["h", "d"]
+    total: Decimal
+    environments: list[AdminCostGroupView]
+    tools: list[AdminCostGroupView]
+    other_workspace_usage: Decimal
 
 
 class AdminBlockedJobsView(BaseModel):
@@ -266,6 +299,10 @@ class AdminStorageView(BaseModel):
     local_cache_bytes: int
     staging_entries: int
     staging_bytes: int
+    pending_request_entries: int
+    pending_request_bytes: int
+    validation_entries: int
+    validation_bytes: int
     free_bytes: int
     warning_threshold_bytes: int
     over_warning_threshold: bool
@@ -299,12 +336,6 @@ class UpdateAdminModalEnvironmentRequest(BaseModel):
 class UpdateAdminModalToolRequest(BaseModel):
     """Editable per-Tool Modal configuration."""
 
-    modal_app_name: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=120,
-        description="Omit to keep unchanged; null restores the configured default.",
-    )
     modal_app_version: int | None = Field(
         default=None,
         ge=1,
@@ -388,33 +419,32 @@ def _modal_view(
         ),
         tools=[
             AdminModalToolView(
-                workload=workload.workload,
-                display_name=configuration.workload_definition(
-                    workload.workload
-                ).display_name,
-                modal_app_name=_text_view(workload.modal_app_name),
-                modal_app_version=_integer_view(workload.modal_app_version),
-                active_jobs=store.count_active_jobs(workload.workload),
-                active_job_limit=_integer_view(workload.active_job_limit),
-                job_logs_visible_to_owner=_boolean_view(
-                    workload.job_logs_visible_to_owner
-                ),
+                tool=tool.tool,
+                display_name=configuration.tool_definition(tool.tool).display_name,
+                modal_app_version=_integer_view(tool.modal_app_version),
+                active_jobs=store.count_active_jobs(tool.tool),
+                active_job_limit=_integer_view(tool.active_job_limit),
+                job_logs_visible_to_owner=_boolean_view(tool.job_logs_visible_to_owner),
             )
-            for workload in (
-                configuration.workload(name) for name in configuration.workload_names()
+            for tool in (
+                configuration.tool(name) for name in configuration.tool_names()
             )
         ],
         state_unknown_jobs=[
             AdminStateUnknownJobView(
                 job_id=job.job_id,
-                workload=job.workload,
+                tool=job.tool,
                 display_name=job.display_name,
-                run_name=job.run_name,
-                reason=job.state_unknown_reason,
-                state_unknown_at=datetime.fromtimestamp(job.state_unknown_at, UTC),
+                reason=job.state_reason,
+                diagnostic_message=job.state_message,
+                modal_environment=job.modal_environment,
+                modal_app_name=job.modal_app_name,
+                modal_app_version=job.modal_app_version,
+                root_function_call_id=job.root_function_call_id,
+                state_unknown_at=datetime.fromtimestamp(job.updated_at, UTC),
             )
             for job in store.list_state_unknown_jobs()
-            if job.state_unknown_at is not None and job.state_unknown_reason is not None
+            if job.state_reason is not None
         ],
         blocked_jobs=[
             AdminBlockedJobsView(
@@ -437,6 +467,16 @@ async def _storage_view(request: Request) -> AdminStorageView:
     usage = await cache.usage_async()
     store: ServiceStore = request.app.state.store
     published = store.published_result_usage()
+    pending = (
+        await asyncio.to_thread(request.app.state.pending_requests.usage)
+        if request.app.state.pending_requests is not None
+        else (0, 0)
+    )
+    validations = (
+        await asyncio.to_thread(request.app.state.validated_inputs.usage)
+        if request.app.state.validated_inputs is not None
+        else (0, 0)
+    )
     threshold = request.app.state.configuration.settings.cache_warning_bytes
     return AdminStorageView(
         published_result_entries=published.entries,
@@ -445,9 +485,16 @@ async def _storage_view(request: Request) -> AdminStorageView:
         local_cache_bytes=usage.cached_bytes,
         staging_entries=usage.staging_entries,
         staging_bytes=usage.staging_bytes,
+        pending_request_entries=pending[0],
+        pending_request_bytes=pending[1],
+        validation_entries=validations[0],
+        validation_bytes=validations[1],
         free_bytes=usage.free_bytes,
         warning_threshold_bytes=threshold,
-        over_warning_threshold=(usage.cached_bytes + usage.staging_bytes > threshold),
+        over_warning_threshold=(
+            usage.cached_bytes + usage.staging_bytes + pending[1] + validations[1]
+            > threshold
+        ),
         reclaimable_entries=usage.reclaimable_entries,
         reclaimable_bytes=usage.reclaimable_bytes,
     )
@@ -627,6 +674,50 @@ def create_admin_router() -> APIRouter:
     ) -> AdminStorageView:
         return await _storage_view(request)
 
+    @router.get("/modal/costs", response_model=AdminCostsView)
+    async def modal_costs(
+        request: Request,
+        _session: Annotated[AuthenticatedSession, Depends(require_admin)],
+        start: datetime,
+        end: datetime,
+        refresh: bool = False,
+    ) -> AdminCostsView:
+        """Return optional Modal billing without affecting service readiness."""
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise HTTPException(400, "Billing interval must be timezone-aware")
+        resolution: Literal["h", "d"] = (
+            "h" if (end - start).total_seconds() <= 2 * 86400 else "d"
+        )
+        try:
+            summary = await request.app.state.billing.report(
+                start=start,
+                end=end,
+                resolution=resolution,
+                refresh=refresh,
+            )
+        except Exception as error:
+            LOGGER.exception("Modal billing report is unavailable")
+            raise CodedAPIError(
+                503,
+                "modal_billing_unavailable",
+                "Modal billing is unavailable for this workspace or interval",
+            ) from error
+        return AdminCostsView(
+            start=start,
+            end=end,
+            resolution=resolution,
+            total=summary.total,
+            environments=[
+                AdminCostGroupView(name=item.name, cost=item.cost)
+                for item in summary.environments
+            ],
+            tools=[
+                AdminCostGroupView(name=item.name, cost=item.cost)
+                for item in summary.tools
+            ],
+            other_workspace_usage=summary.other,
+        )
+
     @router.post(
         "/storage/cache/clear",
         response_model=AdminCacheCleanupView,
@@ -654,7 +745,7 @@ def create_admin_router() -> APIRouter:
         )
 
     @router.post(
-        "/modal/state-unknown-jobs/{job_id}/mark-failed",
+        "/modal/state-unknown-jobs/{job_id}/resolve",
         response_model=AdminModalView,
         responses={
             **mutation_responses,
@@ -662,14 +753,28 @@ def create_admin_router() -> APIRouter:
             409: {"model": AdminJobStateConflictResponse},
         },
     )
-    async def mark_state_unknown_job_failed(
+    async def resolve_state_unknown_job(
         request: Request,
         job_id: UUID,
+        submission: ResolveStateUnknownJobRequest,
         _session: Annotated[AuthenticatedSession, Depends(require_unsafe_admin)],
     ) -> AdminModalView:
         store: ServiceStore = request.app.state.store
         try:
-            store.resolve_state_unknown(job_id, now=int(time.time()))
+            await request.app.state.lifecycle.resolve_state_unknown(
+                job_id,
+                resolution=submission.resolution,
+                function_call_id=(
+                    submission.function_call_id.strip()
+                    if submission.function_call_id
+                    else None
+                ),
+            )
+            if submission.resolution == "resume":
+                await request.app.state.lifecycle.advance(
+                    job_id,
+                    force_refresh=True,
+                )
         except JobNotFoundError as exc:
             raise HTTPException(404, "Job not found") from exc
         except JobStateResolutionError as exc:
@@ -679,8 +784,9 @@ def create_admin_router() -> APIRouter:
                 "This Job no longer has unknown remote state",
             ) from exc
         LOGGER.info(
-            "event=state_unknown_resolved job_id=%s resolution=failed request_id=%s",
+            "event=state_unknown_resolved job_id=%s resolution=%s request_id=%s",
             job_id,
+            submission.resolution,
             request_id_from(request),
         )
         return _modal_view(request.app.state.configuration, store)
@@ -721,15 +827,16 @@ def create_admin_router() -> APIRouter:
                     "Modal environment must not be empty",
                 )
             try:
-                registrations = request.app.state.workloads
-                for workload_name, registration in registrations.items():
-                    if registration.preflight is None:
-                        continue
-                    effective = configuration.workload(workload_name)
-                    await registration.preflight(
-                        effective.modal_app_name.value,
-                        candidate_environment,
-                        effective.modal_app_version.value,
+                from biomodals.execution import DeploymentIdentity
+
+                for tool_name in request.app.state.registrations:
+                    effective = configuration.tool(tool_name)
+                    await request.app.state.remote_execution.preflight(
+                        DeploymentIdentity(
+                            candidate_environment,
+                            effective.modal_app_name,
+                            effective.modal_app_version.value,
+                        )
                     )
             except Exception as exc:
                 LOGGER.exception(
@@ -758,7 +865,7 @@ def create_admin_router() -> APIRouter:
         return _modal_view(configuration, request.app.state.store).environment
 
     @router.patch(
-        "/modal/tools/{workload}",
+        "/modal/tools/{tool}",
         response_model=AdminModalToolView,
         dependencies=[Depends(serialize_runtime_configuration_mutation)],
         responses={
@@ -770,28 +877,18 @@ def create_admin_router() -> APIRouter:
     )
     async def update_modal_tool(
         request: Request,
-        workload: str,
+        tool: str,
         submission: UpdateAdminModalToolRequest,
         _session: Annotated[AuthenticatedSession, Depends(require_unsafe_admin)],
     ) -> AdminModalToolView:
         configuration: RuntimeConfiguration = request.app.state.configuration
-        registration = request.app.state.workloads.get(workload)
+        registration = request.app.state.registrations.get(tool)
         if registration is None:
             raise HTTPException(404, "Tool not found")
-        provider_fields = {"modal_app_name", "modal_app_version"}
+        provider_fields = {"modal_app_version"}
         if submission.model_fields_set & provider_fields:
-            effective = configuration.workload(workload)
-            definition = configuration.workload_definition(workload)
-            if (
-                "modal_app_name" in submission.model_fields_set
-                and not effective.modal_app_name.editable
-            ):
-                raise CodedAPIError(
-                    409,
-                    "setting_overridden",
-                    f"{definition.modal_app_name_environment} is controlled by "
-                    "an environment variable",
-                )
+            effective = configuration.tool(tool)
+            definition = configuration.tool_definition(tool)
             if (
                 "modal_app_version" in submission.model_fields_set
                 and not effective.modal_app_version.editable
@@ -802,60 +899,48 @@ def create_admin_router() -> APIRouter:
                     f"{definition.modal_app_version_environment} is controlled "
                     "by an environment variable",
                 )
-            candidate_app_name = effective.modal_app_name.value
-            if "modal_app_name" in submission.model_fields_set:
-                candidate_app_name = (
-                    configuration.modal_app_name_fallback(workload)
-                    if submission.modal_app_name is None
-                    else submission.modal_app_name.strip()
-                )
-            if not candidate_app_name:
-                raise CodedAPIError(
-                    400,
-                    "setting_invalid",
-                    "Modal app name must not be empty",
-                )
+            candidate_app_name = effective.modal_app_name
             candidate_app_version = effective.modal_app_version.value
             if "modal_app_version" in submission.model_fields_set:
                 candidate_app_version = (
-                    configuration.modal_app_version_fallback(workload)
+                    configuration.modal_app_version_fallback(tool)
                     if submission.modal_app_version is None
                     else submission.modal_app_version
                 )
-            if registration.preflight is not None:
-                try:
-                    await registration.preflight(
-                        candidate_app_name,
+            try:
+                from biomodals.execution import DeploymentIdentity
+
+                await request.app.state.remote_execution.preflight(
+                    DeploymentIdentity(
                         configuration.modal_environment().value,
+                        candidate_app_name,
                         candidate_app_version,
                     )
-                except Exception as exc:
-                    LOGGER.exception(
-                        "Modal App preflight failed for %s request_id=%s",
-                        workload,
-                        request_id_from(request),
-                    )
-                    raise CodedAPIError(
-                        400,
-                        "modal_preflight_failed",
-                        "The configured Modal resources could not be validated",
-                    ) from exc
+                )
+            except Exception as exc:
+                LOGGER.exception(
+                    "Modal App preflight failed for %s request_id=%s",
+                    tool,
+                    request_id_from(request),
+                )
+                raise CodedAPIError(
+                    400,
+                    "modal_preflight_failed",
+                    "The exact deployed ExecutionCoordinator is unavailable or incompatible",
+                ) from exc
         try:
-            configuration.set_workload(
-                workload, **submission.model_dump(exclude_unset=True)
-            )
+            configuration.set_tool(tool, **submission.model_dump(exclude_unset=True))
         except SettingOverrideError as exc:
             raise CodedAPIError(409, "setting_overridden", str(exc)) from exc
         except ValueError as exc:
             raise CodedAPIError(400, "setting_invalid", str(exc)) from exc
         LOGGER.info(
-            "event=runtime_setting_changed scope=tool workload=%s fields=%s "
-            "request_id=%s",
-            workload,
+            "event=runtime_setting_changed scope=tool tool=%s fields=%s request_id=%s",
+            tool,
             ",".join(sorted(submission.model_fields_set)),
             request_id_from(request),
         )
         view = _modal_view(configuration, request.app.state.store)
-        return next(tool for tool in view.tools if tool.workload == workload)
+        return next(item for item in view.tools if item.tool == tool)
 
     return router

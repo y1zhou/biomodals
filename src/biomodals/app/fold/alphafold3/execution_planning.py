@@ -35,6 +35,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     PreparedInferenceRun,
     load_staged_inference_input,
     prepare_inference_run,
+    stage_inference_run_mounted,
     validate_upstream_af3_input,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
@@ -52,16 +53,17 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
     build_invocation_receipt,
     load_invocation_manifest,
 )
-from biomodals.app.fold.alphafold3.modal_adapters import (
-    publish_invocation_receipt,
-    stage_inference_run,
-)
+from biomodals.app.fold.alphafold3.modal_adapters import publish_invocation_receipt
 from biomodals.app.fold.alphafold3.msa_search import (
     MsaAssemblyTask,
     RawSearchTask,
     SearchRuntime,
     inspect_msa_cache,
     plan_msa_resolution,
+)
+from biomodals.app.fold.alphafold3.profiles import (
+    profile_root,
+    resolve_database_profile,
 )
 from biomodals.app.fold.alphafold3.request_results import (
     RequestPublication,
@@ -90,6 +92,7 @@ from biomodals.schema import AppRunResult, AppRunStatus
 
 (
     STAGE_REQUEST,
+    PREPARE_ENVIRONMENT,
     RAW_SEARCHES,
     MSA_ASSEMBLIES,
     TEMPLATE_SEARCHES,
@@ -144,13 +147,7 @@ class AlphaFold3ExecutionPlanning:
             tuple[MsaAssemblyTask, ...], tuple[dict[str, object], ...]
         ] = {}
         self._prepared_inference_cache: PreparedInferenceRun | None = None
-        self._prepared_inference_error: IncompletePrerequisiteError | None = None
         self._seed_prediction_cache: dict[int, dict[str, object]] | None = None
-
-    def refresh(self, changed_nodes: Collection[str] | None = None) -> None:
-        """Refresh worker publications and invalidate dependent planning caches."""
-        self.output_volume.reload()
-        self.invalidate(changed_nodes)
 
     def invalidate(self, changed_nodes: Collection[str] | None = None) -> None:
         """Discard observations affected by newly published workload state."""
@@ -165,7 +162,6 @@ class AlphaFold3ExecutionPlanning:
             self._combined_msa_cache.clear()
         if changed & {RAW_SEARCHES, MSA_ASSEMBLIES, TEMPLATE_SEARCHES}:
             self._prepared_inference_cache = None
-            self._prepared_inference_error = None
         if changed & {
             RAW_SEARCHES,
             MSA_ASSEMBLIES,
@@ -267,11 +263,27 @@ class AlphaFold3ExecutionPlanning:
 
     def generation_id(self, node_key: str, item: PlannedTask) -> str:
         """Bind one workload writer generation to its Execution Task."""
+        return self._generation_id(self.execution_run_id, node_key, item)
+
+    def superseded_generation_ids(
+        self,
+        node_key: str,
+        item: PlannedTask,
+    ) -> tuple[str, ...]:
+        """Identify only terminal service Runs authorized for claim repair."""
+        return tuple(
+            self._generation_id(execution_run_id, node_key, item)
+            for execution_run_id in self.request.repair_execution_run_ids
+        )
+
+    def _generation_id(
+        self,
+        execution_run_id: UUID,
+        node_key: str,
+        item: PlannedTask,
+    ) -> str:
         return sha256(
-            (
-                f"{self.execution_run_id}:{node_key}:"
-                f"{self.task_fingerprint(node_key, item)}"
-            ).encode()
+            f"{execution_run_id}:{node_key}:{item.plan.task_key}".encode()
         ).hexdigest()
 
     def task_call(self, node_key: str, item: PlannedTask) -> ProviderCallSpec:
@@ -283,6 +295,9 @@ class AlphaFold3ExecutionPlanning:
                 "database_id": task.database_id,
                 "sequence": task.sequence,
                 "generation_id": self.generation_id(node_key, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    node_key, item
+                ),
                 "execution_result_path": path.as_posix(),
             }
             function_name = "search_database_msa"
@@ -294,6 +309,9 @@ class AlphaFold3ExecutionPlanning:
                 "include_unpaired": task.include_unpaired,
                 "include_paired": task.include_paired,
                 "generation_id": self.generation_id(node_key, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    node_key, item
+                ),
                 "execution_result_path": path.as_posix(),
             }
             function_name = "assemble_sequence_msas"
@@ -310,6 +328,9 @@ class AlphaFold3ExecutionPlanning:
                 "publish_canonical": task.publish_canonical,
                 "max_template_date": task.max_template_date,
                 "generation_id": self.generation_id(node_key, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    node_key, item
+                ),
                 "execution_result_path": path.as_posix(),
             }
             function_name = "search_protein_templates"
@@ -363,6 +384,13 @@ class AlphaFold3ExecutionPlanning:
             sample_count=prepared.sample_count,
             generation_ids={
                 cast(int, item.value): self.generation_id(SEED_PREDICTIONS, item)
+                for item in items
+            },
+            superseded_generation_ids={
+                cast(int, item.value): self.superseded_generation_ids(
+                    SEED_PREDICTIONS,
+                    item,
+                )
                 for item in items
             },
             reload_volume=False,
@@ -516,15 +544,17 @@ class AlphaFold3ExecutionPlanning:
     def stage_inference(self) -> AppRunResult:
         """Publish and revalidate the immutable inference input."""
         prepared = self.prepared_inference()
-        stage_inference_run(self.output_volume, prepared)
-        self.refresh({STAGE_INFERENCE})
+        stage_inference_run_mounted(self.inference_runtime.output_root, prepared)
         if self.staged_inference_observation() != AvailabilityStatus.AVAILABLE:
             raise RuntimeError("Staged AlphaFold3 input changed")
         return AppRunResult(status=AppRunStatus.SUCCEEDED)
 
     def staged_inference_observation(self) -> AvailabilityStatus:
         """Observe the exact staged inference input without flattening errors."""
-        prepared = self.prepared_inference()
+        try:
+            prepared = self.prepared_inference()
+        except IncompletePrerequisiteError:
+            return AvailabilityStatus.MISSING
         root = self.inference_runtime.output_root
         if not root.is_absolute() or not root.is_dir():
             return AvailabilityStatus.UNKNOWN
@@ -556,6 +586,11 @@ class AlphaFold3ExecutionPlanning:
                 "run_id": prepared.run_id,
                 "request_id": prepared.request_id,
                 "staged_input_record": prepared.staged_input.to_record(),
+                "generation_id": self.generation_id(INFERENCE_SUMMARY, item),
+                "superseded_generation_ids": self.superseded_generation_ids(
+                    INFERENCE_SUMMARY,
+                    item,
+                ),
                 "execution_result_path": self.result_path(
                     INFERENCE_SUMMARY, (item,)
                 ).as_posix(),
@@ -565,7 +600,10 @@ class AlphaFold3ExecutionPlanning:
 
     def summary_result(self, raw_result: object | None = None) -> AppRunResult | None:
         """Validate the accumulated summary for every requested seed."""
-        prepared = self.prepared_inference()
+        try:
+            prepared = self.prepared_inference()
+        except IncompletePrerequisiteError:
+            return None
         if raw_result is not None:
             item = PlannedTask(inference_summary_task_plan(prepared), prepared)
             self._decode_result(raw_result, INFERENCE_SUMMARY, (item,))
@@ -601,6 +639,16 @@ class AlphaFold3ExecutionPlanning:
 
     def request_result(self, raw_result: object | None = None) -> AppRunResult | None:
         """Validate the request manifest and publish its invocation receipt."""
+        if raw_result is None:
+            invocation = load_invocation_manifest(
+                self.output_volume,
+                self.request.invocation,
+            )
+            available = invocation is not None and request_manifest_artifacts_available(
+                self.output_volume,
+                invocation,
+            )
+            return AppRunResult(status=AppRunStatus.SUCCEEDED) if available else None
         prepared = self.prepared_inference()
         publication = RequestPublication.from_prepared(prepared)
         manifest = load_request_manifest(self.output_volume, publication)
@@ -634,18 +682,12 @@ class AlphaFold3ExecutionPlanning:
         """Build the enriched inference request once per publication epoch."""
         if self._prepared_inference_cache is not None:
             return self._prepared_inference_cache
-        if self._prepared_inference_error is not None:
-            raise self._prepared_inference_error
-        try:
-            prepared = prepare_inference_run(
-                self._enriched_config(),
-                recycle=self.request.recycle,
-                sample=self.request.sample,
-                allow_large_inference=self.request.allow_large_inference,
-            )
-        except IncompletePrerequisiteError as error:
-            self._prepared_inference_error = error
-            raise
+        prepared = prepare_inference_run(
+            self._enriched_config(),
+            recycle=self.request.recycle,
+            sample=self.request.sample,
+            allow_large_inference=self.request.allow_large_inference,
+        )
         self._prepared_inference_cache = prepared
         return prepared
 
@@ -698,6 +740,22 @@ class AlphaFold3ExecutionPlanning:
         canonical = tuple(task for task in plan.assemblies if task.publishes_canonical)
         self.search_runtime.sharded_volume.reload()
         self.search_runtime.cache_volume.reload()
+        missing_profiles = {
+            task.database_id
+            for task in plan.raw_searches
+            if not (
+                profile_root(
+                    self.search_runtime.sharded_root,
+                    resolve_database_profile(task.database_id),
+                )
+                / "manifest.json"
+            ).is_file()
+        }
+        if missing_profiles:
+            raise IncompletePrerequisiteError(
+                "Database profiles are not prepared: "
+                + ", ".join(sorted(missing_profiles))
+            )
         raw_statuses, _ = inspect_msa_cache(
             self.search_runtime.sharded_root,
             self.search_runtime.cache_root,

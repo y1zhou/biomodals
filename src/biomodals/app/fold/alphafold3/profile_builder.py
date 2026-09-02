@@ -7,32 +7,19 @@ persistence handles it needs at runtime.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from time import time
 from typing import Any, ClassVar, cast
 
 import orjson
 
-from biomodals.app.fold.alphafold3.generation_claims import (
-    ActiveGenerationError,
-    ClaimStore,
-    GenerationClaim,
-    abandon_generation_claim,
-    acquire_generation_claim,
-    finish_generation_claim,
-    generation_status,
-    latest_generation_owner,
-)
 from biomodals.app.fold.alphafold3.profile_manifest import (
     current_profile_recipe,
     profile_compatibility_identity,
@@ -40,10 +27,8 @@ from biomodals.app.fold.alphafold3.profile_manifest import (
     validate_published_profile,
 )
 from biomodals.app.fold.alphafold3.profiles import (
-    DATABASE_PROFILE_SPECS,
     MAX_PROFILE_IMBALANCE,
     PROFILE_SCHEMA_VERSION,
-    PROFILE_STALE_SECONDS,
     SCRATCH_ROOT,
     SEQKIT_VERSION,
     SHARD_RANDOM_SEED,
@@ -51,14 +36,12 @@ from biomodals.app.fold.alphafold3.profiles import (
     SOURCE_DB_VOLUME_NAME,
     VALIDATION_RELPATHS,
     DatabaseProfileSpec,
-    SourcePolicy,
     profile_root,
     record_multiset_identity,
     resolve_database_profile,
     shard_filename,
     shard_names,
     validate_seqkit_threads,
-    validate_source_policy,
 )
 from biomodals.app.fold.alphafold3.sharding import (
     compile_record_multiset_validator,
@@ -88,17 +71,12 @@ _JSONL_OPTIONS = orjson.OPT_SORT_KEYS | orjson.OPT_APPEND_NEWLINE
 class ProfileBuilderRuntime:
     """Mounted paths and persistence handles for one builder container."""
 
-    SOURCE_MOUNT: ClassVar[str] = f"/{SOURCE_DB_VOLUME_NAME}"
     SHARDED_MOUNT: ClassVar[str] = f"/{SHARDED_DB_VOLUME_NAME}"
     EVIDENCE_RELPATH: ClassVar[str] = "msa-profile-builds"
 
     output_root: Path
-    source_volume: VolumeHandle
     sharded_volume: VolumeHandle
     output_volume: VolumeHandle
-    claims: ClaimStore
-    container_id: str
-    source_root: Path = Path(SOURCE_MOUNT)
     sharded_root: Path = Path(SHARDED_MOUNT)
     evidence_relpath: str = EVIDENCE_RELPATH
 
@@ -375,255 +353,6 @@ def _validate_statistics(
     }
 
 
-def _legacy_profile_claim_key(spec: DatabaseProfileSpec) -> str:
-    return f"active:{spec.profile_id}"
-
-
-def _profile_claim_root_key(spec: DatabaseProfileSpec) -> str:
-    return f"claim:{spec.profile_id}:root"
-
-
-def _adapt_legacy_profile_owner(
-    scope_key: str,
-    value: object,
-) -> dict[str, object]:
-    if not isinstance(value, dict) or value.get("profile_id") != scope_key:
-        raise RuntimeError(f"Profile {scope_key} has an invalid legacy claim owner")
-    database_id = value.get("database_id")
-    if not isinstance(database_id, str):
-        raise RuntimeError(f"Profile {scope_key} legacy claim identity is invalid")
-    spec = resolve_database_profile(database_id)
-    if spec.profile_id != scope_key:
-        raise RuntimeError(f"Profile {scope_key} legacy claim identity is invalid")
-    return {
-        "scope_key": scope_key,
-        "generation_id": value.get("generation_id"),
-        "identity": {
-            "profile_id": scope_key,
-            "database_id": database_id,
-        },
-        "container_id": value.get("container_id"),
-        "started_at": value.get("started_at"),
-        "started_at_epoch_seconds": value.get("started_at_epoch_seconds"),
-        "maximum_age_seconds": value.get("maximum_age_seconds"),
-    }
-
-
-def _adopt_legacy_claim(
-    claims: ClaimStore,
-    spec: DatabaseProfileSpec,
-) -> None:
-    """Adopt an old active-key owner as the append-only claim root."""
-    legacy_claim = claims.get(_legacy_profile_claim_key(spec), None)
-    if legacy_claim is None:
-        return
-    legacy_owner = _adapt_legacy_profile_owner(spec.profile_id, legacy_claim)
-    root_key = _profile_claim_root_key(spec)
-    claims.put(root_key, legacy_owner, skip_if_exists=True)
-    root_owner = claims.get(root_key, None)
-    if not isinstance(root_owner, dict):
-        raise RuntimeError(f"Profile {spec.profile_id} claim root disappeared")
-    if root_owner.get("generation_id") != legacy_owner["generation_id"]:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} legacy and append-only claims conflict"
-        )
-    latest_generation_owner(
-        claims,
-        spec.profile_id,
-        owner_adapter=_adapt_legacy_profile_owner,
-    )
-
-
-def _acquire_profile_claim(
-    runtime: ProfileBuilderRuntime,
-    spec: DatabaseProfileSpec,
-    generation_id: str,
-) -> GenerationClaim:
-    """Append one elected generation after a terminal or stale predecessor."""
-    _adopt_legacy_claim(runtime.claims, spec)
-    try:
-        return acquire_generation_claim(
-            runtime.claims,
-            scope_key=spec.profile_id,
-            generation_id=generation_id,
-            identity={
-                "profile_id": spec.profile_id,
-                "database_id": spec.database_id,
-            },
-            container_id=runtime.container_id,
-            maximum_age_seconds=PROFILE_STALE_SECONDS,
-            owner_adapter=_adapt_legacy_profile_owner,
-        )
-    except ActiveGenerationError as exc:
-        raise RuntimeError(
-            f"Profile {spec.profile_id} is already being built by generation "
-            f"{exc.owner['generation_id']!r}"
-        ) from exc
-
-
-def _hash_decompressed_zstd(
-    archive_path: Path,
-    log_path: Path,
-) -> tuple[str, int]:
-    """Stream one zstd archive through SHA-256 without materializing it."""
-    zstd = require_executable("zstd")
-    argv = [zstd, "--quiet", "--decompress", "--stdout", str(archive_path)]
-    append_log(log_path, f"Running command: {shlex.join(argv)}")
-    with log_path.open("ab") as log:
-        process = subprocess.Popen(  # noqa: S603
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=log,
-        )
-        if process.stdout is None:
-            process.kill()
-            raise RuntimeError("zstd did not expose decompressed stdout")
-        digest = hashlib.sha256()
-        size_bytes = 0
-        while chunk := process.stdout.read(8 * 1024 * 1024):
-            digest.update(chunk)
-            size_bytes += len(chunk)
-        process.stdout.close()
-        returncode = process.wait()
-    if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, argv)
-    return digest.hexdigest(), size_bytes
-
-
-def _apply_source_policy(
-    runtime: ProfileBuilderRuntime,
-    spec: DatabaseProfileSpec,
-    manifest: dict[str, Any],
-    source_policy: SourcePolicy,
-    log_path: Path,
-    *,
-    seqkit_threads: int,
-) -> dict[str, object]:
-    """Retire a source only after a valid profile publication exists."""
-    policy = validate_source_policy(source_policy)
-    source_path = runtime.source_root / spec.source_filename
-    archive_path = source_path.with_name(f"{source_path.name}.zst")
-    if policy == "keep":
-        return {
-            "source_policy": policy,
-            "source_status": "kept" if source_path.is_file() else "already-retired",
-        }
-
-    source_record = manifest.get("source")
-    if not isinstance(source_record, dict):
-        raise ValueError("Validated manifest lost its source record")
-    expected_sha256 = source_record.get("sha256")
-    expected_size = source_record.get("size_bytes")
-    if not isinstance(expected_sha256, str) or not isinstance(expected_size, int):
-        raise ValueError("Validated manifest source identity is invalid")
-
-    if not source_path.is_file():
-        if policy == "compress" and archive_path.is_file():
-            archive_sha256, archive_size = _hash_decompressed_zstd(
-                archive_path,
-                log_path,
-            )
-            if (archive_sha256, archive_size) != (
-                expected_sha256,
-                expected_size,
-            ):
-                raise ValueError(
-                    f"Existing archive does not reproduce {spec.source_filename}"
-                )
-            return {
-                "source_policy": policy,
-                "source_status": "already-compressed",
-                "archive_path": str(archive_path),
-            }
-        if policy == "delete":
-            return {
-                "source_policy": policy,
-                "source_status": "already-deleted",
-            }
-        raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
-
-    if policy == "delete":
-        if (
-            source_path.stat().st_size != expected_size
-            or sha256_file(source_path) != expected_sha256
-        ):
-            raise ValueError(
-                f"Refusing to delete changed source {spec.source_filename}"
-            )
-        source_path.unlink()
-        runtime.source_volume.commit()
-        return {
-            "source_policy": policy,
-            "source_status": "deleted",
-        }
-
-    if archive_path.is_file():
-        if (
-            source_path.stat().st_size != expected_size
-            or sha256_file(source_path) != expected_sha256
-        ):
-            raise ValueError(
-                f"Refusing to replace changed source {spec.source_filename}"
-            )
-        archive_sha256, archive_size = _hash_decompressed_zstd(
-            archive_path,
-            log_path,
-        )
-        if (archive_sha256, archive_size) != (expected_sha256, expected_size):
-            raise ValueError(
-                f"Existing archive does not reproduce {spec.source_filename}"
-            )
-    else:
-        zstd = require_executable("zstd")
-        temporary_archive = archive_path.with_name(
-            f".{archive_path.name}.{uuid.uuid4().hex}.tmp"
-        )
-        argv = [
-            zstd,
-            f"-T{seqkit_threads}",
-            "--quiet",
-            "--stdout",
-            str(source_path),
-        ]
-        append_log(log_path, f"Running command: {shlex.join(argv)}")
-        try:
-            with temporary_archive.open("xb") as archive, log_path.open("ab") as log:
-                completed = subprocess.run(  # noqa: S603
-                    argv,
-                    check=False,
-                    stdout=archive,
-                    stderr=log,
-                )
-                archive.flush()
-                os.fsync(archive.fileno())
-            if completed.returncode != 0:
-                raise subprocess.CalledProcessError(completed.returncode, argv)
-            archive_sha256, archive_size = _hash_decompressed_zstd(
-                temporary_archive,
-                log_path,
-            )
-            if (archive_sha256, archive_size) != (
-                expected_sha256,
-                expected_size,
-            ):
-                raise ValueError(
-                    f"Compressed archive does not reproduce {spec.source_filename}"
-                )
-            temporary_archive.replace(archive_path)
-            runtime.source_volume.commit()
-        finally:
-            temporary_archive.unlink(missing_ok=True)
-
-    source_path.unlink()
-    runtime.source_volume.commit()
-    return {
-        "source_policy": policy,
-        "source_status": "compressed",
-        "archive_path": str(archive_path),
-        "archive_size_bytes": archive_path.stat().st_size,
-    }
-
-
 def _write_success_evidence(
     runtime: ProfileBuilderRuntime,
     evidence_root: Path,
@@ -641,25 +370,13 @@ def _reuse_published_profile(
     spec: DatabaseProfileSpec,
     published_root: Path,
     evidence_root: Path,
-    log_path: Path,
     generation_id: str,
-    source_policy: SourcePolicy,
-    *,
-    seqkit_threads: int,
 ) -> dict[str, object]:
     """Deeply validate and reuse a publication that won a setup race."""
-    manifest = validate_published_profile(
+    validate_published_profile(
         published_root,
         spec,
         verify_digests=True,
-    )
-    source_result = _apply_source_policy(
-        runtime,
-        spec,
-        manifest,
-        source_policy,
-        log_path,
-        seqkit_threads=seqkit_threads,
     )
     result = {
         "status": "reused",
@@ -668,7 +385,6 @@ def _reuse_published_profile(
         "generation_id": generation_id,
         "profile_path": str(published_root),
         "manifest_sha256": sha256_file(published_root / "manifest.json"),
-        **source_result,
     }
     _write_success_evidence(runtime, evidence_root, result)
     return result
@@ -684,12 +400,6 @@ def _prepare_source_evidence(
 ) -> tuple[SourceProfileEvidence, str]:
     """Validate one source FASTA, its fixed counts, and local scratch budget."""
     if not source_path.is_file():
-        archive_path = source_path.with_name(f"{source_path.name}.zst")
-        if archive_path.is_file():
-            raise FileNotFoundError(
-                f"{source_path} is archived as {archive_path}. Restore the "
-                "plain FASTA manually in a Modal Sandbox before rebuilding."
-            )
         raise FileNotFoundError(f"Source FASTA is missing: {source_path}")
     require_regular_file(source_path)
     source_size = source_path.stat().st_size
@@ -966,14 +676,13 @@ def build_profile(
     runtime: ProfileBuilderRuntime,
     database_id: str,
     seqkit_threads: int,
-    source_policy: SourcePolicy,
+    *,
+    generation_id: str,
+    source_path: Path,
 ) -> dict[str, object]:
-    """Build, publish, deeply validate, and optionally retire one source."""
+    """Build, publish, and deeply validate one database profile."""
     spec = resolve_database_profile(database_id)
     threads = validate_seqkit_threads(seqkit_threads)
-    policy = validate_source_policy(source_policy)
-    generation_id = uuid.uuid4().hex
-    source_path = runtime.source_root / spec.source_filename
     published_root = profile_root(runtime.sharded_root, spec)
     evidence_root = (
         runtime.output_root / runtime.evidence_relpath / spec.profile_id / generation_id
@@ -982,8 +691,6 @@ def build_profile(
     evidence_root.mkdir(parents=True, exist_ok=True)
     append_log(log_path, f"Preparing profile {spec.profile_id}")
 
-    runtime.source_volume.reload()
-    runtime.sharded_volume.reload()
     runtime.output_volume.reload()
     if (published_root / "manifest.json").is_file():
         return _reuse_published_profile(
@@ -991,13 +698,9 @@ def build_profile(
             spec,
             published_root,
             evidence_root,
-            log_path,
             generation_id,
-            policy,
-            seqkit_threads=threads,
         )
 
-    claim = _acquire_profile_claim(runtime, spec, generation_id)
     staging_root = (
         runtime.sharded_root / ".staging" / f"{spec.profile_id}-{generation_id}"
     )
@@ -1006,36 +709,9 @@ def build_profile(
     validation_dir = staging_root / "validation"
     payload_moved = False
     manifest_published = False
-    claim_status = "failed"
-    claim_detail: dict[str, object] = {
-        "error_type": "IncompleteProfileBuild",
-        "profile_published": False,
-    }
     try:
-        write_json_atomic(evidence_root / "claim.json", claim.owner)
-        runtime.output_volume.commit()
-        runtime.sharded_volume.reload()
-        if (published_root / "manifest.json").is_file():
-            result = _reuse_published_profile(
-                runtime,
-                spec,
-                published_root,
-                evidence_root,
-                log_path,
-                generation_id,
-                policy,
-                seqkit_threads=threads,
-            )
-            claim_status = "complete"
-            claim_detail = {"manifest_sha256": result["manifest_sha256"]}
-            return result
         if published_root.exists():
-            orphan_root = runtime.sharded_root / ".orphaned"
-            orphan_root.mkdir(parents=True, exist_ok=True)
-            published_root.replace(
-                orphan_root / f"{spec.profile_id}-{uuid.uuid4().hex}"
-            )
-            runtime.sharded_volume.commit()
+            shutil.rmtree(published_root)
 
         source, seqkit = _prepare_source_evidence(
             spec,
@@ -1076,18 +752,10 @@ def build_profile(
         write_json_atomic(published_root / "manifest.json", manifest)
         runtime.sharded_volume.commit()
         manifest_published = True
-        published_manifest = validate_published_profile(
+        validate_published_profile(
             published_root,
             spec,
             verify_digests=True,
-        )
-        source_result = _apply_source_policy(
-            runtime,
-            spec,
-            published_manifest,
-            policy,
-            log_path,
-            seqkit_threads=threads,
         )
         result = {
             "status": "published",
@@ -1105,11 +773,8 @@ def build_profile(
             "maximum_residue_imbalance": shards.statistics["maximum_residue_imbalance"],
             "recovered_records": shards.recovery_metrics["recovered_records"],
             "recovered_residues": shards.recovery_metrics["recovered_residues"],
-            **source_result,
         }
         _write_success_evidence(runtime, evidence_root, result)
-        claim_status = "complete"
-        claim_detail = {"manifest_sha256": result["manifest_sha256"]}
         return result
     except Exception as exc:
         failure = {
@@ -1122,7 +787,6 @@ def build_profile(
             "message": str(exc),
         }
         evidence_committed = False
-        cleanup_completed = manifest_published
         try:
             write_json_atomic(evidence_root / "failure.json", failure)
             runtime.output_volume.commit()
@@ -1140,210 +804,9 @@ def build_profile(
                 elif staging_root.exists():
                     shutil.rmtree(staging_root)
                 runtime.sharded_volume.commit()
-                cleanup_completed = True
             except Exception as cleanup_exc:
                 exc.add_note(
                     "Could not clean the failed profile generation: "
                     f"{type(cleanup_exc).__name__}: {cleanup_exc}"
                 )
-        claim_detail = {
-            "error_type": type(exc).__name__,
-            "profile_published": manifest_published,
-            "failure_evidence_committed": evidence_committed,
-            "cleanup_completed": cleanup_completed,
-        }
         raise
-    finally:
-        finish_generation_claim(
-            runtime.claims,
-            claim,
-            status=claim_status,
-            detail=claim_detail,
-        )
-
-
-def inspect_profile_registry(sharded_root: Path) -> dict[str, object]:
-    """Quickly validate fixed manifests and artifact sizes without rehashing."""
-    valid: list[str] = []
-    missing: list[str] = []
-    invalid: dict[str, dict[str, str]] = {}
-    for spec in DATABASE_PROFILE_SPECS:
-        root = profile_root(sharded_root, spec)
-        if not (root / "manifest.json").is_file():
-            missing.append(spec.database_id)
-            continue
-        try:
-            validate_published_profile(root, spec, verify_digests=False)
-        except (OSError, TypeError, ValueError) as exc:
-            invalid[spec.database_id] = {
-                "profile_id": spec.profile_id,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-            }
-        else:
-            valid.append(spec.database_id)
-    profiles_root = sharded_root / "profiles"
-    present_profile_ids = (
-        sorted(
-            path.name
-            for path in profiles_root.iterdir()
-            if path.is_dir() and not path.is_symlink()
-        )
-        if profiles_root.is_dir()
-        else []
-    )
-    selected_profile_ids = [spec.profile_id for spec in DATABASE_PROFILE_SPECS]
-    return {
-        "schema_version": 1,
-        "valid_database_ids": valid,
-        "missing_database_ids": missing,
-        "invalid_profiles": invalid,
-        "selected_profile_ids": selected_profile_ids,
-        "present_profile_ids": present_profile_ids,
-        "unselected_profile_ids": sorted(
-            set(present_profile_ids) - set(selected_profile_ids)
-        ),
-    }
-
-
-def plan_missing_profile_builds(
-    inventory: dict[str, object],
-    seqkit_threads: int,
-    source_policy: str,
-) -> tuple[tuple[str, int, SourcePolicy], ...]:
-    """Return ordered builder inputs for only missing fixed profiles."""
-    threads = validate_seqkit_threads(seqkit_threads)
-    policy = validate_source_policy(source_policy)
-    invalid = inventory.get("invalid_profiles")
-    if not isinstance(invalid, dict):
-        raise TypeError("Profile inventory has invalid failure details")
-    if invalid:
-        raise RuntimeError(
-            "Existing published profile validation failed; repair it manually "
-            f"before setup: {invalid}"
-        )
-    raw_missing = inventory.get("missing_database_ids")
-    if not isinstance(raw_missing, list) or not all(
-        isinstance(database_id, str) for database_id in raw_missing
-    ):
-        raise TypeError("Profile inventory returned invalid missing database IDs")
-    missing = {
-        database_id for database_id in raw_missing if isinstance(database_id, str)
-    }
-    selected = {spec.database_id for spec in DATABASE_PROFILE_SPECS}
-    unknown = sorted(missing - selected)
-    if unknown:
-        raise ValueError(f"Profile inventory returned unknown database IDs: {unknown}")
-    return tuple(
-        (spec.database_id, threads, policy)
-        for spec in DATABASE_PROFILE_SPECS
-        if spec.database_id in missing
-    )
-
-
-def cleanup_profile_workspace(
-    sharded_root: Path,
-    claims: ClaimStore,
-) -> dict[str, object]:
-    """Remove abandoned and unselected profiles after every builder finishes."""
-    inventory = inspect_profile_registry(sharded_root)
-    if inventory["missing_database_ids"] or inventory["invalid_profiles"]:
-        raise RuntimeError(
-            "Cannot clean profile workspace before all profiles are valid"
-        )
-    active: list[str] = []
-    for spec in DATABASE_PROFILE_SPECS:
-        _adopt_legacy_claim(claims, spec)
-        owner = latest_generation_owner(
-            claims,
-            spec.profile_id,
-            owner_adapter=_adapt_legacy_profile_owner,
-        )
-        if owner is None:
-            continue
-        generation_id = cast(str, owner["generation_id"])
-        status = generation_status(claims, spec.profile_id, generation_id)
-        if status is not None:
-            continue
-        started_at = cast(int | float, owner["started_at_epoch_seconds"])
-        age_seconds = time() - float(started_at)
-        if age_seconds <= PROFILE_STALE_SECONDS:
-            active.append(spec.profile_id)
-            continue
-        abandon_generation_claim(
-            claims,
-            GenerationClaim(
-                scope_key=spec.profile_id,
-                generation_id=generation_id,
-                owner=owner,
-            ),
-            detail={
-                "age_seconds": age_seconds,
-                "cleanup_recovery": True,
-            },
-        )
-        if generation_status(claims, spec.profile_id, generation_id) is None:
-            active.append(spec.profile_id)
-    if active:
-        raise RuntimeError(f"Cannot clean while profile claims are active: {active}")
-
-    removed_workspace: list[str] = []
-    for name in (".staging", ".orphaned"):
-        root = sharded_root / name
-        if not root.exists():
-            continue
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError(f"Expected profile workspace directory: {root}")
-        for child in sorted(root.iterdir()):
-            if child.is_symlink() or not child.is_dir():
-                raise ValueError(f"Unexpected profile workspace entry: {child}")
-            shutil.rmtree(child)
-            removed_workspace.append(child.relative_to(sharded_root).as_posix())
-        root.rmdir()
-
-    removed_profiles: list[str] = []
-    profiles_root = sharded_root / "profiles"
-    unselected = inventory["unselected_profile_ids"]
-    if not isinstance(unselected, list):
-        raise TypeError("Profile inventory has invalid unselected profile IDs")
-    for profile_id in unselected:
-        if not isinstance(profile_id, str) or Path(profile_id).name != profile_id:
-            raise ValueError(f"Unsafe unselected profile ID: {profile_id!r}")
-        root = profiles_root / profile_id
-        if root.is_symlink() or not root.is_dir():
-            raise ValueError(f"Expected unselected profile directory: {root}")
-        shutil.rmtree(root)
-        removed_profiles.append(root.relative_to(sharded_root).as_posix())
-    return {
-        "status": "passed",
-        "removed_workspace_paths": removed_workspace,
-        "removed_unselected_profile_paths": removed_profiles,
-        "inventory": inspect_profile_registry(sharded_root),
-    }
-
-
-def finalize_profile_setup(runtime: ProfileBuilderRuntime) -> dict[str, object]:
-    """Clean the fixed profile registry and publish durable setup evidence."""
-    runtime.sharded_volume.reload()
-    runtime.output_volume.reload()
-    result = cleanup_profile_workspace(runtime.sharded_root, runtime.claims)
-    runtime.sharded_volume.commit()
-
-    setup_id = uuid.uuid4().hex
-    evidence_root = runtime.output_root / runtime.evidence_relpath / "setup" / setup_id
-    completed = result | {
-        "setup_id": setup_id,
-        "completed_at": utc_now(),
-    }
-    write_json_atomic(evidence_root / "inventory.json", completed)
-    runtime.output_volume.commit()
-    write_json_atomic(
-        evidence_root / "done.json",
-        {
-            "status": "complete",
-            "setup_id": setup_id,
-            "completed_at": utc_now(),
-        },
-    )
-    runtime.output_volume.commit()
-    return completed

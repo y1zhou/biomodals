@@ -26,8 +26,11 @@ from biomodals.execution.model import (
     NodeDependency,
     NodePlan,
     NodeStatus,
+    NodeTaskStatusCounts,
     ProviderBinding,
+    ProviderCallDiagnostic,
     ProviderCallOverview,
+    ProviderCallPage,
     ProviderCallPreclaim,
     ProviderCallRecord,
     ProviderCallStatus,
@@ -673,6 +676,7 @@ class SqliteExecutionRepository:
         dependency_rows: list[sqlite3.Row] = []
         call_rows: list[sqlite3.Row] = []
         active_rows: list[sqlite3.Row] = []
+        task_count_rows: list[sqlite3.Row] = []
         active = tuple(
             status.value for status in ProviderCallStatus if not status.is_terminal
         )
@@ -756,6 +760,17 @@ class SqliteExecutionRepository:
                     (*chunk, *active),
                 ).fetchall()
             )
+            task_count_rows.extend(
+                self._connection.execute(
+                    f"""
+                    SELECT execution_run_id, node_key, status, COUNT(*) AS count
+                    FROM execution_tasks
+                    WHERE execution_run_id IN ({placeholders})
+                    GROUP BY execution_run_id, node_key, status
+                    """,  # noqa: S608 - generated placeholders
+                    chunk,
+                ).fetchall()
+            )
 
         dependencies: dict[tuple[str, str], list[sqlite3.Row]] = {}
         for row in dependency_rows:
@@ -785,6 +800,12 @@ class SqliteExecutionRepository:
         for row in call_rows:
             run_id = row["execution_run_id"]
             calls.setdefault(run_id, []).append(_provider_call_overview_from_row(row))
+        task_counts: dict[tuple[str, str], dict[str, int]] = {}
+        for row in task_count_rows:
+            task_counts.setdefault(
+                (row["execution_run_id"], row["node_key"]),
+                {},
+            )[row["status"]] = row["count"]
 
         return {
             UUID(row["execution_run_id"]): ExecutionOverview(
@@ -796,6 +817,16 @@ class SqliteExecutionRepository:
                 active_provider_calls=active_counts.get(
                     row["execution_run_id"],
                     ActiveProviderCallCounts(0, 0),
+                ),
+                node_task_status_counts=tuple(
+                    NodeTaskStatusCounts(
+                        node_key=node.node_key,
+                        **task_counts.get(
+                            (row["execution_run_id"], node.node_key),
+                            {},
+                        ),
+                    )
+                    for node in nodes.get(row["execution_run_id"], ())
                 ),
             )
             for row in run_rows
@@ -2758,6 +2789,73 @@ class SqliteExecutionRepository:
             (str(execution_run_id),),
         ).fetchall()
         return self._provider_calls_from_rows(rows)
+
+    def provider_call_page(
+        self,
+        execution_run_id: UUID,
+        *,
+        node_key: str | None = None,
+        cursor: UUID | None = None,
+        limit: int = 50,
+        newest_first: bool = False,
+    ) -> ProviderCallPage:
+        """Return one bounded Provider Call page in durable creation order."""
+        if not 1 <= limit <= 100:
+            raise ValueError("Provider Call page limit must be between 1 and 100")
+        cursor_rowid: int | None = None
+        if cursor is not None:
+            row = self._connection.execute(
+                """
+                SELECT rowid, execution_run_id, node_key
+                FROM execution_provider_calls WHERE provider_call_id = ?
+                """,
+                (str(cursor),),
+            ).fetchone()
+            if row is None or row["execution_run_id"] != str(execution_run_id):
+                raise ValueError("Provider Call cursor does not belong to this Run")
+            if node_key is not None and row["node_key"] != node_key:
+                raise ValueError("Provider Call cursor does not belong to this Node")
+            cursor_rowid = int(row["rowid"])
+        parameters: list[object] = [str(execution_run_id)]
+        cursor_filter = ""
+        if cursor_rowid is not None:
+            cursor_filter = f"AND rowid {'<' if newest_first else '>'} ?"
+            parameters.append(cursor_rowid)
+        node_filter = ""
+        if node_key is not None:
+            node_filter = "AND node_key = ?"
+            parameters.append(node_key)
+        parameters.append(limit + 1)
+        rows = self._connection.execute(
+            f"""
+            SELECT rowid, * FROM execution_provider_calls
+            WHERE execution_run_id = ? {cursor_filter} {node_filter}
+            ORDER BY rowid {"DESC" if newest_first else "ASC"} LIMIT ?
+            """,  # noqa: S608 - closed internal filter
+            parameters,
+        ).fetchall()
+        selected = rows[:limit]
+        diagnostics = tuple(
+            ProviderCallDiagnostic(
+                provider_call_id=call.provider_call_id,
+                node_key=call.node_key,
+                function_name=call.binding.function_name,
+                status=call.status,
+                provider_call_handle_id=call.provider_call_handle_id,
+                created_at=call.created_at,
+                started_at=call.started_at,
+                completed_at=call.completed_at,
+            )
+            for call in (
+                self._provider_call_from_row(row, task_keys=()) for row in selected
+            )
+        )
+        return ProviderCallPage(
+            calls=diagnostics,
+            next_cursor=(
+                diagnostics[-1].provider_call_id if len(rows) > limit else None
+            ),
+        )
 
     def succeeded_provider_call(
         self,

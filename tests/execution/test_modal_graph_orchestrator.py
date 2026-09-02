@@ -1640,5 +1640,3 @@ def test_orchestrator_modal_app_exposes_standard_coordinator_surface() -> None:
     assert orchestrator.CONF.python_version == "3.13"
     assert orchestrator.OUT_VOLUME_NAME == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
     assert "ExecutionCoordinator.*" in functions
-    assert "WorkflowOrchestrator.*" not in functions
-    assert "run_workflow_orchestrator" not in functions

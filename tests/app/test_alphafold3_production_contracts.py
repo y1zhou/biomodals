@@ -7,6 +7,8 @@ from __future__ import annotations
 import datetime
 import hashlib
 import importlib
+import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -32,7 +34,6 @@ from biomodals.app.fold.alphafold3 import (
 from biomodals.app.fold.alphafold3.generation_claims import (
     ActiveGenerationError,
     GenerationClaim,
-    abandon_generation_claim,
     acquire_generation_claim,
     finish_generation_claim,
     generation_status,
@@ -40,6 +41,7 @@ from biomodals.app.fold.alphafold3.generation_claims import (
 )
 from biomodals.app.fold.alphafold3.inference_inputs import (
     MAX_MODEL_SEEDS,
+    STAGED_INPUT_SCHEMA_VERSION,
     PreparedInferenceRun,
     VolumeUpload,
     hash_sequences,
@@ -54,6 +56,7 @@ from biomodals.app.fold.alphafold3.inference_pipeline import (
     coordinate_seed_predictions,
 )
 from biomodals.app.fold.alphafold3.input_enrichment import (
+    MsaAssemblyResolution,
     apply_msa_resolution,
     chain_msa_states,
     plan_template_searches,
@@ -82,7 +85,6 @@ from biomodals.app.fold.alphafold3.profile_builder import (
     ShardBuildEvidence,
     SourceProfileEvidence,
     build_profile_manifest,
-    plan_missing_profile_builds,
 )
 from biomodals.app.fold.alphafold3.profile_manifest import (
     current_profile_recipe,
@@ -92,9 +94,7 @@ from biomodals.app.fold.alphafold3.profile_manifest import (
 from biomodals.app.fold.alphafold3.profiles import (
     ALPHAFOLD3_COMMIT,
     ALPHAFOLD3_REPOSITORY,
-    COMPOSABLE_LEGACY_VALIDATION_RELPATHS,
     COMPOSABLE_MULTISET_RECIPE_VERSION,
-    DATABASE_PROFILE_SPECS,
     DEFAULT_SEQKIT_THREADS,
     HMMER_VERSION,
     JACKHMMER_PATCH_SHA256,
@@ -435,7 +435,7 @@ class FakeVolumeReader:
         yield value[midpoint:]
 
 
-def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
+def test_profile_manifest_is_fixed() -> None:
     manifest = _profile_manifest("small_bfd")
     source, shards, validation = validate_profile_manifest(
         manifest,
@@ -445,19 +445,6 @@ def test_profile_manifest_and_missing_build_plan_are_fixed() -> None:
     assert source["num_seqs"] == 65_984_053
     assert len(shards) == 64
     assert [record["path"] for record in validation] == list(VALIDATION_RELPATHS)
-
-    inventory: dict[str, object] = {
-        "invalid_profiles": {},
-        "missing_database_ids": ["uniref90", "small_bfd"],
-    }
-    assert plan_missing_profile_builds(
-        inventory,
-        seqkit_threads=4,
-        source_policy="compress",
-    ) == (
-        ("small_bfd", 4, "compress"),
-        ("uniref90", 4, "compress"),
-    )
 
     manifest["shards"][0], manifest["shards"][1] = (
         manifest["shards"][1],
@@ -492,25 +479,6 @@ def test_profile_search_identity_excludes_build_execution_metadata() -> None:
     assert profile_search_identity(changed_shards, spec) != profile_search_identity(
         original,
         spec,
-    )
-
-
-def test_composable_profile_accepts_legacy_timing_artifact() -> None:
-    assert "validation/shuffle-stderr.log" not in VALIDATION_RELPATHS
-    assert "validation/shuffle-stderr.log" in COMPOSABLE_LEGACY_VALIDATION_RELPATHS
-    manifest = _profile_manifest("small_bfd")
-    validation = cast(dict[str, object], manifest["validation"])
-    validation["artifacts"] = [
-        _artifact(path) for path in COMPOSABLE_LEGACY_VALIDATION_RELPATHS
-    ]
-
-    _, _, artifacts = validate_profile_manifest(
-        manifest,
-        resolve_database_profile("small_bfd"),
-    )
-
-    assert [record["path"] for record in artifacts] == list(
-        COMPOSABLE_LEGACY_VALIDATION_RELPATHS
     )
 
 
@@ -647,6 +615,56 @@ def test_input_enrichment_reuses_one_result_across_identical_chains() -> None:
     assert template_plan.chain_indices_by_identity == {
         template_plan.tasks[0].template_identity: (0, 1)
     }
+
+
+@pytest.mark.parametrize(
+    ("unpaired_msa", "paired_msa", "templates", "msa_tasks", "template_tasks"),
+    [
+        (None, None, None, True, None),
+        (None, None, [], True, 0),
+        ("", "", None, False, 1),
+        ("", "", [], False, 0),
+        (">query\nACDE\n", "", None, False, 1),
+        (">query\nACDE\n", "", [], False, 0),
+    ],
+)
+def test_evidence_presence_controls_search_planning(
+    unpaired_msa: str | None,
+    paired_msa: str | None,
+    templates: list[AF3Template] | None,
+    msa_tasks: bool,
+    template_tasks: int | None,
+) -> None:
+    """Planning must preserve AlphaFold3 null versus explicit-empty semantics."""
+    config = AF3Config(
+        name="evidence-matrix",
+        modelSeeds=[1],
+        sequences=[
+            AF3SequenceEntry(
+                protein=AF3Protein(
+                    id="A",
+                    sequence="ACDE",
+                    unpairedMsa=unpaired_msa,
+                    pairedMsa=paired_msa,
+                    templates=templates,
+                )
+            )
+        ],
+    )
+    states = chain_msa_states(config)
+    msa_plan = plan_msa_resolution(states)
+
+    assert bool(msa_plan.raw_searches) is msa_tasks
+    if template_tasks is None:
+        return
+    template_plan = plan_template_searches(
+        config,
+        states,
+        MsaAssemblyResolution({}, {}),
+    )
+    assert len(template_plan.tasks) == template_tasks
+    if unpaired_msa == "" and template_tasks:
+        assert template_plan.tasks[0].unpaired_msa == ">query\nACDE\n"
 
 
 def test_template_task_computes_immutable_identities_once(
@@ -1097,7 +1115,9 @@ def test_search_identity_matches_upstream_constructor_arguments(
                 "length_cutoff": 50,
                 "filter_f3": 0.02,
             },
-            "sharded_merge_order": "reported-evalue-descending-bit-score-name-v1",
+            "sharded_merge_order": (
+                "reported-evalue-descending-bit-score-name-occurrence-v2"
+            ),
         }
     assert scientific_search_parameters(spec) == expected_identity
 
@@ -1219,12 +1239,12 @@ def test_template_identity_matches_upstream_constructor_arguments(
     }
 
 
-def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
+def test_rna_shards_merge_duplicate_occurrences_by_reported_score() -> None:
     assert (
         scientific_search_parameters(resolve_database_profile("rfam"))[
             "sharded_merge_order"
         ]
-        == "reported-evalue-descending-bit-score-name-v1"
+        == "reported-evalue-descending-bit-score-name-occurrence-v2"
     )
 
     @dataclass
@@ -1258,16 +1278,29 @@ def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
     results = (
         Result(
             target_sequence="ACGU",
-            a3m=">query\nACGU\n>hitB/1-4 second\nACGU\n",
+            a3m=(
+                ">query\nACGU\n"
+                ">duplicate/1-4 within-high\nACGU\n"
+                ">duplicate/1-4 within-low\nACGU\n"
+                ">hitB/1-4 second\nACGU\n"
+            ),
             e_value=1e-3,
-            tblout=tblout("hitB", 50.0),
+            tblout="\n".join((
+                tblout("duplicate", 100.0),
+                tblout("duplicate", 1.0),
+                tblout("hitB", 50.0),
+            )),
         ),
         Result(
             target_sequence="ACGU",
-            a3m=(">query\nACGU\n>hitC/1-4 third\nACGU\n>hitA/1-4 first\nACGU\n"),
+            a3m=(
+                ">query\nACGU\n"
+                ">duplicate/1-4 cross-shard\nACGU\n"
+                ">hitA/1-4 first\nACGU\n"
+            ),
             e_value=1e-3,
             tblout="\n".join((
-                tblout("hitC", 10.0, "1e-2"),
+                tblout("duplicate", 80.0),
                 tblout("hitA", 50.0),
             )),
         ),
@@ -1276,15 +1309,17 @@ def test_rna_shards_merge_by_reported_score_with_deterministic_ties() -> None:
     merged = merge_nhmmer_results_by_reported_score(
         module,
         results,
-        max_sequences=3,
+        max_sequences=4,
     )
 
     assert merged.a3m.splitlines() == [
         ">query",
         "ACGU",
-        ">hitA/1-4 first",
+        ">duplicate/1-4 within-high",
         "ACGU",
-        ">hitB/1-4 second",
+        ">duplicate/1-4 cross-shard",
+        "ACGU",
+        ">hitA/1-4 first",
         "ACGU",
     ]
 
@@ -1737,6 +1772,101 @@ def test_template_search_rejects_oversized_result_before_publication(
     assert not (context.sequence_root / "templates.done.json").exists()
 
 
+def test_template_search_redelivers_same_generation_after_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_id = "generation"
+    claims = FakeClaimStore()
+    monkeypatch.setattr(
+        template_search,
+        "_resolve_template_msa",
+        lambda runtime, task: ">query\nACDE\n",
+    )
+    monkeypatch.setattr(
+        template_search,
+        "_execute_template_search",
+        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    runtime = TemplateRuntime(
+        source_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        cache_volume=cast(
+            Any,
+            SimpleNamespace(reload=lambda: None, commit=lambda: None),
+        ),
+        claims=claims,
+        container_id="test",
+        maximum_age_seconds=100,
+        wait_timeout_seconds=100,
+        source_root=tmp_path / "source",
+        cache_root=tmp_path,
+    )
+    task = TemplateTask(
+        sequence="ACDE",
+        unpaired_msa=None,
+        unpaired_msa_reference=MsaArtifactReference.from_content(
+            msa_search.sequence_cache_relpath("protein", "ACDE") / "unpaired.a3m",
+            b">query\nACDE\n",
+        ),
+        publish_canonical=True,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        template_search.run_template_search(
+            runtime,
+            task,
+            generation_id=generation_id,
+        )
+
+    context = build_template_context(
+        tmp_path,
+        task.sequence,
+        task.unpaired_msa_sha256,
+        task.max_template_date,
+    )
+    assert (
+        generation_status(
+            claims,
+            f"template:Protein:{context.sequence_hash}",
+            generation_id,
+        )
+        is None
+    )
+
+    templates = [
+        {
+            "mmcif": "data_template\n#\n",
+            "queryIndices": [0],
+            "templateIndices": [0],
+        }
+    ]
+    monkeypatch.setattr(
+        template_search,
+        "_execute_template_search",
+        lambda *args: (templates, {"contract": "pinned"}),
+    )
+
+    result = template_search.run_template_search(
+        runtime,
+        task,
+        generation_id=generation_id,
+    )
+
+    assert result["status"] == "published"
+    assert result["templates"] == templates
+    assert (
+        generation_status(
+            claims,
+            f"template:Protein:{context.sequence_hash}",
+            generation_id,
+        )["status"]
+        == "complete"
+    )
+
+
 def test_template_cache_inspection_bounds_aggregate_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1886,17 +2016,6 @@ def test_generation_claims_fence_active_and_terminal_writers() -> None:
 
     assert latest_generation_owner(store, first.scope_key) == second.owner
     assert second.owner["predecessor_status"] == "complete"
-    abandon_generation_claim(
-        store,
-        second,
-        detail={"cleanup_recovery": True},
-        now_text="second-abandoned",
-    )
-    assert generation_status(store, second.scope_key, second.generation_id) == {
-        "status": "abandoned",
-        "finished_at": "second-abandoned",
-        "cleanup_recovery": True,
-    }
 
 
 def test_generation_claim_replays_the_same_live_owner() -> None:
@@ -1938,6 +2057,40 @@ def test_generation_claim_replays_the_same_live_owner() -> None:
         )
 
 
+def test_generation_claim_fences_authorized_live_predecessor() -> None:
+    store = FakeClaimStore()
+    first = acquire_generation_claim(
+        store,
+        scope_key="seed:run:1",
+        generation_id="terminal-run-task",
+        identity={"seed": 1},
+        container_id="container-a",
+        maximum_age_seconds=100,
+        now_epoch_seconds=1_000,
+        now_text="first-start",
+    )
+
+    second = acquire_generation_claim(
+        store,
+        scope_key=first.scope_key,
+        generation_id="repair-run-task",
+        identity={"seed": 1},
+        container_id="container-b",
+        maximum_age_seconds=100,
+        superseded_generation_ids=(first.generation_id,),
+        now_epoch_seconds=1_001,
+        now_text="repair-start",
+    )
+
+    assert generation_status(store, first.scope_key, first.generation_id) == {
+        "status": "abandoned",
+        "abandoned_at": "repair-start",
+        "reason": "superseded_execution_run",
+        "successor_generation_id": second.generation_id,
+    }
+    assert latest_generation_owner(store, first.scope_key) == second.owner
+
+
 def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
     """Coordinator-owned seed Tasks reacquire their live writer claims."""
     runtime = InferenceRuntime(
@@ -1974,66 +2127,6 @@ def test_seed_claims_accept_stable_generation_ids(tmp_path: Path) -> None:
         "execution-seed-2",
     )
     assert replay == first
-
-
-def test_generation_claims_adapt_legacy_owners() -> None:
-    """A stage may preserve an append-only chain created before canonical owners."""
-    store = FakeClaimStore()
-    scope_key = "small-bfd-64-v2"
-    store.put(
-        f"claim:{scope_key}:root",
-        {
-            "profile_id": scope_key,
-            "database_id": "small_bfd",
-            "generation_id": "legacy",
-            "container_id": "old-container",
-            "started_at": "legacy-start",
-            "started_at_epoch_seconds": 1_000,
-            "maximum_age_seconds": 100,
-        },
-    )
-
-    def adapt_profile_owner(
-        selected_scope: str,
-        value: object,
-    ) -> dict[str, object]:
-        assert isinstance(value, dict)
-        legacy = cast(dict[str, object], value)
-        return {
-            "scope_key": selected_scope,
-            "generation_id": legacy["generation_id"],
-            "identity": {
-                "profile_id": legacy["profile_id"],
-                "database_id": legacy["database_id"],
-            },
-            "container_id": legacy["container_id"],
-            "started_at": legacy["started_at"],
-            "started_at_epoch_seconds": legacy["started_at_epoch_seconds"],
-            "maximum_age_seconds": legacy["maximum_age_seconds"],
-        }
-
-    successor = acquire_generation_claim(
-        store,
-        scope_key=scope_key,
-        generation_id="canonical",
-        identity={"profile_id": scope_key, "database_id": "small_bfd"},
-        container_id="new-container",
-        maximum_age_seconds=100,
-        now_epoch_seconds=1_101,
-        now_text="canonical-start",
-        owner_adapter=adapt_profile_owner,
-    )
-
-    assert successor.owner["predecessor_generation_id"] == "legacy"
-    assert successor.owner["predecessor_status"] == "abandoned"
-    assert (
-        latest_generation_owner(
-            store,
-            scope_key,
-            owner_adapter=adapt_profile_owner,
-        )
-        == successor.owner
-    )
 
 
 def test_seed_marker_is_the_prediction_reuse_boundary(tmp_path: Path) -> None:
@@ -2192,6 +2285,8 @@ def test_staged_input_rederives_identity_and_preserves_inline_templates(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[
                             AF3Template(
                                 mmcif="data_inline\n#\n",
@@ -2282,51 +2377,6 @@ def test_staged_input_accepts_a_symlinked_volume_mount(tmp_path: Path) -> None:
     assert loaded.config.modelSeeds == [1]
 
 
-def test_staged_input_rechecks_the_serialized_input_limit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output_root = tmp_path / "output"
-    prepared = prepare_inference_run(
-        AF3Config(
-            name="bounded-reload",
-            modelSeeds=[1],
-            sequences=[
-                AF3SequenceEntry(
-                    protein=AF3Protein(
-                        id="A",
-                        sequence="ACDE",
-                        unpairedMsa=">query\nACDE\n",
-                        pairedMsa="",
-                        templates=[],
-                    )
-                )
-            ],
-        ),
-        recycle=1,
-        sample=1,
-    )
-    _materialize_prepared_run(output_root, prepared)
-    input_upload = next(
-        upload
-        for upload in prepared.payload_uploads
-        if upload.relative_path.name == "input.json"
-    )
-    monkeypatch.setattr(
-        inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
-        len(input_upload.content) - 1,
-    )
-
-    with pytest.raises(ValueError, match="Staged artifact is too large"):
-        load_staged_inference_input(
-            output_root,
-            run_id=prepared.run_id,
-            request_id=prepared.request_id,
-            staged_input_record=prepared.staged_input.to_record(),
-        )
-
-
 def test_staged_input_rechecks_the_run_identity_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2359,7 +2409,7 @@ def test_staged_input_rechecks_the_run_identity_limit(
     )
     monkeypatch.setattr(
         inference_inputs,
-        "MAX_STAGED_INPUT_BYTES",
+        "MAX_RUN_IDENTITY_BYTES",
         len(identity_upload.content) - 1,
     )
 
@@ -2385,6 +2435,8 @@ def test_inference_staging_bounds_all_inline_templates(
                 protein=AF3Protein(
                     id="A",
                     sequence="ACDE",
+                    unpairedMsa="",
+                    pairedMsa="",
                     templates=[
                         AF3Template(
                             mmcif=content,
@@ -2420,6 +2472,8 @@ def test_staged_input_rechecks_the_inline_template_total(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[
                             AF3Template(
                                 mmcif=content,
@@ -2463,6 +2517,8 @@ def test_staging_canonicalizes_equivalent_inline_and_path_templates(
                     protein=AF3Protein(
                         id="A",
                         sequence="ACDE",
+                        unpairedMsa="",
+                        pairedMsa="",
                         templates=[template],
                     )
                 )
@@ -2543,6 +2599,8 @@ def test_inference_staging_rejects_unmaterialized_template_paths() -> None:
                         protein=AF3Protein(
                             id="A",
                             sequence="ACDE",
+                            unpairedMsa="",
+                            pairedMsa="",
                             templates=[
                                 AF3Template(
                                     mmcifPath="template.cif",
@@ -2570,6 +2628,8 @@ def test_inference_staging_rejects_empty_inline_templates() -> None:
                         protein=AF3Protein(
                             id="A",
                             sequence="ACDE",
+                            unpairedMsa="",
+                            pairedMsa="",
                             templates=[
                                 AF3Template(
                                     mmcif="",
@@ -2750,15 +2810,51 @@ def test_completed_request_manifest_loads_without_a_remote_worker() -> None:
         ],
     )
     manifest_path = request_manifest_path(publication).as_posix()
+    staged_marker_path = (
+        f"{run_id[:2]}/{run_id}/requests/{publication.request_id}/staged-input.json"
+    )
+    staged_marker = json_bytes({
+        "schema_version": STAGED_INPUT_SCHEMA_VERSION,
+        "status": "complete",
+        "run_id": run_id,
+        "request_id": publication.request_id,
+        "input": {
+            "path": input_path,
+            "size_bytes": len(input_bytes),
+            "sha256": hashlib.sha256(input_bytes).hexdigest(),
+        },
+    })
 
     assert (
         load_request_manifest(
-            FakeVolumeReader({manifest_path: json_bytes(manifest)}),
+            FakeVolumeReader({
+                manifest_path: json_bytes(manifest),
+                staged_marker_path: staged_marker,
+            }),
             publication,
         )
         == manifest
     )
     assert load_request_manifest(FakeVolumeReader({}), publication) is None
+
+    mismatched_manifest = orjson.loads(json_bytes(manifest))
+    input_artifact = next(
+        artifact
+        for artifact in mismatched_manifest["artifacts"]
+        if artifact["role"] == "input"
+    )
+    input_artifact["sha256"] = "0" * 64
+    with pytest.raises(
+        RuntimeError,
+        match="Existing request view input does not match its staged marker",
+    ):
+        load_request_manifest(
+            FakeVolumeReader({
+                manifest_path: json_bytes(mismatched_manifest),
+                staged_marker_path: staged_marker,
+            }),
+            publication,
+        )
 
 
 def test_request_manifest_requires_presentation_input_identity() -> None:
@@ -2980,6 +3076,20 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
             )
         )
     )
+    staged_marker = input_path.with_name("staged-input.json")
+    staged_marker.write_bytes(
+        json_bytes({
+            "schema_version": STAGED_INPUT_SCHEMA_VERSION,
+            "status": "complete",
+            "run_id": run_id,
+            "request_id": request_id,
+            "input": {
+                "path": input_path.relative_to(tmp_path).as_posix(),
+                "size_bytes": input_path.stat().st_size,
+                "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+            },
+        })
+    )
     outputs_root = run_root / "outputs"
     sample_root = outputs_root / f"seed-{seed}_sample-0"
     sample_root.mkdir(parents=True)
@@ -3043,9 +3153,11 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     input_artifact = next(
         artifact for artifact in artifacts if artifact["role"] == "input"
     )
-    presentation_document = orjson.loads(input_path.read_bytes())
-    presentation_document["name"] = "Readable Name"
-    presentation_bytes = json_bytes(presentation_document)
+    presentation_bytes = input_path.read_bytes().replace(
+        orjson.dumps(canonical_name),
+        orjson.dumps("Readable Name"),
+        1,
+    )
     assert input_artifact["archive_size_bytes"] == len(presentation_bytes)
     assert (
         input_artifact["archive_sha256"]
@@ -3065,46 +3177,62 @@ def test_request_publication_persists_only_a_manifest_view(tmp_path: Path) -> No
     assert volume.reload_count == 1
     assert volume.commit_count == 1
 
-
-def test_request_publication_bounds_input_before_artifact_hashing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = "d" * 64
-    seed = 7
-    request_id = hash_sequences(run_id, [seed])
-    run_root = tmp_path / run_id[:2] / run_id
-    input_path = run_root / "requests" / request_id / "input.json"
-    input_path.parent.mkdir(parents=True)
-    input_path.write_bytes(b"{}")
-    marker_path = run_root / ".markers" / "seeds" / f"{seed}.json"
-    marker_path.parent.mkdir(parents=True)
-    marker_path.write_bytes(
-        orjson.dumps({
-            "schema_version": SEED_MARKER_SCHEMA_VERSION,
-            "status": "complete",
-            "run_id": run_id,
-            "seed": seed,
-            "sample_count": 1,
-            "generation_id": "generation",
-            "rankings": [{"seed": seed, "sample_index": 0, "ranking_score": 0.9}],
-        })
+    second_manifest = publish_request_results(
+        InferenceRuntime(
+            output_root=tmp_path,
+            volume=cast(Any, volume),
+            claims=FakeClaimStore(),
+            container_id="test",
+            maximum_age_seconds=100,
+            summary_maximum_age_seconds=100,
+            wait_timeout_seconds=100,
+        ),
+        RequestPublication(
+            run_id=run_id,
+            request_id=request_id,
+            submitted_seeds=(seed,),
+            normalized_seeds=(seed,),
+            sample_count=1,
+            display_name="Another Name",
+        ),
     )
-    monkeypatch.setattr(request_results, "MAX_STAGED_INPUT_BYTES", 1)
-    monkeypatch.setattr(
-        request_results,
-        "_artifact_record",
-        lambda **kwargs: pytest.fail("oversized staged input reached artifact hashing"),
+    second_artifacts = cast(list[dict[str, object]], second_manifest["artifacts"])
+    second_input = next(
+        artifact for artifact in second_artifacts if artifact["role"] == "input"
     )
 
-    with pytest.raises(ValueError, match="Staged AlphaFold input exceeds"):
+    assert second_manifest["view_id"] != manifest["view_id"]
+    assert second_input["volume_path"] == input_artifact["volume_path"]
+    assert second_input["sha256"] == input_artifact["sha256"]
+    assert second_input["archive_sha256"] != input_artifact["archive_sha256"]
+    assert volume.reload_count == 2
+    assert volume.commit_count == 2
+
+    second_view_root = (
+        run_root
+        / "requests"
+        / request_id
+        / "views"
+        / cast(str, second_manifest["view_id"])
+    )
+    mismatched_manifest = orjson.loads(
+        (second_view_root / "manifest.json").read_bytes()
+    )
+    mismatched_input = next(
+        artifact
+        for artifact in mismatched_manifest["artifacts"]
+        if artifact["role"] == "input"
+    )
+    mismatched_input["sha256"] = "0" * 64
+    (second_view_root / "manifest.json").write_bytes(json_bytes(mismatched_manifest))
+    with pytest.raises(
+        RuntimeError,
+        match="Existing request view input does not match its staged marker",
+    ):
         publish_request_results(
             InferenceRuntime(
                 output_root=tmp_path,
-                volume=cast(
-                    Any,
-                    SimpleNamespace(reload=lambda: None, commit=lambda: None),
-                ),
+                volume=cast(Any, volume),
                 claims=FakeClaimStore(),
                 container_id="test",
                 maximum_age_seconds=100,
@@ -3117,7 +3245,32 @@ def test_request_publication_bounds_input_before_artifact_hashing(
                 submitted_seeds=(seed,),
                 normalized_seeds=(seed,),
                 sample_count=1,
-                display_name="Readable Name",
+                display_name="Another Name",
+            ),
+        )
+
+    input_path.write_bytes(input_path.read_bytes().replace(b"ACDE", b"ACDF"))
+    with pytest.raises(
+        RuntimeError,
+        match="Staged AlphaFold input does not match its marker",
+    ):
+        publish_request_results(
+            InferenceRuntime(
+                output_root=tmp_path,
+                volume=cast(Any, volume),
+                claims=FakeClaimStore(),
+                container_id="test",
+                maximum_age_seconds=100,
+                summary_maximum_age_seconds=100,
+                wait_timeout_seconds=100,
+            ),
+            RequestPublication(
+                run_id=run_id,
+                request_id=request_id,
+                submitted_seeds=(seed,),
+                normalized_seeds=(seed,),
+                sample_count=1,
+                display_name="Changed Input",
             ),
         )
 
@@ -3145,9 +3298,11 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         )
     )
     volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
-    presentation_document = orjson.loads(input_bytes)
-    presentation_document["name"] = "Readable Name"
-    presentation_input = json_bytes(presentation_document)
+    presentation_input = input_bytes.replace(
+        orjson.dumps(canonical_name),
+        orjson.dumps("Readable Name"),
+        1,
+    )
     manifest = _request_manifest(
         run_id=run_id,
         submitted_seeds=normalized_seeds,
@@ -3165,15 +3320,28 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         ],
     )
     view_id = cast(str, manifest["view_id"])
+    downloaded_paths: list[str] = []
 
-    archive = create_request_archive(
-        FakeVolumeReader({volume_path: input_bytes}),
-        manifest,
-        output_dir=tmp_path,
-        display_name="Readable Name",
-    )
+    def download_files(downloads: Iterable[tuple[str, Path]]) -> None:
+        for remote_path, destination in downloads:
+            downloaded_paths.append(remote_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(input_bytes)
+
+    original_umask = os.umask(0o077)
+    try:
+        archive = create_request_archive(
+            FakeVolumeReader({}),
+            manifest,
+            output_dir=tmp_path,
+            display_name="Readable Name",
+            download_files=download_files,
+        )
+    finally:
+        os.umask(original_umask)
 
     assert archive.name == f"Readable_Name_{view_id[:12]}_AlphaFold3.tar.zst"
+    assert downloaded_paths == [volume_path]
     archived_input = "\n".join(
         run_command(
             [
@@ -3207,6 +3375,18 @@ def test_request_archive_downloads_exact_manifest_view(tmp_path: Path) -> None:
         "seed,sample,ranking_score",
         "7,0,1.0",
     ]
+
+    original_umask = os.umask(0o022)
+    try:
+        rebuilt = create_request_archive(
+            FakeVolumeReader({volume_path: input_bytes}),
+            manifest,
+            output_dir=tmp_path / "rebuilt",
+            display_name="Readable Name",
+        )
+    finally:
+        os.umask(original_umask)
+    assert rebuilt.read_bytes() == archive.read_bytes()
 
     assert (
         create_request_archive(
@@ -3364,43 +3544,6 @@ def test_request_archive_rejects_a_partial_volume_download(tmp_path: Path) -> No
         )
 
 
-def test_request_archive_rejects_oversized_input_before_download(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = "e" * 64
-    normalized_seeds = [9]
-    request_id = hash_sequences(run_id, normalized_seeds)
-    volume_path = f"{run_id[:2]}/{run_id}/requests/{request_id}/input.json"
-    manifest = _request_manifest(
-        run_id=run_id,
-        submitted_seeds=normalized_seeds,
-        display_name="oversized",
-        artifacts=[
-            {
-                "role": "input",
-                "volume_path": volume_path,
-                "archive_path": f"{canonical_output_name(run_id)}_data.json",
-                "size_bytes": 5,
-                "sha256": hashlib.sha256(b"12345").hexdigest(),
-            }
-        ],
-    )
-    monkeypatch.setattr(request_results, "MAX_STAGED_INPUT_BYTES", 4)
-
-    class NoReadVolume:
-        def read_file(self, path: str):
-            pytest.fail(f"oversized input reached Volume download: {path}")
-
-    with pytest.raises(ValueError, match="Request input artifact exceeds"):
-        create_request_archive(
-            cast(Any, NoReadVolume()),
-            manifest,
-            output_dir=tmp_path,
-            display_name="oversized",
-        )
-
-
 def test_artifact_download_rejects_overflow_before_writing_the_chunk(
     tmp_path: Path,
 ) -> None:
@@ -3544,22 +3687,3 @@ def test_request_archive_rejects_same_size_changed_bytes(tmp_path: Path) -> None
             output_dir=tmp_path,
             display_name="changed",
         )
-
-
-def test_every_fixed_profile_has_one_missing_build_input() -> None:
-    inventory: dict[str, object] = {
-        "invalid_profiles": {},
-        "missing_database_ids": [
-            spec.database_id for spec in reversed(DATABASE_PROFILE_SPECS)
-        ],
-    }
-
-    planned = plan_missing_profile_builds(
-        inventory,
-        seqkit_threads=DEFAULT_SEQKIT_THREADS,
-        source_policy="keep",
-    )
-
-    assert [database_id for database_id, _, _ in planned] == [
-        spec.database_id for spec in DATABASE_PROFILE_SPECS
-    ]

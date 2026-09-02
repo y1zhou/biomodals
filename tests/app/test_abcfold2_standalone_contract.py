@@ -123,7 +123,7 @@ def test_prepare_abcfold2_uses_hash_partitioned_app_run_root(
     assert calls["prepare_boltz"]["out_dir"] == run_root
     assert calls["prepare_chai"]["conf_file"] == run_root / f"{run_id}.yaml"
     assert calls["prepare_chai"]["out_dir"] == run_root
-    assert output_volume.commit_count == 3
+    assert output_volume.commit_count == 1
 
 
 def test_collectors_only_package_completed_seed_directories(
@@ -160,17 +160,6 @@ def test_collectors_only_package_completed_seed_directories(
     assert Path(str(boltz["archive_path"])).read_bytes() == b"tar"
     assert Path(str(chai["archive_path"])).read_bytes() == b"tar"
     assert volume.commit_count == 2
-
-
-def test_seed_publication_rejects_an_old_parameter_key(tmp_path: Path) -> None:
-    result = tmp_path / "boltz_models" / "boltz_results_seed-1"
-    result.mkdir(parents=True)
-    abcfold2_app._write_publication_marker(
-        tmp_path / ".biomodals" / "boltz-seed-1.json",
-        {"publication_key": "old", "result_path": str(result)},
-    )
-
-    assert not abcfold2_app._seed_ready(tmp_path, "boltz", 1, "new")
 
 
 def test_publication_validators_reject_same_size_corruption(tmp_path: Path) -> None:

@@ -117,6 +117,16 @@ class RecoverableTextNode(CoordinatorNode):
 
 
 @dataclass
+class BrokenRecoveryTextNode(RecoverableTextNode):
+    def recover_result_publication(
+        self,
+        context: NodeRunContext,
+    ) -> AppRunResult | None:
+        del context
+        raise ValueError("invalid publication")
+
+
+@dataclass
 class RemoteTextNode(ProviderNode):
     text: str
     function_name: str
@@ -167,6 +177,11 @@ class RemoteFanoutNode(TaskProviderNode):
     )
     cancel_on_finalize: Callable[[], None] | None = field(
         default=None,
+        repr=False,
+        metadata={"dag_hash": False},
+    )
+    cancelled_finalizations: int = field(
+        default=0,
         repr=False,
         metadata={"dag_hash": False},
     )
@@ -233,6 +248,10 @@ class RemoteFanoutNode(TaskProviderNode):
             ],
         )
 
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        del context
+        self.cancelled_finalizations += 1
+
 
 @dataclass
 class RefreshingRemoteFanoutNode(RemoteFanoutNode):
@@ -240,6 +259,13 @@ class RefreshingRemoteFanoutNode(RemoteFanoutNode):
 
     def refresh_result_storage(self) -> None:
         self.refreshes += 1
+
+
+@dataclass
+class FailingCancellationRemoteFanoutNode(RemoteFanoutNode):
+    def finalize_cancelled_remote_tasks(self, context: NodeRunContext) -> None:
+        super().finalize_cancelled_remote_tasks(context)
+        raise RuntimeError("cleanup failed")
 
 
 @dataclass
@@ -765,6 +791,17 @@ def test_result_node_recovers_workload_publication_without_rerunning(
     runtime.close()
 
 
+def test_result_recovery_does_not_hide_invalid_publications(tmp_path: Path) -> None:
+    graph = ExecutionGraph("invalid-recovery")
+    graph.add_node(BrokenRecoveryTextNode("cached"), id="result")
+    runtime = _runtime(tmp_path, graph)
+
+    with pytest.raises(ValueError, match="invalid publication"):
+        runtime.run(workload_run_key="invalid-recovery")
+
+    runtime.close()
+
+
 def test_result_node_commits_workload_publication_after_execution(
     tmp_path: Path,
 ) -> None:
@@ -1103,7 +1140,7 @@ def test_artifact_volume_log_reloads_before_publication(
     runtime.close()
 
 
-def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> None:
+def test_local_dag_uses_kernel_state_and_standard_paths(tmp_path: Path) -> None:
     workflow = ExecutionGraph("demo")
     first_node = TextNode("first")
     first = workflow.add_node(first_node, id="first")
@@ -1128,17 +1165,8 @@ def test_local_dag_uses_kernel_state_and_attempt_free_paths(tmp_path: Path) -> N
         "succeeded",
         "succeeded",
     ]
-    tables = {
-        str(row[0])
-        for row in runtime.store.connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-    assert "attempts" not in tables
-    assert "remote_calls" not in tables
     assert first_node.seen[0].workload_run_key == "friendly-name"
     assert first_node.seen[0].execution_run_id == RUN_ID
-    assert "attempt" not in str(first_node.seen[0].work_dir)
     assert [artifact.artifact_id for artifact in second_node.seen[0].inputs["upstream"]]
     assert (
         runtime.store.output_root.joinpath(
@@ -1286,7 +1314,8 @@ def test_cancel_requested_fanout_reconciles_node_cancellation(
     tmp_path: Path,
 ) -> None:
     workflow = ExecutionGraph("cancel-fanout")
-    workflow.add_node(RemoteFanoutNode(("a", "b")), id="fanout")
+    node = RemoteFanoutNode(("a", "b"))
+    workflow.add_node(node, id="fanout")
     driver = CancellingFanoutModalDriver()
     runtime = _runtime(tmp_path, workflow, driver=driver)
     runtime._initialize("cancel-fanout")
@@ -1299,6 +1328,27 @@ def test_cancel_requested_fanout_reconciles_node_cancellation(
     assert snapshot.run.status == RunStatus.CANCELLED
     assert snapshot.nodes[0].status == NodeStatus.CANCELLED
     assert {task.status for task in snapshot.tasks} == {TaskStatus.CANCELLED}
+    assert node.cancelled_finalizations == 1
+
+
+def test_cancelled_tasks_reconcile_when_workload_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    workflow = ExecutionGraph("cancel-fanout-cleanup-failure")
+    node = FailingCancellationRemoteFanoutNode(("a", "b"))
+    workflow.add_node(node, id="fanout")
+    runtime = _runtime(tmp_path, workflow, driver=CancellingFanoutModalDriver())
+    runtime._initialize("cancel-fanout-cleanup-failure")
+    runtime.advance_once()
+    runtime.cancel()
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        runtime.advance_once()
+
+    snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert snapshot.nodes[0].status == NodeStatus.CANCELLED
+    assert {task.status for task in snapshot.tasks} == {TaskStatus.CANCELLED}
+    assert node.cancelled_finalizations == 1
 
 
 def test_unknown_workflow_prunes_call_after_terminal_publication_appears(

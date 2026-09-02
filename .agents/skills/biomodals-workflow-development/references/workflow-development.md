@@ -345,8 +345,8 @@ after every same-container state or file mutation.
 
 The persisted `workflow-plan.pkl` is trusted internal state tied to the exact
 deployment. A reopened Run must match its Workload Plan Fingerprint, Workload
-Run Key, and Deployment Identity. Old pre-kernel workflow ledgers are rejected;
-there is no compatibility facade or migration.
+Run Key, and Deployment Identity. Pre-kernel workflow ledgers are unsupported
+and are not migrated; initialize a fresh Execution Run instead.
 
 ## Modal Preemption
 
@@ -364,6 +364,12 @@ Worker exit callbacks are advisory. They may checkpoint workload-owned data or
 record diagnostics, but they do not fail, reassign, or retry a Task. Pull-worker
 claims and completions use stable request IDs so a lost response can be replayed
 without creating a new assignment.
+
+Worker code must likewise let `InputCancellation` escape without recording a
+terminal workload failure. It inherits from `BaseException`, so terminalize
+only ordinary caught `Exception` failures. Keep generation-scoped Volume
+staging rerunnable and reserve `finally` for cleanup that cannot prevent the
+same provider input from being redelivered.
 
 Remote workflow code should:
 
@@ -605,6 +611,10 @@ before joining them to mounted paths.
 When a caller waits for a remote function that committed created, copied, or
 deleted files in a mounted Volume, reload that same Volume before reading,
 selecting, materializing, or validating those paths in the caller.
+Treat the successful reload as the visibility boundary: a missing or invalid
+publication is a workload failure, not a reason for an unobserved propagation
+delay. Add a grace period or repeated reload only after reproducing a provider
+contract failure.
 
 ## DAG Construction
 
@@ -656,3 +666,10 @@ new included-app nodes so accidental deployed-app lookup regressions are caught.
 Use fake `ProviderDriver` instances and deterministic function-name-to-handle maps at the
 coordinator boundary. The production Node contract remains primitive and names
 the exact function; it does not carry Modal objects.
+
+Keep tests aligned with the maintained contract. When a change removes a
+field, flag, alias, compatibility path, or implementation, delete its tests in
+the same change and test the replacement behavior directly. Do not turn the
+retired design into an absence assertion. Reserve absence assertions for
+enduring boundaries such as secret redaction, path containment, and an
+intentionally private public API surface.

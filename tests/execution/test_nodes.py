@@ -12,7 +12,6 @@ from biomodals.execution.nodes import (
     ProviderCallSpec,
     ProviderNode,
     TaskDefinition,
-    TaskProviderNode,
 )
 from biomodals.schema import ArtifactKind, ExecutionArtifact, VolumePath
 
@@ -35,15 +34,7 @@ def test_app_backed_node_requires_caller_owned_remote_preparation(
         node.prepare_remote(context)
 
 
-def test_app_backed_node_owns_no_modal_lookup_or_submission_api() -> None:
-    assert not hasattr(ProviderNode, "app_name")
-    assert not hasattr(ProviderNode, "function_name")
-    assert not hasattr(ProviderNode, "load_app_function")
-    assert not hasattr(ProviderNode, "invoke_app_function")
-    assert not hasattr(ProviderNode, "submit_remote")
-
-
-def test_remote_task_node_declares_data_without_modal_submission() -> None:
+def test_remote_task_node_declares_data() -> None:
     task = TaskDefinition(
         task_key="candidate-a",
         scientific_payload={"candidate_id": "candidate-a"},
@@ -52,7 +43,6 @@ def test_remote_task_node_declares_data_without_modal_submission() -> None:
 
     assert task.task_key == "candidate-a"
     assert task.execution_payload == {"candidate_path": "inputs/candidate-a.pdb"}
-    assert not hasattr(TaskProviderNode, "submit_remote")
     with pytest.raises(ValueError, match="cannot be empty"):
         TaskDefinition(
             task_key="",

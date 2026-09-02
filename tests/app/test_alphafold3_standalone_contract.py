@@ -28,11 +28,9 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
 )
 from biomodals.app.fold.alphafold3.modal_adapters import (
     InProcessInferenceExecutor,
-    execute_profile_setup,
     publish_invocation_receipt,
     stage_inference_run,
 )
-from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
     InferenceRuntime,
@@ -147,38 +145,6 @@ def test_summary_claim_lifetime_matches_its_shorter_function_timeout() -> None:
         alphafold3_app._SUMMARY_TIMEOUT_SECONDS + 900
     )
     assert runtime.summary_maximum_age_seconds < runtime.maximum_age_seconds
-
-
-def test_profile_setup_adapter_fans_out_missing_profiles() -> None:
-    spec = DATABASE_PROFILE_SPECS[0]
-    inventory: dict[str, object] = {
-        "invalid_profiles": {},
-        "missing_database_ids": [spec.database_id],
-    }
-    build_result = {"database_id": spec.database_id, "status": "published"}
-    final_inventory = {"missing_database_ids": []}
-    inspect_remote = Mock(return_value=inventory)
-    build_starmap = Mock(return_value=[build_result])
-    finalize_remote = Mock(return_value=final_inventory)
-
-    result = execute_profile_setup(
-        SimpleNamespace(remote=inspect_remote),
-        SimpleNamespace(starmap=build_starmap),
-        SimpleNamespace(remote=finalize_remote),
-        seqkit_threads=8,
-        source_policy="keep",
-    )
-
-    assert result == {
-        "status": "complete",
-        "initial_inventory": inventory,
-        "builder_results": [build_result],
-        "final_inventory": final_inventory,
-    }
-    build_starmap.assert_called_once_with(
-        ((spec.database_id, 8, "keep"),),
-        return_exceptions=True,
-    )
 
 
 def test_in_process_inference_executor_uses_direct_function_bodies() -> None:
@@ -795,7 +761,8 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
     assert protein["pairedMsa"] == ""
     assert protein["templates"] == []
     assert (
-        f"--model_dir={alphafold3_app.CONF.model_volume_mountpoint}" in captured["cmd"]
+        f"--model_dir={alphafold3_app.CONF.model_volume_mountpoint}/AlphaFold3"
+        in captured["cmd"]
     )
     jax_cache_arg = next(
         arg for arg in captured["cmd"] if arg.startswith("--jax_compilation_cache_dir=")
@@ -889,6 +856,32 @@ def test_inference_worker_fails_claim_when_staged_input_loading_fails(
     assert status["error_type"] == "ValueError"
     assert status["message"] == "staged input is invalid"
     assert status["phase"] == "inference-worker"
+
+
+def test_inference_worker_leaves_claim_open_when_container_is_interrupted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_id = "a" * 64
+    claimed_seed = _claimed_seed(run_id, 42)
+    claims = _install_claim_runtime(monkeypatch, tmp_path, claimed_seed)
+
+    with pytest.raises(KeyboardInterrupt):
+        with guard_seed_prediction_claims(
+            alphafold3_app._INFERENCE_RUNTIME,
+            run_id,
+            [claimed_seed.to_dict()],
+        ):
+            raise KeyboardInterrupt
+
+    assert (
+        generation_status(
+            claims,
+            claimed_seed.claim.scope_key,
+            claimed_seed.claim.generation_id,
+        )
+        is None
+    )
 
 
 def test_inference_worker_preserves_claim_already_completed_by_inner_worker(

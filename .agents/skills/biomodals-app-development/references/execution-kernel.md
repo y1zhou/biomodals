@@ -84,6 +84,13 @@ locks, checkpoints, or lifecycle classes.
   Never replace active or outcome-unknown work.
 - Let provider redelivery re-execute the same call and Task identity. A worker
   must be idempotent and must not open the coordinator's SQLite database.
+- Record terminal workload failure only from an ordinary caught `Exception`.
+  Modal interruption raises `InputCancellation`, a `BaseException`; let it
+  escape without terminalizing the Task or its publication claim so Modal can
+  redeliver the same input.
+- Use `finally` for closing handles and removing disposable local staging, not
+  for writing terminal failure markers. Generation-scoped Volume staging must
+  remain safe to clear or reuse when the same input is redelivered.
 - Use fixed-batch dispatch for bounded compatible Tasks and the kernel's SQLite
   pull-worker queue for work stealing. Do not recreate generic scheduling with
   Modal Queue, Dict, file locks, leases, or output markers.
@@ -94,6 +101,10 @@ locks, checkpoints, or lifecycle classes.
 
 - Commit a Volume explicitly when another container can act on or consume the
   new state. Reload before that other container reads it.
+- Treat a completed explicit commit followed by a successful reload as the
+  visibility boundary. If the expected publication is then missing or invalid,
+  fail validation; add a visibility grace period only for a reproduced provider
+  failure that contradicts this contract.
 - Do not commit merely so later code in the same container can see its own
   writes, and do not commit after every file mutation. Modal performs periodic
   commits automatically.

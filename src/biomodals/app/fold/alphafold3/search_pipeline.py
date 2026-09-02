@@ -12,7 +12,6 @@ from typing import Protocol, TypeAlias
 from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.fold.alphafold3.inference_inputs import (
-    serialize_af3_input,
     validate_submitted_af3_input,
     validate_upstream_af3_input,
 )
@@ -131,10 +130,9 @@ def resolve_msa_and_templates(
     search_protein_templates: bool = True,
     max_parallel_search_workers: int = 4,
 ) -> AF3Config:
-    """Populate missing MSA/template fields through one validated deep seam."""
+    """Populate null evidence while preserving explicit empty/supplied fields."""
     worker_budget = validate_search_worker_budget(max_parallel_search_workers)
     conf = validate_submitted_af3_input(config)
-    serialize_af3_input(conf)
     if not search_msa:
         return validate_upstream_af3_input(fill_missing_msa_for_inference(conf))
 
@@ -148,7 +146,7 @@ def resolve_msa_and_templates(
             protein = conf.sequences[state.chain_index].protein
             if protein is None:
                 raise RuntimeError("Protein MSA state no longer matches its chain")
-            if not protein.templates:
+            if protein.templates is None:
                 possible_template_tasks += 1
     task_count = len(plan.raw_searches) + len(plan.assemblies) + possible_template_tasks
     validate_remote_search_task_count(task_count)

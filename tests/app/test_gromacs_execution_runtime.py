@@ -12,11 +12,13 @@ from uuid import UUID
 import orjson
 import pytest
 
+from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
     GromacsPublications,
     gromacs_execution_graph,
+    parse_gromacs_publication,
     persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
@@ -378,6 +380,28 @@ def test_terminal_publication_covers_required_user_outputs(tmp_path: Path) -> No
         f"production_{request.run_name}_nopbc.xtc",
         f"production_{request.run_name}_nopbc_centered.pdb",
     } <= paths
+
+
+def test_terminal_publication_can_be_verified_without_mounting(tmp_path: Path) -> None:
+    request = _request()
+    coordinator = _coordinator(tmp_path, request, FakeClaims(), RUN_ID)
+    try:
+        assert coordinator.run().run.status == RunStatus.SUCCEEDED
+    finally:
+        coordinator.close()
+    publications = _publications(tmp_path, request, FakeClaims(), RUN_ID)
+
+    files = parse_gromacs_publication(
+        request,
+        PREPARE_RESULT,
+        publications.publication_path(PREPARE_RESULT).read_bytes(),
+    )
+
+    assert files is not None
+    assert tuple(file.path for file in files) == tuple(
+        path.relative_to(request.run_root(tmp_path)).as_posix()
+        for path in publications.node_paths(PREPARE_RESULT)
+    )
 
 
 def test_production_invalidation_removes_the_checkpoint_output_set(

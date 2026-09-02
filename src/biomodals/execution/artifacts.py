@@ -56,28 +56,19 @@ class ContentBoundFileSet:
     def load(self) -> tuple[ArtifactFile, ...] | None:
         """Return exact file records only while identity and bytes still match."""
         try:
-            marker = orjson.loads(self.marker_path.read_bytes())
+            content = self.marker_path.read_bytes()
         except (
             FileNotFoundError,
             IsADirectoryError,
             NotADirectoryError,
-            orjson.JSONDecodeError,
         ):
             return None
-        if not (
-            isinstance(marker, dict)
-            and marker.get("schema_version") == 1
-            and marker.get("identity") == dict(self.identity)
-            and isinstance(marker.get("files"), list)
-        ):
-            return None
-        try:
-            files = tuple(ArtifactFile.model_validate(item) for item in marker["files"])
-        except (TypeError, ValueError):
-            return None
-        if tuple(file.path for file in files) != self.expected_paths or any(
-            file.size_bytes is None or file.content_sha256 is None for file in files
-        ):
+        files = parse_content_bound_file_set(
+            content,
+            expected_paths=self.expected_paths,
+            identity=self.identity,
+        )
+        if files is None:
             return None
         for file in files:
             path = _resolve_artifact_file(self.root, file.path)
@@ -108,6 +99,35 @@ class ContentBoundFileSet:
                 ],
             },
         )
+
+
+def parse_content_bound_file_set(
+    content: bytes,
+    *,
+    expected_paths: tuple[str, ...],
+    identity: Mapping[str, Any],
+) -> tuple[ArtifactFile, ...] | None:
+    """Decode one marker without assuming direct access to its files."""
+    try:
+        marker = orjson.loads(content)
+    except orjson.JSONDecodeError:
+        return None
+    if not (
+        isinstance(marker, dict)
+        and marker.get("schema_version") == 1
+        and marker.get("identity") == dict(identity)
+        and isinstance(marker.get("files"), list)
+    ):
+        return None
+    try:
+        files = tuple(ArtifactFile.model_validate(item) for item in marker["files"])
+    except (TypeError, ValueError):
+        return None
+    if tuple(file.path for file in files) != expected_paths or any(
+        file.size_bytes is None or file.content_sha256 is None for file in files
+    ):
+        return None
+    return files
 
 
 def republish_execution_artifact(artifact: ExecutionArtifact) -> AppOutput:

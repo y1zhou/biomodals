@@ -10,6 +10,7 @@ from biomodals.execution.artifact_availability import (
 from biomodals.execution.artifacts import (
     ContentBoundFileSet,
     inline_json_result,
+    parse_content_bound_file_set,
     republish_execution_artifact,
 )
 from biomodals.execution.coordinator import (
@@ -171,6 +172,7 @@ __all__ = [
     "form_pull_worker_candidates",
     "inline_json_result",
     "mounted_volume_checker",
+    "parse_content_bound_file_set",
     "propagated_skip_node_keys",
     "ready_node_keys",
     "required_node_keys",

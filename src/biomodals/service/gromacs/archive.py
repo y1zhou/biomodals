@@ -16,7 +16,11 @@ from typing import BinaryIO, Protocol, TypeVar, cast
 import orjson
 import polars as pl
 
-from biomodals.service.artifacts import ArtifactSourceMissingError
+from biomodals.schema import ArtifactFile
+from biomodals.service.artifacts import (
+    ArtifactIntegrityError,
+    ArtifactSourceMissingError,
+)
 from biomodals.service.gromacs.contracts import artifact_request_sha256
 
 _CHUNK_SIZE = 1024 * 1024
@@ -714,9 +718,11 @@ async def write_gromacs_archive(
     completed_at: int,
     read_file: ReadRemoteFile,
     remote_mtimes: Mapping[str, int],
+    expected_request_sha256: str,
+    published_files: tuple[ArtifactFile, ...],
     run_bounded: RunBounded | None = None,
 ) -> BuiltGromacsArchive:
-    """Package the established GROMACS app's expected Volume files."""
+    """Package files that still match the authoritative app publication."""
 
     async def read_required(path: str) -> AsyncIterator[bytes]:
         try:
@@ -747,6 +753,19 @@ async def write_gromacs_archive(
         max_bytes=_MAX_PDB_BYTES,
     )
     parameters_bytes = parameters_json.encode()
+    if artifact_request_sha256(input_bytes, parameters_json) != expected_request_sha256:
+        raise ArtifactIntegrityError(
+            "GROMACS result input does not match the staged request"
+        )
+    expected_paths = tuple(
+        PurePosixPath(name).name for name, _role in _required_output_files(run_name)
+    )
+    if tuple(file.path for file in published_files) != expected_paths or any(
+        file.size_bytes is None or file.content_sha256 is None
+        for file in published_files
+    ):
+        raise ArtifactIntegrityError("GROMACS result publication is invalid")
+    publication = {file.path: file for file in published_files}
     try:
         stages_document = orjson.loads(stages_json)
     except orjson.JSONDecodeError as exc:
@@ -795,18 +814,25 @@ async def write_gromacs_archive(
                 if name == f"outputs/production_{run_name}.tpr"
                 else None
             )
-            records.append(
-                await _write_remote(
-                    archive,
-                    read_file=read_required,
-                    mtime=required_mtime(remote_path),
-                    remote_path=remote_path,
-                    name=name,
-                    role=role,
-                    run_bounded=run_bounded,
-                    prefix=capture_prefix,
-                )
+            record = await _write_remote(
+                archive,
+                read_file=read_required,
+                mtime=required_mtime(remote_path),
+                remote_path=remote_path,
+                name=name,
+                role=role,
+                run_bounded=run_bounded,
+                prefix=capture_prefix,
             )
+            published = publication[PurePosixPath(name).name]
+            if (
+                record["size_bytes"] != published.size_bytes
+                or record["sha256"] != published.content_sha256
+            ):
+                raise ArtifactIntegrityError(
+                    f"GROMACS output changed after publication: {published.path}"
+                )
+            records.append(record)
         software_version = _tpr_software_version(bytes(topology_prefix))
         provenance_bytes = (
             orjson.dumps(

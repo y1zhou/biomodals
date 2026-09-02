@@ -18,13 +18,19 @@ from threading import Event, Thread
 import orjson
 import pytest
 
-from biomodals.service.artifacts import ArtifactCache, ArtifactSourceMissingError
+from biomodals.schema import ArtifactFile
+from biomodals.service.artifacts import (
+    ArtifactCache,
+    ArtifactIntegrityError,
+    ArtifactSourceMissingError,
+)
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     BuiltGromacsArchive,
     validate_gromacs_archive,
     write_gromacs_archive,
 )
+from biomodals.service.gromacs.contracts import artifact_request_sha256
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
@@ -100,10 +106,29 @@ def _mtimes_for_files(remote_files: dict[str, bytes]) -> dict[str, int]:
     return dict.fromkeys(remote_files, 1_700_000_000)
 
 
+def _published_files(
+    remote_files: dict[str, bytes] | None = None,
+) -> tuple[ArtifactFile, ...]:
+    files = _remote_files() if remote_files is None else remote_files
+    baseline = _remote_files()
+    input_path = f"{RUN_NAME}/{RUN_NAME}.pdb"
+    full_trajectory = f"{RUN_NAME}/production_{RUN_NAME}.xtc"
+    return tuple(
+        ArtifactFile(
+            path=path.removeprefix(f"{RUN_NAME}/"),
+            size_bytes=len(files[path]),
+            content_sha256=hashlib.sha256(files[path]).hexdigest(),
+        )
+        for path in baseline
+        if path not in {input_path, full_trajectory}
+    )
+
+
 def _build_archive(
     *,
     remote_files: dict[str, bytes] | None = None,
     remote_mtimes: dict[str, int] | None = None,
+    published_files: tuple[ArtifactFile, ...] | None = None,
 ) -> tuple[bytes, BuiltGromacsArchive]:
     files = _remote_files() if remote_files is None else remote_files
 
@@ -131,6 +156,10 @@ def _build_archive(
             read_file=read_file,
             remote_mtimes=(
                 _mtimes_for_files(files) if remote_mtimes is None else remote_mtimes
+            ),
+            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            published_files=(
+                _published_files(files) if published_files is None else published_files
             ),
         )
     )
@@ -200,6 +229,26 @@ def test_service_packages_established_remote_files_deterministically() -> None:
         }
 
 
+def test_service_rejects_input_that_differs_from_staged_request() -> None:
+    remote_files = _remote_files()
+    remote_files[f"{RUN_NAME}/{RUN_NAME}.pdb"] = PDB + b"END\n"
+
+    with pytest.raises(ArtifactIntegrityError, match="staged request"):
+        _build_archive(remote_files=remote_files)
+
+
+def test_service_rejects_output_changed_after_publication() -> None:
+    remote_files = _remote_files()
+    published_files = _published_files(remote_files)
+    remote_files[f"{RUN_NAME}/production.mdp"] += b"nstxout = 1\n"
+
+    with pytest.raises(ArtifactIntegrityError, match="after publication"):
+        _build_archive(
+            remote_files=remote_files,
+            published_files=published_files,
+        )
+
+
 @pytest.mark.parametrize(
     "blocking_content",
     [PDB, XTC],
@@ -260,6 +309,8 @@ def test_archive_writes_do_not_block_the_event_loop(
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(files),
+                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                published_files=_published_files(files),
                 run_bounded=cache.run_bounded,
             )
             await observer
@@ -326,6 +377,8 @@ def test_service_preserves_remote_file_modification_times() -> None:
             completed_at=2,
             read_file=read_file,
             remote_mtimes=remote_mtimes,
+            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            published_files=_published_files(remote_files),
         )
     )
 
@@ -509,6 +562,8 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(remote_files),
+                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                published_files=_published_files(remote_files),
             )
         )
 
@@ -545,6 +600,8 @@ def test_large_centered_structure_and_diagnostics_stream_without_a_size_cap() ->
             completed_at=2,
             read_file=read_file,
             remote_mtimes=_mtimes_for_files(remote_files),
+            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            published_files=_published_files(remote_files),
         )
     )
 
@@ -582,5 +639,7 @@ def test_missing_required_remote_output_has_a_distinct_failure() -> None:
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(remote_files),
+                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                published_files=_published_files(),
             )
         )

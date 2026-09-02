@@ -30,6 +30,7 @@ from biomodals.execution import (
     ExecutionArtifact,
     ExecutionGraph,
     ExecutionPlanMetadata,
+    parse_content_bound_file_set,
 )
 from biomodals.execution.modal import (
     ExecutionDefinitionCoordinatorLifecycle,
@@ -170,6 +171,80 @@ class GromacsExecutionRequest:
             raise TypeError("GROMACS PDB content must be base64 text")
         value["pdb_content"] = b64decode(encoded_pdb, validate=True)
         return cls(**value)
+
+
+def gromacs_publication_path(
+    request: GromacsExecutionRequest,
+    node_key: str,
+) -> PurePosixPath:
+    """Return one operation's marker path relative to the output Volume."""
+    marker = sha256(node_key.encode()).hexdigest() + ".json"
+    return PurePosixPath(request.run_name, ".biomodals", "gromacs", marker)
+
+
+def gromacs_node_paths(
+    request: GromacsExecutionRequest,
+    node_key: str,
+) -> tuple[str, ...]:
+    """Return the exact run-relative scientific files for one operation."""
+    name = request.run_name
+    prepare = preparation_execution_paths(name)
+
+    def analysis(prefix: str) -> tuple[str, ...]:
+        return tuple(
+            f"{metric}_{prefix}{name}.{suffix}"
+            for metric in ("rmsd", "rg", "rmsf")
+            for suffix in ("csv", "png")
+        )
+
+    if node_key.startswith("prepare_tpr_"):
+        return prepare
+    if node_key == NVT_ANALYSIS:
+        return analysis("nvt_")
+    if node_key == NPT_ANALYSIS:
+        return analysis("npt_")
+    if node_key.startswith("production_run_"):
+        return (
+            f"production_{name}.xtc",
+            f"production_{name}.edr",
+        )
+    if node_key == PRODUCTION_ANALYSIS:
+        return analysis("production_") + (
+            f"production_{name}_nopbc.xtc",
+            f"production_{name}_nopbc_centered.pdb",
+        )
+    if node_key == PREPARE_RESULT:
+        return (
+            analysis("nvt_")
+            + analysis("npt_")
+            + analysis("production_")
+            + (
+                "production.mdp",
+                f"production_{name}.tpr",
+                f"production_{name}.edr",
+                f"production_{name}_nopbc.xtc",
+                f"production_{name}_nopbc_centered.pdb",
+            )
+        )
+    raise ValueError(f"Unknown GROMACS Node {node_key!r}")
+
+
+def parse_gromacs_publication(
+    request: GromacsExecutionRequest,
+    node_key: str,
+    content: bytes,
+) -> tuple[ArtifactFile, ...] | None:
+    """Decode one app-owned publication fetched through the Volume API."""
+    return parse_content_bound_file_set(
+        content,
+        expected_paths=gromacs_node_paths(request, node_key),
+        identity={
+            "node_key": node_key,
+            "workload_plan_fingerprint": (
+                request.execution_plan.workload_plan_fingerprint
+            ),
+        },
+    )
 
 
 def stage_execution_request(
@@ -352,10 +427,7 @@ class GromacsPublications:
 
     def publication_path(self, node_key: str) -> Path:
         """Return one operation's content-bound publication marker path."""
-        marker = sha256(node_key.encode()).hexdigest() + ".json"
-        return (
-            self.request.run_root(self.output_root) / ".biomodals" / "gromacs" / marker
-        )
+        return self.output_root / gromacs_publication_path(self.request, node_key)
 
     def recover_result(self, node_key: str) -> AppRunResult | None:
         """Return a content-bound result only for a valid existing marker."""
@@ -446,46 +518,7 @@ class GromacsPublications:
     def node_paths(self, node_key: str) -> tuple[Path, ...]:
         """Return the exact scientific files published by one operation."""
         root = self.request.run_root(self.output_root)
-        name = self.request.run_name
-        prepare = tuple(root / path for path in preparation_execution_paths(name))
-
-        def analysis(prefix: str) -> tuple[Path, ...]:
-            return tuple(
-                root / f"{metric}_{prefix}{name}.{suffix}"
-                for metric in ("rmsd", "rg", "rmsf")
-                for suffix in ("csv", "png")
-            )
-
-        if node_key.startswith("prepare_tpr_"):
-            return prepare
-        if node_key == NVT_ANALYSIS:
-            return analysis("nvt_")
-        if node_key == NPT_ANALYSIS:
-            return analysis("npt_")
-        if node_key.startswith("production_run_"):
-            return (
-                root / f"production_{name}.xtc",
-                root / f"production_{name}.edr",
-            )
-        if node_key == PRODUCTION_ANALYSIS:
-            return analysis("production_") + (
-                root / f"production_{name}_nopbc.xtc",
-                root / f"production_{name}_nopbc_centered.pdb",
-            )
-        if node_key == PREPARE_RESULT:
-            return (
-                analysis("nvt_")
-                + analysis("npt_")
-                + analysis("production_")
-                + (
-                    root / "production.mdp",
-                    root / f"production_{name}.tpr",
-                    root / f"production_{name}.edr",
-                    root / f"production_{name}_nopbc.xtc",
-                    root / f"production_{name}_nopbc_centered.pdb",
-                )
-            )
-        raise ValueError(f"Unknown GROMACS Node {node_key!r}")
+        return tuple(root / path for path in gromacs_node_paths(self.request, node_key))
 
     def _read_node_publication(
         self,

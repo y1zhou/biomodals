@@ -9,18 +9,25 @@ from typing import BinaryIO, cast
 import modal
 import orjson
 
+from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
 from biomodals.app.bioinfo.gromacs_execution_runtime import (
     GromacsExecutionRequest,
+    gromacs_publication_path,
     load_execution_request_from_volume,
+    parse_gromacs_publication,
     stage_execution_request,
 )
 from biomodals.execution.modal import stage_execution_launch
-from biomodals.service.artifacts import ArtifactCache
+from biomodals.helper.modal_volume import read_modal_volume_file
+from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     write_gromacs_archive,
 )
-from biomodals.service.gromacs.contracts import GromacsJobOptions
+from biomodals.service.gromacs.contracts import (
+    GromacsJobOptions,
+    artifact_request_sha256,
+)
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobRecord
 from biomodals.service.tool_runtime import PreparedResult
@@ -73,6 +80,19 @@ class GromacsToolAdapter:
             volume,
             job.job_id,
         )
+        marker_path = gromacs_publication_path(request, PREPARE_RESULT).as_posix()
+        marker = await read_modal_volume_file(
+            volume,
+            marker_path,
+            max_bytes=1024 * 1024,
+        )
+        published_files = parse_gromacs_publication(
+            request,
+            PREPARE_RESULT,
+            marker,
+        )
+        if published_files is None:
+            raise ArtifactIntegrityError("GROMACS final publication marker is invalid")
         path = cache.staging_path(str(job.job_id))
         try:
             with path.open("w+b") as raw:
@@ -93,10 +113,11 @@ class GromacsToolAdapter:
                     run_pdbfixer=request.run_pdbfixer,
                     cpu_only=request.cpu_only,
                 )
+                parameters_json = options.model_dump_json()
                 built = await write_gromacs_archive(
                     handle,
                     run_name=request.run_name,
-                    parameters_json=options.model_dump_json(),
+                    parameters_json=parameters_json,
                     modal_app_name=job.modal_app_name,
                     modal_app_version=job.modal_app_version,
                     job_id=str(job.job_id),
@@ -108,6 +129,11 @@ class GromacsToolAdapter:
                     completed_at=completed_at,
                     read_file=read_file,
                     remote_mtimes=remote_mtimes,
+                    expected_request_sha256=artifact_request_sha256(
+                        request.pdb_content,
+                        parameters_json,
+                    ),
+                    published_files=published_files,
                     run_bounded=cache.run_bounded,
                 )
             await cache.publish_staged(

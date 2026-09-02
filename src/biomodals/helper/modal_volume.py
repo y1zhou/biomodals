@@ -8,6 +8,23 @@ from pathlib import Path
 from typing import Any, cast
 
 
+async def read_modal_volume_file(
+    volume: object,
+    remote_path: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read one bounded Volume file through the public streaming API."""
+    if isinstance(max_bytes, bool) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    content = bytearray()
+    async for chunk in cast(Any, volume).read_file.aio(remote_path):
+        content.extend(chunk)
+        if len(content) > max_bytes:
+            raise ValueError(f"Modal Volume file exceeds {max_bytes} bytes")
+    return bytes(content)
+
+
 def download_modal_volume_files(
     volume: object,
     downloads: Iterable[tuple[str, Path]],

@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from uuid import UUID
 
 import numpy as np
 import polars as pl
@@ -15,13 +17,32 @@ import pytest
 
 from biomodals.app.design.humatch import app as humatch_app
 from biomodals.app.design.humatch.execution import (
+    _RESULT_FILE,
+    COLLECT_NODE,
     HUMANIZE_NODE,
+    HUMATCH_BATCH_SIZE,
     HumatchExecutionRequest,
     _HumatchHumanizeNode,
+    humatch_execution_graph,
+    result_from_overview,
 )
 from biomodals.app.design.humatch.models import ASSETS
-from biomodals.execution.nodes import NodeRunContext
-from biomodals.schema import AppRunStatus, InlineBytes
+from biomodals.execution import DeploymentIdentity, GraphExecutionRunStore, RunStatus
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
+from biomodals.execution.modal import (
+    ExecutionVolumeSync,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+)
+from biomodals.execution.nodes import NodeRunContext, TaskDefinition
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    InlineBytes,
+    VolumePath,
+)
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 VALID_CSV = (
@@ -89,20 +110,246 @@ def test_fixed_positions_are_normalized_without_exposing_upstream_spacing() -> N
         humatch_app._normalize_fixed_positions("27,27", "fixed")
 
 
-def test_execution_request_roundtrips_and_plans_one_cpu_node() -> None:
+def test_execution_request_roundtrips_and_plans_fixed_cpu_batches() -> None:
     request = _request()
 
     assert HumatchExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert request.execution_plan.nodes[0].node_key == HUMANIZE_NODE
-    call = _HumatchHumanizeNode(request).prepare_remote(cast(NodeRunContext, None))
-    assert call.function_name == "humatch_humanize"
+    assert [node.node_key for node in request.execution_plan.nodes] == [
+        HUMANIZE_NODE,
+        COLLECT_NODE,
+    ]
+    node = _HumatchHumanizeNode(request)
+    tasks = node.discover_remote_tasks(cast(NodeRunContext, None))
+    call = node.prepare_remote_task_batch(cast(NodeRunContext, None), tasks)
+    assert call.function_name == "humatch_humanize_batch"
     assert call.uses_gpu is False
+    assert call.max_tasks_per_call == HUMATCH_BATCH_SIZE
+    assert call.kwargs["pairs"] == [
+        {
+            "id": "pair-1",
+            "vh": "QVQLVQSGAEVKKPGASVKVSCKASGYTFTNYGMNWVRQAPGQGLEWMG",
+            "vl": "DIQMTQSPSSLSASVGDRVTITCRASQSI",
+        }
+    ]
     assert call.kwargs["max_edits"] == 60
+
+
+def test_execution_request_allows_outer_cpu_call_limit() -> None:
+    request = replace(_request(), max_active_provider_calls=17)
+
+    assert request.max_active_provider_calls == 17
+    with pytest.raises(ValueError, match="positive CPU"):
+        replace(request, max_active_provider_calls=0)
+
+
+def test_fixed_batch_rejects_more_than_six_tasks() -> None:
+    task = TaskDefinition(
+        task_key="pair",
+        scientific_payload={},
+        execution_payload={"id": "pair", "vh": "AAAA", "vl": "CCCC"},
+    )
+    with pytest.raises(ValueError, match="one to six"):
+        _HumatchHumanizeNode(_request()).prepare_remote_task_batch(
+            cast(NodeRunContext, None),
+            tuple(replace(task, task_key=f"pair-{index}") for index in range(7)),
+        )
 
 
 def test_execution_request_rejects_boolean_edit_limit() -> None:
     with pytest.raises(ValueError, match="max_edits"):
         replace(_request(), max_edits=True)
+
+
+def test_worker_calls_one_pair_directly_and_multiple_pairs_in_threads(
+    monkeypatch,
+) -> None:
+    executor_sizes: list[int] = []
+
+    class FakeExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            executor_sizes.append(max_workers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def map(self, function, records):
+            return [function(record) for record in records]
+
+    def fake_pair(record, **_kwargs):
+        return {
+            "humanized": {"id": record["id"]},
+            "humanization_seconds": 1.0,
+        }
+
+    monkeypatch.setattr(humatch_app, "ThreadPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        humatch_app,
+        "_load_upstream",
+        lambda: {"canonical_numbering": ()},
+    )
+    monkeypatch.setattr(humatch_app, "_load_models", lambda _upstream: ((1, 2, 3), 0.5))
+    monkeypatch.setattr(humatch_app, "_humanize_pair_record", fake_pair)
+    monkeypatch.setattr(humatch_app, "_cgroup_cpu_seconds", lambda: None)
+    monkeypatch.setattr(humatch_app, "_cgroup_peak_memory_mib", lambda: None)
+    monkeypatch.setattr(humatch_app, "_cgroup_current_memory_mib", lambda: None)
+    monkeypatch.setattr(humatch_app, "_process_peak_memory_mib", lambda: 10.0)
+
+    one = humatch_app._run_humatch_worker_batch(
+        pairs=[{"id": "one", "vh": "AAAA", "vl": "CCCC"}]
+    )
+    many = humatch_app._run_humatch_worker_batch(
+        pairs=[
+            {"id": f"pair-{index}", "vh": "AAAA", "vl": "CCCC"} for index in range(6)
+        ]
+    )
+
+    assert [result["humanized"]["id"] for result in one["pair_results"]] == ["one"]
+    assert [result["humanized"]["id"] for result in many["pair_results"]] == [
+        f"pair-{index}" for index in range(6)
+    ]
+    assert executor_sizes == [6]
+
+
+def test_execution_graph_batches_seven_pairs_as_six_plus_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    csv_bytes = (
+        "id,vh,vl\n" + "".join(f"pair-{index},AAAA,CCCC\n" for index in range(7))
+    ).encode()
+    request = replace(
+        _request(),
+        csv_bytes=csv_bytes,
+        max_active_provider_calls=2,
+    )
+
+    class Driver:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+            self.results: dict[str, object] = {}
+
+        def resolve(self, binding):
+            return binding.function_name
+
+        def spawn(self, operation, *, args, kwargs):
+            del operation, args
+            identifiers = [pair["id"] for pair in kwargs["pairs"]]
+            self.batches.append(identifiers)
+            call_id = f"call-{len(self.batches)}"
+            self.results[call_id] = {
+                "schema_version": 1,
+                "pair_results": [
+                    {"humanized": {"id": identifier}} for identifier in identifiers
+                ],
+                "metrics": {
+                    "model_load_seconds": 1.0,
+                    "humanization_seconds": 2.0,
+                    "elapsed_seconds": 3.0,
+                },
+            }
+            return call_id
+
+        def observe(self, provider_call_handle_id):
+            return ProviderCallObservation(
+                ProviderCallObservationKind.SUCCEEDED,
+                result=self.results[provider_call_handle_id],
+            )
+
+        def cancel(self, provider_call_handle_id):
+            del provider_call_handle_id
+
+    class Volume:
+        def commit(self) -> None:
+            pass
+
+        def reload(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        humatch_app,
+        "_aggregate_humatch_results",
+        lambda **_kwargs: (b"archive", {"pair_count": 7}),
+    )
+    run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    driver = Driver()
+    store = GraphExecutionRunStore(tmp_path, run_id)
+    runtime = ExecutionGraphRuntime(
+        graph=humatch_execution_graph(request),
+        execution_run_id=run_id,
+        deployment=DeploymentIdentity("main", "Humatch", 1),
+        volume_root=tmp_path,
+        artifact_volume_name="Humatch-outputs",
+        provider_driver=driver,
+        storage_sync=ExecutionVolumeSync(volume=Volume(), store=store),
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=0,
+        store=store,
+        now=iter(range(100, 1000)).__next__,
+        poll_interval_seconds=0,
+    )
+
+    result = runtime.run(workload_run_key="example")
+
+    assert driver.batches == [
+        [f"pair-{index}" for index in range(6)],
+        ["pair-6"],
+    ]
+    assert result.status == AppRunStatus.SUCCEEDED
+    publication = store.artifacts.load_node_result(COLLECT_NODE)
+    assert publication is not None
+    assert publication.metrics["pair_count"] == 7
+    runtime.close()
+
+
+def test_result_loader_returns_content_verified_inline_archive() -> None:
+    run_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    archive = b"archive"
+    archive_path = f"workflow-runs/{run_id}/humatch/demo_humatch.tar.zst"
+    publication = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="humatch_humanization",
+                kind=ArtifactKind.ARCHIVE,
+                storage=VolumePath(
+                    volume_name="Humatch-outputs",
+                    path=archive_path,
+                    media_type=ZSTD_MEDIA_TYPE,
+                ),
+                metadata={
+                    "files": [
+                        {
+                            "path": "demo_humatch.tar.zst",
+                            "size_bytes": len(archive),
+                            "content_sha256": sha256(archive).hexdigest(),
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    files = {
+        _RESULT_FILE.path(run_id).as_posix(): publication.model_dump_json().encode(),
+        archive_path: archive,
+    }
+
+    class Volume:
+        def read_file(self, path: str):
+            yield files[path]
+
+    overview = SimpleNamespace(
+        run=SimpleNamespace(status=RunStatus.SUCCEEDED, execution_run_id=run_id)
+    )
+
+    result = result_from_overview(cast(Any, overview), Volume())
+
+    assert result.outputs[0].storage == InlineBytes(
+        data=archive,
+        filename="demo_humatch.tar.zst",
+        media_type=ZSTD_MEDIA_TYPE,
+    )
 
 
 def test_align_chain_requires_type_coverage_and_conserved_cysteines() -> None:
@@ -158,7 +405,7 @@ def test_humanize_pair_preserves_upstream_result_and_reports_endpoints() -> None
     calls: dict[str, Any] = {}
 
     def predict(sequences, model, *, num_cpus):
-        assert num_cpus == 16
+        assert num_cpus == 2
         if model == "h":
             return np.asarray([[0.01, 0.90, *([0.015] * 6)]])
         if model == "l":

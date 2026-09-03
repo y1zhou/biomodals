@@ -508,6 +508,21 @@ runtimes and model copies therefore cost more than any parallelism they unlock.
 Retain six threads with two Humatch encoding workers per pair for the first
 production implementation.
 
+### Production dispatch shape
+
+The first fanout implementation uses one durable execution Task per VH-VL pair.
+The shared execution kernel groups those Tasks in input order into fixed batches
+of six and admits the resulting CPU Provider Calls under the Run's single
+`--max-containers` ceiling. A one-pair worker calls the pair helper directly;
+workers assigned two to six pairs use one thread per pair while sharing the
+three loaded Keras models. Humatch receives `num_cpus=2` for every pair.
+
+Each worker publishes bounded per-pair JSON results. A coordinator-local collect
+node restores original input order and builds the same eight-file `.tar.zst`
+bundle, so collection starts no extra workload container. The worker decorator
+retains `cpu=(0.125, 16.125)` and `memory=(256, 16384)`. Batching and resource
+allocation remain operational and do not change scientific fingerprints.
+
 ## Place in the antibody-humanization stack
 
 Sapiens and Humatch should produce alternative candidates from the same input,

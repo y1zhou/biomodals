@@ -12,7 +12,10 @@ import hashlib
 import re
 import resource
 import time
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,6 +28,7 @@ import polars as pl
 
 from biomodals.app.config import AppConfig
 from biomodals.app.design.humatch.execution import (
+    HUMATCH_BATCH_SIZE,
     MAX_RESULT_BYTES,
     HumatchExecutionCoordinator,
     HumatchExecutionRequest,
@@ -51,6 +55,7 @@ from biomodals.execution.modal import (
     execution_coordinator_adapter,
     execution_coordinator_identity,
     initialize_execution_coordinator_host,
+    resolve_provider_call_limits,
     submit_staged_execution_run,
 )
 from biomodals.helper import patch_image_for_helper
@@ -79,7 +84,7 @@ MAX_PAIRS = 1000
 MAX_INPUT_BYTES = 3 * 1024 * 1024
 MAX_ID_LENGTH = 200
 MAX_SEQUENCE_LENGTH = 200
-NUM_CPUS = 16
+ENCODING_WORKERS_PER_PAIR = 2
 CPU_LIMIT = 16.125
 PAIR_PAD = "----------"
 _COORDINATOR_TIMEOUT_SECONDS = 24 * 60 * 60
@@ -408,11 +413,13 @@ def _predict_distributions(
     vl: str,
     models: tuple[Any, Any, Any],
     upstream: dict[str, Any],
+    *,
+    num_cpus: int,
 ) -> tuple[Any, Any, Any]:
     predict = upstream["predict"]
-    vh_scores = predict([vh], models[0], num_cpus=NUM_CPUS)[0]
-    vl_scores = predict([vl], models[1], num_cpus=NUM_CPUS)[0]
-    pair_scores = predict([vh + PAIR_PAD + vl], models[2], num_cpus=NUM_CPUS)[0]
+    vh_scores = predict([vh], models[0], num_cpus=num_cpus)[0]
+    vl_scores = predict([vl], models[1], num_cpus=num_cpus)[0]
+    pair_scores = predict([vh + PAIR_PAD + vl], models[2], num_cpus=num_cpus)[0]
     if (
         len(vh_scores) != len(HEAVY_CLASSES)
         or len(vl_scores) != len(LIGHT_CLASSES)
@@ -519,8 +526,11 @@ def _humanize_pair(
     mutate_cdrs: bool,
     fixed_vh_positions: tuple[str, ...],
     fixed_vl_positions: tuple[str, ...],
+    num_cpus: int = ENCODING_WORKERS_PER_PAIR,
 ) -> dict[str, Any]:
-    input_scores = _predict_distributions(pair.vh, pair.vl, models, upstream)
+    input_scores = _predict_distributions(
+        pair.vh, pair.vl, models, upstream, num_cpus=num_cpus
+    )
     selected_vh = _select_target(input_scores[0], "heavy", vh_target_family, upstream)
     selected_vl = _select_target(input_scores[1], "light", vl_target_family, upstream)
     gl_mutate = upstream["gl_mutate"]
@@ -543,7 +553,7 @@ def _humanize_pair(
     )
     config = {
         "max_edit": max_edits,
-        "num_cpus": NUM_CPUS,
+        "num_cpus": num_cpus,
         "GL_target_score_H": germline_likeness_target,
         "GL_allow_CDR_mutations_H": mutate_cdrs,
         "GL_fixed_imgt_positions_H": list(fixed_vh_positions),
@@ -562,7 +572,6 @@ def _humanize_pair(
         "germline_likeness_lookup_arrays_dir": gl_dir,
     }
     started_at = time.perf_counter()
-    cpu_started_at = _cgroup_cpu_seconds()
     result = upstream["humanise"](
         pair.vh,
         pair.vl,
@@ -572,12 +581,13 @@ def _humanize_pair(
         config,
     )
     humanization_seconds = time.perf_counter() - started_at
-    cpu_finished_at = _cgroup_cpu_seconds()
     final_vh = str(result["Humatch_H"])
     final_vl = str(result["Humatch_L"])
     if len(final_vh) != len(pair.vh) or len(final_vl) != len(pair.vl):
         raise ValueError("Humatch returned an unexpected aligned sequence length")
-    final_scores = _predict_distributions(final_vh, final_vl, models, upstream)
+    final_scores = _predict_distributions(
+        final_vh, final_vl, models, upstream, num_cpus=num_cpus
+    )
     gl_score = upstream["gl_score"]
     gl_values = {
         "vh_input_germline_likeness": float(gl_score(pair.vh, selected_vh, gl_dir)),
@@ -651,11 +661,6 @@ def _humanize_pair(
         "alignment": [*vh_alignment, *vl_alignment],
         "mutations": [*vh_mutations, *vl_mutations],
         "humanization_seconds": humanization_seconds,
-        "humanization_cpu_seconds": (
-            None
-            if cpu_started_at is None or cpu_finished_at is None
-            else max(0.0, cpu_finished_at - cpu_started_at)
-        ),
     }
 
 
@@ -663,7 +668,7 @@ def _write_result_bundle(
     *,
     run_name: str,
     input_frame: pl.DataFrame,
-    pair_results: list[dict[str, Any]],
+    pair_results: Sequence[Mapping[str, Any]],
     parameters: dict[str, Any],
 ) -> bytes:
     with TemporaryDirectory(prefix="humatch_") as temporary:
@@ -743,6 +748,262 @@ def _write_result_bundle(
         return archive
 
 
+def _validate_fixed_positions(
+    upstream: dict[str, Any],
+    normalized_vh_positions: tuple[str, ...],
+    normalized_vl_positions: tuple[str, ...],
+) -> None:
+    canonical = set(upstream["canonical_numbering"])
+    for field_name, positions in (
+        ("fixed_vh_positions", normalized_vh_positions),
+        ("fixed_vl_positions", normalized_vl_positions),
+    ):
+        invalid = [
+            position.strip() for position in positions if position not in canonical
+        ]
+        if invalid:
+            raise ValueError(
+                f"{field_name} contains positions outside Humatch's canonical "
+                f"numbering: {', '.join(invalid)}"
+            )
+
+
+def _humanize_pair_record(
+    record: dict[str, str],
+    *,
+    models: tuple[Any, Any, Any],
+    upstream: dict[str, Any],
+    vh_target_family: str,
+    vl_target_family: str,
+    germline_likeness_target: float,
+    vh_classifier_target: float,
+    vl_classifier_target: float,
+    pair_classifier_target: float,
+    max_edits: int,
+    mutate_cdrs: bool,
+    fixed_vh_positions: tuple[str, ...],
+    fixed_vl_positions: tuple[str, ...],
+) -> dict[str, Any]:
+    """Align and humanize one complete pair using shared loaded models."""
+    pair = _AlignedPair(
+        identifier=record["id"],
+        vh=_align_chain(
+            identifier=record["id"],
+            chain_label="vh",
+            sequence=record["vh"],
+            upstream=upstream,
+        ),
+        vl=_align_chain(
+            identifier=record["id"],
+            chain_label="vl",
+            sequence=record["vl"],
+            upstream=upstream,
+        ),
+    )
+    return _humanize_pair(
+        pair=pair,
+        models=models,
+        upstream=upstream,
+        vh_target_family=vh_target_family,
+        vl_target_family=vl_target_family,
+        germline_likeness_target=germline_likeness_target,
+        vh_classifier_target=vh_classifier_target,
+        vl_classifier_target=vl_classifier_target,
+        pair_classifier_target=pair_classifier_target,
+        max_edits=max_edits,
+        mutate_cdrs=mutate_cdrs,
+        fixed_vh_positions=fixed_vh_positions,
+        fixed_vl_positions=fixed_vl_positions,
+        num_cpus=ENCODING_WORKERS_PER_PAIR,
+    )
+
+
+def _run_humatch_worker_batch(
+    *,
+    pairs: list[dict[str, str]],
+    vh_target_family: str = "auto",
+    vl_target_family: str = "auto",
+    germline_likeness_target: float = 0.40,
+    vh_classifier_target: float = 0.95,
+    vl_classifier_target: float = 0.95,
+    pair_classifier_target: float = 0.95,
+    max_edits: int = 60,
+    mutate_cdrs: bool = False,
+    fixed_vh_positions: str = "",
+    fixed_vl_positions: str = "",
+) -> dict[str, Any]:
+    """Humanize one fixed batch directly or with one thread per pair."""
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= HUMATCH_BATCH_SIZE:
+        raise ValueError("Humatch worker batches must contain one to six pairs")
+    if any(
+        not isinstance(pair, dict)
+        or set(pair) != set(CSV_COLUMNS)
+        or not all(isinstance(pair[column], str) for column in CSV_COLUMNS)
+        for pair in pairs
+    ):
+        raise ValueError("Each Humatch worker pair must contain exactly id, vh, and vl")
+    input_frame = parse_humatch_csv(
+        pl.DataFrame(pairs).select(CSV_COLUMNS).write_csv().encode("utf-8")
+    )
+    normalized_vh_positions, normalized_vl_positions = _validate_parameters(
+        vh_target_family=vh_target_family,
+        vl_target_family=vl_target_family,
+        germline_likeness_target=germline_likeness_target,
+        vh_classifier_target=vh_classifier_target,
+        vl_classifier_target=vl_classifier_target,
+        pair_classifier_target=pair_classifier_target,
+        max_edits=max_edits,
+        mutate_cdrs=mutate_cdrs,
+        fixed_vh_positions=fixed_vh_positions,
+        fixed_vl_positions=fixed_vl_positions,
+    )
+    started_at = time.perf_counter()
+    started_at_unix = time.time()
+    cpu_started_at = _cgroup_cpu_seconds()
+    upstream = _load_upstream()
+    _validate_fixed_positions(
+        upstream, normalized_vh_positions, normalized_vl_positions
+    )
+    models, model_load_seconds = _load_models(upstream)
+    worker = partial(
+        _humanize_pair_record,
+        models=models,
+        upstream=upstream,
+        vh_target_family=vh_target_family,
+        vl_target_family=vl_target_family,
+        germline_likeness_target=germline_likeness_target,
+        vh_classifier_target=vh_classifier_target,
+        vl_classifier_target=vl_classifier_target,
+        pair_classifier_target=pair_classifier_target,
+        max_edits=max_edits,
+        mutate_cdrs=mutate_cdrs,
+        fixed_vh_positions=normalized_vh_positions,
+        fixed_vl_positions=normalized_vl_positions,
+    )
+    records = input_frame.to_dicts()
+    if len(records) == 1:
+        pair_results = [worker(records[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=len(records)) as executor:
+            pair_results = list(executor.map(worker, records))
+    elapsed_seconds = time.perf_counter() - started_at
+    cpu_finished_at = _cgroup_cpu_seconds()
+    metrics = {
+        "pair_count": input_frame.height,
+        "model_load_seconds": model_load_seconds,
+        "humanization_seconds": sum(
+            result["humanization_seconds"] for result in pair_results
+        ),
+        "elapsed_seconds": elapsed_seconds,
+        "started_at_unix": started_at_unix,
+        "finished_at_unix": time.time(),
+    }
+    if cpu_started_at is not None and cpu_finished_at is not None:
+        container_cpu_seconds = max(0.0, cpu_finished_at - cpu_started_at)
+        metrics.update({
+            "container_cpu_seconds": container_cpu_seconds,
+            "average_container_cpu_fraction": (
+                container_cpu_seconds / elapsed_seconds / CPU_LIMIT
+            ),
+        })
+    peak_memory_mib = _cgroup_peak_memory_mib()
+    if peak_memory_mib is not None:
+        metrics["peak_container_memory_mib"] = peak_memory_mib
+    current_memory_mib = _cgroup_current_memory_mib()
+    if current_memory_mib is not None:
+        metrics["container_memory_mib_at_completion"] = current_memory_mib
+    metrics["peak_worker_process_memory_mib"] = _process_peak_memory_mib()
+    return {"schema_version": 1, "pair_results": pair_results, "metrics": metrics}
+
+
+def _aggregate_humatch_results(
+    *,
+    run_name: str,
+    csv_bytes: bytes,
+    pair_results: Sequence[Mapping[str, Any]],
+    batch_metrics: Sequence[Mapping[str, Any]],
+    parameters: dict[str, Any],
+) -> tuple[bytes, dict[str, str | int | float | bool]]:
+    """Package ordered pair results and summarize fixed-batch telemetry."""
+    input_frame = parse_humatch_csv(csv_bytes)
+    if [result["humanized"]["id"] for result in pair_results] != input_frame[
+        "id"
+    ].to_list():
+        raise ValueError("Humatch pair results do not match input order")
+    normalized_vh_positions, normalized_vl_positions = _validate_parameters(
+        **parameters
+    )
+    archive = _write_result_bundle(
+        run_name=run_name,
+        input_frame=input_frame,
+        pair_results=pair_results,
+        parameters={
+            **parameters,
+            "fixed_vh_positions": [
+                position.strip() for position in normalized_vh_positions
+            ],
+            "fixed_vl_positions": [
+                position.strip() for position in normalized_vl_positions
+            ],
+        },
+    )
+    worker_elapsed_seconds = sum(
+        float(metrics["elapsed_seconds"]) for metrics in batch_metrics
+    )
+    batch_starts = [
+        float(item["started_at_unix"])
+        for item in batch_metrics
+        if "started_at_unix" in item
+    ]
+    batch_finishes = [
+        float(item["finished_at_unix"])
+        for item in batch_metrics
+        if "finished_at_unix" in item
+    ]
+    max_batch_elapsed_seconds = max(
+        (float(item["elapsed_seconds"]) for item in batch_metrics), default=0.0
+    )
+    container_cpu_seconds = sum(
+        float(metrics.get("container_cpu_seconds", 0.0)) for metrics in batch_metrics
+    )
+    metrics: dict[str, str | int | float | bool] = {
+        "pair_count": input_frame.height,
+        "provider_batch_count": len(batch_metrics),
+        "mutation_count": sum(len(result["mutations"]) for result in pair_results),
+        "success_count": sum(
+            bool(result["summary"]["humanization_success"]) for result in pair_results
+        ),
+        "model_load_seconds": sum(
+            float(item["model_load_seconds"]) for item in batch_metrics
+        ),
+        "humanization_seconds": sum(
+            float(result["humanization_seconds"]) for result in pair_results
+        ),
+        "elapsed_seconds": (
+            max(batch_finishes) - min(batch_starts)
+            if len(batch_starts) == len(batch_metrics)
+            and len(batch_finishes) == len(batch_metrics)
+            else max_batch_elapsed_seconds
+        ),
+        "max_batch_elapsed_seconds": max_batch_elapsed_seconds,
+        "worker_elapsed_seconds": worker_elapsed_seconds,
+    }
+    if container_cpu_seconds:
+        metrics["container_cpu_seconds"] = container_cpu_seconds
+        if worker_elapsed_seconds:
+            metrics["average_container_cpu_fraction"] = (
+                container_cpu_seconds / worker_elapsed_seconds / CPU_LIMIT
+            )
+    for key in (
+        "peak_container_memory_mib",
+        "peak_worker_process_memory_mib",
+    ):
+        values = [float(item[key]) for item in batch_metrics if key in item]
+        if values:
+            metrics[key] = max(values)
+    return archive, metrics
+
+
 def _run_humatch_humanization(
     *,
     run_name: str,
@@ -757,9 +1018,60 @@ def _run_humatch_humanization(
     mutate_cdrs: bool = False,
     fixed_vh_positions: str = "",
     fixed_vl_positions: str = "",
-) -> tuple[bytes, dict[str, Any]]:
-    """Validate, humanize sequentially, and package one paired batch."""
-    normalized_vh_positions, normalized_vl_positions = _validate_parameters(
+) -> tuple[bytes, dict[str, str | int | float | bool]]:
+    """Run the workflow-compatible single-container fallback."""
+    frame = parse_humatch_csv(csv_bytes)
+    parameters = {
+        "vh_target_family": vh_target_family,
+        "vl_target_family": vl_target_family,
+        "germline_likeness_target": germline_likeness_target,
+        "vh_classifier_target": vh_classifier_target,
+        "vl_classifier_target": vl_classifier_target,
+        "pair_classifier_target": pair_classifier_target,
+        "max_edits": max_edits,
+        "mutate_cdrs": mutate_cdrs,
+        "fixed_vh_positions": fixed_vh_positions,
+        "fixed_vl_positions": fixed_vl_positions,
+    }
+    results: list[dict[str, Any]] = []
+    batch_metrics: list[dict[str, Any]] = []
+    records = frame.to_dicts()
+    for offset in range(0, len(records), HUMATCH_BATCH_SIZE):
+        batch = _run_humatch_worker_batch(
+            pairs=records[offset : offset + HUMATCH_BATCH_SIZE], **parameters
+        )
+        results.extend(batch["pair_results"])
+        batch_metrics.append(batch["metrics"])
+    return _aggregate_humatch_results(
+        run_name=run_name,
+        csv_bytes=csv_bytes,
+        pair_results=results,
+        batch_metrics=batch_metrics,
+        parameters=parameters,
+    )
+
+
+@app.function(
+    cpu=(0.125, 16.125),
+    memory=(256, 16384),
+    timeout=CONF.timeout,
+)
+def humatch_humanize_batch(
+    pairs: list[dict[str, str]],
+    vh_target_family: str = "auto",
+    vl_target_family: str = "auto",
+    germline_likeness_target: float = 0.40,
+    vh_classifier_target: float = 0.95,
+    vl_classifier_target: float = 0.95,
+    pair_classifier_target: float = 0.95,
+    max_edits: int = 60,
+    mutate_cdrs: bool = False,
+    fixed_vh_positions: str = "",
+    fixed_vl_positions: str = "",
+) -> dict[str, Any]:
+    """Humanize one kernel-assigned batch of at most six pairs."""
+    return _run_humatch_worker_batch(
+        pairs=pairs,
         vh_target_family=vh_target_family,
         vl_target_family=vl_target_family,
         germline_likeness_target=germline_likeness_target,
@@ -771,132 +1083,12 @@ def _run_humatch_humanization(
         fixed_vh_positions=fixed_vh_positions,
         fixed_vl_positions=fixed_vl_positions,
     )
-    input_frame = parse_humatch_csv(csv_bytes)
-    started_at = time.perf_counter()
-    cpu_started_at = _cgroup_cpu_seconds()
-    upstream = _load_upstream()
-    canonical = set(upstream["canonical_numbering"])
-    for field_name, positions in (
-        ("fixed_vh_positions", normalized_vh_positions),
-        ("fixed_vl_positions", normalized_vl_positions),
-    ):
-        invalid = [
-            position.strip() for position in positions if position not in canonical
-        ]
-        if invalid:
-            raise ValueError(
-                f"{field_name} contains positions outside Humatch's canonical "
-                f"numbering: {', '.join(invalid)}"
-            )
-    aligned_pairs = [
-        _AlignedPair(
-            identifier=row["id"],
-            vh=_align_chain(
-                identifier=row["id"],
-                chain_label="vh",
-                sequence=row["vh"],
-                upstream=upstream,
-            ),
-            vl=_align_chain(
-                identifier=row["id"],
-                chain_label="vl",
-                sequence=row["vl"],
-                upstream=upstream,
-            ),
-        )
-        for row in input_frame.iter_rows(named=True)
-    ]
-    models, model_load_seconds = _load_models(upstream)
-    pair_results = [
-        _humanize_pair(
-            pair=pair,
-            models=models,
-            upstream=upstream,
-            vh_target_family=vh_target_family,
-            vl_target_family=vl_target_family,
-            germline_likeness_target=germline_likeness_target,
-            vh_classifier_target=vh_classifier_target,
-            vl_classifier_target=vl_classifier_target,
-            pair_classifier_target=pair_classifier_target,
-            max_edits=max_edits,
-            mutate_cdrs=mutate_cdrs,
-            fixed_vh_positions=normalized_vh_positions,
-            fixed_vl_positions=normalized_vl_positions,
-        )
-        for pair in aligned_pairs
-    ]
-    parameters = {
-        "vh_target_family": vh_target_family,
-        "vl_target_family": vl_target_family,
-        "germline_likeness_target": germline_likeness_target,
-        "vh_classifier_target": vh_classifier_target,
-        "vl_classifier_target": vl_classifier_target,
-        "pair_classifier_target": pair_classifier_target,
-        "max_edits": max_edits,
-        "mutate_cdrs": mutate_cdrs,
-        "fixed_vh_positions": [
-            position.strip() for position in normalized_vh_positions
-        ],
-        "fixed_vl_positions": [
-            position.strip() for position in normalized_vl_positions
-        ],
-    }
-    archive = _write_result_bundle(
-        run_name=run_name,
-        input_frame=input_frame,
-        pair_results=pair_results,
-        parameters=parameters,
-    )
-    elapsed_seconds = time.perf_counter() - started_at
-    cpu_finished_at = _cgroup_cpu_seconds()
-    humanization_seconds = sum(
-        result["humanization_seconds"] for result in pair_results
-    )
-    humanization_cpu_seconds = sum(
-        result["humanization_cpu_seconds"] or 0.0 for result in pair_results
-    )
-    metrics = {
-        "pair_count": input_frame.height,
-        "mutation_count": sum(len(result["mutations"]) for result in pair_results),
-        "success_count": sum(
-            bool(result["summary"]["humanization_success"]) for result in pair_results
-        ),
-        "model_load_seconds": model_load_seconds,
-        "humanization_seconds": humanization_seconds,
-        "elapsed_seconds": elapsed_seconds,
-    }
-    if cpu_started_at is not None and cpu_finished_at is not None:
-        container_cpu_seconds = max(0.0, cpu_finished_at - cpu_started_at)
-        metrics.update({
-            "container_cpu_seconds": container_cpu_seconds,
-            "average_container_cpu_fraction": (
-                container_cpu_seconds / elapsed_seconds / CPU_LIMIT
-            ),
-        })
-    if humanization_seconds > 0 and any(
-        result["humanization_cpu_seconds"] is not None for result in pair_results
-    ):
-        metrics.update({
-            "humanization_cpu_seconds": humanization_cpu_seconds,
-            "average_humanization_cpu_fraction": (
-                humanization_cpu_seconds / humanization_seconds / CPU_LIMIT
-            ),
-        })
-    peak_memory_mib = _cgroup_peak_memory_mib()
-    if peak_memory_mib is not None:
-        metrics["peak_container_memory_mib"] = peak_memory_mib
-    current_memory_mib = _cgroup_current_memory_mib()
-    if current_memory_mib is not None:
-        metrics["container_memory_mib_at_completion"] = current_memory_mib
-    metrics["peak_worker_process_memory_mib"] = _process_peak_memory_mib()
-    return archive, metrics
 
 
 @app.function(
     cpu=(0.125, 16.125),
     memory=(256, 16384),
     timeout=CONF.timeout,
-    max_containers=1,
 )
 def humatch_humanize(
     run_name: str,
@@ -1072,7 +1264,7 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
     if not development:
         return ModalCallDriver()
     return development_modal_call_driver(
-        {"humatch_humanize": humatch_humanize},
+        {"humatch_humanize_batch": humatch_humanize_batch},
         workload_name=CONF.name,
     )
 
@@ -1092,6 +1284,8 @@ def submit_humatch_task(
     mutate_cdrs: bool = False,
     fixed_vh_positions: str = "",
     fixed_vl_positions: str = "",
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
     use_deployed_coordinator: bool = False,
     deployment_environment: str = "main",
     deployment_name: str = CONF.name,
@@ -1105,7 +1299,7 @@ def submit_humatch_task(
     if input_path.stat().st_size > MAX_INPUT_BYTES:
         raise ValueError(f"Input CSV exceeds {MAX_INPUT_BYTES} bytes")
     csv_bytes = input_path.read_bytes()
-    parse_humatch_csv(csv_bytes)
+    input_frame = parse_humatch_csv(csv_bytes)
     _validate_parameters(
         vh_target_family=vh_target_family,
         vl_target_family=vl_target_family,
@@ -1119,6 +1313,13 @@ def submit_humatch_task(
         fixed_vl_positions=fixed_vl_positions,
     )
     selected_run_name = sanitize_filename(run_name or input_path.stem)
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=(input_frame.height + HUMATCH_BATCH_SIZE - 1)
+        // HUMATCH_BATCH_SIZE,
+        default_max_gpu_containers=0,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
     request = HumatchExecutionRequest(
         run_name=selected_run_name,
         csv_bytes=csv_bytes,
@@ -1135,6 +1336,8 @@ def submit_humatch_task(
         app_version=CONF.repo_commit_hash or IDENTITY.source_commit,
         asset_record=IDENTITY.asset_doi,
         runtime_identity=RUNTIME_IDENTITY,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
     )
     execution_run_id = uuid4()
     deployment = DeploymentIdentity(

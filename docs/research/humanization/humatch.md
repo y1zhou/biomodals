@@ -469,6 +469,45 @@ earlier low-floor six-way result (4.18 versus 4.14 pairs per minute), while
 adding 27.8 seconds of batch latency and about 1.67 GiB of peak worker RSS.
 Fixed batches of six therefore remain the preferred production shape.
 
+### Spawned-process concurrency probe
+
+A final experiment compared the six-thread design with spawn-based process
+isolation. A standard `multiprocessing.Pool` was not suitable because its
+daemon workers cannot create Humatch's nested encoding pools, so the probe used
+`ProcessPoolExecutor` with the `spawn` context. Every outer child loaded a
+private copy of all three Keras models. An initialization barrier ensured all
+children were ready before inference timing began, and cgroup memory was
+sampled every 100 milliseconds to include child and nested-pool processes.
+
+Four isolated Modal containers ran concurrently with
+`cpu=(0.125, 16.125)` and `memory=(256, 16384)`:
+
+| Case | Inference time | Total time | Throughput | Mean CPU cores | Peak cgroup memory |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 6 threads x 2 encoding workers | 93.11 s | 105.32 s | 3.87 pairs/min | 3.11 | 6,041 MiB |
+| 6 processes x 2 encoding workers | 188.05 s | 199.87 s | 1.91 pairs/min | 9.08 | 9,246 MiB |
+| 6 processes x 1 encoding worker | 153.29 s | 165.46 s | 2.35 pairs/min | 6.06 | 10,626 MiB |
+| 8 processes x 1 encoding worker | 204.33 s | 216.57 s | 2.35 pairs/min | 7.79 | 13,540 MiB |
+
+The corresponding Modal calls were
+`fc-01M1JZMXXMW10KD7WE89T40Y7D`,
+`fc-01M1JZMY85GRGJRFCPTTWAQHV6`,
+`fc-01M1JZMYJF30VFPD7VSW57W75A`, and
+`fc-01M1JZMYXEYP0AW5NTHTC6EESF`.
+
+All 26 outputs had identical sequences, mutations, alignments, target
+families, edit counts, and success flags. Each individual case was exactly
+repeatable. The largest cross-process floating-point score difference was
+`1.19e-7`, which did not affect selection or reported success.
+
+Process isolation increased actual CPU use but made six-pair inference 65-102%
+slower than threads. Reducing the nested encoding pool from two workers to one
+helped, but eight outer processes did not improve throughput over six and came
+within about 2.8 GiB of the container memory limit. The private TensorFlow
+runtimes and model copies therefore cost more than any parallelism they unlock.
+Retain six threads with two Humatch encoding workers per pair for the first
+production implementation.
+
 ## Place in the antibody-humanization stack
 
 Sapiens and Humatch should produce alternative candidates from the same input,

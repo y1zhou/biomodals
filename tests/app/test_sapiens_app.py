@@ -54,6 +54,10 @@ def _request() -> SapiensExecutionRequest:
     )
 
 
+def test_modal_group_tag_does_not_depend_on_source_path() -> None:
+    assert sapiens_app.CONF.tags == {"group": "design"}
+
+
 def test_parse_sapiens_csv_accepts_complete_unique_pairs() -> None:
     frame = sapiens_app.parse_sapiens_csv(VALID_CSV)
 

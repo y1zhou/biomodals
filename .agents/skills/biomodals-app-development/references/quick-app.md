@@ -20,6 +20,8 @@ Apply this common contract, then load specialized references from `SKILL.md`.
 
 - Define `CONF = AppConfig(...)`, pin upstream, and reuse its environment, paths,
   GPU, and timeout.
+- Set category tags explicitly. Do not derive them from `__file__`; Modal may
+  stage a composition root at a path such as `/root/app.py`.
 - Build with `patch_image_for_helper(...)`, a Debian slim or pinned registry
   base, `.env(...)`, and `.uv_pip_install(...)`.
 - Use `copy_patch_files=True` only for build-time helper imports. Include sibling

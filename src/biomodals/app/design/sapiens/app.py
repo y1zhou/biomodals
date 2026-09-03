@@ -77,7 +77,7 @@ _COORDINATOR_TIMEOUT_SECONDS = 24 * 60 * 60
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.parent.name},
+    tags={"group": "design"},
     name="Sapiens",
     repo_url="https://github.com/Merck/Sapiens",
     repo_commit_hash="3d676ecde0b6fc113d3f9c5bcb3721a7d70a85b7",

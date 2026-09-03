@@ -58,6 +58,13 @@ Decisions settled on 2026-09-03 for the first Biomodals implementation:
 - install and call pinned `abnativ==2.0.8` directly without importing the
   existing Biomodals AbNatiV scoring app.
 
+Implementation inspection found no duplicate light-CDR percentile append in
+the pinned `eb517f1f` scorer, so the app does not patch scoring logic. It only
+applies the guarded strict-Matplotlib colormap fix already needed by the
+existing AbNatiV image and ABodyBuilder3's documented NumPy tuple-indexing
+compatibility fix. See
+[the app-specific deviation note](../../agents/pabnativ2-app-deviations.md).
+
 Licensing is outside the implementation decision for this initial branch. The
 license and research-use caveat remain documented rather than enforced by a
 runtime gate.
@@ -275,9 +282,12 @@ paired app:
   That record is CC BY 4.0
   ([ABodyBuilder3 record](https://zenodo.org/records/11354577),
   [extraction code](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/init.py)).
-- The wheel embeds small PSSMs and much larger percentile reference tables;
-  the paired percentile CSV is about 57.7 MB uncompressed. These are already
-  compressed into the 30.1 MB wheel
+- The wheel embeds the much larger percentile reference tables; the paired
+  percentile CSV is about 57.7 MB uncompressed. The six humanization PSSMs
+  (about 151 KB total) are present in the pinned source tree but absent from
+  the 30.1 MB wheel because its package-data declaration targets the wrong
+  package directory. The app must restore and hash-verify those six files from
+  the pinned commit
   ([package data declaration](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/pyproject.toml)).
 - Upstream download code uses `wget` and checks only whether a file exists; it
   does not verify published checksums. The app build/setup path must perform
@@ -433,8 +443,10 @@ failure under the shared Humanization Batch contract.
    one row is invalid. No row may disappear silently.
 3. Run the same pair twice in one warm process to catch the mutable-default and
    ordering problems; run fresh processes to assess structure variability.
-4. Require identical discrete CPU/GPU outputs and compare numeric outputs with
-   documented floating-point tolerances; do not fingerprint the hardware.
+4. Require identical discrete outputs across repeated A10G runs and compare
+   numeric outputs with documented tolerances; do not fingerprint individual
+   hardware. The initial benchmark showed CPU/GPU greedy decisions diverge, so
+   CPU must not serve as an equivalent fallback.
 5. Verify both published asset checksums and prove runtime network access is not
    required.
 6. Pin an expected one-pair resource envelope and fail clearly when structure
@@ -444,3 +456,6 @@ The initial app targets equivalence to the pinned 2.0.8 source rather than the
 paper's ten-structure protocol. Its non-commercial license and research-use
 limitations must remain explicit; the app must not be presented as clinical
 validation or as evidence that binding and developability are preserved.
+
+See [the initial single-pair benchmark](pabnativ2-benchmarks.md) for the A10G,
+L40S, CPU, and repeatability measurements that selected the final worker.

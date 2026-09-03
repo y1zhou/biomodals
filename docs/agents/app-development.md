@@ -41,3 +41,6 @@ The skill routes app work to focused references under
 - [GROMACS analysis checkpoints](gromacs-analysis-checkpoints.md) retain the
   established run-directory and timestamp contract for narrow CSV/PNG restart
   repair. Do not extend that exception to new cache stages.
+- [p-AbNatiV2 upstream compatibility patches](pabnativ2-app-deviations.md)
+  document the two guarded Python 3.12 compatibility edits applied to pinned
+  AbNatiV and ABodyBuilder3 sources.

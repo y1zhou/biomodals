@@ -10,7 +10,33 @@ import warnings
 
 import pytest
 
-from biomodals.helper.shell import run_command
+from biomodals.helper.shell import package_outputs, run_command, sanitize_filename
+
+
+def test_sanitize_filename_removes_leading_dashes() -> None:
+    assert sanitize_filename("---run") == "run"
+    with pytest.raises(ValueError, match="safe filename component"):
+        sanitize_filename("---")
+
+
+def test_package_outputs_terminates_tar_options(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "--help"
+    root.mkdir()
+    calls = {}
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/zstd")
+
+    def fake_check_output(command, *, cwd):
+        calls["command"] = command
+        calls["cwd"] = cwd
+        return b"archive"
+
+    monkeypatch.setattr(sp, "check_output", fake_check_output)
+
+    assert package_outputs(root) == b"archive"
+    assert calls == {
+        "command": ["tar", "-I", "zstd -T16", "-f", "-", "-c", "--", "--help"],
+        "cwd": tmp_path,
+    }
 
 
 def test_run_command_tee_streams_raw_child_output(capfd) -> None:

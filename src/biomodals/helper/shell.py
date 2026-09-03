@@ -302,7 +302,7 @@ def package_outputs(
 
     # If no valid subpaths, use all of the root directory
     if not cmd_paths:
-        return sp.check_output([*cmd, "-c", root_path.name], cwd=workdir)  # noqa: S603
+        return sp.check_output([*cmd, "-c", "--", root_path.name], cwd=workdir)  # noqa: S603
 
     # Write the list of paths to a temporary file and use --files-from to pass to tar
     # We use this instead of passing paths directly to avoid issues
@@ -379,7 +379,7 @@ def sanitize_filename(filename: str, separator: str = "_") -> str:
 
     root_dir = Path(os.sep)
     f = (root_dir / filename.strip()).resolve().relative_to(root_dir)
-    sanitized = separator.join(f.parts)
+    sanitized = separator.join(f.parts).lstrip("-")
     if not sanitized:
         raise ValueError("Value must contain at least one safe filename component")
     return sanitized

@@ -87,10 +87,7 @@ def _catalog_entry_name(path: Path) -> str:
 
 def catalog_entry_category(path: Path) -> str:
     """Derive an app category without exposing a package directory as one."""
-    resolved_path = path.resolve()
-    if resolved_path.is_relative_to(APP_HOME):
-        return resolved_path.relative_to(APP_HOME).parts[0]
-    return path.parent.name
+    return path.parent.parent.name if path.name == "app.py" else path.parent.name
 
 
 def get_catalog(

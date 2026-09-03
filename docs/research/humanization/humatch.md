@@ -302,7 +302,7 @@ implementation. To report the post-germline scores, call the deterministic
 upstream germline helper separately, then pass the original parental pair to
 `humanise()` so its edit count remains correct. Accept at most 1,000 pairs and
 do not cache results. Initially run rows sequentially in one warm CPU container
-with `cpu=(0.125, 16.125)`, `memory=(256, 16384)`, and a 24-hour timeout.
+with `cpu=(2.125, 16.125)`, `memory=(256, 16384)`, and a 24-hour timeout.
 Benchmark one pair cold and warm, then pause before testing larger batches. Use
 pair-level fanout when CPU utilization is at least 70% of the limit for at
 least 70% of humanization; test in-container batching when utilization is at
@@ -402,6 +402,44 @@ This result favors a fixed batch size of six over four for the first fanout
 implementation. It remains a single-sequence probe; repeat and mixed-sequence
 validation should accompany the production change rather than adding
 pull-worker scheduling now.
+
+### Guaranteed-CPU six-versus-eight probe
+
+A final probe raised the worker CPU request from 0.125 to 2.125 cores while
+retaining the 16.125-core limit. Four isolated Modal functions ran
+simultaneously: sequential and concurrent baselines for six and eight copies
+of the same non-human pair. Sequential baselines used 16 upstream encoding
+workers per pair; concurrent runs used two per pair. The completed calls were
+`fc-01M1JXRD0F4ATF62GPCTEGDY2V`, `fc-01M1JXRDBE92974FV13026EGY4`,
+`fc-01M1JXRDPKQD162X4T0HK00NB8`, and
+`fc-01M1JXRE1BXNE23YVC7XRF67HW`.
+
+| Measurement | Six sequential | Six concurrent | Eight sequential | Eight concurrent |
+| --- | ---: | ---: | ---: | ---: |
+| Wall time | 202.19 s | 93.02 s | 258.94 s | 125.53 s |
+| Throughput | 1.78 pairs/min | 3.87 pairs/min | 1.85 pairs/min | 3.82 pairs/min |
+| Speedup over matching baseline | - | 2.17x | - | 2.06x |
+| Mean CPU cores | 2.88 | 2.94 | 2.87 | 3.13 |
+| Aggregate memory at completion | 2,532 MiB | 3,285 MiB | 4,162 MiB | 3,823 MiB |
+| Worker-process peak RSS | 3,180 MiB | 4,636 MiB | 3,273 MiB | 6,180 MiB |
+
+Both concurrent modes exactly matched their separately executed sequential
+baselines across final sequences, target families, edit counts, alignments,
+mutations, success flags, and every returned floating-point score. Six-way
+concurrency had 1.2% higher throughput than eight-way concurrency, completed a
+batch 32.5 seconds sooner, and used about 1.54 GiB less peak worker RSS. The
+earlier 0.125-core six-way probe was faster in absolute terms, so this single
+simultaneous run does not show that the higher CPU floor improves latency; its
+purpose is to provide a larger guaranteed allocation closer to the observed
+roughly three-core mean.
+
+The first production fanout should therefore use fixed batches of six pairs,
+six threads per worker container, and two upstream encoding workers per pair.
+Eight-way concurrency adds latency and memory without improving throughput.
+Keep the 2.125-to-16.125 CPU range and 256 MiB-to-16 GiB memory range, and use
+the shared execution kernel for container fanout above six pairs. Validate the
+production path with mixed sequences and repeat runs before treating shared
+model inference as generally thread-safe.
 
 ## Place in the antibody-humanization stack
 

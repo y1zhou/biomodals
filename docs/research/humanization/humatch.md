@@ -2,7 +2,7 @@
 
 Research date: 2026-09-02
 
-Likely implementation target: `src/biomodals/app/design/humatch_app.py`
+Likely implementation target: `src/biomodals/app/design/humatch/app.py`
 
 ## Recommendation in brief
 
@@ -103,7 +103,9 @@ Humanization has two phases:
    variant remains.
 
 CDRs are excluded from both phases by default; users may allow CDR mutation or
-fix additional IMGT positions. The fixed `noise=0.01` parameter changes the
+fix additional IMGT positions. Although the default YAML contains
+`noise: 0.01`, `humanise(...)` never reads it: prediction scaling always uses
+the helper's default `noise_factor=0.01`. The effective constant changes the
 frequency weighting and is not random noise
 ([paper method](https://pmc.ncbi.nlm.nih.gov/articles/PMC11610552/),
 [default config](https://github.com/oxpig/Humatch/blob/06205ad50f64b84468fea14eea573a3fce699550/Humatch/configs/default.yaml),
@@ -206,8 +208,9 @@ identities in the result manifest
    selecting a variant that can push `Edit` *above* `max_edit`, then falls back
    to the previously visited sequence with the largest unscaled sum of the
    three CNN scores. The output has no explicit `humanisation_failed` field.
-   Preserve this behavior for equivalence but report status, stop reason, and
-   achieved thresholds explicitly
+   Preserve this behavior for equivalence. The first implementation will use
+   upstream code without patches and derive only success or failure from the
+   returned scores; an exact stop reason would require later instrumentation
    ([humanization source](https://github.com/oxpig/Humatch/blob/06205ad50f64b84468fea14eea573a3fce699550/Humatch/humanise.py)).
 6. **Scores must not be overclaimed.** The paired negative class is synthetic,
    and the authors say computational designs are predicted rather than proven
@@ -242,7 +245,7 @@ Compare the Biomodals operation against direct `humanise(...)` calls using:
   noncanonical, duplicate-ID, and unnumberable inputs.
 
 Require exact aligned/final sequences, target families, mutation locations,
-edit counts, and stop status. Compare CNN probabilities and germline-likeness
+edit counts, and derived success status. Compare CNN probabilities and germline-likeness
 values at a tight declared tolerance rather than serialized bit identity.
 Repeat warm CPU inference to establish whether exact discrete results remain
 stable. The upstream repository contains examples but no automated tests or
@@ -253,20 +256,96 @@ golden outputs, so Biomodals must retain its own small oracle fixtures
 ## Smallest workflow-compatible Biomodals boundary
 
 Expose one public **humanize** operation with the same wide `id,vh,vl` CSV
-shape selected for Sapiens. Require complete pairs. Typed options should cover
-target HV/LV families (or `auto`), GL and CNN thresholds, maximum combined
-edits, CDR mutation flags, fixed IMGT positions, and the fixed frequency-noise
-constant. Keep alignment and raw classification internal unless a concrete
-consumer later needs independent scoring.
+shape selected for Sapiens. Require complete, uniquely identified pairs and
+fail the whole batch for invalid input, an unnumberable pair, or an execution
+error. A below-target candidate remains a valid result with
+`humanization_success=false`. Apply one set of controls to the complete batch:
+automatic or explicit target HV/LV families, one shared GL target, separate
+H/L/P classifier targets, a maximum combined edit count, one CDR mutation flag,
+and separate fixed VH/VL IMGT positions. Keep the unused YAML `noise` field out
+of the public interface and preserve its effective hardcoded value. Keep
+alignment and raw classification internal unless a concrete consumer later
+needs independent scoring.
+
+The public defaults match upstream's effective defaults:
+
+- `vh_target_family="auto"` and `vl_target_family="auto"`;
+- `germline_likeness_target=0.40` for both chains;
+- `vh_classifier_target=0.95`, `vl_classifier_target=0.95`, and
+  `pair_classifier_target=0.95`;
+- `max_edits=60`;
+- `mutate_cdrs=false` for both chains and both phases; and
+- empty `fixed_vh_positions` and `fixed_vl_positions`.
+
+Validate with a Humatch-owned copy adapted from the small Sapiens validation
+routine rather than importing the Sapiens app package. Bound input at 3 MiB,
+1,000 pairs, 200 characters per ID, and 200 canonical residues per chain;
+then require ANARCI to identify a complete VH plus kappa or lambda VL with the
+IMGT coverage needed by Humatch. This deliberate duplication keeps the two
+workflow-compatible apps independent.
 
 Use a one-Node `ExecutionDefinition` for CLI/service runs and make the same
 remote operation directly usable by a parent workflow. Return an inline
-`.tar.zst` containing normalized input CSV, unpadded humanized CSV and FASTA,
-mutation table, initial/final heavy/light/paired scores, selected target
-families, stop status, optional compact iteration trace, and a complete
-software/asset identity manifest. At the expected sub-100-pair scale, run rows
-sequentially in one warm CPU container and load all three CNNs once. Add
-execution-kernel pair fanout only if 10/100-pair benchmarks show it is needed.
+`.tar.zst` with these files:
+
+- `input.csv` and `humanized.csv` use the common `id,vh,vl` schema;
+- `humanized.fasta` contains the final pairs;
+- `summary.csv` contains selected families, edit count, success, selected-target
+  classifier endpoints, and H/L germline-likeness endpoints;
+- `classifier_scores.csv` contains wide input/final class distributions;
+- `alignment.csv` contains the long input-to-final IMGT comparison;
+- `mutations.csv` contains only parental-to-final substitutions; and
+- `manifest.json` contains parameters and scientific identities.
+
+Do not patch upstream or emit an accepted-mutation trace in the first
+implementation. To report the post-germline scores, call the deterministic
+upstream germline helper separately, then pass the original parental pair to
+`humanise()` so its edit count remains correct. Accept at most 1,000 pairs and
+do not cache results. Initially run rows sequentially in one warm CPU container
+with `cpu=(0.125, 16.125)`, `memory=(256, 16384)`, and a 24-hour timeout.
+Benchmark one pair cold and warm, then pause before testing larger batches. Use
+pair-level fanout when CPU utilization is at least 70% of the limit for at
+least 70% of humanization; test in-container batching when utilization is at
+most 40%, and compare both paths between those bounds.
+
+## Initial implementation benchmark
+
+Benchmark date: 2026-09-03
+
+The initial implementation was tested on upstream's non-human mouse example
+(the `is_human=0` row whose documented result has 24 edits) in the agreed
+`cpu=(0.125, 16.125)`, `memory=(256, 16384)` Modal container. The image used the
+pinned source, assets, and runtime listed above. The wrapper ran the complete
+pair in one worker without pair fanout or in-container pair batching.
+
+| Measurement | First call | Same-container warm call |
+| --- | ---: | ---: |
+| End-to-end worker time | 41.96 s | 35.90 s |
+| Time inside upstream `humanise()` | 20.57 s | 23.46 s |
+| Model load time | 0.22 s | 0.00 s |
+| Mean CPU cores, complete worker | 2.12 | 2.47 |
+| Mean CPU cores, `humanise()` | 2.55 | 2.46 |
+| Mean CPU fraction of 16.125-core limit, complete worker | 13.2% | 15.3% |
+| Mean CPU fraction of 16.125-core limit, `humanise()` | 15.8% | 15.2% |
+
+A separate instrumented repeat took 46.20 seconds end to end and 25.71 seconds
+inside `humanise()`. It observed 3,267.7 MiB of aggregate cgroup memory at
+completion and a 2,776.9 MiB high-water RSS for the worker process. This Modal
+cgroup exposes current aggregate memory but not an aggregate peak counter, so
+the first figure is not claimed as the container's absolute peak.
+
+The Biomodals result exactly matched the unmodified upstream CLI's final VH
+and VL, `hv1`/`kv3` targets, and 24-edit count. Its full-precision scores round
+to the upstream CLI values (`CNN_H=0.958`, `CNN_L=1.000`, `CNN_P=0.982`). First
+and warm Biomodals calls returned identical sequences, mutations, selected
+families, and full-precision classifier and germline-likeness scores. The
+compressed eight-file result bundle was about 4.3 kB.
+
+CPU use is well below the agreed 40% low-utilization boundary. These results
+do not justify pair-per-container fanout: for a later performance iteration,
+batching multiple pairs in one warm container is the more plausible first
+experiment. The initial implementation deliberately remains sequential until
+that optimization is requested.
 
 ## Place in the antibody-humanization stack
 

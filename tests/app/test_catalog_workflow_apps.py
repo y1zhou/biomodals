@@ -58,6 +58,7 @@ def test_package_app_has_stable_catalog_metadata() -> None:
     apps = get_catalog("app", use_absolute_paths=True)
 
     assert apps["sapiens"].as_posix().endswith("/design/sapiens/app.py")
+    assert apps["humatch"].as_posix().endswith("/design/humatch/app.py")
     sapiens = BiomodalsApp("sapiens", all_apps=apps)
     explicit = BiomodalsApp(str(apps["sapiens"]), all_apps=apps)
 

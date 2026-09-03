@@ -783,8 +783,16 @@ _Avoid_: full antibody, antibody chain
 **VH-VL Pair**:
 The associated heavy- and light-chain Antibody Variable Regions for one
 antibody candidate. Sapiens evaluates the two regions independently rather
-than as a jointly conditioned pair.
+than as a jointly conditioned pair; Humatch evaluates both chain-specific and
+joint pairing properties.
 _Avoid_: paired Sapiens model, full antibody
+
+**Complete VH-VL Pair**:
+A VH-VL Pair whose heavy domain and kappa or lambda light domain contain only
+canonical amino acids, can be numbered by ANARCI, and cover the positions
+required by the humanization method. It excludes fragments, missing chains,
+and single-domain antibodies such as VHH.
+_Avoid_: inferred chain pairing, partial variable domain, VHH
 
 **Sapiens Residue Score**:
 The Sapiens model's score for each canonical amino acid at one position in an
@@ -797,6 +805,79 @@ A transformation of an Antibody Variable Region that replaces every eligible
 position with the highest-scoring canonical amino acid from its Sapiens
 Residue Scores.
 _Avoid_: masked infilling, OASis evaluation, experimental validation
+
+**Humatch Humanization**:
+A transformation of a VH-VL Pair that first increases each chain's likeness
+to selected human V-gene families, then selects substitutions using separate
+heavy-chain, light-chain, and pairing classifiers. It produces an alternative
+humanization candidate to Sapiens Humanization rather than a downstream
+refinement of one.
+_Avoid_: per-residue scoring, Sapiens post-processing, immunogenicity prediction
+
+**Humatch Alignment**:
+The fixed-position representation made by assigning IMGT positions to an
+Antibody Variable Region and placing its residues into Humatch's 200-position
+model input. It is a model representation, not a changed antibody sequence.
+_Avoid_: sequence humanization, multiple-sequence alignment, mutation
+
+**Humatch Classifier Scores**:
+Three sequence-level probabilities for a VH-VL Pair: membership of the heavy
+chain in its selected human V-gene family, membership of the light chain in
+its selected human V-gene family, and membership of the pair in Humatch's
+natural-human-pair class.
+_Avoid_: per-residue score, immunogenicity score, experimental validation
+
+**Humatch Target V-Gene Families**:
+The human heavy-chain and light-chain V-gene families that direct Humatch
+Humanization. Humatch can select them from the parental classifier outputs or
+use an explicit valid heavy/light family pair.
+_Avoid_: individual germline allele, source-species label, pairing class
+
+**Humatch Germline-Likeness Score**:
+The mean target-family residue frequency that guides the first phase of
+Humatch Humanization. It is distinct from the Humatch Classifier Scores.
+_Avoid_: classifier probability, sequence identity, immunogenicity score
+
+**Humatch Germline-Likeness Endpoints**:
+The heavy- and light-chain Humatch Germline-Likeness Scores for the parental
+VH-VL Pair, the pair after germline-likeness optimization, and the final
+humanized pair.
+_Avoid_: classifier endpoints, iteration trace, score matrix
+
+**Humatch Protected Position**:
+An IMGT position that Humatch Humanization cannot mutate. CDR positions are
+protected by default unless CDR mutation is explicitly enabled; explicitly
+fixed IMGT positions remain protected.
+_Avoid_: raw sequence index, preferred mutation, Sapiens CDR policy
+
+**Humatch Classifier Target**:
+The minimum selected-family or natural-human-pair probability required for
+Humatch Humanization to report that its three classifier objectives were met.
+_Avoid_: calibrated safety threshold, germline-likeness target, edit limit
+
+**Humatch Edit Count**:
+The total number of amino-acid differences between a Humatch candidate and
+its parental VH-VL Pair, summed across the heavy and light chains.
+_Avoid_: iteration count, candidates evaluated, chain-specific count
+
+**Humatch Humanization Status**:
+Success when the final Humatch Classifier Scores meet all three Humatch
+Classifier Targets; failure otherwise. It does not state which internal
+failure path caused an unsuccessful result.
+_Avoid_: process exit status, germline-likeness target status, stop reason
+
+**Humatch Humanization Result**:
+The humanized VH-VL Pair together with its parental and final Humatch
+Classifier Scores, selected V-gene families, Humatch Alignment comparison,
+positioned mutations, Humatch Humanization Status, and exact scientific
+identities.
+_Avoid_: humanized sequence alone, standalone classification result
+
+**Humanization Candidate Set**:
+The method-attributed Humanization Results produced independently from the
+same parental VH-VL Pair. Collection does not imply that one method consumes
+another method's result or that agreement proves experimental suitability.
+_Avoid_: chained humanization, consensus sequence, validated antibody
 
 **CDR Definition**:
 A named boundary convention that classifies numbered positions in an Antibody
@@ -827,9 +908,11 @@ are not part of the scientific result.
 _Avoid_: iteration history, mutation list, OASis score
 
 **Humanization Batch**:
-A set of explicitly identified VH-VL Pairs that validates and succeeds or
-fails as one scientific input unit.
-_Avoid_: partial result set, inferred FASTA pairing
+A set of explicitly identified VH-VL Pairs that validates and executes as one
+scientific input unit. Invalid input or an execution error fails the complete
+batch; a method can still return a scientifically unsuccessful candidate with
+an explicit Humanization Status.
+_Avoid_: silently dropped pair, inferred FASTA pairing, execution status
 
 **Sapiens Humanization Result**:
 The humanized VH-VL Pairs together with their mutation summaries, Sapiens

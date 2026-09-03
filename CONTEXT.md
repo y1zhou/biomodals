@@ -919,6 +919,58 @@ The humanized VH-VL Pairs together with their mutation summaries, Sapiens
 Endpoint Scores, and exact scientific identities.
 _Avoid_: humanized sequence alone, independent humanness evaluation
 
+**p-AbNatiV2 Humanization**:
+A paired transformation of a Complete VH-VL Pair that greedily accepts
+PSSM-supported substitutions to improve joint p-AbNatiV2 nativeness while
+limiting relative loss of the learned pairing score. The initial Biomodals
+method follows the pinned source implementation's four-prediction solvent-
+accessibility ensemble.
+_Avoid_: independent chain humanization, paper-protocol equivalence, pairing optimization alone
+
+**p-AbNatiV2 Nativeness Score**:
+A model-derived reconstruction score for a complete pair, chain, or antibody
+region. It is not a calibrated probability that a sequence is human and may be
+negative after upstream threshold rescaling.
+_Avoid_: immunogenicity probability, sequence identity, OASis score
+
+**p-AbNatiV2 Pairing Score**:
+The raw `[0,1]` output of the learned classifier trained to distinguish native
+VH-VL pairs from constructed negative pairs. It is reported as a fraction and
+does not predict physical assembly, binding, expression, or efficacy.
+_Avoid_: percent, calibrated pairing probability, developability score
+
+**p-AbNatiV2 Residue Reconstruction Matrix**:
+The 21 reconstruction values for the canonical amino acids and gap at each AHo
+position of a parental or final VH-VL Pair. It is model output rather than an
+experimental mutational-fitness landscape.
+_Avoid_: deep-mutational scan, Sapiens Residue Score, amino-acid probability
+
+**p-AbNatiV2 Structural Displacement**:
+The scaffold and CDR RMSDs between independently predicted parental and final
+structures after scaffold superposition. It is an audit metric, not evidence
+that antigen binding or developability is preserved.
+_Avoid_: binding preservation, experimental structure comparison, mutation score
+
+**p-AbNatiV2 Eligible Position**:
+An AHo position that is allowed by the chain's mutation policy, is not fixed,
+meets the solvent-accessibility threshold, has a residue score at or below the
+liability threshold, and has at least one permitted human-PSSM substitution.
+CDRs are ineligible by default and become eligible only through explicit
+opt-in; opting in never overrides a fixed position.
+_Avoid_: low-scoring position alone, raw sequence offset, guaranteed mutation
+
+**p-AbNatiV2 Pairing-Loss Limit**:
+The largest relative decrease from the current p-AbNatiV2 Pairing Score that a
+candidate substitution may incur. The upstream default is `0.10`, meaning ten
+percent of the current score rather than ten percentage points.
+_Avoid_: minimum pairing score, absolute score delta, classifier target
+
+**p-AbNatiV2 Endpoint Mutation**:
+An amino-acid difference between the parental and final humanized pair, keyed
+by chain and AHo position. It does not record transient substitutions accepted
+and later replaced during greedy search.
+_Avoid_: accepted-step trace, raw sequence diff, DMS candidate
+
 **PPIFlow Candidate Set**:
 The complete collection of structures produced by one PPIFlow design stage and carried together through downstream design, packing, scoring, refolding, and comparison steps.
 _Avoid_: first structure, representative structure, single design

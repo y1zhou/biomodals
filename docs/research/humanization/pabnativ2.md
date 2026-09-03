@@ -2,7 +2,65 @@
 
 Research date: 2026-09-02
 
-Prospective implementation target: `src/biomodals/app/design/pabnativ2_app.py`
+Prospective implementation target: `src/biomodals/app/design/pabnativ2/app.py`
+
+## Initial app decisions
+
+Decisions settled on 2026-09-03 for the first Biomodals implementation:
+
+- expose only paired VH-VL humanization and always return parental and final
+  scores;
+- use the pinned AbNatiV 2.0.8 implementation as the scientific oracle,
+  including its four-prediction RASA ensemble rather than the ten predictions
+  described in the paper;
+- stage checksum-verified paired-model and ABodyBuilder3 checkpoints on the
+  `biomodals-store` Modal Volume instead of embedding them in the image;
+- benchmark one pair on CPU, A10, and L40S before selecting resources or a
+  multi-pair dispatch topology;
+- retain parental and final predicted PDBs plus scaffold/CDR displacement
+  metrics, while omitting incidental upstream scratch outputs;
+- seed supported public APIs and record the seed, with hardware retained only
+  as operational telemetry; do not patch possible ordering or tie behavior
+  unless repeatability tests demonstrate a problem; and
+- return parental and final sequence-, region-, pairing-, percentile-, and
+  residue-level scores. Position matrices contain the upstream 21-value
+  reconstruction distribution and use `pairing_score` for the raw fraction;
+- expose `mutate_cdrs` plus separate AHo `fixed_vh_positions` and
+  `fixed_vl_positions`, with framework-only mutation by default;
+- expose the residue-score, RASA, and maximum relative pairing-score-decrease
+  thresholds with upstream defaults, while fixing the objective weights to
+  `a=10` and `b=1` for the initial scientific version;
+- expose a canonical-amino-acid `forbidden_residues` control defaulting to
+  `C,M`, with gap always forbidden internally;
+- omit experimental parental PDB input from v1 and use predicted structures;
+- provide an explicit artifact-staging entrypoint that verifies and commits
+  the two required checkpoints to `biomodals-store`, while inference mounts
+  the app subdirectory read-only and fails closed on missing or invalid files;
+- report only endpoint mutations rather than transient accepted search steps;
+  and
+- treat a completed unchanged pair as successful rather than imposing an
+  additional scientific score target;
+- write sequence-level metrics to a wide `sequence_scores.csv` with one row
+  per pair and endpoint, and write endpoint residue reconstruction matrices to
+  `residue_scores.parquet` with one row per pair, endpoint, chain, and AHo
+  position;
+- store predicted structures under a row-number-prefixed sanitized-ID path,
+  retaining original IDs in tables and manifests;
+- use AHo as the fixed p-AbNatiV2 coordinate system rather than exposing
+  alternative numbering schemes or CDR definitions;
+- validate all thresholds in `[0,1]`, chain-local fixed AHo positions as
+  unique integers from 1 through 149, and forbidden residues as distinct
+  uppercase canonical amino acids before remote inference;
+- benchmark one cold run on CPU, A10, and L40S, followed by one warm run on the
+  leading device;
+- begin with `cpu=(0.125,16.125), memory=(1024,32768)` for the CPU benchmark
+  and `cpu=8, memory=32768` for each GPU benchmark; and
+- install and call pinned `abnativ==2.0.8` directly without importing the
+  existing Biomodals AbNatiV scoring app.
+
+Licensing is outside the implementation decision for this initial branch. The
+license and research-use caveat remain documented rather than enforced by a
+runtime gate.
 
 ## Executive recommendation
 
@@ -17,8 +75,7 @@ or custom checkpoints in the same app
 ([paired model](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/model/abnativ2_paired.py),
 [paired humanizer](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/humanisation/vh_vl_humanisation_functions.py)).
 
-There are two blockers to resolve before treating this as a generally available
-Biomodals app:
+There are two important constraints on how the initial app is described:
 
 1. The code is CC BY-NC-SA 4.0 and the README expressly prohibits commercial
    use. Commercial or mixed-use deployment needs permission from the authors or
@@ -26,9 +83,9 @@ Biomodals app:
    ([license](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/LICENSE),
    [README](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/README.md)).
 2. The peer-reviewed method averages solvent accessibility over ten predicted
-   structures, while the current source hard-codes four predictions. The app
-   must deliberately choose and version one behavior after checking with
-   upstream; it must not claim both current-code and paper equivalence
+   structures, while the current source hard-codes four predictions. The
+   initial app deliberately follows and versions the current four-prediction
+   implementation; it must not claim paper-protocol equivalence
    ([paper](https://doi.org/10.1080/19420862.2026.2646361),
    [current RASA call](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/humanisation/humanisation_utils.py)).
 
@@ -73,7 +130,8 @@ inference.
 
 The scientific identity of an app run therefore includes at least the code
 version, paired checkpoint checksum, dependency lock, AHo alignment behavior,
-humanization parameters, structure-prediction checkpoint, and device class.
+humanization parameters, and structure-prediction checkpoint. Hardware is
+operational metadata rather than part of the scientific fingerprint.
 
 ## Input contract and alignment
 
@@ -237,10 +295,10 @@ Pin the complete tested runtime and make any upstream patch explicit and
 auditable.
 
 The paired checkpoint plus structure checkpoint transfer is at least 1.66 GB,
-before dependencies and extracted assets. Prefer an immutable, checksum-verified
-model layer or a staged read-only Modal Volume; do not run the broad upstream
-`abnativ init`. Which cache mechanism gives better cold-start behavior should be
-decided from a one-pair benchmark.
+before dependencies and extracted assets. Stage only these required artifacts
+on `biomodals-store`, verify their checksums before use, and mount them read-only
+for inference; do not run the broad upstream `abnativ init` or bake them into
+the image.
 
 ## Runtime, batching, and determinism
 
@@ -253,16 +311,22 @@ DMS, and structure prediction. There is no published one-pair runtime or memory
 requirement in the paper, so resource sizing must be measured rather than
 inferred.
 
-Start with a single-pair benchmark on a CPU container as requested, capturing
+Start with a single-pair benchmark on CPU, A10, and L40S containers, capturing
 image build time, cold start, asset load, alignment, DMS, each structure pass,
-total wall time, peak RSS, and output bytes. Also run the same oracle on the
-smallest practical GPU. If single-pair work is long, fan out one pair per
-execution-kernel task for a batch while preserving the overall 1,000-pair hard
-ceiling. Do not introduce an unbounded `.map()` path.
+total wall time, peak RSS, GPU memory and utilization where applicable, and
+output bytes. Choose resources and dispatch only after comparing these runs.
+Use `cpu=(0.125,16.125), memory=(1024,32768)` for the CPU probe and
+`cpu=8, memory=32768` for the A10 and L40S probes. Run one cold probe on each,
+then one warm repetition on the leading device. Install pinned
+`abnativ==2.0.8` inside this app and do not depend on the implementation of the
+separate Biomodals AbNatiV scoring app.
+If single-pair work is long, fan out bounded execution-kernel Tasks while
+preserving the overall 1,000-pair hard ceiling. Do not introduce an unbounded
+`.map()` path.
 
 Pure scoring uses `eval()` plus inference mode and contains no sampling, so it
-should be deterministic for a pinned checkpoint, runtime, and device. The full
-humanizer has weaker guarantees:
+should be stable for a pinned checkpoint and runtime within ordinary
+floating-point tolerances. The full humanizer has weaker guarantees:
 
 - structure prediction is repeated but the paired humanizer does not expose a
   seed parameter;
@@ -272,11 +336,13 @@ humanizer has weaker guarantees:
   gap, so repeated calls in one warm process can observe changed state
   ([search implementation](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/humanisation/humanisation_utils.py)).
 
-The wrapper should pass a fresh forbidden list, sort every set-derived
-collection, seed all seedable libraries, record device/software identity, and
-test repeated runs in the same warm process. Cross-device floating-point
-differences may still change a threshold or greedy tie; CPU and GPU should be
-treated as distinct scientific execution identities until shown equivalent.
+The wrapper should pass a fresh forbidden list, seed all seedable libraries,
+record hardware as operational telemetry, and test repeated runs in the same
+warm process. Do not patch set ordering or tie behavior unless those tests show
+instability. Cross-device validation requires the same aligned and final
+sequences, eligibility decisions, and endpoint mutations, with numeric outputs
+agreeing within documented floating-point tolerances. Hardware does not enter
+the Workload Plan Fingerprint.
 
 ## Published validation and limits
 
@@ -313,28 +379,49 @@ but do not make v1 a menu of every AbNatiV mode.
 Inputs:
 
 - wide CSV `id,vh,vl`, complete and strictly validated;
-- upstream scientific knobs with upstream defaults: residue threshold, RASA
-  threshold, maximum pairing-score decrease, objective weights, forbidden
-  substitutions, and allowed mutation positions;
-- framework-only mutation by default, with CDR mutation requiring an explicit
-  opt-in warning; and
+- `residue_score_threshold=0.98`, `rasa_threshold=0.15`, and
+  `max_relative_pairing_score_decrease=0.10`, all strictly validated;
+- `mutate_cdrs=False` with separate chain-local AHo
+  `fixed_vh_positions` and `fixed_vl_positions`; fixed positions remain
+  protected when CDR mutation is enabled;
+- `forbidden_residues=C,M`, validated as canonical amino acids with gap always
+  forbidden internally;
+- fixed upstream objective weights `a=10,b=1`, the fixed 1% PSSM cutoff, and
+  the fixed four-prediction RASA ensemble; and
 - no custom model, user PDB, unpaired chain, VHH, training, or plotting in v1.
 
 Stable outputs:
 
 - normalized input and final humanized VH/VL FASTA;
-- one sequence-level table with input/final joint, chain, region, percentile,
-  and raw pairing scores;
-- input and final position-by-21 reconstruction matrices and observed-residue
-  scores, keyed by ID, chain, and AHo position;
-- a mutation table with original/new residue and region; and
-- a compact manifest containing every pin, checksum, parameter, device, seed,
-  validation result, runtime, and upstream/paper behavior choice.
+- `sequence_scores.csv`, with one wide row per ID and `input` or `final`
+  endpoint containing joint, chain, region, percentile, and raw pairing
+  scores;
+- `residue_scores.parquet`, with one row per ID, endpoint, chain, and AHo
+  position containing the observed residue, its residue score, and the 21
+  reconstruction values;
+- an endpoint mutation table with ID, chain, AHo position, region,
+  parental/final residue, and parental/final observed-residue score; and
+- a compact manifest containing every pin, checksum, parameter, seed,
+  validation result, runtime, upstream/paper behavior choice, and device as
+  operational telemetry.
 
 Structures and CDR displacement are scientifically useful audit artifacts and
 are already computed by the upstream pipeline. Include the input/final PDBs and
 displacement summary in a compressed result bundle if the benchmark shows the
-size is modest. Omit PNG, PAP, ChimeraX, and full DMS intermediates by default.
+size is modest. Store each pair under
+`structures/{row_number}_{sanitized_id}/input.pdb` and `final.pdb`, while
+retaining the original ID in tables and the manifest. Omit PNG, PAP, ChimeraX,
+and full DMS intermediates by default.
+
+The public coordinate system is fixed to chain-local AHo positions spanning
+1 through 149. Thresholds must be finite values in `[0,1]`; fixed positions must be
+unique integers in that range; forbidden residues must be distinct uppercase
+canonical amino acids. Validate all controls before scheduling inference.
+
+A pair is scientifically successful whenever the pinned humanization procedure
+completes, including when it returns an unchanged pair. The initial app defines
+no additional target score. Invalid input or an execution error remains a batch
+failure under the shared Humanization Batch contract.
 
 ## Required oracle and acceptance tests
 
@@ -346,13 +433,14 @@ size is modest. Omit PNG, PAP, ChimeraX, and full DMS intermediates by default.
    one row is invalid. No row may disappear silently.
 3. Run the same pair twice in one warm process to catch the mutable-default and
    ordering problems; run fresh processes to assess structure variability.
-4. Test CPU/GPU numerical drift before allowing both backends under one
-   scientific version.
+4. Require identical discrete CPU/GPU outputs and compare numeric outputs with
+   documented floating-point tolerances; do not fingerprint the hardware.
 5. Verify both published asset checksums and prove runtime network access is not
    required.
 6. Pin an expected one-pair resource envelope and fail clearly when structure
    prediction, alignment, or scoring exceeds it.
 
-Until the licensing and 10-versus-4 RASA questions are resolved, an
-implementation can be prototyped and benchmarked, but should not be presented
-as a production-equivalent p-AbNatiV2 service.
+The initial app targets equivalence to the pinned 2.0.8 source rather than the
+paper's ten-structure protocol. Its non-commercial license and research-use
+limitations must remain explicit; the app must not be presented as clinical
+validation or as evidence that binding and developability are preserved.

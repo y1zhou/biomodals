@@ -1,6 +1,6 @@
 ---
 name: biomodals-app-development
-description: Biomodals Modal app development standards. Use when Codex is creating, editing, reviewing, or scaffolding files under src/biomodals/app/**/*_app.py or their supporting modules, including discovery, AppConfig and image construction, input safety, execution-kernel integration, remote coordinators, staged caches, fanout and resumption, upstream patches, scientific equivalence, workflow outputs, examples, and tests.
+description: Biomodals Modal app development standards. Use when Codex is creating, editing, reviewing, or scaffolding apps under src/biomodals/app/, including single-file *_app.py apps, package-based */app.py apps, discovery, AppConfig and image construction, input safety, execution-kernel integration, remote coordinators, staged caches, fanout and resumption, upstream patches, scientific equivalence, workflow outputs, examples, and tests.
 ---
 
 # Biomodals App Development
@@ -30,8 +30,8 @@ description: Biomodals Modal app development standards. Use when Codex is creati
 
 ## Across all app shapes
 
-- Preserve `*_app.py` discovery and help behavior; complex apps may delegate to
-  sibling modules.
+- Preserve discovery and help behavior for both single-file `<tool>_app.py` apps
+  and package-based `<tool>/app.py` apps.
 - Give generic graph, artifact, Run, Node, Task, Provider Call, coordinator, and
   restart mechanics to `biomodals.execution`; use
   `biomodals.execution.modal` for Modal hosting. Keep scientific plans, cache

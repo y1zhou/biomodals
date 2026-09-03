@@ -1,4 +1,4 @@
-"""Immutable Sapiens model identities and image-build download helper."""
+"""Immutable model identities and image-build helper for the Sapiens app."""
 
 from dataclasses import dataclass
 from pathlib import Path

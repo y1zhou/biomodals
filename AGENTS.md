@@ -30,7 +30,9 @@ code. Use the repo-local Modal skill at `.agents/skills/modal/SKILL.md`.
 
 ## Biomodals app development
 
-When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, use the repo-local `biomodals-app-development` skill. See `docs/agents/app-development.md`.
+When creating, editing, or reviewing apps under `src/biomodals/app/`, use the
+repo-local `biomodals-app-development` skill. See
+`docs/agents/app-development.md`.
 The detailed app-development standards are consolidated in `.agents/skills/biomodals-app-development/`.
 
 When developing new apps that must violate the skill's conventions for good reason, document the reason for the deviation in `docs/agents/` and link that note from `docs/agents/app-development.md`.

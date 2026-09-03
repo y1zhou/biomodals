@@ -221,11 +221,11 @@ provider adapter uses `AsyncModalCallDriver` from
 
 ## Source layout
 
-Simple workloads may keep their execution adapter in a sibling
-`<name>_execution.py`. A complicated workload may use a sibling package such as
-`app/score/af3score/`, mirroring the existing AlphaFold3 layout. The discoverable
-`*_app.py` module retains scientific functions, Modal decorators, and thin
-entrypoints rather than generic orchestration.
+Simple workloads may remain in a discoverable `<name>_app.py`. Multi-module
+workloads use a discoverable `<name>/app.py` composition root with execution
+adapters and domain modules in the same package. The composition root retains
+scientific functions, Modal decorators, and thin entrypoints rather than
+generic orchestration.
 
 ## Compatibility and behavior
 

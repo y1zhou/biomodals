@@ -53,6 +53,46 @@ def get_all_scripts(
     return available_apps
 
 
+def get_all_apps(
+    root_dir: Path,
+    *,
+    use_absolute_paths: bool = False,
+    cwd: Path | None = None,
+) -> dict[str, Path]:
+    """Retrieve single-file and package-based Biomodals apps."""
+    available_apps: dict[str, Path] = {}
+    base_cwd = Path.cwd() if cwd is None else cwd
+    app_files = sorted((*root_dir.glob("*/*_app.py"), *root_dir.glob("*/*/app.py")))
+    for app_file in app_files:
+        app_name = _catalog_entry_name(app_file)
+        if existing_path := available_apps.get(app_name):
+            raise ValueError(
+                f"Duplicate app name '{app_name}' discovered at "
+                f"'{existing_path}' and '{app_file}'"
+            )
+        available_apps[app_name] = (
+            app_file.resolve()
+            if use_absolute_paths
+            else app_file.relative_to(base_cwd, walk_up=True)
+        )
+    return available_apps
+
+
+def _catalog_entry_name(path: Path) -> str:
+    """Derive the stable catalog name from either supported source layout."""
+    if path.name == "app.py":
+        return path.parent.name
+    return path.stem.removesuffix("_app").removesuffix("_workflow")
+
+
+def catalog_entry_category(path: Path) -> str:
+    """Derive an app category without exposing a package directory as one."""
+    resolved_path = path.resolve()
+    if resolved_path.is_relative_to(APP_HOME):
+        return resolved_path.relative_to(APP_HOME).parts[0]
+    return path.parent.name
+
+
 def get_catalog(
     catalog_type: CatalogType,
     *,
@@ -62,8 +102,10 @@ def get_catalog(
     """Retrieve app or workflow catalog entries."""
     match catalog_type:
         case "app":
-            return get_all_scripts(
-                APP_HOME, "*/", "_app", use_absolute_paths=use_absolute_paths, cwd=cwd
+            return get_all_apps(
+                APP_HOME,
+                use_absolute_paths=use_absolute_paths,
+                cwd=cwd,
             )
         case "workflow":
             return get_all_scripts(
@@ -176,7 +218,7 @@ class BiomodalsApp:
         # Normalize app name & path
         self._all_apps = all_apps or get_catalog("app", use_absolute_paths=True)
         self.name, self.path = self.resolve_app_path(name_or_path)
-        self.category = self.path.parent.name
+        self.category = catalog_entry_category(self.path)
         self.module = self.app_path_to_module_path(self.path)
 
         # Load functions and build index for quick lookup
@@ -230,7 +272,7 @@ class BiomodalsApp:
         app_path = Path(app_name_or_path).expanduser()
         if not app_path.exists():
             raise AppNotFoundError(app_name_or_path)
-        return app_path.stem.removesuffix("_app").removesuffix("_workflow"), app_path
+        return _catalog_entry_name(app_path), app_path
 
     @staticmethod
     def app_path_to_module_path(app_path: Path) -> str:

@@ -14,10 +14,11 @@ the result schema.
 
 import hashlib
 import time
+from importlib import import_module
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import modal
@@ -25,14 +26,14 @@ import orjson
 import polars as pl
 
 from biomodals.app.config import AppConfig
-from biomodals.app.design.sapiens_execution import (
+from biomodals.app.design.sapiens.execution import (
     SapiensExecutionCoordinator,
     SapiensExecutionRequest,
     load_execution_request,
     result_from_overview,
     stage_execution_request,
 )
-from biomodals.app.design.sapiens_models import (
+from biomodals.app.design.sapiens.models import (
     IDENTITY,
     MODEL_ROOT,
     RUNTIME_IDENTITY,
@@ -76,7 +77,7 @@ _COORDINATOR_TIMEOUT_SECONDS = 24 * 60 * 60
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name},
+    tags={"group": Path(__file__).parent.parent.name},
     name="Sapiens",
     repo_url="https://github.com/Merck/Sapiens",
     repo_commit_hash="3d676ecde0b6fc113d3f9c5bcb3721a7d70a85b7",
@@ -113,7 +114,7 @@ runtime_image = (
         f"safetensors=={IDENTITY.safetensors_version}",
     )
     .add_local_python_source(
-        "biomodals.app.design.sapiens_models",
+        "biomodals.app.design.sapiens.models",
         copy=True,
     )
     .run_function(download_sapiens_models)
@@ -123,7 +124,7 @@ runtime_image = (
         "TOKENIZERS_PARALLELISM": "false",
     })
     .pipe(patch_image_for_helper)
-    .add_local_python_source("biomodals.app.design.sapiens_execution")
+    .add_local_python_source("biomodals.app.design.sapiens.execution")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -234,10 +235,11 @@ def _score_frame(
 
 
 def _predict_scores(chain: Any, model_root: Path) -> Any:
-    import sapiens  # type: ignore[ty:unresolved-import]
+    # Import the upstream top-level package, not this Biomodals package.
+    sapiens_module = cast(Any, import_module("sapiens"))
 
     model_dir = model_root / ("vh" if chain.chain_type == "H" else "vl")
-    return sapiens.predict_scores(
+    return sapiens_module.predict_scores(
         seq=chain.seq,
         chain_type=chain.chain_type,
         checkpoint_path=str(model_dir),

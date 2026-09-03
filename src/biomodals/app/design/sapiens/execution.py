@@ -1,4 +1,4 @@
-"""Single-node execution definition for Sapiens humanization."""
+"""Single-node execution definition for the Sapiens app."""
 
 from __future__ import annotations
 

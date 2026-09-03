@@ -2,7 +2,7 @@
 
 Research date: 2026-09-02
 
-Implementation target: `src/biomodals/app/design/sapiens_app.py`
+Implementation target: `src/biomodals/app/design/sapiens/app.py`
 
 This note separates the small standalone `sapiens` Python package from the
 larger BioPhi humanization workflow. That distinction is the main design

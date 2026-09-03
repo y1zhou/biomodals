@@ -20,6 +20,7 @@ from biomodals.helper.catalog import (
     AppNotFoundError,
     BiomodalsApp,
     CatalogType,
+    catalog_entry_category,
     get_catalog,
 )
 from biomodals.helper.cli_command import (
@@ -174,7 +175,7 @@ def _list_available_entries(
     available_apps = get_catalog(list_type, use_absolute_paths=use_absolute_paths)
     table_rows: list[tuple[str, str, str]] = []
     for app_name, app_path in available_apps.items():
-        app_category = app_path.parent.name
+        app_category = catalog_entry_category(app_path)
         table_rows.append((f"[green]{app_name}[/green]", app_category, str(app_path)))
     match sort_by:
         case "name":

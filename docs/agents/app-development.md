@@ -1,6 +1,7 @@
 # Biomodals App Development
 
-Detailed app-development instructions for `src/biomodals/app/**/*_app.py` live in the repo-local skill:
+Detailed app-development instructions for apps under `src/biomodals/app/` live
+in the repo-local skill:
 
 - `.agents/skills/biomodals-app-development/SKILL.md`
 

@@ -1,14 +1,15 @@
 # Multi-Module Apps
 
-Keep `*_app.py` as the discoverable composition root. Split when stages, caches,
-or backends hide the Modal topology; keep short linear apps together.
+Use `<tool>/app.py` as the discoverable composition root when stages, caches,
+or backends would obscure the Modal topology in one file. Keep short linear apps
+in `<tool>_app.py`.
 
 ## Recommended shape
 
 ```text
-src/biomodals/app/score/tool_app.py       # AppConfig, images, decorators, CLI
 src/biomodals/app/score/tool/
 ├── __init__.py
+├── app.py                                # AppConfig, images, decorators, CLI
 ├── contracts.py                         # frozen plans and manifests
 ├── cache.py                             # identities and publication policy
 ├── backend_a.py                         # pure planning/parsing/reduction
@@ -44,7 +45,7 @@ image = patch_image_for_helper(base_image).add_local_python_source(
 Use `copy=True` only for build-time imports. A local import does not prove remote
 image inclusion.
 
-Prefer decorators in `_app.py`. Otherwise include, import, and re-export sibling
+Prefer decorators in `app.py`. Otherwise include, import, and re-export sibling
 functions there; give Modal functions/classes unique names across included apps.
 
 When the composition root uses a newer Python than a task image, keep the task

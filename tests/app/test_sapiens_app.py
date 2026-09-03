@@ -7,19 +7,21 @@ from __future__ import annotations
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID
 
 import pandas as pd
 import polars as pl
 import pytest
 
-from biomodals.app.design import sapiens_app
-from biomodals.app.design.sapiens_execution import (
+from biomodals.app.design.sapiens import app as sapiens_app
+from biomodals.app.design.sapiens.execution import (
     HUMANIZE_NODE,
     SapiensExecutionRequest,
     _SapiensHumanizeNode,
 )
 from biomodals.execution import RunStatus
+from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -81,7 +83,7 @@ def test_execution_request_roundtrips_and_plans_one_cpu_node() -> None:
 
     assert SapiensExecutionRequest.from_bytes(request.to_bytes()) == request
     assert request.execution_plan.nodes[0].node_key == HUMANIZE_NODE
-    call = _SapiensHumanizeNode(request).prepare_remote(None)  # type: ignore[arg-type]
+    call = _SapiensHumanizeNode(request).prepare_remote(cast(NodeRunContext, None))
     assert call.function_name == "sapiens_humanize"
     assert call.uses_gpu is False
     assert call.kwargs["csv_bytes"] == VALID_CSV

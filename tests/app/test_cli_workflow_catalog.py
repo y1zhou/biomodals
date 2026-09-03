@@ -77,6 +77,15 @@ def test_app_list_command_is_namespaced() -> None:
     assert "rosetta" in result.output
 
 
+def test_app_list_shows_package_app_category() -> None:
+    result = runner.invoke(app, ["app", "list"])
+
+    assert result.exit_code == 0
+    assert any(
+        "sapiens" in line and "design" in line for line in result.output.splitlines()
+    )
+
+
 @pytest.mark.parametrize(
     ("command", "public_flag"),
     [

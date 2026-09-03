@@ -18,6 +18,54 @@ def test_default_catalog_collects_apps() -> None:
     assert apps["ppiflow"].name == "ppiflow_app.py"
 
 
+def test_app_catalog_discovers_single_file_and_package_layouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    category = tmp_path / "design"
+    package = category / "package"
+    package.mkdir(parents=True)
+    single_file = category / "single_app.py"
+    package_app = package / "app.py"
+    single_file.write_text('"""Single-file app."""\n')
+    package_app.write_text('"""Package app."""\n')
+    monkeypatch.setattr(catalog, "APP_HOME", tmp_path)
+
+    apps = get_catalog("app", use_absolute_paths=True)
+
+    assert apps == {
+        "package": package_app.resolve(),
+        "single": single_file.resolve(),
+    }
+
+
+def test_app_catalog_rejects_duplicate_names_across_layouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    category = tmp_path / "design"
+    package = category / "duplicate"
+    package.mkdir(parents=True)
+    (category / "duplicate_app.py").write_text('"""Single-file app."""\n')
+    (package / "app.py").write_text('"""Package app."""\n')
+    monkeypatch.setattr(catalog, "APP_HOME", tmp_path)
+
+    with pytest.raises(ValueError, match="Duplicate app name 'duplicate'"):
+        get_catalog("app", use_absolute_paths=True)
+
+
+def test_package_app_has_stable_catalog_metadata() -> None:
+    apps = get_catalog("app", use_absolute_paths=True)
+
+    assert apps["sapiens"].as_posix().endswith("/design/sapiens/app.py")
+    sapiens = BiomodalsApp("sapiens", all_apps=apps)
+    explicit = BiomodalsApp(str(apps["sapiens"]), all_apps=apps)
+
+    assert sapiens.name == explicit.name == "sapiens"
+    assert sapiens.category == explicit.category == "design"
+    assert sapiens.module == explicit.module == "biomodals.app.design.sapiens.app"
+
+
 def test_workflow_catalog_discovers_natural_workflow_names() -> None:
     workflows = get_catalog("workflow", use_absolute_paths=True)
 

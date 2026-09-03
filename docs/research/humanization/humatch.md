@@ -347,6 +347,37 @@ batching multiple pairs in one warm container is the more plausible first
 experiment. The initial implementation deliberately remains sequential until
 that optimization is requested.
 
+### Four-task concurrency probe
+
+A follow-up probe ran four copies of the same non-human pair in one warm
+container. The sequential baseline retained upstream's 16 encoding workers per
+pair. The concurrent phase used four Python threads sharing one model set and
+reduced each pair to four upstream encoding workers, keeping the nominal nested
+worker budget at 16. This was a temporary benchmark, not a production app
+change.
+
+| Measurement | Four sequential tasks | Four concurrent tasks |
+| --- | ---: | ---: |
+| Wall time | 133.65 s | 76.24 s |
+| Throughput | 1.80 pairs/min | 3.15 pairs/min |
+| Mean CPU cores | 2.79 | 2.97 |
+| Aggregate memory at completion | 2,359 MiB | 3,272 MiB |
+| Worker-process peak RSS | 2,932 MiB | 3,997 MiB |
+
+Concurrency produced a 1.75-fold throughput improvement, not the fourfold
+improvement expected from unconstrained parallel work. All four concurrent
+results exactly matched their sequential counterparts across final sequences,
+mutations, target families, and full-precision scores. This single probe found
+no shared-model correctness failure, but mixed-sequence and repeat tests remain
+necessary before declaring the upstream TensorFlow and multiprocessing path
+safe under threads.
+
+The measured improvement and modest memory increase justify considering four
+tasks per container. They do not yet justify Rosetta-style pull-worker
+complexity. Fixed four-task dispatch through the execution kernel is the
+smaller first implementation; add pull-worker work stealing only if mixed-pair
+benchmarks show material duration skew or straggler cost.
+
 ## Place in the antibody-humanization stack
 
 Sapiens and Humatch should produce alternative candidates from the same input,

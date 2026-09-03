@@ -378,6 +378,31 @@ complexity. Fixed four-task dispatch through the execution kernel is the
 smaller first implementation; add pull-worker work stealing only if mixed-pair
 benchmarks show material duration skew or straggler cost.
 
+### Six-task concurrency probe
+
+A second probe used six copies of the same pair. The sequential baseline again
+used 16 upstream encoding workers per pair. The concurrent phase shared one
+model set across six Python threads and used two encoding workers per pair, for
+12 nominal nested workers.
+
+| Measurement | Six sequential tasks | Six concurrent tasks |
+| --- | ---: | ---: |
+| Wall time | 179.73 s | 87.00 s |
+| Throughput | 2.00 pairs/min | 4.14 pairs/min |
+| Mean CPU cores | 2.84 | 2.87 |
+| Aggregate memory at completion | 2,605 MiB | 3,707 MiB |
+| Worker-process peak RSS | 3,223 MiB | 4,688 MiB |
+
+Six-way concurrency produced a 2.07-fold speedup with exact scientific
+agreement. Compared with four-way concurrency, it handled 50% more pairs in
+only 14% more wall time, improving throughput by 31% while adding about 691 MiB
+of peak worker RSS. Mean CPU use remained below three cores.
+
+This result favors a fixed batch size of six over four for the first fanout
+implementation. It remains a single-sequence probe; repeat and mixed-sequence
+validation should accompany the production change rather than adding
+pull-worker scheduling now.
+
 ## Place in the antibody-humanization stack
 
 Sapiens and Humatch should produce alternative candidates from the same input,

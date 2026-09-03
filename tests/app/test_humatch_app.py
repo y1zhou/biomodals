@@ -160,6 +160,14 @@ def test_execution_request_rejects_boolean_edit_limit() -> None:
         replace(_request(), max_edits=True)
 
 
+@pytest.mark.parametrize(
+    "run_name", ["../example", "/absolute/example", "a/b", "-example"]
+)
+def test_execution_request_rejects_unsafe_run_names(run_name: str) -> None:
+    with pytest.raises(ValueError, match="safe filename component"):
+        replace(_request(), run_name=run_name)
+
+
 def test_worker_calls_one_pair_directly_and_multiple_pairs_in_threads(
     monkeypatch,
 ) -> None:
@@ -178,9 +186,9 @@ def test_worker_calls_one_pair_directly_and_multiple_pairs_in_threads(
         def map(self, function, records):
             return [function(record) for record in records]
 
-    def fake_pair(record, **_kwargs):
+    def fake_pair(pair, **_kwargs):
         return {
-            "humanized": {"id": record["id"]},
+            "humanized": {"id": pair.identifier},
             "humanization_seconds": 1.0,
         }
 
@@ -190,8 +198,13 @@ def test_worker_calls_one_pair_directly_and_multiple_pairs_in_threads(
         "_load_upstream",
         lambda: {"canonical_numbering": ()},
     )
+    monkeypatch.setattr(
+        humatch_app,
+        "_align_chain",
+        lambda *, sequence, **_kwargs: sequence,
+    )
     monkeypatch.setattr(humatch_app, "_load_models", lambda _upstream: ((1, 2, 3), 0.5))
-    monkeypatch.setattr(humatch_app, "_humanize_pair_record", fake_pair)
+    monkeypatch.setattr(humatch_app, "_humanize_pair", fake_pair)
     monkeypatch.setattr(humatch_app, "_cgroup_cpu_seconds", lambda: None)
     monkeypatch.setattr(humatch_app, "_cgroup_peak_memory_mib", lambda: None)
     monkeypatch.setattr(humatch_app, "_cgroup_current_memory_mib", lambda: None)
@@ -211,6 +224,38 @@ def test_worker_calls_one_pair_directly_and_multiple_pairs_in_threads(
         f"pair-{index}" for index in range(6)
     ]
     assert executor_sizes == [6]
+
+
+def test_worker_aligns_all_pairs_before_loading_models(monkeypatch) -> None:
+    events: list[str] = []
+
+    def fake_align(*, identifier, chain_label, sequence, **_kwargs):
+        events.append(f"align:{identifier}:{chain_label}")
+        if identifier == "bad":
+            raise ValueError("bad chain")
+        return sequence
+
+    monkeypatch.setattr(
+        humatch_app,
+        "_load_upstream",
+        lambda: {"canonical_numbering": ()},
+    )
+    monkeypatch.setattr(humatch_app, "_align_chain", fake_align)
+    monkeypatch.setattr(
+        humatch_app,
+        "_load_models",
+        lambda _upstream: events.append("load_models"),
+    )
+
+    with pytest.raises(ValueError, match="bad chain"):
+        humatch_app._run_humatch_worker_batch(
+            pairs=[
+                {"id": "good", "vh": "AAAA", "vl": "CCCC"},
+                {"id": "bad", "vh": "AAAA", "vl": "CCCC"},
+            ]
+        )
+
+    assert events == ["align:good:vh", "align:good:vl", "align:bad:vh"]
 
 
 def test_execution_graph_batches_seven_pairs_as_six_plus_one(

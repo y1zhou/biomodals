@@ -103,6 +103,8 @@ class HumatchExecutionRequest:
             or not self.csv_bytes
         ):
             raise ValueError("Humatch run name and CSV input are required")
+        if sanitize_filename(self.run_name) != self.run_name:
+            raise ValueError("Humatch run name must be a safe filename component")
         if self.vh_target_family not in _VH_FAMILIES:
             raise ValueError("Unsupported Humatch VH target family")
         if self.vl_target_family not in _VL_FAMILIES:

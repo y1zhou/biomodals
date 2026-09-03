@@ -512,8 +512,8 @@ def _alignment_and_mutations(
 
 
 def _humanize_pair(
-    *,
     pair: _AlignedPair,
+    *,
     models: tuple[Any, Any, Any],
     upstream: dict[str, Any],
     vh_target_family: str,
@@ -768,24 +768,11 @@ def _validate_fixed_positions(
             )
 
 
-def _humanize_pair_record(
-    record: dict[str, str],
-    *,
-    models: tuple[Any, Any, Any],
-    upstream: dict[str, Any],
-    vh_target_family: str,
-    vl_target_family: str,
-    germline_likeness_target: float,
-    vh_classifier_target: float,
-    vl_classifier_target: float,
-    pair_classifier_target: float,
-    max_edits: int,
-    mutate_cdrs: bool,
-    fixed_vh_positions: tuple[str, ...],
-    fixed_vl_positions: tuple[str, ...],
-) -> dict[str, Any]:
-    """Align and humanize one complete pair using shared loaded models."""
-    pair = _AlignedPair(
+def _align_pair_record(
+    record: dict[str, str], *, upstream: dict[str, Any]
+) -> _AlignedPair:
+    """Validate and align one complete pair before inference starts."""
+    return _AlignedPair(
         identifier=record["id"],
         vh=_align_chain(
             identifier=record["id"],
@@ -799,22 +786,6 @@ def _humanize_pair_record(
             sequence=record["vl"],
             upstream=upstream,
         ),
-    )
-    return _humanize_pair(
-        pair=pair,
-        models=models,
-        upstream=upstream,
-        vh_target_family=vh_target_family,
-        vl_target_family=vl_target_family,
-        germline_likeness_target=germline_likeness_target,
-        vh_classifier_target=vh_classifier_target,
-        vl_classifier_target=vl_classifier_target,
-        pair_classifier_target=pair_classifier_target,
-        max_edits=max_edits,
-        mutate_cdrs=mutate_cdrs,
-        fixed_vh_positions=fixed_vh_positions,
-        fixed_vl_positions=fixed_vl_positions,
-        num_cpus=ENCODING_WORKERS_PER_PAIR,
     )
 
 
@@ -864,9 +835,13 @@ def _run_humatch_worker_batch(
     _validate_fixed_positions(
         upstream, normalized_vh_positions, normalized_vl_positions
     )
+    aligned_pairs = [
+        _align_pair_record(record, upstream=upstream)
+        for record in input_frame.to_dicts()
+    ]
     models, model_load_seconds = _load_models(upstream)
     worker = partial(
-        _humanize_pair_record,
+        _humanize_pair,
         models=models,
         upstream=upstream,
         vh_target_family=vh_target_family,
@@ -879,13 +854,13 @@ def _run_humatch_worker_batch(
         mutate_cdrs=mutate_cdrs,
         fixed_vh_positions=normalized_vh_positions,
         fixed_vl_positions=normalized_vl_positions,
+        num_cpus=ENCODING_WORKERS_PER_PAIR,
     )
-    records = input_frame.to_dicts()
-    if len(records) == 1:
-        pair_results = [worker(records[0])]
+    if len(aligned_pairs) == 1:
+        pair_results = [worker(aligned_pairs[0])]
     else:
-        with ThreadPoolExecutor(max_workers=len(records)) as executor:
-            pair_results = list(executor.map(worker, records))
+        with ThreadPoolExecutor(max_workers=len(aligned_pairs)) as executor:
+            pair_results = list(executor.map(worker, aligned_pairs))
     elapsed_seconds = time.perf_counter() - started_at
     cpu_finished_at = _cgroup_cpu_seconds()
     metrics = {

@@ -523,6 +523,41 @@ bundle, so collection starts no extra workload container. The worker decorator
 retains `cpu=(0.125, 16.125)` and `memory=(256, 16384)`. Batching and resource
 allocation remain operational and do not change scientific fingerprints.
 
+The production worker validates and aligns every pair before loading models or
+starting concurrent inference. Durable execution requests also require a
+canonical sanitized run name, preventing programmatic callers from introducing
+absolute or traversal paths into archive construction.
+
+### Mixed-sequence production validation
+
+A post-review validation used six different pairs from Humatch's upstream
+[`data/example.csv`](https://github.com/oxpig/Humatch/blob/master/data/example.csv):
+three human and three nonhuman examples spanning `kv2`, `kv3`, `lv1`, and `lv3`
+light-family selections. One six-thread worker was compared with six isolated
+one-pair workers using the production `humatch_humanize_batch` function.
+
+All final sequences, target families, edit counts, alignments, mutation traces,
+success flags, and other nonnumeric fields matched exactly. The comparison found
+249 floating-point score differences, with a maximum absolute difference of
+`3.13e-7`; this is below the declared `1e-6` acceptance tolerance for float32
+classifier inference and did not affect any discrete result. Three consecutive
+warm six-pair runs also matched each other exactly after excluding timing
+fields. Shared-model threaded inference is therefore accepted for this pinned
+runtime with a `1e-6` cross-container score tolerance.
+
+The diagnostic batch was `fc-01M1K4W1F4FTCSKSH5XE3VY8BP`; its one-pair oracle
+calls were `fc-01M1K4W1TKZGYG0WJ7WV24N3X3`,
+`fc-01M1K4W25FJMMTJPFQYDPWBNCG`,
+`fc-01M1K4W2G4JH1WRVRY8YP0FENT`,
+`fc-01M1K4W2VCBE0DD91EGXYHBA1F`,
+`fc-01M1K4W36HKMPCW3477PB7ZKMP`, and
+`fc-01M1K4W3JFH1XWE96GX0Q1WMWP` in Modal app
+`ap-zWDvN4egTehD72cmtp2Llv`. The mixed batch completed in 167.23 seconds,
+averaged 2.23 CPU cores, and reached 4,796 MiB peak worker RSS. The slowest
+isolated pair completed in 124.45 seconds, showing that heterogeneous runtime
+and intra-container contention reduce the throughput advantage measured with
+duplicated inputs, without changing the accepted scientific result.
+
 ## Place in the antibody-humanization stack
 
 Sapiens and Humatch should produce alternative candidates from the same input,

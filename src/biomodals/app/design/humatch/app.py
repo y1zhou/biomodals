@@ -893,7 +893,7 @@ def _run_humatch_humanization(
 
 
 @app.function(
-    cpu=(2.125, 16.125),
+    cpu=(0.125, 16.125),
     memory=(256, 16384),
     timeout=CONF.timeout,
     max_containers=1,

@@ -302,7 +302,7 @@ implementation. To report the post-germline scores, call the deterministic
 upstream germline helper separately, then pass the original parental pair to
 `humanise()` so its edit count remains correct. Accept at most 1,000 pairs and
 do not cache results. Initially run rows sequentially in one warm CPU container
-with `cpu=(2.125, 16.125)`, `memory=(256, 16384)`, and a 24-hour timeout.
+with `cpu=(0.125, 16.125)`, `memory=(256, 16384)`, and a 24-hour timeout.
 Benchmark one pair cold and warm, then pause before testing larger batches. Use
 pair-level fanout when CPU utilization is at least 70% of the limit for at
 least 70% of humanization; test in-container batching when utilization is at
@@ -436,10 +436,38 @@ roughly three-core mean.
 The first production fanout should therefore use fixed batches of six pairs,
 six threads per worker container, and two upstream encoding workers per pair.
 Eight-way concurrency adds latency and memory without improving throughput.
-Keep the 2.125-to-16.125 CPU range and 256 MiB-to-16 GiB memory range, and use
+Keep the 0.125-to-16.125 CPU range and 256 MiB-to-16 GiB memory range, and use
 the shared execution kernel for container fanout above six pairs. Validate the
 production path with mixed sequences and repeat runs before treating shared
 model inference as generally thread-safe.
+
+### Low-floor eight-and-sixteen-way probe
+
+A follow-up restored `cpu=(0.125, 16.125)` and launched two isolated Modal
+containers simultaneously. Each container loaded one shared set of three
+Keras models, then used a `ThreadPoolExecutor` with one thread per pair. The
+eight-way call set Humatch's `num_cpus` to two per pair; the sixteen-way call
+set it to one per pair. These are nominal encoding-worker budgets, not
+dedicated cores or pair-level subprocesses.
+
+The eight-way call (`fc-01M1JYCM340PXRHD7GJBMBRD8P`) completed in 114.80
+seconds at 4.18 pairs per minute, averaged 3.14 CPU cores, ended at 3,759 MiB
+of aggregate memory, and reached 6,395 MiB peak worker RSS. All eight outputs
+were exactly identical after normalizing IDs, including every floating-point
+score, and reproduced the validated `hv1`/`kv3`, 24-edit result.
+
+The sixteen-way call (`fc-01M1JYCMDKP6X6FRTFTH9571W8`) had not completed after
+more than nine minutes and was cancelled with container termination. It
+returned no trustworthy final resource measurements or scientific results.
+The stall is consistent with nested-runtime contention: each outer pair uses a
+Python thread, while every upstream Keras generator batch opens and closes a
+fresh `multiprocessing.Pool(num_cpus)` for Kidera encoding before invoking
+shared TensorFlow models.
+
+The low-floor eight-way result improved throughput by only 1.0% over the
+earlier low-floor six-way result (4.18 versus 4.14 pairs per minute), while
+adding 27.8 seconds of batch latency and about 1.67 GiB of peak worker RSS.
+Fixed batches of six therefore remain the preferred production shape.
 
 ## Place in the antibody-humanization stack
 

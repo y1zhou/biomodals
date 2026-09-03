@@ -50,9 +50,16 @@ must not silently serve as fallback for the A10G app identity.
 ## Runtime decision
 
 Use A10G for the workflow worker with `cpu=(0.125, 8.125)` and
-`memory=(1024, 32768)`. Keep device selection fixed in the workload's runtime
-identity. Do not use L40S unless later evidence shows a material improvement,
+`memory=(1024, 32768)`. Keep device selection fixed in the provider binding and
+record it as operational telemetry, while excluding it from the scientific
+fingerprint. Do not use L40S unless later evidence shows a material improvement,
 and do not use CPU as an equivalent execution path.
+
+The measured one-pair runtime is too long for serial batch execution. The
+production app therefore creates one deterministic execution-kernel Task per
+pair, uses a configurable run-wide GPU-call ceiling with a default of eight,
+and performs ordered aggregation on the coordinator. Benchmark-only phase,
+cgroup, and GPU utilization instrumentation is excluded from production code.
 
 The baseline image pinned Lightning 2.5.0 while the checkpoint reported that
 it was produced by Lightning 2.5.5, generating a warning for every model load.

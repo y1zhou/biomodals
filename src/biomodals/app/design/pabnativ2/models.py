@@ -34,6 +34,8 @@ class PAbNatiV2Identity:
     lightning_version: str = "2.5.5"
     matplotlib_version: str = "3.9.2"
     seaborn_version: str = "0.13.2"
+    pdbfixer_version: str = "1.12.0"
+    freesasa_version: str = "2.2.1"
     protein_topmodel_version: str = "1.0.1"
     anarci_version: str = "2020.04.23"
     hmmer_version: str = "3.4"
@@ -54,6 +56,15 @@ class DownloadSpec:
 
 
 IDENTITY = PAbNatiV2Identity()
+ABNATIV_WHEEL_SHA256 = (
+    "1345b2d27d5f5edd13d80e1944f11bee8c53aef4030f190d9fc4ee5de3b743b1"
+)
+ABNATIV_WHEEL_URL = (
+    "https://files.pythonhosted.org/packages/ff/41/"
+    "6d9941a360eaba2bcc3e806308fd388f30cee5373c85b29322a0556b515c/"
+    f"abnativ-{IDENTITY.abnativ_version}-py3-none-any.whl"
+    f"#sha256={ABNATIV_WHEEL_SHA256}"
+)
 PAIRED_MODEL = DownloadSpec(
     filename=PAIRED_CHECKPOINT,
     url=("https://zenodo.org/record/17295347/files/vpaired2_model.ckpt?download=1"),
@@ -69,6 +80,7 @@ STRUCTURE_MODEL_ARCHIVE = DownloadSpec(
 
 RUNTIME_IDENTITY = "|".join((
     f"abnativ={IDENTITY.abnativ_version}@{IDENTITY.abnativ_commit}",
+    f"abnativ-wheel-sha256={ABNATIV_WHEEL_SHA256}",
     f"abodybuilder3={IDENTITY.abodybuilder3_commit}",
     f"torch={IDENTITY.torch_version}",
     f"torch-cuda={IDENTITY.torch_cuda_version}",
@@ -76,8 +88,12 @@ RUNTIME_IDENTITY = "|".join((
     f"pandas={IDENTITY.pandas_version}",
     f"scipy={IDENTITY.scipy_version}",
     f"biopython={IDENTITY.biopython_version}",
+    f"pdbfixer={IDENTITY.pdbfixer_version}",
+    f"freesasa={IDENTITY.freesasa_version}",
     f"pytorch-lightning={IDENTITY.pytorch_lightning_version}",
     f"lightning={IDENTITY.lightning_version}",
+    f"matplotlib={IDENTITY.matplotlib_version}",
+    f"seaborn={IDENTITY.seaborn_version}",
     f"protein-topmodel={IDENTITY.protein_topmodel_version}",
     f"anarci={IDENTITY.anarci_version}",
     f"hmmer={IDENTITY.hmmer_version}",

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import orjson
@@ -17,25 +18,50 @@ from biomodals.execution import (
     ExecutionOverview,
     ExecutionPlan,
     ExecutionPlanMetadata,
+    NodeDependency,
     NodePlan,
-    ProviderCallStatus,
+    RunStatus,
 )
 from biomodals.execution.modal import (
     ExecutionDefinitionCoordinatorLifecycle,
     ExecutionRequestFile,
-    load_execution_provider_result,
 )
-from biomodals.execution.nodes import NodeRunContext, ProviderCallSpec, ProviderNode
-from biomodals.schema import AppRunResult
+from biomodals.execution.nodes import (
+    CoordinatorNode,
+    NodeRunContext,
+    ProviderCallSpec,
+    TaskDefinition,
+    TaskProviderNode,
+)
+from biomodals.helper.artifacts import read_volume_file_exact, replace_bytes_atomic
+from biomodals.helper.shell import sanitize_filename
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    ExecutionArtifact,
+    InlineBytes,
+    VolumePath,
+)
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
-REQUEST_SCHEMA_VERSION = 1
+REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RESULT_BYTES = 512 * 1024 * 1024
+MAX_PAIR_RESULT_BYTES = 4 * 1024 * 1024
+MAX_RESULT_DESCRIPTOR_BYTES = 64 * 1024
 HUMANIZE_NODE = "humanize"
+COLLECT_NODE = "collect"
 _REQUEST_FILE = ExecutionRequestFile(
     "request.json",
     MAX_REQUEST_BYTES,
     "p-AbNatiV2 execution request",
+)
+_RESULT_FILE = ExecutionRequestFile(
+    "result.json",
+    MAX_RESULT_DESCRIPTOR_BYTES,
+    "p-AbNatiV2 result descriptor",
 )
 
 
@@ -58,12 +84,17 @@ class PAbNatiV2ExecutionRequest:
     structure_archive_md5: str
     runtime_identity: str
     max_active_provider_calls: int = 1
-    max_active_gpu_provider_calls: int = 0
+    max_active_gpu_provider_calls: int = 1
 
     def __post_init__(self) -> None:
         """Reject malformed staged requests before provider dispatch."""
         if not isinstance(self.run_name, str) or not self.run_name:
             raise ValueError("p-AbNatiV2 run name is required")
+        if (
+            sanitize_filename(self.run_name) != self.run_name
+            or len(self.run_name.encode("utf-8")) > 200
+        ):
+            raise ValueError("p-AbNatiV2 run name must be a safe short filename")
         if not isinstance(self.csv_bytes, bytes) or not self.csv_bytes:
             raise ValueError("p-AbNatiV2 CSV input is required")
         if type(self.mutate_cdrs) is not bool:
@@ -104,10 +135,11 @@ class PAbNatiV2ExecutionRequest:
         if (
             type(self.max_active_provider_calls) is not int
             or type(self.max_active_gpu_provider_calls) is not int
-            or self.max_active_provider_calls != 1
-            or self.max_active_gpu_provider_calls != 0
+            or self.max_active_provider_calls < 1
+            or self.max_active_gpu_provider_calls < 1
+            or self.max_active_gpu_provider_calls > self.max_active_provider_calls
         ):
-            raise ValueError("p-AbNatiV2 currently uses one CPU provider call")
+            raise ValueError("p-AbNatiV2 requires positive GPU provider-call capacity")
 
     @property
     def execution_plan(self) -> ExecutionPlan:
@@ -115,7 +147,13 @@ class PAbNatiV2ExecutionRequest:
         return ExecutionPlan(
             workload_name="pabnativ2",
             workload_run_key=self.run_name,
-            nodes=(NodePlan(HUMANIZE_NODE),),
+            nodes=(
+                NodePlan(HUMANIZE_NODE),
+                NodePlan(
+                    COLLECT_NODE,
+                    dependencies=(NodeDependency(HUMANIZE_NODE),),
+                ),
+            ),
             scientific_payload={
                 "input_csv_sha256": sha256(self.csv_bytes).hexdigest(),
                 "mutate_cdrs": self.mutate_cdrs,
@@ -214,38 +252,214 @@ def load_execution_request(
     )
 
 
+def _pair_records(csv_bytes: bytes) -> tuple[dict[str, str], ...]:
+    from biomodals.app.design.pabnativ2.app import (
+        _validate_antibody_chains,
+        parse_pabnativ2_csv,
+    )
+
+    frame = parse_pabnativ2_csv(csv_bytes)
+    _validate_antibody_chains(frame)
+    return tuple(frame.iter_rows(named=True))
+
+
+def _worker_kwargs(request: PAbNatiV2ExecutionRequest) -> dict[str, Any]:
+    return {
+        name: getattr(request, name)
+        for name in (
+            "mutate_cdrs",
+            "fixed_vh_positions",
+            "fixed_vl_positions",
+            "residue_score_threshold",
+            "rasa_threshold",
+            "max_relative_pairing_score_decrease",
+            "forbidden_residues",
+            "seed",
+        )
+    }
+
+
 @dataclass
-class _PAbNatiV2HumanizeNode(ProviderNode):
+class _PAbNatiV2HumanizeNode(TaskProviderNode):
     request: PAbNatiV2ExecutionRequest
 
-    def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
-        """Send the validated payload to the initial CPU worker."""
+    def discover_remote_tasks(
+        self, context: NodeRunContext
+    ) -> tuple[TaskDefinition, ...]:
+        """Validate the complete batch and create one durable Task per pair."""
         del context
+        return tuple(
+            TaskDefinition(
+                task_key=record["id"],
+                scientific_payload={
+                    "id": record["id"],
+                    "vh_sha256": sha256(record["vh"].encode()).hexdigest(),
+                    "vl_sha256": sha256(record["vl"].encode()).hexdigest(),
+                },
+                execution_payload=record,
+            )
+            for record in _pair_records(self.request.csv_bytes)
+        )
+
+    def prepare_remote_task(
+        self,
+        context: NodeRunContext,
+        task: TaskDefinition,
+    ) -> ProviderCallSpec:
+        """Send one validated pair to one A10G worker."""
+        del context
+        payload = task.execution_payload
+        if not isinstance(payload, Mapping):
+            raise TypeError("p-AbNatiV2 pair execution payload must be an object")
+        pair = {name: payload.get(name) for name in ("id", "vh", "vl")}
+        if not all(isinstance(value, str) for value in pair.values()):
+            raise TypeError("p-AbNatiV2 pair execution payload is invalid")
+        typed_pair = cast(dict[str, str], pair)
+        if typed_pair["id"] != task.task_key:
+            raise ValueError("p-AbNatiV2 Task identity does not match its pair ID")
         return ProviderCallSpec(
-            function_name="pabnativ2_humanize",
+            function_name="pabnativ2_humanize_pair",
             uses_gpu=True,
-            runtime_image_key="pabnativ2-cpu",
-            kwargs={
-                "run_name": self.request.run_name,
-                "csv_bytes": self.request.csv_bytes,
-                "mutate_cdrs": self.request.mutate_cdrs,
-                "fixed_vh_positions": self.request.fixed_vh_positions,
-                "fixed_vl_positions": self.request.fixed_vl_positions,
-                "residue_score_threshold": self.request.residue_score_threshold,
-                "rasa_threshold": self.request.rasa_threshold,
-                "max_relative_pairing_score_decrease": (
-                    self.request.max_relative_pairing_score_decrease
-                ),
-                "forbidden_residues": self.request.forbidden_residues,
-                "seed": self.request.seed,
-            },
+            runtime_image_key="pabnativ2-a10g",
+            kwargs={"pair": typed_pair, **_worker_kwargs(self.request)},
+        )
+
+    def finalize_remote_tasks(
+        self,
+        context: NodeRunContext,
+        results: Mapping[str, AppRunResult],
+        errors: Mapping[str, str],
+    ) -> AppRunResult:
+        """Expose pair publications to the coordinator-local collector."""
+        del context
+        if errors:
+            return AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[f"{key}: {errors[key]}" for key in sorted(errors)],
+                metrics={"completed_pairs": len(results), "failed_pairs": len(errors)},
+            )
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            metrics={"completed_pairs": len(results), "failed_pairs": 0},
+        )
+
+
+def _result_path(execution_run_id: UUID, run_name: str) -> PurePosixPath:
+    return (
+        PurePosixPath("workflow-runs")
+        / str(execution_run_id)
+        / "pabnativ2"
+        / f"{run_name}_pabnativ2.tar.zst"
+    )
+
+
+def _read_pair_result(
+    context: NodeRunContext, artifact: ExecutionArtifact
+) -> Mapping[str, Any]:
+    content = context.resolve_artifact(artifact).read_bytes()
+    if not 0 < len(content) <= MAX_PAIR_RESULT_BYTES:
+        raise ValueError("p-AbNatiV2 pair publication has an invalid size")
+    value = orjson.loads(content)
+    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+        raise ValueError("p-AbNatiV2 pair publication schema is invalid")
+    pair_result = value.get("pair_result")
+    if not isinstance(pair_result, Mapping):
+        raise ValueError("p-AbNatiV2 pair publication is incomplete")
+    return pair_result
+
+
+@dataclass
+class _CollectPAbNatiV2ResultsNode(CoordinatorNode):
+    request: PAbNatiV2ExecutionRequest
+
+    def run(self, context: NodeRunContext) -> AppRunResult:
+        """Assemble ordered pair results without starting another container."""
+        if context.volume_root is None or context.artifact_volume_name is None:
+            raise RuntimeError("p-AbNatiV2 collection requires execution storage")
+        pair_results: dict[str, Mapping[str, Any]] = {}
+        for artifact in context.inputs.get("pair-results", []):
+            result = _read_pair_result(context, artifact)
+            humanized = result.get("humanized")
+            if not isinstance(humanized, Mapping) or not isinstance(
+                humanized.get("id"), str
+            ):
+                raise ValueError("p-AbNatiV2 pair publication has no pair ID")
+            pair_id = cast(str, humanized["id"])
+            if pair_id in pair_results:
+                raise ValueError(f"Duplicate p-AbNatiV2 pair publication: {pair_id}")
+            pair_results[pair_id] = result
+
+        records = _pair_records(self.request.csv_bytes)
+        ordered_ids = tuple(record["id"] for record in records)
+        if set(pair_results) != set(ordered_ids):
+            raise ValueError("p-AbNatiV2 pair publications do not match the input")
+        from biomodals.app.design.pabnativ2.app import _aggregate_pabnativ2_results
+
+        archive, metrics = _aggregate_pabnativ2_results(
+            run_name=self.request.run_name,
+            csv_bytes=self.request.csv_bytes,
+            pair_results=[pair_results[pair_id] for pair_id in ordered_ids],
+            parameters=_worker_kwargs(self.request),
+        )
+        relative_path = _result_path(context.execution_run_id, self.request.run_name)
+        output_path = context.volume_root.joinpath(*relative_path.parts)
+        replace_bytes_atomic(output_path, archive)
+        digest = sha256(archive).hexdigest()
+        result = AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name="pabnativ2_humanization",
+                    kind=ArtifactKind.ARCHIVE,
+                    storage=VolumePath(
+                        volume_name=context.artifact_volume_name,
+                        path=relative_path.as_posix(),
+                        media_type=ZSTD_MEDIA_TYPE,
+                    ),
+                    metadata={
+                        "archive_format": "tar.zst",
+                        "run_name": self.request.run_name,
+                        "pair_count": len(ordered_ids),
+                        "score_endpoints": ["input", "final"],
+                        "files": [
+                            {
+                                "path": relative_path.name,
+                                "size_bytes": len(archive),
+                                "content_sha256": digest,
+                            }
+                        ],
+                    },
+                )
+            ],
+            metrics=metrics,
+        )
+        _RESULT_FILE.persist(
+            context.volume_root,
+            context.execution_run_id,
+            result.model_dump_json().encode(),
+        )
+        return result
+
+    def recover_result_publication(
+        self, context: NodeRunContext
+    ) -> AppRunResult | None:
+        """Recover a same-Run archive published before coordinator interruption."""
+        if context.volume_root is None:
+            return None
+        path = context.volume_root.joinpath(
+            *_RESULT_FILE.path(context.execution_run_id).parts
+        )
+        if not path.is_file():
+            return None
+        return AppRunResult.model_validate_json(
+            _RESULT_FILE.load(context.volume_root, context.execution_run_id)
         )
 
 
 def pabnativ2_execution_graph(
     request: PAbNatiV2ExecutionRequest,
 ) -> ExecutionGraph:
-    """Build the one-node p-AbNatiV2 execution graph."""
+    """Build per-pair GPU fan-out followed by local archive collection."""
     graph = ExecutionGraph(
         "pabnativ2",
         plan_metadata=ExecutionPlanMetadata(
@@ -254,7 +468,17 @@ def pabnativ2_execution_graph(
             scientific_versions=dict(request.execution_plan.scientific_versions),
         ),
     )
-    graph.add_node(_PAbNatiV2HumanizeNode(request), id=HUMANIZE_NODE)
+    humanize = graph.add_node(
+        _PAbNatiV2HumanizeNode(request),
+        id=HUMANIZE_NODE,
+        reuse_predecessor_publication=False,
+    )
+    graph.add_node(
+        _CollectPAbNatiV2ResultsNode(request),
+        id=COLLECT_NODE,
+        inputs={"pair-results": humanize.outputs(kind=ArtifactKind.REPORT)},
+        reuse_predecessor_publication=False,
+    )
     return graph
 
 
@@ -312,17 +536,40 @@ def result_from_overview(
     overview: ExecutionOverview,
     output_volume: Any,
 ) -> AppRunResult:
-    """Load the validated result from a successful provider call."""
-    for call in overview.representative_provider_calls:
-        if (
-            call.node_key == HUMANIZE_NODE
-            and call.status == ProviderCallStatus.SUCCEEDED
-        ):
-            value = load_execution_provider_result(
-                output_volume,
-                execution_run_id=overview.run.execution_run_id,
-                envelope=call.result_envelope,
-                max_bytes=MAX_RESULT_BYTES,
+    """Load and content-verify the terminal p-AbNatiV2 archive."""
+    if overview.run.status != RunStatus.SUCCEEDED:
+        raise LookupError("p-AbNatiV2 humanization result is unavailable")
+    result = AppRunResult.model_validate_json(
+        _RESULT_FILE.load_from_volume(output_volume, overview.run.execution_run_id)
+    )
+    outputs: list[AppOutput] = []
+    for output in result.outputs:
+        if not isinstance(output.storage, VolumePath):
+            outputs.append(output)
+            continue
+        files = output.metadata.get("files")
+        if not isinstance(files, list) or len(files) != 1:
+            raise ValueError("p-AbNatiV2 archive manifest is invalid")
+        file = files[0]
+        if not isinstance(file, Mapping):
+            raise ValueError("p-AbNatiV2 archive manifest is invalid")
+        data = read_volume_file_exact(
+            output_volume,
+            output.storage.path,
+            size_bytes=file.get("size_bytes"),
+            content_sha256=file.get("content_sha256"),
+        )
+        if len(data) > MAX_RESULT_BYTES:
+            raise ValueError("p-AbNatiV2 result archive exceeds the byte limit")
+        outputs.append(
+            output.model_copy(
+                update={
+                    "storage": InlineBytes(
+                        data=data,
+                        filename=PurePosixPath(output.storage.path).name,
+                        media_type=output.storage.media_type,
+                    )
+                }
             )
-            return AppRunResult.model_validate(value)
-    raise LookupError("p-AbNatiV2 humanization result is unavailable")
+        )
+    return result.model_copy(update={"outputs": outputs})

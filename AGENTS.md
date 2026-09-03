@@ -11,6 +11,9 @@
   strings with `model_validate_json(...)`. Execution fingerprint encodings are
   the narrow exception: preserve their fixed standard-library JSON encoding
   because serialized bytes are part of durable identity.
+- Keep benchmark harnesses and benchmark-only instrumentation out of committed
+  production code unless explicitly requested. Benchmark methods and results
+  may be recorded in ADRs and research documents.
 - When you have made significant edits and are ready to make commits:
   - CI runs `prek` against `.pre-commit-config.yaml`; run `prek run --files <changed files>` before making commits.
   - For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` before making commits.

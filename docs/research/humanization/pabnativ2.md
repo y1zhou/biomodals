@@ -17,6 +17,10 @@ Decisions settled on 2026-09-03 for the first Biomodals implementation:
   `biomodals-store` Modal Volume instead of embedding them in the image;
 - benchmark one pair on CPU, A10, and L40S before selecting resources or a
   multi-pair dispatch topology;
+- after the benchmark selected A10G and showed a roughly 27-minute one-pair
+  runtime, fan out one deterministic execution-kernel Task per pair, admit at
+  most eight A10G calls by default, and aggregate ordered results on the
+  coordinator into a Volume-backed archive;
 - retain parental and final predicted PDBs plus scaffold/CDR displacement
   metrics, while omitting incidental upstream scratch outputs;
 - seed supported public APIs and record the seed, with hardware retained only
@@ -57,6 +61,10 @@ Decisions settled on 2026-09-03 for the first Biomodals implementation:
   and `cpu=8, memory=32768` for each GPU benchmark; and
 - install and call pinned `abnativ==2.0.8` directly without importing the
   existing Biomodals AbNatiV scoring app.
+
+Benchmark harnesses and resource profilers are not part of the production app.
+Only the resulting resource, topology, and reproducibility decisions are
+retained here and in the benchmark record.
 
 Implementation inspection found no duplicate light-CDR percentile append in
 the pinned `eb517f1f` scorer, so the app does not patch scoring logic. It only

@@ -4,21 +4,30 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
+from uuid import UUID
 
+import orjson
 import polars as pl
 import pytest
 
 from biomodals.app.design.pabnativ2 import app as pabnativ2_app
+from biomodals.app.design.pabnativ2 import execution as pabnativ2_execution
 from biomodals.app.design.pabnativ2 import patches as pabnativ2_patches
 from biomodals.app.design.pabnativ2.execution import (
+    _RESULT_FILE,
+    COLLECT_NODE,
     HUMANIZE_NODE,
     PAbNatiV2ExecutionRequest,
     _PAbNatiV2HumanizeNode,
+    pabnativ2_execution_graph,
+    result_from_overview,
 )
 from biomodals.app.design.pabnativ2.models import (
     IDENTITY,
@@ -26,8 +35,23 @@ from biomodals.app.design.pabnativ2.models import (
     STRUCTURE_MODEL_ARCHIVE,
 )
 from biomodals.app.design.pabnativ2.patches import _replace_once
+from biomodals.execution import DeploymentIdentity, GraphExecutionRunStore, RunStatus
+from biomodals.execution.definition_runtime import ExecutionGraphRuntime
+from biomodals.execution.modal import (
+    ExecutionVolumeSync,
+    ProviderCallObservation,
+    ProviderCallObservationKind,
+)
 from biomodals.execution.nodes import NodeRunContext
-from biomodals.schema import AppRunResult, AppRunStatus
+from biomodals.schema import (
+    AppOutput,
+    AppRunResult,
+    AppRunStatus,
+    ArtifactKind,
+    InlineBytes,
+    VolumePath,
+)
+from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 VALID_CSV = (
     b"id,vh,vl\n"
@@ -139,14 +163,23 @@ def test_pair_seed_is_order_independent_and_input_specific() -> None:
     assert first != pabnativ2_app._pair_seed(4, "other", "AAAA", "CCCC")
 
 
-def test_execution_request_roundtrips_and_plans_one_cpu_node() -> None:
+def test_execution_request_roundtrips_and_plans_per_pair_gpu_tasks(monkeypatch) -> None:
     request = _request()
+    records = tuple(pabnativ2_app.parse_pabnativ2_csv(VALID_CSV).to_dicts())
+    monkeypatch.setattr(pabnativ2_execution, "_pair_records", lambda _content: records)
 
     assert PAbNatiV2ExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert request.execution_plan.nodes[0].node_key == HUMANIZE_NODE
-    call = _PAbNatiV2HumanizeNode(request).prepare_remote(cast(NodeRunContext, None))
-    assert call.function_name == "pabnativ2_humanize"
+    assert [node.node_key for node in request.execution_plan.nodes] == [
+        HUMANIZE_NODE,
+        COLLECT_NODE,
+    ]
+    node = _PAbNatiV2HumanizeNode(request)
+    task = node.discover_remote_tasks(cast(NodeRunContext, None))[0]
+    call = node.prepare_remote_task(cast(NodeRunContext, None), task)
+    assert call.function_name == "pabnativ2_humanize_pair"
     assert call.uses_gpu is True
+    assert call.runtime_image_key == "pabnativ2-a10g"
+    assert call.kwargs["pair"]["id"] == "pair-1"
     assert call.kwargs["seed"] == 7
 
 
@@ -155,7 +188,7 @@ def test_execution_request_rejects_boolean_seed() -> None:
         replace(_request(), seed=True)
 
 
-def test_cpu_worker_returns_common_app_result(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gpu_worker_returns_common_app_result(monkeypatch: pytest.MonkeyPatch) -> None:
     expected = AppRunResult(status=AppRunStatus.SUCCEEDED)
     captured: dict[str, object] = {}
 
@@ -163,12 +196,238 @@ def test_cpu_worker_returns_common_app_result(monkeypatch: pytest.MonkeyPatch) -
         captured.update(kwargs)
         return expected
 
-    monkeypatch.setattr(pabnativ2_app, "_run_pabnativ2", fake_run)
+    monkeypatch.setattr(pabnativ2_app, "_run_pabnativ2_pair", fake_run)
 
-    result = pabnativ2_app.pabnativ2_humanize.get_raw_f()("-unsafe/name", VALID_CSV)
+    pair = {"id": "pair", "vh": "AAAA", "vl": "CCCC"}
+    result = pabnativ2_app.pabnativ2_humanize_pair.get_raw_f()(pair)
 
     assert result is expected
-    assert captured["run_name"] == "unsafe_name"
+    assert captured["pair"] == pair
+
+
+def test_execution_request_requires_gpu_capacity_and_safe_run_name() -> None:
+    request = replace(
+        _request(), max_active_provider_calls=4, max_active_gpu_provider_calls=3
+    )
+
+    assert request.max_active_gpu_provider_calls == 3
+    with pytest.raises(ValueError, match="positive GPU"):
+        replace(request, max_active_gpu_provider_calls=0)
+    with pytest.raises(ValueError, match="safe short filename"):
+        replace(request, run_name="x" * 201)
+
+
+def test_entrypoint_accepts_cli_provider_limits() -> None:
+    entrypoint = pabnativ2_app.submit_pabnativ2_task.info.raw_f
+    assert entrypoint is not None
+    parameters = inspect.signature(entrypoint).parameters
+
+    assert "max_containers" in parameters
+    assert "max_gpu_containers" in parameters
+
+
+def test_execution_graph_fans_out_pairs_and_admits_gpu_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = (
+        {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
+        {"id": "pair-2", "vh": "DDDD", "vl": "EEEE"},
+    )
+    monkeypatch.setattr(pabnativ2_execution, "_pair_records", lambda _content: records)
+    request = replace(
+        _request(),
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
+    )
+
+    class Driver:
+        def __init__(self) -> None:
+            self.pairs: list[str] = []
+            self.results: dict[str, object] = {}
+
+        def resolve(self, binding):
+            return binding.function_name
+
+        def spawn(self, operation, *, args, kwargs):
+            del operation, args
+            pair_id = kwargs["pair"]["id"]
+            self.pairs.append(pair_id)
+            call_id = f"call-{pair_id}"
+            content = orjson.dumps({
+                "schema_version": 1,
+                "pair_result": {"humanized": {"id": pair_id}},
+            })
+            self.results[call_id] = AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    AppOutput(
+                        name="pabnativ2_pair_result",
+                        kind=ArtifactKind.REPORT,
+                        storage=InlineBytes(
+                            data=content,
+                            filename="pabnativ2-pair.json",
+                            media_type="application/json",
+                        ),
+                    )
+                ],
+            )
+            return call_id
+
+        def observe(self, provider_call_handle_id):
+            return ProviderCallObservation(
+                ProviderCallObservationKind.SUCCEEDED,
+                result=self.results[provider_call_handle_id],
+            )
+
+        def cancel(self, provider_call_handle_id):
+            del provider_call_handle_id
+
+    class Volume:
+        def commit(self) -> None:
+            pass
+
+        def reload(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        pabnativ2_app,
+        "_aggregate_pabnativ2_results",
+        lambda **_kwargs: (b"archive", {"pair_count": 2}),
+    )
+    run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    driver = Driver()
+    store = GraphExecutionRunStore(tmp_path, run_id)
+    runtime = ExecutionGraphRuntime(
+        graph=pabnativ2_execution_graph(request),
+        execution_run_id=run_id,
+        deployment=DeploymentIdentity("main", "p-AbNatiV2", 1),
+        volume_root=tmp_path,
+        artifact_volume_name="p-AbNatiV2-outputs",
+        provider_driver=driver,
+        storage_sync=ExecutionVolumeSync(volume=Volume(), store=store),
+        max_active_provider_calls=2,
+        max_active_gpu_provider_calls=2,
+        store=store,
+        now=iter(range(100, 1000)).__next__,
+        poll_interval_seconds=0,
+    )
+
+    result = runtime.run(workload_run_key="example")
+
+    assert driver.pairs == ["pair-1", "pair-2"]
+    assert result.status == AppRunStatus.SUCCEEDED
+    publication = store.artifacts.load_node_result(COLLECT_NODE)
+    assert publication is not None
+    assert publication.metrics["pair_count"] == 2
+    runtime.close()
+
+
+def test_result_loader_returns_content_verified_inline_archive() -> None:
+    run_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    archive = b"archive"
+    archive_path = f"workflow-runs/{run_id}/pabnativ2/demo_pabnativ2.tar.zst"
+    publication = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="pabnativ2_humanization",
+                kind=ArtifactKind.ARCHIVE,
+                storage=VolumePath(
+                    volume_name="p-AbNatiV2-outputs",
+                    path=archive_path,
+                    media_type=ZSTD_MEDIA_TYPE,
+                ),
+                metadata={
+                    "files": [
+                        {
+                            "path": "demo_pabnativ2.tar.zst",
+                            "size_bytes": len(archive),
+                            "content_sha256": sha256(archive).hexdigest(),
+                        }
+                    ]
+                },
+            )
+        ],
+    )
+    files = {
+        _RESULT_FILE.path(run_id).as_posix(): publication.model_dump_json().encode(),
+        archive_path: archive,
+    }
+
+    class Volume:
+        def read_file(self, path: str):
+            yield files[path]
+
+    overview = SimpleNamespace(
+        run=SimpleNamespace(status=RunStatus.SUCCEEDED, execution_run_id=run_id)
+    )
+
+    result = result_from_overview(cast(Any, overview), Volume())
+
+    assert result.outputs[0].storage == InlineBytes(
+        data=archive,
+        filename="demo_pabnativ2.tar.zst",
+        media_type=ZSTD_MEDIA_TYPE,
+    )
+
+
+def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_package(root: Path, *, num_threads: int) -> bytes:
+        assert num_threads == 2
+        captured.update(orjson.loads((root / "manifest.json").read_bytes()))
+        assert (root / "structures/0001_pair-1/input.pdb").read_bytes() == b"input"
+        return b"archive"
+
+    monkeypatch.setattr(pabnativ2_app, "package_outputs", fake_package)
+    parameters = pabnativ2_app._validate_parameters(
+        mutate_cdrs=False,
+        fixed_vh_positions="",
+        fixed_vl_positions="",
+        residue_score_threshold=0.98,
+        rasa_threshold=0.15,
+        max_relative_pairing_score_decrease=0.1,
+        forbidden_residues="C,M",
+        seed=0,
+    )
+    result = {
+        "humanized": {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
+        "sequence_scores": [
+            {"id": "pair-1", "endpoint": endpoint} for endpoint in ("input", "final")
+        ],
+        "residue_scores": [
+            {
+                "id": "pair-1",
+                "endpoint": "input",
+                "chain": "vh",
+                "aho_position": 1,
+                "observed_aa": "A",
+                "observed_residue_score": 0.9,
+            }
+        ],
+        "mutations": [],
+        "input_pdb": "aW5wdXQ=",
+        "final_pdb": "ZmluYWw=",
+        "pair_seed": 1,
+        "device": "NVIDIA A10G",
+    }
+
+    archive = pabnativ2_app._write_bundle(
+        run_name="demo",
+        input_frame=pl.DataFrame([{"id": "pair-1", "vh": "AAAA", "vl": "CCCC"}]),
+        pair_results=[result],
+        parameters=parameters,
+        asset_manifest={"schema_version": 1},
+    )
+
+    assert archive == b"archive"
+    assert captured["protocol"]["equivalence_target"] == "AbNatiV 2.0.8 source"
+    assert captured["protocol"]["paper_rasa_structure_count"] == 10
+    assert captured["protocol"]["pairing_score_units"] == "fraction"
+    assert captured["telemetry"]["accelerators"] == ["NVIDIA A10G"]
+    assert captured["warnings"]
+    assert "wrapper-protocol=2" in captured["scientific_identity"]["runtime"]
 
 
 def test_compatibility_patches_are_guarded_and_idempotent(

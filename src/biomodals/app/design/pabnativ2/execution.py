@@ -5,6 +5,7 @@ from __future__ import annotations
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -50,6 +51,7 @@ REQUEST_SCHEMA_VERSION = 2
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RESULT_BYTES = 512 * 1024 * 1024
 MAX_PAIR_RESULT_BYTES = 4 * 1024 * 1024
+PAIRS_PER_GPU_CALL = 4
 MAX_RESULT_DESCRIPTOR_BYTES = 64 * 1024
 HUMANIZE_NODE = "humanize"
 COLLECT_NODE = "collect"
@@ -283,6 +285,24 @@ def _worker_kwargs(request: PAbNatiV2ExecutionRequest) -> dict[str, Any]:
 class _PAbNatiV2HumanizeNode(TaskProviderNode):
     request: PAbNatiV2ExecutionRequest
 
+    @cached_property
+    def records(self) -> tuple[dict[str, str], ...]:
+        """Validate the batch once and retain its stable input order."""
+        return _pair_records(self.request.csv_bytes)
+
+    @staticmethod
+    def _pair(task: TaskDefinition) -> dict[str, str]:
+        payload = task.execution_payload
+        if not isinstance(payload, Mapping):
+            raise TypeError("p-AbNatiV2 pair execution payload must be an object")
+        pair = {name: payload.get(name) for name in ("id", "vh", "vl")}
+        if not all(isinstance(value, str) for value in pair.values()):
+            raise TypeError("p-AbNatiV2 pair execution payload is invalid")
+        typed_pair = cast(dict[str, str], pair)
+        if typed_pair["id"] != task.task_key:
+            raise ValueError("p-AbNatiV2 Task identity does not match its pair ID")
+        return typed_pair
+
     def discover_remote_tasks(
         self, context: NodeRunContext
     ) -> tuple[TaskDefinition, ...]:
@@ -298,7 +318,7 @@ class _PAbNatiV2HumanizeNode(TaskProviderNode):
                 },
                 execution_payload=record,
             )
-            for record in _pair_records(self.request.csv_bytes)
+            for record in self.records
         )
 
     def prepare_remote_task(
@@ -306,23 +326,65 @@ class _PAbNatiV2HumanizeNode(TaskProviderNode):
         context: NodeRunContext,
         task: TaskDefinition,
     ) -> ProviderCallSpec:
-        """Send one validated pair to one A10G worker."""
+        """Preserve the direct worker for a one-pair input."""
         del context
-        payload = task.execution_payload
-        if not isinstance(payload, Mapping):
-            raise TypeError("p-AbNatiV2 pair execution payload must be an object")
-        pair = {name: payload.get(name) for name in ("id", "vh", "vl")}
-        if not all(isinstance(value, str) for value in pair.values()):
-            raise TypeError("p-AbNatiV2 pair execution payload is invalid")
-        typed_pair = cast(dict[str, str], pair)
-        if typed_pair["id"] != task.task_key:
-            raise ValueError("p-AbNatiV2 Task identity does not match its pair ID")
+        pair = self._pair(task)
+        if len(self.records) > 1:
+            return ProviderCallSpec(
+                function_name="pabnativ2_humanize_batch",
+                uses_gpu=True,
+                runtime_image_key="pabnativ2-a10g-batch",
+                compatibility_key="pabnativ2-four-pair-batch",
+                max_tasks_per_call=PAIRS_PER_GPU_CALL,
+                kwargs={"pairs": [pair], **_worker_kwargs(self.request)},
+            )
         return ProviderCallSpec(
             function_name="pabnativ2_humanize_pair",
             uses_gpu=True,
             runtime_image_key="pabnativ2-a10g",
-            kwargs={"pair": typed_pair, **_worker_kwargs(self.request)},
+            kwargs={"pair": pair, **_worker_kwargs(self.request)},
         )
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
+        """Send up to four ordered pairs to one multiprocessing worker."""
+        if len(self.records) == 1:
+            if len(tasks) != 1:
+                raise ValueError("Single-pair p-AbNatiV2 input cannot be batched")
+            return self.prepare_remote_task(context, tasks[0])
+        del context
+        if not 1 <= len(tasks) <= PAIRS_PER_GPU_CALL:
+            raise ValueError("p-AbNatiV2 GPU batches must contain one to four pairs")
+        return ProviderCallSpec(
+            function_name="pabnativ2_humanize_batch",
+            uses_gpu=True,
+            runtime_image_key="pabnativ2-a10g-batch",
+            compatibility_key="pabnativ2-four-pair-batch",
+            max_tasks_per_call=PAIRS_PER_GPU_CALL,
+            kwargs={
+                "pairs": [self._pair(task) for task in tasks],
+                **_worker_kwargs(self.request),
+            },
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        """Restore one independently publishable result per pair Task."""
+        if len(self.records) == 1:
+            return super().process_remote_task_batch_result(task_keys, result, metadata)
+        if not isinstance(result, Mapping) or set(result) != set(task_keys):
+            raise ValueError("p-AbNatiV2 batch result does not match its pair Tasks")
+        return {
+            task_key: AppRunResult.model_validate(result[task_key])
+            for task_key in task_keys
+        }
 
     def finalize_remote_tasks(
         self,
@@ -459,7 +521,7 @@ class _CollectPAbNatiV2ResultsNode(CoordinatorNode):
 def pabnativ2_execution_graph(
     request: PAbNatiV2ExecutionRequest,
 ) -> ExecutionGraph:
-    """Build per-pair GPU fan-out followed by local archive collection."""
+    """Build fixed GPU batches of durable pairs followed by local collection."""
     graph = ExecutionGraph(
         "pabnativ2",
         plan_metadata=ExecutionPlanMetadata(

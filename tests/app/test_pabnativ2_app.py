@@ -183,6 +183,24 @@ def test_execution_request_roundtrips_and_plans_per_pair_gpu_tasks(monkeypatch) 
     assert call.kwargs["seed"] == 7
 
 
+def test_multi_pair_tasks_prepare_one_fixed_batch(monkeypatch) -> None:
+    records = (
+        {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
+        {"id": "pair-2", "vh": "DDDD", "vl": "EEEE"},
+    )
+    monkeypatch.setattr(pabnativ2_execution, "_pair_records", lambda _content: records)
+    node = _PAbNatiV2HumanizeNode(_request())
+    tasks = node.discover_remote_tasks(cast(NodeRunContext, None))
+
+    descriptor = node.prepare_remote_task(cast(NodeRunContext, None), tasks[0])
+    call = node.prepare_remote_task_batch(cast(NodeRunContext, None), tasks)
+
+    assert descriptor.function_name == "pabnativ2_humanize_batch"
+    assert descriptor.max_tasks_per_call == 4
+    assert call.function_name == "pabnativ2_humanize_batch"
+    assert [pair["id"] for pair in call.kwargs["pairs"]] == ["pair-1", "pair-2"]
+
+
 def test_execution_request_rejects_boolean_seed() -> None:
     with pytest.raises(ValueError, match="seed"):
         replace(_request(), seed=True)
@@ -203,6 +221,63 @@ def test_gpu_worker_returns_common_app_result(monkeypatch: pytest.MonkeyPatch) -
 
     assert result is expected
     assert captured["pair"] == pair
+
+
+def test_gpu_batch_worker_returns_pair_result_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {"pair": AppRunResult(status=AppRunStatus.SUCCEEDED)}
+    captured: dict[str, object] = {}
+
+    def fake_run(**kwargs: object) -> dict[str, AppRunResult]:
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(pabnativ2_app, "_run_pabnativ2_batch", fake_run)
+    pairs = [{"id": "pair", "vh": "AAAA", "vl": "CCCC"}]
+
+    result = pabnativ2_app.pabnativ2_humanize_batch.get_raw_f()(pairs)
+
+    assert result == {
+        pair_id: pair_result.model_dump(mode="json")
+        for pair_id, pair_result in expected.items()
+    }
+    assert captured["pairs"] == pairs
+
+
+def test_batch_runner_spawns_one_process_per_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pairs = [
+        {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
+        {"id": "pair-2", "vh": "DDDD", "vl": "EEEE"},
+    ]
+    expected = AppRunResult(status=AppRunStatus.SUCCEEDED).model_dump_json()
+    captured: dict[str, object] = {}
+
+    class FakeExecutor:
+        def __init__(self, *, max_workers: int, mp_context: Any) -> None:
+            captured["max_workers"] = max_workers
+            captured["start_method"] = mp_context.get_start_method()
+
+        def __enter__(self) -> FakeExecutor:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def map(self, _function: object, payloads: Any) -> tuple[str, str]:
+            captured["payloads"] = tuple(payloads)
+            return (expected, expected)
+
+    monkeypatch.setattr(pabnativ2_app, "_validate_antibody_chains", lambda _frame: None)
+    monkeypatch.setattr("concurrent.futures.ProcessPoolExecutor", FakeExecutor)
+
+    results = pabnativ2_app._run_pabnativ2_batch(pairs=pairs)
+
+    assert list(results) == ["pair-1", "pair-2"]
+    assert captured["max_workers"] == 2
+    assert captured["start_method"] == "spawn"
 
 
 def test_execution_request_requires_gpu_capacity_and_safe_run_name() -> None:
@@ -226,12 +301,11 @@ def test_entrypoint_accepts_cli_provider_limits() -> None:
     assert "max_gpu_containers" in parameters
 
 
-def test_execution_graph_fans_out_pairs_and_admits_gpu_calls(
+def test_execution_graph_batches_four_pairs_per_gpu_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    records = (
-        {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
-        {"id": "pair-2", "vh": "DDDD", "vl": "EEEE"},
+    records = tuple(
+        {"id": f"pair-{index}", "vh": "AAAA", "vl": "CCCC"} for index in range(1, 6)
     )
     monkeypatch.setattr(pabnativ2_execution, "_pair_records", lambda _content: records)
     request = replace(
@@ -242,7 +316,7 @@ def test_execution_graph_fans_out_pairs_and_admits_gpu_calls(
 
     class Driver:
         def __init__(self) -> None:
-            self.pairs: list[str] = []
+            self.batches: list[list[str]] = []
             self.results: dict[str, object] = {}
 
         def resolve(self, binding):
@@ -250,27 +324,31 @@ def test_execution_graph_fans_out_pairs_and_admits_gpu_calls(
 
         def spawn(self, operation, *, args, kwargs):
             del operation, args
-            pair_id = kwargs["pair"]["id"]
-            self.pairs.append(pair_id)
-            call_id = f"call-{pair_id}"
-            content = orjson.dumps({
-                "schema_version": 1,
-                "pair_result": {"humanized": {"id": pair_id}},
-            })
-            self.results[call_id] = AppRunResult(
-                status=AppRunStatus.SUCCEEDED,
-                outputs=[
-                    AppOutput(
-                        name="pabnativ2_pair_result",
-                        kind=ArtifactKind.REPORT,
-                        storage=InlineBytes(
-                            data=content,
-                            filename="pabnativ2-pair.json",
-                            media_type="application/json",
-                        ),
-                    )
-                ],
-            )
+            pairs = kwargs["pairs"]
+            pair_ids = [pair["id"] for pair in pairs]
+            self.batches.append(pair_ids)
+            call_id = f"call-{pair_ids[0]}"
+            self.results[call_id] = {
+                pair_id: AppRunResult(
+                    status=AppRunStatus.SUCCEEDED,
+                    outputs=[
+                        AppOutput(
+                            name="pabnativ2_pair_result",
+                            kind=ArtifactKind.REPORT,
+                            storage=InlineBytes(
+                                data=orjson.dumps({
+                                    "schema_version": 1,
+                                    "pair_result": {"humanized": {"id": pair_id}},
+                                }),
+                                filename="pabnativ2-pair.json",
+                                media_type="application/json",
+                            ),
+                        )
+                    ],
+                    metrics={"pair_count": 1},
+                ).model_dump(mode="json")
+                for pair_id in pair_ids
+            }
             return call_id
 
         def observe(self, provider_call_handle_id):
@@ -292,7 +370,7 @@ def test_execution_graph_fans_out_pairs_and_admits_gpu_calls(
     monkeypatch.setattr(
         pabnativ2_app,
         "_aggregate_pabnativ2_results",
-        lambda **_kwargs: (b"archive", {"pair_count": 2}),
+        lambda **_kwargs: (b"archive", {"pair_count": 5}),
     )
     run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     driver = Driver()
@@ -314,11 +392,14 @@ def test_execution_graph_fans_out_pairs_and_admits_gpu_calls(
 
     result = runtime.run(workload_run_key="example")
 
-    assert driver.pairs == ["pair-1", "pair-2"]
+    assert driver.batches == [
+        ["pair-1", "pair-2", "pair-3", "pair-4"],
+        ["pair-5"],
+    ]
     assert result.status == AppRunStatus.SUCCEEDED
     publication = store.artifacts.load_node_result(COLLECT_NODE)
     assert publication is not None
-    assert publication.metrics["pair_count"] == 2
+    assert publication.metrics["pair_count"] == 5
     runtime.close()
 
 

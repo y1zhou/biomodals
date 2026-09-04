@@ -113,9 +113,13 @@ reported values are live cgroup observations taken during the run.
 
 Naive three-process concurrency is therefore viable for this tested mix: it
 fit comfortably on one A10G, preserved the known 3F8 discrete result, and did
-not push the longest pair near the cutoff. This measurement does not establish
-the optimal fixed batch size or guarantee the same memory and latency for
-three worst-case pairs. The production one-pair-per-container topology remains
-unchanged until that cost-versus-tail-latency tradeoff is explicitly selected.
-All benchmark instrumentation was temporary and is excluded from production
-commits.
+not push the longest pair near the cutoff. This measurement does not guarantee
+the same memory and latency for four worst-case pairs.
+
+The selected production topology preserves the existing direct worker when
+the complete input contains one pair. Inputs containing two through four pairs
+run those pairs as separate spawned processes in one A10G container. Larger
+inputs retain durable per-pair Tasks but group provider calls into stable
+batches of four, with a final smaller batch when needed. The multiprocessing
+worker uses `cpu=(0.125, 8.125)` and `memory=(512, 65536)`. All benchmark
+instrumentation was temporary and is excluded from production commits.

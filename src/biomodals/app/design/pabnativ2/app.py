@@ -32,6 +32,7 @@ from biomodals.app.config import AppConfig
 from biomodals.app.design.pabnativ2.execution import (
     MAX_PAIR_RESULT_BYTES,
     MAX_RESULT_BYTES,
+    PAIRS_PER_GPU_CALL,
     PAbNatiV2ExecutionCoordinator,
     PAbNatiV2ExecutionRequest,
     load_execution_request,
@@ -806,6 +807,72 @@ def _run_pabnativ2_pair(
     )
 
 
+def _run_pabnativ2_pair_in_subprocess(
+    payload: tuple[dict[str, str], dict[str, Any]],
+) -> str:
+    """Run one isolated pair and return a process-safe result encoding."""
+    pair, parameters = payload
+    try:
+        return _run_pabnativ2_pair(pair=pair, **parameters).model_dump_json()
+    except Exception as exc:
+        raise RuntimeError(f"p-AbNatiV2 pair {pair.get('id')!r} failed: {exc}") from exc
+
+
+def _run_pabnativ2_batch(
+    *,
+    pairs: list[dict[str, str]],
+    mutate_cdrs: bool = False,
+    fixed_vh_positions: str = "",
+    fixed_vl_positions: str = "",
+    residue_score_threshold: float = 0.98,
+    rasa_threshold: float = 0.15,
+    max_relative_pairing_score_decrease: float = 0.10,
+    forbidden_residues: str = "C,M",
+    seed: int = 0,
+) -> dict[str, AppRunResult]:
+    """Humanize at most four pairs in isolated processes on one A10G."""
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= PAIRS_PER_GPU_CALL:
+        raise ValueError("p-AbNatiV2 GPU batch must contain one to four pairs")
+    if any(
+        not isinstance(pair, dict)
+        or set(pair) != set(CSV_COLUMNS)
+        or not all(isinstance(pair[column], str) for column in CSV_COLUMNS)
+        for pair in pairs
+    ):
+        raise ValueError("Each p-AbNatiV2 pair must contain exactly id, vh, and vl")
+    frame = parse_pabnativ2_csv(
+        pl.DataFrame(pairs).select(CSV_COLUMNS).write_csv().encode()
+    )
+    _validate_antibody_chains(frame)
+    normalized_pairs = frame.to_dicts()
+    parameters = {
+        "mutate_cdrs": mutate_cdrs,
+        "fixed_vh_positions": fixed_vh_positions,
+        "fixed_vl_positions": fixed_vl_positions,
+        "residue_score_threshold": residue_score_threshold,
+        "rasa_threshold": rasa_threshold,
+        "max_relative_pairing_score_decrease": max_relative_pairing_score_decrease,
+        "forbidden_residues": forbidden_residues,
+        "seed": seed,
+    }
+    if len(normalized_pairs) == 1:
+        pair = normalized_pairs[0]
+        return {pair["id"]: _run_pabnativ2_pair(pair=pair, **parameters)}
+
+    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import get_context
+
+    payloads = [(pair, parameters) for pair in normalized_pairs]
+    with ProcessPoolExecutor(
+        max_workers=len(payloads), mp_context=get_context("spawn")
+    ) as executor:
+        encoded = tuple(executor.map(_run_pabnativ2_pair_in_subprocess, payloads))
+    return {
+        pair["id"]: AppRunResult.model_validate_json(content)
+        for pair, content in zip(normalized_pairs, encoded, strict=True)
+    }
+
+
 def _aggregate_pabnativ2_results(
     *,
     run_name: str,
@@ -846,6 +913,14 @@ def _worker_kwargs() -> dict[str, Any]:
     }
 
 
+def _batch_worker_kwargs() -> dict[str, Any]:
+    return {
+        "memory": (512, 65536),
+        "timeout": CONF.timeout,
+        "volumes": CONF.mounts(model_volume=True),
+    }
+
+
 @app.function(cpu=(0.125, 8.125), gpu="A10G", **_worker_kwargs())
 def pabnativ2_humanize_pair(
     pair: dict[str, str],
@@ -870,6 +945,35 @@ def pabnativ2_humanize_pair(
         forbidden_residues=forbidden_residues,
         seed=seed,
     )
+
+
+@app.function(cpu=(0.125, 8.125), gpu="A10G", **_batch_worker_kwargs())
+def pabnativ2_humanize_batch(
+    pairs: list[dict[str, str]],
+    mutate_cdrs: bool = False,
+    fixed_vh_positions: str = "",
+    fixed_vl_positions: str = "",
+    residue_score_threshold: float = 0.98,
+    rasa_threshold: float = 0.15,
+    max_relative_pairing_score_decrease: float = 0.10,
+    forbidden_residues: str = "C,M",
+    seed: int = 0,
+) -> dict[str, dict[str, Any]]:
+    """Humanize one fixed batch of at most four pairs on one A10G."""
+    results = _run_pabnativ2_batch(
+        pairs=pairs,
+        mutate_cdrs=mutate_cdrs,
+        fixed_vh_positions=fixed_vh_positions,
+        fixed_vl_positions=fixed_vl_positions,
+        residue_score_threshold=residue_score_threshold,
+        rasa_threshold=rasa_threshold,
+        max_relative_pairing_score_decrease=max_relative_pairing_score_decrease,
+        forbidden_residues=forbidden_residues,
+        seed=seed,
+    )
+    return {
+        pair_id: result.model_dump(mode="json") for pair_id, result in results.items()
+    }
 
 
 @app.function(
@@ -1011,7 +1115,10 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
     if not development:
         return ModalCallDriver()
     return development_modal_call_driver(
-        {"pabnativ2_humanize_pair": pabnativ2_humanize_pair},
+        {
+            "pabnativ2_humanize_pair": pabnativ2_humanize_pair,
+            "pabnativ2_humanize_batch": pabnativ2_humanize_batch,
+        },
         workload_name=CONF.name,
     )
 
@@ -1077,9 +1184,14 @@ def submit_pabnativ2_task(
         seed=seed,
     )
     selected_run_name = sanitize_filename(run_name or input_path.stem)
+    provider_call_count = (
+        input_frame.height + PAIRS_PER_GPU_CALL - 1
+    ) // PAIRS_PER_GPU_CALL
     total_limit, gpu_limit = resolve_provider_call_limits(
-        default_max_containers=min(input_frame.height, _DEFAULT_MAX_GPU_CONTAINERS),
-        default_max_gpu_containers=min(input_frame.height, _DEFAULT_MAX_GPU_CONTAINERS),
+        default_max_containers=min(provider_call_count, _DEFAULT_MAX_GPU_CONTAINERS),
+        default_max_gpu_containers=min(
+            provider_call_count, _DEFAULT_MAX_GPU_CONTAINERS
+        ),
         max_containers=max_containers,
         max_gpu_containers=max_gpu_containers,
     )

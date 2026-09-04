@@ -2,7 +2,7 @@
 
 Research date: 2026-09-02
 
-Candidate implementation target: `src/biomodals/app/design/hudiff_ab_app.py`
+Candidate implementation target: `src/biomodals/app/design/hudiff_ab/app.py`
 
 This note covers **HuDiff-Ab**, the paired conventional-antibody model. The
 same repository also contains HuDiff-Nb, but it has a different checkpoint,
@@ -17,23 +17,186 @@ multiple stochastic candidates, whereas Sapiens scores and greedily revises
 each chain independently. The smallest honest app is therefore a **paired
 candidate generator**, not another humanness scorer.
 
-Do not begin production integration until the upstream authors clarify the
-license. The immutable code release is under PolyForm Noncommercial 1.0.0,
+The source and checkpoint license conflicts must remain visible in the app
+documentation, but they do not block implementation or release. Package users
+are responsible for determining whether their use complies with the applicable
+licenses. The immutable code release is under PolyForm Noncommercial 1.0.0,
 while the authors' 2026 protocol calls the same code MIT; the model repository
 declares AFL-3.0, while that protocol calls its release dataset CC BY 4.0. The
-checkpoint and training LMDBs are also combined in one archive with no
-per-file license manifest. These are material, unresolved conflicts, not a
-documentation nicety
+checkpoint and training LMDBs are also combined in one archive with no per-file
+license manifest
 ([code license](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/LICENSE),
 [model-repository metadata](https://huggingface.co/cloud77/HuDiff/blob/3455856e5d97aa72dea98653b44a1aec800fc998/README.md),
 [authors' protocol table](https://bio-protocol.org/en/bpdetail?id=5816&type=0#software-and-datasets)).
 
-If licensing is resolved, start from the immutable upstream release and make a
-narrow, versioned inference patch rather than invoking the command-line script
-unchanged. The upstream script has broken direct-sequence dispatch, incomplete
-input checks, an ignored seed, always-active functional dropout, and no score
-artifact. A Biomodals wrapper should preserve the published sampling algorithm
-while making its stochastic identity and validation explicit.
+Start from the immutable upstream release and make a narrow, versioned inference
+patch rather than invoking the command-line script unchanged. The upstream
+script has broken direct-sequence dispatch, incomplete input checks, an ignored
+seed, always-active functional dropout, and no score artifact. A Biomodals
+wrapper should preserve the published sampling algorithm while making its
+stochastic identity and validation explicit.
+
+## Accepted implementation direction
+
+The initial Biomodals app will:
+
+- proceed as an internal research integration while documenting the unresolved
+  and conflicting source/checkpoint license statements;
+- expose HuDiff-Ab only as a paired conventional-antibody candidate generator,
+  excluding HuDiff-Nb, training, fine-tuning, OASis, and T20 evaluation; and
+- target the immutable `v1.0.0` source and pinned released HuDiff-Ab checkpoint
+  through a narrow, explicitly versioned inference patch rather than claiming
+  untouched command-line equivalence;
+- preserve and fingerprint the released always-active functional dropout as
+  `upstream_inference_dropout=true` by default while explicitly seeding Python,
+  NumPy, and Torch;
+- use the shared strict wide CSV contract with exactly `id,vh,vl`, complete
+  conventional H+K/L pairs, unique nonempty identifiers, all-or-nothing batch
+  validation, and a 1,000-pair ceiling; and
+- accept any structurally valid conventional pair without a source-species
+  field while limiting the supported scientific claim to murine inputs, the
+  released checkpoint's stated target;
+- define `candidate_count` as sampling attempts, defaulting to ten, and retain
+  every attempt's `valid`, `duplicate`, or `invalid` accounting without
+  resampling to guarantee a unique-candidate count;
+- initially constrain `candidate_count` to 1–10 and total requested attempts to
+  10,000; revisit both ceilings only after the first performance measurements;
+- expose `sampling_order=shuffle|left_to_right`, defaulting to `shuffle`, and
+  preserve upstream's one shuffled mutable-position order shared by all
+  attempts for a pair;
+- default the applied root seed to 42, derive a stable seed from the root seed,
+  ID, VH, and VL for each pair, and seed Python, NumPy, and Torch immediately
+  before sampling;
+- expose `upstream_inference_dropout` as a fingerprinted boolean defaulting to
+  true, with false explicitly identifying a HuDiff-derived sampling mode; and
+- run the nearest deployable source-compatible worker on isolated Python 3.10,
+  Torch 1.13, and CUDA 11.6 while keeping the exact Python 3.9 oracle outside
+  Modal;
+- classify every generated attempt as valid, duplicate, or invalid by canonical
+  alphabet, literal fixed-mask preservation, complete IMGT grid round-trip, and
+  retained H plus original K/L chain type; and
+- validate the complete batch before remote dispatch and revalidate each pair
+  before checkpoint loading or GPU inference;
+- report `candidate_generation_status=no_valid_candidates` without turning a
+  fully accounted zero-yield pair into an execution failure;
+- clone the pinned upstream repository into the worker image and invoke its
+  antibody inference script through narrow, exact-preimage guarded patches,
+  rather than importing another Biomodals app or rewriting the released model;
+  and
+- emit the cross-app Humanization Mutation Table as `mutations.parquet`, while
+  keeping compact sequence and candidate-attempt tables as CSV;
+- preserve upstream's sampling support, including `X` and gap, then classify
+  non-canonical or non-round-tripping outputs as invalid attempts without
+  filtering logits or resampling;
+- return one inline `.tar.zst` result bundle, stage models under the stable
+  app-specific `/biomodals-store/hudiff/` directory, and keep result artifacts
+  out of that model store; and
+- perform no cross-run result caching, while allowing the execution kernel to
+  publish invocation-scoped artifacts for retry and resumption.
+
+The native result will contain candidates, aligned mutation differences,
+validity accounting, sampling identities, and exact scientific provenance. It
+will not run or report OASis, T20, human-germline identity, Sapiens scoring, or
+reference-dependent preservation and mutation-precision benchmarks. Preserve
+these evaluation options in the design notes for possible later scoring apps
+or workflow stages; they must remain independently attributed rather than
+being presented as HuDiff-Ab model outputs.
+
+### Deferred evaluation methods
+
+- **OASis** is an external BioPhi repertoire-prevalence measure over overlapping
+  antibody 9-mers. HuDiff's evaluation uses the medium 50% subject-prevalence
+  threshold; it is not an inference output or an immunogenicity probability
+  ([HuDiff evaluation](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/antibody_scripts/humab25_eval.py#L259-L280)).
+- **T20** is the mean sequence identity of the top 20 matches from a human
+  antibody database, computed per chain through an external service in the
+  released evaluation code
+  ([T20 wrapper](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/evaluation/T20_eval.py#L12-L51)).
+- **Human-germline identity** compares a generated framework with an AbNumber
+  human-germline CDR-graft result
+  ([implementation](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/antibody_scripts/humab25_eval.py#L140-L216)).
+- **Preservation** measures aligned identity to the parental sequence across
+  either all positions or Kabat Vernier positions
+  ([implementation](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/antibody_scripts/humab25_eval.py#L153-L203)).
+- **Mutation precision** measures the fraction of generated substitutions that
+  equal an experimentally humanized reference. It requires benchmark reference
+  data and is undefined for an arbitrary new antibody
+  ([implementation](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/antibody_scripts/humab25_eval.py#L20-L137)).
+
+These may become independent scoring apps or workflow stages. They must not be
+silently attached to the HuDiff-Ab Native Result, and their method identities
+must remain distinct from HuDiff-Ab Candidate Generation.
+
+### Archive audit and runtime facts
+
+The pinned Hugging Face revision exposes only the outer
+`release_data_dir.tar.gz`: 2,070,382,005 bytes with SHA-256
+`95d4e9091463939e3032996ae10bee8c8df72d11326d4498344eb1abe0bcb949`.
+It has no public inner manifest, and a large training LMDB precedes the
+checkpoint in its gzip-compressed tar stream. The contemporaneous source and
+model card name `checkpoints/antibody/hudiffab.pt`, while the later protocol
+names `checkpoints/antibody/antibody.pt`. A complete Modal-side audit confirmed
+that `hudiffab.pt` is the released path and that `antibody.pt` is absent. The
+production loader successfully instantiated `AntiTFNet` from the embedded
+`pretrain_config` and loaded its state dictionary. Production staging accepts
+only these audited files:
+
+| Checkpoint | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `checkpoints/abnativ/vh_model.ckpt` | 194,187,065 | `de1a3fdaaa9ae178a77478602dbea7f04f23bd13acea41bdbe0eaa6cfa8dbdbb` |
+| `checkpoints/abnativ/vhh_model.ckpt` | 194,187,397 | `eb22d50d30729eaa61b9cc6083b0fbc8a0a3dcef181ee08663593ab7173801d8` |
+| `checkpoints/abnativ/vkappa_model.ckpt` | 194,188,393 | `937f5ef0e8a1a3594f1f84157c22421f8ca247f83d2a8f2edf7ca347c75f1281` |
+| `checkpoints/abnativ/vlambda_model.ckpt` | 194,188,725 | `4ee34a8514d53f4dffbbcc53d84ab62de2081cf85a96a142b86ccd524be5dbc3` |
+| `checkpoints/antibody/hudiffab.pt` | 479,136,082 | `204e1c69aff239555efe76c10ba316d5348394c222d3d89f4089e6103ce21227` |
+| `checkpoints/nanobody/hudiffnb.pt` | 418,768,789 | `2c103342c6ded156a3bad7b1273afba911bac42c9a18ba11e3498ca1f3c6b4e2` |
+
+The stable publication retains and manifests this complete checkpoint subtree
+for later HuDiff apps. Training LMDBs and other release-archive bulk data are
+not extracted.
+([pinned archive metadata](https://huggingface.co/api/models/cloud77/HuDiff/tree/3455856e5d97aa72dea98653b44a1aec800fc998?recursive=true&expand=true),
+[source instructions](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/README.md#L63-L75),
+[later protocol](https://bio-protocol.org/en/bpdetail?id=5816&type=0#B2-Humanization-with-HuDiff-Ab))
+
+Current Biomodals uses Modal 1.5, whose supported Python versions no longer
+include upstream's Python 3.9. Torch 1.13 supports Python through 3.10. The
+nearest deployable source-compatible worker is therefore isolated Python 3.10
+with Torch 1.13 and CUDA 11.6; an exact Python 3.9 oracle must run outside the
+current Modal runtime. A modernized Torch runtime would be a separate
+scientific implementation requiring new oracle evidence.
+([Modal releases](https://modal.com/docs/sdk/py/releases),
+[PyTorch compatibility](https://pytorch.org/blog/deprecation-cuda-python-support/))
+
+Use a package-based app. `app.py` owns Modal images, resource decorators, app
+composition, and the CLI; `execution.py` owns the execution request and
+per-pair Tasks; `models.py` owns staged checkpoint identities; `patches.py`
+owns exact-preimage source edits; and a focused `worker.py` contains only the
+Python-3.10-compatible inference implementation and its minimal import closure.
+The normal coordinator and composition root remain on the repository runtime.
+
+### Initial performance decision
+
+The cold A10G benchmark used the upstream 7K9I pair, root seed zero, ten attempts,
+`cpu=(0.125, 8.125)`, and `memory=(512, 16384)`. It completed in 16.00 seconds.
+Across two-second samples it averaged 0.97 CPU core, reached 7.27 GiB maximum
+sampled host memory, averaged 39.9% GPU utilization over model loading and
+sampling, reached 90% GPU utilization, used at most 1.96 GiB GPU memory, and
+reached 145.6 W. It returned nine valid unique candidates and one exact valid
+duplicate. The benchmark harness and instrumentation were removed after the
+measurement.
+
+A separate two-attempt production-path validation exercised coordinator task
+discovery, the A10G worker, durable pair publication, collection, and local
+archive retrieval. One candidate was valid and one sampled-gap attempt was
+retained as invalid with `changed IMGT grid occupancy`, confirming the declared
+no-resampling policy. The resulting archive contained all six specified files
+and a typed `mutations.parquet` table.
+
+The initial production shape remains one pair per A10G Provider Call with a
+run-wide GPU-call default of one pending a deliberate pair-concurrency decision.
+The low GPU-memory footprint could support a multi-pair experiment, but the 90%
+utilization peak means near-linear speedup should not be assumed. The app allows
+1–10 attempts per pair and bounds normalized input at 3 MiB, each pair result at
+4 MiB, and the final archive at 64 MiB.
 
 ## Primary-source snapshot and reproducible pins
 
@@ -72,9 +235,9 @@ while making its stochastic identity and validation explicit.
   Python packages are unconstrained
   ([environment](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/environment.yaml)).
 
-## Licensing and redistribution
+## Licensing and redistribution notice
 
-The following conflict must be resolved before a Biomodals app is shipped:
+The following unresolved statements must remain visible to package users:
 
 | Material | License asserted by the owning artifact | Conflicting statement |
 | --- | --- | --- |
@@ -90,10 +253,11 @@ and the paper's [data-availability statement](https://www.nature.com/articles/s4
 
 PolyForm Noncommercial is incompatible with a general assumption that the app
 may be used commercially. The discrepancy cannot be cured by copying the
-protocol's table into Biomodals. Ask upstream to publish an unambiguous license
-for (1) code, (2) each checkpoint, (3) bundled training data, and (4) the
-committed evaluation sets. Retain all required notices after clarification.
-This is a technical inventory, not legal advice.
+protocol's table into Biomodals. Upstream clarification for the code, each
+checkpoint, bundled training data, and committed evaluation sets would be
+useful, but it is not an implementation or package-release gate. Retain the
+published notices and make users responsible for determining whether their use
+complies with them. This is a technical inventory, not legal advice.
 
 ## Scientific purpose and claims
 
@@ -309,10 +473,12 @@ CSV as one opaque call.
    overwrite, unrelated records, and broken string dispatch make the
    interactive parser unsuitable as a public contract. Parse a normalized
    table in Biomodals instead.
-6. **Generated-output validity.** Reject or explicitly resample candidates with
-   `X`, lost positions, wrong chain classification, changed CDRs, or a failed
-   numbering round-trip. Resampling needs a bounded-attempt policy and must be
-   captured in result identity.
+6. **Generated-output validity.** Preserve upstream's full sampling support,
+   including `X` and gap, because masking logits would change the scientific
+   distribution. Classify candidates with non-canonical tokens, lost positions,
+   wrong chain classification, changed CDRs, or a failed numbering round-trip
+   as invalid attempts; retain their raw generated sequences and reasons, and
+   do not resample.
 7. **Dependency confusion and unnecessary imports.** Loading `model_selected`
    eagerly imports training datasets, AbNatiV helpers, and PyMOL even though
    HuDiff-Ab inference only needs `AntiTFNet`. Isolate the exact inference
@@ -323,22 +489,22 @@ CSV as one opaque call.
 
 ## Required upstream patches and scientific identity
 
-The minimum production patch set should be small and separately documented:
+The minimum production patch set should be small, exact-preimage guarded, and
+separately documented. The app will invoke the patched upstream
+`sample_for_anti_cdr.py` in a subprocess with an app-generated safe FASTA and
+internal paths. Patches should:
 
-- expose a pure function over one validated VH/VL pair rather than spawning
-  `sample_for_anti_cdr.py`;
-- replace FASTA/name/path handling with app-owned data structures;
-- load only the pinned HuDiff-Ab checkpoint and narrow inference model;
+- bypass misleading direct-sequence and user-controlled path handling;
+- select the pinned HuDiff-Ab checkpoint and narrow inference model;
 - explicitly seed Python, NumPy, and Torch for each pair/candidate set and
   record device/software identity;
 - use an explicit enum for shuffled versus left-to-right sampling;
-- return candidates in memory and preserve the actual number of unique results;
-- reject missing/ignored IMGT positions and invalid generated tokens;
+- preserve complete indexed attempt output rather than only unique results;
+- reject missing or ignored parental IMGT positions before inference;
 - remove unused training, evaluation, subprocess, PyMOL, and AbNatiV runtime
   imports from the inference path; and
-- decide explicitly whether to preserve upstream always-active dropout or add
-  a deterministic-dropout-fix mode. The latter changes scientific behavior and
-  must alter the execution fingerprint/cache identity.
+- make always-active inference dropout the fingerprinted default and expose
+  its disabled HuDiff-derived mode explicitly.
 
 The app should not claim upstream identity merely because it loads the same
 weights. Record the code commit, outer and inner checkpoint digests, complete
@@ -386,42 +552,52 @@ Recommended operation: `hudiff_ab.humanize`.
 Input should be a bounded UTF-8 wide CSV with `id,vh,vl`, unique nonempty IDs,
 complete canonical uppercase variable regions, and exactly one H plus one K/L
 chain per row. Add explicit `candidate_count`, root `seed`, and
-`sampling_order=shuffle|left_to_right`. Keep the CDR definition fixed to the
+`sampling_order=shuffle|left_to_right`, plus the fingerprinted
+`upstream_inference_dropout` control. Keep the CDR definition fixed to the
 released model's Kabat mask on an IMGT grid; adding alternate definitions or
-CDR mutation would not be HuDiff-Ab-equivalent. Establish both row and byte
-limits from GPU benchmarks, and separately cap total candidates.
+CDR mutation would not be HuDiff-Ab-equivalent. Enforce the initial 1,000-pair,
+3 MiB input, 1–10 attempts-per-pair, and 10,000-total-attempt limits before
+dispatch and again at the worker boundary.
 
-Use one GPU worker per pair or a measured small group of pairs, with candidate
-replicas batched inside that worker. Represent multi-pair CLI work as an
-ExecutionDefinition with durable per-pair Tasks and bounded scheduling so
-workflow callers and standalone callers share the same scientific operation.
-Start by benchmarking T4 and A10G with 1, 10, and 20 candidates; the authors'
-RTX 3060 Ti result suggests CPU should be a fallback/oracle path, not the
-default production resource.
+Initially use one GPU worker per pair, with candidate replicas batched inside
+that worker. Represent multi-pair CLI work as an ExecutionDefinition with
+durable per-pair Tasks and bounded scheduling so workflow callers and
+standalone callers share the same scientific operation. Start with the single
+cold A10G measurement specified above; only then consider grouping independent
+pairs in one GPU container. The authors' RTX 3060 Ti result suggests CPU should
+be an oracle path, not the default production resource.
 
 Return a compact inline `.tar.zst` containing:
 
-- normalized input CSV;
-- one row per generated candidate with stable `id`, `candidate_index`, VH, VL,
-  seed, sampling order, and validity status;
-- an aligned mutation table with chain, IMGT position, parental residue, and
-  generated residue;
-- paired FASTA for valid candidates; and
-- an identity/diagnostics manifest containing checkpoint, runtime, patch,
-  stochastic, retry, and rejection metadata.
+- `input.csv`, the normalized parental pairs;
+- `attempts.csv`, every requested attempt in input-row and attempt-index order,
+  including status, rejection reason, decoded chains, raw aligned token grids,
+  pair seed, attempt index, and any duplicate candidate reference;
+- `candidates.csv`, the valid unique candidates in the same stable order;
+- `candidates.fasta`, the valid unique paired candidates;
+- `mutations.parquet`, with one parental-to-candidate substitution per row,
+  including candidate identity, chain, string-form IMGT position, region,
+  parental residue, and generated residue; and
+- `manifest.json`, containing source, checkpoint, patch, runtime, controls,
+  seeds, retry, rejection, and diagnostic metadata.
 
 Do not fabricate a humanness score. A conditional sampling trace can be added
 later as a clearly named optional artifact, but it is large, order-dependent,
 and not required for the smallest useful generator.
 
-Model setup should download the pinned 2.07 GB archive during image
-construction, verify its outer digest, extract only the fine-tuned HuDiff-Ab
-checkpoint, verify and record the new inner digest, and discard all LMDBs and
-the HuDiff-Nb checkpoint. A persistent model Volume is unnecessary unless
-measurements show image construction or checkpoint size makes it advantageous.
+Model setup should stage the pinned 2.07 GB archive under the stable
+`/biomodals-store/hudiff/` directory, verify its outer digest, retain and
+manifest the complete checkpoint subtree, verify and record every retained
+checkpoint's inner digest, and discard the training LMDBs and other non-runtime
+bulk data. The pinned publication is not nested below a version-addressed
+directory; its manifest rejects unexpected model contents. Checkpoint staging
+and audit must complete before the cold inference benchmark and are not an
+inference warm-up.
 Because the faithful environment is Python 3.9 while Biomodals is Python 3.12+,
 use the repository's documented cross-runtime execution boundary or prove a
 modernized runtime equivalent before importing project source into the image.
+Do not create an app-owned cross-run result cache. The execution kernel still
+materializes invocation-scoped results durably for recovery and retrieval.
 
 ## Relationship to Sapiens and the humanization stack
 
@@ -456,19 +632,18 @@ not required to generate HuDiff-Ab candidates: upstream installs BioPhi/OASis
 only for evaluation
 ([README evaluation section](https://github.com/TencentAI4S/HuDiff/blob/9a7d1d5a458a2fdd6b9dc7e04e891e4b776f6241/README.md#evaluation)).
 
-## Go/no-go checklist
+## Implementation status
 
-Before implementation:
+The initial app documents the conflicting licenses, audits and pins every
+retained checkpoint, runs the released HuDiff-Ab model under the nearest Modal-
+supported legacy environment, fingerprints the exact patch sources, defaults
+to upstream-active inference dropout, records all attempts before deduplication,
+and has completed both the cold worker benchmark and production-path validation.
 
-- obtain authoritative commercial-use and redistribution terms for code,
-  checkpoints, training data, and evaluation data;
-- inspect the pinned archive and record the HuDiff-Ab checkpoint's inner path,
-  SHA-256, size, and embedded configuration;
-- prove a locked inference environment can load and run the checkpoint;
-- choose and version the upstream-dropout versus fixed-dropout behavior;
-- benchmark T4/A10G memory and latency for 1/10/20 candidates and paired-task
-  concurrency; and
-- capture same-device seeded upstream oracle fixtures before refactoring.
+An exact external Python 3.9 oracle remains useful before claiming bitwise
+identity with the authors' original environment. The app therefore claims a
+pinned, source-faithful Python 3.10 implementation rather than cross-runtime
+bitwise identity.
 
-Until the first item is resolved, HuDiff-Ab belongs in the research/design
-stack but not in a distributable production PR.
+License clarification from upstream is welcome but is not an implementation or
+release gate for this package.

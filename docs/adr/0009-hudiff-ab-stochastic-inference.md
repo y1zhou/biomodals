@@ -1,0 +1,58 @@
+# Preserve HuDiff-Ab stochastic inference semantics
+
+Status: accepted.
+
+The initial HuDiff-Ab app targets the immutable `v1.0.0` source and released
+checkpoint while repairing its ignored seed and preserving its accidentally
+active inference dropout. `candidate_count` counts sampling attempts, shuffled
+position order remains shared across a pair's attempts, and
+`upstream_inference_dropout=true` is the default scientific mode; disabling it
+is a separately fingerprinted HuDiff-derived mode. Because current Modal no
+longer supports upstream Python 3.9, the production worker uses the nearest
+compatible Python 3.10, Torch 1.13, and CUDA 11.6 runtime, while exact Python
+3.9 oracle comparisons remain external. These choices preserve the released
+sampling distribution as closely as the deployment platform permits and make
+retry behavior reproducible for a fixed seed, runtime, and device.
+
+The image clones the pinned upstream repository and invokes its antibody
+inference script. Narrow, exact-preimage guarded patches activate the ignored
+seed, expose the fingerprinted dropout choice, remove unused inference import
+edges, and preserve complete candidate-attempt accounting. The source commit
+and patch digest are part of scientific identity.
+
+The released archive is audited and staged in `biomodals-store` before
+inference under the stable app-specific `hudiff/` directory. Training data and
+other non-runtime bulk data are removed, while the complete checkpoint subtree
+is retained and manifested for later HuDiff apps. A version-addressed directory
+is unnecessary for this pinned, unlikely-to-change publication. The initial
+performance measurement is one cold A10G call for one parental pair and the
+default ten attempts; no separate container call warms inference.
+
+Sampling retains upstream's full token support. Outputs containing `X`, gaps,
+changed fixed positions, wrong chain roles, or incomplete numbering are
+recorded as invalid attempts with their raw generated chains and rejection
+reason. They consume attempts and are neither filtered at the logits nor
+resampled. Validation precedes deduplication: the first valid unique pair is a
+candidate and later exact valid matches are duplicates that reference it. A
+candidate attempt is identified by its pair seed and attempt index rather than
+an invented independent per-attempt seed.
+
+The first implementation accepts 1–10 attempts per pair and at most 10,000
+attempts over the existing 1,000-pair input ceiling. It validates the complete
+batch before dispatch and each pair again before model loading. One pair maps
+to one A10G Provider Call with a default GPU-call ceiling of one until benchmark
+evidence justifies in-container batching or wider fan-out.
+
+The operation returns one inline `.tar.zst` containing normalized input, all
+attempts, valid unique candidates, paired candidate FASTA,
+`mutations.parquet`, and a scientific manifest. It uses no cross-run result
+cache; `biomodals-store` holds staged model assets rather than result bundles.
+The execution kernel may durably materialize invocation-scoped results.
+
+The initial 7K9I cold benchmark used root seed zero and completed ten attempts
+on one A10G in 16.00 seconds. Two-second samples showed 0.97 mean CPU core,
+7.27 GiB maximum sampled host memory, 39.9% mean and 90% peak GPU utilization,
+and 1.96 GiB peak GPU memory. Nine attempts were valid unique candidates and
+one was a duplicate.
+These measurements retain the one-pair-per-call implementation for now; they
+do not establish that independent pairs will scale within one GPU process.

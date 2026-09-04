@@ -879,6 +879,60 @@ same parental VH-VL Pair. Collection does not imply that one method consumes
 another method's result or that agreement proves experimental suitability.
 _Avoid_: chained humanization, consensus sequence, validated antibody
 
+**Humanization Mutation Table**:
+A Parquet artifact containing one row per parental-to-result amino-acid
+substitution, with method-appropriate residue coordinates and endpoint
+metadata. All humanization apps use this shared storage format even when their
+native mutation semantics differ.
+_Avoid_: mutation CSV, accepted-edit trace, candidate-attempt table
+
+**HuDiff-Ab Candidate Generation**:
+The stochastic joint reconstruction of heavy- and light-chain framework
+residues around preserved parental CDRs using the released conventional-
+antibody model. It produces paired sequence candidates rather than a native
+humanness, binding, or immunogenicity score.
+_Avoid_: HuDiff-Nb, independent-chain scoring, affinity prediction
+
+**HuDiff-Ab Candidate**:
+One generated VH-VL Pair from HuDiff-Ab Candidate Generation, identified by
+its parental pair, candidate index, sampling configuration, pair seed, and
+attempt index. It is a design proposal requiring downstream evaluation.
+_Avoid_: humanized consensus, scored antibody, validated antibody
+
+**HuDiff-Ab Candidate Attempt**:
+One indexed sampling replica requested for a parental VH-VL Pair. An attempt
+may yield a valid unique candidate, a duplicate, or an invalid generated pair;
+the requested candidate count counts attempts rather than guaranteed outputs.
+Validation precedes deduplication, so invalid attempts cannot become duplicate
+candidates.
+_Avoid_: guaranteed unique candidate, automatic resampling, execution retry
+
+**HuDiff-Ab Sampling Order**:
+The order in which mutable framework positions are autoregressively filled:
+either one shuffled order shared by a pair's candidate attempts or fixed
+left-to-right heavy-then-light order.
+_Avoid_: candidate ranking, Task scheduling order, chain independence
+
+**HuDiff-Ab Inference Dropout**:
+The released HuDiff-Ab model's always-active functional dropout during
+candidate generation. `upstream_inference_dropout=true` preserves this
+sampling behavior; changing it defines a different scientific implementation.
+_Avoid_: training mode, incidental nondeterminism, operational retry policy
+
+**HuDiff-Ab Native Result**:
+The generated candidates, parental-to-candidate mutations, validity accounting,
+sampling identities, and scientific provenance produced by HuDiff-Ab Candidate
+Generation. External humanness or reference-based evaluation is not part of
+this result.
+_Avoid_: OASis report, T20 score, benchmark evaluation
+
+**HuDiff-Ab Candidate Generation Status**:
+The scientific yield for one parental VH-VL Pair after all requested Candidate
+Attempts: candidates available or no valid candidates. No valid candidates is
+not an execution failure when every requested attempt completed and was
+accounted for.
+_Avoid_: Provider Call status, silent empty result, automatic retry
+
 **CDR Definition**:
 A named boundary convention that classifies numbered positions in an Antibody
 Variable Region as complementarity-determining or framework regions. Kabat is

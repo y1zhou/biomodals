@@ -193,10 +193,32 @@ and a typed `mutations.parquet` table.
 
 The initial production shape remains one pair per A10G Provider Call with a
 run-wide GPU-call default of one pending a deliberate pair-concurrency decision.
-The low GPU-memory footprint could support a multi-pair experiment, but the 90%
-utilization peak means near-linear speedup should not be assumed. The app allows
-1–10 attempts per pair and bounds normalized input at 3 MiB, each pair result at
-4 MiB, and the final archive at 64 MiB.
+
+A subsequent two-pair experiment ran the distinct 7K9I and 3F8 pairs as two
+simultaneous upstream subprocesses in one A10G container with
+`cpu=(0.125, 8.125)` and `memory=(512, 65536)`. Two successful cold containers
+completed in 24.67 and 24.89 seconds. The instrumented replacement run averaged
+1.89 CPU cores, reached 4,002 MiB GPU memory, and held the GPU at 100%
+utilization for about nine seconds. GPU utilization averaged 43.7% across the
+whole run, including model loading and teardown. Sampled aggregate process RSS
+reached 17.50 GiB; this `/proc` sum double-counts shared pages and is not a
+cgroup memory measurement, but it demonstrates that a 16 GiB container ceiling
+would be unsafe. Each pair returned nine valid unique candidates.
+
+Compared with the 16.00-second one-pair baseline, two sequential calls would
+take about 32 seconds. Sharing one A10G therefore produced a 1.29-times
+throughput improvement and reduced billed GPU time per pair by about 22%, while
+raising two-pair latency by about 55% relative to two independent A10G
+containers. This is a useful cost optimization but not a wall-time optimization.
+The production shape remains unchanged pending an explicit choice between those
+objectives. Benchmark-only code and instrumentation were removed after both
+runs. The runs are
+[`ap-5Dvs11VugFNNafAmffzu4j`](https://modal.com/apps/innocare/main/ap-5Dvs11VugFNNafAmffzu4j)
+and
+[`ap-WRJSlmBHIIp2FuJkYZ0L1G`](https://modal.com/apps/innocare/main/ap-WRJSlmBHIIp2FuJkYZ0L1G).
+
+The app allows 1–10 attempts per pair and bounds normalized input at 3 MiB,
+each pair result at 4 MiB, and the final archive at 64 MiB.
 
 ## Primary-source snapshot and reproducible pins
 

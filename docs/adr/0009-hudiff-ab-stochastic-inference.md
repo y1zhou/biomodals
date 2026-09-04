@@ -56,3 +56,13 @@ and 1.96 GiB peak GPU memory. Nine attempts were valid unique candidates and
 one was a duplicate.
 These measurements retain the one-pair-per-call implementation for now; they
 do not establish that independent pairs will scale within one GPU process.
+
+A later two-process experiment completed distinct 7K9I and 3F8 pairs together
+on one A10G in 24.67 and 24.89 seconds across two cold containers. The
+instrumented run averaged 1.89 CPU cores, reached 4,002 MiB GPU memory, and held
+100% GPU utilization during sampling. Sampled aggregate process RSS reached
+17.50 GiB, although that `/proc` sum double-counts shared pages. Against the
+16.00-second single-pair baseline, this improves throughput by 1.29 times and
+reduces GPU time per pair by about 22%, but it is slower than running two A10G
+containers in parallel. Production batching remains deferred until cost versus
+wall-time priority is chosen.

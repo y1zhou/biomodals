@@ -713,11 +713,11 @@ def _write_result_bundle(
         pl.DataFrame(
             [row for result in pair_results for row in result["mutations"]],
             schema=mutation_schema,
-        ).write_csv(result_dir / "mutations.csv")
+        ).write_parquet(result_dir / "mutations.parquet", compression="zstd")
 
         artifact_files = sorted(result_dir.iterdir())
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_name": run_name,
             "pair_count": input_frame.height,
             "parameters": parameters,

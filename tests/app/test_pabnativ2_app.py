@@ -523,6 +523,16 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
         assert num_threads == 2
         captured.update(orjson.loads((root / "manifest.json").read_bytes()))
         assert (root / "structures/0001_pair-1/input.pdb").read_bytes() == b"input"
+        assert pl.read_parquet(root / "mutations.parquet").schema == {
+            "id": pl.String,
+            "chain": pl.String,
+            "aho_position": pl.Int64,
+            "region": pl.String,
+            "input_aa": pl.String,
+            "final_aa": pl.String,
+            "input_residue_score": pl.Float64,
+            "final_residue_score": pl.Float64,
+        }
         return b"archive"
 
     monkeypatch.setattr(pabnativ2_app, "package_outputs", fake_package)
@@ -567,6 +577,7 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
     )
 
     assert archive == b"archive"
+    assert captured["schema_version"] == 2
     assert captured["protocol"]["equivalence_target"] == "AbNatiV 2.0.8 source"
     assert captured["protocol"]["paper_rasa_structure_count"] == 10
     assert captured["protocol"]["pairing_score_units"] == "fraction"

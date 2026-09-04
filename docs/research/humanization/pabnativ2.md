@@ -426,8 +426,8 @@ Stable outputs:
 - `residue_scores.parquet`, with one row per ID, endpoint, chain, and AHo
   position containing the observed residue, its residue score, and the 21
   reconstruction values;
-- an endpoint mutation table with ID, chain, AHo position, region,
-  parental/final residue, and parental/final observed-residue score; and
+- `mutations.parquet`, an endpoint mutation table with ID, chain, AHo position,
+  region, parental/final residue, and parental/final observed-residue score; and
 - a compact manifest containing every pin, checksum, parameter, seed,
   validation result, runtime, upstream/paper behavior choice, and device as
   operational telemetry.

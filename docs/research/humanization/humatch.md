@@ -294,7 +294,7 @@ remote operation directly usable by a parent workflow. Return an inline
   classifier endpoints, and H/L germline-likeness endpoints;
 - `classifier_scores.csv` contains wide input/final class distributions;
 - `alignment.csv` contains the long input-to-final IMGT comparison;
-- `mutations.csv` contains only parental-to-final substitutions; and
+- `mutations.parquet` contains only parental-to-final substitutions; and
 - `manifest.json` contains parameters and scientific identities.
 
 Do not patch upstream or emit an accepted-mutation trace in the first

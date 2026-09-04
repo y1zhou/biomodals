@@ -374,8 +374,9 @@ def _write_result_bundle(
             "from_aa": pl.String,
             "to_aa": pl.String,
         }
-        pl.DataFrame(mutation_rows, schema=mutation_schema).write_csv(
-            result_dir / "mutation_history.csv"
+        pl.DataFrame(mutation_rows, schema=mutation_schema).write_parquet(
+            result_dir / "mutation_history.parquet",
+            compression="zstd",
         )
         pl.concat(score_frames, how="vertical", rechunk=True).write_parquet(
             result_dir / "residue_scores.parquet",
@@ -384,7 +385,7 @@ def _write_result_bundle(
 
         artifact_files = sorted(result_dir.iterdir())
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_name": run_name,
             "pair_count": input_frame.height,
             "parameters": {

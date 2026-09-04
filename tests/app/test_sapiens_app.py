@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from uuid import UUID
@@ -178,6 +179,44 @@ def test_humanize_chain_preserves_parental_cdr_each_iteration(monkeypatch) -> No
     assert [frame["endpoint"][0] for frame in score_frames] == ["input", "final"]
     assert {row["iteration"] for row in mutations} == {1, 2}
     assert all(row["numbered_position"] != "H2" for row in mutations)
+
+
+def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
+    expected_schema = {
+        "id": pl.String,
+        "chain": pl.String,
+        "iteration": pl.Int64,
+        "sequence_index": pl.Int64,
+        "numbered_position": pl.String,
+        "region": pl.String,
+        "from_aa": pl.String,
+        "to_aa": pl.String,
+    }
+
+    def fake_package_outputs(result_dir: Path, *, num_threads: int) -> bytes:
+        assert num_threads == 2
+        assert (
+            pl.read_parquet(result_dir / "mutation_history.parquet").schema
+            == expected_schema
+        )
+        assert not (result_dir / "mutation_history.csv").exists()
+        assert b'"schema_version": 2' in (result_dir / "manifest.json").read_bytes()
+        return b"archive"
+
+    monkeypatch.setattr(sapiens_app, "package_outputs", fake_package_outputs)
+    archive = sapiens_app._write_result_bundle(
+        run_name="demo",
+        input_frame=pl.DataFrame([{"id": "pair", "vh": "AAAA", "vl": "CCCC"}]),
+        humanized_rows=[{"id": "pair", "vh": "AAAA", "vl": "CCCC"}],
+        score_frames=[pl.DataFrame({"id": ["pair"]})],
+        mutation_rows=[],
+        iterations=1,
+        numbering_scheme="kabat",
+        cdr_definition="kabat",
+        mutate_cdrs=False,
+    )
+
+    assert archive == b"archive"
 
 
 def test_workflow_function_returns_inline_archive(monkeypatch) -> None:

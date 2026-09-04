@@ -147,7 +147,8 @@ The mean observed-residue probability is a sequence-level summary, not the
 independent OASis humanness score.
 
 The resolved Biomodals artifacts are a normalized paired CSV, paired humanized
-CSV, humanized FASTA, mutation-history CSV, endpoint residue-score Parquet, and
+CSV, humanized FASTA, `mutation_history.parquet`, endpoint residue-score
+Parquet, and
 a scientific-identity manifest. The app uses Polars for app-owned tabular
 serialization even though the upstream API internally returns pandas.
 

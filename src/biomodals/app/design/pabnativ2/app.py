@@ -658,7 +658,7 @@ def _write_bundle(
         pl.DataFrame(
             [row for result in pair_results for row in result["mutations"]],
             schema=mutation_schema,
-        ).write_csv(root / "mutations.csv")
+        ).write_parquet(root / "mutations.parquet", compression="zstd")
         for row_number, result in enumerate(pair_results, start=1):
             humanized = result["humanized"]
             identifier = sanitize_filename(humanized["id"])
@@ -673,7 +673,7 @@ def _write_bundle(
 
         files = sorted(path for path in root.rglob("*") if path.is_file())
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_name": run_name,
             "pair_count": input_frame.height,
             "input_sha256": hashlib.sha256(

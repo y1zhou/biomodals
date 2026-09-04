@@ -527,6 +527,14 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
 
     def fake_package_outputs(result_dir: Any, *, num_threads: int) -> bytes:
         assert num_threads == 2
+        assert pl.read_parquet(Path(result_dir) / "mutations.parquet").schema == {
+            "id": pl.String,
+            "chain": pl.String,
+            "imgt_position": pl.String,
+            "region": pl.String,
+            "from_aa": pl.String,
+            "to_aa": pl.String,
+        }
         captured.update(
             (path.name, path.read_bytes()) for path in Path(result_dir).iterdir()
         )
@@ -572,10 +580,11 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
         "summary.csv",
         "classifier_scores.csv",
         "alignment.csv",
-        "mutations.csv",
+        "mutations.parquet",
         "manifest.json",
     }
     assert b"accepted_mutations" not in b"".join(captured.values())
+    assert b'"schema_version": 2' in captured["manifest.json"]
 
 
 def test_workflow_function_returns_inline_archive(monkeypatch) -> None:

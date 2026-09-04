@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import replace
 from hashlib import sha256
 from io import BytesIO
@@ -58,6 +59,18 @@ VALID_CSV = (
     b"pair-1,QVQLVQSGAEVKKPGASVKVSCKASGYTFTNYGMNWVRQAPGQGLEWMG,"
     b"DIQMTQSPSSLSASVGDRVTITCRASQSI\n"
 )
+
+
+def _write_test_pair_result(
+    payload: tuple[dict[str, str], dict[str, Any]], output_path: str
+) -> None:
+    pair, _parameters = payload
+    if pair["id"] == "hard-exit":
+        os._exit(17)
+    Path(output_path).write_text(
+        AppRunResult(status=AppRunStatus.SUCCEEDED).model_dump_json(),
+        encoding="utf-8",
+    )
 
 
 def _request() -> PAbNatiV2ExecutionRequest:
@@ -195,6 +208,9 @@ def test_multi_pair_tasks_prepare_one_fixed_batch(monkeypatch) -> None:
     descriptor = node.prepare_remote_task(cast(NodeRunContext, None), tasks[0])
     call = node.prepare_remote_task_batch(cast(NodeRunContext, None), tasks)
 
+    assert descriptor == node.prepare_remote_task_batch(
+        cast(NodeRunContext, None), (tasks[0],)
+    )
     assert descriptor.function_name == "pabnativ2_humanize_batch"
     assert descriptor.max_tasks_per_call == 4
     assert call.function_name == "pabnativ2_humanize_batch"
@@ -245,39 +261,64 @@ def test_gpu_batch_worker_returns_pair_result_mapping(
     assert captured["pairs"] == pairs
 
 
-def test_batch_runner_spawns_one_process_per_pair(
+@pytest.mark.parametrize("pair_count", (1, 2))
+def test_batch_runner_spawns_one_process_per_pair_including_singletons(
+    pair_count: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pairs = [
-        {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
-        {"id": "pair-2", "vh": "DDDD", "vl": "EEEE"},
+        {"id": f"pair-{index}", "vh": "AAAA", "vl": "CCCC"}
+        for index in range(1, pair_count + 1)
     ]
-    expected = AppRunResult(status=AppRunStatus.SUCCEEDED).model_dump_json()
-    captured: dict[str, object] = {}
-
-    class FakeExecutor:
-        def __init__(self, *, max_workers: int, mp_context: Any) -> None:
-            captured["max_workers"] = max_workers
-            captured["start_method"] = mp_context.get_start_method()
-
-        def __enter__(self) -> FakeExecutor:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            pass
-
-        def map(self, _function: object, payloads: Any) -> tuple[str, str]:
-            captured["payloads"] = tuple(payloads)
-            return (expected, expected)
-
     monkeypatch.setattr(pabnativ2_app, "_validate_antibody_chains", lambda _frame: None)
-    monkeypatch.setattr("concurrent.futures.ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        pabnativ2_app, "_write_pabnativ2_pair_result", _write_test_pair_result
+    )
 
     results = pabnativ2_app._run_pabnativ2_batch(pairs=pairs)
 
-    assert list(results) == ["pair-1", "pair-2"]
-    assert captured["max_workers"] == 2
-    assert captured["start_method"] == "spawn"
+    assert list(results) == [pair["id"] for pair in pairs]
+    assert {result.status for result in results.values()} == {AppRunStatus.SUCCEEDED}
+
+
+def test_hard_child_exit_preserves_successful_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pairs = [
+        {"id": "successful", "vh": "AAAA", "vl": "CCCC"},
+        {"id": "hard-exit", "vh": "DDDD", "vl": "EEEE"},
+    ]
+    monkeypatch.setattr(pabnativ2_app, "_validate_antibody_chains", lambda _frame: None)
+    monkeypatch.setattr(
+        pabnativ2_app, "_write_pabnativ2_pair_result", _write_test_pair_result
+    )
+
+    results = pabnativ2_app._run_pabnativ2_batch(pairs=pairs)
+
+    assert results["successful"].status == AppRunStatus.SUCCEEDED
+    assert results["hard-exit"].status == AppRunStatus.FAILED
+    assert results["hard-exit"].warnings == [
+        "hard-exit: ProcessExit: child exited with code 17"
+    ]
+
+
+def test_subprocess_failure_returns_a_failed_pair_result(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pair = {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"}
+
+    def fail_pair(**_kwargs: object) -> AppRunResult:
+        raise RuntimeError("upstream failed")
+
+    monkeypatch.setattr(pabnativ2_app, "_run_pabnativ2_pair", fail_pair)
+
+    encoded = pabnativ2_app._run_pabnativ2_pair_in_subprocess((pair, {}))
+    result = AppRunResult.model_validate_json(encoded)
+
+    assert result.status == AppRunStatus.FAILED
+    assert result.warnings == ["pair-1: RuntimeError: upstream failed"]
+    assert "RuntimeError: upstream failed" in capsys.readouterr().err
 
 
 def test_execution_request_requires_gpu_capacity_and_safe_run_name() -> None:
@@ -301,8 +342,11 @@ def test_entrypoint_accepts_cli_provider_limits() -> None:
     assert "max_gpu_containers" in parameters
 
 
-def test_execution_graph_batches_four_pairs_per_gpu_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("failed_pair_id", (None, "pair-2"))
+def test_execution_graph_batches_four_pairs_and_preserves_pair_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_pair_id: str | None,
 ) -> None:
     records = tuple(
         {"id": f"pair-{index}", "vh": "AAAA", "vl": "CCCC"} for index in range(1, 6)
@@ -330,21 +374,30 @@ def test_execution_graph_batches_four_pairs_per_gpu_call(
             call_id = f"call-{pair_ids[0]}"
             self.results[call_id] = {
                 pair_id: AppRunResult(
-                    status=AppRunStatus.SUCCEEDED,
-                    outputs=[
-                        AppOutput(
-                            name="pabnativ2_pair_result",
-                            kind=ArtifactKind.REPORT,
-                            storage=InlineBytes(
-                                data=orjson.dumps({
-                                    "schema_version": 1,
-                                    "pair_result": {"humanized": {"id": pair_id}},
-                                }),
-                                filename="pabnativ2-pair.json",
-                                media_type="application/json",
+                    status=(
+                        AppRunStatus.FAILED
+                        if pair_id == failed_pair_id
+                        else AppRunStatus.SUCCEEDED
+                    ),
+                    outputs=(
+                        []
+                        if pair_id == failed_pair_id
+                        else [
+                            AppOutput(
+                                name="pabnativ2_pair_result",
+                                kind=ArtifactKind.REPORT,
+                                storage=InlineBytes(
+                                    data=orjson.dumps({
+                                        "schema_version": 1,
+                                        "pair_result": {"humanized": {"id": pair_id}},
+                                    }),
+                                    filename="pabnativ2-pair.json",
+                                    media_type="application/json",
+                                ),
                             ),
-                        )
-                    ],
+                        ]
+                    ),
+                    warnings=(["pair failed"] if pair_id == failed_pair_id else []),
                     metrics={"pair_count": 1},
                 ).model_dump(mode="json")
                 for pair_id in pair_ids
@@ -396,10 +449,21 @@ def test_execution_graph_batches_four_pairs_per_gpu_call(
         ["pair-1", "pair-2", "pair-3", "pair-4"],
         ["pair-5"],
     ]
-    assert result.status == AppRunStatus.SUCCEEDED
+    assert result.status == (
+        AppRunStatus.FAILED if failed_pair_id is not None else AppRunStatus.SUCCEEDED
+    )
+    assert [
+        task.status.value for task in store.execution.list_tasks(run_id, HUMANIZE_NODE)
+    ] == [
+        "failed" if pair_id == failed_pair_id else "succeeded"
+        for pair_id in ("pair-1", "pair-2", "pair-3", "pair-4", "pair-5")
+    ]
     publication = store.artifacts.load_node_result(COLLECT_NODE)
-    assert publication is not None
-    assert publication.metrics["pair_count"] == 5
+    if failed_pair_id is None:
+        assert publication is not None
+        assert publication.metrics["pair_count"] == 5
+    else:
+        assert publication is None
     runtime.close()
 
 

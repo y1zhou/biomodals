@@ -807,6 +807,14 @@ def _run_pabnativ2_pair(
     )
 
 
+def _pabnativ2_pair_failure(pair_id: str, reason: str) -> AppRunResult:
+    return AppRunResult(
+        status=AppRunStatus.FAILED,
+        warnings=[f"{pair_id}: {reason}"],
+        metrics={"pair_count": 1, "mutation_count": 0},
+    )
+
+
 def _run_pabnativ2_pair_in_subprocess(
     payload: tuple[dict[str, str], dict[str, Any]],
 ) -> str:
@@ -815,7 +823,22 @@ def _run_pabnativ2_pair_in_subprocess(
     try:
         return _run_pabnativ2_pair(pair=pair, **parameters).model_dump_json()
     except Exception as exc:
-        raise RuntimeError(f"p-AbNatiV2 pair {pair.get('id')!r} failed: {exc}") from exc
+        import traceback
+
+        traceback.print_exc()
+        return _pabnativ2_pair_failure(
+            pair["id"], f"{type(exc).__name__}: {exc}"
+        ).model_dump_json()
+
+
+def _write_pabnativ2_pair_result(
+    payload: tuple[dict[str, str], dict[str, Any]],
+    output_path: str,
+) -> None:
+    """Write one pair outcome outside multiprocessing transport state."""
+    Path(output_path).write_text(
+        _run_pabnativ2_pair_in_subprocess(payload), encoding="utf-8"
+    )
 
 
 def _run_pabnativ2_batch(
@@ -855,22 +878,55 @@ def _run_pabnativ2_batch(
         "forbidden_residues": forbidden_residues,
         "seed": seed,
     }
-    if len(normalized_pairs) == 1:
-        pair = normalized_pairs[0]
-        return {pair["id"]: _run_pabnativ2_pair(pair=pair, **parameters)}
-
-    from concurrent.futures import ProcessPoolExecutor
     from multiprocessing import get_context
 
     payloads = [(pair, parameters) for pair in normalized_pairs]
-    with ProcessPoolExecutor(
-        max_workers=len(payloads), mp_context=get_context("spawn")
-    ) as executor:
-        encoded = tuple(executor.map(_run_pabnativ2_pair_in_subprocess, payloads))
-    return {
-        pair["id"]: AppRunResult.model_validate_json(content)
-        for pair, content in zip(normalized_pairs, encoded, strict=True)
-    }
+    context = get_context("spawn")
+    results: dict[str, AppRunResult] = {}
+    with TemporaryDirectory(prefix="pabnativ2_batch_") as temporary:
+        workers = []
+        for index, (pair, payload) in enumerate(
+            zip(normalized_pairs, payloads, strict=True)
+        ):
+            output_path = Path(temporary) / f"{index}.json"
+            process = context.Process(
+                target=_write_pabnativ2_pair_result,
+                args=(payload, str(output_path)),
+            )
+            try:
+                process.start()
+            except Exception as exc:
+                import traceback
+
+                traceback.print_exc()
+                results[pair["id"]] = _pabnativ2_pair_failure(
+                    pair["id"], f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                workers.append((pair, output_path, process))
+
+        for pair, output_path, process in workers:
+            process.join()
+            if process.exitcode != 0:
+                results[pair["id"]] = _pabnativ2_pair_failure(
+                    pair["id"],
+                    f"ProcessExit: child exited with code {process.exitcode}",
+                )
+                continue
+            try:
+                if output_path.stat().st_size > 2 * MAX_PAIR_RESULT_BYTES:
+                    raise ValueError("child result exceeds the byte limit")
+                results[pair["id"]] = AppRunResult.model_validate_json(
+                    output_path.read_bytes()
+                )
+            except Exception as exc:
+                import traceback
+
+                traceback.print_exc()
+                results[pair["id"]] = _pabnativ2_pair_failure(
+                    pair["id"], f"{type(exc).__name__}: {exc}"
+                )
+    return {pair["id"]: results[pair["id"]] for pair in normalized_pairs}
 
 
 def _aggregate_pabnativ2_results(
@@ -1153,7 +1209,9 @@ def submit_pabnativ2_task(
         mutate_cdrs: Permit CDR mutations in addition to framework mutations.
         fixed_vh_positions: Comma-separated protected heavy-chain AHo positions.
         fixed_vl_positions: Comma-separated protected light-chain AHo positions.
-        residue_score_threshold: Residue score below which positions are candidates.
+        residue_score_threshold: Residue score at or below which positions take
+            the score-liability route; framework PSSM mismatches are an independent
+            liability route in upstream p-AbNatiV2.
         rasa_threshold: Minimum relative solvent accessibility for mutation.
         max_relative_pairing_score_decrease: Maximum accepted pairing-score loss.
         forbidden_residues: Comma-separated amino acids forbidden as replacements.

@@ -953,10 +953,12 @@ _Avoid_: binding preservation, experimental structure comparison, mutation score
 
 **p-AbNatiV2 Eligible Position**:
 An AHo position that is allowed by the chain's mutation policy, is not fixed,
-meets the solvent-accessibility threshold, has a residue score at or below the
-liability threshold, and has at least one permitted human-PSSM substitution.
-CDRs are ineligible by default and become eligible only through explicit
-opt-in; opting in never overrides a fixed position.
+meets the solvent-accessibility threshold, has at least one permitted human-PSSM
+substitution, and is liable through either a residue score at or below the
+threshold or a framework parental residue absent from the permitted human PSSM
+set. The PSSM-mismatch route applies only to framework positions. CDRs are
+ineligible by default and become eligible only through explicit opt-in; opting
+in never overrides a fixed position.
 _Avoid_: low-scoring position alone, raw sequence offset, guaranteed mutation
 
 **p-AbNatiV2 Pairing-Loss Limit**:

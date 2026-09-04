@@ -144,10 +144,15 @@ archives are separately published on
 [Zenodo](https://zenodo.org/records/17466150); they are not needed for
 inference.
 
-The scientific identity of an app run therefore includes at least the code
-version, paired checkpoint checksum, dependency lock, AHo alignment behavior,
-humanization parameters, and structure-prediction checkpoint. Hardware is
-operational metadata rather than part of the scientific fingerprint.
+The scientific identity of an app run therefore includes the code version,
+paired checkpoint checksum, pinned top-level runtime dependencies, AHo alignment
+behavior, humanization parameters, and structure-prediction checkpoint.
+Hardware is operational metadata rather than part of the scientific
+fingerprint. During active development, the environment is not yet a fully
+resolved transitive dependency lock: compatible Python patch releases, Conda
+builds, and transitive packages may change when an image is rebuilt. A complete
+resolved lock and its digest are deferred to release hardening, so the current
+runtime fingerprint must not be described as release-grade reproducibility.
 
 ## Input contract and alignment
 
@@ -243,12 +248,15 @@ pair. Its default search:
 3. limits candidates to permitted AHo positions, by default framework
    positions, intersected with residues whose predicted relative solvent
    accessibility is at least 0.15;
-4. proposes residues from human heavy and kappa/lambda PSSMs above a 1%
+4. treats a position as liable when its residue score is at or below the
+   configured threshold or, for framework positions independently, when the
+   parental residue is absent from the permitted human PSSM set;
+5. proposes residues from human heavy and kappa/lambda PSSMs above a 1%
    frequency cutoff while excluding C, M, and gap;
-5. greedily tries liabilities ordered by the dependence estimate, maximizing a
+6. greedily tries liabilities ordered by the dependence estimate, maximizing a
    weighted change in joint humanness and pairing score while rejecting excess
    pairing-score decreases; and
-6. re-scores the input and final pair and predicts both structures for
+7. re-scores the input and final pair and predicts both structures for
    scaffold/CDR displacement reporting
    ([paired humanizer](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/humanisation/vh_vl_humanisation_functions.py),
    [search utilities](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/humanisation/humanisation_utils.py)).
@@ -442,11 +450,14 @@ completes, including when it returns an unchanged pair. The initial app defines
 no additional target score. Invalid input or an execution error remains a batch
 failure under the shared Humanization Batch contract.
 
-## Required oracle and acceptance tests
+## Validation and acceptance tests
 
-1. Freeze one known VH/VL pair and compare aligned sequences, final humanized
-   pair, mutation list, all sequence/region scores, pairing score, percentiles,
-   and input/final residue matrices against an isolated upstream 2.0.8 oracle.
+1. Perform a one-time manual comparison of a known VH/VL pair against a direct
+   upstream 2.0.8 run, covering the aligned and final sequences, mutations,
+   sequence/region and pairing scores, percentiles, and endpoint residue
+   matrices. Record the setup and result in the research documentation; do not
+   commit the run harness or a frozen oracle fixture that future CI cannot
+   regenerate through Modal.
 2. Test heavy/light type swaps, missing chains, duplicate/empty IDs, ambiguous
    residues, lowercase, overlong input, ANARCI failure, and a mixed batch where
    one row is invalid. No row may disappear silently.
@@ -458,8 +469,8 @@ failure under the shared Humanization Batch contract.
    CPU must not serve as an equivalent fallback.
 5. Verify both published asset checksums and prove runtime network access is not
    required.
-6. Pin an expected one-pair resource envelope and fail clearly when structure
-   prediction, alignment, or scoring exceeds it.
+6. Record the observed one-pair resource envelope in the benchmark document.
+   Do not make a roughly 30-minute Modal inference run part of routine CI.
 
 The initial app targets equivalence to the pinned 2.0.8 source rather than the
 paper's ten-structure protocol. Its non-commercial license and research-use

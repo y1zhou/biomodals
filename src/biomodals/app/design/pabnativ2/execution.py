@@ -327,17 +327,10 @@ class _PAbNatiV2HumanizeNode(TaskProviderNode):
         task: TaskDefinition,
     ) -> ProviderCallSpec:
         """Preserve the direct worker for a one-pair input."""
+        if len(self.records) > 1:
+            return self.prepare_remote_task_batch(context, (task,))
         del context
         pair = self._pair(task)
-        if len(self.records) > 1:
-            return ProviderCallSpec(
-                function_name="pabnativ2_humanize_batch",
-                uses_gpu=True,
-                runtime_image_key="pabnativ2-a10g-batch",
-                compatibility_key="pabnativ2-four-pair-batch",
-                max_tasks_per_call=PAIRS_PER_GPU_CALL,
-                kwargs={"pairs": [pair], **_worker_kwargs(self.request)},
-            )
         return ProviderCallSpec(
             function_name="pabnativ2_humanize_pair",
             uses_gpu=True,

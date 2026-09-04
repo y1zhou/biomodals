@@ -123,3 +123,32 @@ inputs retain durable per-pair Tasks but group provider calls into stable
 batches of four, with a final smaller batch when needed. The multiprocessing
 worker uses `cpu=(0.125, 8.125)` and `memory=(512, 65536)`. All benchmark
 instrumentation was temporary and is excluded from production commits.
+
+## Direct-upstream output comparison
+
+Date: 2026-09-04
+
+Modal app `ap-JAQ0VlKqjU9OzRSfXFKHMV` called the installed upstream AbNatiV
+2.0.8 paired humanizer and paired scorer directly, bypassing the Biomodals
+execution, normalization, and packaging code. It used the pinned compatibility
+image and model assets, an A10G, the 3F8 input, pair seed `2049599637`, and the
+same source-default controls as the accepted final-image cold result. The run
+started device calculation at 14:53:18 SGT and completed at 15:19:57 SGT,
+approximately 1,599 seconds later. The temporary harness and raw output remain
+outside the repository.
+
+The comparison target was the existing
+`pabnativ2_a10_lightning255_cold_pabnativ2.tar.zst` result. The direct upstream
+run produced identical final VH and VL sequences, the same 28 mutations, and
+identical input/final AHo alignments and ordered endpoint residue keys. Maximum
+absolute differences were `3.16e-10` across sequence, region, pairing, and
+percentile scores; `2.96e-8` across observed residue scores and
+reconstruction-probability matrices; and zero across the reported scaffold/CDR
+displacement values. These differences are floating-point noise, so the
+production wrapper preserves the pinned upstream scientific output for this
+oracle pair.
+
+This is a one-time manual source comparison, not a committed fixture or a
+routine CI test. Future CI cannot regenerate the oracle without a long Modal
+GPU run, so local tests instead cover input validation, field normalization,
+batch scheduling, per-pair failures, and aggregation deterministically.

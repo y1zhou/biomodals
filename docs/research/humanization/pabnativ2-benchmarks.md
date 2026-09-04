@@ -75,3 +75,47 @@ was also identical to the Lightning 2.5.0 A10G baseline except for expected
 runtime identity metadata and 0.001–0.002 Å PDB differences. Warm reuse does
 not materially reduce wall time because model initialization and asset
 validation are negligible beside the greedy search.
+
+## Three-pair concurrency in one A10G container
+
+Date: 2026-09-04
+
+Modal app `ap-2iDgJN70qV2E2wDHQqN9Wi` ran the upstream test pairs 3F8,
+Abagovomab, and Abciximab simultaneously as three spawned processes in one
+A10G container. The container used `cpu=(0.125, 8.125)` and
+`memory=(512, 65536)`. Each child used its own derived seed and temporary
+directory and initialized its own CUDA models. The benchmark imposed a
+40-minute cutoff but completed normally before it.
+
+| Pair | Completion | Mutations | Peak child RSS |
+| --- | ---: | ---: | ---: |
+| Abciximab | 553.3 s | 2 | 8,150.5 MiB |
+| Abagovomab | 733.1 s | 9 | 8,598.4 MiB |
+| 3F8 | 1,681.7 s | 28 | 8,506.6 MiB |
+
+The complete three-pair container call took 1,686.1 seconds (28.1 minutes).
+The long-running 3F8 pair was only 33.2 seconds, or 2.0%, slower than its
+1,648.5-second one-pair cold baseline. It produced the same final VH and VL and
+the same 28 mutations as the baseline. The two additional pairs completed
+while 3F8 was still running, so this workload compressed 49.5 minutes of
+observed child elapsed time into 28.1 billed A10G minutes without materially
+delaying the longest pair. Pair runtime remained strongly search-dependent:
+the two-edit Abciximab result completed much earlier than 3F8.
+
+Ten-second `nvidia-smi` samples measured 9.0% mean and 100% peak GPU
+utilization, compared with 5.4% mean for the one-pair baseline. Peak GPU memory
+was 15,345 MiB. During the three-way phase, direct cgroup inspection measured
+about three CPU cores and at most 11.2 GiB current host-memory use. Child peak
+RSS values include shared mappings and must not be added together. The
+benchmark harness expected cgroup v2 counters while the Modal container used
+cgroup v1, so no continuous CPU or host-memory series was retained; the
+reported values are live cgroup observations taken during the run.
+
+Naive three-process concurrency is therefore viable for this tested mix: it
+fit comfortably on one A10G, preserved the known 3F8 discrete result, and did
+not push the longest pair near the cutoff. This measurement does not establish
+the optimal fixed batch size or guarantee the same memory and latency for
+three worst-case pairs. The production one-pair-per-container topology remains
+unchanged until that cost-versus-tail-latency tradeoff is explicitly selected.
+All benchmark instrumentation was temporary and is excluded from production
+commits.

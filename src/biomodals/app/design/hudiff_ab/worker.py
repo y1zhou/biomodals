@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -34,6 +35,7 @@ CSV_COLUMNS = frozenset({"id", "vh", "vl"})
 MODEL_ROOT = Path("/biomodals-store/hudiff")
 SOURCE_ROOT = Path("/opt/HuDiff")
 MAX_PAIR_RESULT_BYTES = 4 * 1024 * 1024
+PAIRS_PER_GPU_CALL = 2
 REGION_NAMES = ("FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4")
 
 
@@ -348,3 +350,45 @@ def hudiff_ab_humanize_pair(
             "mutation_count": len(normalized["mutations"]),
         },
     )
+
+
+def hudiff_ab_humanize_batch(
+    *,
+    pairs: list[dict[str, str]],
+    candidate_count: int = 10,
+    seed: int = 42,
+    sampling_order: str = "shuffle",
+    upstream_inference_dropout: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Humanize at most two validated pairs in concurrent subprocesses."""
+    if not isinstance(pairs, list) or not 1 <= len(pairs) <= PAIRS_PER_GPU_CALL:
+        raise ValueError("HuDiff-Ab GPU batch must contain one or two pairs")
+    for pair in pairs:
+        validate_pair(pair)
+    if len({pair["id"] for pair in pairs}) != len(pairs):
+        raise ValueError("HuDiff-Ab GPU batch IDs must be unique")
+    _validate_controls(
+        candidate_count, seed, sampling_order, upstream_inference_dropout
+    )
+    results: dict[str, AppRunResult] = {}
+    with ThreadPoolExecutor(max_workers=len(pairs)) as executor:
+        futures = {
+            pair["id"]: executor.submit(
+                hudiff_ab_humanize_pair,
+                pair=pair,
+                candidate_count=candidate_count,
+                seed=seed,
+                sampling_order=sampling_order,
+                upstream_inference_dropout=upstream_inference_dropout,
+            )
+            for pair in pairs
+        }
+        for pair_id, future in futures.items():
+            try:
+                results[pair_id] = future.result()
+            except Exception as exc:
+                results[pair_id] = AppRunResult(
+                    status=AppRunStatus.FAILED,
+                    warnings=[f"{pair_id}: {type(exc).__name__}: {exc}"],
+                )
+    return {pair["id"]: results[pair["id"]].model_dump(mode="json") for pair in pairs}

@@ -27,6 +27,7 @@ from biomodals.app.design.hudiff_ab.execution import (
     _HuDiffAbHumanizeNode,
 )
 from biomodals.execution.nodes import NodeRunContext
+from biomodals.schema import AppRunResult, AppRunStatus
 
 VH = "QVQLKQSGPGLVAPSQSLSITCTVSGFSLINYAISWVRQPPGKGLEWLGVIWTGGGTNYNSALKSRLSISKDNSKSQVFLKMNSLQTDDTARYYCARKDYYGRYYGMDYWGQGTSVTVS"
 VL = "QAVVTQESALTTSPGETVTLTCRSSTGAVTTSNYANWVQEKPDHLFTGLIGGTNNRAPGVPARFSGSLIGDKAALTITGAQTEDEAIYFCALWYNNHWVFGGGTKLTVL"
@@ -112,6 +113,51 @@ def test_request_roundtrips_and_plans_one_gpu_task_per_pair(monkeypatch) -> None
     assert call.runtime_image_key == "hudiff_ab-a10g"
     assert call.kwargs["candidate_count"] == 10
     assert call.kwargs["upstream_inference_dropout"] is True
+
+
+def test_multi_pair_tasks_prepare_fixed_batches_of_two(monkeypatch) -> None:
+    records = tuple(
+        {"id": f"pair-{index}", "vh": VH, "vl": VL} for index in range(1, 4)
+    )
+    monkeypatch.setattr(execution, "_pair_records", lambda _content: records)
+    node = _HuDiffAbHumanizeNode(_request())
+    tasks = node.discover_remote_tasks(cast(NodeRunContext, None))
+
+    pair_call = node.prepare_remote_task_batch(cast(NodeRunContext, None), tasks[:2])
+    singleton_call = node.prepare_remote_task(cast(NodeRunContext, None), tasks[2])
+
+    assert pair_call.function_name == "hudiff_ab_humanize_batch"
+    assert pair_call.max_tasks_per_call == 2
+    assert [pair["id"] for pair in pair_call.kwargs["pairs"]] == [
+        "pair-1",
+        "pair-2",
+    ]
+    assert singleton_call.function_name == "hudiff_ab_humanize_batch"
+    assert singleton_call.kwargs["pairs"][0]["id"] == "pair-3"
+
+
+def test_batch_worker_preserves_pair_success_and_failure(monkeypatch) -> None:
+    pairs = [
+        {"id": "successful", "vh": VH, "vl": VL},
+        {"id": "failed", "vh": VH, "vl": VL},
+    ]
+    monkeypatch.setattr(worker, "validate_pair", lambda _pair: None)
+
+    def fake_humanize(*, pair: dict[str, str], **_kwargs: object) -> AppRunResult:
+        if pair["id"] == "failed":
+            raise RuntimeError("expected failure")
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(worker, "hudiff_ab_humanize_pair", fake_humanize)
+
+    raw = worker.hudiff_ab_humanize_batch(pairs=pairs)
+    results = {
+        pair_id: AppRunResult.model_validate(result) for pair_id, result in raw.items()
+    }
+
+    assert results["successful"].status == AppRunStatus.SUCCEEDED
+    assert results["failed"].status == AppRunStatus.FAILED
+    assert results["failed"].warnings == ["failed: RuntimeError: expected failure"]
 
 
 def test_pair_seed_is_repeatable_and_input_specific() -> None:

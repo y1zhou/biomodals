@@ -38,6 +38,9 @@ from biomodals.app.design.hudiff_ab.validation import (
     parse_hudiff_ab_csv,
 )
 from biomodals.app.design.hudiff_ab.worker import (
+    hudiff_ab_humanize_batch as _hudiff_ab_humanize_batch,
+)
+from biomodals.app.design.hudiff_ab.worker import (
     hudiff_ab_humanize_pair as _hudiff_ab_humanize_pair,
 )
 from biomodals.execution import (
@@ -318,6 +321,15 @@ hudiff_ab_humanize_pair = app.function(
     volumes=CONF.mounts(model_volume=True, model_mount_subdir=False),
 )(_hudiff_ab_humanize_pair)
 
+hudiff_ab_humanize_batch = app.function(
+    image=runtime_image,
+    cpu=(0.125, 8.125),
+    memory=(512, 65536),
+    gpu="A10G",
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(model_volume=True, model_mount_subdir=False),
+)(_hudiff_ab_humanize_batch)
+
 
 @app.function(
     cpu=2,
@@ -459,7 +471,10 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
     if not development:
         return ModalCallDriver()
     return development_modal_call_driver(
-        {"hudiff_ab_humanize_pair": hudiff_ab_humanize_pair},
+        {
+            "hudiff_ab_humanize_batch": hudiff_ab_humanize_batch,
+            "hudiff_ab_humanize_pair": hudiff_ab_humanize_pair,
+        },
         workload_name=CONF.name,
     )
 

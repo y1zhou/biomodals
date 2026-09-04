@@ -191,8 +191,7 @@ retained as invalid with `changed IMGT grid occupancy`, confirming the declared
 no-resampling policy. The resulting archive contained all six specified files
 and a typed `mutations.parquet` table.
 
-The initial production shape remains one pair per A10G Provider Call with a
-run-wide GPU-call default of one pending a deliberate pair-concurrency decision.
+The single-pair production path remains one pair per A10G Provider Call.
 
 A subsequent two-pair experiment ran the distinct 7K9I and 3F8 pairs as two
 simultaneous upstream subprocesses in one A10G container with
@@ -210,9 +209,12 @@ take about 32 seconds. Sharing one A10G therefore produced a 1.29-times
 throughput improvement and reduced billed GPU time per pair by about 22%, while
 raising two-pair latency by about 55% relative to two independent A10G
 containers. This is a useful cost optimization but not a wall-time optimization.
-The production shape remains unchanged pending an explicit choice between those
-objectives. Benchmark-only code and instrumentation were removed after both
-runs. The runs are
+Multi-pair production requests therefore use scheduler-owned fixed batches of
+two, with a final singleton batch when needed. Each pair retains its own durable
+Task identity, derived seed, validation, result, and failure status. The batch
+worker uses the benchmarked A10G, `cpu=(0.125, 8.125)`, and
+`memory=(512, 65536)` shape. Benchmark-only code and instrumentation were
+removed after both runs. The runs are
 [`ap-5Dvs11VugFNNafAmffzu4j`](https://modal.com/apps/innocare/main/ap-5Dvs11VugFNNafAmffzu4j)
 and
 [`ap-WRJSlmBHIIp2FuJkYZ0L1G`](https://modal.com/apps/innocare/main/ap-WRJSlmBHIIp2FuJkYZ0L1G).
@@ -581,13 +583,13 @@ CDR mutation would not be HuDiff-Ab-equivalent. Enforce the initial 1,000-pair,
 3 MiB input, 1–10 attempts-per-pair, and 10,000-total-attempt limits before
 dispatch and again at the worker boundary.
 
-Initially use one GPU worker per pair, with candidate replicas batched inside
-that worker. Represent multi-pair CLI work as an ExecutionDefinition with
-durable per-pair Tasks and bounded scheduling so workflow callers and
-standalone callers share the same scientific operation. Start with the single
-cold A10G measurement specified above; only then consider grouping independent
-pairs in one GPU container. The authors' RTX 3060 Ti result suggests CPU should
-be an oracle path, not the default production resource.
+Use the direct A10G worker when the request contains one pair. For multi-pair
+requests, group durable per-pair Tasks into fixed batches of two and run the two
+upstream processes concurrently in one A10G container. A final odd pair uses a
+singleton batch worker. The ExecutionDefinition and bounded scheduler keep
+workflow and standalone callers on the same scientific operation while
+preserving independent pair outcomes. The authors' RTX 3060 Ti result suggests
+CPU should be an oracle path, not the default production resource.
 
 Return a compact inline `.tar.zst` containing:
 

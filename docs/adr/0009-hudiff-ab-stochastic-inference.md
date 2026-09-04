@@ -39,9 +39,11 @@ an invented independent per-attempt seed.
 
 The first implementation accepts 1–10 attempts per pair and at most 10,000
 attempts over the existing 1,000-pair input ceiling. It validates the complete
-batch before dispatch and each pair again before model loading. One pair maps
-to one A10G Provider Call with a default GPU-call ceiling of one until benchmark
-evidence justifies in-container batching or wider fan-out.
+batch before dispatch and each provider batch again before model loading. A
+single-pair request maps directly to one A10G Provider Call. Multi-pair requests
+use scheduler-owned fixed batches of two; the final call may contain one pair.
+Each batch runs its pairs as concurrent upstream subprocesses with independently
+derived seeds and retains one independently publishable Task result per pair.
 
 The operation returns one inline `.tar.zst` containing normalized input, all
 attempts, valid unique candidates, paired candidate FASTA,
@@ -54,8 +56,6 @@ on one A10G in 16.00 seconds. Two-second samples showed 0.97 mean CPU core,
 7.27 GiB maximum sampled host memory, 39.9% mean and 90% peak GPU utilization,
 and 1.96 GiB peak GPU memory. Nine attempts were valid unique candidates and
 one was a duplicate.
-These measurements retain the one-pair-per-call implementation for now; they
-do not establish that independent pairs will scale within one GPU process.
 
 A later two-process experiment completed distinct 7K9I and 3F8 pairs together
 on one A10G in 24.67 and 24.89 seconds across two cold containers. The
@@ -64,5 +64,6 @@ instrumented run averaged 1.89 CPU cores, reached 4,002 MiB GPU memory, and held
 17.50 GiB, although that `/proc` sum double-counts shared pages. Against the
 16.00-second single-pair baseline, this improves throughput by 1.29 times and
 reduces GPU time per pair by about 22%, but it is slower than running two A10G
-containers in parallel. Production batching remains deferred until cost versus
-wall-time priority is chosen.
+containers in parallel. The production implementation therefore keeps the
+single-pair direct path and uses fixed two-pair batches for multi-pair requests.
+The batch worker permits up to 64 GiB host memory, matching the measured shape.

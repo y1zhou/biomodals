@@ -52,6 +52,7 @@ MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RESULT_BYTES = 64 * 1024 * 1024
 MAX_PAIR_RESULT_BYTES = 4 * 1024 * 1024
 MAX_RESULT_DESCRIPTOR_BYTES = 64 * 1024
+PAIRS_PER_GPU_CALL = 2
 HUMANIZE_NODE = "humanize"
 COLLECT_NODE = "collect"
 _REQUEST_FILE = ExecutionRequestFile(
@@ -123,7 +124,7 @@ class HuDiffAbExecutionRequest:
 
     @property
     def execution_plan(self) -> ExecutionPlan:
-        """Describe the initial single-container scientific run."""
+        """Describe the paired humanization run."""
         return ExecutionPlan(
             workload_name="hudiff_ab",
             workload_run_key=self.run_name,
@@ -288,7 +289,9 @@ class _HuDiffAbHumanizeNode(TaskProviderNode):
         context: NodeRunContext,
         task: TaskDefinition,
     ) -> ProviderCallSpec:
-        """Send exactly one validated pair to one A10G worker."""
+        """Preserve the direct worker for a one-pair input."""
+        if len(self.records) > 1:
+            return self.prepare_remote_task_batch(context, (task,))
         del context
         pair = self._pair(task)
         return ProviderCallSpec(
@@ -297,6 +300,47 @@ class _HuDiffAbHumanizeNode(TaskProviderNode):
             runtime_image_key="hudiff_ab-a10g",
             kwargs={"pair": pair, **_worker_kwargs(self.request)},
         )
+
+    def prepare_remote_task_batch(
+        self,
+        context: NodeRunContext,
+        tasks: tuple[TaskDefinition, ...],
+    ) -> ProviderCallSpec:
+        """Send up to two ordered pairs to one concurrent A10G worker."""
+        if len(self.records) == 1:
+            if len(tasks) != 1:
+                raise ValueError("Single-pair HuDiff-Ab input cannot be batched")
+            return self.prepare_remote_task(context, tasks[0])
+        del context
+        if not 1 <= len(tasks) <= PAIRS_PER_GPU_CALL:
+            raise ValueError("HuDiff-Ab GPU batches must contain one or two pairs")
+        return ProviderCallSpec(
+            function_name="hudiff_ab_humanize_batch",
+            uses_gpu=True,
+            runtime_image_key="hudiff_ab-a10g-batch",
+            compatibility_key="hudiff_ab-two-pair-batch",
+            max_tasks_per_call=PAIRS_PER_GPU_CALL,
+            kwargs={
+                "pairs": [self._pair(task) for task in tasks],
+                **_worker_kwargs(self.request),
+            },
+        )
+
+    def process_remote_task_batch_result(
+        self,
+        task_keys: tuple[str, ...],
+        result: Any,
+        metadata: Mapping[str, Any],
+    ) -> Mapping[str, AppRunResult]:
+        """Restore one independently publishable result per pair Task."""
+        if len(self.records) == 1:
+            return super().process_remote_task_batch_result(task_keys, result, metadata)
+        if not isinstance(result, Mapping) or set(result) != set(task_keys):
+            raise ValueError("HuDiff-Ab batch result does not match its pair Tasks")
+        return {
+            task_key: AppRunResult.model_validate(result[task_key])
+            for task_key in task_keys
+        }
 
     def finalize_remote_tasks(
         self,
@@ -430,7 +474,7 @@ class _CollectHuDiffAbResultsNode(CoordinatorNode):
 def hudiff_ab_execution_graph(
     request: HuDiffAbExecutionRequest,
 ) -> ExecutionGraph:
-    """Build durable one-pair GPU Tasks followed by local collection."""
+    """Build fixed two-pair GPU batches followed by local collection."""
     graph = ExecutionGraph(
         "hudiff_ab",
         plan_metadata=ExecutionPlanMetadata(

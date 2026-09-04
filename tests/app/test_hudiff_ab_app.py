@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import cast
 
+import orjson
 import polars as pl
 import pytest
 
@@ -142,6 +145,8 @@ def test_batch_worker_preserves_pair_success_and_failure(monkeypatch) -> None:
         {"id": "failed", "vh": VH, "vl": VL},
     ]
     monkeypatch.setattr(worker, "validate_pair", lambda _pair: None)
+    monkeypatch.setattr(worker, "_prepare_upstream_runtime", lambda: None)
+    monkeypatch.setattr(worker, "_asset_manifest", lambda: {})
 
     def fake_humanize(*, pair: dict[str, str], **_kwargs: object) -> AppRunResult:
         if pair["id"] == "failed":
@@ -158,6 +163,41 @@ def test_batch_worker_preserves_pair_success_and_failure(monkeypatch) -> None:
     assert results["successful"].status == AppRunStatus.SUCCEEDED
     assert results["failed"].status == AppRunStatus.FAILED
     assert results["failed"].warnings == ["failed: RuntimeError: expected failure"]
+
+
+def test_batch_initializes_runtime_once_before_concurrent_helpers(monkeypatch) -> None:
+    pairs = [
+        {"id": "one", "vh": VH, "vl": VL},
+        {"id": "two", "vh": VH, "vl": VL},
+    ]
+    calls = {"patch": 0, "assets": 0}
+    monkeypatch.setattr(worker, "validate_pair", lambda _pair: None)
+    monkeypatch.setattr(
+        worker,
+        "apply_hudiff_inference_patches",
+        lambda: calls.__setitem__("patch", calls["patch"] + 1),
+    )
+    monkeypatch.setattr(
+        worker,
+        "assert_hudiff_assets",
+        lambda _root: calls.__setitem__("assets", calls["assets"] + 1) or {},
+    )
+    worker._prepare_upstream_runtime.cache_clear()
+    worker._asset_manifest.cache_clear()
+
+    def fake_humanize(**_kwargs: object) -> AppRunResult:
+        worker._prepare_upstream_runtime()
+        worker._asset_manifest()
+        return AppRunResult(status=AppRunStatus.SUCCEEDED)
+
+    monkeypatch.setattr(worker, "hudiff_ab_humanize_pair", fake_humanize)
+    try:
+        worker.hudiff_ab_humanize_batch(pairs=pairs)
+    finally:
+        worker._prepare_upstream_runtime.cache_clear()
+        worker._asset_manifest.cache_clear()
+
+    assert calls == {"patch": 1, "assets": 1}
 
 
 def test_pair_seed_is_repeatable_and_input_specific() -> None:
@@ -186,6 +226,67 @@ def test_attempt_validation_rejects_protected_position_changes() -> None:
         worker._attempt_error(attempt, output, {"id": "x", "vh": "A", "vl": "C"})
         == "changed protected CDR or terminal position"
     )
+
+
+def test_attempt_validation_checks_independent_imgt_grid(monkeypatch) -> None:
+    fake_anarci = ModuleType("anarci")
+
+    def number(sequence: str, *, scheme: str):
+        assert scheme == "imgt"
+        return (
+            [((index, ""), residue) for index, residue in enumerate(sequence, 1)],
+            "H" if sequence == "AC" else "K",
+        )
+
+    fake_anarci.__dict__["number"] = number
+    monkeypatch.setitem(sys.modules, "anarci", fake_anarci)
+    output = {
+        "input_vh_aligned": "A-C" + "-" * 149,
+        "input_vl_aligned": "D" + "-" * 138,
+        "mutable_indices": [],
+        "vh_positions": ["1", "2", "3", *([None] * 149)],
+        "vl_positions": ["1", *([None] * 138)],
+    }
+    attempt = {
+        "vh": "AC",
+        "vl": "D",
+        "vh_aligned": output["input_vh_aligned"],
+        "vl_aligned": output["input_vl_aligned"],
+    }
+
+    assert (
+        worker._attempt_error(attempt, output, {"id": "x", "vh": "AC", "vl": "D"})
+        == "decoded sequence does not match independent IMGT numbering"
+    )
+
+
+def test_attempt_validation_preserves_parental_light_type(monkeypatch) -> None:
+    fake_anarci = ModuleType("anarci")
+
+    def number(sequence: str, *, scheme: str):
+        assert scheme == "imgt"
+        chain_type = "H" if sequence == "A" else {"C": "K", "D": "L"}[sequence]
+        return ([((1, ""), sequence)], chain_type)
+
+    fake_anarci.__dict__["number"] = number
+    monkeypatch.setitem(sys.modules, "anarci", fake_anarci)
+    output = {
+        "input_vh_aligned": "A" + "-" * 151,
+        "input_vl_aligned": "C" + "-" * 138,
+        "mutable_indices": [152],
+        "vh_positions": ["1", *([None] * 151)],
+        "vl_positions": ["1", *([None] * 138)],
+    }
+    attempt = {
+        "vh": "A",
+        "vl": "D",
+        "vh_aligned": output["input_vh_aligned"],
+        "vl_aligned": "D" + "-" * 138,
+    }
+
+    assert worker._attempt_error(
+        attempt, output, {"id": "x", "vh": "A", "vl": "C"}
+    ) == ("generated VL changed the input chain type")
 
 
 def test_normalization_deduplicates_only_valid_attempts(monkeypatch) -> None:
@@ -288,6 +389,39 @@ def test_verified_checkpoint_audit_values_are_pinned() -> None:
     )
     assert antibody.size_bytes == 479_136_082
     assert antibody.sha256 == models.ANTIBODY_CHECKPOINT_SHA256
+    assert "hmmer=3.3.2" in models.RUNTIME_IDENTITY
+    assert (
+        f"resolved-environment={models.RUNTIME_ENVIRONMENT_SHA256}"
+        in models.RUNTIME_IDENTITY
+    )
+
+
+def test_checkpoint_publication_replaces_files_without_deleting_tree(
+    monkeypatch, tmp_path: Path
+) -> None:
+    content = b"new checkpoint"
+    checkpoint = models.CheckpointSpec(
+        "checkpoints/antibody/test.pt",
+        len(content),
+        hashlib.sha256(content).hexdigest(),
+    )
+    monkeypatch.setattr(models, "CHECKPOINTS", (checkpoint,))
+    root = tmp_path / "models"
+    staging = tmp_path / "staging"
+    staged_file = staging / checkpoint.path
+    staged_file.parent.mkdir(parents=True)
+    staged_file.write_bytes(content)
+    retained = root / "checkpoints" / "other" / "retained.pt"
+    retained.parent.mkdir(parents=True)
+    retained.write_bytes(b"retained")
+
+    models._publish_checkpoints(root, staging)
+
+    assert (root / checkpoint.path).read_bytes() == content
+    assert retained.read_bytes() == b"retained"
+    assert orjson.loads((root / models.MODEL_MANIFEST).read_bytes()) == (
+        models._expected_manifest()
+    )
 
 
 @pytest.mark.parametrize(

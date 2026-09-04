@@ -101,6 +101,36 @@ def _validate_controls(
         raise ValueError("upstream_inference_dropout must be boolean")
 
 
+def _imgt_grid(
+    sequence: str,
+    positions: list[str | None],
+) -> tuple[str, str]:
+    """Independently number one decoded chain onto the reported IMGT grid."""
+    import anarci  # type: ignore[ty:unresolved-import]
+
+    result = anarci.number(sequence, scheme="imgt")
+    if not result or result[0] is None or not isinstance(result[1], str):
+        raise ValueError("sequence cannot be IMGT-numbered")
+    numbered, chain_type = result
+    indices = {
+        label: index for index, label in enumerate(positions) if isinstance(label, str)
+    }
+    if len(indices) != sum(isinstance(label, str) for label in positions):
+        raise ValueError("reported IMGT grid contains duplicate positions")
+    grid = ["-"] * len(positions)
+    for (number, insertion), residue in numbered:
+        if residue == "-":
+            continue
+        label = f"{number}{insertion.strip()}"
+        index = indices.get(label)
+        if index is None or grid[index] != "-":
+            raise ValueError(f"unsupported IMGT position {label}")
+        grid[index] = residue
+    if "".join(residue for residue in grid if residue != "-") != sequence:
+        raise ValueError("IMGT numbering did not preserve the decoded sequence")
+    return "".join(grid), chain_type
+
+
 def _attempt_error(
     attempt: dict[str, Any],
     output: dict[str, Any],
@@ -138,12 +168,15 @@ def _attempt_error(
             )
         ):
             return "changed protected CDR or terminal position"
-        from abnumber import Chain  # type: ignore[ty:unresolved-import]
-
-        if Chain(vh, scheme="imgt").chain_type != "H":
+        numbered_vh, vh_type = _imgt_grid(vh, output["vh_positions"])
+        numbered_vl, vl_type = _imgt_grid(vl, output["vl_positions"])
+        _, input_vl_type = _imgt_grid(pair["vl"], output["vl_positions"])
+        if numbered_vh != vh_aligned or numbered_vl != vl_aligned:
+            return "decoded sequence does not match independent IMGT numbering"
+        if vh_type != "H":
             return "generated VH has the wrong chain role"
-        if Chain(vl, scheme="imgt").chain_type not in {"K", "L"}:
-            return "generated VL has the wrong chain role"
+        if vl_type != input_vl_type:
+            return "generated VL changed the input chain type"
         if not vh or not vl or len(vh) != len(pair["vh"]) or len(vl) != len(pair["vl"]):
             return "generated chain length changed"
     except Exception as exc:
@@ -370,6 +403,10 @@ def hudiff_ab_humanize_batch(
     _validate_controls(
         candidate_count, seed, sampling_order, upstream_inference_dropout
     )
+    # functools.cache is not single-flight: initialize on the main thread before
+    # concurrent pair helpers can duplicate patching and checkpoint audits.
+    _prepare_upstream_runtime()
+    _asset_manifest()
     results: dict[str, AppRunResult] = {}
     with ThreadPoolExecutor(max_workers=len(pairs)) as executor:
         futures = {

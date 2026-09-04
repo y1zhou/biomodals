@@ -27,6 +27,7 @@ from biomodals.app.design.hudiff_ab.models import (
     MODEL_REVISION,
     RUNTIME_IDENTITY,
     SOURCE_COMMIT,
+    assert_runtime_environment,
     stage_hudiff_assets,
 )
 from biomodals.app.design.hudiff_ab.patches import (
@@ -121,9 +122,17 @@ runtime_image = (
     )
     .run_function(apply_hudiff_inference_patches)
     # UniAF3 requires Python 3.11 and is outside this worker's import closure.
-    .pipe(patch_image_for_helper, skip_deps={"uniaf3"})
+    .pipe(
+        patch_image_for_helper,
+        copy_patch_files=True,
+        skip_deps={"uniaf3"},
+    )
     .add_local_python_source(
         "biomodals.app.design.hudiff_ab.models",
+        copy=True,
+    )
+    .run_function(assert_runtime_environment)
+    .add_local_python_source(
         "biomodals.app.design.hudiff_ab.worker",
     )
 )

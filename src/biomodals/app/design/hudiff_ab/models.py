@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import os
+import re
 import shutil
 import tarfile
 from dataclasses import dataclass
@@ -69,6 +71,9 @@ CHECKPOINTS = (
 ANTIBODY_CHECKPOINT_SHA256 = next(
     item.sha256 for item in CHECKPOINTS if item.path == ANTIBODY_CHECKPOINT
 )
+RUNTIME_ENVIRONMENT_SHA256 = (
+    "6a9d9cce1584eb6cde0a838e1523e317c05dcd0cbe31d7cfb1830ff484edb67c"
+)
 RUNTIME_IDENTITY = "|".join((
     f"hudiff={SOURCE_COMMIT}",
     f"models={MODEL_REVISION}",
@@ -79,6 +84,7 @@ RUNTIME_IDENTITY = "|".join((
     "sequence-models=1.8.0",
     "abnumber=0.3.2",
     "anarci=2020.04.23",
+    "hmmer=3.3.2",
     "biopython=1.79",
     "pandas=1.5.3",
     "scipy=1.9.3",
@@ -86,9 +92,49 @@ RUNTIME_IDENTITY = "|".join((
     "einops=0.6.1",
     "pyyaml=6.0.3",
     "tqdm=4.70.0",
+    f"resolved-environment={RUNTIME_ENVIRONMENT_SHA256}",
     "wrapper-protocol=1",
     "patch-protocol=1",
 ))
+
+
+def runtime_environment_sha256() -> str:
+    """Fingerprint every resolved Conda build and Python distribution."""
+    conda = sorted(
+        (
+            item["name"],
+            item["version"],
+            item["build"],
+            item["channel"],
+        )
+        for path in Path("/opt/conda/conda-meta").glob("*.json")
+        if isinstance((item := orjson.loads(path.read_bytes())), dict)
+    )
+    if not conda:
+        raise RuntimeError("Conda returned an empty package inventory")
+    python = sorted(
+        (
+            re.sub(r"[-_.]+", "-", name).lower(),
+            distribution.version,
+        )
+        for distribution in importlib.metadata.distributions()
+        if (name := distribution.metadata["Name"])
+    )
+    payload = {"conda": conda, "python": python}
+    return hashlib.sha256(
+        orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+    ).hexdigest()
+
+
+def assert_runtime_environment() -> str:
+    """Fail the image build if dependency resolution drifts from its identity."""
+    observed = runtime_environment_sha256()
+    if observed != RUNTIME_ENVIRONMENT_SHA256:
+        raise RuntimeError(
+            "HuDiff-Ab resolved runtime changed: "
+            f"expected {RUNTIME_ENVIRONMENT_SHA256}, observed {observed}"
+        )
+    return observed
 
 
 def _digest(path: Path) -> str:
@@ -149,6 +195,21 @@ def _checkpoint_member(name: str) -> PurePosixPath | None:
     )
 
 
+def _publish_checkpoints(root: Path, staging: Path) -> None:
+    """Atomically replace identical checkpoint files, then publish the manifest."""
+    for item in CHECKPOINTS:
+        relative = PurePosixPath(item.path)
+        source = staging.joinpath(*relative.parts)
+        destination = root.joinpath(*relative.parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+    temporary = root / f".{MODEL_MANIFEST}.{uuid4().hex}.part"
+    temporary.write_bytes(
+        orjson.dumps(_expected_manifest(), option=orjson.OPT_SORT_KEYS)
+    )
+    os.replace(temporary, root / MODEL_MANIFEST)
+
+
 def stage_hudiff_assets(root: Path) -> dict[str, object]:
     """Download, verify, and atomically publish the checkpoint-only subtree."""
     root.mkdir(parents=True, exist_ok=True)
@@ -204,14 +265,7 @@ def stage_hudiff_assets(root: Path) -> dict[str, object]:
             if path.stat().st_size != item.size_bytes or _digest(path) != item.sha256:
                 raise ValueError(f"HuDiff checkpoint failed validation: {item.path}")
 
-        destination = root / "checkpoints"
-        if destination.exists():
-            shutil.rmtree(destination)
-        os.replace(staging / "checkpoints", destination)
-        manifest = _expected_manifest()
-        temporary = root / f".{MODEL_MANIFEST}.{uuid4().hex}.part"
-        temporary.write_bytes(orjson.dumps(manifest, option=orjson.OPT_SORT_KEYS))
-        os.replace(temporary, root / MODEL_MANIFEST)
+        _publish_checkpoints(root, staging)
         return assert_hudiff_assets(root)
     finally:
         archive.unlink(missing_ok=True)

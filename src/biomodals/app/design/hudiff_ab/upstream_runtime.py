@@ -7,6 +7,7 @@ import importlib.metadata
 import os
 import platform
 import random
+import subprocess
 from pathlib import Path
 
 HEAVY_REGION_INDEX = [
@@ -26,6 +27,21 @@ def _distribution_version(name: str, pinned_fallback: str) -> str:
         return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return pinned_fallback
+
+
+def _hmmer_version() -> str:
+    completed = subprocess.run(  # noqa: S603 - fixed environment executable.
+        ["/opt/conda/bin/hmmsearch", "-h"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+    for line in completed.stdout.splitlines():
+        if line.startswith("# HMMER "):
+            return line.split()[2]
+    raise RuntimeError("Could not identify the installed HMMER version")
 
 
 def main() -> None:
@@ -154,6 +170,7 @@ def main() -> None:
             "sequence_models": importlib.metadata.version("sequence-models"),
             "abnumber": importlib.metadata.version("abnumber"),
             "anarci": _distribution_version("anarci", "2020.04.23"),
+            "hmmer": _hmmer_version(),
             "biopython": importlib.metadata.version("biopython"),
             "pandas": importlib.metadata.version("pandas"),
             "scipy": importlib.metadata.version("scipy"),

@@ -67,6 +67,9 @@ The initial Biomodals app will:
 - default the applied root seed to 42, derive a stable seed from the root seed,
   ID, VH, and VL for each pair, and seed Python, NumPy, and Torch immediately
   before sampling;
+- enforce Torch deterministic algorithms, deterministic cuDNN, disabled cuDNN
+  benchmarking, and `CUBLAS_WORKSPACE_CONFIG=:4096:8`, with the complete policy
+  fingerprinted and reported for fixed-runtime, fixed-device retry identity;
 - expose `upstream_inference_dropout` as a fingerprinted boolean defaulting to
   true, with false explicitly identifying a HuDiff-derived sampling mode; and
 - run the nearest deployable source-compatible worker on isolated Python 3.10,
@@ -74,7 +77,8 @@ The initial Biomodals app will:
   Modal;
 - classify every generated attempt as valid, duplicate, or invalid by canonical
   alphabet, literal fixed-mask preservation, complete IMGT grid round-trip, and
-  retained H plus original K/L chain type; and
+  retained H plus original K/L chain type, obtaining raw K/L identity from
+  ANARCI domain metadata rather than its subtype-collapsing `number()` helper;
 - validate the complete batch before remote dispatch and revalidate each pair
   before checkpoint loading or GPU inference;
 - report `candidate_generation_status=no_valid_candidates` without turning a
@@ -190,6 +194,19 @@ archive retrieval. One candidate was valid and one sampled-gap attempt was
 retained as invalid with `changed IMGT grid occupancy`, confirming the declared
 no-resampling policy. The resulting archive contained all six specified files
 and a typed `mutations.parquet` table.
+
+After strict CUDA determinism and raw K/L validation were added, two independent
+source-backed production executions each sampled one 7K9I attempt on A10G with
+root seed `20260905`. Both completed successfully and reported Torch
+deterministic algorithms enabled, deterministic cuDNN enabled, cuDNN
+benchmarking disabled, and `CUBLAS_WORKSPACE_CONFIG=:4096:8`. The five
+scientific artifacts—input, attempts, candidates, candidate FASTA, and mutation
+Parquet—were byte-identical across runs; only `run_name` differed in their
+manifests. This validates the scoped retry guarantee without adding a frozen
+fixture that CI could not regenerate. The runs are
+[`ap-o9hzC7Y7yT4GuPIDWhgaOu`](https://modal.com/apps/innocare/main/ap-o9hzC7Y7yT4GuPIDWhgaOu)
+and
+[`ap-14e2Xhdx1i5GtJks60Ldcu`](https://modal.com/apps/innocare/main/ap-14e2Xhdx1i5GtJks60Ldcu).
 
 The single-pair production path remains one pair per A10G Provider Call.
 
@@ -456,11 +473,16 @@ Sources: [interactive sampler](https://github.com/TencentAI4S/HuDiff/blob/bb7636
 and [seed helper](https://github.com/TencentAI4S/HuDiff/blob/bb7636f182699f98c37855dad05a5c6c61b576bd/utils/misc.py).
 
 Consequently upstream's `--seed` does not reproduce candidates. Restoring the
-seed may reproduce one pinned software/device execution, but exact CPU/GPU or
-cross-version identity is not established. Disabling functional dropout would
-be a plausible bug fix but would change the inference distribution; it must be
-an explicit, fingerprinted scientific mode with separate validation, not a
-silent cleanup.
+seed alone is insufficient to promise deterministic CUDA retries. The Biomodals
+runtime additionally enables Torch's strict deterministic-algorithm mode,
+forces deterministic cuDNN behavior, disables cuDNN benchmarking, and sets
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` before importing Torch. It reports those
+settings in every pair result and fingerprints them in the runtime identity.
+The guarantee is deliberately limited to a fixed seed, pinned runtime, and
+device class; exact CPU/GPU or cross-version identity is not established.
+Disabling functional dropout would be a plausible bug fix but would change the
+inference distribution; it must be an explicit, fingerprinted scientific mode
+with separate validation, not a silent cleanup.
 
 There is no multi-antibody inference batch. The dataset-oriented `sample.py`
 loops antibody pairs serially, while tensor batch size produces candidates for
@@ -558,8 +580,9 @@ established at several levels:
    preservation, canonical output, numbering round-trip, and heavy/light chain
    roles.
 6. Test retry/resumption by deriving each pair's seed independently of task
-   scheduling. The same pair, configuration, checkpoint, and device must yield
-   the same candidates after a retry.
+   scheduling and enforcing the recorded deterministic CUDA policy. The same
+   pair, configuration, checkpoint, runtime, and device class must yield the
+   same candidates after a retry.
 7. If upgrading Python/Torch/CUDA, removing functional dropout, vectorizing
    across input pairs, changing invalid-sample resampling, or changing the
    tokenizer softmax support, treat it as a new scientific implementation.

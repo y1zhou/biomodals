@@ -105,13 +105,28 @@ def _imgt_grid(
     sequence: str,
     positions: list[str | None],
 ) -> tuple[str, str]:
-    """Independently number one decoded chain onto the reported IMGT grid."""
+    """Return one chain's authoritative IMGT grid and raw H/K/L type."""
     import anarci  # type: ignore[ty:unresolved-import]
 
-    result = anarci.number(sequence, scheme="imgt")
-    if not result or result[0] is None or not isinstance(result[1], str):
+    numbered_by_sequence, details_by_sequence, _ = anarci.anarci(
+        [("sequence", sequence)],
+        scheme="imgt",
+        output=False,
+        allow={"H", "K", "L"},
+    )
+    domains = numbered_by_sequence[0]
+    details = details_by_sequence[0]
+    if (
+        not isinstance(domains, list)
+        or len(domains) != 1
+        or not isinstance(details, list)
+        or len(details) != 1
+        or not isinstance(details[0], dict)
+        or details[0].get("chain_type") not in {"H", "K", "L"}
+    ):
         raise ValueError("sequence cannot be IMGT-numbered")
-    numbered, chain_type = result
+    numbered = domains[0][0]
+    chain_type = details[0]["chain_type"]
     indices = {
         label: index for index, label in enumerate(positions) if isinstance(label, str)
     }
@@ -135,6 +150,7 @@ def _attempt_error(
     attempt: dict[str, Any],
     output: dict[str, Any],
     pair: dict[str, str],
+    input_vl_type: str,
 ) -> str | None:
     try:
         vh = attempt["vh"]
@@ -170,7 +186,6 @@ def _attempt_error(
             return "changed protected CDR or terminal position"
         numbered_vh, vh_type = _imgt_grid(vh, output["vh_positions"])
         numbered_vl, vl_type = _imgt_grid(vl, output["vl_positions"])
-        _, input_vl_type = _imgt_grid(pair["vl"], output["vl_positions"])
         if numbered_vh != vh_aligned or numbered_vl != vl_aligned:
             return "decoded sequence does not match independent IMGT numbering"
         if vh_type != "H":
@@ -228,10 +243,19 @@ def _normalize_output(output: dict[str, Any], pair: dict[str, str]) -> dict[str,
     positions = output["vh_positions"] + output["vl_positions"]
     regions = output["region_indices"]
     input_aligned = output["input_vh_aligned"] + output["input_vl_aligned"]
+    input_vh_grid, input_vh_type = _imgt_grid(pair["vh"], output["vh_positions"])
+    input_vl_grid, input_vl_type = _imgt_grid(pair["vl"], output["vl_positions"])
+    if input_vh_type != "H" or input_vl_type not in {"K", "L"}:
+        raise ValueError("HuDiff-Ab subprocess input has the wrong chain roles")
+    if (
+        input_vh_grid != output["input_vh_aligned"]
+        or input_vl_grid != output["input_vl_aligned"]
+    ):
+        raise ValueError("HuDiff-Ab subprocess returned a stale input IMGT grid")
     for source in attempts:
         if not isinstance(source, dict) or type(source.get("attempt_index")) is not int:
             raise ValueError("HuDiff-Ab subprocess returned a malformed attempt")
-        error = _attempt_error(source, output, pair)
+        error = _attempt_error(source, output, pair, input_vl_type)
         key = (source.get("vh", ""), source.get("vl", ""))
         duplicate_of = accepted.get(key) if error is None else None
         candidate_id = None
@@ -294,7 +318,6 @@ def _normalize_output(output: dict[str, Any], pair: dict[str, str]) -> dict[str,
         "candidate_generation_status": (
             "candidates_available" if candidates else "no_valid_candidates"
         ),
-        "asset_manifest": _asset_manifest(),
         "patch_identity": patch_identity(),
     }
 

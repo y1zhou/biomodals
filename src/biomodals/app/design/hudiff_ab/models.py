@@ -74,6 +74,8 @@ ANTIBODY_CHECKPOINT_SHA256 = next(
 RUNTIME_ENVIRONMENT_SHA256 = (
     "6a9d9cce1584eb6cde0a838e1523e317c05dcd0cbe31d7cfb1830ff484edb67c"
 )
+CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+CUDA_DETERMINISM_POLICY = "torch-strict+cudnn-deterministic+cublas-4096x8"
 RUNTIME_IDENTITY = "|".join((
     f"hudiff={SOURCE_COMMIT}",
     f"models={MODEL_REVISION}",
@@ -93,7 +95,8 @@ RUNTIME_IDENTITY = "|".join((
     "pyyaml=6.0.3",
     "tqdm=4.70.0",
     f"resolved-environment={RUNTIME_ENVIRONMENT_SHA256}",
-    "wrapper-protocol=1",
+    f"cuda-determinism={CUDA_DETERMINISM_POLICY}",
+    "wrapper-protocol=2",
     "patch-protocol=1",
 ))
 

@@ -9,6 +9,10 @@ import platform
 import random
 import subprocess
 from pathlib import Path
+from typing import Any
+
+CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+CUDA_DETERMINISM_POLICY = "torch-strict+cudnn-deterministic+cublas-4096x8"
 
 HEAVY_REGION_INDEX = [
     region
@@ -44,6 +48,15 @@ def _hmmer_version() -> str:
     raise RuntimeError("Could not identify the installed HMMER version")
 
 
+def _configure_torch_determinism(torch: Any) -> None:
+    """Enable the deterministic CUDA behavior promised by the runtime identity."""
+    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") != CUBLAS_WORKSPACE_CONFIG:
+        raise RuntimeError("HuDiff-Ab requires its pinned cuBLAS workspace policy")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main() -> None:
     """Run one validated pair through the released HuDiff-Ab sampler."""
     parser = argparse.ArgumentParser()
@@ -74,6 +87,7 @@ def main() -> None:
     ):
         raise ValueError("invalid Biomodals HuDiff-Ab runtime request")
 
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = CUBLAS_WORKSPACE_CONFIG
     os.environ["HUDIFF_UPSTREAM_INFERENCE_DROPOUT"] = "1" if upstream_dropout else "0"
     import numpy as np
     import torch  # type: ignore[ty:unresolved-import]
@@ -88,6 +102,7 @@ def main() -> None:
         get_input_element,
     )
 
+    _configure_torch_determinism(torch)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -178,6 +193,15 @@ def main() -> None:
             "einops": importlib.metadata.version("einops"),
             "pyyaml": importlib.metadata.version("pyyaml"),
             "tqdm": importlib.metadata.version("tqdm"),
+            "cuda_determinism_policy": CUDA_DETERMINISM_POLICY,
+            "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+            "torch_deterministic_algorithms": str(
+                torch.are_deterministic_algorithms_enabled()
+            ).lower(),
+            "torch_cudnn_deterministic": str(
+                torch.backends.cudnn.deterministic
+            ).lower(),
+            "torch_cudnn_benchmark": str(torch.backends.cudnn.benchmark).lower(),
         },
         "input_vh_aligned": "".join(input_tokens[:152]),
         "input_vl_aligned": "".join(input_tokens[152:]),

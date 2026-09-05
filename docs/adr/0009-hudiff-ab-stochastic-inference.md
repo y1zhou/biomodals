@@ -12,7 +12,12 @@ longer supports upstream Python 3.9, the production worker uses the nearest
 compatible Python 3.10, Torch 1.13, and CUDA 11.6 runtime, while exact Python
 3.9 oracle comparisons remain external. These choices preserve the released
 sampling distribution as closely as the deployment platform permits and make
-retry behavior reproducible for a fixed seed, runtime, and device.
+retry behavior reproducible for a fixed seed, runtime, and device. The worker
+enables Torch's strict deterministic-algorithm mode, disables cuDNN benchmarking,
+forces deterministic cuDNN behavior, and sets
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` before importing Torch. This policy is both
+fingerprinted and reported in each pair result; it does not promise bitwise
+identity across different device classes or runtime versions.
 
 The image clones the pinned upstream repository and invokes its antibody
 inference script. Narrow, exact-preimage guarded patches activate the ignored
@@ -37,6 +42,14 @@ candidate and later exact valid matches are duplicates that reference it. A
 candidate attempt is identified by its pair seed and attempt index rather than
 an invented independent per-attempt seed.
 
+Independent output validation uses ANARCI's lower-level domain metadata rather
+than its `number()` convenience function. In the pinned ANARCI release,
+`number()` deliberately maps both raw kappa (`K`) and lambda (`L`) assignments
+to the public light-chain class `L`; the domain metadata retains the distinction
+needed to reject a generated light chain whose subtype differs from its parent.
+The parental VH and VL are numbered once per pair, before candidate validation,
+so this check does not repeat HMMER for every sampling attempt.
+
 The first implementation accepts 1–10 attempts per pair and at most 10,000
 attempts over the existing 1,000-pair input ceiling. It validates the complete
 batch before dispatch and each provider batch again before model loading. A
@@ -55,7 +68,17 @@ The initial 7K9I cold benchmark used root seed zero and completed ten attempts
 on one A10G in 16.00 seconds. Two-second samples showed 0.97 mean CPU core,
 7.27 GiB maximum sampled host memory, 39.9% mean and 90% peak GPU utilization,
 and 1.96 GiB peak GPU memory. Nine attempts were valid unique candidates and
-one was a duplicate.
+one was a duplicate. These measurements predate strict deterministic-algorithm
+enforcement and remain hardware-sizing evidence rather than a runtime promise.
+
+Two separate source-backed production executions then validated the strict
+policy on A10G with one 7K9I attempt and root seed `20260905`. Both reported
+deterministic Torch algorithms enabled, deterministic cuDNN enabled, cuDNN
+benchmarking disabled, and the pinned cuBLAS workspace configuration. Their
+input, attempt, candidate, FASTA, and Parquet artifacts were byte-identical;
+only the intentionally distinct run name differed between manifests. These
+runs validate fixed-runtime, fixed-device retry identity without creating a
+frozen CI fixture that future tests could not regenerate.
 
 A later two-process experiment completed distinct 7K9I and 3F8 pairs together
 on one A10G in 24.67 and 24.89 seconds across two cold containers. The

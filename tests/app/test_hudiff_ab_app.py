@@ -8,8 +8,8 @@ import ast
 import hashlib
 import sys
 from pathlib import Path
-from types import ModuleType
-from typing import cast
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 
 import orjson
 import polars as pl
@@ -35,6 +35,40 @@ from biomodals.schema import AppRunResult, AppRunStatus
 VH = "QVQLKQSGPGLVAPSQSLSITCTVSGFSLINYAISWVRQPPGKGLEWLGVIWTGGGTNYNSALKSRLSISKDNSKSQVFLKMNSLQTDDTARYYCARKDYYGRYYGMDYWGQGTSVTVS"
 VL = "QAVVTQESALTTSPGETVTLTCRSSTGAVTTSNYANWVQEKPDHLFTGLIGGTNNRAPGVPARFSGSLIGDKAALTITGAQTEDEAIYFCALWYNNHWVFGGGTKLTVL"
 VALID_CSV = f"id,vh,vl\n7k9i,{VH},{VL}\n".encode()
+
+
+def _install_fake_anarci(
+    monkeypatch: pytest.MonkeyPatch,
+    chain_types: dict[str, str],
+) -> list[str]:
+    calls: list[str] = []
+    fake_anarci = ModuleType("anarci")
+
+    def anarci(
+        sequences: list[tuple[str, str]],
+        *,
+        scheme: str,
+        output: bool,
+        allow: set[str],
+    ) -> tuple[Any, Any, Any]:
+        assert scheme == "imgt"
+        assert output is False
+        assert allow == {"H", "K", "L"}
+        assert len(sequences) == 1
+        sequence = sequences[0][1]
+        calls.append(sequence)
+        numbering = [
+            ((index, ""), residue) for index, residue in enumerate(sequence, 1)
+        ]
+        return (
+            [[(numbering, 0, len(sequence) - 1)]],
+            [[{"chain_type": chain_types[sequence]}]],
+            [[object()]],
+        )
+
+    fake_anarci.__dict__["anarci"] = anarci
+    monkeypatch.setitem(sys.modules, "anarci", fake_anarci)
+    return calls
 
 
 def _request() -> HuDiffAbExecutionRequest:
@@ -223,23 +257,18 @@ def test_attempt_validation_rejects_protected_position_changes() -> None:
     }
 
     assert (
-        worker._attempt_error(attempt, output, {"id": "x", "vh": "A", "vl": "C"})
+        worker._attempt_error(
+            attempt,
+            output,
+            {"id": "x", "vh": "A", "vl": "C"},
+            "K",
+        )
         == "changed protected CDR or terminal position"
     )
 
 
 def test_attempt_validation_checks_independent_imgt_grid(monkeypatch) -> None:
-    fake_anarci = ModuleType("anarci")
-
-    def number(sequence: str, *, scheme: str):
-        assert scheme == "imgt"
-        return (
-            [((index, ""), residue) for index, residue in enumerate(sequence, 1)],
-            "H" if sequence == "AC" else "K",
-        )
-
-    fake_anarci.__dict__["number"] = number
-    monkeypatch.setitem(sys.modules, "anarci", fake_anarci)
+    _install_fake_anarci(monkeypatch, {"AC": "H", "D": "K"})
     output = {
         "input_vh_aligned": "A-C" + "-" * 149,
         "input_vl_aligned": "D" + "-" * 138,
@@ -255,21 +284,18 @@ def test_attempt_validation_checks_independent_imgt_grid(monkeypatch) -> None:
     }
 
     assert (
-        worker._attempt_error(attempt, output, {"id": "x", "vh": "AC", "vl": "D"})
+        worker._attempt_error(
+            attempt,
+            output,
+            {"id": "x", "vh": "AC", "vl": "D"},
+            "K",
+        )
         == "decoded sequence does not match independent IMGT numbering"
     )
 
 
 def test_attempt_validation_preserves_parental_light_type(monkeypatch) -> None:
-    fake_anarci = ModuleType("anarci")
-
-    def number(sequence: str, *, scheme: str):
-        assert scheme == "imgt"
-        chain_type = "H" if sequence == "A" else {"C": "K", "D": "L"}[sequence]
-        return ([((1, ""), sequence)], chain_type)
-
-    fake_anarci.__dict__["number"] = number
-    monkeypatch.setitem(sys.modules, "anarci", fake_anarci)
+    _install_fake_anarci(monkeypatch, {"A": "H", "D": "L"})
     output = {
         "input_vh_aligned": "A" + "-" * 151,
         "input_vl_aligned": "C" + "-" * 138,
@@ -285,13 +311,25 @@ def test_attempt_validation_preserves_parental_light_type(monkeypatch) -> None:
     }
 
     assert worker._attempt_error(
-        attempt, output, {"id": "x", "vh": "A", "vl": "C"}
+        attempt,
+        output,
+        {"id": "x", "vh": "A", "vl": "C"},
+        "K",
     ) == ("generated VL changed the input chain type")
 
 
 def test_normalization_deduplicates_only_valid_attempts(monkeypatch) -> None:
-    monkeypatch.setattr(worker, "_asset_manifest", lambda: {"schema_version": 1})
     monkeypatch.setattr(worker, "_attempt_error", lambda *_args: None)
+    number_calls: list[str] = []
+
+    def fake_grid(sequence: str, positions: list[str | None]) -> tuple[str, str]:
+        number_calls.append(sequence)
+        return (
+            sequence + "-" * (len(positions) - len(sequence)),
+            "H" if sequence == "A" else "K",
+        )
+
+    monkeypatch.setattr(worker, "_imgt_grid", fake_grid)
     aligned_vh = "A" + "-" * 151
     aligned_vl = "C" + "-" * 138
     output = {
@@ -325,11 +363,19 @@ def test_normalization_deduplicates_only_valid_attempts(monkeypatch) -> None:
     assert len(result["candidates"]) == 1
     assert [row["status"] for row in result["attempts"]] == ["valid", "duplicate"]
     assert result["attempts"][1]["duplicate_of"] == "x__candidate_1"
+    assert number_calls == ["A", "C"]
 
 
 def test_fully_accounted_zero_yield_is_not_an_execution_failure(monkeypatch) -> None:
-    monkeypatch.setattr(worker, "_asset_manifest", lambda: {"schema_version": 1})
     monkeypatch.setattr(worker, "_attempt_error", lambda *_args: "sampled gap")
+    monkeypatch.setattr(
+        worker,
+        "_imgt_grid",
+        lambda sequence, positions: (
+            sequence + "-" * (len(positions) - len(sequence)),
+            "H" if sequence == "A" else "K",
+        ),
+    )
     output = {
         "schema_version": 1,
         "id": "x",
@@ -360,6 +406,52 @@ def test_fully_accounted_zero_yield_is_not_an_execution_failure(monkeypatch) -> 
     assert result["candidates"] == []
     assert result["candidate_generation_status"] == "no_valid_candidates"
     assert result["attempts"][0]["status"] == "invalid"
+
+
+def test_normalization_rejects_stale_parental_grid(monkeypatch) -> None:
+    _install_fake_anarci(monkeypatch, {"AC": "H", "D": "K"})
+    output = {
+        "schema_version": 1,
+        "id": "x",
+        "runtime_versions": {"python": "3.10.18"},
+        "input_vh_aligned": "A-C" + "-" * 149,
+        "input_vl_aligned": "D" + "-" * 138,
+        "mutable_indices": [],
+        "region_indices": [0] * 291,
+        "vh_positions": ["1", "2", "3", *([None] * 149)],
+        "vl_positions": ["1", *([None] * 138)],
+        "attempts": [{"attempt_index": 1}],
+    }
+
+    with pytest.raises(ValueError, match="stale input IMGT grid"):
+        worker._normalize_output(output, {"id": "x", "vh": "AC", "vl": "D"})
+
+
+def test_upstream_runtime_enforces_and_reports_determinism(monkeypatch) -> None:
+    calls: list[bool] = []
+    cudnn = SimpleNamespace(deterministic=False, benchmark=True)
+    torch = SimpleNamespace(
+        use_deterministic_algorithms=lambda enabled: calls.append(enabled),
+        backends=SimpleNamespace(cudnn=cudnn),
+    )
+    monkeypatch.setenv(
+        "CUBLAS_WORKSPACE_CONFIG", upstream_runtime.CUBLAS_WORKSPACE_CONFIG
+    )
+
+    upstream_runtime._configure_torch_determinism(torch)
+
+    assert calls == [True]
+    assert cudnn.deterministic is True
+    assert cudnn.benchmark is False
+    assert upstream_runtime.CUBLAS_WORKSPACE_CONFIG == models.CUBLAS_WORKSPACE_CONFIG
+    assert upstream_runtime.CUDA_DETERMINISM_POLICY == models.CUDA_DETERMINISM_POLICY
+
+
+def test_upstream_runtime_rejects_unpinned_cublas_policy(monkeypatch) -> None:
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+
+    with pytest.raises(RuntimeError, match="cuBLAS workspace policy"):
+        upstream_runtime._configure_torch_determinism(SimpleNamespace())
 
 
 def test_guarded_patch_rejects_changed_preimage(tmp_path: Path) -> None:
@@ -394,6 +486,10 @@ def test_verified_checkpoint_audit_values_are_pinned() -> None:
         f"resolved-environment={models.RUNTIME_ENVIRONMENT_SHA256}"
         in models.RUNTIME_IDENTITY
     )
+    assert f"cuda-determinism={models.CUDA_DETERMINISM_POLICY}" in (
+        models.RUNTIME_IDENTITY
+    )
+    assert "wrapper-protocol=2" in models.RUNTIME_IDENTITY
 
 
 def test_checkpoint_publication_replaces_files_without_deleting_tree(

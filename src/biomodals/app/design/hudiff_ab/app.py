@@ -24,6 +24,7 @@ from biomodals.app.design.hudiff_ab.execution import (
 )
 from biomodals.app.design.hudiff_ab.models import (
     ANTIBODY_CHECKPOINT_SHA256,
+    CUBLAS_WORKSPACE_CONFIG,
     MODEL_REVISION,
     RUNTIME_IDENTITY,
     SOURCE_COMMIT,
@@ -86,6 +87,7 @@ CONF = AppConfig(
 runtime_image = (
     modal.Image
     .micromamba(python_version=CONF.python_version)
+    .env({"CUBLAS_WORKSPACE_CONFIG": CUBLAS_WORKSPACE_CONFIG})
     .apt_install("git")
     .micromamba_install(
         [

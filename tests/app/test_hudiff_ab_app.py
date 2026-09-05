@@ -320,16 +320,7 @@ def test_attempt_validation_preserves_parental_light_type(monkeypatch) -> None:
 
 def test_normalization_deduplicates_only_valid_attempts(monkeypatch) -> None:
     monkeypatch.setattr(worker, "_attempt_error", lambda *_args: None)
-    number_calls: list[str] = []
-
-    def fake_grid(sequence: str, positions: list[str | None]) -> tuple[str, str]:
-        number_calls.append(sequence)
-        return (
-            sequence + "-" * (len(positions) - len(sequence)),
-            "H" if sequence == "A" else "K",
-        )
-
-    monkeypatch.setattr(worker, "_imgt_grid", fake_grid)
+    number_calls = _install_fake_anarci(monkeypatch, {"A": "H", "C": "K"})
     aligned_vh = "A" + "-" * 151
     aligned_vl = "C" + "-" * 138
     output = {
@@ -368,14 +359,7 @@ def test_normalization_deduplicates_only_valid_attempts(monkeypatch) -> None:
 
 def test_fully_accounted_zero_yield_is_not_an_execution_failure(monkeypatch) -> None:
     monkeypatch.setattr(worker, "_attempt_error", lambda *_args: "sampled gap")
-    monkeypatch.setattr(
-        worker,
-        "_imgt_grid",
-        lambda sequence, positions: (
-            sequence + "-" * (len(positions) - len(sequence)),
-            "H" if sequence == "A" else "K",
-        ),
-    )
+    _install_fake_anarci(monkeypatch, {"A": "H", "C": "K"})
     output = {
         "schema_version": 1,
         "id": "x",

@@ -60,7 +60,8 @@ from biomodals.workflow.humanization.contracts import (
     CandidateOrigin,
     HumanizationCandidate,
 )
-from biomodals.workflow.humanization.export import export_results
+from biomodals.workflow.humanization.export import IMGT_MUTATION_SCHEMA, export_results
+from biomodals.workflow.humanization.ranking import RANKING_VERSION, rank_panel
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import (
     FAMILY_COLUMNS,
@@ -72,6 +73,7 @@ from biomodals.workflow.humanization.tables import (
 
 METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
+    "panel_ranking": RANKING_VERSION,
     "biomodals.workflow.humanization": "1",
     "sapiens": sapiens_app.RUNTIME_IDENTITY,
     "sapiens.source": sapiens_app.CONF.repo_commit_hash or "",
@@ -385,10 +387,10 @@ class HumanizationEvaluateNode(TaskProviderNode):
             HumanizationCandidate.model_validate(row)
             for row in orjson.loads(context.read_input_bytes("union"))
         ]
-        evaluations, annotations = [], []
+        evaluations, annotations, mutation_frames = [], [], []
         for result in results.values():
             for output in result.outputs:
-                if output.name not in {"evaluation", "annotation"}:
+                if output.name not in {"evaluation", "annotation", "imgt_mutations"}:
                     continue
                 if context.volume_root is None:
                     raise RuntimeError(
@@ -403,10 +405,15 @@ class HumanizationEvaluateNode(TaskProviderNode):
                     )
                 path = (context.volume_root / output.storage.path).resolve()
                 path.relative_to(context.volume_root.resolve())
+                if output.name == "imgt_mutations":
+                    mutation_frames.append(
+                        pl.read_json(path, schema=IMGT_MUTATION_SCHEMA)
+                    )
+                    continue
                 value = orjson.loads(path.read_bytes())
                 if output.name == "evaluation":
                     evaluations.append(CandidateEvaluation.model_validate(value))
-                else:
+                elif output.name == "annotation":
                     annotations.append(CandidateAnnotation.model_validate(value))
         for candidate in candidates:
             for method in SCORE_COLUMNS:
@@ -431,11 +438,19 @@ class HumanizationEvaluateNode(TaskProviderNode):
                         error=message,
                     )
                 )
-        table = selection_table(candidates, evaluations, annotations)
+        mutations = (
+            pl.concat(mutation_frames)
+            if mutation_frames
+            else pl.DataFrame(schema=IMGT_MUTATION_SCHEMA)
+        )
+        table = rank_panel(
+            selection_table(candidates, evaluations, annotations), mutations
+        )
         bundle = export_results(
             context,
             candidates,
             table,
+            mutations,
             results,
             errors,
             self.settings,

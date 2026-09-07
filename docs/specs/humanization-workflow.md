@@ -135,7 +135,7 @@ filter for manual selection for further characterization: one row per
 parent/candidate, separate scalar numeric score and delta columns, explicit
 status and CDR-preservation columns, mutation counts, sequences, baseline flag,
 and generating-method provenance. Missing scores remain null, never zero or
-error strings in numeric columns. No composite ranking is imposed.
+error strings in numeric columns. No composite fitness score is imposed.
 
 Keep full family distributions, residue-level outputs, and detailed mutations
 in separate tables keyed by parent/candidate identity. Native regional scores
@@ -219,8 +219,57 @@ verification evidence are recorded below; live cloud validation is separate.
     a small example input and usage documentation. Request separate approval
     before live cloud inference; local doubles do not establish live score parity.
 
-Out of scope: HTTP service/frontend, CUMAb, automatic shortlisting, composite
-ranking, cross-parent chain recombination, and unapproved live inference.
+Out of scope: HTTP service/frontend, CUMAb, automatic top-N truncation, composite
+fitness scores, cross-parent chain recombination, and unapproved live inference.
+
+## Panel ordering (2026-09-07 amendment)
+
+The main CSV and Parquet add nullable integer `quality_tier` and `panel_order`
+after the parent and candidate IDs. There is no `selection_reason` column.
+Every candidate and all original scores are retained. Within each parent, the
+baseline appears first, followed by ranked candidates in panel order, followed
+by unranked candidates in stable candidate-ID order. Select ranks 1 through N;
+the parental control does not consume one of those N slots.
+
+Ranking v1 is an explicit provisional selection heuristic, not experimental
+validation or a calibrated confidence score:
+
+- Require complete candidate and parental evaluations, preserved IMGT CDRs,
+  complete framework mutation evidence, and positive parental pairing scores.
+- More than 10% relative loss from the parent in either Humatch or p-AbNatiV2
+  pairing score puts the candidate outside the default ranking pool. Both new
+  fields remain null. This review guardrail is not a validated biological cutoff;
+  affected rows remain available for manual exploratory selection. It does not
+  alter generation settings, sequences, score values, or execution status.
+- Compute Pareto layers within each parent's eligible candidates: maximize
+  p-AbNatiV2 paired nativeness and both evaluators' pairing scores; minimize total
+  VH/VL changes. Layer 1 is nondominated, then repeat on the remaining candidates.
+  Compare scores rounded to six decimals to suppress numerical jitter, not to
+  claim biological significance. Raw scores retain their original precision.
+- Seed panel order by lowest tier, then descending paired nativeness, p-AbNatiV2
+  pairing, Humatch pairing, fewer changes, and finally candidate ID. For subsequent
+  picks, consider the best remaining tier and the immediately following tier;
+  maximize minimum framework distance to already selected candidates. Break ties
+  with the seed ordering. Thus a tier-2 alternative can precede a tier-1 near-copy,
+  but diversity cannot immediately promote an arbitrarily worse tier.
+- Framework distance counts differing IMGT positions across VH and VL using
+  recorded mutations, including insertion codes and deletions. Two different
+  replacements at one position count as one difference. Generator labels do not
+  affect order. No new numbering/model call is needed.
+
+Chain-level nativeness, Sapiens summaries, and Humatch family scores remain
+visible for review but are not additional correlated votes in this first policy.
+All ranks are per-run/per-parent and can change when the candidate pool changes.
+The manifest records the full ranking policy and its version; that version also
+participates in the workflow fingerprint. This amendment supersedes the original
+no-ranking decision while retaining the full, non-truncated candidate table.
+
+Ranking uses Polars filtering, grouped mutation counts, pairwise dominance
+joins, and position-overlap aggregation on narrow frames. Pairwise comparisons
+are bounded within each parent; sequences and unrelated score columns are not
+copied into Python row dictionaries. Only Pareto-layer peeling and the inherently
+sequential greedy panel picks use small control loops. Mutation JSON is parsed
+once into typed Polars frames and reused for ranking and Parquet export.
 
 ## Implementation evidence
 

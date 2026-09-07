@@ -15,13 +15,29 @@ from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import AppOutput, AppRunResult, ArtifactKind, VolumePath
 from biomodals.workflow.humanization.artifacts import archive_members
 from biomodals.workflow.humanization.contracts import HumanizationCandidate
+from biomodals.workflow.humanization.ranking import RANKING_POLICY
 from biomodals.workflow.humanization.settings import HumanizationSettings
+
+IMGT_MUTATION_SCHEMA = {
+    "parent_id": pl.String,
+    "candidate_id": pl.String,
+    "chain": pl.String,
+    "numbering_scheme": pl.String,
+    "cdr_definition": pl.String,
+    "position": pl.Int64,
+    "insertion_code": pl.String,
+    "parent_residue": pl.String,
+    "candidate_residue": pl.String,
+    "region": pl.String,
+    "change_type": pl.String,
+}
 
 
 def export_results(
     context: NodeRunContext,
     candidates: Sequence[HumanizationCandidate],
     table: pl.DataFrame,
+    mutations: pl.DataFrame,
     results: Mapping[str, AppRunResult],
     errors: Mapping[str, str],
     settings: HumanizationSettings,
@@ -51,7 +67,6 @@ def export_results(
         candidate.candidate_id: candidate.parent_id for candidate in candidates
     }
     detail_shards: dict[str, list[Path]] = {}
-    mutations = []
     artifact_sources = []
 
     for artifact in context.inputs.get("generation_native", []):
@@ -85,8 +100,6 @@ def export_results(
                 "output_name": output.name,
                 "metadata": output.metadata,
             })
-            if output.name == "imgt_mutations":
-                mutations.extend(orjson.loads(source.read_bytes()))
             if (
                 not task_key.startswith(("sapiens-", "humatch-", "pabnativ2-"))
                 or output.storage.media_type != "application/zstd"
@@ -108,22 +121,7 @@ def export_results(
         pl.scan_parquet(shards).sink_parquet(
             root / f"{name}.parquet", compression="zstd"
         )
-    mutation_schema = {
-        "parent_id": pl.String,
-        "candidate_id": pl.String,
-        "chain": pl.String,
-        "numbering_scheme": pl.String,
-        "cdr_definition": pl.String,
-        "position": pl.Int64,
-        "insertion_code": pl.String,
-        "parent_residue": pl.String,
-        "candidate_residue": pl.String,
-        "region": pl.String,
-        "change_type": pl.String,
-    }
-    pl.DataFrame(mutations, schema=mutation_schema).write_parquet(
-        root / "imgt_mutations.parquet", compression="zstd"
-    )
+    mutations.write_parquet(root / "imgt_mutations.parquet", compression="zstd")
     files = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name == "manifest.json":
@@ -144,7 +142,8 @@ def export_results(
         "candidate_count": len(candidates),
         "errors": dict(errors),
         "native_publications": artifact_sources,
-        "selection_semantics": "one row per parent/exact pair; no composite ranking; missing scores are null",
+        "selection_semantics": "one row per parent/exact pair; per-parent Pareto tiers and diverse panel order; unranked values are null; no composite fitness score",
+        "ranking_policy": RANKING_POLICY,
         "cdr_definition": "imgt",
         "files": files,
     }

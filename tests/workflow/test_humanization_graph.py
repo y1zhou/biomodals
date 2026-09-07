@@ -185,6 +185,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                 )
             elif operation == "annotate_humanization_candidate":
                 candidate = kwargs["candidate"]
+                changed = candidate["vh"] != kwargs["parent"]["vh"]
                 result = AppRunResult(
                     status=AppRunStatus.SUCCEEDED,
                     outputs=[
@@ -195,10 +196,30 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                                 "candidate_id": candidate["candidate_id"],
                                 "cdr_preservation": "preserved",
                                 "cdr_mutations": 0,
-                                "vh_mutations": 0,
+                                "vh_mutations": int(changed),
                                 "vl_mutations": 0,
                             },
-                        )
+                        ),
+                        json_output(
+                            "imgt_mutations",
+                            [
+                                {
+                                    "parent_id": candidate["parent_id"],
+                                    "candidate_id": candidate["candidate_id"],
+                                    "chain": "vh",
+                                    "position": 3,
+                                    "insertion_code": "",
+                                    "parent_residue": "D",
+                                    "candidate_residue": "H",
+                                    "numbering_scheme": "imgt",
+                                    "cdr_definition": "imgt",
+                                    "region": "framework",
+                                    "change_type": "substitution",
+                                }
+                            ]
+                            if changed
+                            else [],
+                        ),
                     ],
                 )
             else:
@@ -272,6 +293,8 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         )
         table = pl.read_csv(tmp_path / selection.storage.path)
         assert table.height == 2
+        assert table["panel_order"].to_list() == [None, None if fail_first else 1]
+        assert table["quality_tier"].to_list() == [None, None if fail_first else 1]
         assert table["evaluation_complete"].to_list() == [not fail_first] * 2
         assert table["generating_methods"].to_list() == ["pabnativ2", "humatch;sapiens"]
         assert (
@@ -286,6 +309,14 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         )
         root = tmp_path / directory.storage.path
         manifest = orjson.loads((root / "manifest.json").read_bytes())
+        assert manifest["ranking_policy"]["version"] == "1"
+        assert (root / "selection.csv").read_bytes() == (
+            tmp_path / selection.storage.path
+        ).read_bytes()
+        assert (
+            pl.read_parquet(root / "selection.parquet")["panel_order"].to_list()
+            == table["panel_order"].to_list()
+        )
         assert manifest["candidate_count"] == 2
         for entry in manifest["files"]:
             content = (root / entry["path"]).read_bytes()

@@ -61,7 +61,7 @@ Generate independently, deduplicate exact VH-VL pairs within each parent, retain
 all generating-method provenance, and include the unchanged parent as a baseline.
 Evaluate this union without further sequence mutation using Sapiens, Humatch,
 and p-AbNatiV2 in parallel. Export one row per parent/candidate with separate
-method-specific metrics and evaluation status, plus detailed residue artifacts.
+method-specific metrics and evaluation errors, plus detailed residue artifacts.
 Do not blend unlike scores into a single ranking by default.
 
 Candidate identity is the complete VH-VL sequence pair within its parental
@@ -133,7 +133,7 @@ incomplete. An unavailable check is never evidence of preservation.
 These summary definitions are agreed. The main table must be easy to sort and
 filter for manual selection for further characterization: one row per
 parent/candidate, separate scalar numeric score and delta columns, explicit
-status and CDR-preservation columns, mutation counts, sequences, baseline flag,
+error and CDR-preservation columns, mutation counts, sequences, baseline flag,
 and generating-method provenance. Missing scores remain null, never zero or
 error strings in numeric columns. No composite fitness score is imposed.
 
@@ -145,8 +145,8 @@ selection table emphasizes chain/pair summaries and their parental changes.
 ## Agreed deliverables and recovery
 
 - A readable candidate-score CSV.
-- FASTA records for both chains with explicit candidate/pair identity.
-- Detailed Parquet score and mutation tables.
+- VH/VL sequences in the main CSV; no duplicate FASTA or selection Parquet.
+- Detailed Parquet score tables under `scores/` and `imgt_mutations.parquet`.
 - A manifest recording parameters, model versions, provenance, and failures.
 - Reuse the existing execution system's recovery mechanism to reuse matching
   successful work and retry missing or failed work. Changed inputs or scientific
@@ -207,7 +207,7 @@ verification evidence are recorded below; live cloud validation is separate.
    fixed-parent-family and best-family Humatch summaries, Sapiens chain means,
    native p-AbNatiV2 summaries, and comparable parental deltas. Account for every
    candidate/evaluator result, including alignment failures and omissions.
-8. Export the sortable selection CSV, paired FASTA, detailed Parquet tables,
+8. Export the sortable selection CSV and detailed Parquet tables,
    and provenance/failure manifest. Keep raw method score-region definitions
    separate from the shared IMGT preservation annotations.
 9. Integrate and test existing resume/restart semantics, successful-work reuse,
@@ -224,7 +224,7 @@ fitness scores, cross-parent chain recombination, and unapproved live inference.
 
 ## Panel ordering (2026-09-07 amendment)
 
-The main CSV and Parquet add nullable integer `quality_tier` and `panel_order`
+The main CSV adds nullable integer `quality_tier` and `panel_order`
 after the parent and candidate IDs. There is no `selection_reason` column.
 Every candidate and all original scores are retained. Within each parent, the
 baseline appears first, followed by ranked candidates in panel order, followed
@@ -309,8 +309,8 @@ App discovery/help and workflow discovery/help/dry-run smoke checks pass.
   The CLI dry-run succeeds on `examples/data/sapiens_pairs.csv`; discovery,
   composition, and no-launch validation are covered by local tests.
 - Terminal output now includes a self-contained `humanization_results` directory:
-  selection CSV/Parquet, paired FASTA, full candidate provenance, common IMGT
-  mutation Parquet, joined native scoring detail Parquets when available, retained
+  selection CSV, compact candidate provenance in the manifest, common IMGT
+  mutation Parquet, joined scoring detail Parquets under `scores/`, retained
   native publications, and a digest manifest with explicit software/model
   identities. These identities also participate in the scientific fingerprint.
 - Real-coordinator successor tests verify that failed scorer tasks alone are
@@ -369,7 +369,51 @@ uv run biomodals workflow run --max-containers 4 --max-gpu-containers 2 \
 
 The CLI reports the execution/deployment identity and result locations. The
 `humanization_results` directory is self-contained. Open `selection.csv` for
-sorting, or use typed `selection.parquet`; consult the adjacent detailed Parquet
-tables and `candidate_provenance.json` for evidence behind each row. All native
-publications remain under `native/`. Missing or failed model evaluations remain
+sorting; this is the only main selection table and includes both sequences.
+Detailed score Parquets live under `scores/`. Compact candidate origins
+(source IDs, attempts, seeds) live in `manifest.json`, without duplicated
+sequences. No separate selection Parquet, provenance JSON, or FASTA is emitted.
+Parental rows have null `generating_methods`, even when a generator returned
+the unchanged parent; that event is retained only in manifest provenance.
+The three evaluator `*_error` columns replace redundant `*_status` columns:
+null means the evaluation succeeded; missing evaluations have an explicit error.
+`evaluation_complete` still indicates whether all required evidence is present.
+Humatch target-family output labels are `hv1`–`hv7` for VH, and `kv1`–`kv7`
+(kappa) or `lv1`–`lv10` (lambda) for VL. The CLI also accepts `auto`, which
+selects the parent's highest-probability human family and holds that reference
+fixed for all candidates from that parent; the output records the resolved
+family rather than `auto`.
+`imgt_mutations.parquet` omits constant numbering/CDR-definition columns;
+the manifest records the common IMGT definition. Unique generation publications
+remain under `native/`. Scorer detail tables are consolidated under `scores/`;
+their original manifests and publication metadata are retained in the main
+manifest's `scoring_publications`. Scorer input pairs and all summary fields
+are represented in `selection.csv`, so their CSV copies and enclosing archives
+are not exported. Unknown extra scorer files are retained under `native/`.
+Normalized adapter JSON and temporary detail shards are not exported. Execution
+checkpoints remain intact outside the result bundle. Missing or failed model evaluations remain
 explicit, and a changed CDR is not an automatic exclusion.
+
+The waited CLI prints completion status, the result directory's volume/path,
+and the selection-table path, rather than every intermediate task output.
+The finalizer publishes only the self-contained directory, without additional
+selection CSV or error JSON copies.
+
+Apps expose their parameter validators for reuse by standalone calls and other
+workflows. The workflow fingerprint includes p-AbNatiV2's full scientific
+runtime identity (wrapper, compatibility patches, and PSSMs) and HuDiff's patch
+digest. Corrected fingerprints require a new root run rather than restart from
+an older incompatible plan; historical results and model caches are untouched.
+The app-owned p-AbNatiV2 protocol is recorded once under `protocols` in the
+workflow manifest: four-structure source behavior, PSSM cutoff, objective
+weights, and pairing-score interpretation. This does not change inference.
+
+Review decision: defer Humatch's repeated parental-scoring optimization because
+it is not the bottleneck in the current concurrent workflow. Revisit it if
+profiling shows meaningful runtime or cost impact.
+
+Offline export verification against the saved 21-candidate run checked all 63
+scorer archives: input pairs, every summary field, detailed table values, and
+original scorer manifests were preserved, as were the four unique generation
+publications. The self-contained bundle shrank from 273 files to 11. This
+checks export equivalence, not a new cloud inference run.

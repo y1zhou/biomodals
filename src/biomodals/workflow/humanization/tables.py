@@ -134,7 +134,6 @@ def selection_table(
         "evaluation_complete": pl.Boolean,
     }
     for method, metrics in SCORE_COLUMNS.items():
-        schema[f"{method}_status"] = pl.String
         schema[f"{method}_error"] = pl.String
         for metric in metrics:
             schema[f"{method}_{metric}"] = pl.Float64
@@ -153,9 +152,9 @@ def selection_table(
             "vh": candidate.vh,
             "vl": candidate.vl,
             "is_parent": candidate.is_parent,
-            "generating_methods": ";".join(
-                sorted({origin.method for origin in candidate.origins})
-            ),
+            "generating_methods": None
+            if candidate.is_parent
+            else ";".join(sorted({origin.method for origin in candidate.origins})),
             "cdr_preservation": annotation.cdr_preservation
             if annotation
             else "unknown",
@@ -175,7 +174,6 @@ def selection_table(
                 baselines[candidate.parent_id],
                 method,
             ))
-            row[f"{method}_status"] = result.status if result else "missing"
             row[f"{method}_error"] = (
                 result.error if result else "Evaluation unavailable"
             )

@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import shutil
 from collections.abc import Mapping, Sequence
-from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import orjson
 import polars as pl
 
+from biomodals.app.design.pabnativ2.models import HUMANIZATION_PROTOCOL
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import AppOutput, AppRunResult, ArtifactKind, VolumePath
 from biomodals.workflow.humanization.artifacts import archive_members
@@ -22,8 +23,6 @@ IMGT_MUTATION_SCHEMA = {
     "parent_id": pl.String,
     "candidate_id": pl.String,
     "chain": pl.String,
-    "numbering_scheme": pl.String,
-    "cdr_definition": pl.String,
     "position": pl.Int64,
     "insertion_code": pl.String,
     "parent_residue": pl.String,
@@ -51,25 +50,22 @@ def export_results(
     root.mkdir(parents=True, exist_ok=True)
     native = root / "native"
     native.mkdir(exist_ok=True)
+    scores = root / "scores"
+    scores.mkdir(exist_ok=True)
     table.write_csv(root / "selection.csv")
-    table.write_parquet(root / "selection.parquet", compression="zstd")
-    (root / "candidates.fasta").write_text(
-        "".join(
-            f">{candidate.candidate_id}_{chain.upper()}\n{getattr(candidate, chain)}\n"
-            for candidate in candidates
-            for chain in ("vh", "vl")
-        )
-    )
-    (root / "candidate_provenance.json").write_bytes(
-        orjson.dumps([candidate.model_dump() for candidate in candidates])
-    )
     parent_by_candidate = {
         candidate.candidate_id: candidate.parent_id for candidate in candidates
     }
-    detail_shards: dict[str, list[Path]] = {}
     artifact_sources = []
+    scoring_publications = []
 
     for artifact in context.inputs.get("generation_native", []):
+        if artifact.source_app_output_name in {
+            "parents",
+            "generated",
+            "generation_errors",
+        }:
+            continue
         source = context.resolve_artifact(artifact)
         name = hashlib.sha256(artifact.artifact_id.encode()).hexdigest()
         destination = native / f"generation-{name}{source.suffix}"
@@ -81,46 +77,81 @@ def export_results(
             "metadata": artifact.metadata,
         })
 
-    for task_key, result in results.items():
-        for index, output in enumerate(result.outputs):
-            if (
-                not isinstance(output.storage, VolumePath)
-                or output.storage.volume_name != context.artifact_volume_name
-            ):
-                raise ValueError(
-                    "Native results must be materialized in the execution volume"
-                )
-            source = (context.volume_root / output.storage.path).resolve()
-            source.relative_to(context.volume_root.resolve())
-            destination = native / f"{task_key}-{index}{source.suffix}"
-            shutil.copyfile(source, destination)
-            artifact_sources.append({
-                "file": str(destination.relative_to(root)),
-                "task_key": task_key,
-                "output_name": output.name,
-                "metadata": output.metadata,
-            })
-            if (
-                not task_key.startswith(("sapiens-", "humatch-", "pabnativ2-"))
-                or output.storage.media_type != "application/zstd"
-            ):
-                continue
-            method, candidate_id = task_key.split("-", maxsplit=1)
-            for filename, content in archive_members(source.read_bytes()).items():
-                if not filename.endswith(".parquet"):
+    # Scratch shards stay off the execution volume and out of the final bundle.
+    with TemporaryDirectory(prefix="humanization_scores_") as temporary:
+        detail_shards: dict[str, list[pl.LazyFrame]] = {}
+        for task_key, result in results.items():
+            for index, output in enumerate(result.outputs):
+                if output.name in {
+                    "evaluation",
+                    "annotation",
+                    "imgt_mutations",
+                    "evaluated_union",
+                    "generation_complete",
+                }:
                     continue
-                frame = pl.read_parquet(BytesIO(content)).with_columns(
-                    pl.lit(parent_by_candidate[candidate_id]).alias("parent_id"),
-                    pl.lit(candidate_id).alias("candidate_id"),
-                )
-                detail_name = f"{method}_{Path(filename).stem}"
-                shard = native / f"{detail_name}-{candidate_id}.parquet"
-                frame.write_parquet(shard, compression="zstd")
-                detail_shards.setdefault(detail_name, []).append(shard)
-    for name, shards in detail_shards.items():
-        pl.scan_parquet(shards).sink_parquet(
-            root / f"{name}.parquet", compression="zstd"
-        )
+                if (
+                    not isinstance(output.storage, VolumePath)
+                    or output.storage.volume_name != context.artifact_volume_name
+                ):
+                    raise ValueError(
+                        "Native results must be materialized in the execution volume"
+                    )
+                source = (context.volume_root / output.storage.path).resolve()
+                source.relative_to(context.volume_root.resolve())
+                if (
+                    not task_key.startswith(("sapiens-", "humatch-", "pabnativ2-"))
+                    or output.storage.media_type != "application/zstd"
+                ):
+                    destination = native / f"{task_key}-{index}{source.suffix}"
+                    shutil.copyfile(source, destination)
+                    artifact_sources.append({
+                        "file": str(destination.relative_to(root)),
+                        "task_key": task_key,
+                        "output_name": output.name,
+                        "metadata": output.metadata,
+                    })
+                    continue
+                method, candidate_id = task_key.split("-", maxsplit=1)
+                publication = {
+                    "task_key": task_key,
+                    "output_name": output.name,
+                    "metadata": output.metadata,
+                }
+                for filename, content in archive_members(source.read_bytes()).items():
+                    if filename == "manifest.json":
+                        publication["manifest"] = orjson.loads(content)
+                    elif filename in {"input.csv", "summary.csv"}:
+                        # Exact pairs and every native summary field are in selection.csv.
+                        continue
+                    elif filename.endswith(".parquet"):
+                        detail_name = f"{method}_{Path(filename).stem}"
+                        shard = (
+                            Path(temporary) / f"{detail_name}-{candidate_id}.parquet"
+                        )
+                        shard.write_bytes(content)
+                        detail_shards.setdefault(detail_name, []).append(
+                            pl.scan_parquet(shard).with_columns(
+                                pl.lit(parent_by_candidate[candidate_id]).alias(
+                                    "parent_id"
+                                ),
+                                pl.lit(candidate_id).alias("candidate_id"),
+                            )
+                        )
+                    else:
+                        destination = native / f"{task_key}-{filename}"
+                        destination.write_bytes(content)
+                        artifact_sources.append({
+                            "file": str(destination.relative_to(root)),
+                            "task_key": task_key,
+                            "output_name": output.name,
+                            "archive_member": filename,
+                        })
+                scoring_publications.append(publication)
+        for name, shards in detail_shards.items():
+            pl.concat(shards).sink_parquet(
+                scores / f"{name}.parquet", compression="zstd"
+            )
     mutations.write_parquet(root / "imgt_mutations.parquet", compression="zstd")
     files = []
     for path in sorted(root.rglob("*")):
@@ -134,14 +165,23 @@ def export_results(
             "content_sha256": digest,
         })
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "execution_run_id": str(context.execution_run_id),
         "status": "partial" if errors else "succeeded",
         "parameters": settings.model_dump(),
         "scientific_versions": dict(scientific_versions),
+        "protocols": {"pabnativ2": HUMANIZATION_PROTOCOL},
         "candidate_count": len(candidates),
+        "candidate_provenance": [
+            candidate.model_dump(include={"parent_id", "candidate_id", "origins"})
+            for candidate in candidates
+        ],
         "errors": dict(errors),
+        "generation_errors": orjson.loads(
+            context.read_input_bytes("generation_errors")
+        ),
         "native_publications": artifact_sources,
+        "scoring_publications": scoring_publications,
         "selection_semantics": "one row per parent/exact pair; per-parent Pareto tiers and diverse panel order; unranked values are null; no composite fitness score",
         "ranking_policy": RANKING_POLICY,
         "cdr_definition": "imgt",

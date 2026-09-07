@@ -118,7 +118,7 @@ def test_parse_rejects_invalid_batches(content: bytes, message: str) -> None:
 @pytest.mark.parametrize("count", [1, 10, 25, 0, 26, True])
 def test_attempt_bounds_agree_across_entrypoints(count: int) -> None:
     def validate() -> None:
-        hudiff_app._validate_controls(
+        hudiff_app.validate_controls(
             pair_count=1,
             candidate_count=count,
             seed=7,
@@ -142,7 +142,7 @@ def test_attempt_bounds_agree_across_entrypoints(count: int) -> None:
 
 def test_controls_reject_total_attempt_overflow_and_boolean_seed() -> None:
     with pytest.raises(ValueError, match="10,000"):
-        hudiff_app._validate_controls(
+        hudiff_app.validate_controls(
             pair_count=1001,
             candidate_count=10,
             seed=0,
@@ -150,7 +150,7 @@ def test_controls_reject_total_attempt_overflow_and_boolean_seed() -> None:
             upstream_inference_dropout=True,
         )
     with pytest.raises(ValueError, match="seed"):
-        hudiff_app._validate_controls(
+        hudiff_app.validate_controls(
             pair_count=1,
             candidate_count=1,
             seed=True,

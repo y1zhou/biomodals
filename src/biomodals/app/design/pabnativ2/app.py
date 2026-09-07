@@ -42,6 +42,7 @@ from biomodals.app.design.pabnativ2.execution import (
 )
 from biomodals.app.design.pabnativ2.models import (
     ABNATIV_WHEEL_URL,
+    HUMANIZATION_PROTOCOL,
     IDENTITY,
     PAIRED_MODEL,
     RUNTIME_IDENTITY,
@@ -263,7 +264,7 @@ def _fixed_positions(value: str, name: str) -> tuple[int, ...]:
     return tuple(result)
 
 
-def _validate_parameters(
+def validate_parameters(
     *,
     mutate_cdrs: bool,
     fixed_vh_positions: str,
@@ -274,6 +275,7 @@ def _validate_parameters(
     forbidden_residues: str,
     seed: int,
 ) -> _Parameters:
+    """Validate and normalize p-AbNatiV2 controls for app and workflow callers."""
     if type(mutate_cdrs) is not bool:
         raise ValueError("mutate_cdrs must be a boolean")
     thresholds = (
@@ -712,16 +714,7 @@ def _write_bundle(
                 "pssm_sha256": PSSM_SHA256,
                 "staged_assets": asset_manifest,
             },
-            "protocol": {
-                "equivalence_target": "AbNatiV 2.0.8 source",
-                "rasa_structure_count": IDENTITY.rasa_structure_count,
-                "paper_rasa_structure_count": 10,
-                "pairing_score_units": "fraction",
-                "pairing_score_interpretation": (
-                    "model score against synthetic pairing negatives; not a "
-                    "calibrated probability of physical assembly"
-                ),
-            },
+            "protocol": HUMANIZATION_PROTOCOL,
             "telemetry": {
                 "accelerators": sorted({
                     str(result["device"]) for result in pair_results
@@ -766,7 +759,7 @@ def _run_pabnativ2_pair(
         or not all(isinstance(pair[column], str) for column in CSV_COLUMNS)
     ):
         raise ValueError("p-AbNatiV2 pair must contain exactly id, vh, and vl")
-    parameters = _validate_parameters(
+    parameters = validate_parameters(
         mutate_cdrs=mutate_cdrs,
         fixed_vh_positions=fixed_vh_positions,
         fixed_vl_positions=fixed_vl_positions,
@@ -949,7 +942,7 @@ def _aggregate_pabnativ2_results(
         "id"
     ].to_list():
         raise ValueError("p-AbNatiV2 pair results do not match input order")
-    normalized = _validate_parameters(**parameters)
+    normalized = validate_parameters(**parameters)
     asset_manifests = {
         orjson.dumps(result["asset_manifest"], option=orjson.OPT_SORT_KEYS)
         for result in pair_results
@@ -1341,7 +1334,7 @@ def submit_pabnativ2_task(
         raise ValueError(f"Input CSV exceeds {MAX_INPUT_BYTES} bytes")
     csv_bytes = input_path.read_bytes()
     input_frame = parse_pabnativ2_csv(csv_bytes)
-    _validate_parameters(
+    validate_parameters(
         mutate_cdrs=mutate_cdrs,
         fixed_vh_positions=fixed_vh_positions,
         fixed_vl_positions=fixed_vl_positions,

@@ -86,8 +86,6 @@ def annotate_candidate(
                     "parent_id": parent.id,
                     "candidate_id": candidate.candidate_id,
                     "chain": chain,
-                    "numbering_scheme": "imgt",
-                    "cdr_definition": "imgt",
                     "position": position[0],
                     "insertion_code": position[1],
                     "parent_residue": original,

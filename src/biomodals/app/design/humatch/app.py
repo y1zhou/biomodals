@@ -146,7 +146,7 @@ class _AlignedPair:
     vl: str
 
 
-def _validate_parameters(
+def validate_parameters(
     *,
     vh_target_family: str,
     vl_target_family: str,
@@ -159,6 +159,7 @@ def _validate_parameters(
     fixed_vh_positions: str,
     fixed_vl_positions: str,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Validate Humatch controls and normalize fixed IMGT positions."""
     if vh_target_family not in {"auto", *VH_FAMILIES}:
         raise ValueError("vh_target_family must be auto or hv1 through hv7")
     if vl_target_family not in {"auto", *VL_FAMILIES}:
@@ -872,7 +873,7 @@ def _run_humatch_worker_batch(
     input_frame = parse_humatch_csv(
         pl.DataFrame(pairs).select(CSV_COLUMNS).write_csv().encode("utf-8")
     )
-    normalized_vh_positions, normalized_vl_positions = _validate_parameters(
+    normalized_vh_positions, normalized_vl_positions = validate_parameters(
         vh_target_family=vh_target_family,
         vl_target_family=vl_target_family,
         germline_likeness_target=germline_likeness_target,
@@ -944,9 +945,7 @@ def _aggregate_humatch_results(
         "id"
     ].to_list():
         raise ValueError("Humatch pair results do not match input order")
-    normalized_vh_positions, normalized_vl_positions = _validate_parameters(
-        **parameters
-    )
+    normalized_vh_positions, normalized_vl_positions = validate_parameters(**parameters)
     archive = _write_result_bundle(
         run_name=run_name,
         input_frame=input_frame,
@@ -1298,7 +1297,7 @@ def submit_humatch_task(
         raise ValueError(f"Input CSV exceeds {MAX_INPUT_BYTES} bytes")
     csv_bytes = input_path.read_bytes()
     input_frame = parse_humatch_csv(csv_bytes)
-    _validate_parameters(
+    validate_parameters(
         vh_target_family=vh_target_family,
         vl_target_family=vl_target_family,
         germline_likeness_target=germline_likeness_target,

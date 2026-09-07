@@ -73,6 +73,7 @@ from biomodals.workflow.humanization.tables import (
 
 METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
+    "result_schema": "2",
     "panel_ranking": RANKING_VERSION,
     "biomodals.workflow.humanization": "1",
     "sapiens": sapiens_app.RUNTIME_IDENTITY,
@@ -84,11 +85,12 @@ SCIENTIFIC_VERSIONS = {
     "humatch.assets": "|".join(
         f"{asset.filename}:{asset.md5_hex}" for asset in humatch_app.ASSETS
     ),
-    "pabnativ2": pabnativ2_app.RUNTIME_IDENTITY,
+    "pabnativ2": pabnativ2_app.SCIENTIFIC_RUNTIME_IDENTITY,
     "pabnativ2.paired_model": pabnativ2_app.PAIRED_MODEL.md5_hex,
     "pabnativ2.structure_model": pabnativ2_app.STRUCTURE_MODEL_ARCHIVE.md5_hex,
     "hudiff_ab": hudiff_app.RUNTIME_IDENTITY,
     "hudiff_ab.model": hudiff_app.ANTIBODY_CHECKPOINT_SHA256,
+    "hudiff_ab.patch": hudiff_app.patch_identity(),
     "annotation": "anarci=2020.04.23|hmmer=3.3.2|imgt-boundaries-v1",
 }
 CONF = AppConfig(
@@ -456,37 +458,9 @@ class HumanizationEvaluateNode(TaskProviderNode):
             self.settings,
             SCIENTIFIC_VERSIONS,
         )
-        from biomodals.schema import AppOutput, ArtifactKind, InlineBytes
-
-        fasta = "".join(
-            f">{candidate.candidate_id}_{chain.upper()}\n{getattr(candidate, chain)}\n"
-            for candidate in candidates
-            for chain in ("vh", "vl")
-        )
         return AppRunResult(
             status=AppRunStatus.PARTIAL if errors else AppRunStatus.SUCCEEDED,
-            outputs=[
-                AppOutput(
-                    name="selection",
-                    kind=ArtifactKind.TABLE,
-                    storage=InlineBytes(
-                        data=table.write_csv().encode(),
-                        filename="selection.csv",
-                        media_type="text/csv",
-                    ),
-                ),
-                AppOutput(
-                    name="candidates",
-                    kind=ArtifactKind.REPORT,
-                    storage=InlineBytes(
-                        data=fasta.encode(),
-                        filename="candidates.fasta",
-                        media_type="text/plain",
-                    ),
-                ),
-                json_output("evaluation_errors", dict(errors)),
-                bundle,
-            ],
+            outputs=[bundle],
             metrics={"candidate_count": len(candidates), "failed_tasks": len(errors)},
         )
 
@@ -497,10 +471,10 @@ def build_humanization_workflow(
     """Build a barriered generation, union and terminal cross-evaluation graph."""
     parents = parse_parents(csv_bytes)
     settings = settings or HumanizationSettings()
-    sapiens_app._validate_parameters(**settings.method_arguments("sapiens"))
-    humatch_app._validate_parameters(**settings.method_arguments("humatch"))
-    pabnativ2_app._validate_parameters(**settings.method_arguments("pabnativ2"))
-    hudiff_app._validate_controls(
+    sapiens_app.validate_parameters(**settings.method_arguments("sapiens"))
+    humatch_app.validate_parameters(**settings.method_arguments("humatch"))
+    pabnativ2_app.validate_parameters(**settings.method_arguments("pabnativ2"))
+    hudiff_app.validate_controls(
         pair_count=len(parents), **settings.method_arguments("hudiff_ab")
     )
     graph = ExecutionGraph("humanization", scientific_versions=SCIENTIFIC_VERSIONS)
@@ -682,4 +656,12 @@ def submit_humanization_workflow(
         result = AppRunResult.model_validate(call.get())
         print(f"Humanization completed: {result.status}", flush=True)
         for output in result.outputs:
-            print(f"{output.name}: {output.storage}", flush=True)
+            if output.name == "humanization_results" and isinstance(
+                output.storage, VolumePath
+            ):
+                print(
+                    f"humanization_results: volume={output.storage.volume_name} "
+                    f"path={output.storage.path}\n"
+                    f"Selection table: {output.storage.path}/selection.csv",
+                    flush=True,
+                )

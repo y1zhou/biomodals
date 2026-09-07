@@ -56,6 +56,19 @@ class DownloadSpec:
 
 
 IDENTITY = PAbNatiV2Identity()
+HUMANIZATION_PROTOCOL = {
+    "equivalence_target": "AbNatiV 2.0.8 source",
+    "rasa_structure_count": IDENTITY.rasa_structure_count,
+    "paper_rasa_structure_count": 10,
+    "pssm_frequency_cutoff": IDENTITY.pssm_frequency_cutoff,
+    "nativeness_weight": IDENTITY.nativeness_weight,
+    "pairing_weight": IDENTITY.pairing_weight,
+    "pairing_score_units": "fraction",
+    "pairing_score_interpretation": (
+        "model score against synthetic pairing negatives; not a "
+        "calibrated probability of physical assembly"
+    ),
+}
 ABNATIV_WHEEL_SHA256 = (
     "1345b2d27d5f5edd13d80e1944f11bee8c53aef4030f190d9fc4ee5de3b743b1"
 )

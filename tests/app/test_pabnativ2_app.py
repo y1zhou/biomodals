@@ -122,7 +122,7 @@ def test_parse_pabnativ2_csv_rejects_invalid_batches(
 
 
 def test_controls_normalize_positions_and_forbidden_residues() -> None:
-    parameters = pabnativ2_app._validate_parameters(
+    parameters = pabnativ2_app.validate_parameters(
         mutate_cdrs=True,
         fixed_vh_positions="27, 149",
         fixed_vl_positions="",
@@ -167,7 +167,7 @@ def test_controls_reject_invalid_values(
     }
     values.update(overrides)
     with pytest.raises(ValueError, match=message):
-        pabnativ2_app._validate_parameters(**values)  # type: ignore[arg-type]
+        pabnativ2_app.validate_parameters(**values)  # type: ignore[arg-type]
 
 
 def test_pair_seed_is_order_independent_and_input_specific() -> None:
@@ -601,7 +601,7 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
         return b"archive"
 
     monkeypatch.setattr(pabnativ2_app, "package_outputs", fake_package)
-    parameters = pabnativ2_app._validate_parameters(
+    parameters = pabnativ2_app.validate_parameters(
         mutate_cdrs=False,
         fixed_vh_positions="",
         fixed_vl_positions="",
@@ -647,6 +647,7 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
     assert captured["protocol"]["equivalence_target"] == "AbNatiV 2.0.8 source"
     assert captured["protocol"]["paper_rasa_structure_count"] == 10
     assert captured["protocol"]["pairing_score_units"] == "fraction"
+    assert captured["protocol"] == pabnativ2_app.HUMANIZATION_PROTOCOL
     assert captured["telemetry"]["accelerators"] == ["NVIDIA A10G"]
     assert captured["warnings"]
     assert "wrapper-protocol=3" in captured["scientific_identity"]["runtime"]

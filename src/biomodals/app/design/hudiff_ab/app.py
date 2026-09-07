@@ -164,7 +164,7 @@ app = modal.App(CONF.name, image=coordinator_image, tags=CONF.tags)
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_hudiff_ab_task"})
 
 
-def _validate_controls(
+def validate_controls(
     *,
     pair_count: int,
     candidate_count: int,
@@ -172,6 +172,7 @@ def _validate_controls(
     sampling_order: str,
     upstream_inference_dropout: bool,
 ) -> None:
+    """Validate HuDiff sampling controls and the total paired-attempt budget."""
     if type(candidate_count) is not int or not 1 <= candidate_count <= 25:
         raise ValueError("candidate_count must be between 1 and 25")
     if pair_count * candidate_count > MAX_TOTAL_ATTEMPTS:
@@ -316,7 +317,7 @@ def _aggregate_hudiff_ab_results(
     parameters: Mapping[str, Any],
 ) -> tuple[bytes, dict[str, int]]:
     frame = parse_hudiff_ab_csv(csv_bytes)
-    _validate_controls(pair_count=frame.height, **parameters)
+    validate_controls(pair_count=frame.height, **parameters)
     if [result["id"] for result in pair_results] != frame["id"].to_list():
         raise ValueError("HuDiff-Ab pair results do not match input order")
     archive = _write_bundle(
@@ -540,7 +541,7 @@ def submit_hudiff_ab_task(
         raise ValueError(f"Input CSV is missing or exceeds {MAX_INPUT_BYTES} bytes")
     csv_bytes = path.read_bytes()
     frame = parse_hudiff_ab_csv(csv_bytes)
-    _validate_controls(
+    validate_controls(
         pair_count=frame.height,
         candidate_count=candidate_count,
         seed=seed,

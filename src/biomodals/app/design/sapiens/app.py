@@ -135,13 +135,14 @@ app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_sapiens_task"})
 
 
-def _validate_parameters(
+def validate_parameters(
     *,
     iterations: int,
     numbering_scheme: str,
     cdr_definition: str,
     mutate_cdrs: bool,
 ) -> None:
+    """Validate Sapiens controls for standalone and workflow callers."""
     if type(iterations) is not int or not 1 <= iterations <= 5:
         raise ValueError("iterations must be between 1 and 5")
     if not isinstance(numbering_scheme, str) or (
@@ -476,7 +477,7 @@ def _run_sapiens_humanization(
     model_root: Path = MODEL_ROOT,
 ) -> tuple[bytes, int, int, float]:
     """Validate, humanize sequentially, and package one paired batch."""
-    _validate_parameters(
+    validate_parameters(
         iterations=iterations,
         numbering_scheme=numbering_scheme,
         cdr_definition=cdr_definition,
@@ -822,7 +823,7 @@ def submit_sapiens_task(
         raise ValueError(f"Input CSV exceeds {MAX_INPUT_BYTES} bytes")
     csv_bytes = input_path.read_bytes()
     parse_sapiens_csv(csv_bytes)
-    _validate_parameters(
+    validate_parameters(
         iterations=iterations,
         numbering_scheme=numbering_scheme,
         cdr_definition=cdr_definition,

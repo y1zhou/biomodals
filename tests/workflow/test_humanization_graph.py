@@ -27,6 +27,7 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.workflow.humanization.artifacts import json_output
+from biomodals.workflow.humanization.scoring import scoring_result
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import SCORE_COLUMNS
 from biomodals.workflow.humanization.workflow import build_humanization_workflow
@@ -211,8 +212,6 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                                     "insertion_code": "",
                                     "parent_residue": "D",
                                     "candidate_residue": "H",
-                                    "numbering_scheme": "imgt",
-                                    "cdr_definition": "imgt",
                                     "region": "framework",
                                     "change_type": "substitution",
                                 }
@@ -236,7 +235,14 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                         vh_best_family="hv1",
                         vl_best_family="kv1",
                     )
-                result = archive("summary.csv", pl.DataFrame([row]))
+                summary = pl.DataFrame([row])
+                result = scoring_result(
+                    method,
+                    frame,
+                    summary,
+                    {"detail_scores": summary},
+                    {"runtime": "test", "candidate_id": row["id"]},
+                )
             call_id = f"call-{len(self.results)}"
             self.results[call_id] = result
             return call_id
@@ -288,42 +294,109 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             AppRunStatus.PARTIAL if fail_first else AppRunStatus.SUCCEEDED
         ), result
         publication = store.artifacts.load_node_result("evaluate")
-        selection = next(
-            output for output in publication.outputs if output.name == "selection"
-        )
-        table = pl.read_csv(tmp_path / selection.storage.path)
-        assert table.height == 2
-        assert table["panel_order"].to_list() == [None, None if fail_first else 1]
-        assert table["quality_tier"].to_list() == [None, None if fail_first else 1]
-        assert table["evaluation_complete"].to_list() == [not fail_first] * 2
-        assert table["generating_methods"].to_list() == ["pabnativ2", "humatch;sapiens"]
-        assert (
-            table["sapiens_vh_mean_probability_delta"].to_list()
-            == [None if fail_first else 0.0] * 2
-        )
-        assert len(driver.results) == 12
         directory = next(
             output
             for output in publication.outputs
             if output.name == "humanization_results"
         )
         root = tmp_path / directory.storage.path
+        table = pl.read_csv(root / "selection.csv")
+        assert table.height == 2
+        assert table["panel_order"].to_list() == [None, None if fail_first else 1]
+        assert table["quality_tier"].to_list() == [None, None if fail_first else 1]
+        assert table["evaluation_complete"].to_list() == [not fail_first] * 2
+        assert table["generating_methods"].to_list() == [None, "humatch;sapiens"]
+        assert (
+            table["sapiens_vh_mean_probability_delta"].to_list()
+            == [None if fail_first else 0.0] * 2
+        )
+        assert len(driver.results) == 12
         manifest = orjson.loads((root / "manifest.json").read_bytes())
         assert manifest["ranking_policy"]["version"] == "1"
-        assert (root / "selection.csv").read_bytes() == (
-            tmp_path / selection.storage.path
-        ).read_bytes()
-        assert (
-            pl.read_parquet(root / "selection.parquet")["panel_order"].to_list()
-            == table["panel_order"].to_list()
+        assert not {"selection", "evaluation_errors"} & {
+            output.name for output in publication.outputs
+        }
+        assert manifest["protocols"]["pabnativ2"]["rasa_structure_count"] == 4
+        assert manifest["protocols"]["pabnativ2"]["pssm_frequency_cutoff"] == 0.01
+        assert manifest["protocols"]["pabnativ2"]["nativeness_weight"] == 10.0
+        assert manifest["protocols"]["pabnativ2"]["pairing_weight"] == 1.0
+        assert not list((root / "native").glob("*.parquet"))
+        assert len(list((root / "native").iterdir())) == 4
+        assert len(manifest["scoring_publications"]) == (4 if fail_first else 6)
+        assert all(
+            entry["manifest"]["scientific_identity"]["runtime"] == "test"
+            for entry in manifest["scoring_publications"]
+        )
+        assert manifest["schema_version"] == 2
+        assert not any(name.endswith("_status") for name in table.columns)
+        assert not (root / "selection.parquet").exists()
+        assert not (root / "candidate_provenance.json").exists()
+        assert not (root / "candidates.fasta").exists()
+        assert all(output.name != "candidates" for output in publication.outputs)
+        assert len(manifest["candidate_provenance"]) == 2
+        assert all("vh" not in item for item in manifest["candidate_provenance"])
+        baseline = next(
+            item
+            for item in manifest["candidate_provenance"]
+            if item["candidate_id"] == table["candidate_id"][0]
+        )
+        assert baseline["origins"][0]["method"] == "pabnativ2"
+        assert not {"numbering_scheme", "cdr_definition"} & set(
+            pl.read_parquet(root / "imgt_mutations.parquet").columns
         )
         assert manifest["candidate_count"] == 2
         for entry in manifest["files"]:
             content = (root / entry["path"]).read_bytes()
             assert len(content) == entry["size_bytes"]
             assert hashlib.sha256(content).hexdigest() == entry["content_sha256"]
-        assert len((root / "candidates.fasta").read_text().splitlines()) == 8
-        assert pl.read_parquet(root / "humatch_detail_scores.parquet").height == 2
+        assert (
+            pl.read_parquet(root / "scores/humatch_detail_scores.parquet").height == 2
+        )
+        # Original scorer input/summary and detail values survive consolidation.
+        from polars.testing import assert_frame_equal
+
+        from biomodals.workflow.humanization.artifacts import archive_members
+
+        for call_id, original in driver.results.items():
+            operation = driver.operations[int(call_id.split("-")[1])]
+            if not operation.endswith("_score") or (
+                fail_first and operation == "sapiens_score"
+            ):
+                continue
+            method = operation.removesuffix("_score")
+            members = archive_members(original.outputs[0].storage.data)
+            inputs = pl.read_csv(BytesIO(members["input.csv"]), infer_schema=False)
+            candidate_id = inputs["id"][0]
+            selected = table.filter(pl.col("candidate_id") == candidate_id)
+            assert_frame_equal(
+                inputs, selected.select(pl.col("candidate_id").alias("id"), "vh", "vl")
+            )
+            summary = pl.read_csv(BytesIO(members["summary.csv"]))
+            assert_frame_equal(
+                summary,
+                selected.select(
+                    pl.col("candidate_id").alias("id"),
+                    *(
+                        pl.col(f"{method}_{name}").alias(name)
+                        for name in summary.columns
+                        if name != "id"
+                    ),
+                ),
+            )
+            detail = pl.read_parquet(BytesIO(members["detail_scores.parquet"]))
+            assert_frame_equal(
+                detail,
+                pl
+                .read_parquet(root / f"scores/{method}_detail_scores.parquet")
+                .filter(pl.col("candidate_id") == candidate_id)
+                .drop("parent_id", "candidate_id"),
+            )
+            recorded = next(
+                entry
+                for entry in manifest["scoring_publications"]
+                if entry["task_key"] == f"{method}-{candidate_id}"
+            )
+            assert recorded["manifest"] == orjson.loads(members["manifest.json"])
         graph = build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n")
         store.write_coordinator_plan(
             pickle.dumps(

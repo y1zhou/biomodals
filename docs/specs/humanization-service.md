@@ -113,6 +113,28 @@ Graph successors retain validated successful publications, including when the
 terminal bundle belongs to a predecessor Run. The service does not own a
 second scheduler or open remote execution ledgers.
 
+### Runtime preparation
+
+Services must establish runtime prerequisites before scientific execution.
+Humanization invokes the pinned deployment's existing CPU-only HuDiff and
+p-AbNatiV2 model stagers before launching its coordinator. Jobs remain queued
+with `preparing_environment` while this runs and can be cancelled without
+waiting for model downloads. Preparation is shared by jobs using the same
+deployment within one service process; restart or deployment changes cause
+the app-owned stagers to revalidate their publications. A conclusive failure
+marks the unlaunched Job `failed` with `environment_preparation_failed`, freeing
+its admission slot. The failed preparation is retained until operator
+intervention and service restart rather than automatically repeating downloads.
+
+Sapiens and Humatch bake their assets into images. GROMACS also installs its
+runtime dependencies in its image; AlphaFold3 already owns automatic runtime
+asset preparation. Service adapters reuse these app-owned contracts rather
+than duplicating model/database setup logic in the API.
+
+Cancellation records durable intent before returning to the browser. The
+reconciler delivers that intent remotely; ordinary status reads return the
+latest stored projection while a remote operation holds the per-job lock.
+
 ## Integration evidence
 
 Use current main's service architecture, not the older service implementation

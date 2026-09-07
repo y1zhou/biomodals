@@ -44,6 +44,10 @@ class ResultIntegrityError(RuntimeError):
     """An exact previously published Result could not be restored."""
 
 
+class EnvironmentPreparationError(RuntimeError):
+    """Required runtime dependencies need operator intervention before launch."""
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedResult:
     """Verified locally cached result metadata."""
@@ -123,12 +127,23 @@ class JobLifecycle:
     ) -> JobRecord:
         """Perform at most one idempotent service-side lifecycle pass."""
         lock = self._locks.setdefault(job_id, asyncio.Lock())
+        if lock.locked() and not force_refresh:
+            return self._required_job(job_id)
         async with lock:
             job = self._required_job(job_id)
             registration = self.registrations[job.tool]
             now = int(time.time())
             if job.state == JobState.QUEUED and job.root_function_call_id is None:
-                waiting = await registration.adapter.stage(job)
+                try:
+                    waiting = await registration.adapter.stage(job)
+                except EnvironmentPreparationError as error:
+                    LOGGER.warning("Runtime preparation failed", exc_info=True)
+                    return self.store.fail_job(
+                        job_id,
+                        error_code="environment_preparation_failed",
+                        error_message=str(error),
+                        now=now,
+                    )
                 if waiting is not None:
                     return self.store.defer_submission(
                         job_id,
@@ -157,6 +172,8 @@ class JobLifecycle:
                     now=now,
                 )
             if job.state == JobState.CANCEL_REQUESTED:
+                if not background:
+                    return job
                 try:
                     overview = await self.remote.cancel(_locator(job))
                 except RemoteExecutionIdentityMismatchError:
@@ -271,37 +288,16 @@ class JobLifecycle:
             )
 
     async def cancel(self, job_id: UUID) -> JobRecord:
-        """Serialize sticky cancellation with launch for one Job."""
+        """Acknowledge durable intent; reconciliation delivers remote cancellation."""
+        job = self._required_job(job_id)
+        if job.state == JobState.CANCEL_REQUESTED:
+            return job
         lock = self._locks.setdefault(job_id, asyncio.Lock())
         async with lock:
             job = self.store.request_cancel(job_id, now=int(time.time()))
             if job.state == JobState.CANCELLED:
                 await self.registrations[job.tool].adapter.discard_pending(job)
-                return job
-            try:
-                overview = await self.remote.cancel(_locator(job))
-            except RemoteExecutionIdentityMismatchError:
-                LOGGER.warning("Remote execution identity is unknown", exc_info=True)
-                return self.store.mark_state_unknown(
-                    job_id,
-                    reason="provider_outcome_unknown",
-                    message="The remote execution identity could not be confirmed",
-                    now=int(time.time()),
-                )
-            except RemoteDeploymentUnavailableError:
-                LOGGER.warning("Remote deployment is unavailable", exc_info=True)
-                return self.store.mark_state_unknown(
-                    job_id,
-                    reason="deployment_unavailable",
-                    message="The deployed Tool could not be reached",
-                    now=int(time.time()),
-                )
-            return await self._observe(
-                job,
-                overview,
-                self.registrations[job.tool],
-                now=int(time.time()),
-            )
+            return job
 
     async def _observe(
         self,

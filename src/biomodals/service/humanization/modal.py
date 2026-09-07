@@ -9,6 +9,7 @@ from typing import BinaryIO, cast
 
 import modal
 
+from biomodals.execution import DeploymentIdentity
 from biomodals.execution.modal import stage_execution_launch
 from biomodals.helper.modal_volume import (
     download_modal_volume_files,
@@ -21,7 +22,11 @@ from biomodals.service.humanization.results import (
 )
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobRecord
-from biomodals.service.tool_runtime import PreparedResult
+from biomodals.service.tool_runtime import (
+    EnvironmentPreparationError,
+    PreparedResult,
+    SubmissionWait,
+)
 from biomodals.workflow.humanization.execution import (
     HumanizationExecutionRequest,
     load_execution_request_from_volume,
@@ -51,9 +56,15 @@ class HumanizationToolAdapter:
             raise ValueError("modal_download_concurrency must be a positive integer")
         self.pending = pending
         self.modal_download_concurrency = modal_download_concurrency
+        # Service-process scoped: restart or a new pinned deployment revalidates
+        # with the app-owned stagers; never persist an unverified readiness flag.
+        self._preparation_tasks: dict[DeploymentIdentity, asyncio.Task[None]] = {}
 
-    async def stage(self, job: JobRecord) -> None:
+    async def stage(self, job: JobRecord) -> SubmissionWait | None:
         """Verify one immutable request and its initial launch before discarding input."""
+        waiting = self._prepare_environment(job)
+        if waiting is not None:
+            return waiting
         content = self.pending.get(job.job_id)
         volume = self._volume(job)
         await volume.hydrate.aio()
@@ -65,6 +76,45 @@ class HumanizationToolAdapter:
         request = HumanizationExecutionRequest.from_bytes(content)
         await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
         await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
+
+    def _prepare_environment(self, job: JobRecord) -> SubmissionWait | None:
+        """Share preparation without holding a Job lock during model downloads."""
+        deployment = DeploymentIdentity(
+            job.modal_environment, job.modal_app_name, job.modal_app_version
+        )
+        task = self._preparation_tasks.get(deployment)
+        if task is None:
+            task = asyncio.create_task(self._stage_models(deployment))
+            self._preparation_tasks[deployment] = task
+            # Retrieve failures even if all waiting Jobs are cancelled. Keep the
+            # failed task so later admission cannot silently repeat paid staging.
+            task.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+        if not task.done():
+            return SubmissionWait(
+                reason="preparing_environment",
+                message="Preparing and verifying humanization models before execution",
+            )
+        try:
+            task.result()
+        except Exception as error:
+            raise EnvironmentPreparationError(
+                "Humanization models could not be prepared; operator intervention is required"
+            ) from error
+        return None
+
+    @staticmethod
+    async def _stage_models(deployment: DeploymentIdentity) -> None:
+        """Use the containing deployment's CPU-only checksum-validating stagers."""
+        for name in ("stage_hudiff_models", "stage_pabnativ2_models"):
+            function = modal.Function.from_name(
+                deployment.deployment_name,
+                name,
+                environment_name=deployment.environment,
+                version=deployment.deployment_version,
+            )
+            await function.remote.aio()
 
     async def discard_pending(self, job: JobRecord) -> None:
         """Discard the local copy only after successful remote staging."""

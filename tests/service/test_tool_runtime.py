@@ -21,6 +21,7 @@ from biomodals.service.remote_execution import (
 )
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
+    EnvironmentPreparationError,
     JobLifecycle,
     PreparedResult,
     ResultIntegrityError,
@@ -167,6 +168,37 @@ async def test_submission_wait_stays_queued_without_launching(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
+async def test_environment_preparation_failure_retains_input_and_never_launches(
+    tmp_path: Path,
+) -> None:
+    class FailingAdapter(Adapter):
+        attempts = 0
+
+        async def stage(self, job):
+            self.attempts += 1
+            raise EnvironmentPreparationError("Model cache requires operator repair")
+
+        async def discard_pending(self, job):
+            raise AssertionError("Failed preparation must retain pending input")
+
+    adapter = FailingAdapter()
+    store, lifecycle, _adapter = _lifecycle(tmp_path, object(), adapter)
+
+    failed = await lifecycle.advance(JOB_ID)
+
+    assert failed.state == JobState.FAILED
+    assert failed.error_code == "environment_preparation_failed"
+    assert failed.error_message == "Model cache requires operator repair"
+    assert failed.root_function_call_id is None
+    assert failed.completed_at is not None
+    assert store.count_active_jobs() == 0
+    assert store.list_reconcilable_jobs(now=10**10) == []
+    assert await lifecycle.advance(JOB_ID, background=True) == failed
+    assert await lifecycle.advance(JOB_ID, force_refresh=True) == failed
+    assert adapter.attempts == 1
+
+
+@pytest.mark.anyio
 async def test_cancellation_waits_for_launch_checkpoint(tmp_path: Path) -> None:
     class Remote:
         entered = asyncio.Event()
@@ -196,8 +228,46 @@ async def test_cancellation_waits_for_launch_checkpoint(tmp_path: Path) -> None:
 
     assert cancelled.state == JobState.CANCEL_REQUESTED
     assert cancelled.root_function_call_id == "fc-root"
-    assert remote.cancellations == 1
+    assert remote.cancellations == 0
     assert store.get_job_by_id(JOB_ID) == cancelled
+    await lifecycle.advance(JOB_ID, background=True)
+    assert remote.cancellations == 1
+
+
+@pytest.mark.anyio
+async def test_cancellation_acknowledgement_and_status_do_not_wait_for_remote(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def cancel(self, _locator):
+            self.entered.set()
+            await self.release.wait()
+            return _overview(RunStatus.CANCELLED)
+
+    remote = Remote()
+    store, lifecycle, _adapter = _lifecycle(tmp_path, remote)
+    await lifecycle.advance(JOB_ID)
+    try:
+        acknowledged = await asyncio.wait_for(lifecycle.cancel(JOB_ID), timeout=0.1)
+        assert acknowledged.state == JobState.CANCEL_REQUESTED
+        assert store.get_job_by_id(JOB_ID).cancel_requested_at is not None
+        assert (await lifecycle.advance(JOB_ID)).state == JobState.CANCEL_REQUESTED
+        delivery = asyncio.create_task(lifecycle.advance(JOB_ID, background=True))
+        await remote.entered.wait()
+        viewed = await asyncio.wait_for(lifecycle.advance(JOB_ID), timeout=0.1)
+        assert viewed.state == JobState.CANCEL_REQUESTED
+        repeated = await asyncio.wait_for(lifecycle.cancel(JOB_ID), timeout=0.1)
+        assert repeated.cancel_requested_at == acknowledged.cancel_requested_at
+    finally:
+        remote.release.set()
+    cancelled = await delivery
+    assert cancelled.state == JobState.CANCELLED
 
 
 @pytest.mark.anyio

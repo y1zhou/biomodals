@@ -2,6 +2,7 @@
 
 # ruff: noqa: D103
 
+import asyncio
 import hashlib
 import io
 import zipfile
@@ -17,15 +18,26 @@ from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.humanization import modal as service_modal
 from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.pending import PendingRequestStore
+from biomodals.service.tool_runtime import EnvironmentPreparationError, SubmissionWait
 from biomodals.workflow.humanization.contracts import AntibodyPair
 from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
 
 
-def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prepare_environment: bool = False,
+):
     pending = PendingRequestStore(tmp_path)
     pending.initialize()
     adapter = HumanizationToolAdapter(pending, modal_download_concurrency=2)
-    job: Any = SimpleNamespace(job_id=uuid4(), modal_environment="test")
+    job: Any = SimpleNamespace(
+        job_id=uuid4(),
+        modal_environment="test",
+        modal_app_name="HumanizationWorkflow",
+        modal_app_version=1,
+    )
     request = HumanizationExecutionRequest(
         run_name="test",
         pairs=(AntibodyPair(id="001", vh="ACD", vl="EFG"),),
@@ -39,7 +51,111 @@ def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         service_modal, "load_execution_request_from_volume", lambda *_: request
     )
+    if not prepare_environment:
+        monkeypatch.setattr(adapter, "_prepare_environment", lambda _: None)
     return adapter, job, request
+
+
+@pytest.mark.anyio
+async def test_environment_preparation_waits_deduplicates_and_pins_deployment(
+    tmp_path, monkeypatch
+):
+    adapter, job, request = _setup(tmp_path, monkeypatch, prepare_environment=True)
+    adapter.pending.put(job.job_id, request.to_bytes())
+    gate = asyncio.Event()
+    finished = asyncio.Event()
+    calls = []
+
+    def function(app_name, function_name, **kwargs):
+        async def run():
+            calls.append((app_name, function_name, kwargs))
+            await gate.wait()
+            if function_name == "stage_pabnativ2_models":
+                finished.set()
+
+        return SimpleNamespace(remote=SimpleNamespace(aio=run))
+
+    monkeypatch.setattr(service_modal.modal.Function, "from_name", function)
+    staged = []
+    monkeypatch.setattr(
+        service_modal, "stage_execution_request", lambda *_: staged.append("request")
+    )
+    monkeypatch.setattr(
+        service_modal, "stage_execution_launch", lambda *_: staged.append("launch")
+    )
+    assert isinstance(await adapter.stage(job), SubmissionWait)
+    await asyncio.sleep(0)
+    sibling = SimpleNamespace(**{**vars(job), "job_id": uuid4()})
+    assert isinstance(await adapter.stage(sibling), SubmissionWait)
+    assert len(calls) == 1
+    assert staged == []
+    assert adapter.pending.get(job.job_id) == request.to_bytes()
+    gate.set()
+    await asyncio.wait_for(finished.wait(), timeout=2)
+    assert await asyncio.wait_for(adapter.stage(job), timeout=2) is None
+    assert staged == ["request", "launch"]
+    assert await asyncio.wait_for(adapter.stage(sibling), timeout=2) is None
+    assert [call[1] for call in calls] == [
+        "stage_hudiff_models",
+        "stage_pabnativ2_models",
+    ]
+    assert all(call[2] == {"environment_name": "test", "version": 1} for call in calls)
+
+    finished.clear()
+    changed = SimpleNamespace(**{
+        **vars(job),
+        "job_id": uuid4(),
+        "modal_app_version": 2,
+    })
+    assert isinstance(await adapter.stage(changed), SubmissionWait)
+    await asyncio.wait_for(finished.wait(), timeout=2)
+    assert await adapter.stage(changed) is None
+    assert len(calls) == 4
+    assert all(call[2]["version"] == 2 for call in calls[2:])
+
+    finished.clear()
+    restarted, restarted_job, _ = _setup(
+        tmp_path, monkeypatch, prepare_environment=True
+    )
+    assert isinstance(await restarted.stage(restarted_job), SubmissionWait)
+    await asyncio.wait_for(finished.wait(), timeout=2)
+    assert await restarted.stage(restarted_job) is None
+    assert len(calls) == 6
+
+
+@pytest.mark.anyio
+async def test_environment_failure_prevents_launch_without_automatic_staging_retries(
+    tmp_path, monkeypatch
+):
+    adapter, job, request = _setup(tmp_path, monkeypatch, prepare_environment=True)
+    adapter.pending.put(job.job_id, request.to_bytes())
+    failed = asyncio.Event()
+    calls = []
+
+    def function(app_name, function_name, **kwargs):
+        async def run():
+            calls.append(function_name)
+            failed.set()
+            raise RuntimeError("asset checksum mismatch")
+
+        return SimpleNamespace(remote=SimpleNamespace(aio=run))
+
+    monkeypatch.setattr(service_modal.modal.Function, "from_name", function)
+    monkeypatch.setattr(
+        service_modal,
+        "stage_execution_request",
+        lambda *_: pytest.fail("Request staged before model readiness"),
+    )
+    assert isinstance(await adapter.stage(job), SubmissionWait)
+    await failed.wait()
+    for _ in range(2):
+        with pytest.raises(
+            EnvironmentPreparationError, match="operator intervention"
+        ) as caught:
+            await adapter.stage(job)
+        assert str(caught.value.__cause__) == "asset checksum mismatch"
+    assert calls == ["stage_hudiff_models"]
+    assert adapter.pending.get(job.job_id) == request.to_bytes()
 
 
 @pytest.mark.anyio

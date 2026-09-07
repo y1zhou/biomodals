@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease, run_blocking_io
@@ -110,6 +110,7 @@ def create_jobs_router(
     )
     async def cancel_job(
         job_id: UUID,
+        request: Request,
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
     ) -> JobView:
         _owned(store, session, job_id)
@@ -117,6 +118,7 @@ def create_jobs_router(
             job = await lifecycle.cancel(job_id)
         except JobNotCancellableError as error:
             raise CodedAPIError(409, "job_not_cancellable", str(error)) from error
+        request.app.state.reconcile_wakeup.set()
         return view(job, session)
 
     @router.post(

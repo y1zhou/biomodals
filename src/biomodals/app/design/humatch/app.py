@@ -68,6 +68,7 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
+from biomodals.workflow.humanization.scoring import scoring_result
 
 AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
 CSV_COLUMNS = ("id", "vh", "vl")
@@ -131,6 +132,7 @@ runtime_image = (
     .env({"TF_CPP_MIN_LOG_LEVEL": "3"})
     .pipe(patch_image_for_helper)
     .add_local_python_source("biomodals.app.design.humatch.execution")
+    .add_local_python_source("biomodals.workflow.humanization.scoring")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -399,6 +401,107 @@ def _classifier_row(
             for name, value in zip(classes, values, strict=True)
         })
     return row
+
+
+def _score_humatch_pairs(
+    csv_bytes: bytes,
+    *,
+    reference_vh: str,
+    reference_vl: str,
+    vh_target_family: str = "auto",
+    vl_target_family: str = "auto",
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Score unchanged candidates against one parental pair's fixed families."""
+    if vh_target_family not in ("auto", *VH_FAMILIES) or vl_target_family not in (
+        "auto",
+        *VL_FAMILIES,
+    ):
+        raise ValueError("Unsupported Humatch reference family")
+    inputs = parse_humatch_csv(csv_bytes)
+    if inputs.height > HUMATCH_BATCH_SIZE:
+        raise ValueError(f"Score calls support at most {HUMATCH_BATCH_SIZE} pairs")
+    parent_frame = parse_humatch_csv(
+        pl
+        .DataFrame({"id": ["parent"], "vh": [reference_vh], "vl": [reference_vl]})
+        .write_csv()
+        .encode()
+    )
+    upstream = _load_upstream()
+    models, _ = _load_models(upstream)
+    parent = _align_pair_record(parent_frame.row(0, named=True), upstream=upstream)
+    parental = _predict_distributions(
+        parent.vh, parent.vl, models, upstream, num_cpus=ENCODING_WORKERS_PER_PAIR
+    )
+    targets = (
+        _select_target(parental[0], "heavy", vh_target_family, upstream),
+        _select_target(parental[1], "light", vl_target_family, upstream),
+    )
+    summaries, distributions = [], []
+    for row in inputs.iter_rows(named=True):
+        pair = _align_pair_record(row, upstream=upstream)
+        values = _predict_distributions(
+            pair.vh, pair.vl, models, upstream, num_cpus=ENCODING_WORKERS_PER_PAIR
+        )
+        summary: dict[str, Any] = {
+            "id": row["id"],
+            "pairing_score": float(values[2][PAIRED_CLASSES.index("true")]),
+        }
+        for index, (chain, classes, kind, sequence) in enumerate((
+            ("vh", HEAVY_CLASSES, "heavy", pair.vh),
+            ("vl", LIGHT_CLASSES, "light", pair.vl),
+        )):
+            best = _select_target(values[index], kind, "auto", upstream)
+            target = targets[index]
+            summary.update({
+                f"{chain}_target_family": target,
+                f"{chain}_target_probability": float(
+                    values[index][classes.index(target)]
+                ),
+                f"{chain}_best_family": best,
+                f"{chain}_best_family_probability": float(
+                    values[index][classes.index(best)]
+                ),
+                f"{chain}_germline_likeness": float(
+                    upstream["gl_score"](sequence, target, upstream["gl_dir"])
+                ),
+            })
+        summaries.append(summary)
+        distributions.append(
+            _classifier_row(identifier=row["id"], endpoint="candidate", scores=values)
+        )
+    return inputs, pl.DataFrame(summaries), pl.DataFrame(distributions)
+
+
+@app.function(cpu=2, memory=4096, timeout=CONF.timeout)
+def humatch_score(
+    csv_bytes: bytes,
+    reference_vh: str,
+    reference_vl: str,
+    vh_target_family: str = "auto",
+    vl_target_family: str = "auto",
+) -> AppRunResult:
+    """Evaluate unchanged pairs against fixed parental references, with full distributions."""
+    inputs, summary, distributions = _score_humatch_pairs(
+        csv_bytes,
+        reference_vh=reference_vh,
+        reference_vl=reference_vl,
+        vh_target_family=vh_target_family,
+        vl_target_family=vl_target_family,
+    )
+    return scoring_result(
+        "humatch",
+        inputs,
+        summary,
+        {"classifier_scores": distributions},
+        {
+            "runtime": RUNTIME_IDENTITY,
+            "source_commit": CONF.repo_commit_hash,
+            "reference_vh": reference_vh,
+            "reference_vl": reference_vl,
+            "vh_target_family": vh_target_family,
+            "vl_target_family": vl_target_family,
+        },
+    )
 
 
 def _region_for_index(index: int, canonical: tuple[str, ...]) -> str:

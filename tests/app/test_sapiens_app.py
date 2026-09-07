@@ -249,6 +249,78 @@ def test_workflow_function_returns_inline_archive(monkeypatch) -> None:
     )
 
 
+def test_scoring_only_keeps_sequences_and_averages_observed_not_argmax(monkeypatch):
+    seen = []
+
+    def number_chain(**kwargs):
+        assert kwargs["numbering_scheme"] == kwargs["cdr_definition"] == "imgt"
+        return FakeChain(
+            kwargs["sequence"],
+            name=kwargs["identifier"],
+            scheme="imgt",
+            cdr_definition="imgt",
+        )
+
+    def predict(chain, model_root):
+        seen.append(chain.seq)
+        # Deliberately non-normalized over the canonical subset: omitted special
+        # token mass must not be redistributed by the wrapper.
+        rows = []
+        for index, residue in enumerate(chain.seq):
+            row = {amino_acid: 0.0 for amino_acid in sapiens_app.AMINO_ACIDS}
+            row[residue] = 0.1 * (index + 1)
+            row["W"] = 0.5
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    monkeypatch.setattr(sapiens_app, "_number_chain", number_chain)
+    monkeypatch.setattr(sapiens_app, "_predict_scores", predict)
+    monkeypatch.setattr(
+        sapiens_app,
+        "_humanize_chain",
+        lambda **kwargs: pytest.fail("Scoring must not humanize"),
+    )
+    frame, summary, profile = sapiens_app._score_sapiens_pairs(b"id,vh,vl\na,ACD,EF\n")
+    assert seen == ["ACD", "EF"]
+    assert frame["vh"].to_list() == ["ACD"]
+    assert summary["vh_mean_probability"][0] == pytest.approx(0.2)
+    assert summary["vl_mean_probability"][0] == pytest.approx(0.15)
+    assert profile["observed_aa"].to_list() == list("ACDEF")
+    assert profile["argmax_aa"].to_list() == ["W"] * 5
+    assert profile["endpoint"].unique().to_list() == ["candidate"]
+
+
+def test_scoring_operation_returns_summary_and_detail_archive(monkeypatch):
+    from biomodals.workflow.humanization import scoring as humanization
+
+    frame = pl.DataFrame({"id": ["a"], "vh": ["ACD"], "vl": ["EFG"]})
+    summary = pl.DataFrame({
+        "id": ["a"],
+        "vh_mean_probability": [0.2],
+        "vl_mean_probability": [0.3],
+    })
+    detail = pl.DataFrame({"id": ["a"], "observed_aa": ["A"]})
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(set_num_threads=lambda n: None)
+    )
+    monkeypatch.setattr(
+        sapiens_app, "_score_sapiens_pairs", lambda content: (frame, summary, detail)
+    )
+
+    def package(root, *, num_threads):
+        assert pl.read_csv(root / "summary.csv").equals(summary)
+        assert pl.read_parquet(root / "residue_scores.parquet").equals(detail)
+        assert not (root / "humanized.csv").exists()
+        assert b'"operation":"sapiens_score"' in (root / "manifest.json").read_bytes()
+        return b"scores"
+
+    monkeypatch.setattr(humanization, "package_outputs", package)
+    result = sapiens_app.sapiens_score.get_raw_f()(csv_bytes=VALID_CSV)
+    assert result.status == AppRunStatus.SUCCEEDED
+    assert result.outputs[0].name == "sapiens_scores"
+    assert result.outputs[0].storage.data == b"scores"
+
+
 def test_local_entrypoint_stages_kernel_run_and_writes_archive(
     tmp_path,
     monkeypatch,

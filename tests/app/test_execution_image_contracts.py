@@ -19,6 +19,8 @@ from biomodals.app.fold import (
     protenix_app,
 )
 from biomodals.app.score import af3score_app, ensirna_app, oligoformer_app
+from biomodals.execution.modal import orchestrator
+from biomodals.workflow.humanization import workflow as humanization_workflow
 from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
 
 
@@ -32,6 +34,33 @@ def _source_modules(image) -> set[str]:
         image,
     )
     return set(original._added_python_source_set)
+
+
+def test_humanization_coordinator_and_annotation_image_source_closures():
+    """The shared coordinator can import app-composed graph classes remotely."""
+    assert {"biomodals.workflow", "biomodals.app"} <= _source_modules(
+        orchestrator.runtime_image
+    )
+    assert "biomodals.workflow.humanization" in _source_modules(
+        humanization_workflow.annotation_image
+    )
+    assert humanization_workflow.CONF.python_version == "3.13"
+    for module in (
+        humanization_workflow.sapiens_app,
+        humanization_workflow.humatch_app,
+        humanization_workflow.pabnativ2_app,
+    ):
+        assert "biomodals.workflow.humanization.scoring" in _source_modules(
+            module.runtime_image
+        )
+    for relative in (
+        "workflow/humanization/contracts.py",
+        "workflow/humanization/scoring.py",
+        "workflow/humanization/annotation.py",
+        "workflow/humanization/artifacts.py",
+    ):
+        path = Path(__file__).parents[2] / "src" / "biomodals" / relative
+        ast.parse(path.read_text(), feature_version=(3, 12))
 
 
 @pytest.mark.parametrize(

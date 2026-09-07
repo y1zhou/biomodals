@@ -47,6 +47,7 @@ from biomodals.app.design.pabnativ2.models import (
     RUNTIME_IDENTITY,
     STRUCTURE_MODEL_ARCHIVE,
     assert_pabnativ2_assets,
+    assert_pabnativ2_paired_checkpoint,
     stage_pabnativ2_assets,
 )
 from biomodals.app.design.pabnativ2.patches import (
@@ -80,6 +81,7 @@ from biomodals.schema import (
     ArtifactKind,
     InlineBytes,
 )
+from biomodals.workflow.humanization.scoring import scoring_result
 
 AMINO_ACIDS = tuple("ACDEFGHIKLMNPQRSTVWY")
 RECONSTRUCTION_SYMBOLS = (*AMINO_ACIDS, "-")
@@ -169,6 +171,7 @@ runtime_image = (
     .run_function(install_missing_abnativ_pssms)
     .pipe(patch_image_for_helper)
     .add_local_python_source("biomodals.app.design.pabnativ2")
+    .add_local_python_source("biomodals.workflow.humanization.scoring")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 EXECUTION_COORDINATOR_ENTRYPOINTS = frozenset({"submit_pabnativ2_task"})
@@ -972,6 +975,108 @@ def _worker_kwargs() -> dict[str, Any]:
         "timeout": CONF.timeout,
         "volumes": CONF.mounts(model_volume=True),
     }
+
+
+@cache
+def _assert_scoring_checkpoint() -> None:
+    assert_pabnativ2_paired_checkpoint(MODEL_ROOT)
+
+
+def _score_pabnativ2_pairs(
+    csv_bytes: bytes,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Run the native paired scorer without structure prediction or humanization."""
+    import pandas as pd
+    from abnativ.model.scoring_functions import (  # type: ignore[ty:unresolved-import]
+        abnativ_scoring_paired,
+    )
+
+    inputs = parse_pabnativ2_csv(csv_bytes)
+    if inputs.height > PAIRS_PER_GPU_CALL:
+        raise ValueError(f"Score calls support at most {PAIRS_PER_GPU_CALL} pairs")
+    _validate_antibody_chains(inputs)
+    _assert_scoring_checkpoint()
+    records = {
+        f"pair_{index:04d}": row
+        for index, row in enumerate(inputs.iter_rows(named=True))
+    }
+    mean, profile = abnativ_scoring_paired(
+        pd.DataFrame({
+            "ID": list(records),
+            "vh_seq": [row["vh"] for row in records.values()],
+            "vl_seq": [row["vl"] for row in records.values()],
+        }),
+        batch_size=len(records),
+        mean_score_only=False,
+        do_align=True,
+        verbose=False,
+        is_plotting_profiles=False,
+    )
+    if len(mean) != len(records) or set(mean["seq_id"]) != set(records):
+        raise ValueError("p-AbNatiV2 alignment omitted or duplicated candidate IDs")
+    summaries, details = [], []
+    for source in mean.to_dict(orient="records"):
+        original = records[str(source["seq_id"])]
+        if (source["input_seq_vh"], source["input_seq_vl"]) != (
+            original["vh"],
+            original["vl"],
+        ):
+            raise ValueError("p-AbNatiV2 scoring changed the input sequence")
+        row = {
+            "id": original["id"],
+            **{
+                output: _python_number(source[name])
+                for name, output in SEQUENCE_SCORE_COLUMNS.items()
+            },
+        }
+        details.append(row)
+        summaries.append({
+            "id": original["id"],
+            "pair_nativeness": row["joint_score"],
+            "vh_nativeness": row["vh_score"],
+            "vl_nativeness": row["vl_score"],
+            "pairing_score": row["pairing_score"],
+        })
+    profiles = pl.from_pandas(profile)
+    if profiles.height != 298 * len(records) or set(profiles["seq_id"]) != set(records):
+        raise ValueError("p-AbNatiV2 returned incomplete residue profiles")
+    for identifier in records:
+        positions = profiles.filter(pl.col("seq_id") == identifier)[
+            "AHo position"
+        ].to_list()
+        expected = {
+            f"{chain}-{position}" for chain in ("H", "L") for position in range(1, 150)
+        }
+        if len(positions) != 298 or set(positions) != expected:
+            raise ValueError(
+                "p-AbNatiV2 returned duplicate or missing residue positions"
+            )
+    profiles = profiles.with_columns(
+        pl
+        .col("seq_id")
+        .replace_strict({key: row["id"] for key, row in records.items()})
+        .alias("id")
+    ).drop("seq_id")
+    return inputs, pl.DataFrame(summaries), pl.DataFrame(details), profiles
+
+
+@app.function(cpu=2, gpu="A10G", **_worker_kwargs())
+def pabnativ2_score(csv_bytes: bytes) -> AppRunResult:
+    """Evaluate unchanged pairs; report native regions without structural claims."""
+    inputs, summary, details, profile = _score_pabnativ2_pairs(csv_bytes)
+    return scoring_result(
+        "pabnativ2",
+        inputs,
+        summary,
+        {"sequence_scores": details, "residue_scores": profile},
+        {
+            "runtime": RUNTIME_IDENTITY,
+            "source_commit": IDENTITY.abnativ_commit,
+            "paired_model_md5": PAIRED_MODEL.md5_hex,
+            "pairing_units": "fraction",
+            "structure_prediction": False,
+        },
+    )
 
 
 def _batch_worker_kwargs() -> dict[str, Any]:

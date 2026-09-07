@@ -177,6 +177,17 @@ def _load_manifest(root: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def assert_pabnativ2_paired_checkpoint(root: Path) -> None:
+    """Validate the sequence scorer's only checkpoint, without structure assets."""
+    paired = root / PAIRED_CHECKPOINT
+    if (
+        not paired.is_file()
+        or paired.stat().st_size != PAIRED_MODEL.size_bytes
+        or _digest_file(paired, "md5") != PAIRED_MODEL.md5_hex
+    ):
+        raise RuntimeError("p-AbNatiV2 paired checkpoint is missing or corrupt")
+
+
 def assert_pabnativ2_assets(root: Path) -> dict[str, object]:
     """Validate the complete staged publication and return its manifest."""
     manifest = _load_manifest(root)
@@ -189,13 +200,7 @@ def assert_pabnativ2_assets(root: Path) -> dict[str, object]:
     if manifest.get("structure_archive_md5") != STRUCTURE_MODEL_ARCHIVE.md5_hex:
         raise RuntimeError("p-AbNatiV2 structure model identity is invalid")
 
-    paired = root / PAIRED_CHECKPOINT
-    if (
-        not paired.is_file()
-        or paired.stat().st_size != PAIRED_MODEL.size_bytes
-        or _digest_file(paired, "md5") != PAIRED_MODEL.md5_hex
-    ):
-        raise RuntimeError("p-AbNatiV2 paired checkpoint is missing or corrupt")
+    assert_pabnativ2_paired_checkpoint(root)
 
     structure = manifest.get("structure_checkpoint")
     if not isinstance(structure, dict):

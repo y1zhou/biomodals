@@ -879,6 +879,25 @@ same parental VH-VL Pair. Collection does not imply that one method consumes
 another method's result or that agreement proves experimental suitability.
 _Avoid_: chained humanization, consensus sequence, validated antibody
 
+**Humanization Candidate Union**:
+The sequence-distinct VH-VL Pairs collected from independent humanization
+methods for one parent, retaining every generating method's provenance and
+the unchanged parental pair as a baseline.
+_Avoid_: consensus antibody, recombined chains, experimental shortlist
+
+**Humanization Cross-Evaluation**:
+Independent assessment of every pair in a Humanization Candidate Union by
+the same evaluators without further sequence changes. Method-specific scores
+are distinct evidence, not a combined experimental-suitability score.
+_Avoid_: repeated humanization, consensus score, experimental validation
+
+**Shared CDR Preservation Check**:
+An assessment of whether a candidate retains its parent's CDR residues under
+the workflow's common IMGT definition, distinct from each generator's native
+protection rules. A changed CDR is an annotation, not automatic exclusion from
+the Humanization Candidate Union.
+_Avoid_: native sampling mask, CDR repair, binding preservation guarantee
+
 **Humanization Mutation Table**:
 A Parquet artifact containing one row per parental-to-result amino-acid
 substitution, with method-appropriate residue coordinates and endpoint

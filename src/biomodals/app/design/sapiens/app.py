@@ -13,6 +13,7 @@ the result schema.
 # ruff: noqa: PLC0415
 
 import hashlib
+import math
 import time
 from importlib import import_module
 from io import BytesIO
@@ -64,6 +65,7 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
+from biomodals.workflow.humanization.scoring import scoring_result
 
 AMINO_ACIDS = tuple("ACDEFGHIKLMNPQRSTVWY")
 CSV_COLUMNS = ("id", "vh", "vl")
@@ -126,6 +128,7 @@ runtime_image = (
     })
     .pipe(patch_image_for_helper)
     .add_local_python_source("biomodals.app.design.sapiens.execution")
+    .add_local_python_source("biomodals.workflow.humanization.scoring")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 
@@ -250,17 +253,14 @@ def _predict_scores(chain: Any, model_root: Path) -> Any:
     )
 
 
-def _humanize_chain(
+def _number_chain(
     *,
     identifier: str,
     chain_label: str,
     sequence: str,
-    iterations: int,
     numbering_scheme: str,
     cdr_definition: str,
-    mutate_cdrs: bool,
-    model_root: Path,
-) -> tuple[Any, list[pl.DataFrame], list[dict[str, Any]]]:
+) -> Any:
     from abnumber import Chain  # type: ignore[ty:unresolved-import]
 
     parental = Chain(
@@ -278,6 +278,27 @@ def _humanize_chain(
         raise ValueError(f"{identifier}: vh was not identified as a heavy chain")
     if chain_label == "vl" and not parental.is_light_chain():
         raise ValueError(f"{identifier}: vl was not identified as a light chain")
+    return parental
+
+
+def _humanize_chain(
+    *,
+    identifier: str,
+    chain_label: str,
+    sequence: str,
+    iterations: int,
+    numbering_scheme: str,
+    cdr_definition: str,
+    mutate_cdrs: bool,
+    model_root: Path,
+) -> tuple[Any, list[pl.DataFrame], list[dict[str, Any]]]:
+    parental = _number_chain(
+        identifier=identifier,
+        chain_label=chain_label,
+        sequence=sequence,
+        numbering_scheme=numbering_scheme,
+        cdr_definition=cdr_definition,
+    )
 
     current = parental.clone()
     input_scores = _predict_scores(current, model_root)
@@ -499,6 +520,78 @@ def _run_sapiens_humanization(
     )
     elapsed_seconds = time.perf_counter() - started_at
     return archive, input_frame.height, len(mutation_rows), elapsed_seconds
+
+
+def _score_sapiens_pairs(
+    csv_bytes: bytes,
+    *,
+    model_root: Path = MODEL_ROOT,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Evaluate unchanged chains; do not mask, renormalize, or run argmax design."""
+    frame = parse_sapiens_csv(csv_bytes)
+    summaries = []
+    profiles = []
+    for row in frame.iter_rows(named=True):
+        summary: dict[str, Any] = {"id": row["id"]}
+        for label in ("vh", "vl"):
+            chain = _number_chain(
+                identifier=row["id"],
+                chain_label=label,
+                sequence=row[label],
+                numbering_scheme="imgt",
+                cdr_definition="imgt",
+            )
+            scores = _predict_scores(chain, model_root)
+            profile = _score_frame(
+                identifier=row["id"],
+                chain_label=label,
+                endpoint="candidate",
+                chain=chain,
+                scores=scores,
+            )
+            probabilities = [
+                float(scores.iloc[index][residue])
+                for index, residue in enumerate(chain.seq)
+            ]
+            if any(
+                not math.isfinite(value) or not 0 <= value <= 1
+                for value in probabilities
+            ):
+                raise ValueError(
+                    "Sapiens returned invalid observed-residue probabilities"
+                )
+            summary[f"{label}_mean_probability"] = sum(probabilities) / len(
+                probabilities
+            )
+            profiles.append(profile)
+        summaries.append(summary)
+    return frame, pl.DataFrame(summaries), pl.concat(profiles)
+
+
+@app.function(cpu=2, memory=2048, timeout=CONF.timeout)
+def sapiens_score(csv_bytes: bytes) -> AppRunResult:
+    """Score a bounded paired CSV without humanization, returning summary/detail tables."""
+    import torch  # type: ignore[ty:unresolved-import]
+
+    torch.set_num_threads(2)
+    frame, summary, profile = _score_sapiens_pairs(csv_bytes)
+    return scoring_result(
+        "sapiens",
+        frame,
+        summary,
+        {"residue_scores": profile},
+        {
+            "runtime_identity": RUNTIME_IDENTITY,
+            "source_commit": CONF.repo_commit_hash,
+            "model_vh_revision": IDENTITY.vh_revision,
+            "model_vl_revision": IDENTITY.vl_revision,
+            "tokenizer_revision": IDENTITY.tokenizer_revision,
+            "summary_definition": "mean unmasked observed-residue probability, no renormalization",
+            "numbering_scheme": "imgt",
+            "cdr_definition": "imgt",
+            "input_sha256": hashlib.sha256(csv_bytes).hexdigest(),
+        },
+    )
 
 
 @app.function(cpu=2, memory=2048, timeout=CONF.timeout)

@@ -220,3 +220,36 @@ accounts were disabled after browser verification, revoking their sessions.
 
 No further scientific submissions were made. Exact billed spend is not
 available from these checks and must not be inferred from elapsed time alone.
+
+### Successful follow-up smoke test
+
+The user subsequently authorized an additional $10 maximum testing budget.
+Exactly one further one-pair Job was submitted to the unchanged version 2
+deployment, again requesting one HuDiff candidate attempt. Job
+`a0a6d7db-5335-4f0a-b96d-0aefb05965dd` was admitted at 12:08:05 UTC and
+completed successfully at 12:18:13 UTC, before its 15-minute automatic cutoff.
+Existing model assets were revalidated rather than downloaded again.
+
+All four generation methods completed. Generation took 8 minutes 7 seconds;
+union collection took 2 seconds; evaluation and ranking took 36 seconds.
+The final table contains 45 columns and three unique paired sequences: the
+parent plus two generated candidates, ranked first and second. Every row has
+`evaluation_complete=true`, all annotation/evaluation errors are null, and
+the manifest contains no generation or execution errors. Parental generation
+provenance is null, and CDR preservation is reported for all three rows.
+
+The live frontend verified Completed for the Job and all three stages, the
+initial `offset=0&limit=50` table request, ascending and descending sorting
+with nulls last, exact scientific-order restoration, and parent filtering.
+All five selection requests returned HTTP 200, with no browser errors or
+extra scientific submissions. Native CSV (3,391 bytes) and ZIP (1,501,826
+bytes) downloads succeeded through the existing preparation/download flow.
+The direct CSV exactly matches the archive member; all ten declared artifact
+sizes and SHA-256 digests match, and ZIP integrity checks pass.
+
+This closes the live end-to-end service/UI verification gap above. It does
+not replace larger-batch scientific validation or experimental assessment.
+No production code changes or additional deployments were needed. Modal
+reported no active containers afterward, and the temporary account was
+disabled with sessions revoked. Exact billed spend remains unavailable;
+only one bounded run was used from the additional budget.

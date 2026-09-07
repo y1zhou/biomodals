@@ -67,6 +67,9 @@ class ProviderDriver(Protocol):
         """Observe one retained Provider Call."""
         ...
 
-    def cancel(self, provider_call_handle_id: str) -> None:
-        """Request Provider Call cancellation."""
+    def cancel(self, provider_call_handle_id: str) -> ProviderCallObservation | None:
+        """Request cancellation; return CANCELLED only with conclusive evidence.
+
+        None acknowledges only a request and requires subsequent observation.
+        """
         ...

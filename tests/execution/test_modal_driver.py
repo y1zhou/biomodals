@@ -269,6 +269,23 @@ def test_driver_observes_timeout_as_running_and_retained_result_as_success() -> 
     assert observation.result == {"done": True}
 
 
+def test_async_cancel_returns_ack_only_after_successful_rpc() -> None:
+    async def cancel():
+        return None
+
+    call = SimpleNamespace(cancel=SimpleNamespace(aio=cancel))
+    driver = AsyncModalCallDriver(call_resolver=lambda _: call)
+    acknowledged = asyncio.run(driver.cancel("fc-123"))
+    assert acknowledged.kind == ProviderCallObservationKind.CANCELLED
+
+    async def uncertain_cancel():
+        raise TimeoutError("cancel response lost")
+
+    call.cancel.aio = uncertain_cancel
+    with pytest.raises(TimeoutError, match="response lost"):
+        asyncio.run(driver.cancel("fc-123"))
+
+
 def test_driver_observes_user_exception_as_failed() -> None:
     class Call:
         def get(self, timeout=0):

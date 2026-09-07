@@ -129,8 +129,11 @@ class ModalCallDriver:
             result=result,
         )
 
-    def cancel(self, provider_call_handle_id: str) -> None:
+    def cancel(self, provider_call_handle_id: str) -> ProviderCallObservation:
         self._call_resolver(provider_call_handle_id).cancel()
+        # Modal's successful cancellation RPC terminates inputs without retrying;
+        # get(timeout=0) need not subsequently produce a retained terminal result.
+        return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
 
 
 def deployed_function_handle(
@@ -233,6 +236,7 @@ class AsyncModalCallDriver:
             result=result,
         )
 
-    async def cancel(self, provider_call_handle_id: str) -> None:
+    async def cancel(self, provider_call_handle_id: str) -> ProviderCallObservation:
         call = self._call_resolver(provider_call_handle_id)
         await call.cancel.aio()
+        return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)

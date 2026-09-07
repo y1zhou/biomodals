@@ -408,7 +408,9 @@ class ExecutionRuntime:
             if provider_call_ids:
                 self._checkpoint_state()
         for provider_call_id in provider_call_ids:
-            self.request_provider_call_cancellation(provider_call_id, now=now)
+            self.request_provider_call_cancellation(
+                provider_call_id, now=now, result_already_satisfied=True
+            )
         return provider_call_ids
 
     def decode_completed_calls(
@@ -1275,6 +1277,7 @@ class ExecutionRuntime:
         provider_call_id: UUID,
         *,
         now: int,
+        result_already_satisfied: bool = False,
     ) -> ProviderCallRecord:
         """Request cancellation without inventing a conclusive provider outcome."""
         with self._synchronize():
@@ -1295,7 +1298,7 @@ class ExecutionRuntime:
                 self._checkpoint_state()
             return updated
         try:
-            self._driver.cancel(call.provider_call_handle_id)
+            acknowledgement = self._driver.cancel(call.provider_call_handle_id)
         except Exception as error:
             with self._synchronize():
                 with self._transaction():
@@ -1307,10 +1310,27 @@ class ExecutionRuntime:
                 self._checkpoint_state()
             return updated
         with self._synchronize():
-            return self.repository.get_provider_call(
+            current = self.repository.get_provider_call(
                 provider_call_id,
                 include_task_keys=False,
             )
+            if (
+                current.status.is_terminal
+                or acknowledgement is None
+                or acknowledgement.kind != ProviderCallObservationKind.CANCELLED
+            ):
+                return current
+            with self._transaction():
+                updated = _record_provider_call_observation(
+                    self.repository,
+                    provider_call_id,
+                    acknowledgement,
+                    result_envelope=None,
+                    result_already_satisfied=result_already_satisfied,
+                    now=now,
+                )
+            self._checkpoint_state()
+            return updated
 
     def cancel_run(
         self,

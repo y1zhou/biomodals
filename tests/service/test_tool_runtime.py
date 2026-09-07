@@ -440,6 +440,92 @@ async def test_reconciliation_processes_at_most_four_jobs_concurrently() -> None
 
 
 @pytest.mark.anyio
+async def test_slow_reconciliation_does_not_block_new_jobs_or_duplicate_delivery() -> (
+    None
+):
+    stop, wake = asyncio.Event(), asyncio.Event()
+    entered, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    old_id, new_id = uuid4(), uuid4()
+    jobs = [SimpleNamespace(job_id=old_id)]
+    old_calls = 0
+
+    class Store:
+        def list_reconcilable_jobs(self, *, now):
+            return tuple(jobs)
+
+    class Lifecycle:
+        store = Store()
+
+        async def advance(self, job_id, *, finalize, background):
+            nonlocal old_calls
+            if job_id == old_id:
+                old_calls += 1
+                entered.set()
+                await release.wait()
+            else:
+                processed.set()
+                jobs.remove(next(job for job in jobs if job.job_id == new_id))
+
+    task = asyncio.create_task(
+        reconciliation_loop(
+            cast(JobLifecycle, Lifecycle()),
+            interval_seconds=60,
+            stop=stop,
+            wake=wake,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        jobs.append(SimpleNamespace(job_id=new_id))
+        wake.set()
+        await asyncio.wait_for(processed.wait(), timeout=0.1)
+        wake.set()
+        await asyncio.sleep(0)
+        assert old_calls == 1
+    finally:
+        stop.set()
+        release.set()
+        wake.set()
+        await task
+
+
+@pytest.mark.anyio
+async def test_reconciliation_does_not_hot_poll_after_snapshot_is_exhausted() -> None:
+    stop, wake, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+    job = SimpleNamespace(job_id=uuid4())
+
+    class Store:
+        def list_reconcilable_jobs(self, *, now):
+            return (job,)
+
+    class Lifecycle:
+        store = Store()
+
+        async def advance(self, job_id, *, finalize, background):
+            nonlocal calls
+            calls += 1
+            processed.set()
+
+    task = asyncio.create_task(
+        reconciliation_loop(
+            cast(JobLifecycle, Lifecycle()),
+            interval_seconds=60,
+            stop=stop,
+            wake=wake,
+        )
+    )
+    try:
+        await asyncio.wait_for(processed.wait(), timeout=1)
+        await asyncio.sleep(0.02)
+        assert calls == 1
+    finally:
+        stop.set()
+        wake.set()
+        await task
+
+
+@pytest.mark.anyio
 async def test_reconciliation_wakes_for_a_newly_admitted_job() -> None:
     stop = asyncio.Event()
     wake = asyncio.Event()

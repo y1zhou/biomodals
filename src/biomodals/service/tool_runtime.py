@@ -6,6 +6,7 @@ import asyncio
 import errno
 import logging
 import time
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -554,32 +555,48 @@ async def reconciliation_loop(
     stop: asyncio.Event,
     wake: asyncio.Event,
 ) -> None:
-    """Retry bounded service work; remote coordinators keep executing alone."""
-    while not stop.is_set():
-        now = int(time.time())
-        semaphore = asyncio.Semaphore(_RECONCILIATION_CONCURRENCY)
+    """Keep slow Jobs in their own bounded slots across admission wakeups."""
+    active: dict[UUID, asyncio.Task[None]] = {}
+    pending: deque[JobRecord] = deque()
+    loop = asyncio.get_running_loop()
+    next_scan = loop.time()
+    wake_task = asyncio.create_task(wake.wait())
 
-        async def reconcile(job: JobRecord, gate: asyncio.Semaphore) -> None:
-            async with gate:
-                try:
-                    await lifecycle.advance(
-                        job.job_id,
-                        finalize=True,
-                        background=True,
-                    )
-                except Exception:
-                    LOGGER.exception("Could not reconcile Job %s", job.job_id)
-
-        async with asyncio.TaskGroup() as tasks:
-            for job in lifecycle.store.list_reconcilable_jobs(now=now):
-                tasks.create_task(reconcile(job, semaphore))
-        if stop.is_set():
-            break
+    async def reconcile(job: JobRecord) -> None:
         try:
-            await asyncio.wait_for(wake.wait(), timeout=interval_seconds)
-        except TimeoutError:
-            pass
-        wake.clear()
+            await lifecycle.advance(job.job_id, finalize=True, background=True)
+        except Exception:
+            LOGGER.exception("Could not reconcile Job %s", job.job_id)
+
+    try:
+        while not stop.is_set():
+            if wake_task.done() or loop.time() >= next_scan:
+                wake.clear()
+                if wake_task.done():
+                    wake_task = asyncio.create_task(wake.wait())
+                pending = deque(
+                    job
+                    for job in lifecycle.store.list_reconcilable_jobs(
+                        now=int(time.time())
+                    )
+                    if job.job_id not in active
+                )
+                next_scan = loop.time() + interval_seconds
+            while pending and len(active) < _RECONCILIATION_CONCURRENCY:
+                job = pending.popleft()
+                active[job.job_id] = asyncio.create_task(reconcile(job))
+            completed, _ = await asyncio.wait(
+                [wake_task, *active.values()],
+                timeout=max(0, next_scan - loop.time()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            active = {
+                job_id: task for job_id, task in active.items() if task not in completed
+            }
+    finally:
+        for task in (wake_task, *active.values()):
+            task.cancel()
+        await asyncio.gather(wake_task, *active.values(), return_exceptions=True)
 
 
 def _recorded_result(job: JobRecord) -> PreparedResult:

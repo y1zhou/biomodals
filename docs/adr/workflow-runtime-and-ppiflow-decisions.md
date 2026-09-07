@@ -197,6 +197,14 @@ resource managers.
 
 ## Split PPIFlow workflow helpers into a submodule
 
+2026-09-07 layout amendment: complex workflows use
+`workflow/<name>/workflow.py` as their discoverable composition root, consistent
+with package apps. PPIFlow's root is now
+`biomodals.workflow.ppiflow.workflow`; references to `ppiflow_workflow.py` below
+describe the previous layout. Node ownership and scientific behavior are
+unchanged. Catalog names and CLI commands remain `ppiflow`; Python imports use
+the new module path. Existing deployments remain pinned to their original code.
+
 PPIFlow-local manifests, tables, staging, and focused remote task
 implementations live under `biomodals.workflow.ppiflow`, while
 `ppiflow_workflow.py` remains the public workflow module discovered by the CLI

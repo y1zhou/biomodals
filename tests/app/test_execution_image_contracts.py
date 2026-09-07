@@ -19,7 +19,7 @@ from biomodals.app.fold import (
     protenix_app,
 )
 from biomodals.app.score import af3score_app, ensirna_app, oligoformer_app
-from biomodals.workflow import ppiflow_workflow
+from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
 
 
 def _source_modules(image) -> set[str]:

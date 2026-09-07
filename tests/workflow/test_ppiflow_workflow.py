@@ -45,7 +45,6 @@ from biomodals.schema import (
     InlineBytes,
     VolumePath,
 )
-from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.ppiflow import (
     af3score_runtime,
     analysis_runtime,
@@ -59,7 +58,8 @@ from biomodals.workflow.ppiflow import (
     runtime_support,
 )
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
-from biomodals.workflow.ppiflow_workflow import (
+from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
+from biomodals.workflow.ppiflow.workflow import (
     CONF,
     build_ppiflow_workflow,
 )

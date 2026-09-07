@@ -9,7 +9,7 @@ workflow example. Use
 `src/biomodals/workflow/rfd_ligandmpnn_workflow.py` as the reference for
 workflows that select files from one app's volume-backed output and fan those
 files out into another app's workflow-compatible function. Do not use
-`src/biomodals/workflow/ppiflow_workflow.py` as a generic starter template, but
+`src/biomodals/workflow/ppiflow/workflow.py` as a generic starter template, but
 use it as the reference for candidate-manifest joins, retained-candidate
 filtering, candidate-wide Tasks, focused task-image runtimes, and
 PPIFlow-specific stage wiring.
@@ -130,6 +130,10 @@ the workflow module unless it is also useful to the standalone app.
 ## Schema Boundaries
 
 Shared contracts live in `biomodals.schema`.
+
+Keep workflow-specific contracts and helpers beside their workflow. Reserve
+top-level `schema` and `helper` modules for contracts and operations shared
+across multiple independent apps or workflows.
 
 Schema modules must not import `modal`, `biomodals.app`, or
 `biomodals.workflow`. They should contain Pydantic models and primitive fields
@@ -463,6 +467,13 @@ classes must be importable in remote containers by canonical package-qualified
 module names.
 
 ## CLI Namespace
+
+Keep single-file workflows at `workflow/<name>_workflow.py`. Put complex
+multi-file workflows at `workflow/<name>/workflow.py`, with supporting modules
+in the same package and a lightweight `__init__.py`. Both layouts expose
+`<name>` in the catalog; duplicate names across layouts are rejected. The
+composition root owns configuration, Modal bindings, graph construction, and
+the CLI entrypoint. Keep task-image imports narrow and explicitly mounted.
 
 Use `biomodals app ...` for app commands and `biomodals workflow ...` for
 workflow commands. App and workflow discovery should live behind catalog helper

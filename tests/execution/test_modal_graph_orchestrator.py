@@ -45,7 +45,8 @@ from biomodals.schema import (
     ArtifactKind,
 )
 from biomodals.schema.storage import InlineBytes, VolumePath
-from biomodals.workflow import CoordinatorNode, ExecutionGraph, ppiflow_workflow
+from biomodals.workflow import CoordinatorNode, ExecutionGraph
+from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUCCESSOR_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")

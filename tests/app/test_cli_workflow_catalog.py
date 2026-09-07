@@ -52,7 +52,7 @@ def test_run_rejects_outer_options_after_entrypoint_separator(
 def test_cli_loads_workflow_namespace_names() -> None:
     workflow = _load_entry("workflow", "ppiflow")
 
-    assert workflow.module == "biomodals.workflow.ppiflow_workflow"
+    assert workflow.module == "biomodals.workflow.ppiflow.workflow"
     assert workflow.category == "workflow"
 
 

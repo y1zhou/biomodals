@@ -74,16 +74,38 @@ def test_workflow_catalog_discovers_natural_workflow_names() -> None:
     assert "ppiflow" in workflows
     assert "rfd_ligandmpnn" in workflows
     assert "shortmd" in workflows
-    assert workflows["ppiflow"].name == "ppiflow_workflow.py"
+    assert workflows["ppiflow"].name == "workflow.py"
     assert workflows["rfd_ligandmpnn"].name == "rfd_ligandmpnn_workflow.py"
     assert workflows["shortmd"].name == "shortmd_workflow.py"
+
+
+def test_workflow_catalog_supports_both_layouts_and_rejects_duplicates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    package = tmp_path / "complex"
+    package.mkdir()
+    (package / "workflow.py").write_text('"""Package workflow."""\n')
+    (package / "helper.py").write_text('"""Not a workflow."""\n')
+    (tmp_path / "simple_workflow.py").write_text('"""Simple workflow."""\n')
+    monkeypatch.setattr(catalog, "WORKFLOW_HOME", tmp_path)
+    assert get_catalog("workflow", cwd=tmp_path) == {
+        "complex": Path("complex/workflow.py"),
+        "simple": Path("simple_workflow.py"),
+    }
+    assert get_catalog("workflow", use_absolute_paths=True)["complex"] == (
+        package / "workflow.py"
+    )
+    assert catalog._catalog_entry_name(package / "workflow.py") == "complex"
+    (tmp_path / "complex_workflow.py").write_text('"""Duplicate."""\n')
+    with pytest.raises(ValueError, match="Duplicate workflow name 'complex'"):
+        get_catalog("workflow")
 
 
 def test_workflow_file_resolves_to_workflow_module_with_natural_name() -> None:
     workflows = get_catalog("workflow", use_absolute_paths=True)
     app = BiomodalsApp("ppiflow", all_apps=workflows)
 
-    assert app.module == "biomodals.workflow.ppiflow_workflow"
+    assert app.module == "biomodals.workflow.ppiflow.workflow"
     assert app.category == "workflow"
 
 

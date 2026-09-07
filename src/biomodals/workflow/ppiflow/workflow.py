@@ -1,4 +1,4 @@
-"""PPIFlow workflow definition built on the reusable workflow runtime."""
+"""PPIFlow composition root built on the reusable workflow runtime."""
 
 from __future__ import annotations
 

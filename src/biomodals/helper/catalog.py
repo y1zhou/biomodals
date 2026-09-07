@@ -78,16 +78,46 @@ def get_all_apps(
     return available_apps
 
 
+def get_all_workflows(
+    root_dir: Path,
+    *,
+    use_absolute_paths: bool = False,
+    cwd: Path | None = None,
+) -> dict[str, Path]:
+    """Retrieve single-file and package workflows, rejecting ambiguous names."""
+    workflows: dict[str, Path] = {}
+    base_cwd = Path.cwd() if cwd is None else cwd
+    for path in sorted((
+        *root_dir.glob("*_workflow.py"),
+        *root_dir.glob("*/workflow.py"),
+    )):
+        name = _catalog_entry_name(path)
+        if existing := workflows.get(name):
+            raise ValueError(
+                f"Duplicate workflow name '{name}' discovered at '{existing}' and '{path}'"
+            )
+        workflows[name] = (
+            path.resolve()
+            if use_absolute_paths
+            else path.relative_to(base_cwd, walk_up=True)
+        )
+    return workflows
+
+
 def _catalog_entry_name(path: Path) -> str:
     """Derive the stable catalog name from either supported source layout."""
-    if path.name == "app.py":
+    if path.name in {"app.py", "workflow.py"}:
         return path.parent.name
     return path.stem.removesuffix("_app").removesuffix("_workflow")
 
 
 def catalog_entry_category(path: Path) -> str:
     """Derive an app category without exposing a package directory as one."""
-    return path.parent.parent.name if path.name == "app.py" else path.parent.name
+    return (
+        path.parent.parent.name
+        if path.name in {"app.py", "workflow.py"}
+        else path.parent.name
+    )
 
 
 def get_catalog(
@@ -105,10 +135,8 @@ def get_catalog(
                 cwd=cwd,
             )
         case "workflow":
-            return get_all_scripts(
+            return get_all_workflows(
                 WORKFLOW_HOME,
-                "",
-                "_workflow",
                 use_absolute_paths=use_absolute_paths,
                 cwd=cwd,
             )

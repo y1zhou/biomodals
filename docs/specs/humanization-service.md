@@ -134,6 +134,9 @@ than duplicating model/database setup logic in the API.
 Cancellation records durable intent before returning to the browser. The
 reconciler delivers that intent remotely; ordinary status reads return the
 latest stored projection while a remote operation holds the per-job lock.
+Reconciliation keeps at most four independent Jobs in flight across admission
+wakeups, so one slow provider operation does not block the entire queue.
+Completed snapshots are rescanned on wakeups or the interval, not continuously.
 
 ## Integration evidence
 
@@ -158,8 +161,9 @@ or Modal download latency; no benchmark harness is added to production code.
 
 ## Offline verification
 
-The backend suite passed 1,555 tests after integration, bounded ZIP-member
-table parsing, and the shared explicit-refresh fix. Seven humanization browser
+The backend suite passed 1,567 tests after integration, bounded ZIP-member
+table parsing, runtime preparation, cancellation acknowledgements, and
+independent reconciliation. Seven humanization browser
 tests passed, including a real HTTP
 fixture using the shared service lifecycle and a fake scientific adapter:
 100 submitted pairs produced 300 rows, with only 50 rows (91,656 response
@@ -168,7 +172,7 @@ directions, original-order reset, parent filtering, CSV/archive downloads,
 anonymous denial, reauthentication, and submission recovery. The 100-pair
 input render measured 859 ms in that local browser run.
 
-The complete eight-test browser suite subsequently passed in 36.9 seconds,
+The complete eight-test browser suite subsequently passed in 37.0 seconds,
 including the existing MVP GROMACS workflow after the refresh correction.
 
 The browser checks exposed an existing shared refresh bug: polling an active
@@ -176,6 +180,43 @@ root returned the old stage projection even on explicit Refresh. Explicit
 Refresh now reads current stage details without resuming an already-active
 coordinator; background polling retains its inexpensive root-only check.
 
-These checks made no cloud submissions or deployments. The existing live API
-still serves its earlier deployment; enabling the new Tool requires an
-approved coordinator deployment and a coordinated API restart.
+These offline checks made no cloud submissions or deployments.
+
+## Live verification (2026-09-07)
+
+With user authorization and a total $10 development budget, the workflow was
+deployed to `production/HumanizationWorkflow`. Two separate one-pair smoke
+Jobs were submitted, each requesting one HuDiff candidate attempt. Neither
+was a full 100-pair load test.
+
+Version 1 exposed missing production model assets: Sapiens and Humatch
+succeeded, HuDiff failed its manifest validation, and p-AbNatiV2 repeatedly
+failed container startup because its read-only model mount did not exist.
+The failing provider call and coordinator were explicitly cancelled. The
+provider subsequently reported failure; all original execution calls are
+terminal. This was not a successful end-to-end scientific run.
+
+The follow-up changes added app-owned environment preparation before launch,
+kept status reads responsive during cancellation, retained explicit provider
+cancellation acknowledgements in the execution kernel, and isolated slow
+reconciliation Jobs. Version 2 contains the preparation and execution-kernel
+fixes; the queue-isolation change runs in the API process.
+
+The live frontend verified authenticated options and status reads against
+version 2, including the queued model-preparation explanation and responsive
+cancellation presentation. Model preparation completed successfully and the
+coordinator began execution just as the fixed 15-minute cutoff was reached.
+The watchdog requested cancellation at 10:34:55 UTC; the API subsequently
+confirmed terminal `cancelled` with cancelled workflow stages. No live result
+table was produced, so successful end-to-end scientific execution remains
+unverified by this service smoke test. The complete eight-test offline browser
+suite passed again against the queue-isolation fix in 37.0 seconds.
+
+After the API restarted with that fix, the frontend confirmed terminal
+Cancelled and all three cancelled stages, with no result table or cancel
+button, no browser errors, and a 463 ms authenticated Job read. Modal then
+reported no active containers for this deployment. Both temporary smoke
+accounts were disabled after browser verification, revoking their sessions.
+
+No further scientific submissions were made. Exact billed spend is not
+available from these checks and must not be inferred from elapsed time alone.

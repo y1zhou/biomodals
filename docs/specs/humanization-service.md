@@ -1,0 +1,159 @@
+# Humanization website and API
+
+Status: implemented and offline-verified. Deployment and scientific smoke
+runs require separate approval.
+
+## Agreed product requirements
+
+Recorded 2026-09-07 during the coordinated backend/frontend interview.
+
+- Provide ID, VH, and VL input boxes and an Add button that adds the complete
+  pair to a batch. Suggest editable IDs such as `ab_001`; accept any valid,
+  non-duplicate ID. CSV upload appends to the same editable batch. Users can
+  edit or remove pairs before submission and must resolve duplicate IDs.
+- Display the workflow's `selection.csv` table on the webpage when the run
+  finishes. Provide pagination, sorting, parent filtering, and all columns,
+  including expandable/copyable sequences. Preserve the workflow's default
+  ordering, scientific values, nulls, and unranked candidates. User sorting
+  changes presentation only. Offer direct CSV download as well as the archive.
+- Provide an Advanced section exposing the app-specific knobs available in
+  `submit_humanization_workflow`, grouped into General, Sapiens, Humatch,
+  p-AbNatiV2, and HuDiff subsections. One scientific configuration applies to
+  the entire batch. General includes the job name; container ceilings remain
+  admin-controlled. Do not expose CLI-only wait, deployment selection, or
+  restart controls in the submission form.
+- Admit at most 100 pairs per job by default. Control this limit with a
+  backend environment variable, not separate frontend configuration.
+- Keep invalid imported rows visible and highlighted so users can fix or
+  remove them. Block submission until all rows are valid; never silently drop
+  rows. Reject structurally malformed CSV without changing the existing batch.
+- Keep unfinished batches in memory only. Preserve the mounted form during
+  reauthentication, but do not persist antibody sequences in browser storage
+  or restore drafts after a page reload. Warn before leaving an unsent batch.
+- Provide explicit Check submission recovery after a lost submission response,
+  reusing the original idempotency key and unchanged request. Editing the batch
+  or settings creates a new submission intent, not a replay of the old one.
+- Normalize sequences from manual entry and CSV by uppercasing and removing
+  whitespace, showing the normalized sequences before submission. Reject other
+  invalid characters rather than silently removing them.
+- Both input experiences submit one typed JSON payload containing the job
+  name, complete pairs, and batch-wide settings. Backend validation remains
+  authoritative, including the environment-controlled pair limit.
+- Perform result-table filtering, sorting, and pagination on the backend using
+  Polars against the published `selection.csv`. Opening results fetches only
+  the first page, not the complete table. Subsequent requests send query
+  parameters and receive bounded pages; they do not upload table contents.
+  Keep these reads separate from job-status polling and preserve the unchanged
+  CSV download. Backend operations are preferred even if the current table
+  would fit in browser memory, to avoid the initial full-table transfer.
+- Default to 50 rows per page. Custom sorts place nulls last in either
+  direction and break ties deterministically by parent/candidate ID. Without
+  a custom sort, preserve the workflow's original row ordering.
+- Viewing, filtering, sorting, and downloading are sufficient for this
+  release. Do not add persistent experimental-panel selections.
+- Complete VH-VL pairing, candidate generation/evaluation, per-parent ranking,
+  and useful partial scientific results remain governed by the existing
+  [workflow specification](humanization-workflow.md).
+
+## Implementation plan
+
+1. Integrate against current main's service/kernel contracts after resolving
+   the humanization stack baseline, preserving the PRs under review. Finalize
+   typed submission, validation-error, and paginated result contracts so both
+   repositories share one API schema.
+2. Add the narrow workflow-owned coordinator adaptation and humanization Tool
+   registration/adapter/router. Reuse shared admission, authentication,
+   idempotency, remote lifecycle, limits, progress, and result delivery.
+3. Add owner-authorized, bounded Polars result queries with agreed sorting and
+   paging, direct CSV download, and archive packaging/restoration. Reuse local
+   result caching so page requests do not repeatedly fetch Modal artifacts.
+4. Build the frontend batch editor, CSV import, grouped Advanced controls, and
+   submission/recovery flow. Extend shared Tool routes and Job detail with a
+   server-paginated selection table, not a separate job lifecycle.
+5. Verify the shared OpenAPI contract, validation and ownership boundaries,
+   idempotent recovery, partial results, numeric/null sorting, stable paging,
+   and downloads. Run offline integration/browser tests and local performance
+   checks before proposing a separately approved paid Modal smoke run.
+
+The user approved implementation and merging the humanization stack first.
+PRs #49–#54 were atomically merged into main at `e25d570` after conflict
+resolution against the service baseline. Both histories are included.
+
+## HTTP contract
+
+- `GET /api/v1/humanization/options`: authenticated limit, complete scientific
+  defaults, and flat settings JSON schema. `BIOMODALS_HUMANIZATION_MAX_PAIRS`
+  defaults to 100 and may be configured from 1 through the parser limit of
+  1000. There is no independent frontend limit configuration.
+- `POST /api/v1/humanization/jobs`: typed `display_name`, `pairs`, and
+  `settings`; existing session/Origin/CSRF and UUID Idempotency-Key contract.
+  Returns the existing `JobView` with HTTP 202 after durable admission.
+  Requests are capped at 4 MiB before JSON parsing. Semantic validation errors
+  are HTTP 422 with code `humanization_input_invalid` and zero-based
+  `errors[].row_index`, field, code, and message; batch/settings errors use a
+  null row index. Structurally invalid requests use standard HTTP 422 errors.
+- `GET /api/v1/humanization/jobs/{job_id}/selection`: `offset`, `limit`
+  (default 50, maximum 200), optional exact `parent_id`, optional `sort_by`,
+  and `descending`. Returns typed column metadata, only the requested rows,
+  filtered total count, offset/limit, and available parent IDs. Cached ZIP
+  reads and Polars operations run in the bounded I/O executor.
+- `GET /api/v1/humanization/jobs/{job_id}/selection.csv`: original CSV as a
+  native browser download. Both selection endpoints require ownership and a
+  successful or partial result. An evicted local result returns coded 409
+  `result_not_cached`; the frontend calls the existing authenticated
+  prepare-download mutation then retries once. It does not rerun science.
+- Full archives use the existing shared Job download endpoints. The adapter
+  verifies workflow publication identity and file digests, then creates a
+  deterministic ZIP suitable for exact cache restoration.
+
+The workflow uses an immutable staged JSON request and the shared graph-host
+lifecycle. Its coordinator run/resume return bounded execution overviews;
+CLI result retrieval separately reads the actual terminal artifact locations.
+Graph successors retain validated successful publications, including when the
+terminal bundle belongs to a predecessor Run. The service does not own a
+second scheduler or open remote execution ledgers.
+
+## Integration evidence
+
+Use current main's service architecture, not the older service implementation
+in the humanization PR stack. The shared service lifecycle is reusable, but
+the generic workflow coordinator needs explicit protocol adaptation.
+See [backend research](../research/humanization/service-integration.md) and
+[frontend research](../../../biomodals-frontend/docs/research/2026-09-07-humanization-ui.md).
+
+The Humanization Batch glossary distinguishes standalone-app batch failure
+from the workflow's useful partial-results policy. The service preserves the
+workflow policy rather than redefining its scientific outcomes.
+
+## Local query measurement
+
+A disposable synthetic check with 100 parents and 29 rows per parent (2,900
+rows; 200 residues in each sequence) produced a 1,360,041-byte CSV and a
+91,340-byte typed first-page response. Median local parse, descending numeric
+sort, 50-row pagination, and JSON serialization was 5.39 ms across 20 measured
+iterations after warm-up. This measures neither browser rendering nor network
+or Modal download latency; no benchmark harness is added to production code.
+
+## Offline verification
+
+The backend suite passed 1,555 tests after integration, bounded ZIP-member
+table parsing, and the shared explicit-refresh fix. Seven humanization browser
+tests passed, including a real HTTP
+fixture using the shared service lifecycle and a fake scientific adapter:
+100 submitted pairs produced 300 rows, with only 50 rows (91,656 response
+bytes) returned on opening results. Checks covered nulls-last sorting in both
+directions, original-order reset, parent filtering, CSV/archive downloads,
+anonymous denial, reauthentication, and submission recovery. The 100-pair
+input render measured 859 ms in that local browser run.
+
+The complete eight-test browser suite subsequently passed in 36.9 seconds,
+including the existing MVP GROMACS workflow after the refresh correction.
+
+The browser checks exposed an existing shared refresh bug: polling an active
+root returned the old stage projection even on explicit Refresh. Explicit
+Refresh now reads current stage details without resuming an already-active
+coordinator; background polling retains its inexpensive root-only check.
+
+These checks made no cloud submissions or deployments. The existing live API
+still serves its earlier deployment; enabling the new Tool requires an
+approved coordinator deployment and a coordinated API restart.

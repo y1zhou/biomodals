@@ -982,9 +982,9 @@ _Avoid_: iteration history, mutation list, OASis score
 
 **Humanization Batch**:
 A set of explicitly identified VH-VL Pairs that validates and executes as one
-scientific input unit. Invalid input or an execution error fails the complete
-batch; a method can still return a scientifically unsuccessful candidate with
-an explicit Humanization Status.
+scientific input unit. Invalid input rejects the batch; execution errors fail
+a standalone app batch as a unit, while a humanization workflow may retain
+useful partial results from successful generation and evaluation.
 _Avoid_: silently dropped pair, inferred FASTA pairing, execution status
 
 **Sapiens Humanization Result**:

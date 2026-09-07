@@ -20,6 +20,7 @@ ENVIRONMENT_KEYS = (
     "BIOMODALS_GROMACS_APP",
     "BIOMODALS_GROMACS_APP_VERSION",
     "BIOMODALS_GROMACS_ACTIVE_LIMIT",
+    "BIOMODALS_HUMANIZATION_MAX_PAIRS",
     "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT",
     "BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT",
     "BIOMODALS_RECONCILE_SECONDS",
@@ -40,6 +41,23 @@ def test_local_defaults_are_safe_and_cleanup_is_disabled(monkeypatch) -> None:
     assert settings.secure_cookies is False
     assert settings.modal_environment == "production"
     assert settings.modal_download_concurrency == 4
+    assert settings.humanization_max_pairs == 100
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1001", "bad"])
+def test_humanization_pair_limit_rejects_invalid_configuration(value: str) -> None:
+    settings = ServiceSettings.from_environment({
+        "BIOMODALS_HUMANIZATION_MAX_PAIRS": value
+    })
+    with pytest.raises(ValueError):
+        _ = settings.humanization_max_pairs
+
+
+def test_humanization_pair_limit_is_server_controlled() -> None:
+    settings = ServiceSettings.from_environment({
+        "BIOMODALS_HUMANIZATION_MAX_PAIRS": "42"
+    })
+    assert settings.humanization_max_pairs == 42
 
 
 def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> None:

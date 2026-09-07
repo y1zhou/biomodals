@@ -131,7 +131,11 @@ def create_app(
     app.state.allowed_origin = allowed_origin
     app.state.session_cookie_name = session_cookie_name
     app.state.ready = False
-    install_http_contract(app, max_body_bytes=256 * 1024 * 1024)
+    install_http_contract(
+        app,
+        max_body_bytes=256 * 1024 * 1024,
+        path_limits={"/api/v1/humanization/jobs": 4 * 1024 * 1024},
+    )
     app.include_router(create_operations_router(store=store, cache=cache))
     app.include_router(
         create_auth_router(
@@ -169,8 +173,17 @@ def create_deployed_app() -> FastAPI:
     from biomodals.service.config import ServiceSettings
     from biomodals.service.gromacs.modal import GromacsToolAdapter
     from biomodals.service.gromacs.router import create_router as gromacs_router
+    from biomodals.service.humanization.modal import HumanizationToolAdapter
+    from biomodals.service.humanization.router import (
+        create_router as humanization_router,
+    )
     from biomodals.service.pending import PendingRequestStore
-    from biomodals.service.tools import ALPHAFOLD3_TOOL, GROMACS_TOOL, TOOLS
+    from biomodals.service.tools import (
+        ALPHAFOLD3_TOOL,
+        GROMACS_TOOL,
+        HUMANIZATION_TOOL,
+        TOOLS,
+    )
 
     settings = ServiceSettings.from_environment()
     settings.install_modal_credentials()
@@ -195,7 +208,14 @@ def create_deployed_app() -> FastAPI:
         modal_download_concurrency=settings.modal_download_concurrency,
     )
     alphafold3 = ToolRegistration(ALPHAFOLD3_TOOL, alphafold3_adapter)
-    registrations = (gromacs, alphafold3)
+    humanization = ToolRegistration(
+        HUMANIZATION_TOOL,
+        HumanizationToolAdapter(
+            pending,
+            modal_download_concurrency=settings.modal_download_concurrency,
+        ),
+    )
+    registrations = (gromacs, alphafold3, humanization)
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     routers = (
         gromacs_router(
@@ -210,6 +230,14 @@ def create_deployed_app() -> FastAPI:
             validations=validations,
             adapter=alphafold3_adapter,
             remote=remote,
+        ),
+        humanization_router(
+            store=store,
+            configuration=configuration,
+            pending=pending,
+            remote=remote,
+            cache=cache,
+            max_pairs=settings.humanization_max_pairs,
         ),
     )
     auth = AuthService(store, frontend_url=settings.public_url)

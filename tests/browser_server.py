@@ -10,6 +10,7 @@ import io
 import os
 import time
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 import orjson
+import polars as pl
 
 from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
 from biomodals.execution import (
@@ -24,6 +26,7 @@ from biomodals.execution import (
     DeploymentIdentity,
     ExecutionNodeRecord,
     ExecutionOverview,
+    ExecutionPlan,
     ExecutionRunRecord,
     NodeStatus,
     NodeTaskStatusCounts,
@@ -41,6 +44,8 @@ from biomodals.service.auth import AuthService
 from biomodals.service.billing import BillingSummary, CostGroup
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs.router import create_router as gromacs_router
+from biomodals.service.humanization.results import SELECTION_SCHEMA
+from biomodals.service.humanization.router import create_router as humanization_router
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.remote_execution import ExecutionLocator
 from biomodals.service.runtime_config import RuntimeConfiguration
@@ -50,7 +55,13 @@ from biomodals.service.tool_runtime import (
     PreparedResult,
     ToolRegistration,
 )
-from biomodals.service.tools import ALPHAFOLD3_TOOL, GROMACS_TOOL, TOOLS
+from biomodals.service.tools import (
+    ALPHAFOLD3_TOOL,
+    GROMACS_TOOL,
+    HUMANIZATION_TOOL,
+    TOOLS,
+)
+from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
 
 ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
 _CALL_NAMESPACE = UUID("156d600f-2a56-4ce7-8d0c-886bfa35698a")
@@ -80,14 +91,16 @@ class _FakeRemote:
         self.stats_path = stats_path
         self.password_link = ""
         self.secondary_password_link = ""
+        self.humanization_password_link = ""
         self.preflight_versions: list[int] = []
         self.submit_versions: list[int] = []
-        self.started: dict[UUID, tuple[float, int, object]] = {}
+        self.started: dict[UUID, tuple[float, int, ExecutionPlan]] = {}
+        self.deployments: dict[UUID, DeploymentIdentity] = {}
         self.cancelled: set[UUID] = set()
         self.log_fetches = 0
         self._write_stats()
 
-    def bind_plan(self, job_id: UUID, plan: object) -> None:
+    def bind_plan(self, job_id: UUID, plan: ExecutionPlan) -> None:
         self.started[job_id] = (0, 0, plan)
 
     def _write_stats(self) -> None:
@@ -99,6 +112,7 @@ class _FakeRemote:
                 {
                     "password_link": self.password_link,
                     "secondary_password_link": self.secondary_password_link,
+                    "humanization_password_link": self.humanization_password_link,
                     "preflight_versions": self.preflight_versions,
                     "submit_calls": len(self.submit_versions),
                     "submit_versions": self.submit_versions,
@@ -116,6 +130,7 @@ class _FakeRemote:
         self._write_stats()
 
     async def launch(self, locator: ExecutionLocator) -> str:
+        self.deployments[locator.execution_run_id] = locator.deployment
         _, _, plan = self.started[locator.execution_run_id]
         self.started[locator.execution_run_id] = (
             time.monotonic(),
@@ -230,7 +245,13 @@ class _FakeRemote:
             "collect_traj_stats:production_": (2.5, 5.5),
             "prepare_result": (5.5, 6),
         }
-        start, end = windows[node_key]
+        if node_key in windows:
+            start, end = windows[node_key]
+        else:
+            plan = self.started[run_id][2]
+            index = plan.node_keys.index(node_key)
+            width = 6 / len(plan.nodes)
+            start, end = index * width, (index + 1) * width
         if elapsed < start:
             return NodeStatus.PENDING
         if elapsed < end:
@@ -238,9 +259,13 @@ class _FakeRemote:
         return NodeStatus.SUCCEEDED
 
     def _calls(self, run_id: UUID) -> list[ProviderCallDiagnostic]:
-        _, started_at, _ = self.started[run_id]
+        _, started_at, plan = self.started[run_id]
         calls = []
-        for node_key, function_name in self._functions.items():
+        for node in plan.nodes:
+            node_key = node.node_key
+            if node_key in {"union", "prepare_result"}:
+                continue
+            function_name = self._functions.get(node_key, node_key)
             status = self._node_status(run_id, node_key)
             if status == NodeStatus.PENDING:
                 continue
@@ -276,7 +301,7 @@ class _FakeRemote:
                 RunStatus.SUCCEEDED if self._elapsed(run_id) >= 6 else RunStatus.RUNNING
             )
         )
-        deployment = DeploymentIdentity("main", "Gromacs", 7)
+        deployment = self.deployments[run_id]
         nodes = tuple(
             ExecutionNodeRecord(
                 execution_run_id=run_id,
@@ -386,6 +411,99 @@ class _FakeAdapter:
         )
 
 
+class _FakeHumanizationAdapter(_FakeAdapter):
+    """Exercise real humanization admission and table delivery without Modal."""
+
+    def __init__(self, remote: _FakeRemote, pending: PendingRequestStore) -> None:
+        super().__init__(remote, pending, b"")
+        self.requests: dict[UUID, HumanizationExecutionRequest] = {}
+
+    async def stage(self, job: JobRecord) -> None:
+        content = self.pending.get(job.job_id)
+        if content is None:
+            raise FileNotFoundError("Browser test humanization input is unavailable")
+        request = HumanizationExecutionRequest.from_bytes(content)
+        self.requests[job.job_id] = request
+        self.remote.bind_plan(job.job_id, request.execution_plan)
+
+    async def prepare_result(
+        self, job: JobRecord, cache: ArtifactCache, *, completed_at: int
+    ) -> PreparedResult:
+        request = self.requests[job.job_id]
+        rows = []
+        for pair in request.pairs:
+            for index in range(3):
+                vh = (
+                    pair.vh
+                    if index == 0
+                    else ("A" if pair.vh[0] != "A" else "G") + pair.vh[1:]
+                )
+                vl = (
+                    pair.vl
+                    if index < 2
+                    else ("A" if pair.vl[0] != "A" else "G") + pair.vl[1:]
+                )
+                row = {name: None for name in SELECTION_SCHEMA}
+                row.update({
+                    "parent_id": pair.id,
+                    "candidate_id": hashlib.sha256(
+                        orjson.dumps([pair.id, vh, vl])
+                    ).hexdigest(),
+                    "vh": vh,
+                    "vl": vl,
+                    "is_parent": index == 0,
+                    "generating_methods": None
+                    if index == 0
+                    else ("sapiens" if index == 1 else "hudiff_ab"),
+                    "cdr_preservation": "preserved",
+                    "evaluation_complete": True,
+                    "vh_mutations": int(index > 0),
+                    "vl_mutations": int(index == 2),
+                    "cdr_mutations": 0,
+                    "panel_order": index or None,
+                    "quality_tier": 1 if index else None,
+                })
+                for name, dtype in SELECTION_SCHEMA.items():
+                    if dtype == pl.Float64:
+                        row[name] = (
+                            0.025 * index
+                            if name.endswith("_delta")
+                            else 0.8 + 0.025 * index
+                        )
+                for chain, family in (("vh", "hv3"), ("vl", "kv1")):
+                    for kind in ("target", "best"):
+                        row[f"humatch_{chain}_{kind}_family"] = family
+                rows.append(row)
+        table = pl.DataFrame(rows, schema=SELECTION_SCHEMA).select(
+            "parent_id",
+            "candidate_id",
+            "quality_tier",
+            "panel_order",
+            pl.exclude("parent_id", "candidate_id", "quality_tier", "panel_order"),
+        )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("selection.csv", table.write_csv())
+            archive.writestr(
+                "manifest.json",
+                orjson.dumps({
+                    "schema_version": 2,
+                    "execution_run_id": str(job.job_id),
+                    "parameters": request.settings.model_dump(),
+                    "scientific_versions": request.scientific_versions,
+                    "candidate_count": len(rows),
+                    "status": "succeeded",
+                }),
+            )
+        publisher = _FakeAdapter(self.remote, self.pending, buffer.getvalue())
+        result = await publisher.prepare_result(job, cache, completed_at=completed_at)
+        return replace(
+            result,
+            filename=f"humanization-{job.job_id}.zip",
+            archive_schema="humanization/1",
+        )
+
+
 class _UnusedAdapter:
     async def stage(self, _job):
         raise AssertionError("AlphaFold3 is not submitted by this browser fixture")
@@ -435,6 +553,10 @@ def _create_browser_app():
         "browser-user@example.com", display_name="Browser Regular User"
     )
     remote.secondary_password_link = secondary_link.url
+    humanization_link = auth.create_user(
+        "humanization-user@example.com", display_name="Humanization Browser User"
+    )
+    remote.humanization_password_link = humanization_link.url
     remote._write_stats()
     cache = ArtifactCache(settings.cache_dir / "results")
     registrations = (
@@ -442,6 +564,7 @@ def _create_browser_app():
             GROMACS_TOOL, _FakeAdapter(remote, pending, _result_archive())
         ),
         ToolRegistration(ALPHAFOLD3_TOOL, _UnusedAdapter()),
+        ToolRegistration(HUMANIZATION_TOOL, _FakeHumanizationAdapter(remote, pending)),
     )
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
     lifecycle = JobLifecycle(store, remote, registrations, cache)
@@ -463,6 +586,14 @@ def _create_browser_app():
                 validations=validations,
                 adapter=registrations[1].adapter,
                 remote=remote,
+            ),
+            humanization_router(
+                store=store,
+                configuration=configuration,
+                pending=pending,
+                remote=remote,
+                cache=cache,
+                max_pairs=settings.humanization_max_pairs,
             ),
         ),
         remote=remote,

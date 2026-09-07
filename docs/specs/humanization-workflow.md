@@ -2,6 +2,10 @@
 
 Status: implemented; one-pair live Modal smoke test passed on 2026-09-07.
 
+The subsequent [service integration spec](humanization-service.md) extends the
+original CLI-only delivery scope below with website submission and result
+browsing; the scientific contracts remain unchanged.
+
 ## Agreed scope
 
 - Integrate Sapiens, Humatch, p-AbNatiV2, and HuDiff-Ab into one end-to-end

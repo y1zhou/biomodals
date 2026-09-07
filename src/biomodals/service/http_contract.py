@@ -89,19 +89,27 @@ def request_id_from(request: Request) -> str:
 class _RequestSizeMiddleware:
     """Reject oversized bodies before FastAPI parses multipart content."""
 
-    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int,
+        path_limits: dict[str, int] | None = None,
+    ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.path_limits = path_limits or {}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         headers = dict(scope.get("headers", []))
+        max_body_bytes = self.path_limits.get(scope["path"], self.max_body_bytes)
         content_length = headers.get(b"content-length")
         if content_length is not None:
             try:
-                too_large = int(content_length) > self.max_body_bytes
+                too_large = int(content_length) > max_body_bytes
             except ValueError:
                 too_large = False
             if too_large:
@@ -121,7 +129,7 @@ class _RequestSizeMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received_bytes += len(message.get("body", b""))
-                if received_bytes > self.max_body_bytes:
+                if received_bytes > max_body_bytes:
                     raise _RequestBodyTooLarge
             return message
 
@@ -217,7 +225,9 @@ async def require_unsafe_session(
     return session
 
 
-def install_http_contract(app: FastAPI, *, max_body_bytes: int) -> None:
+def install_http_contract(
+    app: FastAPI, *, max_body_bytes: int, path_limits: dict[str, int] | None = None
+) -> None:
     """Install common errors, request limits, IDs, and safe failure logging."""
 
     @app.exception_handler(CodedAPIError)
@@ -254,7 +264,9 @@ def install_http_contract(app: FastAPI, *, max_body_bytes: int) -> None:
         response.headers["X-Request-ID"] = request_id
         return response
 
-    app.add_middleware(_RequestSizeMiddleware, max_body_bytes=max_body_bytes)
+    app.add_middleware(
+        _RequestSizeMiddleware, max_body_bytes=max_body_bytes, path_limits=path_limits
+    )
     app.add_middleware(_RequestIdMiddleware)
 
 

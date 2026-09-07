@@ -123,6 +123,14 @@ runtime_image = (
         copy=True,
     )
     .run_function(apply_hudiff_inference_patches)
+    # Constrain helper dependencies to the validated scientific environment.
+    # Keep the full inventory assertion below: constraints do not pin Conda builds.
+    .add_local_file(
+        Path(__file__).with_name("runtime-constraints.txt"),
+        "/opt/hudiff-runtime-constraints.txt",
+        copy=True,
+    )
+    .env({"UV_CONSTRAINT": "/opt/hudiff-runtime-constraints.txt"})
     # UniAF3 requires Python 3.11 and is outside this worker's import closure.
     .pipe(
         patch_image_for_helper,

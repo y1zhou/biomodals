@@ -243,6 +243,24 @@ above used ten attempts. Sampling still uses one native batch per pair, so
 25 attempts increase GPU memory demand and do not guarantee 25 unique outputs.
 The total standalone budget remains 10,000 attempts.
 
+### Rebuild dependency constraints
+
+The 2026-09-07 workflow rebuild exposed two transitive helper dependency
+updates: `anyio` 4.15.0 → 4.15.1 and `urllib3-future` 2.24.906 → 2.24.907.
+CPU-only inspections of the validated image `im-08MH3kBTTZNGSTjyazY6EW`
+and rebuilt image `im-JFwigtdmTiUafDDFexn6CE` reproduced their respective
+fingerprints; all Conda inventory entries were identical.
+
+`runtime-constraints.txt` records Python distributions from `/opt/conda` in
+the validated image and constrains helper installation through
+[`UV_CONSTRAINT`](https://docs.astral.sh/uv/reference/environment/#uv_constraint).
+It excludes Modal's separately injected `/pkg` distributions. The original
+full-inventory fingerprint remains unchanged and is still enforced at build
+time. Conda build changes or injected-package changes therefore still fail
+closed; this is not a claim that every layer can be reconstructed indefinitely.
+Refresh constraints only after auditing a new environment and validating its
+scientific behavior, not by accepting a newly observed digest automatically.
+
 ## Primary-source snapshot and reproducible pins
 
 - Upstream has one Git tag, [`v1.0.0` at commit

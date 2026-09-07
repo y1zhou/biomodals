@@ -2,7 +2,14 @@
 
 Research date: 2026-09-02
 
-Possible implementation target: `src/biomodals/app/design/cumab_app.py`
+Implementation audit: 2026-09-07
+
+Release decision (2026-09-07): after review, CUMAb will not be included in this
+release of the antibody-humanization stack. The research and implementation
+findings below are retained to guide future work; they do not represent a
+commitment to implement CUMAb in this release.
+
+Possible future implementation target: `src/biomodals/app/design/cumab/app.py`
 
 ## Recommendation in brief
 
@@ -22,8 +29,9 @@ the paper's final filtering, energy ranking, or V-subgroup clustering
 [paper method](https://pmc.ncbi.nlm.nih.gov/articles/PMC10842793/)). A
 scientifically honest `cumab` app requires a durable multi-stage execution
 plan, resumable fanout over more than 20,000 Rosetta jobs, and explicit upstream
-patches. Licensing must be resolved before that implementation is distributed
-or offered as a service.
+patches. Source, Rosetta, and data licenses are documented deployment
+constraints; consistent with the rest of this project, users remain responsible
+for ensuring that their deployment and use comply with them.
 
 ## Immutable source and dependency pins
 
@@ -56,9 +64,13 @@ human amino-acid germline FASTAs: `IGHV`, `IGHJ`, `IGKV`, `IGKJ`, `IGLV`, and
 ([README](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/README.md),
 [database parser](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_graft.py)).
 
-The germline instructions point to live IMGT/GENE-DB queries and give neither
-a release nor checksums. Candidate identities and counts can therefore drift
-as IMGT changes. At research time, the current downloadable reference
+The paper used IMGT germlines downloaded on **29 July 2020**: 54 IGHV, 6 IGHJ,
+39 IGKV, 5 IGKJ, 30 IGLV, and apparently 5 IGLJ sequences. Those counts yield
+the reported 63,180 kappa and 48,600 lambda combinations; the paper appears to
+mislabel the final light-chain J set as kappa a second time. The repository's
+instructions instead point to live IMGT/GENE-DB queries and give neither the
+historical files nor checksums. Candidate identities and counts can therefore
+drift as IMGT changes. At research time, the current downloadable reference
 directory is release `202631-1` (27 July 2026), but reproducing the paper
 requires the historical amino-acid FASTAs used by its authors, not today's
 release
@@ -68,7 +80,14 @@ obtain or reconstruct the paper-era files; otherwise declare a Biomodals
 scientific fork that pins six exact downloaded files, records their SHA-256
 digests, and versions that identity into every cache and result.
 
-## Licensing is an implementation gate
+Germline parsing is order-sensitive. It retains functional, non-partial,
+forward entries, collapses alleles to gene names, and keeps the first acceptable
+allele in FASTA order. It rejects V entries with more than two total cysteines
+and retains a concatenated V-J chain only when that chain has exactly two
+cysteines. Consequently, matching only the published gene counts would not
+reconstruct the paper's candidate universe.
+
+## Licensing and deployment constraints
 
 The CUMAb README says only “Licensed under the Non-Profit Open Software License
 version 3.0”; the repository contains no license text or copyright notice
@@ -76,10 +95,11 @@ version 3.0”; the repository contains no license text or copyright notice
 [repository tree](https://github.com/Fleishman-Lab/CUMAb/tree/88cec68e89e81c2ec4a4c7499a324021062d4a83)). NPOSL-3.0 is a reciprocal
 license with network-deployment/source-disclosure conditions and special
 requirements on who may redistribute under that amended license
-([official text](https://opensource.org/license/NPOSL-3.0)). Obtain maintainer
-or legal confirmation before vendoring or modifying the scripts. The bundled
-HMM database and XML protocols have no separate notices, so their redistribution
-status is no clearer than the repository-level one.
+([official text](https://opensource.org/license/NPOSL-3.0)). Obtaining maintainer
+or legal confirmation would reduce uncertainty around vendoring or modifying
+the scripts. The bundled HMM database and XML protocols have no separate
+notices, so their redistribution status is no clearer than the repository-level
+one.
 
 Rosetta is not OSI open source. Its standard license permits internal
 non-commercial use and forbids commercial/fee-based service use without a
@@ -110,11 +130,22 @@ antibody
 ([paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10842793/),
 [generation source](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_graft.py)).
 
-The default mode grafts complete CDRs under a custom CUMAb definition. `SDR`
-mode instead retains specificity-determining residues, requires an antigen
-chain, and restores antibody-antigen interface residues from the parent. Users
-can also retain explicitly numbered parental residues. D genes are subsumed by
-the fixed CDR-H3 rather than enumerated as framework components
+The default mode grafts all six complete parental CDR strings under custom
+CUMAb motif-regex definitions rather than a standard numbered CDR definition.
+It does not require germline/parent CDR-length compatibility. After grafting,
+it trims the humanized N- and C-termini until each chain has exactly the
+parental length, applies motif screens outside the candidate's newly detected
+CDRs, and collapses duplicate paired sequences while retaining only the first
+germline combination as provenance.
+
+`SDR` mode is a materially different antigen-bound operation. All germline
+L1-L3 and H1-H2 CDR lengths must equal the parental lengths, germline H3 may
+not be longer than parental H3, and only germline H3 is directly
+length-adjusted. The operation restores parental residues identified at the
+antibody-antigen interface throughout the paired sequence, adds explicitly
+fixed residues to that restored set, and requires an antigen chain. The paper
+uses SDR only with experimental antigen-bound structures. D genes are subsumed
+by the fixed CDR-H3 rather than enumerated as framework components
 ([CLI arguments](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_args.py),
 [grafting source](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_graft.py),
 [paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10842793/)).
@@ -141,22 +172,31 @@ also says broader validation is needed
 
 ## Supported inputs, species, and outputs
 
-Upstream accepts exactly one PDB per working directory. It detects one heavy
-and one kappa/lambda light variable domain with the bundled HMM database,
-rewrites the Fv as light chain A and heavy chain B, and optionally rewrites one
-antigen chain as C. A structure may be experimental or modeled; VHH and
-unpaired chains are unsupported because the formatter and generator require
-both heavy and light coordinates
+Upstream accepts exactly one PDB per working directory. It concatenates all
+protein-chain sequences, takes the best heavy and light HMM hits above bit score
+80, and maps those subsequences back to PDB chains; it does not robustly prove
+that the input contains exactly one VH-VL pair. It rewrites the selected Fv as
+light chain A and heavy chain B, and optionally rewrites one antigen chain as C.
+A structure may be experimental or modeled; VHH and unpaired chains are
+unsupported because the formatter and generator require both heavy and light
+coordinates
 ([README](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/README.md),
 [formatter](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_pdb_format.py)).
 
-The CLI allows `origin_species=human|mouse|rabbit`. Human and mouse share the
+The CLI allows `origin_species=human|mouse|rabbit`, defaulting to `mouse`.
+Human and mouse share the
 same motif-based CDR parser; rabbit uses a different H2/H3 expression. The
 source itself warns that rabbit mode may be buggy and has not been validated
 experimentally, so scientific support should initially be described as mouse
 (and structurally compatible human) Fv, with rabbit explicitly experimental
 ([argument help](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_args.py),
 [CDR parser](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/modules_graft.py)).
+
+The remaining upstream controls are `mode=CDR|SDR`, optional `antigen_chain`,
+motif `screens` defaulting to `NG` and `N[^P][ST]`, and chain-local one-based
+fixed residues such as `5L` and `6H`. Supplying `screens` replaces the defaults;
+the CLI cannot request an empty list. Free-form regular expressions should not
+cross the Biomodals trust boundary.
 
 The repository's two top-level scripts produce:
 
@@ -168,8 +208,10 @@ The repository's two top-level scripts produce:
   threading; and
 - optionally `{name}_RMSDS.csv` with L1-L3/H1-H3 RMSDs.
 
-Rosetta itself produces per-run PDB and `score.sc` artifacts. Upstream does not
-produce the paper's final ranked/clustered result table
+Rosetta itself produces per-run PDB and `score.sc` artifacts. The supplied RMSD
+script globally aligns structures with PyMOL `cealign` and measures `CA`,
+carbonyl `C`, and `O` atoms per CDR; it does not apply the paper's 0.5-Angstrom
+filter. Upstream does not produce the paper's final ranked/clustered result table
 ([README](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/README.md),
 [graft driver](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/CUMAb_graft_sequences.py),
 [RMSD script](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/scripts/find_RMSDs.py)).
@@ -203,12 +245,14 @@ fanout concurrency; upstream provides no per-process resource measurements.
 
 ## Validation, security, and upstream bugs
 
-1. **The published XML files are syntactically broken.** `CUMAb.xml` has
+1. **The published XML files are syntactically broken and incomplete.** `CUMAb.xml` has
    missing `<` characters on an `Add` and a `RotamerTrialsMinMover`, and
    `Relax.xml` has malformed `ScoreFunction`, `Reweight`, and
    `PreventResiduesFromRepacking` tags plus stray text. Patch files must be
    versioned, explained, and checked against the paper or maintainer before any
-   equivalence claim
+   equivalence claim. Naively restoring delimiters may create a duplicate
+   `RTmin` definition, while generated relax arguments omit script variables
+   referenced by the XML. A guessed syntax cleanup is not upstream-equivalent
    ([CUMAb.xml](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/xmls/CUMAb.xml),
    [Relax.xml](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/xmls/Relax.xml)).
 2. **Shell injection and path confusion are present.** User-controlled PDB
@@ -239,7 +283,11 @@ fanout concurrency; upstream provides no per-process resource measurements.
 6. **The local release is scientifically incomplete.** There is no automatic
    selection of the lowest of 15 relaxations, no threading scheduler, no 0.5-A
    filtering policy conditional on experimental versus modeled input, and no
-   energy ranking/V-family clustering. Implementing these is app-owned
+   energy ranking/V-family clustering. The paper clusters CDR-mode candidates
+   by combined heavy/light V subgroup and SDR candidates by those subgroups
+   plus heavy J. It then sometimes substitutes a lower-ranked cluster member
+   after visual inspection to reuse chains and reduce cloning. That manual step
+   has no reproducible implementation. Automating the rest is app-owned
    orchestration derived from the paper, not a transparent wrapper
    ([README](https://github.com/Fleishman-Lab/CUMAb/blob/88cec68e89e81c2ec4a4c7499a324021062d4a83/README.md),
    [paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10842793/)).
@@ -257,6 +305,13 @@ Rosetta source/database commit, compiler/runtime, and legacy Python
 environment. Preserve unmodified upstream behavior for formatting and sequence
 generation where it is scientifically valid, while making security fixes at
 the boundary.
+
+The exact July-2020 FASTAs, their ordering and hashes, the working paper XMLs,
+the score field used to select the parental relaxation, the score field used
+for final candidate ordering, historical seeds/execution layout, and a
+deterministic replacement for manual visual substitutions are not published.
+Without those assets or maintainer clarification, a complete implementation
+must be identified as `CUMAb-derived` rather than paper-equivalent.
 
 For preparation/grafting, compare normalized formatted chains, detected
 kappa/lambda type, CDR boundaries, parental/fixed positions, exact germline
@@ -315,3 +370,50 @@ not a mandatory stage after Sapiens. Applying CUMAb's paper protocol to a
 Sapiens candidate would replace that candidate's framework and would no longer
 mean “structurally score the Sapiens design.” If a later workflow needs a
 general Rosetta Fv scorer, design and validate that as a separate operation.
+
+## Future implementation findings and open decision tree
+
+The package convention and current execution runtime support
+`src/biomodals/app/design/cumab/app.py`. CUMAb should own one execution graph:
+prepare and publish a candidate manifest; fan out 15 seeded parental relaxations;
+select the lowest-energy parent; discover and fan out candidate threading tasks;
+then filter, rank, cluster, and collect. It may reuse the generic Rosetta task
+contract, executor, pull-worker loop, and atomic publications, but must not
+launch a nested Rosetta App Run. The generic Rosetta image is release 2025.51,
+not CUMAb's pinned Rosetta commit, and therefore is not automatically a
+scientifically equivalent runtime.
+
+If CUMAb is revisited in a later release, the design tree has these unresolved
+decisions, ordered by dependency:
+
+1. **Product and equivalence boundary**: full paper-style humanization versus
+   a preparation-only `cumab-candidates` operation; exact paper equivalence
+   blocked on unpublished historical assets versus an explicitly identified
+   `CUMAb-derived` method using pinned available assets and documented repairs.
+2. **Rosetta runtime**: obtain/build the exact pinned Rosetta commit or use a
+   currently available release as part of the derived method. This choice fixes
+   the scientific runtime, image path, oracle, and meaningful benchmarks.
+3. **Reference data**: obtain the ordered July-2020 FASTAs or pin a current
+   exact IMGT snapshot with file hashes and accept a changed candidate universe.
+4. **Initial scientific modes**: CDR only versus CDR plus the substantially
+   different antigen-bound SDR operation; supported origin species; and an
+   explicit experimental-versus-modeled input declaration.
+5. **Input unit**: caller-supplied PDB only versus optional structure prediction;
+   one structure per root Execution Run versus a multi-structure batch.
+6. **Repair policy**: exact-preimage guarded source/XML patches, how to resolve
+   ambiguous XML semantics, which Rosetta score fields select the parent and
+   rank candidates, and whether to omit the paper's manual final substitutions.
+7. **Control surface**: published motif screens only, fixed-position coordinate
+   system, seed, and any candidate cap or germline-family restriction.
+8. **Resource topology**: worker CPU/memory/scratch shape, jobs per container,
+   Provider Call ceiling, checkpoint cadence, and timeout. These require one
+   relax and one thread-job benchmark in the selected Rosetta runtime.
+9. **Failure and selection semantics**: whether individual thread failures yield
+   a partial result, the exact experimental-input RMSD exclusion, modeled-input
+   reporting, cluster keys, and deterministic representative selection.
+10. **Artifacts and retention**: compact report schema, full-candidate Parquet,
+    shared `mutations.parquet`, selected structures, failure table, retained
+    intermediate structures, default local download, and Volume lifetime.
+11. **Stack integration**: mapping a structure-first CUMAb result into the
+    sequence-first Humanization Candidate Set without implying that CUMAb
+    consumes or merely scores another method's sequence.

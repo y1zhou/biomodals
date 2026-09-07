@@ -1156,6 +1156,10 @@ def test_local_dag_uses_kernel_state_and_standard_paths(tmp_path: Path) -> None:
 
     assert result.status == AppRunStatus.SUCCEEDED
     snapshot = runtime.store.execution.snapshot(RUN_ID)
+    assert len(result.outputs) == 1
+    assert isinstance(result.outputs[0].storage, VolumePath)
+    assert (tmp_path / result.outputs[0].storage.path).read_text() == "second"
+    assert runtime.run(workload_run_key="friendly-name").outputs == result.outputs
     assert snapshot.run.status == RunStatus.SUCCEEDED
     assert [node.status for node in snapshot.nodes] == [
         NodeStatus.SUCCEEDED,
@@ -1196,6 +1200,8 @@ def test_independent_remote_nodes_spawn_before_results_are_polled(
     result = runtime.run(workload_run_key="parallel")
 
     assert result.status == AppRunStatus.SUCCEEDED
+    assert len(result.outputs) == 2
+    assert all(isinstance(output.storage, VolumePath) for output in result.outputs)
     assert driver.events[:4] == [
         "resolve:main/DemoWorkflow/7/run_gpu",
         "resolve:main/DemoWorkflow/7/run_cpu",
@@ -1404,6 +1410,7 @@ def test_unknown_workflow_prunes_call_after_terminal_publication_appears(
     result = runtime.resume(workload_run_key="unknown-pruning")
 
     assert result.status == AppRunStatus.SUCCEEDED
+    assert [output.storage for output in result.outputs] == [storage]
     assert driver.cancelled == ["fc-run_remote"]
     call = runtime.store.execution.list_provider_calls(RUN_ID)[0]
     assert call.status == ProviderCallStatus.CANCELLED
@@ -2891,6 +2898,8 @@ def test_remote_task_node_can_publish_partial_outcomes(tmp_path: Path) -> None:
     result = runtime.run(workload_run_key="partial-fanout")
 
     assert result.status == AppRunStatus.PARTIAL
+    assert result.outputs == runtime.store.artifacts.load_node_result("fanout").outputs
+    assert result.outputs
     assert runtime.store.execution.get_node(RUN_ID, "fanout").status == (
         NodeStatus.PARTIAL
     )

@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from biomodals.execution import ActiveProviderCallCounts, RunStatus
+from biomodals.execution import ActiveProviderCallCounts, NodeStatus, RunStatus
 from biomodals.service import tool_runtime
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
@@ -485,6 +485,43 @@ async def test_storage_exhaustion_blocks_result_preparation(tmp_path: Path) -> N
         JobState.BLOCKED,
         "result_preparation_failed",
     )
+
+
+@pytest.mark.anyio
+async def test_explicit_refresh_updates_stages_while_root_is_active(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _locator, _function_call_id):
+            return None
+
+        async def status(self, _locator):
+            overview = _overview(RunStatus.RUNNING)
+            overview.nodes = (
+                SimpleNamespace(
+                    node_key="prepare-environment",
+                    status=NodeStatus.RUNNING,
+                    started_at=20,
+                    completed_at=None,
+                ),
+            )
+            return overview
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+    store.replace_projection(
+        JOB_ID,
+        state=JobState.RUNNING,
+        projection={"stages": [{"code": "prepare_environment", "started_at": None}]},
+        observed_at=10**10,
+    )
+
+    refreshed = await lifecycle.advance(JOB_ID, force_refresh=True)
+
+    assert refreshed.projection["stages"][0]["started_at"] == 20
 
 
 @pytest.mark.anyio

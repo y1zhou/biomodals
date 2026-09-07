@@ -102,8 +102,10 @@ per-Job serialization.
 The background reconciler runs every 60 seconds by default. While a root
 Function Call is active it uses the SDK's nonblocking root-call status only;
 it reads the detailed coordinator ledger after terminal root completion or an
-interactive detail/refresh request. Root-call failure is terminal rather than
-indistinguishable from an active timeout.
+interactive detail/refresh request. A failed root call triggers a coordinator
+ledger read: the Run may be durably suspended rather than terminal. It is not
+treated as an active timeout. Explicit refresh reads detailed status even
+while the root call is active, without launching a replacement coordinator.
 An active timeout touches only `jobs.updated_at`, moving that Job behind older
 reconciliation candidates without pretending that its detailed projection was
 refreshed. This lets a bounded 100-Job pass rotate fairly without another

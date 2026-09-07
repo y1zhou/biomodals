@@ -205,6 +205,7 @@ class JobLifecycle:
                     return job
                 try:
                     overview = None
+                    active_root = False
                     if (
                         background
                         or force_refresh
@@ -213,7 +214,8 @@ class JobLifecycle:
                         overview = await self.remote.poll_root(
                             _locator(job), job.root_function_call_id
                         )
-                        if overview is None:
+                        active_root = overview is None
+                        if active_root and not force_refresh:
                             return self.store.touch_job(job_id, now=now)
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
@@ -241,7 +243,7 @@ class JobLifecycle:
                     registration,
                     now=now,
                     finalize=finalize,
-                    resume_recoverable=force_refresh,
+                    resume_recoverable=force_refresh and not active_root,
                 )
             if finalize and job.state == JobState.FINALIZING:
                 return await self._finalize(

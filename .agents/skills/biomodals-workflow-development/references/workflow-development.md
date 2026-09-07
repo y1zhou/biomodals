@@ -400,6 +400,14 @@ satisfied.
 
 ## Orchestrator Submission
 
+Service-facing workflows may instead own a bounded immutable JSON request and
+bind the same graph through `ExecutionDefinitionCoordinatorLifecycle`, as
+humanization does. This staged host exposes `run` and `resume` returning an
+`ExecutionOverview`, matching the shared service contract. Keep request
+validation, staging, and optional terminal-result retrieval workflow-owned;
+the shared host still owns lifecycle and Successor publication reuse. Do not
+introduce a service-local scheduler or a second scientific graph.
+
 The reusable Modal orchestrator lives under
 `biomodals.execution.modal.orchestrator` and is not a user-facing workflow
 script. Workflow modules compose its app into their own Modal app:

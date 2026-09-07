@@ -23,12 +23,14 @@ from biomodals.execution import (
     ExecutionRunRecord,
     ExecutionRuntime,
     ExecutionTaskRecord,
+    NodeStatus,
     ProviderBinding,
     ProviderCallDiagnostic,
     ProviderCallPage,
     ProviderCallSubmission,
     RunStatus,
     SqliteExecutionRepository,
+    TaskStatus,
     drive_execution_run,
     resume_execution_run,
 )
@@ -1149,6 +1151,100 @@ class ExecutionDefinitionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
             lock=self._writer_lock,
             volume_io_lock=self._volume_io_lock,
         )
+
+    def _persist_successor_request(
+        self,
+        request: Any,
+        predecessor_execution_run_id: UUID,
+    ) -> None:
+        """Carry successful graph publications into the successor's repair closure.
+
+        These are reuse candidates, not completed Tasks: the graph runtime still
+        checks publication availability and Task fingerprints before accepting them.
+        """
+        definition = self.graph_builder(
+            request, predecessor_execution_run_id
+        ).validate()
+        predecessor = GraphExecutionRunStore(
+            self.volume_root, predecessor_execution_run_id
+        )
+        target = self._run_store()
+        try:
+            try:
+                existing = target.execution.get_run(self.execution_run_id)
+            except ExecutionRunNotFoundError:
+                existing = None
+            if existing is not None and (
+                existing.predecessor_execution_run_id != predecessor_execution_run_id
+                or existing.plan != request.execution_plan
+                or existing.deployment != self.deployment
+                or existing.max_active_provider_calls
+                != request.max_active_provider_calls
+                or existing.max_active_gpu_provider_calls
+                != request.max_active_gpu_provider_calls
+            ):
+                raise ValueError("Persisted successor does not match restart request")
+            if existing is None:
+                now = int(time.time())
+                with target.transaction():
+                    target.execution.create_run(
+                        execution_run_id=self.execution_run_id,
+                        predecessor_execution_run_id=predecessor_execution_run_id,
+                        plan=request.execution_plan,
+                        deployment=self.deployment,
+                        max_active_provider_calls=request.max_active_provider_calls,
+                        max_active_gpu_provider_calls=request.max_active_gpu_provider_calls,
+                        now=now,
+                    )
+                    for node in predecessor.execution.list_nodes(
+                        predecessor_execution_run_id
+                    ):
+                        if not definition.nodes[
+                            node.node_key
+                        ].reuse_predecessor_publication:
+                            continue
+                        if node.status == NodeStatus.SUCCEEDED:
+                            result = predecessor.artifacts.load_node_result(
+                                node.node_key
+                            )
+                            if result is not None:
+                                target.artifacts.record_node_publication(
+                                    node.node_key,
+                                    result=result,
+                                    artifacts=predecessor.artifacts.load_node_output_artifacts(
+                                        node.node_key
+                                    ),
+                                    now=now,
+                                )
+                        for task in predecessor.execution.list_tasks(
+                            predecessor_execution_run_id, node.node_key
+                        ):
+                            if task.status != TaskStatus.SUCCEEDED:
+                                continue
+                            result = predecessor.artifacts.load_task_result(
+                                node.node_key, task.task_key
+                            )
+                            if (
+                                result is not None
+                                and predecessor.artifacts.load_task_fingerprint(
+                                    node.node_key, task.task_key
+                                )
+                                == task.fingerprint
+                            ):
+                                target.artifacts.record_task_publication(
+                                    node.node_key,
+                                    task.task_key,
+                                    task_fingerprint=task.fingerprint,
+                                    result=result,
+                                    artifacts=predecessor.artifacts.load_task_output_artifacts(
+                                        node.node_key, task.task_key
+                                    ),
+                                    now=now,
+                                )
+        finally:
+            predecessor.close()
+            target.close()
+        super()._persist_successor_request(request, predecessor_execution_run_id)
 
     def _create_runtime(
         self,

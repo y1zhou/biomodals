@@ -4,8 +4,6 @@ Generates with Sapiens, Humatch, p-AbNatiV2 and HuDiff-Ab, then evaluates
 the sequence-distinct union. Research-use candidates require experimental testing.
 """
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
@@ -22,12 +20,22 @@ from biomodals.app.design.humatch import app as humatch_app
 from biomodals.app.design.pabnativ2 import app as pabnativ2_app
 from biomodals.app.design.sapiens import app as sapiens_app
 from biomodals.execution import (
+    COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
     CoordinatorNode,
     DeploymentIdentity,
     ExecutionGraph,
+    ExecutionOverview,
     NodeRunContext,
+    ProviderCallDiagnostic,
+    ProviderCallPage,
 )
 from biomodals.execution.modal import (
+    ModalCallDriver,
+    development_modal_call_driver,
+    execution_coordinator_adapter,
+    execution_coordinator_handle,
+    execution_coordinator_identity,
+    initialize_execution_coordinator_host,
     orchestrator,
     resolve_provider_call_limits,
     stage_execution_launch,
@@ -35,6 +43,7 @@ from biomodals.execution.modal import (
 from biomodals.execution.model import NodeAggregationPolicy
 from biomodals.execution.nodes import ProviderCallSpec, TaskDefinition, TaskProviderNode
 from biomodals.helper.catalog import include_dependency_apps
+from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
 from biomodals.schema import (
     AppConfig,
@@ -59,6 +68,12 @@ from biomodals.workflow.humanization.contracts import (
     CandidateEvaluation,
     CandidateOrigin,
     HumanizationCandidate,
+)
+from biomodals.workflow.humanization.execution import (
+    HumanizationExecutionCoordinator,
+    HumanizationExecutionRequest,
+    load_execution_request,
+    stage_execution_request,
 )
 from biomodals.workflow.humanization.export import IMGT_MUTATION_SCHEMA, export_results
 from biomodals.workflow.humanization.ranking import RANKING_VERSION, rank_panel
@@ -101,9 +116,10 @@ CONF = AppConfig(
     depends_on_apps=METHODS,
     tags={"depends_on": "-".join(METHODS)},
 )
-app = modal.App(CONF.name, image=orchestrator.runtime_image, tags=CONF.tags).include(
-    orchestrator.app, inherit_tags=True
-)
+OUT_VOLUME = orchestrator.OUT_VOLUME
+OUT_VOLUME_NAME = orchestrator.OUT_VOLUME_NAME
+OUT_VOLUME_MOUNTPOINT = orchestrator.CONF.output_volume_mountpoint
+app = modal.App(CONF.name, image=orchestrator.runtime_image, tags=CONF.tags)
 app = include_dependency_apps(app, CONF.depends_on_apps)
 annotation_image = hudiff_app.coordinator_image.add_local_python_source(
     "biomodals.workflow.humanization"
@@ -469,14 +485,28 @@ def build_humanization_workflow(
     csv_bytes: bytes, settings: HumanizationSettings | None = None
 ) -> ExecutionGraph:
     """Build a barriered generation, union and terminal cross-evaluation graph."""
-    parents = parse_parents(csv_bytes)
-    settings = settings or HumanizationSettings()
+    return build_humanization_graph(
+        parse_parents(csv_bytes), settings or HumanizationSettings()
+    )
+
+
+def validate_humanization_settings(
+    settings: HumanizationSettings, *, pair_count: int
+) -> None:
+    """Apply each app's authoritative native control validation."""
     sapiens_app.validate_parameters(**settings.method_arguments("sapiens"))
     humatch_app.validate_parameters(**settings.method_arguments("humatch"))
     pabnativ2_app.validate_parameters(**settings.method_arguments("pabnativ2"))
     hudiff_app.validate_controls(
-        pair_count=len(parents), **settings.method_arguments("hudiff_ab")
+        pair_count=pair_count, **settings.method_arguments("hudiff_ab")
     )
+
+
+def build_humanization_graph(
+    parents: tuple[AntibodyPair, ...], settings: HumanizationSettings
+) -> ExecutionGraph:
+    """Build the same scientific graph from already validated paired inputs."""
+    validate_humanization_settings(settings, pair_count=len(parents))
     graph = ExecutionGraph("humanization", scientific_versions=SCIENTIFIC_VERSIONS)
     generation = graph.add_node(
         HumanizationGenerateNode(parents, settings),
@@ -510,6 +540,158 @@ def build_humanization_workflow(
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
     )
     return graph
+
+
+@app.cls(
+    cpu=(0.125, 16.125),
+    memory=(256, 65536),
+    timeout=MAX_TIMEOUT,
+    max_containers=1,
+    scaledown_window=COORDINATOR_SCALEDOWN_WINDOW_SECONDS,
+    volumes={OUT_VOLUME_MOUNTPOINT: OUT_VOLUME},
+)
+@modal.concurrent(max_inputs=8)
+class ExecutionCoordinator:
+    """One run-scoped writer for both staged API and CLI submissions."""
+
+    execution_run_id: str = modal.parameter()
+    deployment_environment: str = modal.parameter()
+    deployment_name: str = modal.parameter()
+    deployment_version: int = modal.parameter()
+    development: bool = modal.parameter()
+
+    @modal.enter()
+    def enter(self) -> None:
+        """Reload staged inputs before serving the pinned Run."""
+        initialize_execution_coordinator_host(self)
+        execution_coordinator_identity(self)
+        OUT_VOLUME.reload()
+
+    @modal.method()
+    def run(self, development: bool = False) -> ExecutionOverview:
+        """Drive a staged root Run and return its authoritative overview."""
+        return self._adapter(development=development).run()
+
+    @modal.method()
+    def resume(self) -> ExecutionOverview:
+        """Resume suspended work without retrying conclusive failures."""
+        return self._adapter().resume()
+
+    @modal.method()
+    def status(self) -> ExecutionOverview:
+        """Read the durable kernel projection."""
+        return self._adapter().status()
+
+    @modal.method()
+    def result(self) -> AppRunResult:
+        """Return final artifact locations without transferring scientific files."""
+        return self._adapter().result()
+
+    @modal.method()
+    def cancel(self) -> ExecutionOverview:
+        """Cancel owned work through the shared kernel."""
+        return self._adapter().cancel()
+
+    @modal.method()
+    def provider_calls(
+        self,
+        node_key: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+        newest_first: bool = False,
+    ) -> ProviderCallPage:
+        """Page shared provider diagnostics for service progress and logs."""
+        return self._adapter().provider_calls(
+            cursor=UUID(cursor) if cursor else None,
+            limit=limit,
+            node_key=node_key,
+            newest_first=newest_first,
+        )
+
+    @modal.method()
+    def provider_call(self, provider_call_id: str) -> ProviderCallDiagnostic | None:
+        """Read one provider call without widening the status payload."""
+        return self._adapter().provider_call(UUID(provider_call_id))
+
+    @modal.method()
+    def prepare_restart(
+        self,
+        predecessor_execution_run_id: str,
+        predecessor_deployment_environment: str,
+        predecessor_deployment_name: str,
+        predecessor_deployment_version: int,
+        max_active_provider_calls: int | None = None,
+        max_active_gpu_provider_calls: int | None = None,
+    ) -> None:
+        """Prepare a compatible Successor through the shared lifecycle."""
+        self._adapter().prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=DeploymentIdentity(
+                predecessor_deployment_environment,
+                predecessor_deployment_name,
+                predecessor_deployment_version,
+            ),
+            max_active_provider_calls=max_active_provider_calls,
+            max_active_gpu_provider_calls=max_active_gpu_provider_calls,
+        )
+
+    @modal.method()
+    def drive_prepared(self) -> ExecutionOverview:
+        """Drive a prepared Successor Run."""
+        return self._adapter().drive_prepared()
+
+    @modal.method()
+    def restart_from(self, predecessor_execution_run_id: str) -> ExecutionOverview:
+        """Validate the CLI's staged scientific request against its predecessor."""
+        adapter = self._adapter()
+        adapter.prepare_restart(
+            predecessor_execution_run_id=UUID(predecessor_execution_run_id),
+            predecessor_deployment=None,
+            candidate_request=load_execution_request(
+                OUT_VOLUME_MOUNTPOINT, UUID(self.execution_run_id)
+            ),
+        )
+        return adapter.drive_prepared()
+
+    @modal.exit()
+    def exit(self) -> None:
+        """Checkpoint the single writer without cancelling provider work."""
+        adapter = getattr(self, "_coordinator_adapter", None)
+        if adapter is not None:
+            adapter.close()
+
+    def _adapter(
+        self, *, development: bool | None = None
+    ) -> HumanizationExecutionCoordinator:
+        execution_run_id, deployment = execution_coordinator_identity(self)
+        return execution_coordinator_adapter(
+            self,
+            development=development,
+            factory=lambda selected_mode: HumanizationExecutionCoordinator(
+                execution_run_id=execution_run_id,
+                deployment=deployment,
+                volume_root=OUT_VOLUME_MOUNTPOINT,
+                output_volume=OUT_VOLUME,
+                output_volume_name=OUT_VOLUME_NAME,
+                provider_driver=(
+                    development_modal_call_driver(
+                        {
+                            "sapiens_humanize": sapiens_app.sapiens_humanize,
+                            "sapiens_score": sapiens_app.sapiens_score,
+                            "humatch_humanize": humatch_app.humatch_humanize,
+                            "humatch_score": humatch_app.humatch_score,
+                            "pabnativ2_humanize_pair": pabnativ2_app.pabnativ2_humanize_pair,
+                            "pabnativ2_score": pabnativ2_app.pabnativ2_score,
+                            "hudiff_ab_humanize_pair": hudiff_app.hudiff_ab_humanize_pair,
+                            "annotate_humanization_candidate": annotate_humanization_candidate,
+                        },
+                        workload_name=CONF.name,
+                    )
+                    if selected_mode
+                    else ModalCallDriver()
+                ),
+            ),
+        )
 
 
 @app.local_entrypoint()
@@ -616,52 +798,53 @@ def submit_humanization_workflow(
     if predecessor is not None and not use_deployed_coordinator:
         raise ValueError("Restart requires an exact deployed workflow version")
     execution_run_id = uuid4()
-    stage_execution_launch(orchestrator.OUT_VOLUME, execution_run_id, predecessor)
+    stage_execution_request(
+        OUT_VOLUME,
+        execution_run_id,
+        HumanizationExecutionRequest(
+            run_name=sanitize_filename(run_id or source.stem),
+            pairs=parse_parents(content),
+            settings=settings,
+            max_active_provider_calls=total,
+            max_active_gpu_provider_calls=gpu,
+        ),
+    )
+    stage_execution_launch(OUT_VOLUME, execution_run_id, predecessor)
     deployment = DeploymentIdentity(
         deployment_environment if use_deployed_coordinator else "development",
         deployment_name or CONF.name,
         deployment_version if use_deployed_coordinator else 1,
     )
-    coordinator = orchestrator.execution_coordinator_handle(
+    coordinator = execution_coordinator_handle(
         execution_run_id=execution_run_id,
         deployment=deployment,
         use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
     )
-    kwargs = {
-        "graph": graph,
-        "workload_run_key": sanitize_filename(run_id or source.stem),
-        "max_parallel_nodes": total,
-        "max_active_provider_calls": total,
-        "max_active_gpu_provider_calls": gpu,
-    }
-    if not use_deployed_coordinator:
-        kwargs["development_function_handles"] = {
-            "sapiens_humanize": sapiens_app.sapiens_humanize,
-            "sapiens_score": sapiens_app.sapiens_score,
-            "humatch_humanize": humatch_app.humatch_humanize,
-            "humatch_score": humatch_app.humatch_score,
-            "pabnativ2_humanize_pair": pabnativ2_app.pabnativ2_humanize_pair,
-            "pabnativ2_score": pabnativ2_app.pabnativ2_score,
-            "hudiff_ab_humanize_pair": hudiff_app.hudiff_ab_humanize_pair,
-            "annotate_humanization_candidate": annotate_humanization_candidate,
-        }
-    call = orchestrator.submit_workflow_run(
-        coordinator,
-        execution_run_id=execution_run_id,
-        deployment=deployment,
-        predecessor_execution_run_id=predecessor,
-        coordinator_kwargs=kwargs,
+    print(
+        f"Deployment Identity: {deployment.environment}/{deployment.deployment_name}/"
+        f"v{deployment.deployment_version}\nExecution Run ID: {execution_run_id}",
+        flush=True,
     )
+    call = (
+        coordinator.run.spawn(development=not use_deployed_coordinator)
+        if predecessor is None
+        else coordinator.restart_from.spawn(
+            predecessor_execution_run_id=str(predecessor)
+        )
+    )
+    print(f"Coordinator FunctionCall ID: {call.object_id}", flush=True)
     if wait:
-        result = AppRunResult.model_validate(call.get())
-        print(f"Humanization completed: {result.status}", flush=True)
-        for output in result.outputs:
-            if output.name == "humanization_results" and isinstance(
-                output.storage, VolumePath
-            ):
-                print(
-                    f"humanization_results: volume={output.storage.volume_name} "
-                    f"path={output.storage.path}\n"
-                    f"Selection table: {output.storage.path}/selection.csv",
-                    flush=True,
-                )
+        overview = call.get()
+        print(f"Humanization completed: {overview.run.status.value}", flush=True)
+        if overview.run.status.value in {"succeeded", "partial"}:
+            result = AppRunResult.model_validate(coordinator.result.remote())
+            for output in result.outputs:
+                if output.name == "humanization_results" and isinstance(
+                    output.storage, VolumePath
+                ):
+                    print(
+                        f"humanization_results: volume={output.storage.volume_name} path={output.storage.path}\n"
+                        f"Selection table: {output.storage.path}/selection.csv",
+                        flush=True,
+                    )

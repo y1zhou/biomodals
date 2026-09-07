@@ -1,7 +1,6 @@
 """Real execution-kernel checks with fake provider calls, never live inference."""
 
 import hashlib
-import pickle
 import tarfile
 from io import BytesIO
 from uuid import UUID
@@ -17,7 +16,6 @@ from biomodals.execution.modal import (
     ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
-    orchestrator,
 )
 from biomodals.schema import (
     AppOutput,
@@ -27,6 +25,12 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.workflow.humanization.artifacts import json_output
+from biomodals.workflow.humanization.contracts import AntibodyPair
+from biomodals.workflow.humanization.execution import (
+    HumanizationExecutionCoordinator,
+    HumanizationExecutionRequest,
+    persist_execution_request,
+)
 from biomodals.workflow.humanization.scoring import scoring_result
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import SCORE_COLUMNS
@@ -378,53 +382,52 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                 if entry["task_key"] == f"{method}-{candidate_id}"
             )
             assert recorded["manifest"] == orjson.loads(members["manifest.json"])
-        graph = build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n")
-        store.write_coordinator_plan(
-            pickle.dumps(
-                orchestrator.ExecutionCoordinatorPlan(
-                    graph=graph,
-                    workload_run_key="test",
-                    max_active_provider_calls=2,
-                    max_active_gpu_provider_calls=1,
-                )
-            )
+        request = HumanizationExecutionRequest(
+            run_name="test",
+            pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),),
+            max_active_provider_calls=2,
+            max_active_gpu_provider_calls=1,
         )
+        persist_execution_request(tmp_path, run_id, request)
     finally:
         runtime.close()
 
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME", Volume())
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME_NAME", "workflow")
-    monkeypatch.setattr(orchestrator.CONF, "output_volume_mountpoint", str(tmp_path))
-    raw_cls = orchestrator.ExecutionCoordinator._get_user_cls()
-    successor = raw_cls()
-    successor.execution_run_id = str(UUID(int=3))
-    successor.deployment_environment = "main"
-    successor.deployment_name = "HumanizationWorkflow"
-    successor.deployment_version = 1
-    successor.development = False
-    raw_cls.enter._get_raw_f()(successor)
-    successor._modal_driver = lambda: driver
+    successor = HumanizationExecutionCoordinator(
+        execution_run_id=UUID(int=3),
+        deployment=DeploymentIdentity("main", "HumanizationWorkflow", 1),
+        volume_root=tmp_path,
+        output_volume=Volume(),
+        output_volume_name="workflow",
+        provider_driver=driver,
+        poll_interval_seconds=0,
+    )
     driver.fail = False
     try:
         with pytest.raises(ValueError):
-            raw_cls.prepare_restart_from._get_raw_f()(
-                successor,
-                predecessor_execution_run_id=str(run_id),
-                workload_run_key="test",
-                graph=build_humanization_workflow(
-                    b"id,vh,vl\na,ACD,EFG\n", HumanizationSettings(sapiens_iterations=2)
+            successor.prepare_restart(
+                predecessor_execution_run_id=run_id,
+                predecessor_deployment=None,
+                candidate_request=HumanizationExecutionRequest(
+                    run_name="test",
+                    pairs=request.pairs,
+                    settings=HumanizationSettings(sapiens_iterations=2),
                 ),
             )
-        raw_cls.prepare_restart_from._get_raw_f()(
-            successor,
-            predecessor_execution_run_id=str(run_id),
-            workload_run_key="test",
-            graph=graph,
+        successor.prepare_restart(
+            predecessor_execution_run_id=run_id,
+            predecessor_deployment=None,
             max_active_provider_calls=1,
             max_active_gpu_provider_calls=1,
         )
-        result = raw_cls.drive_prepared._get_raw_f()(successor)
-        assert result.status == AppRunStatus.SUCCEEDED
+        result = successor.drive_prepared()
+        assert result.run.status.value == "succeeded"
         assert driver.operations[12:] == (["sapiens_score"] * 2 if fail_first else [])
+        publication = successor.result()
+        directory = next(
+            output
+            for output in publication.outputs
+            if output.name == "humanization_results"
+        )
+        assert (tmp_path / directory.storage.path / "selection.csv").is_file()
     finally:
-        raw_cls.exit._get_raw_f()(successor)
+        successor.close()

@@ -30,29 +30,6 @@ class AppNotFoundError(ValueError):
         super().__init__(f"Application '{app_name}' not found.")
 
 
-def get_all_scripts(
-    root_dir: Path,
-    glob_prefix: str,
-    glob_suffix: str,
-    *,
-    use_absolute_paths: bool = False,
-    cwd: Path | None = None,
-) -> dict[str, Path]:
-    """Retrieve all available biomodals applications."""
-    available_apps: dict[str, Path] = {}
-    base_cwd = Path.cwd() if cwd is None else cwd
-    glob_pattern = f"{glob_prefix}*{glob_suffix}.py"
-    for app_file in root_dir.glob(glob_pattern):
-        app_path = (
-            app_file.resolve()
-            if use_absolute_paths
-            else app_file.relative_to(base_cwd, walk_up=True)
-        )
-        app_name = app_file.stem.removesuffix(glob_suffix)
-        available_apps[app_name] = app_path
-    return available_apps
-
-
 def get_all_apps(
     root_dir: Path,
     *,

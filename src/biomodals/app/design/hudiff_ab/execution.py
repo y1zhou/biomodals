@@ -95,8 +95,8 @@ class HuDiffAbExecutionRequest:
             raise ValueError("HuDiff-Ab run name must be a safe short filename")
         if not isinstance(self.csv_bytes, bytes) or not self.csv_bytes:
             raise ValueError("HuDiff-Ab CSV input is required")
-        if type(self.candidate_count) is not int or not 1 <= self.candidate_count <= 10:
-            raise ValueError("HuDiff-Ab candidate_count must be between 1 and 10")
+        if type(self.candidate_count) is not int or not 1 <= self.candidate_count <= 25:
+            raise ValueError("HuDiff-Ab candidate_count must be between 1 and 25")
         if type(self.seed) is not int or not 0 <= self.seed <= 2**32 - 1:
             raise ValueError("HuDiff-Ab seed must be an unsigned 32-bit integer")
         if self.sampling_order not in {"shuffle", "left_to_right"}:

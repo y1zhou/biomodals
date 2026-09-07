@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -31,6 +32,7 @@ from biomodals.app.design.hudiff_ab.execution import (
 )
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import AppRunResult, AppRunStatus
+from biomodals.workflow.humanization.settings import HumanizationSettings
 
 VH = "QVQLKQSGPGLVAPSQSLSITCTVSGFSLINYAISWVRQPPGKGLEWLGVIWTGGGTNYNSALKSRLSISKDNSKSQVFLKMNSLQTDDTARYYCARKDYYGRYYGMDYWGQGTSVTVS"
 VL = "QAVVTQESALTTSPGETVTLTCRSSTGAVTTSNYANWVQEKPDHLFTGLIGGTNNRAPGVPARFSGSLIGDKAALTITGAQTEDEAIYFCALWYNNHWVFGGGTKLTVL"
@@ -111,6 +113,31 @@ def test_parse_accepts_complete_unique_wide_csv() -> None:
 def test_parse_rejects_invalid_batches(content: bytes, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         hudiff_app.parse_hudiff_ab_csv(content)
+
+
+@pytest.mark.parametrize("count", [1, 10, 25, 0, 26, True])
+def test_attempt_bounds_agree_across_entrypoints(count: int) -> None:
+    def validate() -> None:
+        hudiff_app._validate_controls(
+            pair_count=1,
+            candidate_count=count,
+            seed=7,
+            sampling_order="shuffle",
+            upstream_inference_dropout=True,
+        )
+
+    validators = (
+        validate,
+        lambda: worker._validate_controls(count, 7, "shuffle", True),
+        lambda: replace(_request(), candidate_count=count),
+        lambda: HumanizationSettings(hudiff_ab_candidate_count=count),
+    )
+    for validator in validators:
+        if type(count) is int and 1 <= count <= 25:
+            validator()
+        else:
+            with pytest.raises(ValueError):
+                validator()
 
 
 def test_controls_reject_total_attempt_overflow_and_boolean_seed() -> None:

@@ -79,7 +79,7 @@ def main() -> None:
         or not isinstance(pair.get("vh"), str)
         or not isinstance(pair.get("vl"), str)
         or type(candidate_count) is not int
-        or not 1 <= candidate_count <= 10
+        or not 1 <= candidate_count <= 25
         or type(seed) is not int
         or not 0 <= seed <= 2**32 - 1
         or sampling_order not in {"shuffle", "left_to_right"}

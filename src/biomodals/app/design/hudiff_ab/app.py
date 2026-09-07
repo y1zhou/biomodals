@@ -164,8 +164,8 @@ def _validate_controls(
     sampling_order: str,
     upstream_inference_dropout: bool,
 ) -> None:
-    if type(candidate_count) is not int or not 1 <= candidate_count <= 10:
-        raise ValueError("candidate_count must be between 1 and 10")
+    if type(candidate_count) is not int or not 1 <= candidate_count <= 25:
+        raise ValueError("candidate_count must be between 1 and 25")
     if pair_count * candidate_count > MAX_TOTAL_ATTEMPTS:
         raise ValueError("HuDiff-Ab request exceeds 10,000 total attempts")
     if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
@@ -515,7 +515,7 @@ def submit_hudiff_ab_task(
         input_csv: UTF-8 CSV with exactly ``id,vh,vl`` columns.
         output_dir: Local directory for the downloaded archive.
         run_name: Optional safe display name for this invocation.
-        candidate_count: Sampling attempts per pair, from one through ten.
+        candidate_count: Sampling attempts per pair, from one through 25.
         seed: Unsigned 32-bit root seed; each pair receives a derived seed.
         sampling_order: ``shuffle`` or deterministic ``left_to_right``.
         upstream_inference_dropout: Preserve released always-active dropout.

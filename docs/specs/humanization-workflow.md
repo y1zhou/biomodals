@@ -161,7 +161,7 @@ or replacement-call loops.
 
 - HuDiff defaults to 10 sampling attempts per parent, seed 42. The exposed
   `candidate_count` is an attempt budget, not a guaranteed unique yield; current
-  bounds are 1–10 attempts per parent and 10,000 per standalone request.
+  bounds are 1–25 attempts per parent and 10,000 per standalone request.
 - Sapiens, Humatch, and p-AbNatiV2 each return one final pair per parent. With
   default HuDiff attempts, the union has at most 13 generated pairs plus its
   parental baseline, before deduplication and failed/invalid attempts.

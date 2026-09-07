@@ -236,8 +236,12 @@ removed after both runs. The runs are
 and
 [`ap-WRJSlmBHIIp2FuJkYZ0L1G`](https://modal.com/apps/innocare/main/ap-WRJSlmBHIIp2FuJkYZ0L1G).
 
-The app allows 1–10 attempts per pair and bounds normalized input at 3 MiB,
+The app now allows 1–25 attempts per pair (default 10) and bounds normalized input at 3 MiB,
 each pair result at 4 MiB, and the final archive at 64 MiB.
+The higher cap supports observing workflow panel rankings; the benchmarks
+above used ten attempts. Sampling still uses one native batch per pair, so
+25 attempts increase GPU memory demand and do not guarantee 25 unique outputs.
+The total standalone budget remains 10,000 attempts.
 
 ## Primary-source snapshot and reproducible pins
 

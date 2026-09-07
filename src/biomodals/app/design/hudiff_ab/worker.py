@@ -91,8 +91,8 @@ def _validate_controls(
     sampling_order: str,
     upstream_inference_dropout: bool,
 ) -> None:
-    if type(candidate_count) is not int or not 1 <= candidate_count <= 10:
-        raise ValueError("candidate_count must be between 1 and 10")
+    if type(candidate_count) is not int or not 1 <= candidate_count <= 25:
+        raise ValueError("candidate_count must be between 1 and 25")
     if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
         raise ValueError("seed must be an unsigned 32-bit integer")
     if sampling_order not in {"shuffle", "left_to_right"}:

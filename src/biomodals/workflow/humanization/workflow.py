@@ -605,7 +605,7 @@ def submit_humanization_workflow(
         pabnativ2_max_relative_pairing_score_decrease: Allowed relative pairing decrease.
         pabnativ2_forbidden_residues: Comma-separated forbidden proposed residues.
         pabnativ2_seed: Root seed for native p-AbNatiV2 generation.
-        hudiff_ab_candidate_count: Sampling attempts per parent, 1–10; not guaranteed yield.
+        hudiff_ab_candidate_count: Sampling attempts per parent, 1–25; not guaranteed yield.
         hudiff_ab_seed: Root seed for HuDiff generation.
         hudiff_ab_sampling_order: shuffle or left_to_right.
         hudiff_ab_upstream_inference_dropout: Preserve released inference dropout.

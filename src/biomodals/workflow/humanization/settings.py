@@ -36,7 +36,7 @@ class HumanizationSettings(BaseModel):
     )
     pabnativ2_forbidden_residues: str = "C,M"
     pabnativ2_seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
-    hudiff_ab_candidate_count: int = Field(default=10, ge=1, le=10, strict=True)
+    hudiff_ab_candidate_count: int = Field(default=10, ge=1, le=25, strict=True)
     hudiff_ab_seed: int = Field(default=42, ge=0, le=2**32 - 1, strict=True)
     hudiff_ab_sampling_order: Literal["shuffle", "left_to_right"] = "shuffle"
     hudiff_ab_upstream_inference_dropout: bool = True

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
 from dataclasses import replace
 from hashlib import sha256
 from io import BytesIO
@@ -237,6 +238,66 @@ def test_gpu_worker_returns_common_app_result(monkeypatch: pytest.MonkeyPatch) -
 
     assert result is expected
     assert captured["pair"] == pair
+
+
+@pytest.mark.parametrize("fail", (False, True))
+def test_pair_worker_closes_figures_on_success_and_failure(monkeypatch, fail) -> None:
+    closed = []
+    pyplot = SimpleNamespace(close=closed.append)
+    monkeypatch.setitem(sys.modules, "matplotlib", SimpleNamespace(pyplot=pyplot))
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", pyplot)
+    monkeypatch.setattr(pabnativ2_app, "_assert_assets_once", lambda: {})
+    monkeypatch.setattr(pabnativ2_app, "_validate_antibody_chains", lambda _frame: None)
+
+    def humanize(**_kwargs):
+        if fail:
+            raise RuntimeError("upstream failure")
+        return {"mutations": []}
+
+    monkeypatch.setattr(pabnativ2_app, "_humanize_pair", humanize)
+    pair = {"id": "parent.v1", "vh": "AAAA", "vl": "CCCC"}
+    for _ in range(2):
+        if fail:
+            with pytest.raises(RuntimeError, match="upstream failure"):
+                pabnativ2_app._run_pabnativ2_pair(pair=pair)
+        else:
+            assert (
+                pabnativ2_app._run_pabnativ2_pair(pair=pair).status
+                == AppRunStatus.SUCCEEDED
+            )
+    assert closed == ["all", "all"]
+
+
+@pytest.mark.parametrize("identifier", ("parent.v1", "抗" * 100))
+def test_upstream_name_is_short_and_seed_keeps_original_id(
+    monkeypatch, tmp_path, identifier
+) -> None:
+    pair = {"id": identifier, "vh": "AAAA", "vl": "CCCC"}
+    seeds = []
+    monkeypatch.setattr(pabnativ2_app, "_set_seed", seeds.append)
+
+    def humanize(_vh, _vl, **kwargs):
+        assert kwargs["name_seq"] == "pair_0001"
+        raise RuntimeError("reached upstream")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "abnativ.humanisation.vh_vl_humanisation_functions",
+        SimpleNamespace(abnativ_vh_vl_humanisation_paired=humanize),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "abnativ.model.scoring_functions",
+        SimpleNamespace(abnativ_scoring_paired=None),
+    )
+    parameters = pabnativ2_app._Parameters(
+        False, (), (), 0.98, 0.15, 0.1, ("C", "M"), 7
+    )
+    with pytest.raises(RuntimeError, match="reached upstream"):
+        pabnativ2_app._humanize_pair(
+            row_number=1, row=pair, parameters=parameters, scratch_root=tmp_path
+        )
+    assert seeds == [pabnativ2_app._pair_seed(7, identifier, "AAAA", "CCCC")]
 
 
 def test_gpu_batch_worker_returns_pair_result_mapping(
@@ -520,9 +581,13 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
     captured: dict[str, Any] = {}
 
     def fake_package(root: Path, *, num_threads: int) -> bytes:
+        assert (root / "humanized.fasta").read_text().splitlines()[::2] == [
+            ">parent.v1_抗_VH",
+            ">parent.v1_抗_VL",
+        ]
         assert num_threads == 2
         captured.update(orjson.loads((root / "manifest.json").read_bytes()))
-        assert (root / "structures/0001_pair-1/input.pdb").read_bytes() == b"input"
+        assert (root / "structures/pair_0001/input.pdb").read_bytes() == b"input"
         assert pl.read_parquet(root / "mutations.parquet").schema == {
             "id": pl.String,
             "chain": pl.String,
@@ -547,13 +612,14 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
         seed=0,
     )
     result = {
-        "humanized": {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
+        "humanized": {"id": "parent.v1 抗", "vh": "AAAA", "vl": "CCCC"},
         "sequence_scores": [
-            {"id": "pair-1", "endpoint": endpoint} for endpoint in ("input", "final")
+            {"id": "parent.v1 抗", "endpoint": endpoint}
+            for endpoint in ("input", "final")
         ],
         "residue_scores": [
             {
-                "id": "pair-1",
+                "id": "parent.v1 抗",
                 "endpoint": "input",
                 "chain": "vh",
                 "aho_position": 1,
@@ -570,7 +636,7 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
 
     archive = pabnativ2_app._write_bundle(
         run_name="demo",
-        input_frame=pl.DataFrame([{"id": "pair-1", "vh": "AAAA", "vl": "CCCC"}]),
+        input_frame=pl.DataFrame([{"id": "parent.v1 抗", "vh": "AAAA", "vl": "CCCC"}]),
         pair_results=[result],
         parameters=parameters,
         asset_manifest={"schema_version": 1},
@@ -583,7 +649,8 @@ def test_result_manifest_records_protocol_caveat_and_device(monkeypatch) -> None
     assert captured["protocol"]["pairing_score_units"] == "fraction"
     assert captured["telemetry"]["accelerators"] == ["NVIDIA A10G"]
     assert captured["warnings"]
-    assert "wrapper-protocol=2" in captured["scientific_identity"]["runtime"]
+    assert "wrapper-protocol=3" in captured["scientific_identity"]["runtime"]
+    assert captured["structure_ids"] == {"pair_0001": "parent.v1 抗"}
 
 
 def test_compatibility_patches_are_guarded_and_idempotent(

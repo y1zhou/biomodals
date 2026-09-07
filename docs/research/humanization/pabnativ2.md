@@ -436,9 +436,11 @@ Structures and CDR displacement are scientifically useful audit artifacts and
 are already computed by the upstream pipeline. Include the input/final PDBs and
 displacement summary in a compressed result bundle if the benchmark shows the
 size is modest. Store each pair under
-`structures/{row_number}_{sanitized_id}/input.pdb` and `final.pdb`, while
-retaining the original ID in tables and the manifest. Omit PNG, PAP, ChimeraX,
-and full DMS intermediates by default.
+`structures/pair_NNNN/input.pdb` and `final.pdb`, with a one-based four-digit
+row number. Retain the original ID in tables and the manifest's `structure_ids`
+mapping. Short internal names avoid upstream dot truncation and filesystem
+byte limits; see [the output identifier decision](../../adr/0011-humanization-output-identifiers.md).
+Omit PNG, PAP, ChimeraX, and full DMS intermediates by default.
 
 The public coordinate system is fixed to chain-local AHo positions spanning
 1 through 149. Thresholds must be finite values in `[0,1]`; fixed positions must be

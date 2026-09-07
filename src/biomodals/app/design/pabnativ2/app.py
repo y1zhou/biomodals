@@ -18,6 +18,7 @@ import random
 from base64 import b64decode, b64encode
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cache
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -70,7 +71,7 @@ from biomodals.execution.modal import (
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import MODEL_VOLUME
-from biomodals.helper.io import build_local_output_path
+from biomodals.helper.io import build_local_output_path, fasta_identifier
 from biomodals.helper.shell import package_outputs, sanitize_filename
 from biomodals.schema import (
     AppOutput,
@@ -92,7 +93,7 @@ MODEL_ROOT = Path("/biomodals-store")
 _TIMEOUT_SECONDS = 24 * 60 * 60
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
 _DEFAULT_MAX_GPU_CONTAINERS = 8
-_WRAPPER_PROTOCOL_VERSION = "2"
+_WRAPPER_PROTOCOL_VERSION = "3"
 _PATCH_PROTOCOL_VERSION = "1"
 SCIENTIFIC_RUNTIME_IDENTITY = "|".join((
     RUNTIME_IDENTITY,
@@ -218,9 +219,11 @@ def parse_pabnativ2_csv(content: bytes) -> pl.DataFrame:
             ord(character) < 32 or character == ">" for character in identifier
         ):
             raise ValueError(f"Row {row_number}: id contains unsupported characters")
-        if identifier in seen:
-            raise ValueError(f"Row {row_number}: duplicate id {identifier!r}")
-        seen.add(identifier)
+        if fasta_identifier(identifier) in seen:
+            raise ValueError(
+                f"Row {row_number}: duplicate id after FASTA whitespace normalization: {identifier!r}"
+            )
+        seen.add(fasta_identifier(identifier))
         for column in ("vh", "vl"):
             sequence = row[column]
             if not isinstance(sequence, str) or not sequence:
@@ -520,7 +523,7 @@ def _humanize_pair(
         abnativ_scoring_paired,
     )
 
-    pair_name = f"{row_number:04d}_{sanitize_filename(row['id'])}"
+    pair_name = f"pair_{row_number:04d}"
     pair_seed = _pair_seed(parameters.seed, row["id"], row["vh"], row["vl"])
     _set_seed(pair_seed)
     humanizer_mean = abnativ_vh_vl_humanisation_paired(
@@ -582,14 +585,9 @@ def _humanize_pair(
     }
 
 
-_asset_manifest: dict[str, object] | None = None
-
-
+@cache
 def _assert_assets_once() -> dict[str, object]:
-    global _asset_manifest
-    if _asset_manifest is None:
-        _asset_manifest = assert_pabnativ2_assets(MODEL_ROOT)
-    return _asset_manifest
+    return assert_pabnativ2_assets(MODEL_ROOT)
 
 
 def _write_bundle(
@@ -609,9 +607,9 @@ def _write_bundle(
                 line
                 for row in input_frame.iter_rows(named=True)
                 for line in (
-                    f">{row['id']}_VH",
+                    f">{fasta_identifier(row['id'])}_VH",
                     row["vh"],
-                    f">{row['id']}_VL",
+                    f">{fasta_identifier(row['id'])}_VL",
                     row["vl"],
                 )
             )
@@ -628,9 +626,9 @@ def _write_bundle(
                 line
                 for row in humanized_rows
                 for line in (
-                    f">{row['id']}_VH",
+                    f">{fasta_identifier(row['id'])}_VH",
                     row["vh"],
-                    f">{row['id']}_VL",
+                    f">{fasta_identifier(row['id'])}_VL",
                     row["vl"],
                 )
             )
@@ -660,9 +658,7 @@ def _write_bundle(
             schema=mutation_schema,
         ).write_parquet(root / "mutations.parquet", compression="zstd")
         for row_number, result in enumerate(pair_results, start=1):
-            humanized = result["humanized"]
-            identifier = sanitize_filename(humanized["id"])
-            destination = root / "structures" / f"{row_number:04d}_{identifier}"
+            destination = root / "structures" / f"pair_{row_number:04d}"
             destination.mkdir(parents=True)
             (destination / "input.pdb").write_bytes(
                 b64decode(result["input_pdb"], validate=True)
@@ -676,6 +672,10 @@ def _write_bundle(
             "schema_version": 2,
             "run_name": run_name,
             "pair_count": input_frame.height,
+            "structure_ids": {
+                f"pair_{index:04d}": result["humanized"]["id"]
+                for index, result in enumerate(pair_results, start=1)
+            },
             "input_sha256": hashlib.sha256(
                 input_frame.write_csv().encode()
             ).hexdigest(),
@@ -779,12 +779,17 @@ def _run_pabnativ2_pair(
     asset_manifest = _assert_assets_once()
     _validate_antibody_chains(input_frame)
     with TemporaryDirectory(prefix="pabnativ2_run_") as scratch:
-        result = _humanize_pair(
-            row_number=1,
-            row=input_frame.row(0, named=True),
-            parameters=parameters,
-            scratch_root=Path(scratch),
-        )
+        import matplotlib.pyplot as plt  # type: ignore[ty:unresolved-import]
+
+        try:
+            result = _humanize_pair(
+                row_number=1,
+                row=input_frame.row(0, named=True),
+                parameters=parameters,
+                scratch_root=Path(scratch),
+            )
+        finally:
+            plt.close("all")
     result["asset_manifest"] = asset_manifest
     content = orjson.dumps({"schema_version": 1, "pair_result": result})
     if len(content) > MAX_PAIR_RESULT_BYTES:

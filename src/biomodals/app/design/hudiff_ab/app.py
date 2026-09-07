@@ -62,7 +62,7 @@ from biomodals.execution.modal import (
 )
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.constant import MODEL_VOLUME
-from biomodals.helper.io import build_local_output_path
+from biomodals.helper.io import build_local_output_path, fasta_identifier
 from biomodals.helper.shell import package_outputs, sanitize_filename
 from biomodals.schema import InlineBytes
 
@@ -190,7 +190,9 @@ def _write_bundle(
         attempts = [row for result in pair_results for row in result["attempts"]]
         candidates = [row for result in pair_results for row in result["candidates"]]
         mutations = [row for result in pair_results for row in result["mutations"]]
-        pl.DataFrame(attempts).write_csv(root / "attempts.csv")
+        pl.DataFrame(attempts, infer_schema_length=None).write_csv(
+            root / "attempts.csv"
+        )
         pl.DataFrame(
             candidates,
             schema={
@@ -203,8 +205,8 @@ def _write_bundle(
         ).write_csv(root / "candidates.csv")
         (root / "candidates.fasta").write_text(
             "".join(
-                f">{row['candidate_id']}_VH\n{row['vh']}\n"
-                f">{row['candidate_id']}_VL\n{row['vl']}\n"
+                f">{fasta_identifier(row['candidate_id'])}_VH\n{row['vh']}\n"
+                f">{fasta_identifier(row['candidate_id'])}_VL\n{row['vl']}\n"
                 for row in candidates
             ),
             encoding="utf-8",

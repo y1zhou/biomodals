@@ -194,6 +194,10 @@ def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
     }
 
     def fake_package_outputs(result_dir: Path, *, num_threads: int) -> bytes:
+        assert (result_dir / "humanized.fasta").read_text().splitlines()[::2] == [
+            ">pair_1_VH",
+            ">pair_1_VL",
+        ]
         assert num_threads == 2
         assert (
             pl.read_parquet(result_dir / "mutation_history.parquet").schema
@@ -206,9 +210,9 @@ def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
     monkeypatch.setattr(sapiens_app, "package_outputs", fake_package_outputs)
     archive = sapiens_app._write_result_bundle(
         run_name="demo",
-        input_frame=pl.DataFrame([{"id": "pair", "vh": "AAAA", "vl": "CCCC"}]),
-        humanized_rows=[{"id": "pair", "vh": "AAAA", "vl": "CCCC"}],
-        score_frames=[pl.DataFrame({"id": ["pair"]})],
+        input_frame=pl.DataFrame([{"id": "pair 1", "vh": "AAAA", "vl": "CCCC"}]),
+        humanized_rows=[{"id": "pair 1", "vh": "AAAA", "vl": "CCCC"}],
+        score_frames=[pl.DataFrame({"id": ["pair 1"]})],
         mutation_rows=[],
         iterations=1,
         numbering_scheme="kabat",
@@ -298,4 +302,10 @@ def test_local_entrypoint_stages_kernel_run_and_writes_archive(
     assert calls["stage"][0] is output_volume
     assert calls["stage"][2].max_active_gpu_provider_calls == 0
     assert calls["submit"][1]["accepted_statuses"] == (RunStatus.SUCCEEDED,)
+    assert (tmp_path / "pairs_sapiens.tar.zst").read_bytes() == b"archive"
+
+    calls.clear()
+    with pytest.raises(FileExistsError):
+        raw_f(input_csv=str(input_path), output_dir=str(tmp_path))
+    assert calls == {}
     assert (tmp_path / "pairs_sapiens.tar.zst").read_bytes() == b"archive"

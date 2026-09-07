@@ -96,7 +96,7 @@ RUNTIME_IDENTITY = "|".join((
     "tqdm=4.70.0",
     f"resolved-environment={RUNTIME_ENVIRONMENT_SHA256}",
     f"cuda-determinism={CUDA_DETERMINISM_POLICY}",
-    "wrapper-protocol=2",
+    "wrapper-protocol=3",
     "patch-protocol=1",
 ))
 

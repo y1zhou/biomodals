@@ -6,6 +6,8 @@ from io import BytesIO
 
 import polars as pl
 
+from biomodals.helper.io import fasta_identifier
+
 CSV_COLUMNS = ("id", "vh", "vl")
 AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
 MAX_PAIRS = 1000
@@ -40,9 +42,11 @@ def parse_hudiff_ab_csv(content: bytes) -> pl.DataFrame:
             raise ValueError(f"Row {row_number}: id is invalid")
         if any(ord(character) < 32 or character == ">" for character in identifier):
             raise ValueError(f"Row {row_number}: id contains unsupported characters")
-        if identifier in seen:
-            raise ValueError(f"Row {row_number}: duplicate id {identifier!r}")
-        seen.add(identifier)
+        if fasta_identifier(identifier) in seen:
+            raise ValueError(
+                f"Row {row_number}: duplicate id after FASTA whitespace normalization: {identifier!r}"
+            )
+        seen.add(fasta_identifier(identifier))
         for column in ("vh", "vl"):
             sequence = row[column]
             if not isinstance(sequence, str) or not sequence:

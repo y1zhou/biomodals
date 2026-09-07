@@ -54,6 +54,7 @@ from biomodals.execution.modal import (
     submit_staged_execution_run,
 )
 from biomodals.helper import patch_image_for_helper
+from biomodals.helper.io import build_local_output_path, fasta_identifier
 from biomodals.helper.shell import package_outputs, sanitize_filename
 from biomodals.schema import (
     AppOutput,
@@ -187,9 +188,11 @@ def parse_sapiens_csv(content: bytes) -> pl.DataFrame:
             ord(character) < 32 or character == ">" for character in identifier
         ):
             raise ValueError(f"Row {row_number}: id contains unsupported characters")
-        if identifier in seen:
-            raise ValueError(f"Row {row_number}: duplicate id {identifier!r}")
-        seen.add(identifier)
+        if fasta_identifier(identifier) in seen:
+            raise ValueError(
+                f"Row {row_number}: duplicate id after FASTA whitespace normalization: {identifier!r}"
+            )
+        seen.add(fasta_identifier(identifier))
         for column, sequence, max_length in (
             ("vh", vh, MAX_VH_LENGTH),
             ("vl", vl, MAX_VL_LENGTH),
@@ -354,9 +357,9 @@ def _write_result_bundle(
             line
             for row in humanized_rows
             for line in (
-                f">{row['id']}_VH",
+                f">{fasta_identifier(row['id'])}_VH",
                 row["vh"],
-                f">{row['id']}_VL",
+                f">{fasta_identifier(row['id'])}_VL",
                 row["vl"],
             )
         ]
@@ -395,6 +398,7 @@ def _write_result_bundle(
                 "mutate_cdrs": mutate_cdrs,
             },
             "scientific_identity": {
+                "runtime": RUNTIME_IDENTITY,
                 "sapiens_package": CONF.version,
                 "sapiens_commit": CONF.repo_commit_hash,
                 "abnumber": IDENTITY.abnumber_version,
@@ -732,6 +736,12 @@ def submit_sapiens_task(
         mutate_cdrs=mutate_cdrs,
     )
     selected_run_name = sanitize_filename(run_name or input_path.stem)
+    local_output_dir = (
+        Path.cwd() if output_dir is None else Path(output_dir).expanduser().resolve()
+    )
+    output_path = build_local_output_path(
+        local_output_dir, run_name=selected_run_name, suffix="sapiens"
+    )
     request = SapiensExecutionRequest(
         run_name=selected_run_name,
         csv_bytes=csv_bytes,
@@ -773,10 +783,7 @@ def submit_sapiens_task(
     )
     if not isinstance(output.storage, InlineBytes):
         raise TypeError("Sapiens output must be inline .tar.zst bytes")
-    local_output_dir = (
-        Path.cwd() if output_dir is None else Path(output_dir).expanduser().resolve()
-    )
     local_output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = local_output_dir / output.storage.filename
-    output_path.write_bytes(output.storage.data)
+    with output_path.open("xb") as stream:
+        stream.write(output.storage.data)
     print(f"Sapiens results saved to: {output_path}")

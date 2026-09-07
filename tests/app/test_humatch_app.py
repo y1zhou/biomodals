@@ -205,10 +205,6 @@ def test_worker_calls_one_pair_directly_and_multiple_pairs_in_threads(
     )
     monkeypatch.setattr(humatch_app, "_load_models", lambda _upstream: ((1, 2, 3), 0.5))
     monkeypatch.setattr(humatch_app, "_humanize_pair", fake_pair)
-    monkeypatch.setattr(humatch_app, "_cgroup_cpu_seconds", lambda: None)
-    monkeypatch.setattr(humatch_app, "_cgroup_peak_memory_mib", lambda: None)
-    monkeypatch.setattr(humatch_app, "_cgroup_current_memory_mib", lambda: None)
-    monkeypatch.setattr(humatch_app, "_process_peak_memory_mib", lambda: 10.0)
 
     one = humatch_app._run_humatch_worker_batch(
         pairs=[{"id": "one", "vh": "AAAA", "vl": "CCCC"}]
@@ -542,16 +538,16 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
 
     monkeypatch.setattr(humatch_app, "package_outputs", fake_package_outputs)
     pair_result = {
-        "humanized": {"id": "pair", "vh": "AAAA", "vl": "CCCC"},
+        "humanized": {"id": "pair 1", "vh": "AAAA", "vl": "CCCC"},
         "summary": {
-            "id": "pair",
+            "id": "pair 1",
             "edit_count": 0,
             "humanization_success": True,
         },
-        "classifier_scores": [{"id": "pair", "endpoint": "input", "h_neg": 0.0}],
+        "classifier_scores": [{"id": "pair 1", "endpoint": "input", "h_neg": 0.0}],
         "alignment": [
             {
-                "id": "pair",
+                "id": "pair 1",
                 "chain": "vh",
                 "imgt_position": "1",
                 "region": "FR1",
@@ -563,7 +559,7 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
         ],
         "mutations": [],
     }
-    frame = pl.DataFrame([{"id": "pair", "vh": "AAAA", "vl": "CCCC"}])
+    frame = pl.DataFrame([{"id": "pair 1", "vh": "AAAA", "vl": "CCCC"}])
 
     archive = humatch_app._write_result_bundle(
         run_name="demo",
@@ -572,6 +568,10 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
         parameters={},
     )
 
+    assert captured["humanized.fasta"].decode().splitlines()[::2] == [
+        ">pair_1_VH",
+        ">pair_1_VL",
+    ]
     assert archive == b"archive"
     assert set(captured) == {
         "input.csv",

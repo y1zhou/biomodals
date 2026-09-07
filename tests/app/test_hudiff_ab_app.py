@@ -473,7 +473,75 @@ def test_verified_checkpoint_audit_values_are_pinned() -> None:
     assert f"cuda-determinism={models.CUDA_DETERMINISM_POLICY}" in (
         models.RUNTIME_IDENTITY
     )
-    assert "wrapper-protocol=2" in models.RUNTIME_IDENTITY
+    assert "wrapper-protocol=3" in models.RUNTIME_IDENTITY
+
+
+def test_bundle_handles_late_nullable_attempt_fields(monkeypatch) -> None:
+    attempts = [
+        {
+            "status": "valid",
+            "rejection_reason": None,
+            "duplicate_of": None,
+            "candidate_id": f"clone 1__candidate_{index}",
+        }
+        for index in range(100)
+    ]
+    attempts.extend([
+        {
+            "status": "invalid",
+            "rejection_reason": "gap",
+            "duplicate_of": None,
+            "candidate_id": None,
+        },
+        {
+            "status": "duplicate",
+            "rejection_reason": None,
+            "duplicate_of": "clone 1__candidate_0",
+            "candidate_id": None,
+        },
+    ])
+
+    def package(root: Path, **_kwargs) -> bytes:
+        frame = pl.read_csv(root / "attempts.csv")
+        assert frame.height == 102
+        assert frame["rejection_reason"][100] == "gap"
+        assert frame["duplicate_of"][101] == "clone 1__candidate_0"
+        assert (root / "candidates.fasta").read_text().splitlines()[::2] == [
+            ">clone_1__candidate_0_VH",
+            ">clone_1__candidate_0_VL",
+        ]
+        return b"archive"
+
+    monkeypatch.setattr(hudiff_app, "package_outputs", package)
+    result = {
+        "id": "clone 1",
+        "pair_seed": 42,
+        "attempts": attempts,
+        "candidates": [
+            {
+                "id": "clone 1",
+                "candidate_id": "clone 1__candidate_0",
+                "attempt_index": 1,
+                "vh": "AAAA",
+                "vl": "CCCC",
+            }
+        ],
+        "mutations": [],
+        "asset_manifest": {},
+        "patch_identity": "test",
+        "runtime_versions": {},
+        "device": "test",
+        "candidate_generation_status": "candidates_available",
+    }
+    assert (
+        hudiff_app._write_bundle(
+            run_name="test",
+            input_frame=pl.DataFrame([{"id": "clone 1", "vh": "AAAA", "vl": "CCCC"}]),
+            pair_results=[result],
+            parameters={},
+        )
+        == b"archive"
+    )
 
 
 def test_checkpoint_publication_replaces_files_without_deleting_tree(

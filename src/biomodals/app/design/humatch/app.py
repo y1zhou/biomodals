@@ -10,7 +10,6 @@ level classifier distributions, IMGT alignment, and mutation provenance.
 
 import hashlib
 import re
-import resource
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -59,7 +58,7 @@ from biomodals.execution.modal import (
     submit_staged_execution_run,
 )
 from biomodals.helper import patch_image_for_helper
-from biomodals.helper.io import build_local_output_path
+from biomodals.helper.io import build_local_output_path, fasta_identifier
 from biomodals.helper.shell import package_outputs, sanitize_filename
 from biomodals.schema import (
     AppOutput,
@@ -85,7 +84,6 @@ MAX_INPUT_BYTES = 3 * 1024 * 1024
 MAX_ID_LENGTH = 200
 MAX_SEQUENCE_LENGTH = 200
 ENCODING_WORKERS_PER_PAIR = 2
-CPU_LIMIT = 16.125
 PAIR_PAD = "----------"
 _COORDINATOR_TIMEOUT_SECONDS = 24 * 60 * 60
 _MAX_CONCURRENT_COORDINATOR_INPUTS = 8
@@ -144,53 +142,6 @@ class _AlignedPair:
     identifier: str
     vh: str
     vl: str
-
-
-def _cgroup_cpu_seconds() -> float | None:
-    """Read CPU time for all processes in this Modal container."""
-    try:
-        for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines():
-            name, value = line.split()
-            if name == "usage_usec":
-                return int(value) / 1_000_000
-    except (OSError, ValueError):
-        pass
-    try:
-        nanoseconds = Path("/sys/fs/cgroup/cpuacct/cpuacct.usage").read_text()
-        return int(nanoseconds.strip()) / 1_000_000_000
-    except (OSError, ValueError):
-        return None
-
-
-def _cgroup_peak_memory_mib() -> float | None:
-    """Read peak aggregate memory for the Modal container."""
-    for path in (
-        Path("/sys/fs/cgroup/memory.peak"),
-        Path("/sys/fs/cgroup/memory/memory.max_usage_in_bytes"),
-    ):
-        try:
-            return int(path.read_text().strip()) / (1024 * 1024)
-        except (OSError, ValueError):
-            pass
-    return None
-
-
-def _cgroup_current_memory_mib() -> float | None:
-    """Read current aggregate memory for the Modal container."""
-    for path in (
-        Path("/sys/fs/cgroup/memory.current"),
-        Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
-    ):
-        try:
-            return int(path.read_text().strip()) / (1024 * 1024)
-        except (OSError, ValueError):
-            pass
-    return None
-
-
-def _process_peak_memory_mib() -> float:
-    """Read the worker process high-water RSS on Linux."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def _validate_parameters(
@@ -283,9 +234,11 @@ def parse_humatch_csv(content: bytes) -> pl.DataFrame:
             ord(character) < 32 or character == ">" for character in identifier
         ):
             raise ValueError(f"Row {row_number}: id contains unsupported characters")
-        if identifier in seen:
-            raise ValueError(f"Row {row_number}: duplicate id {identifier!r}")
-        seen.add(identifier)
+        if fasta_identifier(identifier) in seen:
+            raise ValueError(
+                f"Row {row_number}: duplicate id after FASTA whitespace normalization: {identifier!r}"
+            )
+        seen.add(fasta_identifier(identifier))
         for column in ("vh", "vl"):
             sequence = row[column]
             if not isinstance(sequence, str) or not sequence:
@@ -684,9 +637,9 @@ def _write_result_bundle(
             line
             for row in humanized_rows
             for line in (
-                f">{row['id']}_VH",
+                f">{fasta_identifier(row['id'])}_VH",
                 row["vh"],
-                f">{row['id']}_VL",
+                f">{fasta_identifier(row['id'])}_VL",
                 row["vl"],
             )
         ]
@@ -830,7 +783,6 @@ def _run_humatch_worker_batch(
     )
     started_at = time.perf_counter()
     started_at_unix = time.time()
-    cpu_started_at = _cgroup_cpu_seconds()
     upstream = _load_upstream()
     _validate_fixed_positions(
         upstream, normalized_vh_positions, normalized_vl_positions
@@ -862,7 +814,6 @@ def _run_humatch_worker_batch(
         with ThreadPoolExecutor(max_workers=len(aligned_pairs)) as executor:
             pair_results = list(executor.map(worker, aligned_pairs))
     elapsed_seconds = time.perf_counter() - started_at
-    cpu_finished_at = _cgroup_cpu_seconds()
     metrics = {
         "pair_count": input_frame.height,
         "model_load_seconds": model_load_seconds,
@@ -873,21 +824,6 @@ def _run_humatch_worker_batch(
         "started_at_unix": started_at_unix,
         "finished_at_unix": time.time(),
     }
-    if cpu_started_at is not None and cpu_finished_at is not None:
-        container_cpu_seconds = max(0.0, cpu_finished_at - cpu_started_at)
-        metrics.update({
-            "container_cpu_seconds": container_cpu_seconds,
-            "average_container_cpu_fraction": (
-                container_cpu_seconds / elapsed_seconds / CPU_LIMIT
-            ),
-        })
-    peak_memory_mib = _cgroup_peak_memory_mib()
-    if peak_memory_mib is not None:
-        metrics["peak_container_memory_mib"] = peak_memory_mib
-    current_memory_mib = _cgroup_current_memory_mib()
-    if current_memory_mib is not None:
-        metrics["container_memory_mib_at_completion"] = current_memory_mib
-    metrics["peak_worker_process_memory_mib"] = _process_peak_memory_mib()
     return {"schema_version": 1, "pair_results": pair_results, "metrics": metrics}
 
 
@@ -938,9 +874,6 @@ def _aggregate_humatch_results(
     max_batch_elapsed_seconds = max(
         (float(item["elapsed_seconds"]) for item in batch_metrics), default=0.0
     )
-    container_cpu_seconds = sum(
-        float(metrics.get("container_cpu_seconds", 0.0)) for metrics in batch_metrics
-    )
     metrics: dict[str, str | int | float | bool] = {
         "pair_count": input_frame.height,
         "provider_batch_count": len(batch_metrics),
@@ -963,19 +896,6 @@ def _aggregate_humatch_results(
         "max_batch_elapsed_seconds": max_batch_elapsed_seconds,
         "worker_elapsed_seconds": worker_elapsed_seconds,
     }
-    if container_cpu_seconds:
-        metrics["container_cpu_seconds"] = container_cpu_seconds
-        if worker_elapsed_seconds:
-            metrics["average_container_cpu_fraction"] = (
-                container_cpu_seconds / worker_elapsed_seconds / CPU_LIMIT
-            )
-    for key in (
-        "peak_container_memory_mib",
-        "peak_worker_process_memory_mib",
-    ):
-        values = [float(item[key]) for item in batch_metrics if key in item]
-        if values:
-            metrics[key] = max(values)
     return archive, metrics
 
 

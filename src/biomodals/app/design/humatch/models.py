@@ -104,6 +104,7 @@ ASSETS = _WEIGHTS + tuple(
 )
 
 RUNTIME_IDENTITY = "|".join((
+    "output-protocol=3",
     f"humatch={IDENTITY.package_version}@{IDENTITY.source_commit}",
     f"assets={IDENTITY.asset_doi}",
     f"tensorflow={IDENTITY.tensorflow_version}",

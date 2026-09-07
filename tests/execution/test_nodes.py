@@ -34,7 +34,7 @@ def test_app_backed_node_requires_caller_owned_remote_preparation(
         node.prepare_remote(context)
 
 
-def test_remote_task_node_declares_data() -> None:
+def test_remote_task_definitions_and_provider_call_validation() -> None:
     task = TaskDefinition(
         task_key="candidate-a",
         scientific_payload={"candidate_id": "candidate-a"},

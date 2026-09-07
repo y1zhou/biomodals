@@ -12,7 +12,7 @@ from biomodals.helper import catalog
 from biomodals.helper.catalog import BiomodalsApp, get_catalog, include_dependency_apps
 
 
-def test_default_catalog_collects_apps() -> None:
+def test_app_catalog_resolves_ppiflow_app() -> None:
     apps = get_catalog("app", use_absolute_paths=True)
 
     assert apps["ppiflow"].name == "ppiflow_app.py"

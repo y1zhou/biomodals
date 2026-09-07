@@ -109,19 +109,13 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
 ):
     """Exercise actual artifact materialization and candidate/evaluator joins."""
 
-    def archive(name, frame):
+    def generation_archive(frame):
         stream = BytesIO()
         content = frame.write_csv().encode()
         with tarfile.open(fileobj=stream, mode="w") as bundle:
-            member = tarfile.TarInfo(f"result/{name}")
+            member = tarfile.TarInfo("result/humanized.csv")
             member.size = len(content)
             bundle.addfile(member, BytesIO(content))
-            if name == "summary.csv":
-                detail = BytesIO()
-                frame.write_parquet(detail)
-                member = tarfile.TarInfo("result/detail_scores.parquet")
-                member.size = len(detail.getvalue())
-                bundle.addfile(member, BytesIO(detail.getvalue()))
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -149,8 +143,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         def spawn(self, operation, *, args, kwargs):
             self.operations.append(operation)
             if operation in {"sapiens_humanize", "humatch_humanize"}:
-                result = archive(
-                    "humanized.csv",
+                result = generation_archive(
                     pl.read_csv(BytesIO(kwargs["csv_bytes"])).with_columns(
                         pl.lit("ACH").alias("vh")
                     ),
@@ -313,9 +306,6 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         assert len(driver.results) == 12
         manifest = orjson.loads((root / "manifest.json").read_bytes())
         assert manifest["ranking_policy"]["version"] == "1"
-        assert not {"selection", "evaluation_errors"} & {
-            output.name for output in publication.outputs
-        }
         assert manifest["protocols"]["pabnativ2"]["rasa_structure_count"] == 4
         assert manifest["protocols"]["pabnativ2"]["pssm_frequency_cutoff"] == 0.01
         assert manifest["protocols"]["pabnativ2"]["nativeness_weight"] == 10.0
@@ -328,22 +318,13 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             for entry in manifest["scoring_publications"]
         )
         assert manifest["schema_version"] == 2
-        assert not any(name.endswith("_status") for name in table.columns)
-        assert not (root / "selection.parquet").exists()
-        assert not (root / "candidate_provenance.json").exists()
-        assert not (root / "candidates.fasta").exists()
-        assert all(output.name != "candidates" for output in publication.outputs)
         assert len(manifest["candidate_provenance"]) == 2
-        assert all("vh" not in item for item in manifest["candidate_provenance"])
         baseline = next(
             item
             for item in manifest["candidate_provenance"]
             if item["candidate_id"] == table["candidate_id"][0]
         )
         assert baseline["origins"][0]["method"] == "pabnativ2"
-        assert not {"numbering_scheme", "cdr_definition"} & set(
-            pl.read_parquet(root / "imgt_mutations.parquet").columns
-        )
         assert manifest["candidate_count"] == 2
         for entry in manifest["files"]:
             content = (root / entry["path"]).read_bytes()

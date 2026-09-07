@@ -179,7 +179,7 @@ def test_artifact_publication_and_task_completion_share_caller_transaction() -> 
     assert execution.get_task(RUN_ID, "design", "node").status.value == "succeeded"
 
 
-def test_schema_contains_shared_execution_and_execution_artifacts_only() -> None:
+def test_schema_contains_execution_and_artifact_tables() -> None:
     connection, _, _ = _stores()
 
     tables = {

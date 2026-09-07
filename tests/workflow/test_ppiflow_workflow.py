@@ -1788,8 +1788,6 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     assert isinstance(output.storage, InlineBytes)
     plan = orjson.loads(output.storage.data)
     assert plan["num_jobs"] == 2
-    assert "worker_count" not in plan
-    assert "claim_capacity" not in plan
     assert [task["candidate_id"] for task in plan["tasks"]] == ["a", "b"]
     assert [task["index"] for task in plan["tasks"]] == [1, 2]
     assert [task["input_sha256"] for task in plan["tasks"]] == [

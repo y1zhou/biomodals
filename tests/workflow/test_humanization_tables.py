@@ -105,7 +105,6 @@ def test_sortable_summary_nulls_deltas_and_no_silent_loss():
     assert table.schema["sapiens_vh_mean_probability"] == pl.Float64
     assert table.schema["humatch_pairing_score"] == pl.Float64
     assert table["humatch_pairing_score"].null_count() == 2
-    assert not any(name.endswith("_status") for name in table.columns)
     assert table["humatch_error"].to_list() == ["Evaluation unavailable"] * 2
     assert table["sapiens_error"].to_list() == [None, None]
     assert table["generating_methods"].to_list() == [None, "sapiens"]

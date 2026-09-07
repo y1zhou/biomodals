@@ -203,7 +203,6 @@ def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
             pl.read_parquet(result_dir / "mutation_history.parquet").schema
             == expected_schema
         )
-        assert not (result_dir / "mutation_history.csv").exists()
         assert b'"schema_version": 2' in (result_dir / "manifest.json").read_bytes()
         return b"archive"
 

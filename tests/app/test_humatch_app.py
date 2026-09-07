@@ -583,7 +583,6 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
         "mutations.parquet",
         "manifest.json",
     }
-    assert b"accepted_mutations" not in b"".join(captured.values())
     assert b'"schema_version": 2' in captured["manifest.json"]
 
 

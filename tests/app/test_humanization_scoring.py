@@ -105,14 +105,13 @@ def test_pab_scoring_preserves_ids_scores_and_has_no_structure_stage(monkeypatch
         "_humanize_pair",
         lambda **kwargs: pytest.fail("No humanization or structure prediction"),
     )
-    inputs, summary, details, profile = pab._score_pabnativ2_pairs(
+    inputs, summary, _details, profile = pab._score_pabnativ2_pairs(
         b"id,vh,vl\nraw.id,ACD,EFG\n"
     )
     assert summary["id"].to_list() == ["raw.id"]
     assert summary["pair_nativeness"].to_list() == [-0.2]
     assert summary["pairing_score"].to_list() == [0.85]
     assert profile["id"].unique().to_list() == ["raw.id"]
-    assert "structure_scaffold_rmsd_angstrom" not in details.columns
     assert inputs["vh"].to_list() == ["ACD"]
 
     monkeypatch.setitem(

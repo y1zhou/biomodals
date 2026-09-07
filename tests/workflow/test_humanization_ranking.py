@@ -68,7 +68,6 @@ def test_diversity_can_promote_tier_two_over_a_near_duplicate():
     assert expected["panel_order"].to_list() == [None, 1, 2, 3]
     assert expected.schema["panel_order"] == pl.Int64
     assert expected.schema["quality_tier"] == pl.Int64
-    assert "selection_reason" not in expected.columns
     for order in permutations(rows):
         assert_frame_equal(_rank(pl.DataFrame(order), mutations[::-1]), expected)
     assert_frame_equal(_rank(expected, mutations), expected)

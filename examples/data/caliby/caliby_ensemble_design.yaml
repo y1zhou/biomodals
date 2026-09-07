@@ -1,0 +1,25 @@
+input_path: examples/data/caliby/native_pdbs
+run_name: caliby_ensemble_design_example
+num_samples_per_pdb: 32
+num_seqs_per_pdb: 4
+pdb_name_list: examples/data/caliby/pdb_name_lists/2_native_pdbs.txt
+
+# Advanced options. Ordinary users can leave these commented out.
+# pos_constraint_csv: examples/data/caliby/pos_constraint_csvs/native_pdb_constraints.csv
+#   Use only with a pdb_name_list whose PDB keys appear in the constraints CSV.
+# score_baseline: true
+#   Run score_ensemble.py after sequence design to get native/baseline energy.
+# max_num_conformers: 32
+#   Maximum conformers used by seq_des_ensemble.py for each PDB.
+# include_primary_conformer: true
+#   Always include the original/primary conformer in the ensemble design input.
+# seed: 0
+#   Random seed for generate_ensembles.py.
+# sampling_cfg_overrides:
+#   omit_aas: ["C"]
+#     Globally omit amino acids from design, e.g. cysteine.
+#   potts_sampling_cfg:
+#     potts_temperature: 0.1
+#       Raise final Potts sampling temperature for more sequence diversity.
+#     potts_sweeps: 5000
+#       Increase Potts sampling sweeps; slower, sometimes broader sampling.

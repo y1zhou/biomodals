@@ -11,6 +11,9 @@
   strings with `model_validate_json(...)`. Execution fingerprint encodings are
   the narrow exception: preserve their fixed standard-library JSON encoding
   because serialized bytes are part of durable identity.
+- Keep benchmark harnesses and benchmark-only instrumentation out of committed
+  production code unless explicitly requested. Benchmark methods and results
+  may be recorded in ADRs and research documents.
 - When you have made significant edits and are ready to make commits:
   - CI runs `prek` against `.pre-commit-config.yaml`; run `prek run --files <changed files>` before making commits.
   - For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` before making commits.
@@ -30,7 +33,9 @@ code. Use the repo-local Modal skill at `.agents/skills/modal/SKILL.md`.
 
 ## Biomodals app development
 
-When creating, editing, or reviewing files under `src/biomodals/app/**/*_app.py`, use the repo-local `biomodals-app-development` skill. See `docs/agents/app-development.md`.
+When creating, editing, or reviewing apps under `src/biomodals/app/`, use the
+repo-local `biomodals-app-development` skill. See
+`docs/agents/app-development.md`.
 The detailed app-development standards are consolidated in `.agents/skills/biomodals-app-development/`.
 
 When developing new apps that must violate the skill's conventions for good reason, document the reason for the deviation in `docs/agents/` and link that note from `docs/agents/app-development.md`.

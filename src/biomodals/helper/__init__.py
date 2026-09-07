@@ -52,7 +52,10 @@ def patch_image_for_helper(
         "biomodals.execution",
     ]
     if include_workflow_modules:
-        mods.append("biomodals.workflow")
+        # Workflow composition roots import app metadata and execution classes.
+        # The shared coordinator unpickles those roots in its own image, not in
+        # the included apps' images, so it needs their local source as well.
+        mods.extend(("biomodals.workflow", "biomodals.app"))
 
     new_image = image.apt_install("zstd", "fd-find")
     if ignore_dep_versions:

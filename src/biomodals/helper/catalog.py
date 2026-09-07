@@ -30,27 +30,71 @@ class AppNotFoundError(ValueError):
         super().__init__(f"Application '{app_name}' not found.")
 
 
-def get_all_scripts(
+def get_all_apps(
     root_dir: Path,
-    glob_prefix: str,
-    glob_suffix: str,
     *,
     use_absolute_paths: bool = False,
     cwd: Path | None = None,
 ) -> dict[str, Path]:
-    """Retrieve all available biomodals applications."""
+    """Retrieve single-file and package-based Biomodals apps."""
     available_apps: dict[str, Path] = {}
     base_cwd = Path.cwd() if cwd is None else cwd
-    glob_pattern = f"{glob_prefix}*{glob_suffix}.py"
-    for app_file in root_dir.glob(glob_pattern):
-        app_path = (
+    app_files = sorted((*root_dir.glob("*/*_app.py"), *root_dir.glob("*/*/app.py")))
+    for app_file in app_files:
+        app_name = _catalog_entry_name(app_file)
+        if existing_path := available_apps.get(app_name):
+            raise ValueError(
+                f"Duplicate app name '{app_name}' discovered at "
+                f"'{existing_path}' and '{app_file}'"
+            )
+        available_apps[app_name] = (
             app_file.resolve()
             if use_absolute_paths
             else app_file.relative_to(base_cwd, walk_up=True)
         )
-        app_name = app_file.stem.removesuffix(glob_suffix)
-        available_apps[app_name] = app_path
     return available_apps
+
+
+def get_all_workflows(
+    root_dir: Path,
+    *,
+    use_absolute_paths: bool = False,
+    cwd: Path | None = None,
+) -> dict[str, Path]:
+    """Retrieve single-file and package workflows, rejecting ambiguous names."""
+    workflows: dict[str, Path] = {}
+    base_cwd = Path.cwd() if cwd is None else cwd
+    for path in sorted((
+        *root_dir.glob("*_workflow.py"),
+        *root_dir.glob("*/workflow.py"),
+    )):
+        name = _catalog_entry_name(path)
+        if existing := workflows.get(name):
+            raise ValueError(
+                f"Duplicate workflow name '{name}' discovered at '{existing}' and '{path}'"
+            )
+        workflows[name] = (
+            path.resolve()
+            if use_absolute_paths
+            else path.relative_to(base_cwd, walk_up=True)
+        )
+    return workflows
+
+
+def _catalog_entry_name(path: Path) -> str:
+    """Derive the stable catalog name from either supported source layout."""
+    if path.name in {"app.py", "workflow.py"}:
+        return path.parent.name
+    return path.stem.removesuffix("_app").removesuffix("_workflow")
+
+
+def catalog_entry_category(path: Path) -> str:
+    """Derive an app category without exposing a package directory as one."""
+    return (
+        path.parent.parent.name
+        if path.name in {"app.py", "workflow.py"}
+        else path.parent.name
+    )
 
 
 def get_catalog(
@@ -62,14 +106,14 @@ def get_catalog(
     """Retrieve app or workflow catalog entries."""
     match catalog_type:
         case "app":
-            return get_all_scripts(
-                APP_HOME, "*/", "_app", use_absolute_paths=use_absolute_paths, cwd=cwd
+            return get_all_apps(
+                APP_HOME,
+                use_absolute_paths=use_absolute_paths,
+                cwd=cwd,
             )
         case "workflow":
-            return get_all_scripts(
+            return get_all_workflows(
                 WORKFLOW_HOME,
-                "",
-                "_workflow",
                 use_absolute_paths=use_absolute_paths,
                 cwd=cwd,
             )
@@ -176,7 +220,7 @@ class BiomodalsApp:
         # Normalize app name & path
         self._all_apps = all_apps or get_catalog("app", use_absolute_paths=True)
         self.name, self.path = self.resolve_app_path(name_or_path)
-        self.category = self.path.parent.name
+        self.category = catalog_entry_category(self.path)
         self.module = self.app_path_to_module_path(self.path)
 
         # Load functions and build index for quick lookup
@@ -230,7 +274,7 @@ class BiomodalsApp:
         app_path = Path(app_name_or_path).expanduser()
         if not app_path.exists():
             raise AppNotFoundError(app_name_or_path)
-        return app_path.stem.removesuffix("_app").removesuffix("_workflow"), app_path
+        return _catalog_entry_name(app_path), app_path
 
     @staticmethod
     def app_path_to_module_path(app_path: Path) -> str:

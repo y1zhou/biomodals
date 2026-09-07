@@ -14,9 +14,9 @@ import pytest
 
 from biomodals.app.design import ppiflow_app
 from biomodals.schema import ArtifactKind, ExecutionArtifact, VolumePath
-from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.ppiflow import manifests, staging
-from biomodals.workflow.ppiflow_workflow import (
+from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
+from biomodals.workflow.ppiflow.workflow import (
     _active_ppiflow_app_steps,
     _inline_rosetta_config_files,
     _stage_ppiflow_app_inputs,

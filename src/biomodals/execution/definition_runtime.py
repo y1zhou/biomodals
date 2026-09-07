@@ -255,7 +255,7 @@ class ExecutionGraphRuntime:
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=self._synchronize_kernel_state,
         )
-        return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
+        return self._run_result(snapshot.run.status, snapshot.run.status_message)
 
     def resume(
         self,
@@ -284,7 +284,21 @@ class ExecutionGraphRuntime:
             poll_interval_seconds=self.poll_interval_seconds,
             synchronize=self._synchronize_kernel_state,
         )
-        return _app_result_for_run(snapshot.run.status, snapshot.run.status_message)
+        return self._run_result(snapshot.run.status, snapshot.run.status_message)
+
+    def _run_result(self, status: RunStatus, message: str | None) -> AppRunResult:
+        """Return recorded terminal publications, not intermediate task outputs."""
+        result = _app_result_for_run(status, message)
+        with self.store.synchronize():
+            plan = self.store.execution.get_run(self.execution_run_id).plan
+            for node_key in plan.terminal_node_keys:
+                node = self.store.execution.get_node(self.execution_run_id, node_key)
+                if node.status not in {NodeStatus.SUCCEEDED, NodeStatus.PARTIAL}:
+                    continue
+                publication = self.store.artifacts.load_node_result(node_key)
+                if publication is not None:
+                    result.outputs.extend(publication.outputs)
+        return result
 
     def advance_once(self) -> None:
         """Apply one caller-driven workflow scheduling cycle."""

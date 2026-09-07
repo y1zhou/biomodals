@@ -4,8 +4,10 @@ Apply this common contract, then load specialized references from `SKILL.md`.
 
 ## Discovery and module shape
 
-- Put the discoverable entrypoint at
-  `src/biomodals/app/<category>/<tool>_app.py`; the CLI strips `_app`.
+- Put a single-file app at
+  `src/biomodals/app/<category>/<tool>_app.py`. Put a multi-module app at
+  `src/biomodals/app/<category>/<tool>/app.py`. Both layouts expose `<tool>` as
+  the catalog name; do not define both for the same tool.
 - Expose module-level `app`, Modal functions, and `submit_<tool>_task` there.
 - Make the module docstring useful in `biomodals app help <tool>`: include the
   upstream URL, prerequisites, caveats, and outputs.
@@ -18,6 +20,8 @@ Apply this common contract, then load specialized references from `SKILL.md`.
 
 - Define `CONF = AppConfig(...)`, pin upstream, and reuse its environment, paths,
   GPU, and timeout.
+- Set category tags explicitly. Do not derive them from `__file__`; Modal may
+  stage a composition root at a path such as `/root/app.py`.
 - Build with `patch_image_for_helper(...)`, a Debian slim or pinned registry
   base, `.env(...)`, and `.uv_pip_install(...)`.
 - Use `copy_patch_files=True` only for build-time helper imports. Include sibling

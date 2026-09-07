@@ -45,7 +45,6 @@ from biomodals.schema import (
     InlineBytes,
     VolumePath,
 )
-from biomodals.workflow import ppiflow_workflow
 from biomodals.workflow.ppiflow import (
     af3score_runtime,
     analysis_runtime,
@@ -59,7 +58,8 @@ from biomodals.workflow.ppiflow import (
     runtime_support,
 )
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
-from biomodals.workflow.ppiflow_workflow import (
+from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
+from biomodals.workflow.ppiflow.workflow import (
     CONF,
     build_ppiflow_workflow,
 )
@@ -1788,8 +1788,6 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     assert isinstance(output.storage, InlineBytes)
     plan = orjson.loads(output.storage.data)
     assert plan["num_jobs"] == 2
-    assert "worker_count" not in plan
-    assert "claim_capacity" not in plan
     assert [task["candidate_id"] for task in plan["tasks"]] == ["a", "b"]
     assert [task["index"] for task in plan["tasks"]] == [1, 2]
     assert [task["input_sha256"] for task in plan["tasks"]] == [

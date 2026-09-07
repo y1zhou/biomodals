@@ -68,4 +68,5 @@ def test_patch_image_includes_execution_with_workflow_modules(monkeypatch) -> No
         "biomodals.schema",
         "biomodals.execution",
         "biomodals.workflow",
+        "biomodals.app",
     )

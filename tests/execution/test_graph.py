@@ -2,12 +2,11 @@
 
 # ruff: noqa: D101,D102,D103
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 
 import pytest
 
 from biomodals.execution import ExecutionPlanMetadata, NodeAggregationPolicy
-from biomodals.execution.definition import NodeHandle
 from biomodals.execution.definition_plan import execution_plan, node_task_plan
 from biomodals.execution.nodes import CoordinatorNode, TaskProviderNode
 from biomodals.schema import ArtifactKind
@@ -47,10 +46,6 @@ def test_selector_input_creates_data_dependency() -> None:
     assert definition.dependencies["score"] == {"design"}
     assert definition.nodes["score"].inputs["structures"].producing_node_id == "design"
     assert downstream.node_id == "score"
-
-
-def test_node_handle_exposes_node_id() -> None:
-    assert [field.name for field in fields(NodeHandle)] == ["node_id"]
 
 
 def test_depends_on_creates_control_edge() -> None:

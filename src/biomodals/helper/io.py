@@ -6,6 +6,11 @@ from pathlib import Path
 from biomodals.helper.shell import sanitize_filename
 
 
+def fasta_identifier(identifier: str) -> str:
+    """Replace whitespace for FASTA IDs; callers must check uniqueness."""
+    return re.sub(r"\s", "_", identifier)
+
+
 def resolve_local_output_dir(out_dir: str | Path | None) -> Path:
     """Resolve a local output directory without creating it."""
     if out_dir is None:

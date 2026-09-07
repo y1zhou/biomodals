@@ -25,7 +25,7 @@ primary end-to-end example for app-composed workflows. Use
 [RFD-LigandMPNN](../../../src/biomodals/workflow/rfd_ligandmpnn_workflow.py)
 for workflows that fan out one app's volume-backed outputs into another app's
 workflow-compatible remote function. Use
-[PPIFlow](../../../src/biomodals/workflow/ppiflow_workflow.py) for
+[PPIFlow](../../../src/biomodals/workflow/ppiflow/workflow.py) for
 candidate-manifest joins, retained-candidate filtering, candidate-wide remote
 Tasks, focused task-image runtimes, and PPIFlow-specific stage wiring.
 

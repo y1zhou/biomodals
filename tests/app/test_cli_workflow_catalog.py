@@ -52,7 +52,7 @@ def test_run_rejects_outer_options_after_entrypoint_separator(
 def test_cli_loads_workflow_namespace_names() -> None:
     workflow = _load_entry("workflow", "ppiflow")
 
-    assert workflow.module == "biomodals.workflow.ppiflow_workflow"
+    assert workflow.module == "biomodals.workflow.ppiflow.workflow"
     assert workflow.category == "workflow"
 
 
@@ -75,6 +75,15 @@ def test_app_list_command_is_namespaced() -> None:
 
     assert result.exit_code == 0
     assert "rosetta" in result.output
+
+
+def test_app_list_shows_package_app_category() -> None:
+    result = runner.invoke(app, ["app", "list"])
+
+    assert result.exit_code == 0
+    assert any(
+        "sapiens" in line and "design" in line for line in result.output.splitlines()
+    )
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,7 @@ from biomodals.service.humanization.contracts import (
     InputIssue,
     validate_pairs,
 )
+from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.humanization.results import (
     SELECTION_SCHEMA,
     SelectionPage,
@@ -58,6 +59,7 @@ def create_router(
     pending: PendingRequestStore,
     remote: RemoteExecutionClient,
     cache: ArtifactCache,
+    adapter: HumanizationToolAdapter,
     max_pairs: int = 100,
 ) -> APIRouter:
     """Reuse durable admission and result cache without another job scheduler."""
@@ -79,12 +81,42 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_session)],
     ) -> HumanizationOptions:
         from biomodals.app.design.humatch.app import VH_FAMILIES, VL_FAMILIES
+        from biomodals.app.design.sapiens.app import MAX_VH_LENGTH, MAX_VL_LENGTH
 
         schema = HumanizationSettings.model_json_schema()
         properties = schema["properties"]
         properties["humatch_vh_target_family"]["enum"] = ["auto", *VH_FAMILIES]
         properties["humatch_vl_target_family"]["enum"] = ["auto", *VL_FAMILIES]
-        return HumanizationOptions(max_pairs=max_pairs, settings_schema=schema)
+        return HumanizationOptions(
+            max_pairs=max_pairs,
+            max_vh_length=MAX_VH_LENGTH,
+            max_vl_length=MAX_VL_LENGTH,
+            settings_schema=schema,
+        )
+
+    @router.get("/jobs/{job_id}/inputs", response_model=HumanizationSubmission)
+    async def inputs(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+        response: Response,
+    ) -> HumanizationSubmission:
+        job = store.get_job(session.principal.user_id, job_id)
+        if job is None or job.tool != "humanization":
+            raise HTTPException(404, "Job not found")
+        try:
+            retained = await adapter.input_request(job)
+        except FileNotFoundError as error:
+            raise CodedAPIError(
+                404,
+                "job_input_unavailable",
+                "Humanization input is no longer available",
+            ) from error
+        response.headers["Cache-Control"] = "private, no-store"
+        return HumanizationSubmission(
+            display_name=job.display_name,
+            pairs=[pair.model_dump() for pair in retained.pairs],
+            settings=retained.settings,
+        )
 
     @router.post(
         "/jobs",

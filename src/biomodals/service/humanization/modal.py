@@ -120,6 +120,15 @@ class HumanizationToolAdapter:
         """Discard the local copy only after successful remote staging."""
         self.pending.delete(job.job_id)
 
+    async def input_request(self, job: JobRecord) -> HumanizationExecutionRequest:
+        """Recover editable inputs without preparing models or executing science."""
+        content = await asyncio.to_thread(self.pending.get, job.job_id)
+        if content is not None:
+            return HumanizationExecutionRequest.from_bytes(content)
+        return await asyncio.to_thread(
+            load_execution_request_from_volume, self._volume(job), job.job_id
+        )
+
     async def prepare_result(
         self,
         job: JobRecord,

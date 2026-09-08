@@ -62,6 +62,8 @@ class HumanizationOptions(BaseModel):
     """Server-owned admission limit and native scientific settings metadata."""
 
     max_pairs: int
+    max_vh_length: int
+    max_vl_length: int
     defaults: HumanizationSettings = Field(default_factory=HumanizationSettings)
     settings_schema: dict[str, Any]
 
@@ -70,6 +72,8 @@ def validate_pairs(
     submission: HumanizationSubmission, *, max_pairs: int
 ) -> tuple[tuple[AntibodyPair, ...], list[InputIssue]]:
     """Match the scientific parser's rules while reporting all invalid rows."""
+    from biomodals.app.design.sapiens.app import MAX_VH_LENGTH, MAX_VL_LENGTH
+
     issues: list[InputIssue] = []
     if len(submission.pairs) > max_pairs:
         issues.append(
@@ -102,17 +106,24 @@ def validate_pairs(
             invalid_duplicates.update((seen[normalized_id], index))
         else:
             seen[normalized_id] = index
-        for field in ("vh", "vl"):
+        for field, max_length in (("vh", MAX_VH_LENGTH), ("vl", MAX_VL_LENGTH)):
             sequence = getattr(pair, field)
-            if not 1 <= len(sequence) <= 200 or set(sequence) - set(
-                "ACDEFGHIKLMNPQRSTVWY"
-            ):
+            if len(sequence) > max_length:
+                issues.append(
+                    InputIssue(
+                        row_index=index,
+                        field=field,
+                        code="sequence_too_long",
+                        message=f"{field.upper()} must be at most {max_length} residues; provide the variable domain only",
+                    )
+                )
+            elif not sequence or set(sequence) - set("ACDEFGHIKLMNPQRSTVWY"):
                 issues.append(
                     InputIssue(
                         row_index=index,
                         field=field,
                         code="sequence_invalid",
-                        message="Use 1–200 canonical amino-acid residues",
+                        message=f"Use 1–{max_length} canonical amino-acid residues",
                     )
                 )
     issues.extend(

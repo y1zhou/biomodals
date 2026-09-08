@@ -105,6 +105,21 @@ resolution against the service baseline. Both histories are included.
   defaults, and flat settings JSON schema. `BIOMODALS_HUMANIZATION_MAX_PAIRS`
   defaults to 100 and may be configured from 1 through the parser limit of
   1000. There is no independent frontend limit configuration.
+  Required `max_vh_length=142` and `max_vl_length=126` expose the Sapiens
+  limits for website admission. Both the editor and server reject longer
+  normalized sequences with row-addressable `sequence_too_long` errors before
+  provider preflight. This website policy does not narrow the CLI/workflow
+  parser or guarantee that every shorter input can be numbered by every model.
+- `GET /api/v1/humanization/jobs/{job_id}/inputs`: owner-only editable
+  `HumanizationSubmission` (`display_name`, `pairs`, `settings`), with
+  `Cache-Control: private, no-store`. Read local pending input if available,
+  otherwise the original job's immutable staged request in its Modal environment.
+  Missing/foreign/wrong-tool jobs return 404; unavailable retained input returns
+  404 `job_input_unavailable`. Retrieval is permitted for any job state and
+  preserves historical oversized inputs for correction. No models are prepared
+  and no work is launched. The Job detail rerun button opens a memory-only
+  editable draft; explicit submission creates a new Job and idempotency intent
+  under the current deployment, not an execution-kernel Successor Run.
 - `POST /api/v1/humanization/jobs`: typed `display_name`, `pairs`, and
   `settings`; existing session/Origin/CSRF and UUID Idempotency-Key contract.
   Returns the existing `JobView` with HTTP 202 after durable admission.

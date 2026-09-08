@@ -27,6 +27,7 @@ from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import router as gromacs_routes
 from biomodals.service.gromacs.router import create_router as gromacs_router
 from biomodals.service.http_contract import require_session, require_unsafe_session
+from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.humanization.results import SELECTION_SCHEMA
 from biomodals.service.humanization.router import create_router as humanization_router
 from biomodals.service.pending import PendingRequestStore
@@ -109,6 +110,8 @@ def test_humanization_options_limits_and_unauthenticated_access(tmp_path: Path) 
     _humanization_session(app)
     options = _request(app, "GET", "/api/v1/humanization/options")
     assert options.json()["max_pairs"] == 100
+    assert options.json()["max_vh_length"] == 142
+    assert options.json()["max_vl_length"] == 126
     assert options.json()["defaults"]["hudiff_ab_candidate_count"] == 10
     assert options.json()["defaults"]["pabnativ2_num_seeds"] == 1
     seed_count = options.json()["settings_schema"]["properties"]["pabnativ2_num_seeds"]
@@ -274,6 +277,7 @@ def _app(tmp_path: Path):
                 pending=pending,
                 remote=remote,
                 cache=cache,
+                adapter=HumanizationToolAdapter(pending),
             ),
         ),
         remote=remote,
@@ -299,6 +303,104 @@ def _session(user_id: UUID | None = None) -> AuthenticatedSession:
         last_seen_at=now,
         absolute_expires_at=now + 3600,
     )
+
+
+def test_humanization_length_limits_reject_before_remote_admission(
+    tmp_path, monkeypatch
+):
+    app = _app(tmp_path)
+    _humanization_session(app)
+
+    async def no_preflight(*args):
+        raise AssertionError("Invalid lengths reached remote admission")
+
+    monkeypatch.setattr(Remote, "preflight", no_preflight)
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json={"pairs": [{"id": "long", "vh": "A" * 143, "vl": "C" * 127}]},
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 422
+    assert {(issue["field"], issue["code"]) for issue in response.json()["errors"]} == {
+        ("vh", "sequence_too_long"),
+        ("vl", "sequence_too_long"),
+    }
+
+
+def test_humanization_rerun_inputs_are_private_editable_and_not_submitted(
+    tmp_path, monkeypatch
+):
+    from biomodals.service.humanization import modal as humanization_modal
+    from biomodals.workflow.humanization.contracts import AntibodyPair
+    from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
+    from biomodals.workflow.humanization.settings import HumanizationSettings
+
+    app = _app(tmp_path)
+    session = _humanization_session(app)
+    payload = {
+        "display_name": "Original job",
+        "pairs": [{"id": "boundary", "vh": "A" * 142, "vl": "C" * 126}],
+        "settings": {
+            "sapiens_iterations": 3,
+            "pabnativ2_num_seeds": 2,
+            "pabnativ2_seed": 0,
+            "hudiff_ab_seed": 42,
+            "humatch_mutate_cdrs": True,
+        },
+    }
+    submitted = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json=payload,
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    assert submitted.status_code == 202
+    job_id = UUID(submitted.json()["job_id"])
+    path = f"/api/v1/humanization/jobs/{job_id}/inputs"
+    restored = _request(app, "GET", path)
+    assert restored.status_code == 200
+    assert restored.headers["cache-control"] == "private, no-store"
+    assert restored.json()["pairs"] == payload["pairs"]
+    assert (
+        restored.json()["settings"]
+        == HumanizationSettings(**payload["settings"]).model_dump()
+    )
+    assert restored.json()["display_name"] == payload["display_name"]
+    app.dependency_overrides[require_session] = _session
+    assert _request(app, "GET", path).status_code == 404
+    app.dependency_overrides.pop(require_session)
+    assert _request(app, "GET", path).status_code == 401
+    app.dependency_overrides[require_session] = lambda: session
+    # A cancelled historical input remains editable even though new admission rejects it.
+    PendingRequestStore(tmp_path / "pending").delete(job_id)
+    app.state.store.request_cancel(job_id, now=3)
+    retained = HumanizationExecutionRequest(
+        run_name="old", pairs=(AntibodyPair(id="old", vh="A" * 192, vl="C" * 106),)
+    )
+    monkeypatch.setattr(
+        humanization_modal.HumanizationToolAdapter, "_volume", lambda *_: object()
+    )
+    monkeypatch.setattr(
+        humanization_modal, "load_execution_request_from_volume", lambda *_: retained
+    )
+    assert len(_request(app, "GET", path).json()["pairs"][0]["vh"]) == 192
+    assert (
+        app.state.store.get_job(session.principal.user_id, job_id).state
+        == JobState.CANCELLED
+    )
+
+    def unavailable(*args):
+        raise FileNotFoundError("removed")
+
+    monkeypatch.setattr(
+        humanization_modal, "load_execution_request_from_volume", unavailable
+    )
+    response = _request(app, "GET", path)
+    assert response.status_code == 404
+    assert response.json()["code"] == "job_input_unavailable"
 
 
 def _enabled_session(app) -> AuthenticatedSession:

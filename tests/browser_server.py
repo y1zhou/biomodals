@@ -449,6 +449,15 @@ class _FakeHumanizationAdapter(_FakeAdapter):
         self.requests[job.job_id] = request
         self.remote.bind_plan(job.job_id, request.execution_plan)
 
+    async def input_request(self, job: JobRecord) -> HumanizationExecutionRequest:
+        content = self.pending.get(job.job_id)
+        if content is not None:
+            return HumanizationExecutionRequest.from_bytes(content)
+        try:
+            return self.requests[job.job_id]
+        except KeyError as error:
+            raise FileNotFoundError("Input unavailable") from error
+
     async def prepare_result(
         self, job: JobRecord, cache: ArtifactCache, *, completed_at: int
     ) -> PreparedResult:
@@ -616,6 +625,7 @@ def _create_browser_app():
                 pending=pending,
                 remote=remote,
                 cache=cache,
+                adapter=registrations[2].adapter,
                 max_pairs=settings.humanization_max_pairs,
             ),
         ),

@@ -208,13 +208,11 @@ def create_deployed_app() -> FastAPI:
         modal_download_concurrency=settings.modal_download_concurrency,
     )
     alphafold3 = ToolRegistration(ALPHAFOLD3_TOOL, alphafold3_adapter)
-    humanization = ToolRegistration(
-        HUMANIZATION_TOOL,
-        HumanizationToolAdapter(
-            pending,
-            modal_download_concurrency=settings.modal_download_concurrency,
-        ),
+    humanization_adapter = HumanizationToolAdapter(
+        pending,
+        modal_download_concurrency=settings.modal_download_concurrency,
     )
+    humanization = ToolRegistration(HUMANIZATION_TOOL, humanization_adapter)
     registrations = (gromacs, alphafold3, humanization)
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     routers = (
@@ -237,6 +235,7 @@ def create_deployed_app() -> FastAPI:
             pending=pending,
             remote=remote,
             cache=cache,
+            adapter=humanization_adapter,
             max_pairs=settings.humanization_max_pairs,
         ),
     )

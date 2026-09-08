@@ -28,6 +28,13 @@ class SelectionColumn(BaseModel):
     type: Literal["string", "integer", "number", "boolean"]
 
 
+class NativenessRange(BaseModel):
+    """Full-result finite bounds for one original nativeness score."""
+
+    min: float
+    max: float
+
+
 class SelectionPage(BaseModel):
     """One bounded page with the full table's available parent filters."""
 
@@ -40,8 +47,8 @@ class SelectionPage(BaseModel):
     default_hidden_columns: list[str] = Field(
         description="Data-dependent defaults computed over the full result before filtering or pagination."
     )
-    nativeness_max_abs: dict[str, float] = Field(
-        description="Full-result maximum absolute finite value for each p-AbNatiV2 nativeness column and delta. Zero for no finite values or all zeros; visualization scale only."
+    nativeness_ranges: dict[str, NativenessRange] = Field(
+        description="Full-result finite min/max for the three original p-AbNatiV2 nativeness columns, before filtering or pagination. Both zero when no finite values exist. Original scores and their deltas share this range; visualization only."
     )
 
 
@@ -76,10 +83,23 @@ def query_selection(
         .not_()
         .alias("evaluation_complete"),
     ).row(0, named=True)
-    nativeness_max_abs = table.select(
-        pl.col(name).filter(pl.col(name).is_finite()).abs().max().fill_null(0.0)
+    nativeness_ranges = table.select(
+        pl.struct(
+            pl
+            .col(name)
+            .filter(pl.col(name).is_finite())
+            .min()
+            .fill_null(0.0)
+            .alias("min"),
+            pl
+            .col(name)
+            .filter(pl.col(name).is_finite())
+            .max()
+            .fill_null(0.0)
+            .alias("max"),
+        ).alias(name)
         for name in table.columns
-        if name.endswith(("_nativeness", "_nativeness_delta"))
+        if name.endswith("_nativeness")
     ).row(0, named=True)
     if parent_id is not None:
         table = table.filter(pl.col("parent_id") == parent_id)
@@ -109,7 +129,7 @@ def query_selection(
         limit=limit,
         parent_ids=parent_ids,
         default_hidden_columns=[name for name, hide in hidden.items() if hide],
-        nativeness_max_abs=nativeness_max_abs,
+        nativeness_ranges=nativeness_ranges,
     )
 
 

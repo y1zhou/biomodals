@@ -27,6 +27,21 @@ submission-layout and CSV-import amendments on 2026-09-08.
   the entire batch. General holds any shared scientific controls, not Job name;
   container ceilings remain admin-controlled. Do not expose CLI-only wait,
   deployment selection, or restart controls in the submission form.
+- General Root seed defaults to 0 and explicitly sets both `pabnativ2_seed`
+  and `hudiff_ab_seed`; the standalone HuDiff default remains 42. General
+  Allow CDR mutations sets Sapiens, Humatch and p-AbNatiV2 controls together;
+  HuDiff has no corresponding option. These are frontend mappings, not new
+  generic API fields.
+- Sapiens iterations retain every paired intermediate design for shared
+  evaluation. p-AbNatiV2 Sampling attempts per parent maps to
+  `pabnativ2_num_seeds` (integer 1–25, default 1), meaning independent optimizer
+  runs, not guaranteed unique sequences. See the scientific
+  [generation contract](humanization-workflow.md#verified-run-controls).
+  These changes require a coordinated containing-workflow deployment, service
+  version pin and API restart. Do not expose updated live options against an
+  old pinned workflow, even at count 1: old settings reject the new field.
+  Until deployment is authorized, keep the live API at baseline; the new
+  frontend disables submission when its options lack `pabnativ2_num_seeds`.
 - Admit at most 100 pairs per job by default. Control this limit with a
   backend environment variable, not separate frontend configuration.
 - Keep invalid imported rows visible and highlighted so users can fix or

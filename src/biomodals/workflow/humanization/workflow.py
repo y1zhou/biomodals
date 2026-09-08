@@ -90,7 +90,7 @@ METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
     "result_schema": "2",
     "panel_ranking": RANKING_VERSION,
-    "biomodals.workflow.humanization": "1",
+    "biomodals.workflow.humanization": "2",
     "sapiens": sapiens_app.RUNTIME_IDENTITY,
     "sapiens.source": sapiens_app.CONF.repo_commit_hash or "",
     "sapiens.vh": sapiens_app.IDENTITY.vh_revision,
@@ -145,17 +145,25 @@ class HumanizationGenerateNode(TaskProviderNode):
             TaskDefinition("parents", [parent.model_dump() for parent in self.parents])
         ]
         method = self.method
+        parameters = self.settings.method_arguments(method)
+        variants = (
+            [dict(parameters, seed=seed) for seed in self.settings.pabnativ2_seeds]
+            if method == "pabnativ2"
+            else [parameters]
+        )
         for index, parent in enumerate(self.parents):
-            tasks.append(
-                TaskDefinition(
-                    f"{method}-{index:04d}",
-                    {
-                        "parent": parent.model_dump(),
-                        "method": method,
-                        "parameters": self.settings.method_arguments(method),
-                    },
+            for replicate, arguments in enumerate(variants):
+                suffix = f"-seed-{replicate:02d}" if len(variants) > 1 else ""
+                tasks.append(
+                    TaskDefinition(
+                        f"{method}-{index:04d}{suffix}",
+                        {
+                            "parent": parent.model_dump(),
+                            "method": method,
+                            "parameters": arguments,
+                        },
+                    )
                 )
-            )
         return tuple(tasks)
 
     def recover_remote_task_result(
@@ -193,7 +201,11 @@ class HumanizationGenerateNode(TaskProviderNode):
             function_name=operation,
             uses_gpu=method in {"pabnativ2", "hudiff_ab"},
             kwargs=kwargs,
-            metadata={"method": method, "parent": parent},
+            metadata={
+                "method": method,
+                "parent": parent,
+                "parameters": payload["parameters"],
+            },
         )
 
     def process_remote_task_result(
@@ -204,7 +216,10 @@ class HumanizationGenerateNode(TaskProviderNode):
         if result.status != AppRunStatus.SUCCEEDED:
             return result
         rows = generated_pairs(
-            metadata["method"], AntibodyPair.model_validate(metadata["parent"]), result
+            metadata["method"],
+            AntibodyPair.model_validate(metadata["parent"]),
+            result,
+            sapiens_iterations=metadata["parameters"].get("iterations", 1),
         )
         normalized = [
             {"parent_id": parent_id, "vh": vh, "vl": vl, "origin": origin.model_dump()}
@@ -747,6 +762,7 @@ def submit_humanization_workflow(
     pabnativ2_max_relative_pairing_score_decrease: float = 0.1,
     pabnativ2_forbidden_residues: str = "C,M",
     pabnativ2_seed: int = 0,
+    pabnativ2_num_seeds: int = 1,
     hudiff_ab_candidate_count: int = 10,
     hudiff_ab_seed: int = 42,
     hudiff_ab_sampling_order: str = "shuffle",
@@ -766,7 +782,7 @@ def submit_humanization_workflow(
     Args:
         input_csv: UTF-8 CSV file with exactly id,vh,vl columns.
         run_id: Logical run label; defaults to the input filename stem.
-        sapiens_iterations: Greedy humanization iterations, 1–5.
+        sapiens_iterations: Greedy passes, 1–5; retain each paired design before deduplication.
         sapiens_numbering_scheme: Native kabat, chothia, or imgt numbering.
         sapiens_cdr_definition: Native kabat, chothia, imgt, or north CDR boundaries.
         sapiens_mutate_cdrs: Permit Sapiens CDR mutation.
@@ -788,6 +804,7 @@ def submit_humanization_workflow(
         pabnativ2_max_relative_pairing_score_decrease: Allowed relative pairing decrease.
         pabnativ2_forbidden_residues: Comma-separated forbidden proposed residues.
         pabnativ2_seed: Root seed for native p-AbNatiV2 generation.
+        pabnativ2_num_seeds: Independent p-AbNatiV2 runs per parent, 1–25; not guaranteed yield.
         hudiff_ab_candidate_count: Sampling attempts per parent, 1–25; not guaranteed yield.
         hudiff_ab_seed: Root seed for HuDiff generation.
         hudiff_ab_sampling_order: shuffle or left_to_right.

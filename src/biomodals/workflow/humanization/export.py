@@ -174,6 +174,7 @@ def export_results(
         "execution_run_id": str(context.execution_run_id),
         "status": "partial" if errors else "succeeded",
         "parameters": settings.model_dump(),
+        "generation_seeds": {"pabnativ2": settings.pabnativ2_seeds},
         "scientific_versions": dict(scientific_versions),
         "protocols": {"pabnativ2": HUMANIZATION_PROTOCOL},
         "candidate_count": len(candidates),

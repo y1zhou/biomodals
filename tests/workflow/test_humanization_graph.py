@@ -59,21 +59,52 @@ def test_generation_methods_are_independent_nodes_with_a_union_barrier():
     assert all(edge.accept_partial for edge in union.dependencies)
 
 
-def test_all_generator_failures_still_publish_parental_union(tmp_path):
-    """A local baseline makes all-generator failure a collectable partial result."""
+@pytest.mark.parametrize("pab_success", [False, True])
+def test_generation_failures_preserve_baselines_and_successful_replicas(
+    tmp_path, pab_success
+):
+    """A failed replica cannot discard another replica's successful design."""
+    settings = HumanizationSettings(pabnativ2_num_seeds=3 if pab_success else 1)
 
     class Driver:
         def __init__(self):
             self.calls = []
+            self.kwargs = []
 
         def resolve(self, binding):
             return binding.function_name
 
         def spawn(self, operation, *, args, kwargs):
             self.calls.append(operation)
+            self.kwargs.append(kwargs)
             return f"call-{len(self.calls)}"
 
         def observe(self, provider_call_handle_id):
+            index = int(provider_call_handle_id.split("-")[1]) - 1
+            kwargs = self.kwargs[index]
+            if (
+                pab_success
+                and self.calls[index] == "pabnativ2_humanize_pair"
+                and kwargs["seed"] == settings.pabnativ2_seeds[0]
+            ):
+                return ProviderCallObservation(
+                    ProviderCallObservationKind.SUCCEEDED,
+                    result=AppRunResult(
+                        status=AppRunStatus.SUCCEEDED,
+                        outputs=[
+                            json_output(
+                                "native",
+                                {
+                                    "schema_version": 1,
+                                    "pair_result": {
+                                        "humanized": {**kwargs["pair"], "vh": "ACH"},
+                                        "pair_seed": kwargs["seed"],
+                                    },
+                                },
+                            )
+                        ],
+                    ),
+                )
             return ProviderCallObservation(
                 ProviderCallObservationKind.FAILED, message="model unavailable"
             )
@@ -92,7 +123,7 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
     store = GraphExecutionRunStore(tmp_path, run_id)
     driver = Driver()
     runtime = ExecutionGraphRuntime(
-        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n"),
+        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n", settings),
         execution_run_id=run_id,
         deployment=DeploymentIdentity("main", "HumanizationWorkflow", 1),
         volume_root=tmp_path,
@@ -122,9 +153,12 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
         candidates = orjson.loads(
             (tmp_path / publication.outputs[0].storage.path).read_bytes()
         )
-        assert len(candidates) == 1
+        assert len(candidates) == 1 + int(pab_success)
         assert candidates[0]["is_parent"] is True
         assert candidates[0]["vh"] == "ACD"
+        if pab_success:
+            assert candidates[1]["vh"] == "ACH"
+            assert candidates[1]["origins"][0]["seed"] == settings.pabnativ2_seeds[0]
         generation_errors = next(
             output
             for output in publication.outputs
@@ -135,7 +169,11 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
         ) == {
             "sapiens-0000",
             "humatch-0000",
-            "pabnativ2-0000",
+            *(
+                {"pabnativ2-0000-seed-01", "pabnativ2-0000-seed-02"}
+                if pab_success
+                else {"pabnativ2-0000"}
+            ),
             "hudiff_ab-0000",
         }
     finally:
@@ -143,8 +181,9 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
 
 
 @pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("num_seeds", [1, 3])
 def test_full_graph_joins_successful_native_results_into_sortable_table(
-    tmp_path, monkeypatch, fail_first
+    tmp_path, monkeypatch, fail_first, num_seeds
 ):
     """Exercise actual artifact materialization and candidate/evaluator joins."""
 
@@ -155,6 +194,17 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             member = tarfile.TarInfo("result/humanized.csv")
             member.size = len(content)
             bundle.addfile(member, BytesIO(content))
+            designs = (
+                pl
+                .concat([
+                    frame.with_columns(pl.lit(i).alias("iteration")) for i in (1, 2)
+                ])
+                .write_csv()
+                .encode()
+            )
+            member = tarfile.TarInfo("result/iteration_designs.csv")
+            member.size = len(designs)
+            bundle.addfile(member, BytesIO(designs))
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -197,7 +247,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                                 "schema_version": 1,
                                 "pair_result": {
                                     "humanized": kwargs["pair"],
-                                    "pair_seed": 0,
+                                    "pair_seed": kwargs["seed"],
                                 },
                             },
                         )
@@ -307,8 +357,10 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
     run_id = UUID(int=2)
     store = GraphExecutionRunStore(tmp_path, run_id)
     driver = Driver()
+    settings = HumanizationSettings(sapiens_iterations=2, pabnativ2_num_seeds=num_seeds)
+    expected_calls = 12 + num_seeds - 1
     runtime = ExecutionGraphRuntime(
-        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n"),
+        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n", settings),
         execution_run_id=run_id,
         deployment=DeploymentIdentity("main", "HumanizationWorkflow", 1),
         volume_root=tmp_path,
@@ -342,15 +394,18 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             table["sapiens_vh_mean_probability_delta"].to_list()
             == [None if fail_first else 0.0] * 2
         )
-        assert len(driver.results) == 12
+        assert len(driver.results) == expected_calls
         manifest = orjson.loads((root / "manifest.json").read_bytes())
+        assert manifest["generation_seeds"]["pabnativ2"] == list(
+            settings.pabnativ2_seeds
+        )
         assert manifest["ranking_policy"]["version"] == "1"
         assert manifest["protocols"]["pabnativ2"]["rasa_structure_count"] == 4
         assert manifest["protocols"]["pabnativ2"]["pssm_frequency_cutoff"] == 0.01
         assert manifest["protocols"]["pabnativ2"]["nativeness_weight"] == 10.0
         assert manifest["protocols"]["pabnativ2"]["pairing_weight"] == 1.0
         assert not list((root / "native").glob("*.parquet"))
-        assert len(list((root / "native").iterdir())) == 4
+        assert len(list((root / "native").iterdir())) == 4 + num_seeds - 1
         assert len(manifest["scoring_publications"]) == (4 if fail_first else 6)
         assert all(
             entry["manifest"]["scientific_identity"]["runtime"] == "test"
@@ -364,6 +419,15 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             if item["candidate_id"] == table["candidate_id"][0]
         )
         assert baseline["origins"][0]["method"] == "pabnativ2"
+        assert len(baseline["origins"]) == num_seeds
+        changed = next(
+            item for item in manifest["candidate_provenance"] if item != baseline
+        )
+        assert {
+            origin["source_id"]
+            for origin in changed["origins"]
+            if origin["method"] == "sapiens"
+        } == {"a__iteration_1", "a__iteration_2"}
         assert manifest["candidate_count"] == 2
         for entry in manifest["files"]:
             content = (root / entry["path"]).read_bytes()
@@ -420,6 +484,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         request = HumanizationExecutionRequest(
             run_name="test",
             pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),),
+            settings=settings,
             max_active_provider_calls=2,
             max_active_gpu_provider_calls=1,
         )
@@ -445,7 +510,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                 candidate_request=HumanizationExecutionRequest(
                     run_name="test",
                     pairs=request.pairs,
-                    settings=HumanizationSettings(sapiens_iterations=2),
+                    settings=HumanizationSettings(sapiens_iterations=3),
                 ),
             )
         successor.prepare_restart(
@@ -456,7 +521,9 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         )
         result = successor.drive_prepared()
         assert result.run.status.value == "succeeded"
-        assert driver.operations[12:] == (["sapiens_score"] * 2 if fail_first else [])
+        assert driver.operations[expected_calls:] == (
+            ["sapiens_score"] * 2 if fail_first else []
+        )
         publication = successor.result()
         directory = next(
             output

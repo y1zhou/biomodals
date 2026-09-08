@@ -166,9 +166,26 @@ or replacement-call loops.
 - HuDiff defaults to 10 sampling attempts per parent, seed 42. The exposed
   `candidate_count` is an attempt budget, not a guaranteed unique yield; current
   bounds are 1–25 attempts per parent and 10,000 per standalone request.
-- Sapiens, Humatch, and p-AbNatiV2 each return one final pair per parent. With
-  default HuDiff attempts, the union has at most 13 generated pairs plus its
-  parental baseline, before deduplication and failed/invalid attempts.
+- Sapiens retains the paired VH/VL design after each of its 1–5 passes in
+  `iteration_designs.csv`; `humanized.csv` remains the standalone final endpoint.
+  Every pass enters the union with its iteration source ID, including no-ops
+  and repeated endpoints, then exact-pair deduplication precedes evaluation.
+  Retention adds no inference passes; additional unique designs add scoring work.
+- Humatch returns one optimized endpoint per parent, possibly unchanged.
+- `pabnativ2_num_seeds` is a strict integer from 1–25, default 1. At 1 the
+  native app receives `pabnativ2_seed` unchanged. Above 1, use
+  `random.Random(pabnativ2_seed).sample(range(2**32), pabnativ2_num_seeds)`
+  to derive distinct roots. Reuse this ordered list for every parent; each
+  native app derives its own pair seed from root, ID, VH and VL. Schedule
+  each root/parent as an independent Task under the existing global limits.
+  Retain successful siblings when a replica fails; the result remains partial.
+  The manifest records actual roots in `generation_seeds.pabnativ2`, parameters,
+  and per-candidate derived seeds; native evidence retains every endpoint.
+  These are optimization replicates, not guaranteed novel candidates.
+- For `I` Sapiens passes, `R` p-AbNatiV2 roots and `A` HuDiff attempts,
+  the per-parent ceiling is `1 + I + 1 + R + A` including the baseline,
+  before deduplication and failed/invalid generation. Defaults still give at
+  most 14 rows per parent. HuDiff's root/count semantics are unchanged.
 - Existing CSV parsers cap requests at 1,000 parents and 3 MiB. Method-specific
   length and alignment limits differ and must not become an implicit requirement
   that every accepted parent be processable by every generator.

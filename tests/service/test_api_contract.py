@@ -110,6 +110,13 @@ def test_humanization_options_limits_and_unauthenticated_access(tmp_path: Path) 
     options = _request(app, "GET", "/api/v1/humanization/options")
     assert options.json()["max_pairs"] == 100
     assert options.json()["defaults"]["hudiff_ab_candidate_count"] == 10
+    assert options.json()["defaults"]["pabnativ2_num_seeds"] == 1
+    seed_count = options.json()["settings_schema"]["properties"]["pabnativ2_num_seeds"]
+    assert (seed_count["type"], seed_count["minimum"], seed_count["maximum"]) == (
+        "integer",
+        1,
+        25,
+    )
     assert (
         options.json()["settings_schema"]["properties"]["humatch_vh_target_family"][
             "enum"

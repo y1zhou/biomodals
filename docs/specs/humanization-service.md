@@ -5,12 +5,17 @@ runs require separate approval.
 
 ## Agreed product requirements
 
-Recorded 2026-09-07 during the coordinated backend/frontend interview.
+Recorded 2026-09-07 during the coordinated backend/frontend interview, with
+submission-layout and CSV-import amendments on 2026-09-08.
 
 - Provide ID, VH, and VL input boxes and an Add button that adds the complete
   pair to a batch. Suggest editable IDs such as `ab_001`; accept any valid,
   non-duplicate ID. CSV upload appends to the same editable batch. Users can
   edit or remove pairs before submission and must resolve duplicate IDs.
+- Place Job name above the batch editor, outside Advanced. Accept CSV files
+  up to and including 10 MiB; reject larger files before parsing without
+  changing the batch. This browser import limit is separate from the normalized
+  JSON API request limit and does not increase the allowed number of pairs.
 - Display the workflow's `selection.csv` table on the webpage when the run
   finishes. Provide pagination, sorting, parent filtering, and all columns,
   including expandable/copyable sequences. Preserve the workflow's default
@@ -19,9 +24,9 @@ Recorded 2026-09-07 during the coordinated backend/frontend interview.
 - Provide an Advanced section exposing the app-specific knobs available in
   `submit_humanization_workflow`, grouped into General, Sapiens, Humatch,
   p-AbNatiV2, and HuDiff subsections. One scientific configuration applies to
-  the entire batch. General includes the job name; container ceilings remain
-  admin-controlled. Do not expose CLI-only wait, deployment selection, or
-  restart controls in the submission form.
+  the entire batch. General holds any shared scientific controls, not Job name;
+  container ceilings remain admin-controlled. Do not expose CLI-only wait,
+  deployment selection, or restart controls in the submission form.
 - Admit at most 100 pairs per job by default. Control this limit with a
   backend environment variable, not separate frontend configuration.
 - Keep invalid imported rows visible and highlighted so users can fix or
@@ -130,6 +135,12 @@ Older pinned plans with a single `generate` Node retain their aggregate stage;
 method timings must not be inferred from an aggregate record. The graph change
 requires a new workflow deployment and corresponding service version pin before
 new live Jobs can use these rows. Existing historical Runs are not rewritten.
+
+Offline verification on 2026-09-08 passed 1,577 backend tests and all ten
+cross-repository browser tests. The real fixture exercised simultaneous
+completed Sapiens/Humatch and running p-AbNatiV2/HuDiff rows, then completed
+100-pair result delivery with bounded pages and downloads. No deployment or
+paid execution was performed for this stage-projection change.
 
 ### Runtime preparation
 

@@ -32,7 +32,7 @@ class SapiensIdentity:
 
 IDENTITY = SapiensIdentity()
 RUNTIME_IDENTITY = "|".join((
-    "output-protocol=3",
+    "output-protocol=4",
     f"sapiens={IDENTITY.sapiens_version}",
     f"abnumber={IDENTITY.abnumber_version}",
     f"anarci={IDENTITY.anarci_version}",

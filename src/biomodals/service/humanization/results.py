@@ -40,6 +40,9 @@ class SelectionPage(BaseModel):
     default_hidden_columns: list[str] = Field(
         description="Data-dependent defaults computed over the full result before filtering or pagination."
     )
+    nativeness_max_abs: dict[str, float] = Field(
+        description="Full-result maximum absolute finite value for each p-AbNatiV2 nativeness column and delta. Zero for no finite values or all zeros; visualization scale only."
+    )
 
 
 def query_selection(
@@ -73,6 +76,11 @@ def query_selection(
         .not_()
         .alias("evaluation_complete"),
     ).row(0, named=True)
+    nativeness_max_abs = table.select(
+        pl.col(name).filter(pl.col(name).is_finite()).abs().max().fill_null(0.0)
+        for name in table.columns
+        if name.endswith(("_nativeness", "_nativeness_delta"))
+    ).row(0, named=True)
     if parent_id is not None:
         table = table.filter(pl.col("parent_id") == parent_id)
     total_rows = table.height
@@ -101,6 +109,7 @@ def query_selection(
         limit=limit,
         parent_ids=parent_ids,
         default_hidden_columns=[name for name, hide in hidden.items() if hide],
+        nativeness_max_abs=nativeness_max_abs,
     )
 
 

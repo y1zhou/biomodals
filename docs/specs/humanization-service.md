@@ -110,6 +110,11 @@ resolution against the service baseline. Both histories are included.
   and values remain available in the response and unchanged CSV; static
   defaults for `is_parent`, `cdr_preservation`, and Humatch family labels are
   frontend-owned. Computing the flags reuses the existing parsed table.
+  Required `nativeness_max_abs: Record<string, number>` contains the maximum
+  absolute finite value over the full result for each of the three
+  `pabnativ2_*_nativeness` columns and their deltas. All-zero or all-null
+  columns have scale zero. These scales are also independent of pages and
+  filters, and reuse the same parsed table without additional file reads.
 - `GET /api/v1/humanization/jobs/{job_id}/selection.csv`: original CSV as a
   native browser download. Both selection endpoints require ownership and a
   successful or partial result. An evicted local result returns coded 409
@@ -202,6 +207,13 @@ likeness is an average observed residue-frequency score in `[0,1]`, not
 sequence identity or confidence. p-AbNatiV2 nativeness scores are affine
 rescalings of reconstruction scores and can be negative; do not clamp or
 present them as probabilities. See the [p-AbNatiV2 score research](../research/humanization/pabnativ2.md#score-semantics).
+
+For visualization only, nativeness bars may use `raw_value / max_abs` to fit
+`[-1,1]` while preserving zero and sign. A zero scale produces zero extent;
+a null value remains missing. Use each column's own full-result scale,
+including separate scales for deltas. Always display the raw numeric value.
+This is batch-relative visual scaling, not scientific standardization: bar
+lengths are not directly comparable across columns or different Jobs.
 
 Deltas are candidate minus parental score in the original score units, not
 relative percentages. Positive means a higher score in the model's preferred

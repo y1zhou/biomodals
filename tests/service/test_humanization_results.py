@@ -102,6 +102,39 @@ def test_selection_numeric_sort_nulls_last_and_stable_ties(
     assert page.rows[-1]["panel_order"] is None
 
 
+def test_nativeness_scales_use_full_result_and_preserve_raw_values(
+    tmp_path: Path,
+) -> None:
+    """Off-page and filtered values define stable zero-preserving visual scales."""
+    path = _selection(tmp_path)
+    table = pl.read_csv(path, schema_overrides=SELECTION_SCHEMA).with_columns(
+        pl.Series("pabnativ2_pair_nativeness", [-2.0, 0.5, None, 0.0]),
+        pl.Series("pabnativ2_pair_nativeness_delta", [1.25, -0.25, None, 0.0]),
+        pl.lit(0.0).alias("pabnativ2_vh_nativeness"),
+    )
+    table.write_csv(path)
+    expected = {
+        name: 0.0
+        for name in table.columns
+        if name.endswith(("_nativeness", "_nativeness_delta"))
+    }
+    expected.update(pabnativ2_pair_nativeness=2.0, pabnativ2_pair_nativeness_delta=1.25)
+    for kwargs in (
+        {},
+        {"offset": 1, "limit": 1},
+        {"parent_id": "001"},
+        {"parent_id": "missing"},
+        {"sort_by": "panel_order", "descending": True},
+    ):
+        assert query_selection(path, **kwargs).nativeness_max_abs == expected
+    assert [row["pabnativ2_pair_nativeness"] for row in query_selection(path).rows] == [
+        -2.0,
+        0.5,
+        None,
+        0.0,
+    ]
+
+
 @pytest.mark.parametrize(
     "kwargs", [{"offset": -1}, {"limit": 0}, {"limit": 201}, {"sort_by": "missing"}]
 )

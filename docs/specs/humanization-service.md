@@ -102,6 +102,14 @@ resolution against the service baseline. Both histories are included.
   and `descending`. Returns typed column metadata, only the requested rows,
   filtered total count, offset/limit, and available parent IDs. Cached ZIP
   reads and Polars operations run in the bounded I/O executor.
+  Required `default_hidden_columns: string[]` reports data-dependent display
+  defaults from the full authoritative result, before any filter/sort/page:
+  each `*_error` column is hidden when all its values are null, and
+  `evaluation_complete` is hidden unless at least one row is false. These
+  defaults remain stable even for empty pages or parent filters. All columns
+  and values remain available in the response and unchanged CSV; static
+  defaults for `is_parent`, `cdr_preservation`, and Humatch family labels are
+  frontend-owned. Computing the flags reuses the existing parsed table.
 - `GET /api/v1/humanization/jobs/{job_id}/selection.csv`: original CSV as a
   native browser download. Both selection endpoints require ownership and a
   successful or partial result. An evicted local result returns coded 409
@@ -178,6 +186,28 @@ See [backend research](../research/humanization/service-integration.md) and
 The Humanization Batch glossary distinguishes standalone-app batch failure
 from the workflow's useful partial-results policy. The service preserves the
 workflow policy rather than redefining its scientific outcomes.
+
+## Result display semantics
+
+`quality_tier` and `panel_order` are per-parent, one-based ascending ranks.
+Tier 1 is the first Pareto front; panel order is a diversity-aware suggested
+selection sequence, not a composite fitness score. Null ranks identify the
+parent or candidates outside ranking eligibility, not a worst numeric rank.
+
+Sapiens mean residue probabilities, Humatch classifier probabilities and
+pairing score, and p-AbNatiV2 pairing score use fractions in `[0,1]`. The
+p-AbNatiV2 upstream pairing column's percent sign is misleading: its value
+is the raw sigmoid fraction, with no division by 100. Humatch germline
+likeness is an average observed residue-frequency score in `[0,1]`, not
+sequence identity or confidence. p-AbNatiV2 nativeness scores are affine
+rescalings of reconstruction scores and can be negative; do not clamp or
+present them as probabilities. See the [p-AbNatiV2 score research](../research/humanization/pabnativ2.md#score-semantics).
+
+Deltas are candidate minus parental score in the original score units, not
+relative percentages. Positive means a higher score in the model's preferred
+direction; it does not establish experimental improvement or reduced
+immunogenicity. Best-family probability deltas are omitted because the best
+family may change between sequences.
 
 ## Local query measurement
 

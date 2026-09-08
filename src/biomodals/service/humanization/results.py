@@ -37,6 +37,9 @@ class SelectionPage(BaseModel):
     offset: int
     limit: int
     parent_ids: list[str]
+    default_hidden_columns: list[str] = Field(
+        description="Data-dependent defaults computed over the full result before filtering or pagination."
+    )
 
 
 def query_selection(
@@ -57,6 +60,19 @@ def query_selection(
     if set(table.columns) != set(SELECTION_SCHEMA):
         raise ValueError("Selection table columns do not match the workflow schema")
     parent_ids = table.get_column("parent_id").unique().sort().to_list()
+    hidden = table.select(
+        *(
+            pl.col(name).is_null().all().alias(name)
+            for name in table.columns
+            if name.endswith("_error")
+        ),
+        pl
+        .col("evaluation_complete")
+        .eq(False)
+        .any()
+        .not_()
+        .alias("evaluation_complete"),
+    ).row(0, named=True)
     if parent_id is not None:
         table = table.filter(pl.col("parent_id") == parent_id)
     total_rows = table.height
@@ -84,6 +100,7 @@ def query_selection(
         offset=offset,
         limit=limit,
         parent_ids=parent_ids,
+        default_hidden_columns=[name for name, hide in hidden.items() if hide],
     )
 
 

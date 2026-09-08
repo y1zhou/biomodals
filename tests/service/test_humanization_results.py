@@ -49,6 +49,42 @@ def test_selection_paging_types_and_parent_filter(tmp_path: Path) -> None:
     assert query_selection(path, parent_id="missing").total_rows == 0
 
 
+def test_visibility_defaults_use_all_rows_before_filter_and_page(
+    tmp_path: Path,
+) -> None:
+    """An error outside the visible parent/page must remain discoverable."""
+    path = _selection(tmp_path)
+    table = pl.read_csv(path, schema_overrides=SELECTION_SCHEMA).with_columns(
+        pl
+        .when(pl.col("parent_id") == "002")
+        .then(pl.lit("failed"))
+        .otherwise(None)
+        .alias("sapiens_error"),
+        (pl.col("parent_id") != "002").alias("evaluation_complete"),
+    )
+    table.write_csv(path)
+    expected = [
+        name
+        for name in table.columns
+        if name.endswith("_error") and name != "sapiens_error"
+    ]
+    for kwargs in (
+        {},
+        {"offset": 1, "limit": 1},
+        {"parent_id": "001"},
+        {"parent_id": "missing"},
+        {"sort_by": "panel_order", "descending": True},
+    ):
+        assert query_selection(path, **kwargs).default_hidden_columns == expected
+    table.with_columns(
+        pl.lit(None).alias("sapiens_error"), pl.lit(True).alias("evaluation_complete")
+    ).write_csv(path)
+    assert query_selection(path).default_hidden_columns == [
+        *[name for name in table.columns if name.endswith("_error")],
+        "evaluation_complete",
+    ]
+
+
 @pytest.mark.parametrize(
     "descending,expected",
     [(False, ["02", "03", "01", "02"]), (True, ["01", "02", "03", "02"])],

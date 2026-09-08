@@ -37,6 +37,28 @@ from biomodals.workflow.humanization.tables import SCORE_COLUMNS
 from biomodals.workflow.humanization.workflow import build_humanization_workflow
 
 
+def test_generation_methods_are_independent_nodes_with_a_union_barrier():
+    """All methods can start together, while collection waits for every method."""
+    request = HumanizationExecutionRequest(
+        run_name="test",
+        pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),),
+    )
+    plan = request.execution_plan
+    generation = plan.nodes[:4]
+    assert {node.node_key for node in generation} == {
+        "generate_sapiens",
+        "generate_humatch",
+        "generate_pabnativ2",
+        "generate_hudiff_ab",
+    }
+    assert all(node.dependencies == () for node in generation)
+    union = next(node for node in plan.nodes if node.node_key == "union")
+    assert {edge.node_key for edge in union.dependencies} == {
+        node.node_key for node in generation
+    }
+    assert all(edge.accept_partial for edge in union.dependencies)
+
+
 def test_all_generator_failures_still_publish_parental_union(tmp_path):
     """A local baseline makes all-generator failure a collectable partial result."""
 
@@ -103,6 +125,19 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
         assert len(candidates) == 1
         assert candidates[0]["is_parent"] is True
         assert candidates[0]["vh"] == "ACD"
+        generation_errors = next(
+            output
+            for output in publication.outputs
+            if output.name == "generation_errors"
+        )
+        assert set(
+            orjson.loads((tmp_path / generation_errors.storage.path).read_bytes())
+        ) == {
+            "sapiens-0000",
+            "humatch-0000",
+            "pabnativ2-0000",
+            "hudiff_ab-0000",
+        }
     finally:
         runtime.close()
 

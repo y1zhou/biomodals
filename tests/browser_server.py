@@ -233,11 +233,14 @@ class _FakeRemote:
         started, _, _ = self.started[run_id]
         return max(0, time.monotonic() - started) if started else 0
 
-    def _node_status(self, run_id: UUID, node_key: str) -> NodeStatus:
-        if run_id in self.cancelled:
-            return NodeStatus.CANCELLED
-        elapsed = self._elapsed(run_id)
+    def _node_window(self, run_id: UUID, node_key: str) -> tuple[float, float]:
         windows = {
+            "generate_sapiens": (0, 1),
+            "generate_humatch": (0, 2),
+            "generate_pabnativ2": (0, 4),
+            "generate_hudiff_ab": (0, 3),
+            "union": (4, 4.5),
+            "evaluate": (4.5, 6),
             "prepare_tpr_gpu": (0, 1),
             "collect_traj_stats:nvt_": (1, 5),
             "collect_traj_stats:npt_": (1, 5),
@@ -246,12 +249,17 @@ class _FakeRemote:
             "prepare_result": (5.5, 6),
         }
         if node_key in windows:
-            start, end = windows[node_key]
-        else:
-            plan = self.started[run_id][2]
-            index = plan.node_keys.index(node_key)
-            width = 6 / len(plan.nodes)
-            start, end = index * width, (index + 1) * width
+            return windows[node_key]
+        plan = self.started[run_id][2]
+        index = plan.node_keys.index(node_key)
+        width = 6 / len(plan.nodes)
+        return index * width, (index + 1) * width
+
+    def _node_status(self, run_id: UUID, node_key: str) -> NodeStatus:
+        if run_id in self.cancelled:
+            return NodeStatus.CANCELLED
+        elapsed = self._elapsed(run_id)
+        start, end = self._node_window(run_id, node_key)
         if elapsed < start:
             return NodeStatus.PENDING
         if elapsed < end:
@@ -265,13 +273,20 @@ class _FakeRemote:
             node_key = node.node_key
             if node_key in {"union", "prepare_result"}:
                 continue
-            function_name = self._functions.get(node_key, node_key)
+            function_name = {
+                "generate_sapiens": "sapiens_humanize",
+                "generate_humatch": "humatch_humanize",
+                "generate_pabnativ2": "pabnativ2_humanize_pair",
+                "generate_hudiff_ab": "hudiff_ab_humanize_pair",
+            }.get(node_key, self._functions.get(node_key, node_key))
             status = self._node_status(run_id, node_key)
             if status == NodeStatus.PENDING:
                 continue
             provider_status = (
                 ProviderCallStatus.SUCCEEDED
                 if status == NodeStatus.SUCCEEDED
+                else ProviderCallStatus.CANCELLED
+                if status == NodeStatus.CANCELLED
                 else ProviderCallStatus.RUNNING
             )
             provider_id = uuid5(_CALL_NAMESPACE, f"{run_id}:{node_key}")
@@ -282,9 +297,11 @@ class _FakeRemote:
                     function_name=function_name,
                     status=provider_status,
                     provider_call_handle_id=f"fake-{provider_id}",
-                    created_at=started_at,
-                    started_at=started_at,
-                    completed_at=started_at + 1
+                    created_at=started_at + int(self._node_window(run_id, node_key)[0]),
+                    started_at=started_at + int(self._node_window(run_id, node_key)[0]),
+                    completed_at=int(time.time())
+                    if status == NodeStatus.CANCELLED
+                    else started_at + int(self._node_window(run_id, node_key)[1])
                     if provider_status.is_terminal
                     else None,
                 )
@@ -319,8 +336,14 @@ class _FakeRemote:
                 error_message=None,
                 created_at=started_at,
                 updated_at=int(time.time()),
-                started_at=started_at,
-                completed_at=int(time.time()) if status.is_terminal else None,
+                started_at=started_at + int(self._node_window(run_id, node.node_key)[0])
+                if self._elapsed(run_id) >= self._node_window(run_id, node.node_key)[0]
+                else None,
+                completed_at=int(time.time())
+                if cancelled
+                else started_at + int(self._node_window(run_id, node.node_key)[1])
+                if self._node_status(run_id, node.node_key).is_terminal
+                else None,
             )
             for ordinal, node in enumerate(plan.nodes)
         )

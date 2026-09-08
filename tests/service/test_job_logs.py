@@ -20,6 +20,7 @@ from biomodals.service.job_logs_api import (
     _validate_window_parameters,
 )
 from biomodals.service.remote_execution import ExecutionLocator
+from biomodals.service.tools import HUMANIZATION_TOOL
 
 
 def _call(status: ProviderCallStatus) -> ProviderCallDiagnostic:
@@ -113,3 +114,29 @@ async def test_stage_targets_query_only_mapped_nodes_newest_first() -> None:
 
     assert remote.requested == [("first", True), ("second", True)]
     assert set(selected) == set(calls.values())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", ["sapiens", "humatch", "pabnativ2", "hudiff_ab"])
+async def test_humanization_log_target_selects_only_its_method(method):
+    stage = next(
+        stage
+        for stage in HUMANIZATION_TOOL.stages
+        if stage.code == f"generate_{method}"
+    )
+    requested = []
+
+    class Remote:
+        async def provider_calls(self, locator, *, node_key, limit, newest_first):
+            requested.append(node_key)
+            return ProviderCallPage((), None)
+
+    await _stage_calls(
+        Remote(),
+        ExecutionLocator(
+            uuid4(), DeploymentIdentity("main", "HumanizationWorkflow", 1)
+        ),
+        node_keys=stage.node_keys,
+        limit=10,
+    )
+    assert requested == [f"generate_{method}"]

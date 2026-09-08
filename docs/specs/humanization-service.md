@@ -113,6 +113,24 @@ Graph successors retain validated successful publications, including when the
 terminal bundle belongs to a predecessor Run. The service does not own a
 second scheduler or open remote execution ledgers.
 
+### Concurrent generation stages
+
+New workflow plans expose six Job stages: `generate_sapiens` (Sapiens),
+`generate_humatch` (Humatch), `generate_pabnativ2` (p-AbNatiV2),
+`generate_hudiff_ab` (HuDiff), `union`, and `evaluate`. Each generator owns
+one independent kernel Node with per-pair Tasks, so status, timings, counts,
+and stage-filtered log targets come from that method's actual records.
+All four Nodes can run concurrently under the existing shared provider limits;
+union collection waits for all four. No `JobView` schema change is needed.
+
+Each method retains the existing local baseline publication and partial-result
+policy, including when every provider Task for that method fails. Generation
+errors are combined at the union boundary and still reach final publication.
+Older pinned plans with a single `generate` Node retain their aggregate stage;
+method timings must not be inferred from an aggregate record. The graph change
+requires a new workflow deployment and corresponding service version pin before
+new live Jobs can use these rows. Existing historical Runs are not rewritten.
+
 ### Runtime preparation
 
 Services must establish runtime prerequisites before scientific execution.

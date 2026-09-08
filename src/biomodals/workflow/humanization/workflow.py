@@ -131,10 +131,11 @@ annotate_humanization_candidate = app.function(
 
 @dataclass
 class HumanizationGenerateNode(TaskProviderNode):
-    """One semantic generation stage with independently owned method/pair Tasks."""
+    """One method's generation stage with independently owned pair Tasks."""
 
     parents: tuple[AntibodyPair, ...]
     settings: HumanizationSettings
+    method: str
 
     def discover_remote_tasks(
         self, context: NodeRunContext
@@ -143,18 +144,18 @@ class HumanizationGenerateNode(TaskProviderNode):
         tasks = [
             TaskDefinition("parents", [parent.model_dump() for parent in self.parents])
         ]
+        method = self.method
         for index, parent in enumerate(self.parents):
-            for method in METHODS:
-                tasks.append(
-                    TaskDefinition(
-                        f"{method}-{index:04d}",
-                        {
-                            "parent": parent.model_dump(),
-                            "method": method,
-                            "parameters": self.settings.method_arguments(method),
-                        },
-                    )
+            tasks.append(
+                TaskDefinition(
+                    f"{method}-{index:04d}",
+                    {
+                        "parent": parent.model_dump(),
+                        "method": method,
+                        "parameters": self.settings.method_arguments(method),
+                    },
                 )
+            )
         return tuple(tasks)
 
     def recover_remote_task_result(
@@ -235,7 +236,12 @@ class HumanizationUnionNode(CoordinatorNode):
     def run(self, context: NodeRunContext) -> AppRunResult:
         """Publish the complete union, including unchanged parental baselines."""
         generated = []
-        for artifact in context.inputs.get("generated", []):
+        for artifact in (
+            artifact
+            for name, artifacts in context.inputs.items()
+            if name.startswith("generated_")
+            for artifact in artifacts
+        ):
             rows = orjson.loads(context.resolve_artifact(artifact).read_bytes())
             for row in rows:
                 generated.append((
@@ -251,7 +257,18 @@ class HumanizationUnionNode(CoordinatorNode):
                 json_output(
                     "candidate_union",
                     [candidate.model_dump() for candidate in candidates],
-                )
+                ),
+                json_output(
+                    "generation_errors",
+                    {
+                        key: value
+                        for name in context.inputs
+                        if name.startswith("generation_errors_")
+                        for key, value in orjson.loads(
+                            context.read_input_bytes(name)
+                        ).items()
+                    },
+                ),
             ],
         )
 
@@ -508,20 +525,25 @@ def build_humanization_graph(
     """Build the same scientific graph from already validated paired inputs."""
     validate_humanization_settings(settings, pair_count=len(parents))
     graph = ExecutionGraph("humanization", scientific_versions=SCIENTIFIC_VERSIONS)
-    generation = graph.add_node(
-        HumanizationGenerateNode(parents, settings),
-        id="generate",
-        aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
-    )
+    generation = {
+        method: graph.add_node(
+            HumanizationGenerateNode(parents, settings, method),
+            id=f"generate_{method}",
+            aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
+        )
+        for method in METHODS
+    }
     union = graph.add_node(
         HumanizationUnionNode(parents),
         id="union",
         inputs={
-            "generated": ArtifactSelector(
-                producing_node_id=generation.node_id, pattern="generated.json"
+            f"{output}_{method}": ArtifactSelector(
+                producing_node_id=node.node_id, pattern=f"{output}.json"
             )
+            for method, node in generation.items()
+            for output in ("generated", "generation_errors")
         },
-        accept_partial_from=[generation],
+        accept_partial_from=list(generation.values()),
         reuse_predecessor_publication=False,
     )
     graph.add_node(
@@ -532,11 +554,16 @@ def build_humanization_graph(
                 producing_node_id=union.node_id, pattern="candidate_union.json"
             ),
             "generation_errors": ArtifactSelector(
-                producing_node_id=generation.node_id, pattern="generation_errors.json"
+                producing_node_id=union.node_id, pattern="generation_errors.json"
             ),
-            "generation_native": ArtifactSelector(producing_node_id=generation.node_id),
+            **{
+                f"generation_native_{method}": ArtifactSelector(
+                    producing_node_id=node.node_id
+                )
+                for method, node in generation.items()
+            },
         },
-        accept_partial_from=[generation],
+        accept_partial_from=list(generation.values()),
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
     )
     return graph

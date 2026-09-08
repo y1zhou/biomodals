@@ -59,7 +59,12 @@ def export_results(
     artifact_sources = []
     scoring_publications = []
 
-    for artifact in context.inputs.get("generation_native", []):
+    for artifact in (
+        artifact
+        for name, artifacts in context.inputs.items()
+        if name.startswith("generation_native_")
+        for artifact in artifacts
+    ):
         if artifact.source_app_output_name in {
             "parents",
             "generated",

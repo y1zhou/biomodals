@@ -12,5 +12,6 @@ uv run biomodals workflow run --dry-run humanization -- \
 #   --hudiff-ab-candidate-count 25 --hudiff-ab-seed 42
 #
 # Models are not downloaded or deployed by workflow submission. Results include
-# selection.csv, scores/ Parquet tables, imgt_mutations.parquet, and manifest.json.
+# selection.csv, scores/ Parquet tables, imgt_mutations.parquet,
+# generation.parquet, and manifest.json.
 # HuDiff's candidate count is an attempt budget, not a guaranteed unique yield.

@@ -3,10 +3,7 @@
 Status: implemented and offline-verified. Deployment and scientific smoke
 runs require separate approval.
 
-## Agreed product requirements
-
-Recorded 2026-09-07 during the coordinated backend/frontend interview, with
-submission-layout and CSV-import amendments on 2026-09-08.
+## Website contract
 
 - Provide ID, VH, and VL input boxes and an Add button that adds the complete
   pair to a batch. Suggest editable IDs such as `ab_001`; accept any valid,
@@ -37,11 +34,9 @@ submission-layout and CSV-import amendments on 2026-09-08.
   `pabnativ2_num_seeds` (integer 1–25, default 1), meaning independent optimizer
   runs, not guaranteed unique sequences. See the scientific
   [generation contract](humanization-workflow.md#verified-run-controls).
-  These changes require a coordinated containing-workflow deployment, service
-  version pin and API restart. Do not expose updated live options against an
-  old pinned workflow, even at count 1: old settings reject the new field.
-  Until deployment is authorized, keep the live API at baseline; the new
-  frontend disables submission when its options lack `pabnativ2_num_seeds`.
+  The API and its pinned containing workflow must have matching scientific
+  settings and identities. Older options without this control are unsupported
+  by the current form; editing may continue, but submission is disabled.
 - Admit at most 100 pairs per job by default. Control this limit with a
   backend environment variable, not separate frontend configuration.
 - Keep invalid imported rows visible and highlighted so users can fix or
@@ -75,30 +70,6 @@ submission-layout and CSV-import amendments on 2026-09-08.
   and useful partial scientific results remain governed by the existing
   [workflow specification](humanization-workflow.md).
 
-## Implementation plan
-
-1. Integrate against current main's service/kernel contracts after resolving
-   the humanization stack baseline, preserving the PRs under review. Finalize
-   typed submission, validation-error, and paginated result contracts so both
-   repositories share one API schema.
-2. Add the narrow workflow-owned coordinator adaptation and humanization Tool
-   registration/adapter/router. Reuse shared admission, authentication,
-   idempotency, remote lifecycle, limits, progress, and result delivery.
-3. Add owner-authorized, bounded Polars result queries with agreed sorting and
-   paging, direct CSV download, and archive packaging/restoration. Reuse local
-   result caching so page requests do not repeatedly fetch Modal artifacts.
-4. Build the frontend batch editor, CSV import, grouped Advanced controls, and
-   submission/recovery flow. Extend shared Tool routes and Job detail with a
-   server-paginated selection table, not a separate job lifecycle.
-5. Verify the shared OpenAPI contract, validation and ownership boundaries,
-   idempotent recovery, partial results, numeric/null sorting, stable paging,
-   and downloads. Run offline integration/browser tests and local performance
-   checks before proposing a separately approved paid Modal smoke run.
-
-The user approved implementation and merging the humanization stack first.
-PRs #49–#54 were atomically merged into main at `e25d570` after conflict
-resolution against the service baseline. Both histories are included.
-
 ## HTTP contract
 
 - `GET /api/v1/humanization/options`: authenticated limit, complete scientific
@@ -117,8 +88,9 @@ resolution against the service baseline. Both histories are included.
   otherwise the original job's immutable staged request in its Modal environment.
   Missing/foreign/wrong-tool jobs return 404; unavailable retained input returns
   404 `job_input_unavailable`. Retrieval is permitted for any job state and
-  preserves historical oversized inputs for correction. No models are prepared
-  and no work is launched. The Job detail rerun button opens a memory-only
+  preserves historical oversized inputs for correction. Restored per-model
+  settings remain unchanged until a shared control is edited. No models are
+  prepared and no work is launched. The Job detail rerun button opens a memory-only
   editable draft; explicit submission creates a new Job and idempotency intent
   under the current deployment, not an execution-kernel Successor Run.
 - `POST /api/v1/humanization/jobs`: typed `display_name`, `pairs`, and
@@ -164,11 +136,17 @@ second scheduler or open remote execution ledgers.
 
 ### Result preparation
 
-Result preparation follows the [schema 3 publication contract](humanization-result-publication.md).
-Schema 2 archives remain readable and immutable. Bulk Modal transfers reuse the
-shared downloader on cancellation-draining independent I/O workers; local ZIP
-verification and cache publication remain on the cache worker. Network waits
-must not occupy that worker and block readiness or cached result queries.
+Result membership and compatibility follow the
+[workflow publication contract](humanization-workflow.md#result-publication).
+Use the shared bounded manifest reader and bulk Modal downloader. Await bulk
+transfers through `run_blocking_io`, which drains the worker before propagating
+cancellation and releasing its temporary directory. Transfers do not occupy
+the cache's single worker. Local archive construction, digest verification and
+atomic publication remain on `cache.run_bounded`.
+
+The 32 MiB selection-member guard bounds both table queries and direct CSV
+reads. Retain this guard when changing admission; verify the largest advertised
+pair/yield envelope. Result restoration never launches science.
 
 ### Concurrent generation stages
 
@@ -187,12 +165,6 @@ Older pinned plans with a single `generate` Node retain their aggregate stage;
 method timings must not be inferred from an aggregate record. The graph change
 requires a new workflow deployment and corresponding service version pin before
 new live Jobs can use these rows. Existing historical Runs are not rewritten.
-
-Offline verification on 2026-09-08 passed 1,577 backend tests and all ten
-cross-repository browser tests. The real fixture exercised simultaneous
-completed Sapiens/Humatch and running p-AbNatiV2/HuDiff rows, then completed
-100-pair result delivery with bounded pages and downloads. No deployment or
-paid execution was performed for this stage-projection change.
 
 ### Runtime preparation
 
@@ -219,18 +191,6 @@ Reconciliation keeps at most four independent Jobs in flight across admission
 wakeups, so one slow provider operation does not block the entire queue.
 Completed snapshots are rescanned on wakeups or the interval, not continuously.
 
-## Integration evidence
-
-Use current main's service architecture, not the older service implementation
-in the humanization PR stack. The shared service lifecycle is reusable, but
-the generic workflow coordinator needs explicit protocol adaptation.
-See [backend research](../research/humanization/service-integration.md) and
-[frontend research](../../../biomodals-frontend/docs/research/2026-09-07-humanization-ui.md).
-
-The Humanization Batch glossary distinguishes standalone-app batch failure
-from the workflow's useful partial-results policy. The service preserves the
-workflow policy rather than redefining its scientific outcomes.
-
 ## Result display semantics
 
 `quality_tier` and `panel_order` are per-parent, one-based ascending ranks.
@@ -238,15 +198,9 @@ Tier 1 is the first Pareto front; panel order is a diversity-aware suggested
 selection sequence, not a composite fitness score. Null ranks identify the
 parent or candidates outside ranking eligibility, not a worst numeric rank.
 
-Ranking v2 uses five Pareto objectives: maximize p-AbNatiV2 pair nativeness,
-p-AbNatiV2 pairing, Humatch pairing, and the arithmetic mean of VH/VL Humatch
-best-human-family probabilities; minimize total VH/VL mutations. The mean is
-computed internally from raw scores before six-decimal comparison, not added as
-an API/table column. Only the two pairing scores have parental decrease
-guardrails. The service presents the stored workflow ranks without recomputing
-them: existing v1 jobs are unchanged, and v2 applies to new jobs on an updated
-workflow deployment. See the [ranking policy](humanization-workflow.md) for
-eligibility and diversity-aware panel ordering.
+The service presents stored ranks without recalculation; sorting is only a
+view operation. See the [workflow ranking policy](humanization-workflow.md#panel-ordering)
+for objectives, eligibility, versioning and diversity selection.
 
 Sapiens mean residue probabilities, Humatch classifier probabilities and
 pairing score, and p-AbNatiV2 pairing score use fractions in `[0,1]`. The
@@ -272,106 +226,26 @@ direction; it does not establish experimental improvement or reduced
 immunogenicity. Best-family probability deltas are omitted because the best
 family may change between sequences.
 
-## Local query measurement
+## Ownership and verification
 
-A disposable synthetic check with 100 parents and 29 rows per parent (2,900
-rows; 200 residues in each sequence) produced a 1,360,041-byte CSV and a
-91,340-byte typed first-page response. Median local parse, descending numeric
-sort, 50-row pagination, and JSON serialization was 5.39 ms across 20 measured
-iterations after warm-up. This measures neither browser rendering nor network
-or Modal download latency; no benchmark harness is added to production code.
+Humanization reuses the registered Tool adapter/router, shared remote-authority
+bridge, authentication, admission, idempotency, logs and Result lifecycle.
+Its workflow-owned staged request adapts the generic graph coordinator to the
+service's `run`/`resume` and bounded `ExecutionOverview` contract. It does not
+introduce a service-local scheduler. Shared lifecycle behavior belongs to the
+[API Tool service contract](api-tool-service.md) and
+[remote-authority decision](../adr/0007-api-jobs-use-remote-coordinators.md).
 
-## Offline verification
+Offline tests use fake providers and real HTTP/ZIP paths to cover admission,
+ownership, replay/recovery, input restoration, six-stage mixed completion,
+server paging/filter/sort, null handling, CSV/archive downloads and cancellation.
+Frontend tests remain in the frontend repository; generated types use the exact
+backend OpenAPI export. Local tests do not establish model equivalence.
 
-The backend suite passed 1,567 tests after integration, bounded ZIP-member
-table parsing, runtime preparation, cancellation acknowledgements, and
-independent reconciliation. Seven humanization browser
-tests passed, including a real HTTP
-fixture using the shared service lifecycle and a fake scientific adapter:
-100 submitted pairs produced 300 rows, with only 50 rows (91,656 response
-bytes) returned on opening results. Checks covered nulls-last sorting in both
-directions, original-order reset, parent filtering, CSV/archive downloads,
-anonymous denial, reauthentication, and submission recovery. The 100-pair
-input render measured 859 ms in that local browser run.
-
-The complete eight-test browser suite subsequently passed in 37.0 seconds,
-including the existing MVP GROMACS workflow after the refresh correction.
-
-The browser checks exposed an existing shared refresh bug: polling an active
-root returned the old stage projection even on explicit Refresh. Explicit
-Refresh now reads current stage details without resuming an already-active
-coordinator; background polling retains its inexpensive root-only check.
-
-These offline checks made no cloud submissions or deployments.
-
-## Live verification (2026-09-07)
-
-With user authorization and a total $10 development budget, the workflow was
-deployed to `production/HumanizationWorkflow`. Two separate one-pair smoke
-Jobs were submitted, each requesting one HuDiff candidate attempt. Neither
-was a full 100-pair load test.
-
-Version 1 exposed missing production model assets: Sapiens and Humatch
-succeeded, HuDiff failed its manifest validation, and p-AbNatiV2 repeatedly
-failed container startup because its read-only model mount did not exist.
-The failing provider call and coordinator were explicitly cancelled. The
-provider subsequently reported failure; all original execution calls are
-terminal. This was not a successful end-to-end scientific run.
-
-The follow-up changes added app-owned environment preparation before launch,
-kept status reads responsive during cancellation, retained explicit provider
-cancellation acknowledgements in the execution kernel, and isolated slow
-reconciliation Jobs. Version 2 contains the preparation and execution-kernel
-fixes; the queue-isolation change runs in the API process.
-
-The live frontend verified authenticated options and status reads against
-version 2, including the queued model-preparation explanation and responsive
-cancellation presentation. Model preparation completed successfully and the
-coordinator began execution just as the fixed 15-minute cutoff was reached.
-The watchdog requested cancellation at 10:34:55 UTC; the API subsequently
-confirmed terminal `cancelled` with cancelled workflow stages. No live result
-table was produced, so successful end-to-end scientific execution remains
-unverified by this service smoke test. The complete eight-test offline browser
-suite passed again against the queue-isolation fix in 37.0 seconds.
-
-After the API restarted with that fix, the frontend confirmed terminal
-Cancelled and all three cancelled stages, with no result table or cancel
-button, no browser errors, and a 463 ms authenticated Job read. Modal then
-reported no active containers for this deployment. Both temporary smoke
-accounts were disabled after browser verification, revoking their sessions.
-
-No further scientific submissions were made. Exact billed spend is not
-available from these checks and must not be inferred from elapsed time alone.
-
-### Successful follow-up smoke test
-
-The user subsequently authorized an additional $10 maximum testing budget.
-Exactly one further one-pair Job was submitted to the unchanged version 2
-deployment, again requesting one HuDiff candidate attempt. Job
-`a0a6d7db-5335-4f0a-b96d-0aefb05965dd` was admitted at 12:08:05 UTC and
-completed successfully at 12:18:13 UTC, before its 15-minute automatic cutoff.
-Existing model assets were revalidated rather than downloaded again.
-
-All four generation methods completed. Generation took 8 minutes 7 seconds;
-union collection took 2 seconds; evaluation and ranking took 36 seconds.
-The final table contains 45 columns and three unique paired sequences: the
-parent plus two generated candidates, ranked first and second. Every row has
-`evaluation_complete=true`, all annotation/evaluation errors are null, and
-the manifest contains no generation or execution errors. Parental generation
-provenance is null, and CDR preservation is reported for all three rows.
-
-The live frontend verified Completed for the Job and all three stages, the
-initial `offset=0&limit=50` table request, ascending and descending sorting
-with nulls last, exact scientific-order restoration, and parent filtering.
-All five selection requests returned HTTP 200, with no browser errors or
-extra scientific submissions. Native CSV (3,391 bytes) and ZIP (1,501,826
-bytes) downloads succeeded through the existing preparation/download flow.
-The direct CSV exactly matches the archive member; all ten declared artifact
-sizes and SHA-256 digests match, and ZIP integrity checks pass.
-
-This closes the live end-to-end service/UI verification gap above. It does
-not replace larger-batch scientific validation or experimental assessment.
-No production code changes or additional deployments were needed. Modal
-reported no active containers afterward, and the temporary account was
-disabled with sessions revoked. Exact billed spend remains unavailable;
-only one bounded run was used from the additional budget.
+An authorized one-pair service/UI smoke run on the older version 2 deployment
+completed with three candidates and verified all five selection requests,
+native CSV and ZIP downloads, and artifact hashes. Earlier missing-model and
+slow-status failures motivated the preparation and lock behavior above.
+That history is not evidence that the currently edited workflow is deployed.
+For rollout, deploy/pin matching workflow and service versions, rerun offline
+contract checks, then obtain approval for bounded live scientific verification.

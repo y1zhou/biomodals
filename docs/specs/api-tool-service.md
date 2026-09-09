@@ -81,6 +81,7 @@ GET  /api/v1/alphafold3/validations/{validation_id}
 GET  /api/v1/alphafold3/validations/{validation_id}/document
 DELETE /api/v1/alphafold3/validations/{validation_id}
 POST /api/v1/alphafold3/jobs
+POST /api/v1/humanization/jobs
 ```
 
 Lifecycle and delivery are shared:
@@ -401,7 +402,7 @@ short `Retry-After`; historical window reads do not consume these permits.
 
 Tool configuration controls whether logs are Administrator-only or also
 available to the owning User. GROMACS initially allows owner access;
-AlphaFold3 initially restricts logs to Administrators.
+AlphaFold3 and humanization initially restrict logs to Administrators.
 
 ## Modal billing
 
@@ -439,16 +440,18 @@ synthetic zero-cost report.
 
 ## Frontend routing
 
-GROMACS and AlphaFold3 retain contextual Job URLs while sharing one generic Job
+Registered Tools retain contextual Job URLs while sharing one generic Job
 detail component:
 
 ```text
 /tools/gromacs/jobs/{job_id}
 /tools/alphafold3/jobs/{job_id}
+/tools/humanization/jobs/{job_id}
 ```
 
 The component verifies that the Tool in the returned Job matches its route.
-After implementation AlphaFold3 is an available catalog Tool rather than WIP.
+Humanization-specific submission and table behavior is defined in its
+[service contract](humanization-service.md); shared Job behavior remains here.
 
 ## Deployment validation
 

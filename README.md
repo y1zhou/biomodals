@@ -23,82 +23,16 @@ The same execution kernel provides durable task state, dependency scheduling,
 provider-call tracking, cancellation, and recovery for coordinated apps,
 workflows, and web Jobs.
 
-## Architecture
+## How execution works
 
-Coordinated direct apps, workflows, and web Jobs submit an
-`ExecutionDefinition` to the same provider-neutral execution kernel:
+Coordinated apps, workflows and website Jobs use the same execution kernel.
+A deployed, run-scoped coordinator owns scientific scheduling and durable state.
+The CLI and API are clients of that coordinator; the API separately owns
+accounts, admission, status projections and result delivery.
 
-```mermaid
----
-config:
-  theme: base
-  layout: elk
-  look: handDrawn
-  elk:
-    mergeEdges: false
-    nodePlacementStrategy: LINEAR_SEGMENTS
-  flowchart:
-    curve: rounded
----
-flowchart LR
-    App["Direct app<br/>Scientific plan and bindings"] --> Kernel
-    Workflow["Workflow<br/>Scientific DAG and bindings"] --> Kernel
-    Service["FastAPI service<br/>Job and workload adapter"] --> Kernel
-    Kernel["biomodals.execution<br/>Durable Task orchestration"]
-    Kernel <-->|"Provider calls"| ModalHost["biomodals.execution.modal<br/>Modal host and driver"]
-    ModalHost <-->|"Functions and outcomes"| Modal["Modal"]
-```
-
-Inside the kernel, the coordinator runtime combines a pure scheduler with
-durable state and a provider-neutral call boundary. Workload-owned hooks and
-provider integrations remain outside:
-
-```mermaid
----
-config:
-  theme: base
-  layout: elk
-  look: handDrawn
-  elk:
-    mergeEdges: false
-    nodePlacementStrategy: LINEAR_SEGMENTS
-  flowchart:
-    curve: rounded
----
-flowchart TD
-    Plan["Execution plan<br/>Nodes · dependencies · Tasks"] --> Runtime
-    Hooks["Workload hooks<br/>Cache validation and result assembly"] <--> Runtime
-
-    subgraph Kernel["biomodals.execution"]
-        Runtime["Coordinator runtime<br/>Drive, recover, and cancel"]
-        Scheduler["Scheduler<br/>DAG readiness and admission"]
-        Ledger[("SQLite repository<br/>Durable state and atomic claims")]
-        Boundary["Provider interface<br/>Submit · observe · cancel"]
-
-        Runtime <-->|"Priorities and candidates"| Scheduler
-        Runtime <-->|"State and claims"| Ledger
-        Runtime <-->|"Calls and observations"| Boundary
-    end
-
-    Boundary <--> ModalHost["biomodals.execution.modal<br/>Driver and durable host"]
-    ModalHost <--> Modal["Modal"]
-```
-
-`biomodals.execution` is an embedded Python library, not a central scheduler
-service. Each coordinator embeds it and owns the database for the work it
-coordinates.
-
-| Component | Responsibility |
-| --- | --- |
-| `biomodals.app` | Independently deployed scientific Modal apps |
-| `biomodals.workflow` | DAGs that compose app functions into larger pipelines |
-| `biomodals.execution` | Provider-neutral DAG, task, artifact, scheduling, and SQLite mechanics |
-| `biomodals.execution.modal` | Modal calls, Volumes, deployment identity, and remote coordinators |
-| `biomodals.service` | Accounts, web Jobs, administration, Results, and HTTP routes |
-
-The kernel owns execution state only. Scientific cache validation, input and
-output formats, and publication rules remain with each app or workflow. User
-accounts and other non-execution service data remain in `biomodals.service`.
+Scientific formats and cache validation remain with each app or workflow.
+For developer context, start with the [documentation map](docs/README.md);
+the sections below cover running tools and operating the service.
 
 ## Quick start
 
@@ -250,8 +184,9 @@ For the complete model, see
 ## Web API
 
 The optional FastAPI service is a single-host control plane for the BioModals
-web interface. It exposes GROMACS MD simulation and AlphaFold3 structure
-prediction through the same account and Job routes.
+web interface. It exposes GROMACS MD simulation, AlphaFold3 structure
+prediction and [antibody humanization](docs/humanization.md) through shared
+account and Job routes.
 
 The service owns Users, Sessions, lean Job locators and projections, runtime
 settings, retained AlphaFold3 validation resources, and Result staging. Each
@@ -265,17 +200,20 @@ It uses same-origin `/api` requests and generated OpenAPI types.
 
 ### Local API development
 
-Install the API dependencies and deploy both API Tools in the Modal Environment
+Install the API dependencies and deploy the registered Tools in the Modal Environment
 selected by the development configuration:
 
 ```bash
 uv sync --extra api
 uv run biomodals app deploy gromacs --env production
 uv run biomodals app deploy alphafold3 --env production
+uv run biomodals workflow deploy humanization --env production
 ```
 
 Copy [`.env.example`](.env.example), replace both Modal token placeholders,
-and keep the private copy out of Git:
+and set each Tool's exact deployed version to match this checkout. Example
+version numbers are placeholders, not compatibility guarantees. Keep the
+private copy out of Git:
 
 ```bash
 install -m 600 .env.example .env
@@ -307,7 +245,8 @@ Session cookies.
 `true` behind the production HTTPS reverse proxy.
 
 The OpenAPI document includes the shared Job routes, typed GROMACS submission,
-retained AlphaFold3 JSON validation and submission, paginated Provider Call log
+retained AlphaFold3 JSON validation and submission, paired humanization
+submission and result tables, paginated Provider Call log
 targets, and Administrator billing reports. AlphaFold3 input documents are
 limited to 256 MiB in both browser validation and the standalone CLI. Modal
 validation retention also has fixed per-User and service-wide count and byte

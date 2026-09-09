@@ -248,25 +248,6 @@ Local-container execution, parallel provider image definitions, and a generic
 provider registry are outside this refactor. The code should leave a real seam
 for them without implementing or testing hypothetical providers.
 
-## Implemented sequence
-
-The consolidation was delivered as independently reviewable commits with
-focused tests kept green:
-
-1. Record this domain and interface amendment.
-2. Introduce provider-neutral names and the `execution.modal` package.
-3. Move and deepen `helper.app_execution`, then delete it.
-4. Move generic graph, artifact, runtime, and coordinator behavior from
-   `workflow.core`, then delete it.
-5. Establish the shared `ExecutionDefinition`, Node, artifact, and dispatch
-   interfaces.
-6. Migrate simple direct apps and remove equivalent lifecycle code.
-7. Migrate specialized apps while preserving their scientific hooks.
-8. Migrate ShortMD, RFD-LigandMPNN, and PPIFlow.
-9. Make API app calls consume the same app-owned definitions.
-10. Remove obsolete names, schema migration code, tests, and documentation.
-11. Run full local verification and report per-workload and total LOC changes.
-
 ## Completion criteria
 
 The consolidation is complete when:

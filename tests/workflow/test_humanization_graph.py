@@ -176,6 +176,21 @@ def test_generation_failures_preserve_baselines_and_successful_replicas(
             ),
             "hudiff_ab-0000",
         }
+        final = store.artifacts.load_node_result("evaluate")
+        root = tmp_path / next(
+            o.storage.path for o in final.outputs if o.name == "humanization_results"
+        )
+        ledger = pl.read_parquet(root / "generation.parquet")
+        failures = ledger.filter(pl.col("outcome") == "failed")
+        assert failures.height == (5 if pab_success else 4)
+        assert failures["reason"].str.contains("model unavailable").all()
+        assert failures["candidate_id"].null_count() == failures.height
+        assert failures["seed"].null_count() == failures.height
+        assert sorted(
+            failures.filter(pl.col("method") == "pabnativ2")["root_seed"].to_list()
+        ) == sorted(
+            settings.pabnativ2_seeds[1:] if pab_success else settings.pabnativ2_seeds
+        )
     finally:
         runtime.close()
 
@@ -261,7 +276,11 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                             "native",
                             {
                                 "schema_version": 1,
-                                "pair_result": {"candidates": [], "pair_seed": 42},
+                                "pair_result": {
+                                    "candidates": [],
+                                    "attempts": [],
+                                    "pair_seed": 42,
+                                },
                             },
                         )
                     ],
@@ -399,35 +418,24 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         assert manifest["generation_seeds"]["pabnativ2"] == list(
             settings.pabnativ2_seeds
         )
-        assert manifest["ranking_policy"]["version"] == "1"
+        assert manifest["ranking_policy"]["version"] == "2"
         assert manifest["protocols"]["pabnativ2"]["rasa_structure_count"] == 4
         assert manifest["protocols"]["pabnativ2"]["pssm_frequency_cutoff"] == 0.01
         assert manifest["protocols"]["pabnativ2"]["nativeness_weight"] == 10.0
         assert manifest["protocols"]["pabnativ2"]["pairing_weight"] == 1.0
-        assert not list((root / "native").glob("*.parquet"))
-        assert len(list((root / "native").iterdir())) == 4 + num_seeds - 1
-        assert len(manifest["scoring_publications"]) == (4 if fail_first else 6)
-        assert all(
-            entry["manifest"]["scientific_identity"]["runtime"] == "test"
-            for entry in manifest["scoring_publications"]
-        )
-        assert manifest["schema_version"] == 2
-        assert len(manifest["candidate_provenance"]) == 2
-        baseline = next(
-            item
-            for item in manifest["candidate_provenance"]
-            if item["candidate_id"] == table["candidate_id"][0]
-        )
-        assert baseline["origins"][0]["method"] == "pabnativ2"
-        assert len(baseline["origins"]) == num_seeds
-        changed = next(
-            item for item in manifest["candidate_provenance"] if item != baseline
-        )
-        assert {
-            origin["source_id"]
-            for origin in changed["origins"]
-            if origin["method"] == "sapiens"
-        } == {"a__iteration_1", "a__iteration_2"}
+        assert manifest["schema_version"] == 3
+        generation = pl.read_parquet(root / "generation.parquet")
+        baseline = generation.filter(pl.col("candidate_id") == table["candidate_id"][0])
+        assert baseline["method"].to_list() == ["pabnativ2"] * num_seeds
+        assert baseline["outcome"].to_list() == ["no_op"] * num_seeds
+        assert sorted(baseline["seed"].to_list()) == sorted(settings.pabnativ2_seeds)
+        sapiens = generation.filter(pl.col("method") == "sapiens")
+        assert sapiens["source_id"].to_list() == ["a__iteration_1", "a__iteration_2"]
+        assert sapiens["iteration"].to_list() == [1, 2]
+        assert sapiens["candidate_id"].to_list() == [table["candidate_id"][1]] * 2
+        assert generation.filter(pl.col("method") == "hudiff_ab")[
+            "outcome"
+        ].to_list() == ["no_candidates"]
         assert manifest["candidate_count"] == 2
         for entry in manifest["files"]:
             content = (root / entry["path"]).read_bytes()
@@ -475,12 +483,6 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                 .filter(pl.col("candidate_id") == candidate_id)
                 .drop("parent_id", "candidate_id"),
             )
-            recorded = next(
-                entry
-                for entry in manifest["scoring_publications"]
-                if entry["task_key"] == f"{method}-{candidate_id}"
-            )
-            assert recorded["manifest"] == orjson.loads(members["manifest.json"])
         request = HumanizationExecutionRequest(
             run_name="test",
             pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),),

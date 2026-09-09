@@ -31,7 +31,9 @@ def _row(name, *, score=0.8, changes=1, parent="a", **overrides):
         "cdr_preservation": "preserved",
         "vh_mutations": 0 if name == "parent" else changes,
         "vl_mutations": 0,
-        **dict.fromkeys(OBJECTIVES, score),
+        **dict.fromkeys(OBJECTIVES[:-1], score),
+        "humatch_vh_best_family_probability": score,
+        "humatch_vl_best_family_probability": score,
         **overrides,
     }
 
@@ -85,6 +87,8 @@ def test_missing_changed_and_pairing_regressions_remain_unranked():
         _row("humatch_regressed", humatch_pairing_score=0.1),
         _row("missing", pabnativ2_pair_nativeness=None),
         _row("nonfinite", pabnativ2_pair_nativeness=float("nan")),
+        _row("missing_family", humatch_vh_best_family_probability=None),
+        _row("nonfinite_family", humatch_vl_best_family_probability=float("inf")),
         _row("no_evidence"),
     ]
     mutations = [_mutation(row["candidate_id"], 10) for row in rows[1:-1]]
@@ -182,3 +186,72 @@ def test_sequential_fronts_and_exact_pairing_boundary():
     table = _rank(pl.DataFrame(rows), mutations)
     assert table["quality_tier"].to_list() == [None, 1, 2, 3, 4]
     assert table["panel_order"].to_list() == [None, 1, 2, 3, 4]
+
+
+def test_mean_family_probability_is_one_independent_objective():
+    """Average both chains, retain tradeoffs, and do not add a family guardrail."""
+    rows = [
+        _row(
+            "parent",
+            humatch_vh_best_family_probability=1.0,
+            humatch_vl_best_family_probability=1.0,
+        ),
+        _row(
+            "balanced",
+            humatch_vh_best_family_probability=0.6,
+            humatch_vl_best_family_probability=0.6,
+        ),
+        _row(
+            "asymmetric",
+            humatch_vh_best_family_probability=0.9,
+            humatch_vl_best_family_probability=0.3,
+        ),
+        _row(
+            "lower",
+            humatch_vh_best_family_probability=0.9,
+            humatch_vl_best_family_probability=0.1,
+        ),
+        _row(
+            "tradeoff",
+            pabnativ2_pair_nativeness=0.9,
+            humatch_vh_best_family_probability=0.1,
+            humatch_vl_best_family_probability=0.1,
+        ),
+    ]
+    table = _rank(
+        pl.DataFrame(rows), [_mutation(r["candidate_id"], 10) for r in rows[1:]]
+    )
+    assert dict(table.select("candidate_id", "quality_tier").iter_rows()) == {
+        "parent": None,
+        "balanced": 1,
+        "asymmetric": 1,
+        "lower": 2,
+        "tradeoff": 1,
+    }
+
+
+def test_family_mean_breaks_seed_ties_and_rounds_after_averaging():
+    """Use raw-chain arithmetic before six-decimal dominance and tie breaking."""
+    rows = [
+        _row("parent"),
+        _row(
+            "a",
+            humatch_vh_best_family_probability=0.50000049,
+            humatch_vl_best_family_probability=0.50000049,
+        ),
+        _row(
+            "b",
+            humatch_vh_best_family_probability=0.50000051,
+            humatch_vl_best_family_probability=0.50000001,
+        ),
+        _row(
+            "z",
+            humatch_vh_best_family_probability=0.8,
+            humatch_vl_best_family_probability=0.9,
+        ),
+    ]
+    table = _rank(
+        pl.DataFrame(rows), [_mutation(r["candidate_id"], 10) for r in rows[1:]]
+    )
+    assert table["candidate_id"].to_list() == ["parent", "z", "a", "b"]
+    assert table["quality_tier"].to_list() == [None, 1, 2, 2]

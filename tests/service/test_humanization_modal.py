@@ -7,6 +7,7 @@ import hashlib
 import io
 import zipfile
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -187,14 +188,17 @@ async def test_staging_preserves_input_until_request_and_launch_are_verified(
     await adapter.stage(job)
 
 
-def _publication(job, request):
+def _publication(job, request, version=2):
     files = {
         "selection.csv": b"parent_id,candidate_id\n001,abc\n",
         "imgt_mutations.parquet": b"evidence",
         "native/generation.tar.zst": b"native evidence",
     }
+    if version == 3:
+        files.pop("native/generation.tar.zst")
+        files["generation.parquet"] = b"generation accounting"
     manifest = {
-        "schema_version": 2,
+        "schema_version": version,
         "execution_run_id": str(job.job_id),
         "parameters": request.settings.model_dump(),
         "scientific_versions": request.scientific_versions,
@@ -211,12 +215,14 @@ def _publication(job, request):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("version", [2, 3])
 async def test_prepare_result_publishes_verified_reproducible_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    version: int,
 ) -> None:
     adapter, job, request = _setup(tmp_path, monkeypatch)
-    files, manifest = _publication(job, request)
+    files, manifest = _publication(job, request, version)
 
     async def read_manifest(*_, max_bytes):
         assert max_bytes == service_modal.MAX_MANIFEST_BYTES
@@ -253,6 +259,47 @@ async def test_prepare_result_publishes_verified_reproducible_archive(
         assert len(downloads) == 2 * len(files)
     finally:
         await cache.shutdown()
+
+
+@pytest.mark.anyio
+async def test_download_leaves_cache_available_and_drains_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, job, request = _setup(tmp_path, monkeypatch)
+    _, manifest = _publication(job, request)
+    started = asyncio.Event()
+    release = Event()
+    destinations = []
+    loop = asyncio.get_running_loop()
+
+    async def read_manifest(*_, max_bytes):
+        return orjson.dumps(manifest)
+
+    def download(_volume, selected, *, concurrency):
+        destinations.extend(destination for _, destination in selected)
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=5)
+        for destination in destinations:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"finished before cleanup")
+
+    monkeypatch.setattr(service_modal, "read_modal_volume_file", read_manifest)
+    monkeypatch.setattr(service_modal, "download_modal_volume_files", download)
+    cache = ArtifactCache(tmp_path / "cache")
+    task = asyncio.create_task(adapter.prepare_result(job, cache, completed_at=1))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.wait_for(cache.check_ready_async(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert destinations[0].parent.is_dir()
+    finally:
+        release.set()
+        outcomes = await asyncio.gather(task, return_exceptions=True)
+        await cache.shutdown()
+    assert isinstance(outcomes[0], asyncio.CancelledError)
+    assert not destinations[0].parent.exists()
 
 
 @pytest.mark.anyio

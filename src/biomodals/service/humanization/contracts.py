@@ -31,7 +31,7 @@ class HumanizationSubmission(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     display_name: str = Field(default="Antibody humanization", max_length=120)
-    pairs: list[PairInput] = Field(min_length=1, max_length=1000)
+    pairs: list[PairInput] = Field(min_length=1, max_length=200)
     settings: HumanizationSettings = Field(default_factory=HumanizationSettings)
 
     @field_validator("display_name")

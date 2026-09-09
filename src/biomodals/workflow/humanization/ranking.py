@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import polars as pl
 
-RANKING_VERSION = "1"
+RANKING_VERSION = "2"
 SCORE_DECIMALS = 6
 MAX_PAIRING_DROP = 0.10
-OBJECTIVES = (
-    "pabnativ2_pair_nativeness",
+PAIRING_SCORES = (
     "pabnativ2_pairing_score",
     "humatch_pairing_score",
+)
+OBJECTIVES = (
+    "pabnativ2_pair_nativeness",
+    *PAIRING_SCORES,
+    "humatch_mean_best_family_probability",
 )
 KEY = ["parent_id", "candidate_id"]
 POSITION = ["chain", "position", "insertion_code"]
 RANKING_POLICY = {
     "version": RANKING_VERSION,
     "maximize": list(OBJECTIVES),
+    "derived_objectives": {
+        "humatch_mean_best_family_probability": "(humatch_vh_best_family_probability + humatch_vl_best_family_probability) / 2",
+    },
     "minimize": ["vh_mutations + vl_mutations"],
     "score_decimal_places": SCORE_DECIMALS,
     "max_relative_parental_pairing_decrease": MAX_PAIRING_DROP,
@@ -52,7 +59,14 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
         "is_parent",
         "evaluation_complete",
         "cdr_preservation",
-        *OBJECTIVES,
+        *OBJECTIVES[:-1],
+        (
+            (
+                pl.col("humatch_vh_best_family_probability")
+                + pl.col("humatch_vl_best_family_probability")
+            )
+            / 2
+        ).alias("humatch_mean_best_family_probability"),
         "vh_mutations",
         "vl_mutations",
     )
@@ -60,10 +74,10 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
         pl.col("is_parent")
         & pl.col("evaluation_complete")
         & pl.all_horizontal(
-            pl.col(name).is_finite() & (pl.col(name) > 0) for name in OBJECTIVES[1:]
+            pl.col(name).is_finite() & (pl.col(name) > 0) for name in PAIRING_SCORES
         )
     ).select(
-        "parent_id", *[pl.col(name).alias(f"{name}_parent") for name in OBJECTIVES[1:]]
+        "parent_id", *[pl.col(name).alias(f"{name}_parent") for name in PAIRING_SCORES]
     )
     counts = patterns.group_by(KEY).agg(
         (pl.col("chain") == "vh").sum().alias("_vh_count"),
@@ -90,7 +104,7 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
                 >= (pl.col(f"{name}_parent") * (1 - MAX_PAIRING_DROP)).round(
                     SCORE_DECIMALS
                 )
-                for name in OBJECTIVES[1:]
+                for name in PAIRING_SCORES
             ],
         )
         .select(
@@ -102,7 +116,7 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
         )
         .collect()
     )
-    # Pairwise tables are bounded per parent (currently <=13 designs), never
+    # Pairwise tables are bounded per parent, never
     # cross-joined across parents or with full sequences/native residue profiles.
     pattern_groups = patterns.join(
         eligible.select(KEY), on=KEY, how="semi"

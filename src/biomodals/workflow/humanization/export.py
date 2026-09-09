@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,7 +14,10 @@ from biomodals.app.design.pabnativ2.models import HUMANIZATION_PROTOCOL
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import AppOutput, AppRunResult, ArtifactKind, VolumePath
 from biomodals.workflow.humanization.artifacts import archive_members
-from biomodals.workflow.humanization.contracts import HumanizationCandidate
+from biomodals.workflow.humanization.contracts import (
+    AntibodyPair,
+    HumanizationCandidate,
+)
 from biomodals.workflow.humanization.ranking import RANKING_POLICY
 from biomodals.workflow.humanization.settings import HumanizationSettings
 
@@ -31,6 +33,66 @@ IMGT_MUTATION_SCHEMA = {
     "change_type": pl.String,
 }
 
+GENERATION_SCHEMA = {
+    "parent_id": pl.String,
+    "method": pl.String,
+    "source_id": pl.String,
+    "seed": pl.Int64,
+    "root_seed": pl.Int64,
+    "iteration": pl.Int64,
+    "attempt_index": pl.Int64,
+    "outcome": pl.String,
+    "reason": pl.String,
+    "vh": pl.String,
+    "vl": pl.String,
+}
+
+
+def generation_table(
+    context: NodeRunContext,
+    selection: pl.DataFrame,
+    parents: Sequence[AntibodyPair],
+    settings: HumanizationSettings,
+    errors: Mapping[str, str],
+) -> pl.DataFrame:
+    """Join generation outcomes to the exact union without repeating sequences."""
+    rows = [
+        row
+        for name, artifacts in context.inputs.items()
+        if name.startswith("generation_native_")
+        for artifact in artifacts
+        if artifact.source_app_output_name == "generation_outcomes"
+        for row in orjson.loads(context.resolve_artifact(artifact).read_bytes())
+    ]
+    for task_key, reason in errors.items():
+        method, index, *replicate = task_key.split("-")
+        parameters = settings.method_arguments(method)
+        seed = parameters.get("seed")
+        if method == "pabnativ2":
+            seed = settings.pabnativ2_seeds[int(replicate[-1]) if replicate else 0]
+        rows.append({
+            "parent_id": parents[int(index)].id,
+            "method": method,
+            "root_seed": seed,
+            "outcome": "failed",
+            "reason": reason,
+        })
+    union = selection.select("parent_id", "candidate_id", "vh", "vl", "is_parent")
+    return (
+        pl
+        .DataFrame(rows, schema=GENERATION_SCHEMA)
+        .join(union, on=["parent_id", "vh", "vl"], how="left", validate="m:1")
+        .with_columns(
+            pl
+            .when((pl.col("outcome") == "generated") & pl.col("is_parent"))
+            .then(pl.lit("no_op"))
+            .otherwise(pl.col("outcome"))
+            .alias("outcome")
+        )
+        .drop("vh", "vl", "is_parent")
+        .sort("parent_id", "method", "seed", "iteration", "attempt_index", "source_id")
+    )
+
 
 def export_results(
     context: NodeRunContext,
@@ -41,6 +103,7 @@ def export_results(
     errors: Mapping[str, str],
     settings: HumanizationSettings,
     scientific_versions: Mapping[str, str],
+    parents: Sequence[AntibodyPair],
 ) -> AppOutput:
     """Publish a terminal directory covering every retained scientific artifact."""
     if context.volume_root is None or context.artifact_volume_name is None:
@@ -48,45 +111,22 @@ def export_results(
     root = context.work_dir / "humanization"
     root.resolve().relative_to(context.volume_root.resolve())
     root.mkdir(parents=True, exist_ok=True)
-    native = root / "native"
-    native.mkdir(exist_ok=True)
     scores = root / "scores"
     scores.mkdir(exist_ok=True)
     table.write_csv(root / "selection.csv")
     parent_by_candidate = {
         candidate.candidate_id: candidate.parent_id for candidate in candidates
     }
-    artifact_sources = []
-    scoring_publications = []
-
-    for artifact in (
-        artifact
-        for name, artifacts in context.inputs.items()
-        if name.startswith("generation_native_")
-        for artifact in artifacts
-    ):
-        if artifact.source_app_output_name in {
-            "parents",
-            "generated",
-            "generation_errors",
-        }:
-            continue
-        source = context.resolve_artifact(artifact)
-        name = hashlib.sha256(artifact.artifact_id.encode()).hexdigest()
-        destination = native / f"generation-{name}{source.suffix}"
-        shutil.copyfile(source, destination)
-        artifact_sources.append({
-            "file": str(destination.relative_to(root)),
-            "artifact_id": artifact.artifact_id,
-            "output_name": artifact.source_app_output_name,
-            "metadata": artifact.metadata,
-        })
+    generation_errors = orjson.loads(context.read_input_bytes("generation_errors"))
+    generation_table(
+        context, table, parents, settings, generation_errors
+    ).write_parquet(root / "generation.parquet", compression="zstd")
 
     # Scratch shards stay off the execution volume and out of the final bundle.
     with TemporaryDirectory(prefix="humanization_scores_") as temporary:
         detail_shards: dict[str, list[pl.LazyFrame]] = {}
         for task_key, result in results.items():
-            for index, output in enumerate(result.outputs):
+            for output in result.outputs:
                 if output.name in {
                     "evaluation",
                     "annotation",
@@ -108,28 +148,10 @@ def export_results(
                     not task_key.startswith(("sapiens-", "humatch-", "pabnativ2-"))
                     or output.storage.media_type != "application/zstd"
                 ):
-                    destination = native / f"{task_key}-{index}{source.suffix}"
-                    shutil.copyfile(source, destination)
-                    artifact_sources.append({
-                        "file": str(destination.relative_to(root)),
-                        "task_key": task_key,
-                        "output_name": output.name,
-                        "metadata": output.metadata,
-                    })
                     continue
                 method, candidate_id = task_key.split("-", maxsplit=1)
-                publication = {
-                    "task_key": task_key,
-                    "output_name": output.name,
-                    "metadata": output.metadata,
-                }
                 for filename, content in archive_members(source.read_bytes()).items():
-                    if filename == "manifest.json":
-                        publication["manifest"] = orjson.loads(content)
-                    elif filename in {"input.csv", "summary.csv"}:
-                        # Exact pairs and every native summary field are in selection.csv.
-                        continue
-                    elif filename.endswith(".parquet"):
+                    if filename.endswith(".parquet"):
                         detail_name = f"{method}_{Path(filename).stem}"
                         shard = (
                             Path(temporary) / f"{detail_name}-{candidate_id}.parquet"
@@ -143,16 +165,6 @@ def export_results(
                                 pl.lit(candidate_id).alias("candidate_id"),
                             )
                         )
-                    else:
-                        destination = native / f"{task_key}-{filename}"
-                        destination.write_bytes(content)
-                        artifact_sources.append({
-                            "file": str(destination.relative_to(root)),
-                            "task_key": task_key,
-                            "output_name": output.name,
-                            "archive_member": filename,
-                        })
-                scoring_publications.append(publication)
         for name, shards in detail_shards.items():
             pl.concat(shards).sink_parquet(
                 scores / f"{name}.parquet", compression="zstd"
@@ -170,7 +182,7 @@ def export_results(
             "content_sha256": digest,
         })
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "execution_run_id": str(context.execution_run_id),
         "status": "partial" if errors else "succeeded",
         "parameters": settings.model_dump(),
@@ -178,16 +190,7 @@ def export_results(
         "scientific_versions": dict(scientific_versions),
         "protocols": {"pabnativ2": HUMANIZATION_PROTOCOL},
         "candidate_count": len(candidates),
-        "candidate_provenance": [
-            candidate.model_dump(include={"parent_id", "candidate_id", "origins"})
-            for candidate in candidates
-        ],
-        "errors": dict(errors),
-        "generation_errors": orjson.loads(
-            context.read_input_bytes("generation_errors")
-        ),
-        "native_publications": artifact_sources,
-        "scoring_publications": scoring_publications,
+        "generation_failure_count": len(generation_errors),
         "selection_semantics": "one row per parent/exact pair; per-parent Pareto tiers and diverse panel order; unranked values are null; no composite fitness score",
         "ranking_policy": RANKING_POLICY,
         "cdr_definition": "imgt",

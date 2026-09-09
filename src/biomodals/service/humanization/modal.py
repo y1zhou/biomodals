@@ -15,7 +15,11 @@ from biomodals.helper.modal_volume import (
     download_modal_volume_files,
     read_modal_volume_file,
 )
-from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
+from biomodals.service.artifacts import (
+    ArtifactCache,
+    ArtifactIntegrityError,
+    run_blocking_io,
+)
 from biomodals.service.humanization.results import (
     HumanizationManifest,
     build_humanization_archive,
@@ -168,7 +172,7 @@ class HumanizationToolAdapter:
             ) as directory:
                 root = Path(directory)
                 await cache.run_bounded((root / "manifest.json").write_bytes, content)
-                await cache.run_bounded(
+                await run_blocking_io(
                     download_modal_volume_files,
                     volume,
                     (

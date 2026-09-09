@@ -63,8 +63,8 @@ def create_router(
     max_pairs: int = 100,
 ) -> APIRouter:
     """Reuse durable admission and result cache without another job scheduler."""
-    if not 1 <= max_pairs <= 1000:
-        raise ValueError("Humanization max_pairs must be between 1 and 1000")
+    if not 1 <= max_pairs <= 200:
+        raise ValueError("Humanization max_pairs must be between 1 and 200")
     router = APIRouter(prefix="/api/v1/humanization", tags=["humanization"])
 
     def view(job: JobRecord, session: AuthenticatedSession) -> JobView:

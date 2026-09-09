@@ -103,8 +103,9 @@ resolution against the service baseline. Both histories are included.
 
 - `GET /api/v1/humanization/options`: authenticated limit, complete scientific
   defaults, and flat settings JSON schema. `BIOMODALS_HUMANIZATION_MAX_PAIRS`
-  defaults to 100 and may be configured from 1 through the parser limit of
-  1000. There is no independent frontend limit configuration.
+  defaults to 100 and may be configured from 1 through 200. This website bound
+  keeps supported result tables within the bounded reader; the CLI parser has
+  a separate limit. There is no independent frontend limit configuration.
   Required `max_vh_length=142` and `max_vl_length=126` expose the Sapiens
   limits for website admission. Both the editor and server reject longer
   normalized sequences with row-addressable `sequence_too_long` errors before
@@ -160,6 +161,14 @@ CLI result retrieval separately reads the actual terminal artifact locations.
 Graph successors retain validated successful publications, including when the
 terminal bundle belongs to a predecessor Run. The service does not own a
 second scheduler or open remote execution ledgers.
+
+### Result preparation
+
+Result preparation follows the [schema 3 publication contract](humanization-result-publication.md).
+Schema 2 archives remain readable and immutable. Bulk Modal transfers reuse the
+shared downloader on cancellation-draining independent I/O workers; local ZIP
+verification and cache publication remain on the cache worker. Network waits
+must not occupy that worker and block readiness or cached result queries.
 
 ### Concurrent generation stages
 
@@ -228,6 +237,16 @@ workflow policy rather than redefining its scientific outcomes.
 Tier 1 is the first Pareto front; panel order is a diversity-aware suggested
 selection sequence, not a composite fitness score. Null ranks identify the
 parent or candidates outside ranking eligibility, not a worst numeric rank.
+
+Ranking v2 uses five Pareto objectives: maximize p-AbNatiV2 pair nativeness,
+p-AbNatiV2 pairing, Humatch pairing, and the arithmetic mean of VH/VL Humatch
+best-human-family probabilities; minimize total VH/VL mutations. The mean is
+computed internally from raw scores before six-decimal comparison, not added as
+an API/table column. Only the two pairing scores have parental decrease
+guardrails. The service presents the stored workflow ranks without recomputing
+them: existing v1 jobs are unchanged, and v2 applies to new jobs on an updated
+workflow deployment. See the [ranking policy](humanization-workflow.md) for
+eligibility and diversity-aware panel ordering.
 
 Sapiens mean residue probabilities, Humatch classifier probabilities and
 pairing score, and p-AbNatiV2 pairing score use fractions in `[0,1]`. The

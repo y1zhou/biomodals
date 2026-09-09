@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import modal
@@ -88,7 +88,7 @@ from biomodals.workflow.humanization.tables import (
 
 METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
-    "result_schema": "2",
+    "result_schema": "3",
     "panel_ranking": RANKING_VERSION,
     "biomodals.workflow.humanization": "2",
     "sapiens": sapiens_app.RUNTIME_IDENTITY,
@@ -225,8 +225,58 @@ class HumanizationGenerateNode(TaskProviderNode):
             {"parent_id": parent_id, "vh": vh, "vl": vl, "origin": origin.model_dump()}
             for parent_id, vh, vl, origin in rows
         ]
+        outcomes = [
+            {
+                "parent_id": parent_id,
+                **origin.model_dump(),
+                "root_seed": metadata["parameters"].get("seed"),
+                "iteration": int(origin.source_id.rsplit("_", 1)[1])
+                if origin.method == "sapiens"
+                else None,
+                "outcome": "generated",
+                "reason": None,
+                "vh": vh,
+                "vl": vl,
+            }
+            for parent_id, vh, vl, origin in rows
+        ]
+        if metadata["method"] == "hudiff_ab":
+            native = orjson.loads(cast("InlineBytes", result.outputs[0].storage).data)[
+                "pair_result"
+            ]
+            for attempt in native["attempts"]:
+                if attempt["status"] == "valid":
+                    continue
+                outcomes.append({
+                    "parent_id": metadata["parent"]["id"],
+                    "method": "hudiff_ab",
+                    "source_id": attempt["duplicate_of"],
+                    "seed": native["pair_seed"],
+                    "root_seed": metadata["parameters"].get("seed"),
+                    "attempt_index": attempt["attempt_index"],
+                    "iteration": None,
+                    "outcome": "duplicate"
+                    if attempt["status"] == "duplicate"
+                    else "rejected",
+                    "reason": attempt["rejection_reason"],
+                    "vh": attempt["vh"] if attempt["status"] == "duplicate" else None,
+                    "vl": attempt["vl"] if attempt["status"] == "duplicate" else None,
+                })
+        if not outcomes:
+            outcomes.append({
+                "parent_id": metadata["parent"]["id"],
+                "method": metadata["method"],
+                "root_seed": metadata["parameters"].get("seed"),
+                "outcome": "no_candidates",
+            })
         return result.model_copy(
-            update={"outputs": [*result.outputs, json_output("generated", normalized)]}
+            update={
+                "outputs": [
+                    *result.outputs,
+                    json_output("generated", normalized),
+                    json_output("generation_outcomes", outcomes),
+                ]
+            }
         )
 
     def finalize_remote_tasks(
@@ -505,6 +555,7 @@ class HumanizationEvaluateNode(TaskProviderNode):
             errors,
             self.settings,
             SCIENTIFIC_VERSIONS,
+            self.parents,
         )
         return AppRunResult(
             status=AppRunStatus.PARTIAL if errors else AppRunStatus.SUCCEEDED,

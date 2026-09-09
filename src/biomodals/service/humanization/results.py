@@ -153,7 +153,7 @@ class HumanizationManifestFile(BaseModel):
 class HumanizationManifest(BaseModel):
     """Publication identity and safe membership, shared by download and packaging."""
 
-    schema_version: Literal[2]
+    schema_version: Literal[2, 3]
     execution_run_id: UUID
     parameters: HumanizationSettings
     scientific_versions: dict[str, str]
@@ -174,7 +174,10 @@ class HumanizationManifest(BaseModel):
                 or "\\" in name
             ):
                 raise ValueError(f"Unsafe result path: {name}")
-        if not {"selection.csv", "imgt_mutations.parquet"} <= set(names):
+        required = {"selection.csv", "imgt_mutations.parquet"}
+        if self.schema_version == 3:
+            required.add("generation.parquet")
+        if not required <= set(names):
             raise ValueError("Scientific publication is missing required tables")
         return self
 

@@ -44,7 +44,7 @@ def test_local_defaults_are_safe_and_cleanup_is_disabled(monkeypatch) -> None:
     assert settings.humanization_max_pairs == 100
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "1001", "bad"])
+@pytest.mark.parametrize("value", ["0", "-1", "201", "1000", "bad"])
 def test_humanization_pair_limit_rejects_invalid_configuration(value: str) -> None:
     settings = ServiceSettings.from_environment({
         "BIOMODALS_HUMANIZATION_MAX_PAIRS": value
@@ -53,11 +53,12 @@ def test_humanization_pair_limit_rejects_invalid_configuration(value: str) -> No
         _ = settings.humanization_max_pairs
 
 
-def test_humanization_pair_limit_is_server_controlled() -> None:
+@pytest.mark.parametrize("limit", [42, 200])
+def test_humanization_pair_limit_is_server_controlled(limit: int) -> None:
     settings = ServiceSettings.from_environment({
-        "BIOMODALS_HUMANIZATION_MAX_PAIRS": "42"
+        "BIOMODALS_HUMANIZATION_MAX_PAIRS": str(limit)
     })
-    assert settings.humanization_max_pairs == 42
+    assert settings.humanization_max_pairs == limit
 
 
 def test_host_and_modal_settings_are_explicitly_configurable(monkeypatch) -> None:

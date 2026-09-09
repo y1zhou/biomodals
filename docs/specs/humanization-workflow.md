@@ -151,7 +151,8 @@ selection table emphasizes chain/pair summaries and their parental changes.
 - A readable candidate-score CSV.
 - VH/VL sequences in the main CSV; no duplicate FASTA or selection Parquet.
 - Detailed Parquet score tables under `scores/` and `imgt_mutations.parquet`.
-- A manifest recording parameters, model versions, provenance, and failures.
+- A compact manifest recording parameters, model versions and delivered-file
+  hashes; `generation.parquet` records candidate origins and generation outcomes.
 - Reuse the existing execution system's recovery mechanism to reuse matching
   successful work and retry missing or failed work. Changed inputs or scientific
   settings must not reuse incompatible results.
@@ -179,8 +180,9 @@ or replacement-call loops.
   native app derives its own pair seed from root, ID, VH and VL. Schedule
   each root/parent as an independent Task under the existing global limits.
   Retain successful siblings when a replica fails; the result remains partial.
-  The manifest records actual roots in `generation_seeds.pabnativ2`, parameters,
-  and per-candidate derived seeds; native evidence retains every endpoint.
+  The manifest records actual roots in `generation_seeds.pabnativ2` and parameters.
+  `generation.parquet` records each outcome's root and reported derived pair seed;
+  native task evidence remains outside the downloaded archive.
   These are optimization replicates, not guaranteed novel candidates.
 - For `I` Sapiens passes, `R` p-AbNatiV2 roots and `A` HuDiff attempts,
   the per-parent ceiling is `1 + I + 1 + R + A` including the baseline,
@@ -252,7 +254,7 @@ baseline appears first, followed by ranked candidates in panel order, followed
 by unranked candidates in stable candidate-ID order. Select ranks 1 through N;
 the parental control does not consume one of those N slots.
 
-Ranking v1 is an explicit provisional selection heuristic, not experimental
+Ranking v2 is an explicit provisional selection heuristic, not experimental
 validation or a calibrated confidence score:
 
 - Require complete candidate and parental evaluations, preserved IMGT CDRs,
@@ -263,12 +265,18 @@ validation or a calibrated confidence score:
   affected rows remain available for manual exploratory selection. It does not
   alter generation settings, sequences, score values, or execution status.
 - Compute Pareto layers within each parent's eligible candidates: maximize
-  p-AbNatiV2 paired nativeness and both evaluators' pairing scores; minimize total
-  VH/VL changes. Layer 1 is nondominated, then repeat on the remaining candidates.
-  Compare scores rounded to six decimals to suppress numerical jitter, not to
-  claim biological significance. Raw scores retain their original precision.
+  p-AbNatiV2 paired nativeness, both evaluators' pairing scores, and the arithmetic
+  mean of Humatch VH/VL best-human-family probabilities; minimize total VH/VL
+  changes. These are five separate objectives, not a composite score. The mean
+  is `(humatch_vh_best_family_probability + humatch_vl_best_family_probability) / 2`,
+  requires both chain values, and adds no parental family-probability guardrail.
+  Layer 1 is nondominated, then repeat on the remaining candidates. Compute the
+  mean from raw scores, then compare objectives rounded to six decimals to
+  suppress numerical jitter, not to claim biological significance. Raw scores
+  retain their original precision; no derived mean column is added to the table.
 - Seed panel order by lowest tier, then descending paired nativeness, p-AbNatiV2
-  pairing, Humatch pairing, fewer changes, and finally candidate ID. For subsequent
+  pairing, Humatch pairing, mean Humatch best-family probability, fewer changes,
+  and finally candidate ID. For subsequent
   picks, consider the best remaining tier and the immediately following tier;
   maximize minimum framework distance to already selected candidates. Break ties
   with the seed ordering. Thus a tier-2 alternative can precede a tier-1 near-copy,
@@ -278,12 +286,16 @@ validation or a calibrated confidence score:
   replacements at one position count as one difference. Generator labels do not
   affect order. No new numbering/model call is needed.
 
-Chain-level nativeness, Sapiens summaries, and Humatch family scores remain
-visible for review but are not additional correlated votes in this first policy.
+Chain-level nativeness and Sapiens summaries remain visible for review but are
+not ranking objectives. Humatch's two best-family scores contribute one mean
+objective, not two independent votes; target-family probabilities are not added.
 All ranks are per-run/per-parent and can change when the candidate pool changes.
 The manifest records the full ranking policy and its version; that version also
 participates in the workflow fingerprint. This amendment supersedes the original
 no-ranking decision while retaining the full, non-truncated candidate table.
+Ranking v2 supersedes v1 by adding the mean-family objective. Previously published
+v1 results remain unchanged; using v2 for new jobs requires an updated workflow
+deployment. The change reuses existing scores and adds no model calls.
 
 Ranking uses Polars filtering, grouped mutation counts, pairwise dominance
 joins, and position-overlap aggregation on narrow frames. Pairwise comparisons
@@ -329,11 +341,9 @@ App discovery/help and workflow discovery/help/dry-run smoke checks pass.
   are now wired, with explicit native method flags and global concurrency flags.
   The CLI dry-run succeeds on `examples/data/sapiens_pairs.csv`; discovery,
   composition, and no-launch validation are covered by local tests.
-- Terminal output now includes a self-contained `humanization_results` directory:
-  selection CSV, compact candidate provenance in the manifest, common IMGT
-  mutation Parquet, joined scoring detail Parquets under `scores/`, retained
-  native publications, and a digest manifest with explicit software/model
-  identities. These identities also participate in the scientific fingerprint.
+- Terminal output is a self-contained `humanization_results` directory following
+  the [result publication contract](humanization-result-publication.md). Scientific
+  identities also participate in the execution fingerprint.
 - Real-coordinator successor tests verify that failed scorer tasks alone are
   rerun, successful generator/evaluator publications are reused, and changed
   scientific settings are rejected before preparing an incompatible successor.
@@ -391,11 +401,13 @@ uv run biomodals workflow run --max-containers 4 --max-gpu-containers 2 \
 The CLI reports the execution/deployment identity and result locations. The
 `humanization_results` directory is self-contained. Open `selection.csv` for
 sorting; this is the only main selection table and includes both sequences.
-Detailed score Parquets live under `scores/`. Compact candidate origins
-(source IDs, attempts, seeds) live in `manifest.json`, without duplicated
-sequences. No separate selection Parquet, provenance JSON, or FASTA is emitted.
+Detailed score Parquets live under `scores/`. Compact generation accounting
+(source IDs, seeds, iterations, attempts, outcomes and retained candidate IDs)
+lives in `generation.parquet`, without duplicated sequences. See the
+[result publication contract](humanization-result-publication.md).
+No separate selection Parquet, provenance JSON, or FASTA is emitted.
 Parental rows have null `generating_methods`, even when a generator returned
-the unchanged parent; that event is retained only in manifest provenance.
+the unchanged parent; that event is retained as a `no_op` generation row.
 The three evaluator `*_error` columns replace redundant `*_status` columns:
 null means the evaluation succeeded; missing evaluations have an explicit error.
 `evaluation_complete` still indicates whether all required evidence is present.
@@ -405,12 +417,13 @@ selects the parent's highest-probability human family and holds that reference
 fixed for all candidates from that parent; the output records the resolved
 family rather than `auto`.
 `imgt_mutations.parquet` omits constant numbering/CDR-definition columns;
-the manifest records the common IMGT definition. Unique generation publications
-remain under `native/`. Scorer detail tables are consolidated under `scores/`;
-their original manifests and publication metadata are retained in the main
-manifest's `scoring_publications`. Scorer input pairs and all summary fields
-are represented in `selection.csv`, so their CSV copies and enclosing archives
-are not exported. Unknown extra scorer files are retained under `native/`.
+the manifest records the common IMGT definition. Scorer detail tables are
+consolidated under `scores/`; scorer input pairs and summary fields are represented
+in `selection.csv`. Result schema 3 records scientific identities and protocols
+once, and hashes only delivered files. Native generation archives, per-candidate
+scorer manifests, structures, generation profiles and structural diagnostics are
+outside the standard download boundary. Original task publications remain
+available under the existing operational retention policy.
 Normalized adapter JSON and temporary detail shards are not exported. Execution
 checkpoints remain intact outside the result bundle. Missing or failed model evaluations remain
 explicit, and a changed CDR is not an automatic exclusion.

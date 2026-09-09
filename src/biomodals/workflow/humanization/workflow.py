@@ -114,7 +114,7 @@ CONF = AppConfig(
     version="0.1.0",
     python_version="3.13",
     depends_on_apps=METHODS,
-    tags={"depends_on": "-".join(METHODS)},
+    tags={"depends_on": "-".join(METHODS), "biomodals_tool": "humanization"},
 )
 OUT_VOLUME = orchestrator.OUT_VOLUME
 OUT_VOLUME_NAME = orchestrator.OUT_VOLUME_NAME

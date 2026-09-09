@@ -86,6 +86,7 @@ def test_cli_dry_run_validates_native_controls_without_staging(
 
 def test_composition_includes_all_generators_and_scorers():
     """Included operations have unique tags and do not include child coordinators."""
+    assert workflow.CONF.tags["biomodals_tool"] == "humanization"
     assert workflow.CONF.depends_on_apps == (
         "sapiens",
         "humatch",

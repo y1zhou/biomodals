@@ -412,8 +412,11 @@ parallel Tool and Environment groupings. The current-environment summary uses
 the selected report interval and displays zero when that Environment has no
 reported usage.
 
-Deployed Tool Apps carry a stable `biomodals_tool` tag (`gromacs` or
-`alphafold3`). Billing reports request this tag and use it as the only reliable
+Deployed Tool Apps and workflows carry a stable `biomodals_tool` tag (`gromacs`,
+`alphafold3`, or `humanization`). Humanization tags the containing workflow
+deployment, covering its included model functions and coordinator. Billing
+recognizes keys from the service's Tool registry rather than a separate allowlist.
+Billing reports request this tag and use it as the only reliable
 Tool attribution key. Untagged or unknown values remain **Other / untagged**;
 historical usage from before tagging is not guessed from object
 descriptions. This fallback applies only to the Tool breakdown: every billing

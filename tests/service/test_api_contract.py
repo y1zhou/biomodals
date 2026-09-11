@@ -104,6 +104,63 @@ def test_humanization_submission_replay_and_row_errors(tmp_path: Path) -> None:
     assert invalid_settings.json()["errors"][0]["row_index"] is None
 
 
+def test_humanization_admission_snapshots_per_job_provider_limits(tmp_path):
+    from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
+
+    app = _app(tmp_path)
+    _humanization_session(app)
+    configuration = app.state.configuration
+    pending = PendingRequestStore(tmp_path / "pending")
+    configuration.set_tool("humanization", active_job_limit=2)
+
+    def submit(key):
+        return _request(
+            app,
+            "POST",
+            "/api/v1/humanization/jobs",
+            json=_humanization_input(),
+            headers={"Origin": ORIGIN, "Idempotency-Key": str(key)},
+        )
+
+    original_key = uuid4()
+    original = submit(original_key)
+    sibling = submit(uuid4())
+    assert original.status_code == sibling.status_code == 202
+    original_id = UUID(original.json()["job_id"])
+    sibling_id = UUID(sibling.json()["job_id"])
+    saved = {job_id: pending.get(job_id) for job_id in (original_id, sibling_id)}
+    assert submit(uuid4()).status_code == 409
+
+    configuration.set_tool("humanization", active_job_limit=3)
+    additional = submit(uuid4())
+    assert additional.status_code == 202
+    additional_id = UUID(additional.json()["job_id"])
+    for job_id, expected in (
+        (original_id, (16, 10)),
+        (sibling_id, (16, 10)),
+        (additional_id, (24, 15)),
+    ):
+        job = app.state.store.get_job_by_id(job_id)
+        assert (
+            job.max_active_provider_calls,
+            job.max_active_gpu_provider_calls,
+        ) == expected
+        content = pending.get(job_id)
+        assert content is not None
+        retained = HumanizationExecutionRequest.from_bytes(content)
+        assert (
+            retained.max_active_provider_calls,
+            retained.max_active_gpu_provider_calls,
+        ) == expected
+
+    configuration.set_tool("humanization", active_job_limit=0)
+    assert submit(uuid4()).status_code == 409
+    replay = submit(original_key)
+    assert replay.status_code == 202
+    assert replay.json()["job_id"] == str(original_id)
+    assert {job_id: pending.get(job_id) for job_id in saved} == saved
+
+
 def test_humanization_options_limits_and_unauthenticated_access(tmp_path: Path) -> None:
     app = _app(tmp_path)
     assert _request(app, "GET", "/api/v1/humanization/options").status_code == 401

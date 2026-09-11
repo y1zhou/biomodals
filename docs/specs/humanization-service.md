@@ -164,8 +164,12 @@ New workflow plans expose six Job stages: `generate_sapiens` (Sapiens),
 `generate_hudiff_ab` (HuDiff), `union`, and `evaluate`. Each generator owns
 one independent kernel Node with per-pair Tasks, so status, timings, counts,
 and stage-filtered log targets come from that method's actual records.
-All four Nodes can run concurrently under the existing shared provider limits;
-union collection waits for all four. No `JobView` schema change is needed.
+All four Nodes can run concurrently under the Job's snapshotted provider limits;
+union collection waits for all four. The admin Tool active-Job limit derives
+these per-Job ceilings through the
+[shared admission contract](api-tool-service.md#provider-call-limits), with a
+humanization-specific GPU multiplier. It is not a shared GPU pool across Jobs,
+and existing Job snapshots do not change. No `JobView` schema change is needed.
 
 Each method retains the existing local baseline publication and partial-result
 policy, including when every provider Task for that method fails. Generation

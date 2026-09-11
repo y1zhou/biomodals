@@ -66,10 +66,12 @@ download-cache metadata, cleanup, and the `finalizing` and `blocked` Job states.
 These delivery states are not added to the execution kernel.
 
 Each Tool has one Administrator-configurable active-Job limit. At admission,
-the service snapshots a per-Run total Provider Call ceiling equal to eight
-times that limit and a GPU Provider Call ceiling equal to that limit, then
-supplies both to the remote coordinator. Later Administrator changes affect
-new Jobs only.
+the service snapshots Tool-derived total and GPU Provider Call ceilings and
+supplies both to the remote coordinator. Humanization has a larger GPU
+multiplier for its concurrent methods; the exact formulas live in the
+[Provider Call limits contract](../specs/api-tool-service.md#provider-call-limits).
+These are independent per-Run ceilings, not a cross-Run pool. Later
+Administrator changes and API upgrades affect new Jobs only.
 
 GROMACS and AlphaFold3 adopt this topology together. Future coordinator-aware
 apps and workflows can be registered through the same service boundary without

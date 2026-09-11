@@ -177,10 +177,18 @@ function names remain available only as diagnostic log-target metadata.
 ## Provider Call limits
 
 Each Tool's active Job limit also determines the per-Job Provider Call limits
-snapshotted during admission. The total container ceiling is eight times the
-active Job limit; the GPU subset ceiling equals the active Job limit. A disabled
-Tool admits no Jobs. This keeps one capacity control in the Administrator UI
-while preserving explicit immutable limits on every admitted Job.
+snapshotted during admission. For an active Job limit of `N`, every Tool gets
+`max(1, 8*N)` total Provider Calls per Job. Humanization gets `max(1, 5*N)`
+GPU Provider Calls per Job; GROMACS and AlphaFold3 retain `max(1, N)`.
+GPU calls count toward the total. A zero active Job limit pauses admission;
+the positive provider-limit floors do not enable new Jobs.
+
+These are independent per-Job ceilings, not a shared Tool-wide GPU pool.
+For example, humanization `N=2` permits two admitted Jobs, each with ceilings
+of 16 total and 10 GPU Provider Calls. This keeps one capacity control in the
+Administrator UI. Later configuration changes and API upgrades never
+recalculate existing Jobs' stored limits or retained execution requests;
+idempotent replays keep the original snapshots.
 
 The deployed Modal App name is startup configuration only. Changing it requires
 updating the Tool's `.env` value and restarting the API service. Administrators

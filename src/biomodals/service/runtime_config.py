@@ -58,7 +58,8 @@ class ToolRuntimeConfiguration:
     @property
     def max_active_gpu_provider_calls(self) -> int:
         """Derive the per-Job GPU container ceiling from Tool capacity."""
-        return max(1, self.active_job_limit.value)
+        multiplier = 5 if self.tool == "humanization" else 1
+        return max(1, self.active_job_limit.value * multiplier)
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +235,7 @@ class RuntimeConfiguration:
     ) -> None:
         """Atomically update supplied settings for one fixed Tool."""
         definition = self.tool_definition(tool)
-        updates: dict[str, str | int | bool | None] = {}
+        updates: dict[str, int | bool | None] = {}
         if not isinstance(modal_app_version, _Unchanged):
             self._ensure_editable(definition.modal_app_version_environment)
             updates["modal_app_version"] = (

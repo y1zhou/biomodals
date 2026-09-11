@@ -10,7 +10,7 @@ dependencies = [
     "modal>=1.5.4",
     "niquests>=3.18.4",
     "orjson>=3.11.8",
-    "polars[calamine,numpy,pandas,xlsxwriter]>=1.39.3",
+    "polars[calamine,numpy,pandas,xlsxwriter]>=1.44.2",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1,<2",
     "pyyaml>=6.0.3",
@@ -18,6 +18,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "typer>=0.20.0",
     "uniaf3==0.2.1",
+    "zstandard>=0.25.0",
 ]
 
 [project.optional-dependencies]

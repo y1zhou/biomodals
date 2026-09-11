@@ -138,16 +138,16 @@ gate; the rebuildable Result cache remains excluded from backup.
 
 ### Deployment documentation only
 
-The current implementation cycle must add a production runbook and example
-native and container service definitions. They must document a dedicated
+The [production runbook](../deployment/mvp-runbook.md) and
+[native and container service examples](../../deploy/README.md) document a dedicated
 service user, private service configuration, absolute state and cache paths,
 one API worker, an explicit working directory where applicable, restart policy,
 logging, and safe update and rollback checks. The native systemd example also
 uses a restrictive umask and journald.
 
-These artifacts are examples only. This cycle must not install a unit, modify
-the live production host, start a production service, or deploy the production
-frontend.
+These artifacts are examples only. Updating them does not authorize installing
+a unit, modifying the live production host, starting a production service, or
+deploying the production frontend.
 
 ### Liveness and readiness
 

@@ -116,14 +116,20 @@ biomodals.example.com {
 
 	@assets path /assets/*
 	header @assets Cache-Control "public, max-age=31536000, immutable"
-	@document path / /index.html
-	header @document Cache-Control "no-cache"
-
-	root * /srv/biomodals.example.com
-	route {
-		reverse_proxy @api 127.0.0.1:4100
-		try_files {path} /index.html
+	handle @api {
+		reverse_proxy 127.0.0.1:4100
+	}
+	handle /assets/* {
+		root * /srv/biomodals.example.com
 		file_server
+	}
+	handle {
+		root * /srv/biomodals.example.com
+		route {
+			try_files {path} /index.html
+			header /index.html Cache-Control "no-cache"
+			file_server
+		}
 	}
 }
 ```
@@ -131,6 +137,43 @@ biomodals.example.com {
 Do not add HSTS `includeSubDomains` or preload until every affected subdomain is
 audited. Confirm that production serves hashed static assets and never Vite HMR,
 React Refresh, or source modules.
+
+The separate handlers keep API requests out of the SPA fallback and return a
+real 404 for missing assets. The document cache header runs **after** the
+rewrite, so deep links receive it too. See Caddy's
+[SPA routing guidance](https://caddyserver.com/docs/caddyfile/patterns#single-page-apps-spas).
+
+### Password Links and missing browser routes
+
+`/set-password` is a frontend route, not a file or a FastAPI GET endpoint.
+A Password Link has the form `/set-password#token=...`; the fragment stays in
+the browser. Caddy must serve `index.html` for `/set-password`, then the
+frontend submits the password to `POST /api/v1/auth/set-password`. Do not add
+an API GET route or move the token into a query parameter to work around a 404.
+
+Check the actual public origin without a token or cookies:
+
+```console
+curl --silent --show-error --output /dev/null --write-out '%{http_code} %{content_type}\n' https://biomodals.example.com/
+curl --silent --show-error --output /dev/null --write-out '%{http_code} %{content_type}\n' https://biomodals.example.com/set-password
+curl --silent --show-error --output /dev/null --write-out '%{http_code} %{content_type}\n' https://biomodals.example.com/login
+```
+
+All three should return HTTP 200 HTML. If `/` works but the two deep links
+return 404, check that the **loaded production site block**, not only the
+development proxy, contains `try_files {path} /index.html` in its static
+handler. A `root` plus `file_server` alone does not provide SPA routing.
+Keep the `/api/*` handler unchanged and do not use `handle_path` to strip the
+API prefix. Validate the administrator-reviewed Caddyfile before an authorized
+reload; no frontend rebuild is needed for a routing-only correction.
+
+If HTML returns 200 but the page is blank or shows a client-side not-found
+screen, inspect browser console errors and the referenced `/assets/*` files.
+Confirm Caddy's root contains the matching release's `index.html` and assets
+(the contents of `dist/`, not its parent directory). Use the same public
+origin in `BIOMODALS_PUBLIC_URL` when issuing Password Links. A no-token
+`/set-password` page can show a missing-link message; that is not a routing
+failure. Never share a real Password Link in diagnostic output.
 
 ## Update and rollback checks
 

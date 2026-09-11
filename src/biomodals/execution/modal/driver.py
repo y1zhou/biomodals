@@ -29,6 +29,7 @@ _DEFINITE_SUBMISSION_ERRORS = (
     ValueError,
 )
 _INCONCLUSIVE_SERVICE_ERRORS = (
+    ConnectionError,
     modal.exception.AuthError,
     modal.exception.ClientClosed,
     modal.exception.ConnectionError,
@@ -51,9 +52,11 @@ _DEPLOYMENT_UNAVAILABLE_ERRORS = (
 )
 
 
-def _observation_from_error(error: Exception) -> ProviderCallObservation:
-    if isinstance(error, (TimeoutError, modal.exception.TimeoutError)):
-        kind = ProviderCallObservationKind.RUNNING
+def _observation_from_error(
+    error: Exception | modal.exception.InputCancellation,
+) -> ProviderCallObservation:
+    if isinstance(error, modal.exception.FunctionTimeoutError):
+        kind = ProviderCallObservationKind.FAILED
     elif isinstance(error, modal.exception.InputCancellation):
         kind = ProviderCallObservationKind.CANCELLED
     elif isinstance(
@@ -61,6 +64,8 @@ def _observation_from_error(error: Exception) -> ProviderCallObservation:
         (modal.exception.OutputExpiredError, *_INCONCLUSIVE_SERVICE_ERRORS),
     ):
         kind = ProviderCallObservationKind.STATE_UNKNOWN
+    elif isinstance(error, (TimeoutError, modal.exception.TimeoutError)):
+        kind = ProviderCallObservationKind.RUNNING
     elif isinstance(error, _CONCLUSIVE_EXECUTION_ERRORS):
         kind = ProviderCallObservationKind.FAILED
     else:
@@ -122,7 +127,7 @@ class ModalCallDriver:
         call = self._call_resolver(provider_call_handle_id)
         try:
             result = call.get(timeout=0)
-        except Exception as error:
+        except (Exception, modal.exception.InputCancellation) as error:
             return _observation_from_error(error)
         return ProviderCallObservation(
             ProviderCallObservationKind.SUCCEEDED,
@@ -229,7 +234,7 @@ class AsyncModalCallDriver:
         call = self._call_resolver(provider_call_handle_id)
         try:
             result = await call.get.aio(timeout=0)
-        except Exception as error:
+        except (Exception, modal.exception.InputCancellation) as error:
             return _observation_from_error(error)
         return ProviderCallObservation(
             ProviderCallObservationKind.SUCCEEDED,

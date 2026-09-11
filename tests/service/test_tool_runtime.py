@@ -13,11 +13,18 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from biomodals.execution import ActiveProviderCallCounts, NodeStatus, RunStatus
+from biomodals.execution import (
+    ActiveProviderCallCounts,
+    ExecutionRunNotFoundError,
+    NodeStatus,
+    RunStatus,
+)
 from biomodals.service import tool_runtime
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
+    RemoteExecutionClient,
     RemoteExecutionIdentityMismatchError,
+    RemoteExecutionNotInitializedError,
 )
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
@@ -29,7 +36,7 @@ from biomodals.service.tool_runtime import (
     ToolRegistration,
     reconciliation_loop,
 )
-from biomodals.service.tools import ALPHAFOLD3_TOOL
+from biomodals.service.tools import ALPHAFOLD3_TOOL, TOOLS
 
 JOB_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
@@ -61,7 +68,7 @@ def _overview(status: RunStatus):
     )
 
 
-def _store(tmp_path: Path) -> ServiceStore:
+def _store(tmp_path: Path, tool=ALPHAFOLD3_TOOL) -> ServiceStore:
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
     user = store.create_user(
@@ -83,12 +90,12 @@ def _store(tmp_path: Path) -> ServiceStore:
     )
     store.admit_job(
         owner_user_id=user.user_id,
-        tool="alphafold3",
+        tool=tool.key,
         display_name="prediction",
         idempotency_key="request",
         request_digest="a" * 64,
         modal_environment="main",
-        modal_app_name="AlphaFold3",
+        modal_app_name=tool.default_modal_app_name,
         modal_app_version=1,
         tool_active_job_limit=200,
         global_active_job_limit=200,
@@ -100,16 +107,123 @@ def _store(tmp_path: Path) -> ServiceStore:
     return store
 
 
-def _lifecycle(tmp_path: Path, remote, adapter: Adapter | None = None):
-    store = _store(tmp_path)
+def _lifecycle(
+    tmp_path: Path, remote, adapter: Adapter | None = None, *, tool=ALPHAFOLD3_TOOL
+):
+    store = _store(tmp_path, tool)
     selected = adapter or Adapter()
     lifecycle = JobLifecycle(
         store,
         remote,
-        (ToolRegistration(ALPHAFOLD3_TOOL, selected),),
+        (ToolRegistration(tool, selected),),
         ArtifactCache(tmp_path / "cache"),
     )
     return store, lifecycle, selected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool", TOOLS, ids=lambda tool: tool.key)
+@pytest.mark.parametrize("cancel_requested", [False, True])
+async def test_failed_initialization_finishes_without_remote_cancellation_loop(
+    tmp_path, monkeypatch, tool, cancel_requested
+):
+    calls = []
+
+    def failed(*_args, **_kwargs):
+        calls.append("failed")
+        raise ValueError(
+            "Target deployment changed scientific versions: private-detail"
+        )
+
+    def missing():
+        calls.append("status")
+        raise ExecutionRunNotFoundError(str(JOB_ID))
+
+    coordinator = SimpleNamespace(
+        status=SimpleNamespace(remote=missing),
+        cancel=SimpleNamespace(remote=failed),
+    )
+    monkeypatch.setattr(
+        RemoteExecutionClient, "_coordinator", staticmethod(lambda _: coordinator)
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall.from_id",
+        lambda _: SimpleNamespace(get=failed),
+    )
+    store, lifecycle, _adapter = _lifecycle(
+        tmp_path, RemoteExecutionClient(), tool=tool
+    )
+    store.record_launch(JOB_ID, function_call_id="fc-root", now=20)
+    if cancel_requested:
+        await lifecycle.cancel(JOB_ID)
+
+    completed = await lifecycle.advance(JOB_ID, background=True)
+
+    assert completed.state == (
+        JobState.CANCELLED if cancel_requested else JobState.FAILED
+    )
+    assert completed.completed_at is not None
+    assert completed.root_function_call_id == "fc-root"
+    assert completed.error_code == (
+        None if cancel_requested else "execution_initialization_failed"
+    )
+    assert "private-detail" not in (completed.error_message or "")
+    assert store.count_active_jobs() == 0
+    assert store.list_reconcilable_jobs(now=10**10) == []
+    recorded_calls = list(calls)
+    restarted = JobLifecycle(
+        store,
+        RemoteExecutionClient(),
+        tuple(lifecycle.registrations.values()),
+        lifecycle.cache,
+    )
+    assert await restarted.advance(JOB_ID, background=True) == completed
+    assert await restarted.advance(JOB_ID, force_refresh=True) == completed
+    assert calls == recorded_calls
+
+
+@pytest.mark.anyio
+async def test_missing_previously_observed_execution_remains_unknown(tmp_path):
+    class Remote:
+        async def poll_root(self, _locator, _call_id):
+            raise RemoteExecutionNotInitializedError("missing Run")
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    store.record_launch(JOB_ID, function_call_id="fc-root", now=20)
+    store.replace_projection(
+        JOB_ID, state=JobState.RUNNING, projection={"stages": []}, observed_at=21
+    )
+
+    unknown = await lifecycle.advance(JOB_ID, background=True)
+
+    assert unknown.state == JobState.STATE_UNKNOWN
+    assert unknown.state_reason == "remote_execution_missing"
+    assert unknown.completed_at is None
+    assert store.count_active_jobs() == 1
+
+
+@pytest.mark.anyio
+async def test_confirmed_uninitialized_run_retains_unknown_job_cancellation_intent(
+    tmp_path,
+):
+    class Remote:
+        async def poll_root(self, _locator, _call_id):
+            raise RemoteExecutionNotInitializedError("missing Run")
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    store.record_launch(JOB_ID, function_call_id="fc-root", now=20)
+    await lifecycle.cancel(JOB_ID)
+    store.mark_state_unknown(
+        JOB_ID, reason="provider_outcome_unknown", message="uncertain", now=21
+    )
+
+    cancelled = await lifecycle.advance(JOB_ID, background=True)
+
+    assert cancelled.state == JobState.CANCELLED
+    assert cancelled.cancel_requested_at is not None
+    assert cancelled.state_reason is None
+    assert cancelled.state_message is None
+    assert store.count_active_jobs() == 0
 
 
 @pytest.mark.anyio
@@ -210,7 +324,7 @@ async def test_cancellation_waits_for_launch_checkpoint(tmp_path: Path) -> None:
             await self.release.wait()
             return "fc-root"
 
-        async def cancel(self, _locator):
+        async def cancel(self, _locator, *, root_function_call_id=None):
             self.cancellations += 1
             return _overview(RunStatus.CANCEL_REQUESTED)
 
@@ -245,7 +359,7 @@ async def test_cancellation_acknowledgement_and_status_do_not_wait_for_remote(
         async def launch(self, _locator):
             return "fc-root"
 
-        async def cancel(self, _locator):
+        async def cancel(self, _locator, *, root_function_call_id=None):
             self.entered.set()
             await self.release.wait()
             return _overview(RunStatus.CANCELLED)

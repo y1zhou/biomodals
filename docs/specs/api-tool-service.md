@@ -553,6 +553,19 @@ creating a Job. A queued Job cancelled before spawn becomes locally cancelled
 and never creates a remote Execution Run. Cancellation racing an ambiguous
 spawn retains cancellation intent and requires remote-state resolution.
 
+For a recorded root call that conclusively failed or was cancelled, the service
+reads status from the exact pinned coordinator. If it reports
+`ExecutionRunNotFoundError` for this Job's Run ID and the service has never
+observed that Run, initialization did not establish an execution to recover.
+The Job becomes `failed/execution_initialization_failed`, or `cancelled` when
+cancellation intent is already durable. This releases admission and ends
+background retries without creating a Remote Run Ledger or changing the
+request. A failed cancellation RPC uses the same root-result/status check,
+including against older coordinators that reconstruct invalid requests during
+cancellation. A polling timeout, expired call result, unavailable deployment,
+or unreadable ledger is not this confirmation. A previously observed Run that
+is now missing remains `state_unknown/remote_execution_missing`.
+
 Owner-visible projections never copy remote status messages, Node errors,
 Modal exceptions, or storage paths. Failed Jobs use fixed service-defined
 error copy; partial Runs use one generic incomplete-results warning. Raw remote

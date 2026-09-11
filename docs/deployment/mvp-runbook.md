@@ -175,6 +175,20 @@ origin in `BIOMODALS_PUBLIC_URL` when issuing Password Links. A no-token
 `/set-password` page can show a missing-link message; that is not a routing
 failure. Never share a real Password Link in diagnostic output.
 
+## Jobs stuck before startup
+
+A rejected startup request can leave an older API showing `Running` or
+`Cancellation requested` even though no scientific work began. Update and
+restart the API to enable failed-startup recovery; the next background pass
+closes a confirmed uninitialized Job as `Failed` or `Cancelled`. This recovery
+uses the Job's original pinned deployment and does not require a scientific
+redeployment, a new submission, or a database edit.
+
+The original deployment must still be reachable. If the root call's outcome
+or remote state cannot be confirmed, the API retains uncertainty and admission
+ownership. Do not stop the entire shared Modal deployment to clear one Job's
+website status, or assume that cancelling its root call stops child work.
+
 ## Update and rollback checks
 
 Before every deployment, record exactly two last-deployed commit hashes: one

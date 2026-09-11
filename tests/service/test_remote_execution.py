@@ -12,12 +12,15 @@ import pytest
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionOverview,
+    ExecutionRunNotFoundError,
     ProviderCallStatus,
+    RunStatus,
 )
 from biomodals.service.remote_execution import (
     ExecutionLocator,
     RemoteExecutionClient,
     RemoteExecutionIdentityMismatchError,
+    RemoteExecutionNotInitializedError,
 )
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -177,11 +180,20 @@ async def test_builtin_root_poll_timeout_means_still_running(monkeypatch) -> Non
 
 
 @pytest.mark.anyio
-async def test_root_error_returns_the_durable_coordinator_status(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "root_error",
+    [
+        ValueError("invalid request"),
+        modal.exception.RemoteError("coordinator suspended"),
+    ],
+)
+async def test_root_error_returns_the_durable_coordinator_status(
+    monkeypatch, root_error
+) -> None:
     durable = _overview()
 
     def failed(**_arguments):
-        raise modal.exception.RemoteError("coordinator suspended")
+        raise root_error
 
     coordinator = SimpleNamespace(status=RemoteMethod(durable))
     monkeypatch.setattr(
@@ -197,6 +209,105 @@ async def test_root_error_returns_the_durable_coordinator_status(monkeypatch) ->
     )
 
     assert await RemoteExecutionClient().poll_root(LOCATOR, "fc-failed") is durable
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "root_error",
+    [
+        ConnectionError("connection lost"),
+        modal.exception.ConnectionError("connection lost"),
+        modal.exception.OutputExpiredError("expired"),
+        modal.exception.AuthError("unauthorized"),
+        modal.exception.InternalError("provider unavailable"),
+    ],
+)
+async def test_uncertain_root_never_proves_initialization_failure(
+    monkeypatch, root_error
+):
+    def failed(**_arguments):
+        raise root_error
+
+    def coordinator(_locator):
+        raise AssertionError("an inconclusive root must not be treated as finished")
+
+    monkeypatch.setattr(
+        RemoteExecutionClient, "_coordinator", staticmethod(coordinator)
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall.from_id",
+        lambda _: SimpleNamespace(get=failed),
+    )
+
+    with pytest.raises(RemoteExecutionIdentityMismatchError):
+        await RemoteExecutionClient().poll_root(LOCATOR, "fc-unknown")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "status_error,expected_error",
+    [
+        (ExecutionRunNotFoundError(str(RUN_ID)), RemoteExecutionNotInitializedError),
+        (
+            ExecutionRunNotFoundError(str(OTHER_RUN_ID)),
+            RemoteExecutionIdentityMismatchError,
+        ),
+        (TimeoutError("status timed out"), TimeoutError),
+        (ConnectionError("status unreachable"), ConnectionError),
+        (RuntimeError("ledger unreadable"), RuntimeError),
+    ],
+)
+async def test_failed_root_requires_exact_missing_run_confirmation(
+    monkeypatch, status_error, expected_error
+):
+    def failed(**_arguments):
+        raise ValueError("rejected before initialization")
+
+    def status():
+        raise status_error
+
+    coordinator = SimpleNamespace(status=SimpleNamespace(remote=status))
+    monkeypatch.setattr(
+        RemoteExecutionClient, "_coordinator", staticmethod(lambda _: coordinator)
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall.from_id",
+        lambda _: SimpleNamespace(get=failed),
+    )
+
+    with pytest.raises(expected_error) as error:
+        await RemoteExecutionClient().poll_root(LOCATOR, "fc-failed")
+    assert type(error.value) is expected_error
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("root_finished", [False, True])
+async def test_cancel_error_does_not_finish_an_active_or_initialized_run(
+    monkeypatch, root_finished
+):
+    def cancel():
+        raise ValueError("cancel could not reopen the runtime")
+
+    def get(**_arguments):
+        if root_finished:
+            raise ValueError("root failed")
+        raise TimeoutError
+
+    durable = _overview()
+    durable.run.status = RunStatus.RUNNING
+    coordinator = SimpleNamespace(
+        status=RemoteMethod(durable), cancel=SimpleNamespace(remote=cancel)
+    )
+    monkeypatch.setattr(
+        RemoteExecutionClient, "_coordinator", staticmethod(lambda _: coordinator)
+    )
+    monkeypatch.setattr(
+        "biomodals.service.remote_execution.modal.FunctionCall.from_id",
+        lambda _: SimpleNamespace(get=get),
+    )
+
+    with pytest.raises(ValueError, match="cancel could not reopen"):
+        await RemoteExecutionClient().cancel(LOCATOR, root_function_call_id="fc-root")
 
 
 @pytest.mark.anyio

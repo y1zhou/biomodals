@@ -4,7 +4,7 @@ Status: accepted
 
 Decision date: 2026-08-23
 
-Last amended: 2026-08-27
+Last amended: 2026-09-11
 
 ## Context
 
@@ -188,6 +188,12 @@ a process interruption therefore cannot cause an automatic duplicate spawn.
 An Administrator may then attach the known root Function Call and resume,
 requeue only after confirming that no spawn occurred, or request cancellation.
 Launch and cancellation use the same per-Job service lock.
+
+When a root call conclusively ends before any Run is initialized, the service
+may close the Job after the pinned coordinator confirms that exact Run is
+absent. This handles admission and failed startup, not scientific execution or
+kernel cancellation. The evidence requirements and treatment of uncertainty
+are defined in [Submission and recovery](../specs/api-tool-service.md#submission-and-recovery).
 
 Result restoration is likewise service-owned. Concurrent preparations for the
 same Job join one cancellation-shielded restoration task, while different Jobs

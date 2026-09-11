@@ -158,7 +158,9 @@ class _FakeRemote:
     ) -> frozenset[str]:
         return frozenset()
 
-    async def cancel(self, locator: ExecutionLocator) -> ExecutionOverview:
+    async def cancel(
+        self, locator: ExecutionLocator, *, root_function_call_id: str | None = None
+    ) -> ExecutionOverview:
         self.cancelled.add(locator.execution_run_id)
         self._write_stats()
         return self._overview(locator.execution_run_id)

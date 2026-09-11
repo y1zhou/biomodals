@@ -2043,7 +2043,9 @@ class ServiceStore:
                 """
                 UPDATE jobs
                 SET state = ?, error_code = ?, error_message = ?,
-                    completed_at = ?, updated_at = ? WHERE job_id = ?
+                    completed_at = ?, updated_at = ?,
+                    state_reason = NULL, state_message = NULL,
+                    next_retry_at = NULL WHERE job_id = ?
                 """,
                 (
                     JobState.FAILED.value,

@@ -22,6 +22,7 @@ from biomodals.service.remote_execution import (
     RemoteDeploymentUnavailableError,
     RemoteExecutionClient,
     RemoteExecutionIdentityMismatchError,
+    RemoteExecutionNotInitializedError,
     RemoteSubmissionOutcomeUnknownError,
 )
 from biomodals.service.store import JobRecord, JobState, ServiceStore
@@ -176,7 +177,11 @@ class JobLifecycle:
                 if not background:
                     return job
                 try:
-                    overview = await self.remote.cancel(_locator(job))
+                    overview = await self.remote.cancel(
+                        _locator(job), root_function_call_id=job.root_function_call_id
+                    )
+                except RemoteExecutionNotInitializedError:
+                    return self._finish_uninitialized(job, now=now)
                 except RemoteExecutionIdentityMismatchError:
                     LOGGER.warning(
                         "Remote execution identity is unknown", exc_info=True
@@ -237,6 +242,8 @@ class JobLifecycle:
                             return self.store.touch_job(job_id, now=now)
                     if overview is None:
                         overview = await self.remote.status(_locator(job))
+                except RemoteExecutionNotInitializedError:
+                    return self._finish_uninitialized(job, now=now)
                 except RemoteExecutionIdentityMismatchError:
                     LOGGER.warning(
                         "Remote execution identity is unknown", exc_info=True
@@ -270,6 +277,29 @@ class JobLifecycle:
                     result_state=JobState(job.result_state or JobState.SUCCEEDED),
                 )
             return job
+
+    def _finish_uninitialized(self, job: JobRecord, *, now: int) -> JobRecord:
+        """Release admission only when no previously observed Run is missing."""
+        if job.projection_observed_at is not None:
+            return self.store.mark_state_unknown(
+                job.job_id,
+                reason="remote_execution_missing",
+                message="A previously observed execution could not be found",
+                now=now,
+            )
+        if job.cancel_requested_at is not None:
+            return self.store.replace_projection(
+                job.job_id, state=JobState.CANCELLED, projection={}, observed_at=now
+            )
+        return self.store.fail_job(
+            job.job_id,
+            error_code="execution_initialization_failed",
+            error_message=(
+                "The remote execution failed before initialization. "
+                "Contact an administrator before submitting a new Job."
+            ),
+            now=now,
+        )
 
     async def resolve_state_unknown(
         self,

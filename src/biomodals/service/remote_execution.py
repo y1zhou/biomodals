@@ -14,10 +14,12 @@ import modal
 from biomodals.execution import (
     DeploymentIdentity,
     ExecutionOverview,
+    ExecutionRunNotFoundError,
     ProviderCallDiagnostic,
     ProviderCallPage,
 )
-from biomodals.execution.modal import deployed_execution_coordinator
+from biomodals.execution.modal import ModalCallDriver, deployed_execution_coordinator
+from biomodals.execution.provider import ProviderCallObservationKind
 
 CALL_GRAPH_TIMEOUT_SECONDS = 5.0
 _CONCURRENT_STREAM_CLOSE = "aclose(): asynchronous generator is already running"
@@ -33,6 +35,10 @@ class RemoteSubmissionOutcomeUnknownError(RuntimeError):
 
 class RemoteExecutionIdentityMismatchError(RuntimeError):
     """A remote overview does not belong to the pinned service Job."""
+
+
+class RemoteExecutionNotInitializedError(RuntimeError):
+    """The root call ended unsuccessfully and its coordinator has no Run."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,21 +100,32 @@ class RemoteExecutionClient:
     async def poll_root(
         self, locator: ExecutionLocator, function_call_id: str
     ) -> ExecutionOverview | None:
-        """Poll one root call without invoking coordinator code."""
-        call = modal.FunctionCall.from_id(function_call_id)
-        try:
-            overview = await asyncio.to_thread(call.get, timeout=0)
-        except (TimeoutError, modal.exception.TimeoutError):
+        """Poll the root; consult the ledger after a conclusive call failure."""
+        driver = ModalCallDriver(call_resolver=modal.FunctionCall.from_id)
+        observation = await asyncio.to_thread(driver.observe, function_call_id)
+        if observation.kind == ProviderCallObservationKind.RUNNING:
             return None
-        except modal.exception.NotFoundError as error:
+        if observation.kind == ProviderCallObservationKind.STATE_UNKNOWN:
             raise RemoteExecutionIdentityMismatchError(
-                "Pinned root Function Call is unavailable"
-            ) from error
-        except modal.exception.RemoteError:
+                "Pinned root Function Call is unavailable or its outcome is unknown"
+            )
+        if observation.kind in {
+            ProviderCallObservationKind.FAILED,
+            ProviderCallObservationKind.CANCELLED,
+        }:
             # The root call can raise after durably suspending the Run. The
             # coordinator ledger, not Modal's call result, owns terminality.
-            return await self.status(locator)
-        return self._verified(locator, overview)
+            try:
+                return await self.status(locator)
+            except ExecutionRunNotFoundError as error:
+                if str(error) != str(locator.execution_run_id):
+                    raise RemoteExecutionIdentityMismatchError(
+                        "Missing remote Run does not match the pinned Job locator"
+                    ) from error
+                raise RemoteExecutionNotInitializedError(
+                    "Root Function Call ended without initializing its Execution Run"
+                ) from error
+        return self._verified(locator, observation.result)
 
     async def status(self, locator: ExecutionLocator) -> ExecutionOverview:
         """Read one bounded remote execution overview."""
@@ -118,12 +135,23 @@ class RemoteExecutionClient:
             raise RemoteDeploymentUnavailableError(str(error)) from error
         return self._verified(locator, overview)
 
-    async def cancel(self, locator: ExecutionLocator) -> ExecutionOverview:
+    async def cancel(
+        self, locator: ExecutionLocator, *, root_function_call_id: str | None = None
+    ) -> ExecutionOverview:
         """Request durable cancellation from the execution authority."""
         try:
             overview = await asyncio.to_thread(self._coordinator(locator).cancel.remote)
         except modal.exception.NotFoundError as error:
             raise RemoteDeploymentUnavailableError(str(error)) from error
+        except Exception:
+            # Older coordinators reconstruct the request even for cancellation.
+            # If that fails, only a conclusive root result plus a ledger read can
+            # resolve the Job; never turn a failed cancel RPC into success alone.
+            if root_function_call_id is not None:
+                observed = await self.poll_root(locator, root_function_call_id)
+                if observed is not None and observed.run.status.is_terminal:
+                    return observed
+            raise
         return self._verified(locator, overview)
 
     async def queued_provider_call_handles(

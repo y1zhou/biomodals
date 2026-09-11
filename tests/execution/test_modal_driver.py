@@ -300,6 +300,32 @@ def test_driver_observes_user_exception_as_failed() -> None:
     assert observation.message == "worker failed"
 
 
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (TimeoutError(), ProviderCallObservationKind.RUNNING),
+        (modal.exception.TimeoutError(), ProviderCallObservationKind.RUNNING),
+        (modal.exception.FunctionTimeoutError(), ProviderCallObservationKind.FAILED),
+        (modal.exception.InputCancellation(), ProviderCallObservationKind.CANCELLED),
+        (
+            modal.exception.OutputExpiredError(),
+            ProviderCallObservationKind.STATE_UNKNOWN,
+        ),
+        (ConnectionError(), ProviderCallObservationKind.STATE_UNKNOWN),
+        (modal.exception.ConnectionError(), ProviderCallObservationKind.STATE_UNKNOWN),
+    ],
+)
+def test_driver_distinguishes_poll_failures_from_function_timeout(error, expected):
+    def get(**_arguments):
+        raise error
+
+    observed = ModalCallDriver(
+        call_resolver=lambda _: SimpleNamespace(get=get)
+    ).observe("fc-root")
+
+    assert observed.kind == expected
+
+
 def test_async_driver_uses_exact_deployment_and_retained_call_handle() -> None:
     async def scenario() -> None:
         resolved: list[tuple] = []

@@ -226,4 +226,27 @@ def project_overview(
     }
 
 
-TOOLS = (GROMACS_TOOL, ALPHAFOLD3_TOOL)
+HUMANIZATION_TOOL = ToolDefinition(
+    key="humanization",
+    display_name="Antibody humanization",
+    modal_app_name_environment="BIOMODALS_HUMANIZATION_APP",
+    modal_app_version_environment="BIOMODALS_HUMANIZATION_APP_VERSION",
+    active_job_limit_environment="BIOMODALS_HUMANIZATION_ACTIVE_LIMIT",
+    default_modal_app_name="HumanizationWorkflow",
+    default_modal_app_version=1,
+    default_active_job_limit=2,
+    stages=(
+        ToolStageDefinition("generate_sapiens", "Sapiens", ("generate_sapiens",)),
+        ToolStageDefinition("generate_humatch", "Humatch", ("generate_humatch",)),
+        ToolStageDefinition(
+            "generate_pabnativ2", "p-AbNatiV2", ("generate_pabnativ2",)
+        ),
+        ToolStageDefinition("generate_hudiff_ab", "HuDiff", ("generate_hudiff_ab",)),
+        # Previously deployed plans contain only this aggregate Node.
+        ToolStageDefinition("generate", "Generate candidates", ("generate",)),
+        ToolStageDefinition("union", "Collect unique candidates", ("union",)),
+        ToolStageDefinition("evaluate", "Evaluate and rank candidates", ("evaluate",)),
+    ),
+)
+
+TOOLS = (GROMACS_TOOL, ALPHAFOLD3_TOOL, HUMANIZATION_TOOL)

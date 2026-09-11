@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from biomodals.execution import ActiveProviderCallCounts, RunStatus
+from biomodals.execution import ActiveProviderCallCounts, NodeStatus, RunStatus
 from biomodals.service import tool_runtime
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.remote_execution import (
@@ -21,6 +21,7 @@ from biomodals.service.remote_execution import (
 )
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import (
+    EnvironmentPreparationError,
     JobLifecycle,
     PreparedResult,
     ResultIntegrityError,
@@ -167,6 +168,37 @@ async def test_submission_wait_stays_queued_without_launching(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
+async def test_environment_preparation_failure_retains_input_and_never_launches(
+    tmp_path: Path,
+) -> None:
+    class FailingAdapter(Adapter):
+        attempts = 0
+
+        async def stage(self, job):
+            self.attempts += 1
+            raise EnvironmentPreparationError("Model cache requires operator repair")
+
+        async def discard_pending(self, job):
+            raise AssertionError("Failed preparation must retain pending input")
+
+    adapter = FailingAdapter()
+    store, lifecycle, _adapter = _lifecycle(tmp_path, object(), adapter)
+
+    failed = await lifecycle.advance(JOB_ID)
+
+    assert failed.state == JobState.FAILED
+    assert failed.error_code == "environment_preparation_failed"
+    assert failed.error_message == "Model cache requires operator repair"
+    assert failed.root_function_call_id is None
+    assert failed.completed_at is not None
+    assert store.count_active_jobs() == 0
+    assert store.list_reconcilable_jobs(now=10**10) == []
+    assert await lifecycle.advance(JOB_ID, background=True) == failed
+    assert await lifecycle.advance(JOB_ID, force_refresh=True) == failed
+    assert adapter.attempts == 1
+
+
+@pytest.mark.anyio
 async def test_cancellation_waits_for_launch_checkpoint(tmp_path: Path) -> None:
     class Remote:
         entered = asyncio.Event()
@@ -196,8 +228,46 @@ async def test_cancellation_waits_for_launch_checkpoint(tmp_path: Path) -> None:
 
     assert cancelled.state == JobState.CANCEL_REQUESTED
     assert cancelled.root_function_call_id == "fc-root"
-    assert remote.cancellations == 1
+    assert remote.cancellations == 0
     assert store.get_job_by_id(JOB_ID) == cancelled
+    await lifecycle.advance(JOB_ID, background=True)
+    assert remote.cancellations == 1
+
+
+@pytest.mark.anyio
+async def test_cancellation_acknowledgement_and_status_do_not_wait_for_remote(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def cancel(self, _locator):
+            self.entered.set()
+            await self.release.wait()
+            return _overview(RunStatus.CANCELLED)
+
+    remote = Remote()
+    store, lifecycle, _adapter = _lifecycle(tmp_path, remote)
+    await lifecycle.advance(JOB_ID)
+    try:
+        acknowledged = await asyncio.wait_for(lifecycle.cancel(JOB_ID), timeout=0.1)
+        assert acknowledged.state == JobState.CANCEL_REQUESTED
+        assert store.get_job_by_id(JOB_ID).cancel_requested_at is not None
+        assert (await lifecycle.advance(JOB_ID)).state == JobState.CANCEL_REQUESTED
+        delivery = asyncio.create_task(lifecycle.advance(JOB_ID, background=True))
+        await remote.entered.wait()
+        viewed = await asyncio.wait_for(lifecycle.advance(JOB_ID), timeout=0.1)
+        assert viewed.state == JobState.CANCEL_REQUESTED
+        repeated = await asyncio.wait_for(lifecycle.cancel(JOB_ID), timeout=0.1)
+        assert repeated.cancel_requested_at == acknowledged.cancel_requested_at
+    finally:
+        remote.release.set()
+    cancelled = await delivery
+    assert cancelled.state == JobState.CANCELLED
 
 
 @pytest.mark.anyio
@@ -370,6 +440,92 @@ async def test_reconciliation_processes_at_most_four_jobs_concurrently() -> None
 
 
 @pytest.mark.anyio
+async def test_slow_reconciliation_does_not_block_new_jobs_or_duplicate_delivery() -> (
+    None
+):
+    stop, wake = asyncio.Event(), asyncio.Event()
+    entered, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    old_id, new_id = uuid4(), uuid4()
+    jobs = [SimpleNamespace(job_id=old_id)]
+    old_calls = 0
+
+    class Store:
+        def list_reconcilable_jobs(self, *, now):
+            return tuple(jobs)
+
+    class Lifecycle:
+        store = Store()
+
+        async def advance(self, job_id, *, finalize, background):
+            nonlocal old_calls
+            if job_id == old_id:
+                old_calls += 1
+                entered.set()
+                await release.wait()
+            else:
+                processed.set()
+                jobs.remove(next(job for job in jobs if job.job_id == new_id))
+
+    task = asyncio.create_task(
+        reconciliation_loop(
+            cast(JobLifecycle, Lifecycle()),
+            interval_seconds=60,
+            stop=stop,
+            wake=wake,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        jobs.append(SimpleNamespace(job_id=new_id))
+        wake.set()
+        await asyncio.wait_for(processed.wait(), timeout=0.1)
+        wake.set()
+        await asyncio.sleep(0)
+        assert old_calls == 1
+    finally:
+        stop.set()
+        release.set()
+        wake.set()
+        await task
+
+
+@pytest.mark.anyio
+async def test_reconciliation_does_not_hot_poll_after_snapshot_is_exhausted() -> None:
+    stop, wake, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+    job = SimpleNamespace(job_id=uuid4())
+
+    class Store:
+        def list_reconcilable_jobs(self, *, now):
+            return (job,)
+
+    class Lifecycle:
+        store = Store()
+
+        async def advance(self, job_id, *, finalize, background):
+            nonlocal calls
+            calls += 1
+            processed.set()
+
+    task = asyncio.create_task(
+        reconciliation_loop(
+            cast(JobLifecycle, Lifecycle()),
+            interval_seconds=60,
+            stop=stop,
+            wake=wake,
+        )
+    )
+    try:
+        await asyncio.wait_for(processed.wait(), timeout=1)
+        await asyncio.sleep(0.02)
+        assert calls == 1
+    finally:
+        stop.set()
+        wake.set()
+        await task
+
+
+@pytest.mark.anyio
 async def test_reconciliation_wakes_for_a_newly_admitted_job() -> None:
     stop = asyncio.Event()
     wake = asyncio.Event()
@@ -485,6 +641,43 @@ async def test_storage_exhaustion_blocks_result_preparation(tmp_path: Path) -> N
         JobState.BLOCKED,
         "result_preparation_failed",
     )
+
+
+@pytest.mark.anyio
+async def test_explicit_refresh_updates_stages_while_root_is_active(
+    tmp_path: Path,
+) -> None:
+    class Remote:
+        async def launch(self, _locator):
+            return "fc-root"
+
+        async def poll_root(self, _locator, _function_call_id):
+            return None
+
+        async def status(self, _locator):
+            overview = _overview(RunStatus.RUNNING)
+            overview.nodes = (
+                SimpleNamespace(
+                    node_key="prepare-environment",
+                    status=NodeStatus.RUNNING,
+                    started_at=20,
+                    completed_at=None,
+                ),
+            )
+            return overview
+
+    store, lifecycle, _adapter = _lifecycle(tmp_path, Remote())
+    await lifecycle.advance(JOB_ID)
+    store.replace_projection(
+        JOB_ID,
+        state=JobState.RUNNING,
+        projection={"stages": [{"code": "prepare_environment", "started_at": None}]},
+        observed_at=10**10,
+    )
+
+    refreshed = await lifecycle.advance(JOB_ID, force_refresh=True)
+
+    assert refreshed.projection["stages"][0]["started_at"] == 20
 
 
 @pytest.mark.anyio

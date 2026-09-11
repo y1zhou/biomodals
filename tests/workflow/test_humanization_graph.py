@@ -1,7 +1,6 @@
 """Real execution-kernel checks with fake provider calls, never live inference."""
 
 import hashlib
-import pickle
 import tarfile
 from io import BytesIO
 from uuid import UUID
@@ -17,7 +16,6 @@ from biomodals.execution.modal import (
     ExecutionVolumeSync,
     ProviderCallObservation,
     ProviderCallObservationKind,
-    orchestrator,
 )
 from biomodals.schema import (
     AppOutput,
@@ -27,27 +25,86 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.workflow.humanization.artifacts import json_output
+from biomodals.workflow.humanization.contracts import AntibodyPair
+from biomodals.workflow.humanization.execution import (
+    HumanizationExecutionCoordinator,
+    HumanizationExecutionRequest,
+    persist_execution_request,
+)
 from biomodals.workflow.humanization.scoring import scoring_result
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import SCORE_COLUMNS
 from biomodals.workflow.humanization.workflow import build_humanization_workflow
 
 
-def test_all_generator_failures_still_publish_parental_union(tmp_path):
-    """A local baseline makes all-generator failure a collectable partial result."""
+def test_generation_methods_are_independent_nodes_with_a_union_barrier():
+    """All methods can start together, while collection waits for every method."""
+    request = HumanizationExecutionRequest(
+        run_name="test",
+        pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),),
+    )
+    plan = request.execution_plan
+    generation = plan.nodes[:4]
+    assert {node.node_key for node in generation} == {
+        "generate_sapiens",
+        "generate_humatch",
+        "generate_pabnativ2",
+        "generate_hudiff_ab",
+    }
+    assert all(node.dependencies == () for node in generation)
+    union = next(node for node in plan.nodes if node.node_key == "union")
+    assert {edge.node_key for edge in union.dependencies} == {
+        node.node_key for node in generation
+    }
+    assert all(edge.accept_partial for edge in union.dependencies)
+
+
+@pytest.mark.parametrize("pab_success", [False, True])
+def test_generation_failures_preserve_baselines_and_successful_replicas(
+    tmp_path, pab_success
+):
+    """A failed replica cannot discard another replica's successful design."""
+    settings = HumanizationSettings(pabnativ2_num_seeds=3 if pab_success else 1)
 
     class Driver:
         def __init__(self):
             self.calls = []
+            self.kwargs = []
 
         def resolve(self, binding):
             return binding.function_name
 
         def spawn(self, operation, *, args, kwargs):
             self.calls.append(operation)
+            self.kwargs.append(kwargs)
             return f"call-{len(self.calls)}"
 
         def observe(self, provider_call_handle_id):
+            index = int(provider_call_handle_id.split("-")[1]) - 1
+            kwargs = self.kwargs[index]
+            if (
+                pab_success
+                and self.calls[index] == "pabnativ2_humanize_pair"
+                and kwargs["seed"] == settings.pabnativ2_seeds[0]
+            ):
+                return ProviderCallObservation(
+                    ProviderCallObservationKind.SUCCEEDED,
+                    result=AppRunResult(
+                        status=AppRunStatus.SUCCEEDED,
+                        outputs=[
+                            json_output(
+                                "native",
+                                {
+                                    "schema_version": 1,
+                                    "pair_result": {
+                                        "humanized": {**kwargs["pair"], "vh": "ACH"},
+                                        "pair_seed": kwargs["seed"],
+                                    },
+                                },
+                            )
+                        ],
+                    ),
+                )
             return ProviderCallObservation(
                 ProviderCallObservationKind.FAILED, message="model unavailable"
             )
@@ -66,7 +123,7 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
     store = GraphExecutionRunStore(tmp_path, run_id)
     driver = Driver()
     runtime = ExecutionGraphRuntime(
-        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n"),
+        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n", settings),
         execution_run_id=run_id,
         deployment=DeploymentIdentity("main", "HumanizationWorkflow", 1),
         volume_root=tmp_path,
@@ -96,16 +153,52 @@ def test_all_generator_failures_still_publish_parental_union(tmp_path):
         candidates = orjson.loads(
             (tmp_path / publication.outputs[0].storage.path).read_bytes()
         )
-        assert len(candidates) == 1
+        assert len(candidates) == 1 + int(pab_success)
         assert candidates[0]["is_parent"] is True
         assert candidates[0]["vh"] == "ACD"
+        if pab_success:
+            assert candidates[1]["vh"] == "ACH"
+            assert candidates[1]["origins"][0]["seed"] == settings.pabnativ2_seeds[0]
+        generation_errors = next(
+            output
+            for output in publication.outputs
+            if output.name == "generation_errors"
+        )
+        assert set(
+            orjson.loads((tmp_path / generation_errors.storage.path).read_bytes())
+        ) == {
+            "sapiens-0000",
+            "humatch-0000",
+            *(
+                {"pabnativ2-0000-seed-01", "pabnativ2-0000-seed-02"}
+                if pab_success
+                else {"pabnativ2-0000"}
+            ),
+            "hudiff_ab-0000",
+        }
+        final = store.artifacts.load_node_result("evaluate")
+        root = tmp_path / next(
+            o.storage.path for o in final.outputs if o.name == "humanization_results"
+        )
+        ledger = pl.read_parquet(root / "generation.parquet")
+        failures = ledger.filter(pl.col("outcome") == "failed")
+        assert failures.height == (5 if pab_success else 4)
+        assert failures["reason"].str.contains("model unavailable").all()
+        assert failures["candidate_id"].null_count() == failures.height
+        assert failures["seed"].null_count() == failures.height
+        assert sorted(
+            failures.filter(pl.col("method") == "pabnativ2")["root_seed"].to_list()
+        ) == sorted(
+            settings.pabnativ2_seeds[1:] if pab_success else settings.pabnativ2_seeds
+        )
     finally:
         runtime.close()
 
 
 @pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("num_seeds", [1, 3])
 def test_full_graph_joins_successful_native_results_into_sortable_table(
-    tmp_path, monkeypatch, fail_first
+    tmp_path, monkeypatch, fail_first, num_seeds
 ):
     """Exercise actual artifact materialization and candidate/evaluator joins."""
 
@@ -116,6 +209,17 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             member = tarfile.TarInfo("result/humanized.csv")
             member.size = len(content)
             bundle.addfile(member, BytesIO(content))
+            designs = (
+                pl
+                .concat([
+                    frame.with_columns(pl.lit(i).alias("iteration")) for i in (1, 2)
+                ])
+                .write_csv()
+                .encode()
+            )
+            member = tarfile.TarInfo("result/iteration_designs.csv")
+            member.size = len(designs)
+            bundle.addfile(member, BytesIO(designs))
         return AppRunResult(
             status=AppRunStatus.SUCCEEDED,
             outputs=[
@@ -158,7 +262,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                                 "schema_version": 1,
                                 "pair_result": {
                                     "humanized": kwargs["pair"],
-                                    "pair_seed": 0,
+                                    "pair_seed": kwargs["seed"],
                                 },
                             },
                         )
@@ -172,7 +276,11 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                             "native",
                             {
                                 "schema_version": 1,
-                                "pair_result": {"candidates": [], "pair_seed": 42},
+                                "pair_result": {
+                                    "candidates": [],
+                                    "attempts": [],
+                                    "pair_seed": 42,
+                                },
                             },
                         )
                     ],
@@ -268,8 +376,10 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
     run_id = UUID(int=2)
     store = GraphExecutionRunStore(tmp_path, run_id)
     driver = Driver()
+    settings = HumanizationSettings(sapiens_iterations=2, pabnativ2_num_seeds=num_seeds)
+    expected_calls = 12 + num_seeds - 1
     runtime = ExecutionGraphRuntime(
-        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n"),
+        graph=build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n", settings),
         execution_run_id=run_id,
         deployment=DeploymentIdentity("main", "HumanizationWorkflow", 1),
         volume_root=tmp_path,
@@ -303,28 +413,29 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
             table["sapiens_vh_mean_probability_delta"].to_list()
             == [None if fail_first else 0.0] * 2
         )
-        assert len(driver.results) == 12
+        assert len(driver.results) == expected_calls
         manifest = orjson.loads((root / "manifest.json").read_bytes())
-        assert manifest["ranking_policy"]["version"] == "1"
+        assert manifest["generation_seeds"]["pabnativ2"] == list(
+            settings.pabnativ2_seeds
+        )
+        assert manifest["ranking_policy"]["version"] == "2"
         assert manifest["protocols"]["pabnativ2"]["rasa_structure_count"] == 4
         assert manifest["protocols"]["pabnativ2"]["pssm_frequency_cutoff"] == 0.01
         assert manifest["protocols"]["pabnativ2"]["nativeness_weight"] == 10.0
         assert manifest["protocols"]["pabnativ2"]["pairing_weight"] == 1.0
-        assert not list((root / "native").glob("*.parquet"))
-        assert len(list((root / "native").iterdir())) == 4
-        assert len(manifest["scoring_publications"]) == (4 if fail_first else 6)
-        assert all(
-            entry["manifest"]["scientific_identity"]["runtime"] == "test"
-            for entry in manifest["scoring_publications"]
-        )
-        assert manifest["schema_version"] == 2
-        assert len(manifest["candidate_provenance"]) == 2
-        baseline = next(
-            item
-            for item in manifest["candidate_provenance"]
-            if item["candidate_id"] == table["candidate_id"][0]
-        )
-        assert baseline["origins"][0]["method"] == "pabnativ2"
+        assert manifest["schema_version"] == 3
+        generation = pl.read_parquet(root / "generation.parquet")
+        baseline = generation.filter(pl.col("candidate_id") == table["candidate_id"][0])
+        assert baseline["method"].to_list() == ["pabnativ2"] * num_seeds
+        assert baseline["outcome"].to_list() == ["no_op"] * num_seeds
+        assert sorted(baseline["seed"].to_list()) == sorted(settings.pabnativ2_seeds)
+        sapiens = generation.filter(pl.col("method") == "sapiens")
+        assert sapiens["source_id"].to_list() == ["a__iteration_1", "a__iteration_2"]
+        assert sapiens["iteration"].to_list() == [1, 2]
+        assert sapiens["candidate_id"].to_list() == [table["candidate_id"][1]] * 2
+        assert generation.filter(pl.col("method") == "hudiff_ab")[
+            "outcome"
+        ].to_list() == ["no_candidates"]
         assert manifest["candidate_count"] == 2
         for entry in manifest["files"]:
             content = (root / entry["path"]).read_bytes()
@@ -372,59 +483,55 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                 .filter(pl.col("candidate_id") == candidate_id)
                 .drop("parent_id", "candidate_id"),
             )
-            recorded = next(
-                entry
-                for entry in manifest["scoring_publications"]
-                if entry["task_key"] == f"{method}-{candidate_id}"
-            )
-            assert recorded["manifest"] == orjson.loads(members["manifest.json"])
-        graph = build_humanization_workflow(b"id,vh,vl\na,ACD,EFG\n")
-        store.write_coordinator_plan(
-            pickle.dumps(
-                orchestrator.ExecutionCoordinatorPlan(
-                    graph=graph,
-                    workload_run_key="test",
-                    max_active_provider_calls=2,
-                    max_active_gpu_provider_calls=1,
-                )
-            )
+        request = HumanizationExecutionRequest(
+            run_name="test",
+            pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),),
+            settings=settings,
+            max_active_provider_calls=2,
+            max_active_gpu_provider_calls=1,
         )
+        persist_execution_request(tmp_path, run_id, request)
     finally:
         runtime.close()
 
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME", Volume())
-    monkeypatch.setattr(orchestrator, "OUT_VOLUME_NAME", "workflow")
-    monkeypatch.setattr(orchestrator.CONF, "output_volume_mountpoint", str(tmp_path))
-    raw_cls = orchestrator.ExecutionCoordinator._get_user_cls()
-    successor = raw_cls()
-    successor.execution_run_id = str(UUID(int=3))
-    successor.deployment_environment = "main"
-    successor.deployment_name = "HumanizationWorkflow"
-    successor.deployment_version = 1
-    successor.development = False
-    raw_cls.enter._get_raw_f()(successor)
-    successor._modal_driver = lambda: driver
+    successor = HumanizationExecutionCoordinator(
+        execution_run_id=UUID(int=3),
+        deployment=DeploymentIdentity("main", "HumanizationWorkflow", 1),
+        volume_root=tmp_path,
+        output_volume=Volume(),
+        output_volume_name="workflow",
+        provider_driver=driver,
+        poll_interval_seconds=0,
+    )
     driver.fail = False
     try:
         with pytest.raises(ValueError):
-            raw_cls.prepare_restart_from._get_raw_f()(
-                successor,
-                predecessor_execution_run_id=str(run_id),
-                workload_run_key="test",
-                graph=build_humanization_workflow(
-                    b"id,vh,vl\na,ACD,EFG\n", HumanizationSettings(sapiens_iterations=2)
+            successor.prepare_restart(
+                predecessor_execution_run_id=run_id,
+                predecessor_deployment=None,
+                candidate_request=HumanizationExecutionRequest(
+                    run_name="test",
+                    pairs=request.pairs,
+                    settings=HumanizationSettings(sapiens_iterations=3),
                 ),
             )
-        raw_cls.prepare_restart_from._get_raw_f()(
-            successor,
-            predecessor_execution_run_id=str(run_id),
-            workload_run_key="test",
-            graph=graph,
+        successor.prepare_restart(
+            predecessor_execution_run_id=run_id,
+            predecessor_deployment=None,
             max_active_provider_calls=1,
             max_active_gpu_provider_calls=1,
         )
-        result = raw_cls.drive_prepared._get_raw_f()(successor)
-        assert result.status == AppRunStatus.SUCCEEDED
-        assert driver.operations[12:] == (["sapiens_score"] * 2 if fail_first else [])
+        result = successor.drive_prepared()
+        assert result.run.status.value == "succeeded"
+        assert driver.operations[expected_calls:] == (
+            ["sapiens_score"] * 2 if fail_first else []
+        )
+        publication = successor.result()
+        directory = next(
+            output
+            for output in publication.outputs
+            if output.name == "humanization_results"
+        )
+        assert (tmp_path / directory.storage.path / "selection.csv").is_file()
     finally:
-        raw_cls.exit._get_raw_f()(successor)
+        successor.close()

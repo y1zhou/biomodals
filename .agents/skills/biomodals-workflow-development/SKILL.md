@@ -13,8 +13,9 @@ does not own a second orchestration core.
 ## Core Workflow
 
 Before making non-trivial workflow changes, read the
-[maintained standards](references/workflow-development.md) and
-[repo coordination notes](../../../docs/agents/workflow-development.md).
+[maintained standards](references/workflow-development.md) in full.
+When changing app-owned functions, also use the
+[app-development skill](../biomodals-app-development/SKILL.md).
 
 When a workflow image, coordinator image, or included app image runs below the
 repository's Python minimum, also read
@@ -28,41 +29,6 @@ workflow-compatible remote function. Use
 [PPIFlow](../../../src/biomodals/workflow/ppiflow/workflow.py) for
 candidate-manifest joins, retained-candidate filtering, candidate-wide remote
 Tasks, focused task-image runtimes, and PPIFlow-specific stage wiring.
-
-## Working Rules
-
-- Keep `biomodals.schema` pure Pydantic and free of Modal imports.
-- Compose workflow deployments with the shared Modal execution host and
-  included dependency apps. Provider calls name operations exactly; the Modal
-  integration resolves them against the pinned containing deployment.
-- Build a kernel-owned `ExecutionDefinition`. Prefer app-backed Execution Nodes
-  for existing app operations; add workflow-owned Nodes only for adapters,
-  summaries, selectors, and workflow-specific file-management glue.
-- Execution Nodes prepare provider operations and adapt results, but never
-  submit directly.
-- Keep hydrated Modal objects out of workflow Nodes. Explicit development runs
-  may supply a function-name-to-handle map at the coordinator boundary.
-- Keep generic execution state and artifact records in `biomodals.execution`;
-  keep publication meaning and validation workload-owned. Do not add workflow
-  attempt tables, replacement-call loops, or a second task queue.
-- Import app-owned volume handles, volume names, and mountpoints from source app
-  modules, and reload relevant volumes before reading mutations committed by
-  another container.
-- When staging workflow-derived files for downstream apps, do not use full
-  artifact/provenance strings as local filenames. Derive short deterministic
-  names from candidate ids or content hashes because pipeline-derived names can
-  exceed filesystem component limits.
-- User-facing workflow local entrypoints should accept `dry_run: bool = False`.
-  When set, build the workflow, call `print_workflow_dag(workflow.validate())`,
-  and return before constructing or submitting the orchestrator. The workflow
-  CLI forwards `biomodals workflow run --dry-run` to this entrypoint flag.
-- When adding or changing workflow-compatible app functions, use RFdiffusion and
-  LigandMPNN as the current app-side reference implementations and coordinate
-  with the app-development skill.
-- Keep the kernel interface deep. Add shared behavior for repeated app and
-  workflow needs, not one-off workflow conveniences.
-- When similar functions serve different workflow roles, document each role's
-  behavior and rationale in its docstring or the owning design document.
 
 ## Verification
 

@@ -37,6 +37,7 @@ Keep paid-work limits deliberately small during pre-release validation:
 BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT=1
 BIOMODALS_GROMACS_ACTIVE_LIMIT=1
 BIOMODALS_ALPHAFOLD3_ACTIVE_LIMIT=1
+BIOMODALS_HUMANIZATION_ACTIVE_LIMIT=1
 BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=1
 ```
 
@@ -169,6 +170,10 @@ The checklist must order these actions:
    and ZIP schema. For a changed AlphaFold3 path, verify server validation and
    confirmation, Prepare environment, optional MSA and template searches,
    prediction, Prepare results, and the downloadable `.tar.zst` archive.
+   For humanization, verify four independent generator stages, union/evaluation,
+   useful partial outcomes, bounded table reads and CSV/ZIP downloads. Match the
+   containing workflow's scientific identity to the API before submission; older
+   archives retain their published schema and ranking.
 7. Stop on any unexpected invocation, stage, archive member, permission error,
    or configuration error. Capture the Job ID, request ID, safe stage, and
    timestamps before retrying; do not blindly resubmit paid work.

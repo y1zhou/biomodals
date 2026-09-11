@@ -63,6 +63,8 @@ def generated_pairs(
     method: HumanizationMethod,
     parent: AntibodyPair,
     result: AppRunResult,
+    *,
+    sapiens_iterations: int = 1,
 ) -> list[tuple[str, str, str, CandidateOrigin]]:
     """Decode one successful app call without mixing its chains or parental IDs."""
     if len(result.outputs) != 1 or not isinstance(
@@ -74,9 +76,15 @@ def generated_pairs(
         raise ValueError("Generator result exceeds byte limit")
     if method in {"sapiens", "humatch"}:
         members = archive_members(content)
-        frame = pl.read_csv(BytesIO(members["humanized.csv"]), infer_schema=False)
-        if frame.height != 1 or frame["id"].to_list() != [parent.id]:
+        filename = "iteration_designs.csv" if method == "sapiens" else "humanized.csv"
+        frame = pl.read_csv(BytesIO(members[filename]), infer_schema=False)
+        count = sapiens_iterations if method == "sapiens" else 1
+        if frame.height != count or not frame["id"].eq(parent.id).all():
             raise ValueError("Generator output does not match its parent")
+        if method == "sapiens" and frame["iteration"].to_list() != [
+            str(i) for i in range(1, count + 1)
+        ]:
+            raise ValueError("Sapiens output does not match requested iterations")
         rows = frame.to_dicts()
         seed = None
     else:
@@ -93,7 +101,9 @@ def generated_pairs(
         pair = AntibodyPair(id=parent.id, vh=row["vh"], vl=row["vl"])
         origin = CandidateOrigin(
             method=method,
-            source_id=row.get("candidate_id", parent.id),
+            source_id=f"{parent.id}__iteration_{row['iteration']}"
+            if method == "sapiens"
+            else row.get("candidate_id", parent.id),
             attempt_index=row.get("attempt_index"),
             seed=seed,
         )

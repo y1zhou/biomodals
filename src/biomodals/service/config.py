@@ -215,6 +215,14 @@ class ServiceSettings:
     modal_token_id: str | None
     modal_token_secret: str | None = field(repr=False)
 
+    @property
+    def humanization_max_pairs(self) -> int:
+        """Server-owned website admission bound within the workflow parser limit."""
+        value = _positive_integer(self.sources, "BIOMODALS_HUMANIZATION_MAX_PAIRS", 100)
+        if value > 200:
+            raise ValueError("BIOMODALS_HUMANIZATION_MAX_PAIRS must not exceed 200")
+        return value
+
     @classmethod
     def from_environment(
         cls,

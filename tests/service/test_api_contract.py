@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import zipfile
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
+import polars as pl
 
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.router import create_router as af3_router
@@ -24,13 +27,183 @@ from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import router as gromacs_routes
 from biomodals.service.gromacs.router import create_router as gromacs_router
 from biomodals.service.http_contract import require_session, require_unsafe_session
+from biomodals.service.humanization.modal import HumanizationToolAdapter
+from biomodals.service.humanization.results import SELECTION_SCHEMA
+from biomodals.service.humanization.router import create_router as humanization_router
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import JobLifecycle, ToolRegistration
-from biomodals.service.tools import ALPHAFOLD3_TOOL, GROMACS_TOOL, TOOLS
+from biomodals.service.tools import (
+    ALPHAFOLD3_TOOL,
+    GROMACS_TOOL,
+    HUMANIZATION_TOOL,
+    TOOLS,
+)
 
 ORIGIN = "https://biomodals.internal"
+
+
+def _humanization_input():
+    return {"pairs": [{"id": "ab_001", "vh": "ac de", "vl": "FGHI"}]}
+
+
+def _humanization_session(app):
+    session = _enabled_session(app)
+    app.dependency_overrides[require_unsafe_session] = lambda: session
+    app.dependency_overrides[require_session] = lambda: session
+    return session
+
+
+def test_humanization_submission_replay_and_row_errors(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    _humanization_session(app)
+    headers = {"Origin": ORIGIN, "Idempotency-Key": str(uuid4())}
+    payload = _humanization_input()
+    first = _request(
+        app, "POST", "/api/v1/humanization/jobs", json=payload, headers=headers
+    )
+    assert first.status_code == 202, first.text
+    replay = _request(
+        app, "POST", "/api/v1/humanization/jobs", json=payload, headers=headers
+    )
+    assert replay.json()["job_id"] == first.json()["job_id"]
+    payload["display_name"] = "Another job"
+    conflict = _request(
+        app, "POST", "/api/v1/humanization/jobs", json=payload, headers=headers
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "idempotency_conflict"
+    payload = {
+        "pairs": [
+            {"id": "same", "vh": "ACX", "vl": "FG"},
+            {"id": "same", "vh": "AC", "vl": ""},
+        ]
+    }
+    invalid = _request(
+        app, "POST", "/api/v1/humanization/jobs", json=payload, headers=headers
+    )
+    assert invalid.status_code == 422
+    assert {
+        (issue["row_index"], issue["field"], issue["code"])
+        for issue in invalid.json()["errors"]
+    } == {
+        (0, "vh", "sequence_invalid"),
+        (1, "vl", "sequence_invalid"),
+        (0, "id", "id_duplicate"),
+        (1, "id", "id_duplicate"),
+    }
+    invalid_settings = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json={**_humanization_input(), "settings": {"humatch_vh_target_family": "bad"}},
+        headers=headers,
+    )
+    assert invalid_settings.status_code == 422
+    assert invalid_settings.json()["errors"][0]["row_index"] is None
+
+
+def test_humanization_options_limits_and_unauthenticated_access(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    assert _request(app, "GET", "/api/v1/humanization/options").status_code == 401
+    _humanization_session(app)
+    options = _request(app, "GET", "/api/v1/humanization/options")
+    assert options.json()["max_pairs"] == 100
+    assert options.json()["max_vh_length"] == 142
+    assert options.json()["max_vl_length"] == 126
+    assert options.json()["defaults"]["hudiff_ab_candidate_count"] == 10
+    assert options.json()["defaults"]["pabnativ2_num_seeds"] == 1
+    seed_count = options.json()["settings_schema"]["properties"]["pabnativ2_num_seeds"]
+    assert (seed_count["type"], seed_count["minimum"], seed_count["maximum"]) == (
+        "integer",
+        1,
+        25,
+    )
+    assert (
+        options.json()["settings_schema"]["properties"]["humatch_vh_target_family"][
+            "enum"
+        ][1]
+        == "hv1"
+    )
+    oversized = {
+        "pairs": [{"id": f"ab_{i}", "vh": "ACDE", "vl": "FGHI"} for i in range(101)]
+    }
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json=oversized,
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 422
+    assert response.json()["errors"][0]["code"] == "batch_too_large"
+    oversized_body = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        content=b"{}",
+        headers={"Content-Length": str(4 * 1024 * 1024 + 1)},
+    )
+    assert oversized_body.status_code == 413
+
+
+def test_humanization_partial_table_owner_paging_download_and_cache_miss(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path)
+    session = _humanization_session(app)
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json=_humanization_input(),
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 202, response.text
+    job_id = UUID(response.json()["job_id"])
+    cache = app.state.cache
+    staging = cache.staging_path(str(job_id))
+    csv = pl.DataFrame(
+        [
+            {"parent_id": "ab_001", "candidate_id": "01", "panel_order": None},
+            {"parent_id": "ab_001", "candidate_id": "02", "panel_order": 10},
+            {"parent_id": "ab_001", "candidate_id": "03", "panel_order": 2},
+        ],
+        schema=SELECTION_SCHEMA,
+    ).write_csv()
+    with zipfile.ZipFile(staging, "w") as archive:
+        archive.writestr("selection.csv", csv)
+    size = staging.stat().st_size
+    digest = hashlib.sha256(staging.read_bytes()).hexdigest()
+    asyncio.run(
+        cache.publish_staged(str(job_id), staging, size_bytes=size, sha256=digest)
+    )
+    app.state.store.complete_job(
+        job_id,
+        result_state=JobState.PARTIAL,
+        result_filename="humanization.zip",
+        result_media_type="application/zip",
+        result_size_bytes=size,
+        result_sha256=digest,
+        result_archive_schema="humanization/1",
+        now=3,
+    )
+    path = f"/api/v1/humanization/jobs/{job_id}/selection"
+    page = _request(app, "GET", path, params={"sort_by": "panel_order", "limit": 1})
+    assert page.status_code == 200, page.text
+    assert page.json()["rows"][0]["candidate_id"] == "03"
+    assert page.json()["total_rows"] == 3
+    assert _request(app, "GET", path + ".csv").text == csv
+    assert _request(app, "GET", path, params={"sort_by": "bogus"}).status_code == 422
+    assert _request(app, "GET", path, params={"limit": 201}).status_code == 422
+    app.dependency_overrides[require_session] = _session
+    assert _request(app, "GET", path).status_code == 404
+    app.dependency_overrides[require_session] = lambda: session
+    cache.discard(str(job_id))
+    missing = _request(app, "GET", path)
+    assert missing.status_code == 409
+    assert missing.json()["code"] == "result_not_cached"
 
 
 class Remote:
@@ -76,6 +249,7 @@ def _app(tmp_path: Path):
     registrations = (
         ToolRegistration(GROMACS_TOOL, Adapter()),
         ToolRegistration(ALPHAFOLD3_TOOL, Adapter()),
+        ToolRegistration(HUMANIZATION_TOOL, Adapter()),
     )
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     app = create_app(
@@ -96,6 +270,14 @@ def _app(tmp_path: Path):
                 validations=validations,
                 adapter=alphafold3_adapter,
                 remote=remote,
+            ),
+            humanization_router(
+                store=store,
+                configuration=configuration,
+                pending=pending,
+                remote=remote,
+                cache=cache,
+                adapter=HumanizationToolAdapter(pending),
             ),
         ),
         remote=remote,
@@ -121,6 +303,104 @@ def _session(user_id: UUID | None = None) -> AuthenticatedSession:
         last_seen_at=now,
         absolute_expires_at=now + 3600,
     )
+
+
+def test_humanization_length_limits_reject_before_remote_admission(
+    tmp_path, monkeypatch
+):
+    app = _app(tmp_path)
+    _humanization_session(app)
+
+    async def no_preflight(*args):
+        raise AssertionError("Invalid lengths reached remote admission")
+
+    monkeypatch.setattr(Remote, "preflight", no_preflight)
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json={"pairs": [{"id": "long", "vh": "A" * 143, "vl": "C" * 127}]},
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    assert response.status_code == 422
+    assert {(issue["field"], issue["code"]) for issue in response.json()["errors"]} == {
+        ("vh", "sequence_too_long"),
+        ("vl", "sequence_too_long"),
+    }
+
+
+def test_humanization_rerun_inputs_are_private_editable_and_not_submitted(
+    tmp_path, monkeypatch
+):
+    from biomodals.service.humanization import modal as humanization_modal
+    from biomodals.workflow.humanization.contracts import AntibodyPair
+    from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
+    from biomodals.workflow.humanization.settings import HumanizationSettings
+
+    app = _app(tmp_path)
+    session = _humanization_session(app)
+    payload = {
+        "display_name": "Original job",
+        "pairs": [{"id": "boundary", "vh": "A" * 142, "vl": "C" * 126}],
+        "settings": {
+            "sapiens_iterations": 3,
+            "pabnativ2_num_seeds": 2,
+            "pabnativ2_seed": 0,
+            "hudiff_ab_seed": 42,
+            "humatch_mutate_cdrs": True,
+        },
+    }
+    submitted = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json=payload,
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    assert submitted.status_code == 202
+    job_id = UUID(submitted.json()["job_id"])
+    path = f"/api/v1/humanization/jobs/{job_id}/inputs"
+    restored = _request(app, "GET", path)
+    assert restored.status_code == 200
+    assert restored.headers["cache-control"] == "private, no-store"
+    assert restored.json()["pairs"] == payload["pairs"]
+    assert (
+        restored.json()["settings"]
+        == HumanizationSettings(**payload["settings"]).model_dump()
+    )
+    assert restored.json()["display_name"] == payload["display_name"]
+    app.dependency_overrides[require_session] = _session
+    assert _request(app, "GET", path).status_code == 404
+    app.dependency_overrides.pop(require_session)
+    assert _request(app, "GET", path).status_code == 401
+    app.dependency_overrides[require_session] = lambda: session
+    # A cancelled historical input remains editable even though new admission rejects it.
+    PendingRequestStore(tmp_path / "pending").delete(job_id)
+    app.state.store.request_cancel(job_id, now=3)
+    retained = HumanizationExecutionRequest(
+        run_name="old", pairs=(AntibodyPair(id="old", vh="A" * 192, vl="C" * 106),)
+    )
+    monkeypatch.setattr(
+        humanization_modal.HumanizationToolAdapter, "_volume", lambda *_: object()
+    )
+    monkeypatch.setattr(
+        humanization_modal, "load_execution_request_from_volume", lambda *_: retained
+    )
+    assert len(_request(app, "GET", path).json()["pairs"][0]["vh"]) == 192
+    assert (
+        app.state.store.get_job(session.principal.user_id, job_id).state
+        == JobState.CANCELLED
+    )
+
+    def unavailable(*args):
+        raise FileNotFoundError("removed")
+
+    monkeypatch.setattr(
+        humanization_modal, "load_execution_request_from_volume", unavailable
+    )
+    response = _request(app, "GET", path)
+    assert response.status_code == 404
+    assert response.json()["code"] == "job_input_unavailable"
 
 
 def _enabled_session(app) -> AuthenticatedSession:

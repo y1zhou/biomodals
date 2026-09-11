@@ -439,7 +439,7 @@ size is modest. Store each pair under
 `structures/pair_NNNN/input.pdb` and `final.pdb`, with a one-based four-digit
 row number. Retain the original ID in tables and the manifest's `structure_ids`
 mapping. Short internal names avoid upstream dot truncation and filesystem
-byte limits; see [the output identifier decision](../../adr/0011-humanization-output-identifiers.md).
+byte limits; see [the output identifier decision](../../adr/0010-humanization-publication-contract.md#identifiers).
 Omit PNG, PAP, ChimeraX, and full DMS intermediates by default.
 
 The public coordinate system is fixed to chain-local AHo positions spanning

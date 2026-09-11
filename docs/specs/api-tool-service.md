@@ -81,6 +81,7 @@ GET  /api/v1/alphafold3/validations/{validation_id}
 GET  /api/v1/alphafold3/validations/{validation_id}/document
 DELETE /api/v1/alphafold3/validations/{validation_id}
 POST /api/v1/alphafold3/jobs
+POST /api/v1/humanization/jobs
 ```
 
 Lifecycle and delivery are shared:
@@ -102,8 +103,10 @@ per-Job serialization.
 The background reconciler runs every 60 seconds by default. While a root
 Function Call is active it uses the SDK's nonblocking root-call status only;
 it reads the detailed coordinator ledger after terminal root completion or an
-interactive detail/refresh request. Root-call failure is terminal rather than
-indistinguishable from an active timeout.
+interactive detail/refresh request. A failed root call triggers a coordinator
+ledger read: the Run may be durably suspended rather than terminal. It is not
+treated as an active timeout. Explicit refresh reads detailed status even
+while the root call is active, without launching a replacement coordinator.
 An active timeout touches only `jobs.updated_at`, moving that Job behind older
 reconciliation candidates without pretending that its detailed projection was
 refreshed. This lets a bounded 100-Job pass rotate fairly without another
@@ -399,7 +402,7 @@ short `Retry-After`; historical window reads do not consume these permits.
 
 Tool configuration controls whether logs are Administrator-only or also
 available to the owning User. GROMACS initially allows owner access;
-AlphaFold3 initially restricts logs to Administrators.
+AlphaFold3 and humanization initially restrict logs to Administrators.
 
 ## Modal billing
 
@@ -410,8 +413,11 @@ parallel Tool and Environment groupings. The current-environment summary uses
 the selected report interval and displays zero when that Environment has no
 reported usage.
 
-Deployed Tool Apps carry a stable `biomodals_tool` tag (`gromacs` or
-`alphafold3`). Billing reports request this tag and use it as the only reliable
+Deployed Tool Apps and workflows carry a stable `biomodals_tool` tag (`gromacs`,
+`alphafold3`, or `humanization`). Humanization tags the containing workflow
+deployment, covering its included model functions and coordinator. Billing
+recognizes keys from the service's Tool registry rather than a separate allowlist.
+Billing reports request this tag and use it as the only reliable
 Tool attribution key. Untagged or unknown values remain **Other / untagged**;
 historical usage from before tagging is not guessed from object
 descriptions. This fallback applies only to the Tool breakdown: every billing
@@ -434,16 +440,18 @@ synthetic zero-cost report.
 
 ## Frontend routing
 
-GROMACS and AlphaFold3 retain contextual Job URLs while sharing one generic Job
+Registered Tools retain contextual Job URLs while sharing one generic Job
 detail component:
 
 ```text
 /tools/gromacs/jobs/{job_id}
 /tools/alphafold3/jobs/{job_id}
+/tools/humanization/jobs/{job_id}
 ```
 
 The component verifies that the Tool in the returned Job matches its route.
-After implementation AlphaFold3 is an available catalog Tool rather than WIP.
+Humanization-specific submission and table behavior is defined in its
+[service contract](humanization-service.md); shared Job behavior remains here.
 
 ## Deployment validation
 

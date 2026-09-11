@@ -164,7 +164,7 @@ def test_humanize_chain_preserves_parental_cdr_each_iteration(monkeypatch) -> No
 
     monkeypatch.setattr(sapiens_app, "_predict_scores", fake_predict)
 
-    chain, score_frames, mutations = sapiens_app._humanize_chain(
+    chain, designs, score_frames, mutations = sapiens_app._humanize_chain(
         identifier="pair",
         chain_label="vh",
         sequence="AAAA",
@@ -176,6 +176,7 @@ def test_humanize_chain_preserves_parental_cdr_each_iteration(monkeypatch) -> No
     )
 
     assert chain.seq == "DADD"
+    assert designs == ["CACC", "DADD"]
     assert [frame["endpoint"][0] for frame in score_frames] == ["input", "final"]
     assert {row["iteration"] for row in mutations} == {1, 2}
     assert all(row["numbered_position"] != "H2" for row in mutations)
@@ -204,6 +205,9 @@ def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
             == expected_schema
         )
         assert b'"schema_version": 2' in (result_dir / "manifest.json").read_bytes()
+        assert pl.read_csv(result_dir / "iteration_designs.csv").to_dicts() == [
+            {"id": "pair 1", "iteration": 1, "vh": "AAAA", "vl": "CCCC"}
+        ]
         return b"archive"
 
     monkeypatch.setattr(sapiens_app, "package_outputs", fake_package_outputs)
@@ -211,6 +215,7 @@ def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
         run_name="demo",
         input_frame=pl.DataFrame([{"id": "pair 1", "vh": "AAAA", "vl": "CCCC"}]),
         humanized_rows=[{"id": "pair 1", "vh": "AAAA", "vl": "CCCC"}],
+        iteration_rows=[{"id": "pair 1", "iteration": 1, "vh": "AAAA", "vl": "CCCC"}],
         score_frames=[pl.DataFrame({"id": ["pair 1"]})],
         mutation_rows=[],
         iterations=1,
@@ -220,6 +225,49 @@ def test_result_bundle_writes_typed_mutation_history(monkeypatch) -> None:
     )
 
     assert archive == b"archive"
+
+
+def test_paired_iteration_outputs_keep_matching_chain_passes(monkeypatch):
+    """Collect each pass without remixing chains or running extra inference."""
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(set_num_threads=lambda _: None)
+    )
+    monkeypatch.setattr(
+        sapiens_app,
+        "_number_chain",
+        lambda **kwargs: FakeChain(
+            kwargs["sequence"],
+            name=kwargs["identifier"],
+            scheme="kabat",
+            cdr_definition="kabat",
+        ),
+    )
+    predictions = []
+    replacements = {"AAAA": "CCCC", "CACC": "DDDD", "EEEE": "FFFF", "FEFF": "GGGG"}
+
+    def predict(chain, model_root):
+        predictions.append(chain.seq)
+        return _scores(replacements.get(chain.seq, chain.seq))
+
+    def package(**kwargs):
+        assert kwargs["iteration_rows"] == [
+            {"id": "a", "iteration": 1, "vh": "CACC", "vl": "FEFF"},
+            {"id": "a", "iteration": 2, "vh": "DADD", "vl": "GEGG"},
+        ]
+        assert kwargs["humanized_rows"] == [{"id": "a", "vh": "DADD", "vl": "GEGG"}]
+        return b"archive"
+
+    monkeypatch.setattr(sapiens_app, "_predict_scores", predict)
+    monkeypatch.setattr(sapiens_app, "_write_result_bundle", package)
+    sapiens_app._run_sapiens_humanization(
+        run_name="test",
+        csv_bytes=b"id,vh,vl\na,AAAA,EEEE\n",
+        iterations=2,
+        numbering_scheme="kabat",
+        cdr_definition="kabat",
+        mutate_cdrs=False,
+    )
+    assert predictions == ["AAAA", "CACC", "DADD", "EEEE", "FEFF", "GEGG"]
 
 
 def test_workflow_function_returns_inline_archive(monkeypatch) -> None:

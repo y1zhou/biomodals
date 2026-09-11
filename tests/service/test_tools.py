@@ -4,6 +4,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from biomodals.execution import (
     ActiveProviderCallCounts,
     NodeStatus,
@@ -11,9 +13,119 @@ from biomodals.execution import (
     RunStatus,
     WorkStatusReason,
 )
-from biomodals.service.tools import GROMACS_TOOL, project_overview
+from biomodals.service.tools import GROMACS_TOOL, HUMANIZATION_TOOL, project_overview
 
 CALL_HANDLE = "fc-provider"
+
+
+def test_historical_humanization_plan_keeps_its_recorded_aggregate_stage():
+    overview = SimpleNamespace(
+        run=SimpleNamespace(status=RunStatus.RUNNING),
+        nodes=(
+            SimpleNamespace(
+                node_key="generate",
+                status=NodeStatus.RUNNING,
+                status_reason=None,
+                started_at=10,
+                completed_at=None,
+            ),
+        ),
+        representative_provider_calls=(),
+        active_provider_calls=ActiveProviderCallCounts(total=0, gpu=0),
+        node_task_status_counts=(),
+    )
+    [stage] = project_overview(HUMANIZATION_TOOL, overview)["stages"]
+    assert (stage["code"], stage["label"], stage["started_at"]) == (
+        "generate",
+        "Generate candidates",
+        10,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        (NodeStatus.RUNNING, None),
+        (NodeStatus.PARTIAL, "partial"),
+        (NodeStatus.FAILED, "failed"),
+        (NodeStatus.CANCELLED, "cancelled"),
+    ],
+)
+def test_humanization_methods_keep_independent_status_timing_and_counts(
+    status, outcome
+):
+    states = [
+        NodeStatus.SUCCEEDED,
+        NodeStatus.SUCCEEDED,
+        status,
+        NodeStatus.RUNNING,
+        NodeStatus.PENDING,
+        NodeStatus.PENDING,
+    ]
+    codes = [
+        "generate_sapiens",
+        "generate_humatch",
+        "generate_pabnativ2",
+        "generate_hudiff_ab",
+        "union",
+        "evaluate",
+    ]
+    overview = SimpleNamespace(
+        run=SimpleNamespace(status=RunStatus.RUNNING),
+        nodes=tuple(
+            SimpleNamespace(
+                node_key=code,
+                status=state,
+                status_reason=None,
+                started_at=10 if index < 4 else None,
+                completed_at=20 + index if state.is_terminal else None,
+            )
+            for index, (code, state) in enumerate(zip(codes, states, strict=True))
+        ),
+        representative_provider_calls=tuple(
+            SimpleNamespace(
+                node_key=code,
+                provider_call_handle_id=f"fc-{code}",
+                status=ProviderCallStatus.RUNNING,
+            )
+            for code, state in zip(codes, states, strict=True)
+            if state == NodeStatus.RUNNING
+        ),
+        active_provider_calls=ActiveProviderCallCounts(total=2, gpu=2),
+        node_task_status_counts=tuple(
+            SimpleNamespace(
+                node_key=code,
+                pending=0,
+                running=int(state == NodeStatus.RUNNING),
+                succeeded=int(state == NodeStatus.SUCCEEDED),
+                failed=0,
+                cancelled=0,
+                skipped=0,
+            )
+            for code, state in zip(codes, states, strict=True)
+        ),
+    )
+    stages = project_overview(
+        HUMANIZATION_TOOL,
+        overview,
+        queued_provider_call_handles=frozenset({"fc-generate_hudiff_ab"}),
+    )["stages"]
+    assert [stage["code"] for stage in stages] == codes
+    assert [stage["label"] for stage in stages[:4]] == [
+        "Sapiens",
+        "Humatch",
+        "p-AbNatiV2",
+        "HuDiff",
+    ]
+    assert [stage["ended_at"] for stage in stages[:2]] == [20, 21]
+    assert all(stage["outcome"] == "completed" for stage in stages[:2])
+    assert stages[2]["outcome"] == outcome
+    assert stages[2]["ended_at"] == (22 if status.is_terminal else None)
+    assert stages[3]["provider_state"] == "queued"
+    assert stages[3]["task_counts"]["running"] == 1
+    assert stages[4]["started_at"] is None
+    assert stages[5]["outcome"] is None
+    assert [stage["node_keys"] for stage in stages] == [[code] for code in codes]
 
 
 def test_projection_marks_only_active_remote_stages() -> None:

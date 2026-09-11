@@ -1624,6 +1624,13 @@ hosting live under `biomodals.execution.modal`. Provider SDK objects do not
 leak into plans or persisted models. This is a narrow provider seam, not a
 plugin registry or universal coordinator deployment.
 
+A provider cancellation acknowledgement may conclusively confirm termination
+without a retained result from subsequent polling. The Modal adapter returns
+an explicit `CANCELLED` observation only after its cancellation RPC succeeds;
+the runtime checkpoints that evidence through its normal terminal transition.
+A request-only acknowledgement or RPC error does not release ownership, and
+an already-recorded terminal outcome is never overwritten.
+
 ### Result Envelope and split completion
 
 Provider Call completion and scientific Task completion are deliberately

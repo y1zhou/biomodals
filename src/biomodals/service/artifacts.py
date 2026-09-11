@@ -104,17 +104,27 @@ class ArtifactLease:
         self._cache = cache
         self._job_id = job_id
 
-    def read(self, size: int) -> bytes:
+    def read(self, size: int = -1) -> bytes:
         """Read bytes from the verified descriptor."""
         if self._descriptor is None:
             raise ValueError("Artifact lease is closed")
+        if size < 0:
+            size = os.fstat(self._descriptor).st_size - self.tell()
         return os.read(self._descriptor, size)
 
-    def seek(self, offset: int) -> None:
-        """Move the verified descriptor to an absolute byte offset."""
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Seek the verified descriptor, including archive directory reads."""
         if self._descriptor is None:
             raise ValueError("Artifact lease is closed")
-        os.lseek(self._descriptor, offset, os.SEEK_SET)
+        return os.lseek(self._descriptor, offset, whence)
+
+    def tell(self) -> int:
+        """Return the position for file-like archive readers."""
+        return self.seek(0, os.SEEK_CUR)
+
+    def seekable(self) -> bool:
+        """Cached archives are regular files."""
+        return True
 
     def close(self) -> None:
         """Close the descriptor and make its cache entry evictable."""

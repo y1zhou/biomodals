@@ -11,6 +11,8 @@ from typing import Any
 
 import modal
 
+from biomodals.service.tools import TOOLS
+
 
 @dataclass(frozen=True, slots=True)
 class CostGroup:
@@ -72,6 +74,7 @@ class BillingService:
 
 
 def _summarize(rows: list[Any]) -> BillingSummary:
+    known_tools = {tool.key for tool in TOOLS}
     total = Decimal(0)
     environments: dict[str, Decimal] = {}
     tools: dict[str, Decimal] = {}
@@ -83,7 +86,7 @@ def _summarize(rows: list[Any]) -> BillingSummary:
             environments.get(row.environment_name, Decimal(0)) + cost
         )
         tool = row.tags.get("biomodals_tool")
-        if tool in {"gromacs", "alphafold3"}:
+        if tool in known_tools:
             tools[tool] = tools.get(tool, Decimal(0)) + cost
         else:
             other += cost

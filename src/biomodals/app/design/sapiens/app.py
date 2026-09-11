@@ -2,7 +2,8 @@
 
 Humanize complete VH-VL pairs with the BioPhi Sapiens argmax procedure. Input
 is a UTF-8 CSV with exactly ``id,vh,vl`` columns. The result is one inline
-``.tar.zst`` bundle containing paired sequences, mutation provenance, and the
+``.tar.zst`` bundle containing final paired sequences, paired designs after
+each pass in ``iteration_designs.csv``, mutation provenance, and the
 20-amino-acid Sapiens score matrices for the input and final sequences.
 
 Parental CDRs are preserved by default. Numbering and CDR definitions are
@@ -292,7 +293,7 @@ def _humanize_chain(
     cdr_definition: str,
     mutate_cdrs: bool,
     model_root: Path,
-) -> tuple[Any, list[pl.DataFrame], list[dict[str, Any]]]:
+) -> tuple[Any, list[str], list[pl.DataFrame], list[dict[str, Any]]]:
     parental = _number_chain(
         identifier=identifier,
         chain_label=chain_label,
@@ -313,6 +314,7 @@ def _humanize_chain(
         )
     ]
     mutation_rows: list[dict[str, Any]] = []
+    designs = []
     for iteration in range(1, iterations + 1):
         scores = (
             input_scores if iteration == 1 else _predict_scores(current, model_root)
@@ -340,6 +342,7 @@ def _humanize_chain(
                     "to_aa": after,
                 })
         current = next_chain
+        designs.append(current.seq)
 
     final_scores = _predict_scores(current, model_root)
     score_frames.append(
@@ -351,7 +354,7 @@ def _humanize_chain(
             scores=final_scores,
         )
     )
-    return current, score_frames, mutation_rows
+    return current, designs, score_frames, mutation_rows
 
 
 def _write_result_bundle(
@@ -359,6 +362,7 @@ def _write_result_bundle(
     run_name: str,
     input_frame: pl.DataFrame,
     humanized_rows: list[dict[str, str]],
+    iteration_rows: list[dict[str, Any]],
     score_frames: list[pl.DataFrame],
     mutation_rows: list[dict[str, Any]],
     iterations: int,
@@ -375,6 +379,15 @@ def _write_result_bundle(
             schema={column: pl.String for column in CSV_COLUMNS},
         )
         humanized.write_csv(result_dir / "humanized.csv")
+        pl.DataFrame(
+            iteration_rows,
+            schema={
+                "id": pl.String,
+                "iteration": pl.Int64,
+                "vh": pl.String,
+                "vl": pl.String,
+            },
+        ).write_csv(result_dir / "iteration_designs.csv")
         fasta_lines = [
             line
             for row in humanized_rows
@@ -489,12 +502,14 @@ def _run_sapiens_humanization(
     torch.set_num_threads(2)
     started_at = time.perf_counter()
     humanized_rows: list[dict[str, str]] = []
+    iteration_rows: list[dict[str, Any]] = []
     score_frames: list[pl.DataFrame] = []
     mutation_rows: list[dict[str, Any]] = []
     for row in input_frame.iter_rows(named=True):
         humanized_row = {"id": row["id"]}
+        designs_by_chain = {}
         for chain_label in ("vh", "vl"):
-            chain, chain_scores, chain_mutations = _humanize_chain(
+            chain, designs, chain_scores, chain_mutations = _humanize_chain(
                 identifier=row["id"],
                 chain_label=chain_label,
                 sequence=row[chain_label],
@@ -505,13 +520,22 @@ def _run_sapiens_humanization(
                 model_root=model_root,
             )
             humanized_row[chain_label] = chain.seq
+            designs_by_chain[chain_label] = designs
             score_frames.extend(chain_scores)
             mutation_rows.extend(chain_mutations)
         humanized_rows.append(humanized_row)
+        iteration_rows.extend(
+            {"id": row["id"], "iteration": iteration, "vh": vh, "vl": vl}
+            for iteration, (vh, vl) in enumerate(
+                zip(designs_by_chain["vh"], designs_by_chain["vl"], strict=True),
+                start=1,
+            )
+        )
     archive = _write_result_bundle(
         run_name=run_name,
         input_frame=input_frame,
         humanized_rows=humanized_rows,
+        iteration_rows=iteration_rows,
         score_frames=score_frames,
         mutation_rows=mutation_rows,
         iterations=iterations,

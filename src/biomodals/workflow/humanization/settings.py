@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,10 +37,28 @@ class HumanizationSettings(BaseModel):
     )
     pabnativ2_forbidden_residues: str = "C,M"
     pabnativ2_seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
+    pabnativ2_num_seeds: int = Field(
+        default=1,
+        ge=1,
+        le=25,
+        strict=True,
+        description="Independent optimization runs per parent; distinct seeds do not guarantee distinct candidates.",
+    )
     hudiff_ab_candidate_count: int = Field(default=10, ge=1, le=25, strict=True)
     hudiff_ab_seed: int = Field(default=42, ge=0, le=2**32 - 1, strict=True)
     hudiff_ab_sampling_order: Literal["shuffle", "left_to_right"] = "shuffle"
     hudiff_ab_upstream_inference_dropout: bool = True
+
+    @property
+    def pabnativ2_seeds(self) -> tuple[int, ...]:
+        """Preserve one native root or deterministically sample distinct replicate roots."""
+        if self.pabnativ2_num_seeds == 1:
+            return (self.pabnativ2_seed,)
+        return tuple(
+            random.Random(self.pabnativ2_seed).sample(  # noqa: S311 - reproducible science, not security
+                range(2**32), self.pabnativ2_num_seeds
+            )
+        )
 
     def method_arguments(self, method: str) -> dict[str, Any]:
         """Strip only the owning method's prefix for its native app operation."""
@@ -47,5 +66,5 @@ class HumanizationSettings(BaseModel):
         return {
             key.removeprefix(prefix): value
             for key, value in self.model_dump().items()
-            if key.startswith(prefix)
+            if key.startswith(prefix) and key != "pabnativ2_num_seeds"
         }

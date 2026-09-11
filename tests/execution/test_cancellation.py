@@ -2,6 +2,8 @@
 
 # ruff: noqa: D101, D102, D103, D107, S106
 
+import pytest
+
 from biomodals.execution import (
     NodeStatus,
     ProviderCallStatus,
@@ -11,6 +13,7 @@ from biomodals.execution import (
     WorkStatusReason,
 )
 from biomodals.execution.modal import (
+    ModalCallDriver,
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
@@ -21,7 +24,86 @@ from .provider_call_helpers import (
     RUN_ID,
     create_repository,
     persist_fixed_policy,
+    persist_pull_policy,
 )
+
+
+@pytest.mark.parametrize("pruned", [False, True])
+@pytest.mark.parametrize("pull_worker", [False, True])
+def test_modal_cancellation_ack_closes_owner_despite_pending_get(
+    pruned, pull_worker
+) -> None:
+    repository = create_repository(task_count=1)
+    if pull_worker:
+        persist_pull_policy(
+            repository, binding=GPU_BINDING, compatibility_key="gpu", claim_capacity=1
+        )
+        claim = repository.preclaim_pull_worker(
+            RUN_ID,
+            "inference",
+            submission_token="worker",
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            claim_capacity=1,
+            now=110,
+        )
+    else:
+        persist_fixed_policy(
+            repository, ("seed-0",), binding=GPU_BINDING, compatibility_key="gpu"
+        )
+        claim = repository.preclaim_fixed_batch(
+            RUN_ID,
+            "inference",
+            ("seed-0",),
+            submission_token="batch",
+            binding=GPU_BINDING,
+            compatibility_key="gpu",
+            now=110,
+        )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id, provider_call_handle_id="fc-123", now=111
+    )
+    if pull_worker:
+        repository.claim_pull_tasks(
+            claim.call.provider_call_id, request_id="claim", capacity=1, now=112
+        )
+    checkpoints = []
+
+    class Call:
+        def cancel(self):
+            # Intent crosses the durability boundary before the provider RPC.
+            assert checkpoints
+
+        def get(self, timeout=0):
+            raise TimeoutError("cancelled input has no retained result")
+
+    driver = ModalCallDriver(call_resolver=lambda _: Call())
+    runtime = ExecutionRuntime(
+        repository,
+        provider_driver=driver,
+        checkpoint=lambda: checkpoints.append(
+            repository.get_provider_call(claim.call.provider_call_id).status
+        ),
+    )
+    assert driver.observe("fc-123").kind == ProviderCallObservationKind.RUNNING
+    if pruned:
+        runtime.prune_unrequired_nodes(RUN_ID, required_node_keys=set(), now=120)
+    else:
+        runtime.cancel_run(RUN_ID, now=120)
+    assert checkpoints[-1] == ProviderCallStatus.CANCELLED
+    task = repository.get_task(RUN_ID, "inference", "seed-0")
+    assert task.status == TaskStatus.CANCELLED
+    if pruned:
+        assert task.status_reason == WorkStatusReason.RESULT_ALREADY_SATISFIED
+    assert repository.active_provider_call_counts(RUN_ID).total == 0
+    assert driver.observe("fc-123").kind == ProviderCallObservationKind.RUNNING
+    runtime.reconcile_provider_calls(
+        RUN_ID, required_node_keys={"inference"}, encode_result=lambda x: x, now=121
+    )
+    assert repository.get_provider_call(claim.call.provider_call_id).status == (
+        ProviderCallStatus.CANCELLED
+    )
 
 
 class CancelDriver:
@@ -45,6 +127,42 @@ class CancelDriver:
         if self.cancel_error is not None:
             raise self.cancel_error
         self.cancelled.append(provider_call_handle_id)
+
+
+def test_cancel_ack_preserves_success_recorded_during_provider_rpc() -> None:
+    repository = create_repository(task_count=1)
+    persist_fixed_policy(
+        repository, ("seed-0",), binding=GPU_BINDING, compatibility_key="gpu"
+    )
+    claim = repository.preclaim_fixed_batch(
+        RUN_ID,
+        "inference",
+        ("seed-0",),
+        submission_token="batch",
+        binding=GPU_BINDING,
+        compatibility_key="gpu",
+        now=110,
+    )
+    assert claim is not None
+    repository.attach_provider_call(
+        claim.call.provider_call_id, provider_call_handle_id="fc-123", now=111
+    )
+    envelope = {"outputs": "published"}
+
+    class RacingDriver(CancelDriver):
+        def cancel(self, provider_call_handle_id):
+            repository.record_provider_call_result(
+                claim.call.provider_call_id, result_envelope=envelope, now=119
+            )
+            return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)
+
+    runtime = ExecutionRuntime(
+        repository, provider_driver=RacingDriver(), checkpoint=lambda: None
+    )
+    runtime.cancel_run(RUN_ID, now=120)
+    call = repository.get_provider_call(claim.call.provider_call_id)
+    assert call.status == ProviderCallStatus.SUCCEEDED
+    assert call.result_envelope == envelope
 
 
 def test_pending_run_cancels_without_provider_work() -> None:

@@ -108,8 +108,18 @@ def humanization_execution_graph(
     """Reconstruct the existing generation/union/evaluation graph."""
     from biomodals.workflow.humanization.workflow import build_humanization_graph
 
-    if request.scientific_versions != _scientific_versions():
-        raise ValueError("Target deployment changed humanization scientific versions")
+    target_versions = _scientific_versions()
+    if request.scientific_versions != target_versions:
+        changed = sorted(
+            name
+            for name in request.scientific_versions.keys() | target_versions.keys()
+            if request.scientific_versions.get(name) != target_versions.get(name)
+        )
+        raise ValueError(
+            "Target deployment changed humanization scientific versions: "
+            f"{', '.join(changed)}. Update the API and containing workflow from the "
+            "same checkout, pin the matching deployment, and submit a new Job."
+        )
     return build_humanization_graph(request.pairs, request.settings)
 
 

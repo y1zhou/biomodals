@@ -124,14 +124,15 @@ def test_staged_host_returns_partial_overview_and_reopens_without_resubmission(
     assert table.select("parent_id", "is_parent").rows() == [("a", True)]
 
 
-def test_staged_host_rejects_different_scientific_version(tmp_path):
+@pytest.mark.parametrize("component", ["sapiens", "hudiff_ab"])
+def test_staged_host_rejects_different_scientific_version(tmp_path, component):
     """A changed deployed runtime cannot silently execute an older staged request."""
     request = HumanizationExecutionRequest(
         run_name="test", pairs=(AntibodyPair(id="a", vh="ACD", vl="EFG"),)
     )
     request = replace(
         request,
-        scientific_versions={**request.scientific_versions, "sapiens": "changed"},
+        scientific_versions={**request.scientific_versions, component: "changed"},
     )
     run_id = UUID(int=3)
     persist_execution_request(tmp_path, run_id, request)
@@ -143,5 +144,8 @@ def test_staged_host_rejects_different_scientific_version(tmp_path):
         output_volume_name="workflow",
         provider_driver=object(),
     )
-    with pytest.raises(ValueError, match="scientific"):
+    with pytest.raises(ValueError) as error:
         coordinator.run()
+    assert f"scientific versions: {component}." in str(error.value)
+    assert "same checkout" in str(error.value)
+    assert "new Job" in str(error.value)

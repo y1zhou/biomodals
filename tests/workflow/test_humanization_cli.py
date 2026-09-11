@@ -31,13 +31,14 @@ def test_workflow_calls_public_app_validator(monkeypatch, method):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("identity", ["pabnativ2", "hudiff_ab.patch"])
+@pytest.mark.parametrize("identity", ["pabnativ2", "hudiff_ab", "hudiff_ab.patch"])
 def test_app_scientific_identity_changes_workflow_fingerprint(monkeypatch, identity):
     """Patch/wrapper/asset identities must reach the execution reuse boundary."""
     from biomodals.execution.definition_plan import execution_plan
 
     expected = {
         "pabnativ2": workflow.pabnativ2_app.SCIENTIFIC_RUNTIME_IDENTITY,
+        "hudiff_ab": workflow.hudiff_app.RUNTIME_IDENTITY,
         "hudiff_ab.patch": workflow.hudiff_app.patch_identity(),
     }
     assert workflow.SCIENTIFIC_VERSIONS[identity] == expected[identity]

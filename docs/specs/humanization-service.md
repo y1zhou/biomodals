@@ -134,6 +134,15 @@ Graph successors retain validated successful publications, including when the
 terminal bundle belongs to a predecessor Run. The service does not own a
 second scheduler or open remote execution ledgers.
 
+The staged request retains scientific versions from the submitting API's
+checkout; the coordinator requires them to match its own deployment. These
+versions include HuDiff's resolved runtime environment digest, imported from
+the app automatically, so a dependency update can change this identity without
+a workflow-code change. Update the API checkout and containing workflow
+together, pin the matching deployment, and restart the API. A mismatch error
+names the differing components; submit a new Job after aligning versions.
+Do not rewrite an older request's identities or bypass the check.
+
 ### Result preparation
 
 Result membership and compatibility follow the

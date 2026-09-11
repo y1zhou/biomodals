@@ -50,6 +50,48 @@ in-container path. These file values remain database-overridable defaults.
 The humanization workflow deployment includes its four dependent apps; it
 does not require separate deployments of those generators.
 
+## First-administrator bootstrap
+
+For unattended first deployment, generate an Argon2id password hash locally:
+
+```console
+uv run biomodals api admin hash-password
+```
+
+The command prompts twice with input hidden, applies the normal password
+policy, and prints only the hash to stdout. It does not access the database,
+load service configuration, or contact Modal. Do not pass the password as a
+command argument or put it in shell history.
+
+Place the email and generated hash in the private file selected by
+`BIOMODALS_API_CONF_ENV`:
+
+```dotenv
+BIOMODALS_DEFAULT_ADMIN_EMAIL=admin@example.com
+BIOMODALS_DEFAULT_ADMIN_PASSWORD_HASH='paste-generated-argon2id-hash-here'
+```
+
+Replace the hash placeholder with the complete output, including its `$`
+characters. Use single quotes when assigning it in a shell. For Compose,
+mount the private configuration file and point `BIOMODALS_API_CONF_ENV` at its
+container path rather than embedding a hash in interpolated YAML. Restrict
+the file to its service owner with mode `0600`; hashes still allow offline
+password guessing if stolen. No plaintext-password setting is supported.
+
+When the API starts, it creates an enabled administrator named
+`Administrator`, using the configured default per-User Job limit, only if no
+administrator exists. Log in through the ordinary `/login` page with the
+original password, not the hash. No Password Link or Session is created by
+bootstrap. Remove the bootstrap values after successful setup; changing them
+later never resets an existing password or recovers a disabled account.
+
+Any existing administrator, including disabled or pending-setup accounts,
+causes both values to be ignored. Without an administrator, omitting both
+values preserves manual provisioning; supplying only one, an invalid email,
+or an invalid hash stops startup. An existing non-admin with the same email
+is an error, not an implicit promotion. Use the existing offline admin
+commands for recovery. No database migration is needed.
+
 ## Native systemd
 
 Install the project and API dependencies in the path used by

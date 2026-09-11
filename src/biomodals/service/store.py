@@ -565,6 +565,57 @@ class ServiceStore:
                 ((job_id,) for job_id in cached_job_ids),
             )
 
+    def has_admin(self) -> bool:
+        """Include disabled and pending administrators in the bootstrap guard."""
+        with self._connection() as conn:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM users WHERE is_admin = 1 LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+
+    def bootstrap_admin(
+        self,
+        *,
+        email: str,
+        password_hash: str,
+        active_job_limit: int,
+        now: int,
+    ) -> bool:
+        """Atomically create the initial enabled admin without tokens or sessions."""
+        if active_job_limit < 0:
+            raise ValueError("active_job_limit must be non-negative")
+        try:
+            with self._transaction() as conn:
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM users WHERE is_admin = 1 LIMIT 1"
+                    ).fetchone()
+                    is not None
+                ):
+                    return False
+                conn.execute(
+                    """
+                    INSERT INTO users (
+                        user_id, email, display_name, password_hash, status,
+                        is_admin, active_job_limit, created_at, updated_at
+                    ) VALUES (?, ?, 'Administrator', ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        email,
+                        password_hash,
+                        UserStatus.ENABLED.value,
+                        active_job_limit,
+                        now,
+                        now,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise UserAlreadyExistsError(f"User already exists: {email}") from exc
+        return True
+
     def create_user(
         self,
         *,

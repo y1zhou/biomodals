@@ -189,6 +189,12 @@ def create_deployed_app() -> FastAPI:
     settings.install_modal_credentials()
     store = ServiceStore(settings.database_path)
     store.initialize()
+    auth = AuthService(store, frontend_url=settings.public_url)
+    auth.bootstrap_admin(
+        settings.sources.value("BIOMODALS_DEFAULT_ADMIN_EMAIL", ""),
+        settings.sources.value("BIOMODALS_DEFAULT_ADMIN_PASSWORD_HASH", ""),
+        active_job_limit=settings.default_user_active_job_limit,
+    )
     pending = PendingRequestStore(settings.state_dir)
     pending.initialize()
     validations = ValidatedInputStore(settings.state_dir)
@@ -239,7 +245,6 @@ def create_deployed_app() -> FastAPI:
             max_pairs=settings.humanization_max_pairs,
         ),
     )
-    auth = AuthService(store, frontend_url=settings.public_url)
     app = create_app(
         store=store,
         auth=auth,

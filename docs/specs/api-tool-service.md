@@ -49,6 +49,32 @@ and `cache_cleared_at`; no remote Volume path is duplicated locally. Clearing
 and later reconstructing an archive preserves its Result metadata while
 updating that cache timestamp.
 
+## First-administrator bootstrap
+
+The production app factory supports optional startup-only
+`BIOMODALS_DEFAULT_ADMIN_EMAIL` and `BIOMODALS_DEFAULT_ADMIN_PASSWORD_HASH`
+values, resolved through the existing process-over-private-file configuration
+sources. They are not Admin Runtime Settings and are never returned by an
+HTTP endpoint. There is no plaintext-password counterpart.
+
+Before validating either bootstrap value, authentication checks for any
+`users.is_admin = 1` row, regardless of User Status. If one exists, bootstrap
+is a no-op. Otherwise, both absent means manual provisioning; an incomplete
+pair, invalid normalized email, or malformed/non-Argon2id hash fails startup.
+The enabled administrator insert rechecks for an administrator in the same
+SQLite write transaction. An email collision fails without updating the
+existing User. Bootstrap uses the existing password-hash column, display name
+`Administrator`, and configured default per-User active-Job limit. It creates
+no password tokens or sessions, requires no schema migration, and does not
+change normal login, reset, or role invariants.
+
+`biomodals api admin hash-password` prompts privately with confirmation and
+reuses the normal password policy and Argon2 defaults. It loads no service
+configuration and performs no persistence or provider actions. Hash import
+validates the encoding, not the unknown plaintext's strength; operators must
+use this command to apply the policy. Operator setup and secret handling are
+documented in the [deployment guide](../../deploy/README.md#first-administrator-bootstrap).
+
 ## Registration
 
 Each registered Tool contributes:

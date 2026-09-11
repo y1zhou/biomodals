@@ -14,6 +14,8 @@ from threading import BoundedSemaphore, Lock
 from typing import TypeVar, cast
 from uuid import UUID
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from pwdlib import PasswordHash
 
 from biomodals.service.store import (
@@ -194,6 +196,34 @@ class AuthService:
         self.frontend_url = frontend_url.rstrip("/")
         self._now = now or (lambda: int(time.time()))
         self._password_hash = PasswordHash.recommended()
+
+    def bootstrap_admin(
+        self,
+        email: str,
+        password_hash: str,
+        *,
+        active_job_limit: int = 2,
+    ) -> bool:
+        """Create an initial admin only when configured and no admin exists."""
+        if self.store.has_admin():
+            return False
+        email = email.strip()
+        password_hash = password_hash.strip()
+        if not email and not password_hash:
+            return False
+        if not email or not password_hash:
+            raise ValueError(
+                "Bootstrap requires both BIOMODALS_DEFAULT_ADMIN_EMAIL and "
+                "BIOMODALS_DEFAULT_ADMIN_PASSWORD_HASH"
+            )
+        email = _normalize_email(email)
+        _validate_bootstrap_hash(password_hash)
+        return self.store.bootstrap_admin(
+            email=email,
+            password_hash=password_hash,
+            active_job_limit=active_job_limit,
+            now=self._now(),
+        )
 
     def create_user(
         self,
@@ -377,6 +407,29 @@ def _validate_password(password: str) -> None:
         )
     if password.casefold() in _COMMON_PASSWORDS:
         raise PasswordPolicyError("Choose a less common password")
+
+
+def hash_password(password: str) -> str:
+    """Apply the normal password policy and return a salted bootstrap hash."""
+    _validate_password(password)
+    return PasswordHash.recommended().hash(password)
+
+
+def _validate_bootstrap_hash(password_hash: str) -> None:
+    error = (
+        "BIOMODALS_DEFAULT_ADMIN_PASSWORD_HASH must be a valid Argon2id hash; "
+        "generate it with biomodals api admin hash-password"
+    )
+    if not password_hash.startswith("$argon2id$"):
+        raise ValueError(error)
+    try:
+        # Decode and verify once: a mismatch is valid, a malformed hash is not.
+        PasswordHasher().verify(password_hash, "")
+    except VerifyMismatchError:
+        return
+    except (InvalidHashError, VerificationError):
+        raise ValueError(error) from None
+    raise ValueError("The bootstrap password must not be empty")
 
 
 def _principal(user: UserRecord) -> Principal:

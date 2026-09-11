@@ -256,8 +256,10 @@ readiness or Job execution.
 
 ### Create the first administrator
 
-There is no public registration. The first User must be created as an
-Administrator:
+There is no public registration. For automatic first-admin setup, configure
+an email and a pre-generated password hash as described in
+[first-administrator bootstrap](deploy/README.md#first-administrator-bootstrap).
+Otherwise, create the first User manually as an Administrator:
 
 ```bash
 uv run biomodals api admin create-user alice@example.com \

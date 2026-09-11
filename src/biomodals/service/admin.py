@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Manually manage Biomodals API users.",
+    help="Provision and manage Biomodals API users.",
 )
 
 
@@ -41,6 +41,21 @@ def _auth_service(
 def _fail(exc: Exception) -> NoReturn:
     typer.echo(f"Error: {exc}", err=True)
     raise typer.Exit(code=1) from exc
+
+
+@app.command("hash-password")
+def hash_password() -> None:
+    """Prompt privately and print an Argon2id hash for first-admin bootstrap."""
+    from biomodals.service.auth import hash_password as encode_password
+
+    password = typer.prompt(
+        "Password", hide_input=True, confirmation_prompt=True, err=True
+    )
+    try:
+        encoded = encode_password(password)
+    except ValueError as exc:
+        _fail(exc)
+    typer.echo(encoded)
 
 
 @app.command("create-user")

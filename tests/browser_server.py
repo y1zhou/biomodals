@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import io
 import os
+import secrets
 import time
 import zipfile
 from dataclasses import replace
@@ -15,10 +16,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 import orjson
 import polars as pl
+from service.alphafold3_preview_fixture import preview_archive
 
 from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
 from biomodals.execution import (
@@ -49,7 +51,7 @@ from biomodals.service.humanization.router import create_router as humanization_
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.remote_execution import ExecutionLocator
 from biomodals.service.runtime_config import RuntimeConfiguration
-from biomodals.service.store import JobRecord, ServiceStore
+from biomodals.service.store import JobRecord, JobState, ServiceStore
 from biomodals.service.tool_runtime import (
     JobLifecycle,
     PreparedResult,
@@ -92,6 +94,8 @@ class _FakeRemote:
         self.password_link = ""
         self.secondary_password_link = ""
         self.humanization_password_link = ""
+        self.alphafold3_password_link = ""
+        self.alphafold3_job_id = ""
         self.preflight_versions: list[int] = []
         self.submit_versions: list[int] = []
         self.started: dict[UUID, tuple[float, int, ExecutionPlan]] = {}
@@ -113,6 +117,8 @@ class _FakeRemote:
                     "password_link": self.password_link,
                     "secondary_password_link": self.secondary_password_link,
                     "humanization_password_link": self.humanization_password_link,
+                    "alphafold3_password_link": self.alphafold3_password_link,
+                    "alphafold3_job_id": self.alphafold3_job_id,
                     "preflight_versions": self.preflight_versions,
                     "submit_calls": len(self.submit_versions),
                     "submit_versions": self.submit_versions,
@@ -538,15 +544,21 @@ class _FakeHumanizationAdapter(_FakeAdapter):
         )
 
 
-class _UnusedAdapter:
-    async def stage(self, _job):
+class _FakeAlphaFold3Adapter(_FakeAdapter):
+    async def stage(self, job: JobRecord) -> None:
         raise AssertionError("AlphaFold3 is not submitted by this browser fixture")
 
-    async def discard_pending(self, _job):
+    async def discard_pending(self, job: JobRecord) -> None:
         return None
 
-    async def prepare_result(self, _job, _cache, *, completed_at):
-        raise AssertionError("AlphaFold3 is not submitted by this browser fixture")
+    async def prepare_result(self, job, cache, *, completed_at):
+        prepared = await super().prepare_result(job, cache, completed_at=completed_at)
+        return replace(
+            prepared,
+            filename="preview.tar.zst",
+            media_type="application/zstd",
+            archive_schema="alphafold3-request/1",
+        )
 
 
 class _FakeBilling:
@@ -591,13 +603,54 @@ def _create_browser_app():
         "humanization-user@example.com", display_name="Humanization Browser User"
     )
     remote.humanization_password_link = humanization_link.url
-    remote._write_stats()
     cache = ArtifactCache(settings.cache_dir / "results")
+    af3_link = auth.create_user(
+        "alphafold3-user@example.com", display_name="AlphaFold3 Browser User"
+    )
+    af3_session = auth.set_password(
+        af3_link.url.partition("#token=")[2], secrets.token_urlsafe(32)
+    )
+    remote.alphafold3_password_link = auth.create_password_reset(
+        "alphafold3-user@example.com"
+    ).url
+    af3_archive = preview_archive()
+    af3_job = store.admit_job(
+        owner_user_id=af3_session.principal.user_id,
+        tool="alphafold3",
+        display_name="Preview fixture",
+        idempotency_key=str(uuid4()),
+        request_digest="d" * 64,
+        modal_environment="main",
+        modal_app_name="AlphaFold3",
+        modal_app_version=1,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=8,
+        max_active_gpu_provider_calls=1,
+        now=int(time.time()),
+    ).job
+    cached_fixture = cache.directory / f"{af3_job.job_id}.result"
+    cached_fixture.write_bytes(af3_archive)
+    cached_fixture.chmod(0o600)
+    store.complete_job(
+        af3_job.job_id,
+        result_state=JobState.SUCCEEDED,
+        result_filename="preview.tar.zst",
+        result_media_type="application/zstd",
+        result_size_bytes=len(af3_archive),
+        result_sha256=hashlib.sha256(af3_archive).hexdigest(),
+        result_archive_schema="alphafold3-request/1",
+        now=int(time.time()),
+    )
+    remote.alphafold3_job_id = str(af3_job.job_id)
+    remote._write_stats()
     registrations = (
         ToolRegistration(
             GROMACS_TOOL, _FakeAdapter(remote, pending, _result_archive())
         ),
-        ToolRegistration(ALPHAFOLD3_TOOL, _UnusedAdapter()),
+        ToolRegistration(
+            ALPHAFOLD3_TOOL, _FakeAlphaFold3Adapter(remote, pending, af3_archive)
+        ),
         ToolRegistration(HUMANIZATION_TOOL, _FakeHumanizationAdapter(remote, pending)),
     )
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
@@ -620,6 +673,7 @@ def _create_browser_app():
                 validations=validations,
                 adapter=registrations[1].adapter,
                 remote=remote,
+                cache=cache,
             ),
             humanization_router(
                 store=store,

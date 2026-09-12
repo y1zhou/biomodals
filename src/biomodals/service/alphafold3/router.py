@@ -8,6 +8,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -16,10 +17,22 @@ from uuid import UUID, uuid4
 import orjson
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
+from starlette.datastructures import MutableHeaders
+from starlette.types import Message, Receive, Scope, Send
 
 from biomodals.execution import DeploymentIdentity
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
+from biomodals.service.alphafold3.results import (
+    MAX_PAE_GRID,
+    PaeWindow,
+    PredictionData,
+    PredictionReader,
+    PredictionSummary,
+    PreviewTooLargeError,
+    pae_window,
+)
 from biomodals.service.alphafold3.validation import (
     MAX_VALIDATION_BYTES,
     ValidatedInput,
@@ -28,6 +41,7 @@ from biomodals.service.alphafold3.validation import (
     ValidationSettings,
     ValidationStorageLowError,
 )
+from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
@@ -42,6 +56,7 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobRecord,
+    JobState,
     ServiceStore,
     UserNotFoundError,
 )
@@ -67,6 +82,18 @@ class AlphaFold3JobRequest(BaseModel):
     validation_id: UUID
 
 
+class _PrivatePredictionRoute(APIRoute):
+    """Protect preview responses, including authentication and validation errors."""
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_private(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "private, no-store"
+            await send(message)
+
+        await super().handle(scope, receive, send_private)
+
+
 def create_router(
     *,
     store: ServiceStore,
@@ -74,11 +101,151 @@ def create_router(
     validations: ValidatedInputStore,
     adapter: AlphaFold3ToolAdapter,
     remote: RemoteExecutionClient,
+    cache: ArtifactCache,
 ) -> APIRouter:
     """Create AlphaFold3 validation and submission routes."""
     router = APIRouter(prefix="/api/v1/alphafold3", tags=["alphafold3"])
+    preview_router = APIRouter(
+        prefix="/jobs/{job_id}/prediction", route_class=_PrivatePredictionRoute
+    )
     upload_slots = asyncio.Semaphore(2)
     validation_lock = asyncio.Lock()
+    predictions = PredictionReader()
+
+    async def read_result[T](
+        job_id: UUID,
+        session: AuthenticatedSession,
+        operation: Callable[[PredictionData], T],
+    ) -> T:
+        job = store.get_job(session.principal.user_id, job_id)
+        if job is None or job.tool != "alphafold3":
+            raise HTTPException(404, "Job not found")
+        if (
+            job.state != JobState.SUCCEEDED
+            or job.result_size_bytes is None
+            or job.result_sha256 is None
+        ):
+            raise CodedAPIError(409, "result_not_ready", "Result is not ready")
+        if job.result_archive_schema != "alphafold3-request/1":
+            raise CodedAPIError(409, "result_invalid", "Unsupported result archive")
+        digest = job.result_sha256
+        lease = await cache.acquire_async(
+            str(job_id), size_bytes=job.result_size_bytes, sha256=digest
+        )
+        if lease is None:
+            raise CodedAPIError(
+                409,
+                "result_not_cached",
+                "Prepare the result download before opening this prediction",
+            )
+        try:
+
+            def read() -> T:
+                data = predictions.read(
+                    lease,
+                    job_id=str(job_id),
+                    digest=digest,
+                    display_name=job.display_name,
+                )
+                return operation(data)
+
+            return await cache.run_bounded(read)
+        except PreviewTooLargeError as error:
+            raise CodedAPIError(
+                413,
+                "preview_too_large",
+                "Result exceeds the structure preview limit; use the archive download",
+            ) from error
+        except (KeyError, ValueError, TypeError, OSError) as error:
+            raise CodedAPIError(
+                409, "result_invalid", "Prediction is unavailable or invalid"
+            ) from error
+        finally:
+            lease.close()
+
+    @preview_router.get(
+        "",
+        response_model=PredictionSummary,
+        responses={
+            409: {"model": CodedErrorResponse},
+            413: {"model": CodedErrorResponse},
+        },
+    )
+    async def prediction(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> PredictionSummary:
+        return await read_result(job_id, session, lambda data: data.summary)
+
+    @preview_router.get(
+        "/model.cif",
+        response_class=Response,
+        responses={
+            200: {
+                "content": {
+                    "chemical/x-mmcif": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                }
+            },
+            409: {"model": CodedErrorResponse},
+            413: {"model": CodedErrorResponse},
+        },
+    )
+    async def prediction_model(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> Response:
+        return Response(
+            await read_result(job_id, session, lambda data: data.cif),
+            media_type="chemical/x-mmcif",
+            headers={
+                "Content-Disposition": 'inline; filename="model.cif"',
+            },
+        )
+
+    @preview_router.get(
+        "/pae",
+        response_model=PaeWindow,
+        responses={
+            409: {"model": CodedErrorResponse},
+            413: {"model": CodedErrorResponse},
+            422: {"model": CodedErrorResponse},
+        },
+    )
+    async def prediction_pae(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+        x_start: Annotated[int, Query(ge=0)] = 0,
+        x_end: Annotated[int | None, Query(ge=1)] = None,
+        y_start: Annotated[int, Query(ge=0)] = 0,
+        y_end: Annotated[int | None, Query(ge=1)] = None,
+        max_size: Annotated[int, Query(ge=1, le=MAX_PAE_GRID)] = MAX_PAE_GRID,
+    ) -> PaeWindow:
+        def window(data: PredictionData) -> PaeWindow:
+            if data.summary.pae_error is not None:
+                raise CodedAPIError(
+                    409,
+                    data.summary.pae_error,
+                    "PAE preview is unavailable; native confidence values remain in the archive",
+                )
+            try:
+                return pae_window(
+                    data,
+                    x_start=x_start,
+                    x_end=x_end,
+                    y_start=y_start,
+                    y_end=y_end,
+                    max_size=max_size,
+                )
+            except ValueError as error:
+                raise CodedAPIError(
+                    422, "pae_window_invalid", "PAE window is outside the token matrix"
+                ) from error
+
+        return await read_result(job_id, session, window)
+
+    router.include_router(preview_router)
 
     @router.post(
         "/validations",

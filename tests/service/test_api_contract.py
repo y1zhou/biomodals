@@ -327,6 +327,7 @@ def _app(tmp_path: Path):
                 validations=validations,
                 adapter=alphafold3_adapter,
                 remote=remote,
+                cache=cache,
             ),
             humanization_router(
                 store=store,

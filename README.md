@@ -247,7 +247,11 @@ Session cookies.
 The OpenAPI document includes the shared Job routes, typed GROMACS submission,
 retained AlphaFold3 JSON validation and submission, paired humanization
 submission and result tables, paginated Provider Call log
-targets, and Administrator billing reports. AlphaFold3 input documents are
+targets, and Administrator billing reports. Completed AlphaFold3 Jobs also
+provide an owner-private highest-ranked structure and interactive PAE preview.
+Large or unavailable previews do not prevent native archive downloads; see
+the [AlphaFold3 viewer specification](docs/specs/alphafold3-ux.md) for preview
+limits. AlphaFold3 input documents are
 limited to 256 MiB in both browser validation and the standalone CLI. Modal
 validation retention also has fixed per-User and service-wide count and byte
 budgets so uploads cannot exhaust the state filesystem. Modal billing is

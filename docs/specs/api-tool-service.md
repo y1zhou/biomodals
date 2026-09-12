@@ -231,6 +231,13 @@ an app policy, not a service-cache cleanup operation.
 
 ## AlphaFold3 submission
 
+Completed AlphaFold3 Jobs additionally expose private request-scoped
+prediction metadata, native CIF and bounded PAE reads. These reuse the shared
+verified Result cache and download preparation. The exact routes, identity,
+preview limits, null/aggregation behavior and browser interaction are owned by
+the [AlphaFold3 UX specification](alphafold3-ux.md); scientific execution and
+the downloaded archive remain unchanged.
+
 AlphaFold3 first creates a validated submission resource:
 
 ```text

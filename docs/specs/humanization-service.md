@@ -14,8 +14,10 @@ runs require separate approval.
   changing the batch. This browser import limit is separate from the normalized
   JSON API request limit and does not increase the allowed number of pairs.
 - Display the workflow's `selection.csv` table on the webpage when the run
-  finishes. Provide pagination, sorting, parent filtering, and all columns,
-  including expandable/copyable sequences. Preserve the workflow's default
+  finishes. Place **Humanization candidates** above **Execution stages**, as
+  with the AlphaFold3 result viewer. Provide pagination, sorting, parent
+  filtering, and all columns, including expandable/copyable sequences.
+  Preserve the workflow's default
   ordering, scientific values, nulls, and unranked candidates. User sorting
   changes presentation only. Offer direct CSV download as well as the archive.
 - Provide an Advanced section exposing the app-specific knobs available in

@@ -198,8 +198,9 @@ may still pin a deployment version and choose Job-log visibility per Tool.
 
 ### Explicit preparation retry
 
-An owner may retry a failed local archive preparation after the service has
-persisted a publishable scientific outcome. `JobView.can_retry_result_preparation`
+For every Tool, the Job page offers **Retry fetching results** when an owner
+may retry a failed local archive preparation after the service has persisted a
+publishable scientific outcome. `JobView.can_retry_result_preparation`
 is true only for `failed/result_preparation_failed` Jobs with a saved
 `succeeded` or `partial` result outcome, the original finalization timestamp,
 and no previously published Result digest. Completed stage rows alone are not

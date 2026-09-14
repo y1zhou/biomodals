@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import polars as pl
+import pytest
 
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.router import create_router as af3_router
@@ -483,6 +484,95 @@ def _enabled_session(app) -> AuthenticatedSession:
     return _session(user.user_id)
 
 
+def test_alphafold3_rerun_preserves_retained_input_and_settings(tmp_path, monkeypatch):
+    from biomodals.service.alphafold3 import modal as af3_modal
+
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+    app.dependency_overrides[require_session] = lambda: session
+    app.dependency_overrides[require_unsafe_session] = lambda: session
+    settings = {
+        "search_msa": False,
+        "search_protein_templates": False,
+        "recycle": 0,
+        "sample": 3,
+    }
+    native = {
+        "name": "Original input",
+        "modelSeeds": [7, 19],
+        "sequences": [
+            {
+                "protein": {
+                    "id": "B",
+                    "sequence": "ACDE",
+                    "unpairedMsa": "",
+                    "pairedMsa": "",
+                    "templates": [],
+                }
+            }
+        ],
+        "dialect": "alphafold3",
+        "version": 3,
+    }
+    headers = {"Origin": ORIGIN}
+    validation = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/validations",
+        params=settings,
+        json=native,
+        headers=headers,
+    )
+    assert validation.status_code == 201, validation.text
+    validation_id = validation.json()["validation_id"]
+    submitted = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/jobs",
+        json={"validation_id": validation_id},
+        headers={**headers, "Idempotency-Key": str(uuid4())},
+    )
+    assert submitted.status_code == 202, submitted.text
+    job_id = UUID(submitted.json()["job_id"])
+    original = app.state.store.fail_job(
+        job_id,
+        error_code="remote_execution_failed",
+        error_message="Remote execution failed",
+        now=10,
+    )
+    path = f"/api/v1/alphafold3/jobs/{job_id}/inputs"
+    restored = _request(app, "GET", path)
+    assert restored.status_code == 200, restored.text
+    assert restored.headers["cache-control"] == "private, no-store"
+    assert restored.json()["settings"] == settings
+    downloaded = _request(app, "GET", f"/api/v1/alphafold3/jobs/{job_id}/document")
+    assert restored.json()["document_json"] == downloaded.text
+    assert downloaded.json()["modelSeeds"] == native["modelSeeds"]
+    assert downloaded.json()["sequences"] == native["sequences"]
+    assert app.state.store.get_job_by_id(job_id) == original
+    assert (
+        len(app.state.store.list_jobs_page(session.principal.user_id, limit=10).jobs)
+        == 1
+    )
+    assert app.state.remote_execution.preflights == 1
+
+    app.dependency_overrides[require_session] = _session
+    assert _request(app, "GET", path).status_code == 404
+    app.dependency_overrides.pop(require_session)
+    assert _request(app, "GET", path).status_code == 401
+    app.dependency_overrides[require_session] = lambda: session
+    ValidatedInputStore(tmp_path / "validations").delete_claimed(UUID(validation_id))
+
+    def unavailable(*args):
+        raise FileNotFoundError("removed")
+
+    monkeypatch.setattr(AlphaFold3ToolAdapter, "_volume", lambda *_: object())
+    monkeypatch.setattr(af3_modal, "load_execution_request_from_volume", unavailable)
+    missing = _request(app, "GET", path)
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "job_input_unavailable"
+
+
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
@@ -732,18 +822,21 @@ def test_authenticated_routes_receive_the_principal(tmp_path: Path) -> None:
     assert jobs.json() == {"jobs": [], "next_cursor": None}
 
 
-def test_result_retry_is_owner_scoped_csrf_protected_and_durable(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tool", TOOLS, ids=lambda tool: tool.key)
+def test_result_retry_is_owner_scoped_csrf_protected_and_durable(
+    tmp_path, monkeypatch, tool
+):
     app = _app(tmp_path)
     session = _enabled_session(app)
     store = app.state.store
     job = store.admit_job(
         owner_user_id=session.principal.user_id,
-        tool="alphafold3",
+        tool=tool.key,
         display_name="Prepared prediction",
         idempotency_key=str(uuid4()),
         request_digest="a" * 64,
         modal_environment="main",
-        modal_app_name="AlphaFold3",
+        modal_app_name=tool.default_modal_app_name,
         modal_app_version=1,
         tool_active_job_limit=10,
         global_active_job_limit=10,

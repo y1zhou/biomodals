@@ -703,9 +703,10 @@ async def test_transient_result_failure_retries_later(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("tool", TOOLS, ids=lambda tool: tool.key)
 @pytest.mark.parametrize("result_state", [JobState.SUCCEEDED, JobState.PARTIAL])
 async def test_explicit_result_retry_only_repeats_local_preparation(
-    tmp_path: Path, result_state: JobState
+    tmp_path: Path, result_state: JobState, tool
 ) -> None:
     class RecoveringAdapter(Adapter):
         async def stage(self, job):
@@ -721,9 +722,13 @@ async def test_explicit_result_retry_only_repeats_local_preparation(
             )
 
     store, lifecycle, adapter = _lifecycle(
-        tmp_path, SimpleNamespace(), RecoveringAdapter()
+        tmp_path, SimpleNamespace(), RecoveringAdapter(), tool=tool
     )
-    projection = {"stages": [{"code": "predict", "outcome": "completed"}]}
+    projection = {
+        "stages": [
+            {"code": stage.code, "outcome": "completed"} for stage in tool.stages
+        ]
+    }
     store.begin_finalization(
         JOB_ID, result_state=result_state, projection=projection, now=20
     )

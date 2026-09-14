@@ -4,7 +4,7 @@ Status: implemented and verified offline; not deployed
 
 Researched: 2026-09-11
 
-Decisions updated: 2026-09-12
+Decisions updated: 2026-09-14
 
 ## Scope and conclusion
 
@@ -21,6 +21,10 @@ The following requirements are settled by the request:
 - The Job detail page must display the highest-ranked prediction using Mol*,
   without its left upload/database panel, while retaining a top sequence view
   and right-hand style controls.
+- Completed Jobs label the archive action **Download all results** to
+  distinguish the complete download from the single prediction shown inline.
+- Failed Jobs offer **Rerun with same inputs**, opening an editable draft
+  without automatically validating or submitting it.
 - PAE plots must appear below the structure viewer. This website targets
   large screens only; mobile layout work is explicitly out of scope.
 
@@ -656,6 +660,24 @@ that would simply read the same immutable bytes again. Preview recovery does
 not rerun science or change the published Result identity. Failure of the
 initial archive preparation is handled separately by the shared
 [explicit preparation retry](api-tool-service.md#explicit-preparation-retry).
+
+### Editable rerun contract
+
+`GET /api/v1/alphafold3/jobs/{job_id}/inputs` returns `AlphaFold3JobInputs`:
+`document_json` contains the retained normalized native JSON as text, and
+`settings` contains the original `recycle`, `sample`, `search_msa` and
+`search_protein_templates` values. All four saved settings are returned; current
+defaults do not replace them. The native-document download and this endpoint
+share the same owner-scoped loader, reading either the retained validation or
+the already staged execution request. Responses are private/no-store. Another
+owner or Tool is 404; missing retained data is `404 job_input_unavailable`.
+
+The rerun route uses `source_job` to initialize an isolated editable Expert
+draft. It preserves native fields, chain IDs and seeds, including content the
+basic editor cannot represent. It neither overwrites an unrelated saved draft
+nor resumes an old pending validation. Missing inputs block submission rather
+than silently substituting defaults. A new validation and Job require explicit
+user actions; current admission limits and scientific validation still apply.
 
 ### Resource limits and measurements
 

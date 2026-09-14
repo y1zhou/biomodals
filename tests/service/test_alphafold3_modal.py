@@ -10,6 +10,7 @@ import pytest
 
 from biomodals.service.alphafold3 import modal as af3_modal
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
+from biomodals.service.alphafold3.validation import ValidationSettings
 from biomodals.service.store import JobState, ServiceStore
 
 
@@ -129,7 +130,7 @@ async def test_terminal_predecessor_authorizes_exact_claim_repair(
 
 
 @pytest.mark.anyio
-async def test_input_document_uses_staged_execution_request(
+async def test_input_and_settings_use_staged_execution_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -149,6 +150,10 @@ async def test_input_document_uses_staged_execution_request(
         "load_execution_request_from_volume",
         lambda selected, job_id: SimpleNamespace(
             config=(selected, job_id),
+            search_msa=False,
+            search_protein_templates=False,
+            recycle=0,
+            sample=3,
         ),
     )
     monkeypatch.setattr(
@@ -157,6 +162,9 @@ async def test_input_document_uses_staged_execution_request(
         lambda config: repr(config).encode(),
     )
 
-    document = await adapter.input_document(job)
+    document, settings = await adapter.input_document_and_settings(job)
 
     assert document == repr((volume, job.job_id)).encode()
+    assert settings == ValidationSettings(
+        search_msa=False, search_protein_templates=False, recycle=0, sample=3
+    )

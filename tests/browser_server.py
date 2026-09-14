@@ -70,10 +70,6 @@ ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
 _CALL_NAMESPACE = UUID("156d600f-2a56-4ce7-8d0c-886bfa35698a")
 
 
-def _result_archive() -> bytes:
-    return trajectory_archive()
-
-
 class _FakeRemote:
     """Mimic a deployed coordinator while retaining the real service boundary."""
 
@@ -690,7 +686,7 @@ def _create_browser_app():
     remote._write_stats()
     registrations = (
         ToolRegistration(
-            GROMACS_TOOL, _FakeAdapter(remote, pending, _result_archive())
+            GROMACS_TOOL, _FakeAdapter(remote, pending, trajectory_archive())
         ),
         ToolRegistration(
             ALPHAFOLD3_TOOL, _FakeAlphaFold3Adapter(remote, pending, af3_archive)

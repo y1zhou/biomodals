@@ -229,6 +229,23 @@ def load_execution_request_from_volume(
     )
 
 
+def load_input_document_from_volume(
+    output_volume: Any,
+    execution_run_id: UUID,
+) -> bytes:
+    """Read saved native JSON for editing, not for execution or cache reuse.
+
+    Historical scientific versions and operational settings do not affect
+    document retrieval. New submissions still undergo current validation.
+    """
+    value = orjson.loads(
+        _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
+    )
+    if not isinstance(value, dict) or not isinstance(value.get("config"), dict):
+        raise ValueError("Saved AlphaFold3 input document is invalid")
+    return orjson.dumps(value["config"])
+
+
 def persist_execution_request(
     volume_root: str | Path,
     execution_run_id: UUID,

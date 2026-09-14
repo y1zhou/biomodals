@@ -484,9 +484,9 @@ def _enabled_session(app) -> AuthenticatedSession:
     return _session(user.user_id)
 
 
-def test_alphafold3_rerun_preserves_retained_input_and_settings(tmp_path, monkeypatch):
-    from biomodals.service.alphafold3 import modal as af3_modal
-
+def test_alphafold3_rerun_document_is_private_and_does_not_submit(
+    tmp_path, monkeypatch
+):
     app = _app(tmp_path)
     session = _enabled_session(app)
     app.dependency_overrides[require_session] = lambda: session
@@ -540,15 +540,12 @@ def test_alphafold3_rerun_preserves_retained_input_and_settings(tmp_path, monkey
         error_message="Remote execution failed",
         now=10,
     )
-    path = f"/api/v1/alphafold3/jobs/{job_id}/inputs"
+    path = f"/api/v1/alphafold3/jobs/{job_id}/document"
     restored = _request(app, "GET", path)
     assert restored.status_code == 200, restored.text
     assert restored.headers["cache-control"] == "private, no-store"
-    assert restored.json()["settings"] == settings
-    downloaded = _request(app, "GET", f"/api/v1/alphafold3/jobs/{job_id}/document")
-    assert restored.json()["document_json"] == downloaded.text
-    assert downloaded.json()["modelSeeds"] == native["modelSeeds"]
-    assert downloaded.json()["sequences"] == native["sequences"]
+    assert restored.headers["content-type"] == "application/json"
+    assert restored.json() == native
     assert app.state.store.get_job_by_id(job_id) == original
     assert (
         len(app.state.store.list_jobs_page(session.principal.user_id, limit=10).jobs)
@@ -563,14 +560,24 @@ def test_alphafold3_rerun_preserves_retained_input_and_settings(tmp_path, monkey
     app.dependency_overrides[require_session] = lambda: session
     ValidatedInputStore(tmp_path / "validations").delete_claimed(UUID(validation_id))
 
-    def unavailable(*args):
-        raise FileNotFoundError("removed")
+    class Volume:
+        content: bytes | None = b'{"config":' + restored.content + b"}"
 
-    monkeypatch.setattr(AlphaFold3ToolAdapter, "_volume", lambda *_: object())
-    monkeypatch.setattr(af3_modal, "load_execution_request_from_volume", unavailable)
-    missing = _request(app, "GET", path)
-    assert missing.status_code == 404
-    assert missing.json()["code"] == "job_input_unavailable"
+        def read_file(self, _path):
+            if self.content is None:
+                raise FileNotFoundError("removed")
+            yield self.content
+
+    volume = Volume()
+    monkeypatch.setattr(AlphaFold3ToolAdapter, "_volume", lambda *_: volume)
+    staged = _request(app, "GET", path)
+    assert staged.status_code == 200
+    assert staged.json() == native
+    for content in (None, b"invalid JSON", b'{"config":null}'):
+        volume.content = content
+        missing = _request(app, "GET", path)
+        assert missing.status_code == 404
+        assert missing.json()["code"] == "job_input_unavailable"
 
 
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:

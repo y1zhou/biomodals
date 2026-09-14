@@ -39,10 +39,7 @@ from biomodals.execution import (
 )
 from biomodals.execution.model import ProviderCallOverview
 from biomodals.service.alphafold3.router import create_router as af3_router
-from biomodals.service.alphafold3.validation import (
-    ValidatedInputStore,
-    ValidationSettings,
-)
+from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService
@@ -556,31 +553,24 @@ class _FakeAlphaFold3Adapter(_FakeAdapter):
     async def discard_pending(self, job: JobRecord) -> None:
         return None
 
-    async def input_document_and_settings(
-        self, job: JobRecord
-    ) -> tuple[bytes, ValidationSettings]:
-        return (
-            orjson.dumps({
-                "name": job.display_name,
-                "modelSeeds": [2, 19],
-                "sequences": [
-                    {
-                        "protein": {
-                            "id": "A",
-                            "sequence": "ACDE",
-                            "unpairedMsa": "",
-                            "pairedMsa": "",
-                            "templates": [],
-                        }
+    async def input_document(self, job: JobRecord) -> bytes:
+        return orjson.dumps({
+            "name": job.display_name,
+            "modelSeeds": [2, 19],
+            "sequences": [
+                {
+                    "protein": {
+                        "id": "A",
+                        "sequence": "ACDE",
+                        "unpairedMsa": "",
+                        "pairedMsa": "",
+                        "templates": [],
                     }
-                ],
-                "dialect": "alphafold3",
-                "version": 3,
-            }),
-            ValidationSettings(
-                search_msa=False, search_protein_templates=False, recycle=0, sample=3
-            ),
-        )
+                }
+            ],
+            "dialect": "alphafold3",
+            "version": 3,
+        })
 
     async def prepare_result(self, job, cache, *, completed_at):
         prepared = await super().prepare_result(job, cache, completed_at=completed_at)

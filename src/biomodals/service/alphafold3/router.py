@@ -82,15 +82,6 @@ class AlphaFold3JobRequest(BaseModel):
     validation_id: UUID
 
 
-class AlphaFold3JobInputs(BaseModel):
-    """Retained native JSON and exact scientific settings for an editable rerun."""
-
-    model_config = ConfigDict(frozen=True)
-
-    document_json: str
-    settings: ValidationSettings
-
-
 class _PrivatePredictionRoute(APIRoute):
     """Protect preview responses, including authentication and validation errors."""
 
@@ -400,41 +391,26 @@ def create_router(
                 raise HTTPException(404, "Validation not found")
         return Response(status_code=204)
 
-    async def retained_job_input(
-        job_id: UUID, session: AuthenticatedSession
-    ) -> tuple[bytes, ValidationSettings]:
+    @router.get(
+        "/jobs/{job_id}/document",
+        responses={404: {"model": CodedErrorResponse}},
+    )
+    async def download_job_document(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> Response:
         job = store.get_job(session.principal.user_id, job_id)
         if job is None or job.tool != "alphafold3":
             raise HTTPException(404, "Job not found")
         try:
-            return await adapter.input_document_and_settings(job)
-        except FileNotFoundError as error:
+            document = await adapter.input_document(job)
+        except (FileNotFoundError, ValueError) as error:
             raise CodedAPIError(
                 404,
                 "job_input_unavailable",
                 "AlphaFold3 input is no longer available",
             ) from error
 
-    @router.get(
-        "/jobs/{job_id}/inputs",
-        response_model=AlphaFold3JobInputs,
-        responses={404: {"model": CodedErrorResponse}},
-    )
-    async def job_inputs(
-        job_id: UUID,
-        session: Annotated[AuthenticatedSession, Depends(require_session)],
-        response: Response,
-    ) -> AlphaFold3JobInputs:
-        document, settings = await retained_job_input(job_id, session)
-        response.headers["Cache-Control"] = "private, no-store"
-        return AlphaFold3JobInputs(document_json=document.decode(), settings=settings)
-
-    @router.get("/jobs/{job_id}/document")
-    async def download_job_document(
-        job_id: UUID,
-        session: Annotated[AuthenticatedSession, Depends(require_session)],
-    ) -> Response:
-        document, _settings = await retained_job_input(job_id, session)
         return Response(
             content=document,
             media_type="application/json",

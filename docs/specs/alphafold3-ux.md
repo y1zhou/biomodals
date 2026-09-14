@@ -663,18 +663,22 @@ initial archive preparation is handled separately by the shared
 
 ### Editable rerun contract
 
-`GET /api/v1/alphafold3/jobs/{job_id}/inputs` returns `AlphaFold3JobInputs`:
-`document_json` contains the retained normalized native JSON as text, and
-`settings` contains the original `recycle`, `sample`, `search_msa` and
-`search_protein_templates` values. All four saved settings are returned; current
-defaults do not replace them. The native-document download and this endpoint
-share the same owner-scoped loader, reading either the retained validation or
-the already staged execution request. Responses are private/no-store. Another
-owner or Tool is 404; missing retained data is `404 job_input_unavailable`.
+`GET /api/v1/alphafold3/jobs/{job_id}/document` serves the saved native input JSON
+for both downloads and editable reruns. It reads either the retained validation
+document or the `config` object in the staged request as plain JSON, preserving
+all fields without reconstructing an execution request. Historical scientific
+versions do not need to match current code just to retrieve inputs. Execution
+and cache reuse keep their strict identity validation. Responses are
+private/no-store. Another owner or Tool is 404; missing or unreadable retained
+data is `404 job_input_unavailable`.
 
 The rerun route uses `source_job` to initialize an isolated editable Expert
 draft. It preserves native fields, chain IDs and seeds, including content the
-basic editor cannot represent. It neither overwrites an unrelated saved draft
+basic editor cannot represent. Settings outside the JSON (`recycle`, `sample`,
+`search_msa`, `search_protein_templates`) start at current form defaults. A banner
+above the form states: "Inputs copied from a previous job. Other settings use
+current defaults and may differ from the original run. Review the configuration
+before submitting." It neither overwrites an unrelated saved draft
 nor resumes an old pending validation. Missing inputs block submission rather
 than silently substituting defaults. A new validation and Job require explicit
 user actions; current admission limits and scientific validation still apply.

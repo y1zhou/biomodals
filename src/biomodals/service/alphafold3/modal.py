@@ -10,9 +10,9 @@ import modal
 
 from biomodals.app.fold.alphafold3.execution_request import (
     load_execution_request_from_volume,
+    load_input_document_from_volume,
     stage_execution_request,
 )
-from biomodals.app.fold.alphafold3.inference_inputs import serialize_af3_input
 from biomodals.app.fold.alphafold3.invocation_cache import (
     load_invocation_manifest,
 )
@@ -20,10 +20,7 @@ from biomodals.app.fold.alphafold3.request_results import create_request_archive
 from biomodals.execution.modal import stage_execution_launch
 from biomodals.helper.artifacts import file_size_sha256
 from biomodals.helper.modal_volume import download_modal_volume_files
-from biomodals.service.alphafold3.validation import (
-    ValidatedInputStore,
-    ValidationSettings,
-)
+from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 from biomodals.service.tool_runtime import PreparedResult, SubmissionWait
@@ -97,35 +94,18 @@ class AlphaFold3ToolAdapter:
                 job.pending_validation_id,
             )
 
-    async def input_document_and_settings(
-        self, job: JobRecord
-    ) -> tuple[bytes, ValidationSettings]:
-        """Read native input and original settings without new scientific work."""
+    async def input_document(self, job: JobRecord) -> bytes:
+        """Read saved native JSON without requiring execution compatibility."""
         if job.pending_validation_id is not None:
             validated = self.validations.get_claimed(
                 job.pending_validation_id,
                 owner_user_id=job.owner_user_id,
             )
             if validated is not None:
-                return (
-                    await asyncio.to_thread(validated.document_path.read_bytes),
-                    validated.settings,
-                )
-        volume = self._volume(job)
-
-        def read_staged() -> tuple[bytes, ValidationSettings]:
-            request = load_execution_request_from_volume(volume, job.job_id)
-            return (
-                serialize_af3_input(request.config),
-                ValidationSettings(
-                    search_msa=request.search_msa,
-                    search_protein_templates=request.search_protein_templates,
-                    recycle=request.recycle,
-                    sample=request.sample,
-                ),
-            )
-
-        return await asyncio.to_thread(read_staged)
+                return await asyncio.to_thread(validated.document_path.read_bytes)
+        return await asyncio.to_thread(
+            load_input_document_from_volume, self._volume(job), job.job_id
+        )
 
     async def prepare_result(
         self,

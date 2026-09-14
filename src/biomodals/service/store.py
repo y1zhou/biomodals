@@ -54,6 +54,10 @@ class JobNotCancellableError(RuntimeError):
     """Raised when cancellation is requested for a terminal job."""
 
 
+class JobNotRetryableError(RuntimeError):
+    """Raised when a Job has no failed local Result preparation to retry."""
+
+
 class JobStateResolutionError(RuntimeError):
     """Raised when an Administrator resolves a Job in another state."""
 
@@ -237,6 +241,17 @@ class JobRecord:
     next_retry_at: int | None
     blocking_category: str | None
     cache_cleared_at: int | None
+
+    @property
+    def can_retry_result_preparation(self) -> bool:
+        """Only first publication may retry after a recorded scientific outcome."""
+        return (
+            self.state == JobState.FAILED
+            and self.error_code == "result_preparation_failed"
+            and self.result_state in {JobState.SUCCEEDED.value, JobState.PARTIAL.value}
+            and self.finalization_started_at is not None
+            and self.result_sha256 is None
+        )
 
     @property
     def warnings(self) -> list[str]:
@@ -1811,6 +1826,36 @@ class ServiceStore:
             if row is None:
                 raise JobNotFoundError(f"Job not found: {job_id}")
         return _job_from_row(row)
+
+    def retry_result_preparation(self, job_id: UUID, *, now: int) -> JobRecord:
+        """Queue local preparation without changing remote evidence or identity."""
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError(f"Job not found: {job_id}")
+            job = _job_from_row(row)
+            if job.state in {JobState.FINALIZING, JobState.SUCCEEDED, JobState.PARTIAL}:
+                return job
+            if not job.can_retry_result_preparation:
+                raise JobNotRetryableError(
+                    "Only failed Result preparation after scientific completion can be retried"
+                )
+            conn.execute(
+                """
+                UPDATE jobs SET state = ?, updated_at = ?, completed_at = NULL,
+                    error_code = NULL, error_message = NULL,
+                    state_reason = NULL, state_message = NULL,
+                    blocked_at = NULL, blocking_category = NULL, next_retry_at = NULL
+                WHERE job_id = ?
+                """,
+                (JobState.FINALIZING.value, now, str(job_id)),
+            )
+            updated = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
+            ).fetchone()
+        return _job_from_row(updated)
 
     def request_cancel(self, job_id: UUID, *, now: int) -> JobRecord:
         """Persist sticky cancellation intent before contacting Modal."""

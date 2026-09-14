@@ -96,6 +96,7 @@ class _FakeRemote:
         self.humanization_password_link = ""
         self.alphafold3_password_link = ""
         self.alphafold3_job_id = ""
+        self.alphafold3_retry_job_id = ""
         self.preflight_versions: list[int] = []
         self.submit_versions: list[int] = []
         self.started: dict[UUID, tuple[float, int, ExecutionPlan]] = {}
@@ -119,6 +120,7 @@ class _FakeRemote:
                     "humanization_password_link": self.humanization_password_link,
                     "alphafold3_password_link": self.alphafold3_password_link,
                     "alphafold3_job_id": self.alphafold3_job_id,
+                    "alphafold3_retry_job_id": self.alphafold3_retry_job_id,
                     "preflight_versions": self.preflight_versions,
                     "submit_calls": len(self.submit_versions),
                     "submit_versions": self.submit_versions,
@@ -614,35 +616,62 @@ def _create_browser_app():
         "alphafold3-user@example.com"
     ).url
     af3_archive = preview_archive()
-    af3_job = store.admit_job(
-        owner_user_id=af3_session.principal.user_id,
-        tool="alphafold3",
-        display_name="Preview fixture",
-        idempotency_key=str(uuid4()),
-        request_digest="d" * 64,
-        modal_environment="main",
-        modal_app_name="AlphaFold3",
-        modal_app_version=1,
-        tool_active_job_limit=10,
-        global_active_job_limit=10,
-        max_active_provider_calls=8,
-        max_active_gpu_provider_calls=1,
-        now=int(time.time()),
-    ).job
-    cached_fixture = cache.directory / f"{af3_job.job_id}.result"
-    cached_fixture.write_bytes(af3_archive)
-    cached_fixture.chmod(0o600)
-    store.complete_job(
-        af3_job.job_id,
-        result_state=JobState.SUCCEEDED,
-        result_filename="preview.tar.zst",
-        result_media_type="application/zstd",
-        result_size_bytes=len(af3_archive),
-        result_sha256=hashlib.sha256(af3_archive).hexdigest(),
-        result_archive_schema="alphafold3-request/1",
-        now=int(time.time()),
-    )
-    remote.alphafold3_job_id = str(af3_job.job_id)
+    for preparation_failed in (False, True):
+        af3_job = store.admit_job(
+            owner_user_id=af3_session.principal.user_id,
+            tool="alphafold3",
+            display_name="Preview fixture",
+            idempotency_key=str(uuid4()),
+            request_digest="d" * 64,
+            modal_environment="main",
+            modal_app_name="AlphaFold3",
+            modal_app_version=1,
+            tool_active_job_limit=10,
+            global_active_job_limit=10,
+            max_active_provider_calls=8,
+            max_active_gpu_provider_calls=1,
+            now=int(time.time()),
+        ).job
+        if preparation_failed:
+            now = int(time.time())
+            store.begin_finalization(
+                af3_job.job_id,
+                result_state=JobState.SUCCEEDED,
+                projection={
+                    "stages": [
+                        {
+                            "code": "predict",
+                            "label": "Predict structures",
+                            "outcome": "completed",
+                            "started_at": now - 2,
+                            "ended_at": now - 1,
+                        }
+                    ]
+                },
+                now=now,
+            )
+            store.fail_job(
+                af3_job.job_id,
+                error_code="result_preparation_failed",
+                error_message="The Result archive could not be prepared",
+                now=now,
+            )
+            remote.alphafold3_retry_job_id = str(af3_job.job_id)
+        else:
+            cached_fixture = cache.directory / f"{af3_job.job_id}.result"
+            cached_fixture.write_bytes(af3_archive)
+            cached_fixture.chmod(0o600)
+            store.complete_job(
+                af3_job.job_id,
+                result_state=JobState.SUCCEEDED,
+                result_filename="preview.tar.zst",
+                result_media_type="application/zstd",
+                result_size_bytes=len(af3_archive),
+                result_sha256=hashlib.sha256(af3_archive).hexdigest(),
+                result_archive_schema="alphafold3-request/1",
+                now=int(time.time()),
+            )
+            remote.alphafold3_job_id = str(af3_job.job_id)
     remote._write_stats()
     registrations = (
         ToolRegistration(

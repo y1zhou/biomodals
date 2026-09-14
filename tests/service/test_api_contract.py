@@ -732,6 +732,70 @@ def test_authenticated_routes_receive_the_principal(tmp_path: Path) -> None:
     assert jobs.json() == {"jobs": [], "next_cursor": None}
 
 
+def test_result_retry_is_owner_scoped_csrf_protected_and_durable(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+    store = app.state.store
+    job = store.admit_job(
+        owner_user_id=session.principal.user_id,
+        tool="alphafold3",
+        display_name="Prepared prediction",
+        idempotency_key=str(uuid4()),
+        request_digest="a" * 64,
+        modal_environment="main",
+        modal_app_name="AlphaFold3",
+        modal_app_version=1,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=8,
+        max_active_gpu_provider_calls=1,
+        now=3,
+    ).job
+    store.begin_finalization(
+        job.job_id, result_state=JobState.SUCCEEDED, projection={}, now=4
+    )
+    store.fail_job(
+        job.job_id,
+        error_code="result_preparation_failed",
+        error_message="The Result archive could not be prepared",
+        now=5,
+    )
+    base = f"/api/v1/jobs/{job.job_id}"
+    path = base + "/retry-result-preparation"
+    headers = {"Origin": ORIGIN}
+    assert _request(app, "POST", path, headers=headers).status_code == 401
+    monkeypatch.setattr(app.state.auth, "authenticate", lambda _: session)
+    denied = _request(
+        app,
+        "POST",
+        path,
+        headers={**headers, "Cookie": "__Host-biomodals-session=fixture"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "csrf_invalid"
+
+    app.dependency_overrides[require_session] = lambda: session
+    assert _request(app, "GET", base).json()["can_retry_result_preparation"]
+    app.dependency_overrides[require_unsafe_session] = _session
+    assert _request(app, "POST", path, headers=headers).status_code == 404
+    app.dependency_overrides[require_unsafe_session] = lambda: session
+    accepted = _request(app, "POST", path, headers=headers)
+    assert accepted.status_code == 202
+    assert accepted.json()["state"] == "finalizing"
+    assert not accepted.json()["can_retry_result_preparation"]
+    assert app.state.reconcile_wakeup.is_set()
+    assert _request(app, "POST", path, headers=headers).json() == accepted.json()
+    store.fail_job(
+        job.job_id,
+        error_code="remote_execution_failed",
+        error_message="Remote execution failed",
+        now=6,
+    )
+    refused = _request(app, "POST", path, headers=headers)
+    assert refused.status_code == 409
+    assert refused.json()["code"] == "result_retry_not_allowed"
+
+
 def test_alphafold3_lost_response_replays_after_validation_consumption(
     tmp_path: Path,
 ) -> None:

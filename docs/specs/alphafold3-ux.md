@@ -648,6 +648,15 @@ limits return `preview_too_large`. Invalid rectangles return
 `pae_too_large` independently; the PAE endpoint returns its matching code if
 unavailable. All preview responses retain private/no-store headers.
 
+The UI displays preview error codes, owner-safe details and any support ID.
+Transient network/storage failures offer an explicit Retry preview action;
+each attempt uses the same read and shared cache-restoration path above.
+Invalid source artifacts or fixed preview-size limits do not offer a retry
+that would simply read the same immutable bytes again. Preview recovery does
+not rerun science or change the published Result identity. Failure of the
+initial archive preparation is handled separately by the shared
+[explicit preparation retry](api-tool-service.md#explicit-preparation-retry).
+
 ### Resource limits and measurements
 
 Code-owned preview limits, independent of scientific admission:

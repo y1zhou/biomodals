@@ -196,6 +196,34 @@ may still pin a deployment version and choose Job-log visibility per Tool.
 
 ## Result metadata
 
+### Explicit preparation retry
+
+An owner may retry a failed local archive preparation after the service has
+persisted a publishable scientific outcome. `JobView.can_retry_result_preparation`
+is true only for `failed/result_preparation_failed` Jobs with a saved
+`succeeded` or `partial` result outcome, the original finalization timestamp,
+and no previously published Result digest. Completed stage rows alone are not
+evidence that all required scientific publication work succeeded.
+
+The owner- and CSRF-protected `POST /api/v1/jobs/{job_id}/retry-result-preparation`
+returns `202` and the updated Job. It durably queues `finalizing`, clears the
+previous local failure and completion timestamp, and wakes the existing
+bounded reconciler. That reconciler invokes only the Tool's Result preparation
+adapter; the endpoint never launches, resumes, or polls a scientific Run. It
+may download the already published artifacts from Modal storage, but does not
+submit new scientific tasks. The Job ID, pinned deployment, scientific stage
+evidence, result outcome and original finalization timestamp stay unchanged.
+
+Repeated requests while finalizing or after completion return the current Job
+without another preparation attempt. Other states return
+`409 result_retry_not_allowed`; other owners receive 404. A process restart
+resumes the queued preparation. Transient preparation failures retain their
+existing automatic backoff; another permanent local failure again requires
+explicit Retry. Previously published Result identities are never replaced by
+this endpoint: cache restoration must still reproduce the recorded bytes.
+
+### Published archives
+
 Prepared Results record a friendly filename, media type, byte size, SHA-256
 digest, archive schema version, authoritative provider location, and local
 cache state. Shared download handling uses this metadata rather than assuming

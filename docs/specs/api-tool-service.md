@@ -261,6 +261,33 @@ app-owned GROMACS scientific publication. A cleared local archive is rebuilt
 from the verified remote publication. Retention of scientific Modal outputs is
 an app policy, not a service-cache cleanup operation.
 
+### GROMACS trajectory overview
+
+Completed GROMACS Jobs show a **Trajectory overview** panel above Execution
+stages with the native production RMSD, radius-of-gyration and RMSF PNG figures.
+Equilibration figures remain in the downloaded archive. No plots or scientific
+results are recomputed for this panel.
+
+`GET /api/v1/gromacs/jobs/{job_id}/trajectory/{metric}.png`, with `metric` one of
+`rmsd`, `rg`, `rmsf`, serves one original `image/png`. The reader selects the
+production role recorded in the archive manifest, not a reconstructed filename.
+It uses the shared verified Result lease and bounded artifact worker, reading
+only the manifest and requested PNG without extracting trajectory files. Limits
+are 1 MiB for the manifest, 16 MiB per PNG and 16,777,216 pixels per image. Existing
+PNG envelope/CRC validation applies; native bytes, axes and units are unchanged.
+
+Reads require the owner session and a succeeded Job with published Result metadata.
+All preview responses, including errors, are private/no-store. Anonymous access
+is 401; another owner or Tool is 404. `409 result_not_ready` means no completed
+Result, `409 result_not_cached` requests the shared prepare-download action, and
+`409 result_invalid` means the figure is missing or invalid. Oversized figures
+return `413 trajectory_plot_too_large`; the archive download remains available.
+
+The browser fetches the three images concurrently with independent failures,
+shares one cache-restoration request if needed, and retries affected reads once.
+It never buffers the whole ZIP and releases image object URLs on unmount. The
+panel does not alter Job state, launch Modal work, or replace the download action.
+
 ## AlphaFold3 submission
 
 Completed AlphaFold3 Jobs additionally expose private request-scoped

@@ -8,7 +8,9 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
+from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from biomodals.service.auth import AuthenticatedSession, AuthService
@@ -70,6 +72,20 @@ class CodedAPIError(Exception):
         self.code = code
         self.detail = detail
         self.headers = headers or {}
+
+
+class PrivateResultRoute(APIRoute):
+    """Keep private preview responses and their errors out of HTTP caches."""
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Apply the same private policy to successful and rejected requests."""
+
+        async def send_private(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "private, no-store"
+            await send(message)
+
+        await super().handle(scope, receive, send_private)
 
 
 def model_response(model: BaseModel, *, status_code: int) -> Response:

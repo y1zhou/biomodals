@@ -249,6 +249,9 @@ retained AlphaFold3 JSON validation and submission, paired humanization
 submission and result tables, paginated Provider Call log
 targets, and Administrator billing reports. Completed AlphaFold3 Jobs also
 provide an owner-private highest-ranked structure and interactive PAE preview.
+Completed GROMACS Jobs show their production RMSD, radius-of-gyration and RMSF
+figures in a **Trajectory overview** panel above Execution stages, using the
+original PNGs from the result archive without rerunning the simulation.
 Large or unavailable previews do not prevent native archive downloads; see
 the [AlphaFold3 viewer specification](docs/specs/alphafold3-ux.md) for preview
 limits. AlphaFold3 input documents are

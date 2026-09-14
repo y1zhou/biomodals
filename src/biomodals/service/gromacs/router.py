@@ -5,25 +5,48 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+import zipfile
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated
 from uuid import UUID, uuid4
 
 import orjson
-from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import Response
 
 from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
 from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
 from biomodals.execution import DeploymentIdentity
 from biomodals.helper.pdb import validate_pdb_content
+from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthenticatedSession
+from biomodals.service.gromacs.archive import (
+    TrajectoryMetric,
+    TrajectoryPlotTooLargeError,
+    read_trajectory_plot,
+)
 from biomodals.service.gromacs.contracts import (
     MAX_SIMULATION_TIME_NS,
     GromacsJobOptions,
     gromacs_run_name,
 )
-from biomodals.service.http_contract import CodedAPIError, require_unsafe_session
+from biomodals.service.http_contract import (
+    CodedAPIError,
+    CodedErrorResponse,
+    PrivateResultRoute,
+    require_session,
+    require_unsafe_session,
+)
 from biomodals.service.jobs import JobView
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.remote_execution import RemoteExecutionClient
@@ -31,6 +54,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
+    JobState,
     ServiceStore,
     UserNotFoundError,
 )
@@ -65,10 +89,77 @@ def create_router(
     configuration: RuntimeConfiguration,
     pending: PendingRequestStore,
     remote: RemoteExecutionClient,
+    cache: ArtifactCache,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
     """Create the GROMACS endpoint around shared admission."""
     router = APIRouter(prefix="/api/v1/gromacs", tags=["gromacs"])
+    previews = APIRouter(
+        prefix="/jobs/{job_id}/trajectory", route_class=PrivateResultRoute
+    )
+
+    @previews.get(
+        "/{metric}.png",
+        response_class=Response,
+        responses={
+            200: {
+                "content": {
+                    "image/png": {"schema": {"type": "string", "format": "binary"}}
+                }
+            },
+            409: {"model": CodedErrorResponse},
+            413: {"model": CodedErrorResponse},
+        },
+    )
+    async def trajectory_plot(
+        job_id: UUID,
+        metric: TrajectoryMetric,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> Response:
+        job = store.get_job(session.principal.user_id, job_id)
+        if job is None or job.tool != "gromacs":
+            raise HTTPException(404, "Job not found")
+        if (
+            job.state != JobState.SUCCEEDED
+            or job.result_size_bytes is None
+            or job.result_sha256 is None
+        ):
+            raise CodedAPIError(409, "result_not_ready", "Result is not ready")
+        lease = await cache.acquire_async(
+            str(job_id), size_bytes=job.result_size_bytes, sha256=job.result_sha256
+        )
+        if lease is None:
+            raise CodedAPIError(
+                409,
+                "result_not_cached",
+                "Prepare the result download before opening these plots",
+            )
+        try:
+            content = await cache.run_bounded(read_trajectory_plot, lease, metric)
+        except TrajectoryPlotTooLargeError as error:
+            raise CodedAPIError(
+                413,
+                "trajectory_plot_too_large",
+                "Plot exceeds the preview limit; use the archive download",
+            ) from error
+        except (KeyError, ValueError, TypeError, OSError, zipfile.BadZipFile) as error:
+            raise CodedAPIError(
+                409,
+                "result_invalid",
+                "Production trajectory plot is unavailable or invalid",
+            ) from error
+        finally:
+            lease.close()
+        return Response(
+            content,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'inline; filename="production-{metric}.png"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    router.include_router(previews)
 
     @router.post(
         "/jobs",

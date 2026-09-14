@@ -321,6 +321,7 @@ def _app(tmp_path: Path):
                 configuration=configuration,
                 pending=pending,
                 remote=remote,
+                cache=cache,
             ),
             af3_router(
                 store=store,

@@ -21,6 +21,7 @@ from uuid import UUID, uuid4, uuid5
 import orjson
 import polars as pl
 from service.alphafold3_preview_fixture import preview_archive
+from service.gromacs_preview_fixture import trajectory_archive
 
 from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
 from biomodals.execution import (
@@ -70,12 +71,7 @@ _CALL_NAMESPACE = UUID("156d600f-2a56-4ce7-8d0c-886bfa35698a")
 
 
 def _result_archive() -> bytes:
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("input.pdb", "ATOM\nEND\n")
-        archive.writestr("outputs/trajectory_nopbc.xtc", b"trajectory")
-        archive.writestr("metadata/manifest.json", "{}\n")
-    return buffer.getvalue()
+    return trajectory_archive()
 
 
 class _FakeRemote:
@@ -714,6 +710,7 @@ def _create_browser_app():
                 configuration=configuration,
                 pending=pending,
                 remote=remote,
+                cache=cache,
             ),
             af3_router(
                 store=store,

@@ -17,10 +17,7 @@ from uuid import UUID, uuid4
 import orjson
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
-from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
-from starlette.datastructures import MutableHeaders
-from starlette.types import Message, Receive, Scope, Send
 
 from biomodals.execution import DeploymentIdentity
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
@@ -46,6 +43,7 @@ from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
+    PrivateResultRoute,
     require_session,
     require_unsafe_session,
 )
@@ -82,18 +80,6 @@ class AlphaFold3JobRequest(BaseModel):
     validation_id: UUID
 
 
-class _PrivatePredictionRoute(APIRoute):
-    """Protect preview responses, including authentication and validation errors."""
-
-    async def handle(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async def send_private(message: Message) -> None:
-            if message["type"] == "http.response.start":
-                MutableHeaders(scope=message)["Cache-Control"] = "private, no-store"
-            await send(message)
-
-        await super().handle(scope, receive, send_private)
-
-
 def create_router(
     *,
     store: ServiceStore,
@@ -106,7 +92,7 @@ def create_router(
     """Create AlphaFold3 validation and submission routes."""
     router = APIRouter(prefix="/api/v1/alphafold3", tags=["alphafold3"])
     preview_router = APIRouter(
-        prefix="/jobs/{job_id}/prediction", route_class=_PrivatePredictionRoute
+        prefix="/jobs/{job_id}/prediction", route_class=PrivateResultRoute
     )
     upload_slots = asyncio.Semaphore(2)
     validation_lock = asyncio.Lock()

@@ -227,6 +227,7 @@ def create_deployed_app() -> FastAPI:
             configuration=configuration,
             pending=pending,
             remote=remote,
+            cache=cache,
         ),
         af3_router(
             store=store,

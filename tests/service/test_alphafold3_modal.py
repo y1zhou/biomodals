@@ -6,8 +6,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import orjson
 import pytest
+from uniaf3.schema.alphafold3 import AF3Config
 
+from biomodals.app.fold.alphafold3 import invocation_cache, msa_search
+from biomodals.app.fold.alphafold3.execution_request import (
+    EXECUTION_REQUEST_FILENAME,
+    AlphaFold3ExecutionRequest,
+)
 from biomodals.service.alphafold3 import modal as af3_modal
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.store import JobState, ServiceStore
@@ -129,34 +136,53 @@ async def test_terminal_predecessor_authorizes_exact_claim_repair(
 
 
 @pytest.mark.anyio
-async def test_input_document_uses_staged_execution_request(
+async def test_historical_input_survives_scientific_version_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, owner = _store(tmp_path)
     job = _admit(store, owner, job_id=uuid4(), ordinal=1)
-    volume = object()
+    native = {
+        "name": "Original input",
+        "modelSeeds": [2, 19],
+        "sequences": [{"protein": {"id": "A", "sequence": "ACDE"}}],
+        "dialect": "alphafold3",
+        "version": 3,
+    }
+    with monkeypatch.context() as historical:
+        historical.setattr(
+            invocation_cache,
+            "RUN_IDENTITY_SCHEMA",
+            "biomodals-alphafold3-inference-run-v3",
+        )
+        historical.setattr(
+            msa_search,
+            "NHMMER_SHARDED_MERGE_ORDER",
+            "reported-evalue-descending-bit-score-name-v1",
+        )
+        content = AlphaFold3ExecutionRequest.prepare(
+            AF3Config.model_validate(native),
+            search_msa=False,
+            search_protein_templates=False,
+            recycle=0,
+            sample=3,
+        ).to_bytes()
+
+    with pytest.raises(ValueError, match="does not match"):
+        AlphaFold3ExecutionRequest.from_bytes(content)
+
+    class Volume:
+        def read_file(self, path):
+            assert path == (
+                f".biomodals/execution/runs/{job.job_id}/{EXECUTION_REQUEST_FILENAME}"
+            )
+            yield content
+
+    volume = Volume()
     validations = SimpleNamespace(get_claimed=lambda *_args, **_kwargs: None)
     adapter = AlphaFold3ToolAdapter(validations, store)
     monkeypatch.setattr(adapter, "_volume", lambda _job: volume)
 
-    async def to_thread(function, *args, **kwargs):
-        return function(*args, **kwargs)
-
-    monkeypatch.setattr(af3_modal.asyncio, "to_thread", to_thread)
-    monkeypatch.setattr(
-        af3_modal,
-        "load_execution_request_from_volume",
-        lambda selected, job_id: SimpleNamespace(
-            config=(selected, job_id),
-        ),
-    )
-    monkeypatch.setattr(
-        af3_modal,
-        "serialize_af3_input",
-        lambda config: repr(config).encode(),
-    )
-
     document = await adapter.input_document(job)
 
-    assert document == repr((volume, job.job_id)).encode()
+    assert orjson.loads(document) == orjson.loads(content)["config"]

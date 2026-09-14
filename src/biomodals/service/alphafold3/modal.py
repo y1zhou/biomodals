@@ -10,9 +10,9 @@ import modal
 
 from biomodals.app.fold.alphafold3.execution_request import (
     load_execution_request_from_volume,
+    load_input_document_from_volume,
     stage_execution_request,
 )
-from biomodals.app.fold.alphafold3.inference_inputs import serialize_af3_input
 from biomodals.app.fold.alphafold3.invocation_cache import (
     load_invocation_manifest,
 )
@@ -95,7 +95,7 @@ class AlphaFold3ToolAdapter:
             )
 
     async def input_document(self, job: JobRecord) -> bytes:
-        """Return the normalized AlphaFold3 input retained for one Job."""
+        """Read saved native JSON without requiring execution compatibility."""
         if job.pending_validation_id is not None:
             validated = self.validations.get_claimed(
                 job.pending_validation_id,
@@ -103,11 +103,8 @@ class AlphaFold3ToolAdapter:
             )
             if validated is not None:
                 return await asyncio.to_thread(validated.document_path.read_bytes)
-        volume = self._volume(job)
         return await asyncio.to_thread(
-            lambda: serialize_af3_input(
-                load_execution_request_from_volume(volume, job.job_id).config
-            )
+            load_input_document_from_volume, self._volume(job), job.job_id
         )
 
     async def prepare_result(

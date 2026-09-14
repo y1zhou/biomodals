@@ -11,7 +11,7 @@ import zlib
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import BinaryIO, Protocol, TypeVar, cast
+from typing import BinaryIO, Literal, Protocol, TypeVar, cast
 
 import orjson
 import polars as pl
@@ -93,6 +93,54 @@ class _HashingWriter:
 
 
 GROMACS_ARCHIVE_SCHEMA_VERSION = 5
+MAX_TRAJECTORY_PNG_BYTES = 16 * 1024 * 1024
+MAX_TRAJECTORY_PNG_PIXELS = 16 * 1024 * 1024
+TrajectoryMetric = Literal["rmsd", "rg", "rmsf"]
+_TRAJECTORY_ROLES = {
+    "rmsd": "production_rmsd_plot",
+    "rg": "production_radius_of_gyration_plot",
+    "rmsf": "production_rmsf_plot",
+}
+
+
+class TrajectoryPlotTooLargeError(ValueError):
+    """A native PNG exceeds the website's bounded preview limits."""
+
+
+def read_trajectory_plot(handle: BinaryIO, metric: TrajectoryMetric) -> bytes:
+    """Read one native production PNG from an already verified Result ZIP.
+
+    Resolve the published role instead of reconstructing historical filenames.
+    Only the small manifest and selected PNG are decompressed; trajectory data
+    stays in the archive. No files are extracted or plots recomputed.
+    """
+    with zipfile.ZipFile(handle) as archive:
+        manifest = orjson.loads(_read_small(archive, "metadata/manifest.json"))
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("files"), list
+        ):
+            raise ValueError("GROMACS archive manifest is invalid")
+        paths = [
+            record.get("path")
+            for record in manifest["files"]
+            if isinstance(record, dict)
+            and record.get("role") == _TRAJECTORY_ROLES[metric]
+        ]
+        if len(paths) != 1 or not isinstance(paths[0], str):
+            raise ValueError("GROMACS production plot is missing or ambiguous")
+        name = paths[0]
+        info = archive.getinfo(name)
+        if not _safe_member(info) or PurePosixPath(name).suffix != ".png":
+            raise ValueError("GROMACS production plot is invalid")
+        if info.file_size > MAX_TRAJECTORY_PNG_BYTES:
+            raise TrajectoryPlotTooLargeError("GROMACS production PNG is too large")
+        _validate_png_member(archive, name)
+        width, height = struct.unpack(">II", _read_prefix(archive, name, 24)[16:24])
+        if width * height > MAX_TRAJECTORY_PNG_PIXELS:
+            raise TrajectoryPlotTooLargeError(
+                "GROMACS production PNG has too many pixels"
+            )
+        return _read_small(archive, name, max_bytes=MAX_TRAJECTORY_PNG_BYTES)
 
 
 def _analysis_output_files(prefix: str, *, stage: str) -> list[tuple[str, str]]:
@@ -757,10 +805,11 @@ async def write_gromacs_archive(
         raise ArtifactIntegrityError(
             "GROMACS result input does not match the staged request"
         )
-    expected_paths = tuple(
+    expected_paths = sorted(
         PurePosixPath(name).name for name, _role in _required_output_files(run_name)
     )
-    if tuple(file.path for file in published_files) != expected_paths or any(
+    # Publication order is independent of ZIP order; sorting retains duplicates.
+    if sorted(file.path for file in published_files) != expected_paths or any(
         file.size_bytes is None or file.content_sha256 is None
         for file in published_files
     ):

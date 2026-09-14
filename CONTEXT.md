@@ -642,6 +642,10 @@ _Avoid_: worker-local ranking, seed sample directory, completion marker
 The deterministic ordering shared by request-scoped and global prediction summaries: descending ranking score, then ascending model seed, then ascending sample index. It makes equal-score best-sample selection independent of worker completion order.
 _Avoid_: worker completion order, submission order, arbitrary equal-score winner
 
+**Highest-Ranked Prediction**:
+The prediction ranked first within one Inference Request according to Prediction Ranking Order. It is not the best prediction across every request sharing the same Inference Run Identity.
+_Avoid_: globally best model, highest-pLDDT model, most recently completed sample
+
 **Inference Request**:
 The normalized model-seed set requested against an Inference Run Identity. Its request ID ignores submitted order, duplicate seeds, and display name, and it may reuse existing Seed Predictions without changing the shared run identity.
 _Avoid_: inference run identity, request view, GPU worker assignment

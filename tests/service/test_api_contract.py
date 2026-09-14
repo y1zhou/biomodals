@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import polars as pl
+import pytest
 
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.router import create_router as af3_router
@@ -320,6 +321,7 @@ def _app(tmp_path: Path):
                 configuration=configuration,
                 pending=pending,
                 remote=remote,
+                cache=cache,
             ),
             af3_router(
                 store=store,
@@ -327,6 +329,7 @@ def _app(tmp_path: Path):
                 validations=validations,
                 adapter=alphafold3_adapter,
                 remote=remote,
+                cache=cache,
             ),
             humanization_router(
                 store=store,
@@ -480,6 +483,102 @@ def _enabled_session(app) -> AuthenticatedSession:
         absolute_expires_at=1000,
     )
     return _session(user.user_id)
+
+
+def test_alphafold3_rerun_document_is_private_and_does_not_submit(
+    tmp_path, monkeypatch
+):
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+    app.dependency_overrides[require_session] = lambda: session
+    app.dependency_overrides[require_unsafe_session] = lambda: session
+    settings = {
+        "search_msa": False,
+        "search_protein_templates": False,
+        "recycle": 0,
+        "sample": 3,
+    }
+    native = {
+        "name": "Original input",
+        "modelSeeds": [7, 19],
+        "sequences": [
+            {
+                "protein": {
+                    "id": "B",
+                    "sequence": "ACDE",
+                    "unpairedMsa": "",
+                    "pairedMsa": "",
+                    "templates": [],
+                }
+            }
+        ],
+        "dialect": "alphafold3",
+        "version": 3,
+    }
+    headers = {"Origin": ORIGIN}
+    validation = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/validations",
+        params=settings,
+        json=native,
+        headers=headers,
+    )
+    assert validation.status_code == 201, validation.text
+    validation_id = validation.json()["validation_id"]
+    submitted = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/jobs",
+        json={"validation_id": validation_id},
+        headers={**headers, "Idempotency-Key": str(uuid4())},
+    )
+    assert submitted.status_code == 202, submitted.text
+    job_id = UUID(submitted.json()["job_id"])
+    original = app.state.store.fail_job(
+        job_id,
+        error_code="remote_execution_failed",
+        error_message="Remote execution failed",
+        now=10,
+    )
+    path = f"/api/v1/alphafold3/jobs/{job_id}/document"
+    restored = _request(app, "GET", path)
+    assert restored.status_code == 200, restored.text
+    assert restored.headers["cache-control"] == "private, no-store"
+    assert restored.headers["content-type"] == "application/json"
+    assert restored.json() == native
+    assert app.state.store.get_job_by_id(job_id) == original
+    assert (
+        len(app.state.store.list_jobs_page(session.principal.user_id, limit=10).jobs)
+        == 1
+    )
+    assert app.state.remote_execution.preflights == 1
+
+    app.dependency_overrides[require_session] = _session
+    assert _request(app, "GET", path).status_code == 404
+    app.dependency_overrides.pop(require_session)
+    assert _request(app, "GET", path).status_code == 401
+    app.dependency_overrides[require_session] = lambda: session
+    ValidatedInputStore(tmp_path / "validations").delete_claimed(UUID(validation_id))
+
+    class Volume:
+        content: bytes | None = b'{"config":' + restored.content + b"}"
+
+        def read_file(self, _path):
+            if self.content is None:
+                raise FileNotFoundError("removed")
+            yield self.content
+
+    volume = Volume()
+    monkeypatch.setattr(AlphaFold3ToolAdapter, "_volume", lambda *_: volume)
+    staged = _request(app, "GET", path)
+    assert staged.status_code == 200
+    assert staged.json() == native
+    for content in (None, b"invalid JSON", b'{"config":null}'):
+        volume.content = content
+        missing = _request(app, "GET", path)
+        assert missing.status_code == 404
+        assert missing.json()["code"] == "job_input_unavailable"
 
 
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
@@ -729,6 +828,73 @@ def test_authenticated_routes_receive_the_principal(tmp_path: Path) -> None:
     assert principal.json()["email"] == "scientist@example.com"
     assert jobs.status_code == 200
     assert jobs.json() == {"jobs": [], "next_cursor": None}
+
+
+@pytest.mark.parametrize("tool", TOOLS, ids=lambda tool: tool.key)
+def test_result_retry_is_owner_scoped_csrf_protected_and_durable(
+    tmp_path, monkeypatch, tool
+):
+    app = _app(tmp_path)
+    session = _enabled_session(app)
+    store = app.state.store
+    job = store.admit_job(
+        owner_user_id=session.principal.user_id,
+        tool=tool.key,
+        display_name="Prepared prediction",
+        idempotency_key=str(uuid4()),
+        request_digest="a" * 64,
+        modal_environment="main",
+        modal_app_name=tool.default_modal_app_name,
+        modal_app_version=1,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=8,
+        max_active_gpu_provider_calls=1,
+        now=3,
+    ).job
+    store.begin_finalization(
+        job.job_id, result_state=JobState.SUCCEEDED, projection={}, now=4
+    )
+    store.fail_job(
+        job.job_id,
+        error_code="result_preparation_failed",
+        error_message="The Result archive could not be prepared",
+        now=5,
+    )
+    base = f"/api/v1/jobs/{job.job_id}"
+    path = base + "/retry-result-preparation"
+    headers = {"Origin": ORIGIN}
+    assert _request(app, "POST", path, headers=headers).status_code == 401
+    monkeypatch.setattr(app.state.auth, "authenticate", lambda _: session)
+    denied = _request(
+        app,
+        "POST",
+        path,
+        headers={**headers, "Cookie": "__Host-biomodals-session=fixture"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "csrf_invalid"
+
+    app.dependency_overrides[require_session] = lambda: session
+    assert _request(app, "GET", base).json()["can_retry_result_preparation"]
+    app.dependency_overrides[require_unsafe_session] = _session
+    assert _request(app, "POST", path, headers=headers).status_code == 404
+    app.dependency_overrides[require_unsafe_session] = lambda: session
+    accepted = _request(app, "POST", path, headers=headers)
+    assert accepted.status_code == 202
+    assert accepted.json()["state"] == "finalizing"
+    assert not accepted.json()["can_retry_result_preparation"]
+    assert app.state.reconcile_wakeup.is_set()
+    assert _request(app, "POST", path, headers=headers).json() == accepted.json()
+    store.fail_job(
+        job.job_id,
+        error_code="remote_execution_failed",
+        error_message="Remote execution failed",
+        now=6,
+    )
+    refused = _request(app, "POST", path, headers=headers)
+    assert refused.status_code == 409
+    assert refused.json()["code"] == "result_retry_not_allowed"
 
 
 def test_alphafold3_lost_response_replays_after_validation_consumption(

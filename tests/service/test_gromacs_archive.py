@@ -18,6 +18,12 @@ from threading import Event, Thread
 import orjson
 import pytest
 
+from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs_execution_runtime import (
+    GromacsExecutionRequest,
+    gromacs_node_paths,
+    parse_gromacs_publication,
+)
 from biomodals.schema import ArtifactFile
 from biomodals.service.artifacts import (
     ArtifactCache,
@@ -35,6 +41,20 @@ from biomodals.service.gromacs.contracts import artifact_request_sha256
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
 PARAMETERS = '{"cpu_only":false,"simulation_time_ns":5}'
+REQUEST = GromacsExecutionRequest(
+    run_name=RUN_NAME,
+    pdb_content=PDB,
+    simulation_time_ns=5,
+    run_pdbfixer=True,
+    cpu_only=False,
+    num_threads=8,
+    use_openmp_threads=False,
+    ld_seed=11,
+    gen_seed=12,
+    genion_seed=13,
+    max_active_provider_calls=4,
+    max_active_gpu_provider_calls=1,
+)
 XTC = struct.pack(
     ">iiif9fi3f",
     1995,
@@ -110,17 +130,13 @@ def _published_files(
     remote_files: dict[str, bytes] | None = None,
 ) -> tuple[ArtifactFile, ...]:
     files = _remote_files() if remote_files is None else remote_files
-    baseline = _remote_files()
-    input_path = f"{RUN_NAME}/{RUN_NAME}.pdb"
-    full_trajectory = f"{RUN_NAME}/production_{RUN_NAME}.xtc"
     return tuple(
         ArtifactFile(
-            path=path.removeprefix(f"{RUN_NAME}/"),
-            size_bytes=len(files[path]),
-            content_sha256=hashlib.sha256(files[path]).hexdigest(),
+            path=path,
+            size_bytes=len(files[f"{RUN_NAME}/{path}"]),
+            content_sha256=hashlib.sha256(files[f"{RUN_NAME}/{path}"]).hexdigest(),
         )
-        for path in baseline
-        if path not in {input_path, full_trajectory}
+        for path in gromacs_node_paths(REQUEST, PREPARE_RESULT)
     )
 
 
@@ -194,10 +210,23 @@ def _rewrite_local_header(
     return bytes(mutated)
 
 
-def test_service_packages_established_remote_files_deterministically() -> None:
+def test_service_packages_app_publication_deterministically() -> None:
     prefix = f"production_{RUN_NAME}"
-    first_bytes, first = _build_archive()
-    second_bytes, second = _build_archive()
+    marker = orjson.dumps({
+        "schema_version": 1,
+        "identity": {
+            "node_key": PREPARE_RESULT,
+            "workload_plan_fingerprint": REQUEST.execution_plan.workload_plan_fingerprint,
+        },
+        "files": [
+            file.model_dump(mode="json", exclude_none=True)
+            for file in _published_files()
+        ],
+    })
+    published = parse_gromacs_publication(REQUEST, PREPARE_RESULT, marker)
+    assert published is not None
+    first_bytes, first = _build_archive(published_files=published)
+    second_bytes, second = _build_archive(published_files=tuple(reversed(published)))
 
     assert first_bytes == second_bytes
     assert first == second
@@ -247,6 +276,31 @@ def test_service_rejects_output_changed_after_publication() -> None:
             remote_files=remote_files,
             published_files=published_files,
         )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda files: files[:-1],
+        lambda files: (*files, files[0]),
+        lambda files: (*files, files[0].model_copy(update={"path": "unexpected.dat"})),
+        lambda files: (files[0].model_copy(update={"size_bytes": None}), *files[1:]),
+        lambda files: (
+            files[0].model_copy(update={"content_sha256": None}),
+            *files[1:],
+        ),
+    ],
+    ids=[
+        "missing-file",
+        "duplicate-file",
+        "extra-file",
+        "missing-size",
+        "missing-digest",
+    ],
+)
+def test_service_rejects_invalid_publication_records(mutate) -> None:
+    with pytest.raises(ArtifactIntegrityError, match="publication is invalid"):
+        _build_archive(published_files=mutate(_published_files()))
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,70 @@
+data_synthetic_af3_preview
+# Synthetic coordinates for offline UI tests, not a scientific prediction.
+_entry.id synthetic_af3_preview
+loop_
+_entity.id
+_entity.type
+_entity.pdbx_description
+1 polymer 'Synthetic peptide'
+2 polymer 'Synthetic DNA'
+3 non-polymer 'Synthetic ligand'
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+1 'polypeptide(L)'
+2 polydeoxyribonucleotide
+loop_
+_struct_asym.id
+_struct_asym.entity_id
+A 1
+B 2
+C 3
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 ALA n
+1 2 GLY n
+1 3 TYR n
+2 1 DA n
+2 2 DC n
+loop_
+_chem_comp.id
+_chem_comp.type
+_chem_comp.name
+ALA 'L-peptide linking' ALANINE
+GLY 'peptide linking' GLYCINE
+TYR 'L-peptide linking' TYROSINE
+DA 'DNA linking' DEOXYADENOSINE
+DC 'DNA linking' DEOXYCYTIDINE
+LIG non-polymer 'Synthetic ligand'
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+ATOM 1 C CA . ALA A 1 1 ? 0.0 0.0 0.0 1.0 92.0 1 ALA A CA 1
+ATOM 2 C CA . GLY A 1 2 ? 3.8 0.0 0.0 1.0 85.0 2 GLY A CA 1
+ATOM 3 C CA . TYR A 1 3 ? 6.0 3.1 0.0 1.0 71.0 3 TYR A CA 1
+ATOM 4 C "C1'" . DA B 2 1 ? 0.0 5.0 0.0 1.0 88.0 1 DA B "C1'" 1
+ATOM 5 C "C1'" . DC B 2 2 ? 4.0 5.0 0.0 1.0 76.0 2 DC B "C1'" 1
+HETATM 6 C C1 . LIG C 3 . ? 2.0 2.0 2.0 1.0 60.0 1 LIG C C1 1
+HETATM 7 N N1 . LIG C 3 . ? 3.3 2.0 2.0 1.0 80.0 1 LIG C N1 1
+#

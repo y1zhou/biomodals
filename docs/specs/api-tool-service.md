@@ -196,6 +196,35 @@ may still pin a deployment version and choose Job-log visibility per Tool.
 
 ## Result metadata
 
+### Explicit preparation retry
+
+For every Tool, the Job page offers **Retry fetching results** when an owner
+may retry a failed local archive preparation after the service has persisted a
+publishable scientific outcome. `JobView.can_retry_result_preparation`
+is true only for `failed/result_preparation_failed` Jobs with a saved
+`succeeded` or `partial` result outcome, the original finalization timestamp,
+and no previously published Result digest. Completed stage rows alone are not
+evidence that all required scientific publication work succeeded.
+
+The owner- and CSRF-protected `POST /api/v1/jobs/{job_id}/retry-result-preparation`
+returns `202` and the updated Job. It durably queues `finalizing`, clears the
+previous local failure and completion timestamp, and wakes the existing
+bounded reconciler. That reconciler invokes only the Tool's Result preparation
+adapter; the endpoint never launches, resumes, or polls a scientific Run. It
+may download the already published artifacts from Modal storage, but does not
+submit new scientific tasks. The Job ID, pinned deployment, scientific stage
+evidence, result outcome and original finalization timestamp stay unchanged.
+
+Repeated requests while finalizing or after completion return the current Job
+without another preparation attempt. Other states return
+`409 result_retry_not_allowed`; other owners receive 404. A process restart
+resumes the queued preparation. Transient preparation failures retain their
+existing automatic backoff; another permanent local failure again requires
+explicit Retry. Previously published Result identities are never replaced by
+this endpoint: cache restoration must still reproduce the recorded bytes.
+
+### Published archives
+
 Prepared Results record a friendly filename, media type, byte size, SHA-256
 digest, archive schema version, authoritative provider location, and local
 cache state. Shared download handling uses this metadata rather than assuming
@@ -223,13 +252,50 @@ end-user archive. The GROMACS Tool Adapter packages that publication into the
 existing `input.pdb`, `outputs/`, and `metadata/` schema. It does not infer
 successful files independently of the coordinator publication, and this API
 presentation behavior does not require changes to `gromacs_app.py`.
+Publication records may have a different order from ZIP members. Validate the
+exact filenames and their multiplicities independently of order, while retaining
+the size and SHA-256 checks for every file and the existing deterministic ZIP order.
 
 The service does not upload that ZIP back to Modal and does not delete the
 app-owned GROMACS scientific publication. A cleared local archive is rebuilt
 from the verified remote publication. Retention of scientific Modal outputs is
 an app policy, not a service-cache cleanup operation.
 
+### GROMACS trajectory overview
+
+Completed GROMACS Jobs show a **Trajectory overview** panel above Execution
+stages with the native production RMSD, radius-of-gyration and RMSF PNG figures.
+Equilibration figures remain in the downloaded archive. No plots or scientific
+results are recomputed for this panel.
+
+`GET /api/v1/gromacs/jobs/{job_id}/trajectory/{metric}.png`, with `metric` one of
+`rmsd`, `rg`, `rmsf`, serves one original `image/png`. The reader selects the
+production role recorded in the archive manifest, not a reconstructed filename.
+It uses the shared verified Result lease and bounded artifact worker, reading
+only the manifest and requested PNG without extracting trajectory files. Limits
+are 1 MiB for the manifest, 16 MiB per PNG and 16,777,216 pixels per image. Existing
+PNG envelope/CRC validation applies; native bytes, axes and units are unchanged.
+
+Reads require the owner session and a succeeded Job with published Result metadata.
+All preview responses, including errors, are private/no-store. Anonymous access
+is 401; another owner or Tool is 404. `409 result_not_ready` means no completed
+Result, `409 result_not_cached` requests the shared prepare-download action, and
+`409 result_invalid` means the figure is missing or invalid. Oversized figures
+return `413 trajectory_plot_too_large`; the archive download remains available.
+
+The browser fetches the three images concurrently with independent failures,
+shares one cache-restoration request if needed, and retries affected reads once.
+It never buffers the whole ZIP and releases image object URLs on unmount. The
+panel does not alter Job state, launch Modal work, or replace the download action.
+
 ## AlphaFold3 submission
+
+Completed AlphaFold3 Jobs additionally expose private request-scoped
+prediction metadata, native CIF and bounded PAE reads. These reuse the shared
+verified Result cache and download preparation. The exact routes, identity,
+preview limits, null/aggregation behavior and browser interaction are owned by
+the [AlphaFold3 UX specification](alphafold3-ux.md); scientific execution and
+the downloaded archive remain unchanged.
 
 AlphaFold3 first creates a validated submission resource:
 

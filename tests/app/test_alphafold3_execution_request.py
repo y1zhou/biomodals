@@ -14,6 +14,7 @@ from biomodals.app.fold.alphafold3 import execution_request, inference_inputs
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
     load_execution_request,
+    load_input_document_from_volume,
     persist_execution_request,
     stage_execution_request,
 )
@@ -168,3 +169,30 @@ def test_coordinator_request_persistence_is_idempotent(tmp_path: Path) -> None:
     request_path = persist_execution_request(tmp_path, RUN_ID, request)
     assert persist_execution_request(tmp_path, RUN_ID, request) == request_path
     assert load_execution_request(tmp_path, RUN_ID) == request
+
+
+def test_input_document_preserves_json_without_execution_reconstruction(
+    tmp_path: Path,
+) -> None:
+    """Document reads retain native fields independently of execution metadata."""
+    request = _request()
+    native = orjson.loads(request.to_bytes())["config"]
+    native["custom_metadata"] = {"label": "original", "value": None}
+    path = persist_execution_request(tmp_path, RUN_ID, request)
+    tmp_path.joinpath(*path.parts).write_bytes(orjson.dumps({"config": native}))
+
+    document = load_input_document_from_volume(FakeVolume(tmp_path), RUN_ID)
+
+    assert orjson.loads(document) == native
+
+
+@pytest.mark.parametrize("content", [b"invalid JSON", b"[]", b"{}", b'{"config":[]}'])
+def test_input_document_rejects_unreadable_saved_data(
+    tmp_path: Path, content: bytes
+) -> None:
+    """Malformed saved envelopes do not become apparently usable documents."""
+    path = persist_execution_request(tmp_path, RUN_ID, _request())
+    tmp_path.joinpath(*path.parts).write_bytes(content)
+
+    with pytest.raises(ValueError):
+        load_input_document_from_volume(FakeVolume(tmp_path), RUN_ID)

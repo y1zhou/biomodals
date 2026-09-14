@@ -22,6 +22,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobCursorError,
     JobNotCancellableError,
+    JobNotRetryableError,
     JobRecord,
     JobState,
     ServiceStore,
@@ -118,6 +119,24 @@ def create_jobs_router(
             job = await lifecycle.cancel(job_id)
         except JobNotCancellableError as error:
             raise CodedAPIError(409, "job_not_cancellable", str(error)) from error
+        request.app.state.reconcile_wakeup.set()
+        return view(job, session)
+
+    @router.post(
+        "/{job_id}/retry-result-preparation",
+        status_code=status.HTTP_202_ACCEPTED,
+        responses={409: {"model": CodedErrorResponse}},
+    )
+    async def retry_result_preparation(
+        job_id: UUID,
+        request: Request,
+        session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
+    ) -> JobView:
+        _owned(store, session, job_id)
+        try:
+            job = await lifecycle.retry_result_preparation(job_id)
+        except JobNotRetryableError as error:
+            raise CodedAPIError(409, "result_retry_not_allowed", str(error)) from error
         request.app.state.reconcile_wakeup.set()
         return view(job, session)
 

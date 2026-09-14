@@ -227,6 +227,7 @@ def create_deployed_app() -> FastAPI:
             configuration=configuration,
             pending=pending,
             remote=remote,
+            cache=cache,
         ),
         af3_router(
             store=store,
@@ -234,6 +235,7 @@ def create_deployed_app() -> FastAPI:
             validations=validations,
             adapter=alphafold3_adapter,
             remote=remote,
+            cache=cache,
         ),
         humanization_router(
             store=store,

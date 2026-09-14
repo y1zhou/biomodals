@@ -25,7 +25,12 @@ from biomodals.service.remote_execution import (
     RemoteExecutionNotInitializedError,
     RemoteSubmissionOutcomeUnknownError,
 )
-from biomodals.service.store import JobRecord, JobState, ServiceStore
+from biomodals.service.store import (
+    JobNotRetryableError,
+    JobRecord,
+    JobState,
+    ServiceStore,
+)
 from biomodals.service.tools import ToolDefinition, project_overview
 
 LOGGER = logging.getLogger(__name__)
@@ -329,6 +334,19 @@ class JobLifecycle:
             if job.state == JobState.CANCELLED:
                 await self.registrations[job.tool].adapter.discard_pending(job)
             return job
+
+    async def retry_result_preparation(self, job_id: UUID) -> JobRecord:
+        """Persist an explicit retry; the reconciler only repeats archive work."""
+        job = self._required_job(job_id)
+        if job.state in {JobState.FINALIZING, JobState.SUCCEEDED, JobState.PARTIAL}:
+            return job
+        if not job.can_retry_result_preparation:
+            raise JobNotRetryableError(
+                "Only failed Result preparation after scientific completion can be retried"
+            )
+        lock = self._locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            return self.store.retry_result_preparation(job_id, now=int(time.time()))
 
     async def _observe(
         self,

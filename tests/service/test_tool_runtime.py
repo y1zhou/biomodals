@@ -703,31 +703,89 @@ async def test_transient_result_failure_retries_later(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_permanent_result_failure_does_not_retry(tmp_path: Path) -> None:
-    class InvalidAdapter(Adapter):
+@pytest.mark.parametrize("tool", TOOLS, ids=lambda tool: tool.key)
+@pytest.mark.parametrize("result_state", [JobState.SUCCEEDED, JobState.PARTIAL])
+async def test_explicit_result_retry_only_repeats_local_preparation(
+    tmp_path: Path, result_state: JobState, tool
+) -> None:
+    class RecoveringAdapter(Adapter):
+        async def stage(self, job):
+            raise AssertionError("Result retry must not stage scientific execution")
+
         async def prepare_result(self, job, cache, *, completed_at):
-            del job, cache, completed_at
-            raise ValueError("invalid archive")
+            self.prepared += 1
+            assert completed_at == 20
+            if self.prepared == 1:
+                raise ValueError("local preparation failed")
+            return PreparedResult(
+                "result.tar.zst", "application/zstd", 1, "a" * 64, "v1"
+            )
 
-    store, lifecycle, _adapter = _lifecycle(
-        tmp_path,
-        SimpleNamespace(),
-        InvalidAdapter(),
+    store, lifecycle, adapter = _lifecycle(
+        tmp_path, SimpleNamespace(), RecoveringAdapter(), tool=tool
     )
+    projection = {
+        "stages": [
+            {"code": stage.code, "outcome": "completed"} for stage in tool.stages
+        ]
+    }
     store.begin_finalization(
-        JOB_ID,
-        result_state=JobState.SUCCEEDED,
-        projection={"stages": [], "warnings": []},
-        now=20,
+        JOB_ID, result_state=result_state, projection=projection, now=20
     )
-
     failed = await lifecycle.advance(JOB_ID, finalize=True)
-
     assert (failed.state, failed.error_code) == (
         JobState.FAILED,
         "result_preparation_failed",
     )
     assert failed.error_message == "The Result archive could not be prepared"
+    assert failed.can_retry_result_preparation
+    await lifecycle.advance(JOB_ID, finalize=True, background=True)
+    assert adapter.prepared == 1
+
+    retried = await lifecycle.retry_result_preparation(JOB_ID)
+    assert retried.state == JobState.FINALIZING
+    assert retried.result_state == result_state.value
+    assert retried.projection == projection
+    assert retried.finalization_started_at == 20
+    assert retried.completed_at is None
+    assert retried.error_code is retried.error_message is None
+    assert not retried.can_retry_result_preparation
+    assert adapter.prepared == 1
+    assert [job.job_id for job in store.list_reconcilable_jobs(now=10**10)] == [JOB_ID]
+    assert (
+        await lifecycle.retry_result_preparation(JOB_ID)
+    ).state == JobState.FINALIZING
+
+    # A fresh process uses the persisted retry; no remote client methods exist.
+    restarted = JobLifecycle(
+        store,
+        SimpleNamespace(),
+        tuple(lifecycle.registrations.values()),
+        lifecycle.cache,
+    )
+    completed = await restarted.advance(JOB_ID, finalize=True, background=True)
+    assert completed.state == result_state
+    assert completed.projection == projection
+    assert completed.error_code is completed.error_message is None
+    assert adapter.prepared == 2
+    assert (await restarted.retry_result_preparation(JOB_ID)).state == result_state
+    assert adapter.prepared == 2
+
+
+@pytest.mark.anyio
+async def test_result_retry_rejects_scientific_failure(tmp_path: Path) -> None:
+    store, lifecycle, adapter = _lifecycle(tmp_path, SimpleNamespace())
+    failed = store.fail_job(
+        JOB_ID,
+        error_code="remote_execution_failed",
+        error_message="Remote execution failed",
+        now=20,
+    )
+    assert not failed.can_retry_result_preparation
+    with pytest.raises(tool_runtime.JobNotRetryableError):
+        await lifecycle.retry_result_preparation(JOB_ID)
+    assert store.get_job_by_id(JOB_ID) == failed
+    assert adapter.prepared == 0
 
 
 @pytest.mark.anyio

@@ -48,6 +48,7 @@ class JobView(BaseModel):
     display_name: str
     state: JobState
     can_view_logs: bool
+    can_retry_result_preparation: bool
     stages: list[JobStageView]
     created_at: datetime
     updated_at: datetime
@@ -83,6 +84,7 @@ class JobView(BaseModel):
             display_name=record.display_name,
             state=record.state,
             can_view_logs=can_view_logs,
+            can_retry_result_preparation=record.can_retry_result_preparation,
             stages=stages,
             created_at=datetime.fromtimestamp(record.created_at, UTC),
             updated_at=datetime.fromtimestamp(record.updated_at, UTC),

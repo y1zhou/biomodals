@@ -757,10 +757,11 @@ async def write_gromacs_archive(
         raise ArtifactIntegrityError(
             "GROMACS result input does not match the staged request"
         )
-    expected_paths = tuple(
+    expected_paths = sorted(
         PurePosixPath(name).name for name, _role in _required_output_files(run_name)
     )
-    if tuple(file.path for file in published_files) != expected_paths or any(
+    # Publication order is independent of ZIP order; sorting retains duplicates.
+    if sorted(file.path for file in published_files) != expected_paths or any(
         file.size_bytes is None or file.content_sha256 is None
         for file in published_files
     ):

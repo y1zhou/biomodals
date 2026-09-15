@@ -30,7 +30,7 @@ def auth(tmp_path):
     """Keep all account state in an isolated database."""
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    return AuthService(store, frontend_url="http://localhost:5173")
+    return AuthService(store, frontend_urls=("http://localhost:5173",))
 
 
 def test_bootstrap_creates_enabled_admin_and_preserves_password(auth, password_hash):
@@ -69,7 +69,7 @@ def test_unconfigured_bootstrap_preserves_manual_provisioning(auth):
     assert not auth.bootstrap_admin("", "")
     assert auth.store.list_users() == []
     link = auth.create_user("admin@example.com", display_name="Admin", is_admin=True)
-    assert "/set-password#token=" in link.url
+    assert "/set-password#token=" in link.urls[0]
 
 
 @pytest.mark.parametrize(

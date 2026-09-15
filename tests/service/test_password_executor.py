@@ -51,7 +51,7 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
 ) -> None:
     store = ServiceStore(tmp_path / "state.sqlite3")
     store.initialize()
-    auth = AuthService(store, frontend_url=ORIGIN)
+    auth = AuthService(store, frontend_urls=(ORIGIN,))
     principal = Principal(
         user_id=uuid4(),
         email="alice@example.com",
@@ -99,7 +99,7 @@ def test_password_work_is_bounded_and_workers_stop_with_the_app(
         remote=remote,
         lifecycle=lifecycle,
         cache=cache,
-        allowed_origin=ORIGIN,
+        allowed_origins=frozenset({ORIGIN}),
         secure_cookies=True,
     )
 

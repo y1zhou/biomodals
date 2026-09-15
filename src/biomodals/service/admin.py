@@ -32,8 +32,10 @@ def _auth_service(
     store.initialize()
     return AuthService(
         store,
-        frontend_url=(
-            settings.password_link_origin() if password_links else "http://localhost"
+        frontend_urls=(
+            settings.password_link_origins()
+            if password_links
+            else ("http://localhost",)
         ),
     )
 
@@ -78,7 +80,7 @@ def create_user(
         ),
     ] = None,
 ) -> None:
-    """Create a user and print their one-time password setup link."""
+    """Create a user and print their alternative one-time password setup URLs."""
     try:
         settings = AdminSettings.from_environment()
         link = _auth_service(settings, password_links=True).create_user(
@@ -93,7 +95,7 @@ def create_user(
         )
     except (LookupError, ValueError) as exc:
         _fail(exc)
-    typer.echo(link.url)
+    typer.echo("\n".join(link.urls))
     typer.echo(
         "Expires at: "
         f"{datetime.fromtimestamp(link.expires_at, UTC).isoformat().replace('+00:00', 'Z')}"
@@ -104,12 +106,12 @@ def create_user(
 def reset_password(
     email: Annotated[str, typer.Argument(help="Company email address.")],
 ) -> None:
-    """Print a new one-time password reset link for an active user."""
+    """Print alternative URLs for one new password reset token."""
     try:
         link = _auth_service(password_links=True).create_password_reset(email)
     except (LookupError, ValueError) as exc:
         _fail(exc)
-    typer.echo(link.url)
+    typer.echo("\n".join(link.urls))
     typer.echo(
         "Expires at: "
         f"{datetime.fromtimestamp(link.expires_at, UTC).isoformat().replace('+00:00', 'Z')}"

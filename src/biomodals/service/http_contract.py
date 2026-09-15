@@ -200,8 +200,8 @@ class _RequestIdMiddleware:
 
 
 async def require_origin(request: Request) -> None:
-    """Require the exact configured browser Origin on unsafe requests."""
-    if request.headers.get("Origin") != request.app.state.allowed_origin:
+    """Require an explicitly allowed browser Origin on unsafe requests."""
+    if request.headers.get("Origin") not in request.app.state.allowed_origins:
         raise CodedAPIError(
             status.HTTP_403_FORBIDDEN,
             "origin_not_allowed",

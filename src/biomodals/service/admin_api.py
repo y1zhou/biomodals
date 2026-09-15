@@ -160,10 +160,10 @@ class CreateAdminUserRequest(BaseModel):
 
 
 class CreatedAdminUserView(BaseModel):
-    """New User plus the one-time Password Link shown exactly once."""
+    """New User plus alternative URLs for one one-time Password Link."""
 
     user: AdminUserView
-    password_link: str
+    password_links: tuple[str, ...] = Field(min_length=1)
     expires_at: datetime
 
 
@@ -181,9 +181,9 @@ class UpdateAdminUserRequest(BaseModel):
 
 
 class PasswordLinkView(BaseModel):
-    """One newly issued one-time Password Link."""
+    """Alternative URLs sharing one newly issued one-time Password Link token."""
 
-    password_link: str
+    password_links: tuple[str, ...] = Field(min_length=1)
     expires_at: datetime
 
 
@@ -578,7 +578,7 @@ def create_admin_router() -> APIRouter:
             raise RuntimeError("Created User could not be loaded")
         return CreatedAdminUserView(
             user=AdminUserView.from_record(user),
-            password_link=link.url,
+            password_links=link.urls,
             expires_at=datetime.fromtimestamp(link.expires_at, UTC),
         )
 
@@ -646,7 +646,7 @@ def create_admin_router() -> APIRouter:
         except UserNotFoundError as exc:
             raise CodedAPIError(409, "user_inactive", "User is disabled") from exc
         return PasswordLinkView(
-            password_link=link.url,
+            password_links=link.urls,
             expires_at=datetime.fromtimestamp(link.expires_at, UTC),
         )
 

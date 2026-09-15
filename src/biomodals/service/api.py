@@ -46,7 +46,7 @@ def create_app(
     remote: RemoteExecutionClient,
     lifecycle: JobLifecycle,
     cache: ArtifactCache,
-    allowed_origin: str,
+    allowed_origins: frozenset[str],
     secure_cookies: bool,
     reconcile_interval_seconds: float = 60,
 ) -> FastAPI:
@@ -60,8 +60,10 @@ def create_app(
         raise ValueError("Runtime Tool definitions must match registrations")
     if reconcile_interval_seconds <= 0:
         raise ValueError("reconcile_interval_seconds must be positive")
-    if not allowed_origin or allowed_origin.endswith("/"):
-        raise ValueError("allowed_origin must be an exact origin without a slash")
+    if not allowed_origins or any(
+        not origin or origin.endswith("/") for origin in allowed_origins
+    ):
+        raise ValueError("allowed_origins must contain exact origins without a slash")
     session_cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
     password_executor = PasswordExecutor()
     reconcile_wakeup = asyncio.Event()
@@ -128,7 +130,7 @@ def create_app(
     app.state.billing = BillingService()
     app.state.pending_requests = None
     app.state.validated_inputs = None
-    app.state.allowed_origin = allowed_origin
+    app.state.allowed_origins = allowed_origins
     app.state.session_cookie_name = session_cookie_name
     app.state.ready = False
     install_http_contract(
@@ -189,7 +191,7 @@ def create_deployed_app() -> FastAPI:
     settings.install_modal_credentials()
     store = ServiceStore(settings.database_path)
     store.initialize()
-    auth = AuthService(store, frontend_url=settings.public_url)
+    auth = AuthService(store, frontend_urls=settings.public_urls)
     auth.bootstrap_admin(
         settings.sources.value("BIOMODALS_DEFAULT_ADMIN_EMAIL", ""),
         settings.sources.value("BIOMODALS_DEFAULT_ADMIN_PASSWORD_HASH", ""),
@@ -256,7 +258,7 @@ def create_deployed_app() -> FastAPI:
         remote=remote,
         lifecycle=lifecycle,
         cache=cache,
-        allowed_origin=settings.public_url,
+        allowed_origins=settings.allowed_origins,
         secure_cookies=settings.secure_cookies,
         reconcile_interval_seconds=settings.reconcile_interval_seconds,
     )

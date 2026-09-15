@@ -233,8 +233,11 @@ Explicit process environment variables override values from the file.
 Administrator-editable runtime settings resolve in this order: process
 environment, database value, `.env` value, then built-in default.
 
-`BIOMODALS_PUBLIC_URL` is the single browser origin used for Password Links
-and mutation Origin checks. The development server listens on
+`BIOMODALS_PUBLIC_URL` accepts a comma-separated list of browser origins for
+mutations and Password Links. Bare hostnames and IPs use HTTP. Link creation
+returns one alternative per address; using any one consumes the shared token.
+See the [internal HTTP access setup](deploy/README.md#multiple-origins-and-internal-http-access).
+The development server listens on
 `127.0.0.1:4144` by default and uses one worker.
 
 Configure the frontend development server to proxy `/api` to
@@ -242,7 +245,8 @@ Configure the frontend development server to proxy `/api` to
 Session cookies.
 
 `BIOMODALS_SECURE_COOKIES` defaults to `false` for local HTTP. Set it to
-`true` behind the production HTTPS reverse proxy.
+`true` for HTTPS-only production access. Allowing any HTTP origin requires
+`false`; this cookie mode applies service-wide.
 
 The OpenAPI document includes the shared Job routes, typed GROMACS submission,
 retained AlphaFold3 JSON validation and submission, paired humanization

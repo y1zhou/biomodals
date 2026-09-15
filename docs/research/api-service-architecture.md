@@ -12,7 +12,9 @@ configuration, and deployment decisions
 service execution, Job orchestration, Tool-registration, and service-local DAG
 passage and diagram below. Those parts are historical. The HTTP, identity,
 artifact-delivery, authentication, configuration, and deployment decisions
-remain applicable.
+remain applicable except where explicitly amended. The current multi-origin
+configuration and Password Link response contract are in the
+[Browser origins and cookie mode specification](../specs/api-tool-service.md#browser-origins-and-cookie-mode).
 
 ## Decision
 
@@ -655,8 +657,8 @@ The application factory reads these settings:
 | `BIOMODALS_STATE_DIR` | `.biomodals/state` | Durable SQLite directory |
 | `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable Result-archive cache directory |
 | `BIOMODALS_CACHE_WARNING_BYTES` | `1099511627776` | Soft warning threshold for local Result staging and cache usage (1 TiB) |
-| `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | One public origin for links, exact-Origin checks, and same-origin browser access |
-| `BIOMODALS_SECURE_COOKIES` | `false` | Use secure `__Host-` session cookies behind HTTPS |
+| `BIOMODALS_PUBLIC_URL` | `http://localhost:5173` | Browser origins and Password Link alternatives; see the current [contract](../specs/api-tool-service.md#browser-origins-and-cookie-mode) |
+| `BIOMODALS_SECURE_COOKIES` | `false` | Require secure `__Host-` session cookies for HTTPS-only access; mixed HTTP access uses the documented service-wide insecure mode |
 | `BIOMODALS_MODAL_ENVIRONMENT` | `production` | Modal Environment default; configurable in Admin unless a process override is set |
 | `BIOMODALS_MODAL_DOWNLOAD_CONCURRENCY` | `4` | Concurrent Modal Volume download blocks per Job |
 | `BIOMODALS_GROMACS_APP` | `Gromacs` | Deployed GROMACS Modal App name |

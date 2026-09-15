@@ -2,7 +2,7 @@
 
 Status: accepted and implemented
 
-Last updated: 2026-08-27
+Last updated: 2026-09-14
 
 This specification applies ADR 0007 to the implemented FastAPI service and its
 frontend.
@@ -48,6 +48,41 @@ Prepared Results retain filename, media type, size, SHA-256, archive schema,
 and `cache_cleared_at`; no remote Volume path is duplicated locally. Clearing
 and later reconstructing an archive preserves its Result metadata while
 updating that cache timestamp.
+
+## Browser origins and cookie mode
+
+`BIOMODALS_PUBLIC_URL` accepts one or more comma-separated browser origins.
+Bare hosts/IPs (optionally with a port) default to HTTP; HTTPS requires an
+explicit scheme. Other schemes, paths, credentials, wildcards, queries,
+fragments and empty entries fail startup. Surrounding whitespace and trailing
+slashes are removed; hostname case and default ports are normalized to browser
+origins. Duplicates are collapsed in configured order. The
+process setting replaces the whole private-file list. `ServiceSettings`
+retains ordered `public_urls` for presentation and exposes their immutable
+set for authorization.
+
+User creation and reset mint one token and return a URL for each origin, in
+configuration order. All alternatives share the same expiry and single-use
+state; redemption through one makes all others invalid. Only the token digest
+is stored, and tokens remain in URL fragments. The admin HTTP responses expose
+a nonempty `password_links` array and `expires_at`; the CLI prints every URL.
+This replaces the singular response field and requires coordinated frontend
+rollout. Existing stored tokens and single-URL configuration remain valid.
+
+Login, Password Setup, and authenticated mutations require exact membership
+of the browser's `Origin` header. Missing, `null`, or unlisted origins return
+403 `origin_not_allowed`. Forwarded headers do not authorize origins, and no
+cross-origin browser API access is introduced. Session and CSRF validation
+remain unchanged.
+
+All-HTTPS origin sets require `BIOMODALS_SECURE_COOKIES=true`; sets containing
+any HTTP origin require `false`. This is one service-wide cookie policy, not
+per-request inference from proxy headers. Insecure mode uses the ordinary
+session cookie without `Secure`; secure mode retains the `__Host-` session
+cookie. Both remain host-only with HttpOnly sessions and SameSite=Lax.
+Switching modes requires a fresh browser login, not a persistence migration.
+Operator configuration and the accepted internal-HTTP security tradeoff are
+documented in the [deployment guide](../../deploy/README.md#multiple-origins-and-internal-http-access).
 
 ## First-administrator bootstrap
 

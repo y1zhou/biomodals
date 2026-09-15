@@ -164,9 +164,9 @@ class IssuedSession:
 
 @dataclass(frozen=True, slots=True)
 class IssuedPasswordLink:
-    """One-time URL and its non-secret absolute expiry."""
+    """Alternative URLs for one shared one-time token and absolute expiry."""
 
-    url: str
+    urls: tuple[str, ...]
     expires_at: int
 
 
@@ -188,12 +188,12 @@ class AuthService:
         self,
         store: ServiceStore,
         *,
-        frontend_url: str,
+        frontend_urls: tuple[str, ...],
         now: Callable[[], int] | None = None,
     ) -> None:
         """Configure persistence, frontend links, and an injectable clock."""
         self.store = store
-        self.frontend_url = frontend_url.rstrip("/")
+        self.frontend_urls = frontend_urls
         self._now = now or (lambda: int(time.time()))
         self._password_hash = PasswordHash.recommended()
 
@@ -254,7 +254,7 @@ class AuthService:
             is_admin=is_admin,
             active_job_limit=active_job_limit,
         )
-        return IssuedPasswordLink(self._password_link(token), expires_at)
+        return IssuedPasswordLink(self._password_links(token), expires_at)
 
     def create_password_reset(self, email: str) -> IssuedPasswordLink:
         """Replace prior reset links and return a one-hour password link."""
@@ -268,7 +268,7 @@ class AuthService:
             token_digest=_token_digest(token),
             expires_at=expires_at,
         )
-        return IssuedPasswordLink(self._password_link(token), expires_at)
+        return IssuedPasswordLink(self._password_links(token), expires_at)
 
     def set_password(self, token: str, password: str) -> IssuedSession:
         """Replace credentials and issue one fresh browser session."""
@@ -377,8 +377,10 @@ class AuthService:
         )
         return _principal(user)
 
-    def _password_link(self, token: str) -> str:
-        return f"{self.frontend_url}/set-password#token={token}"
+    def _password_links(self, token: str) -> tuple[str, ...]:
+        return tuple(
+            f"{origin}/set-password#token={token}" for origin in self.frontend_urls
+        )
 
 
 def _new_token() -> str:

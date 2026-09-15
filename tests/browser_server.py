@@ -598,7 +598,7 @@ def _create_browser_app():
     })
     store = ServiceStore(settings.database_path)
     store.initialize()
-    auth = AuthService(store, frontend_url=ORIGIN)
+    auth = AuthService(store, frontend_urls=settings.public_urls)
     pending = PendingRequestStore(settings.state_dir)
     pending.initialize()
     validations = ValidatedInputStore(settings.state_dir)
@@ -607,25 +607,25 @@ def _create_browser_app():
     link = auth.create_user(
         "browser-admin@example.com", display_name="Browser Administrator", is_admin=True
     )
-    remote.password_link = link.url
+    remote.password_link = link.urls[0]
     secondary_link = auth.create_user(
         "browser-user@example.com", display_name="Browser Regular User"
     )
-    remote.secondary_password_link = secondary_link.url
+    remote.secondary_password_link = secondary_link.urls[0]
     humanization_link = auth.create_user(
         "humanization-user@example.com", display_name="Humanization Browser User"
     )
-    remote.humanization_password_link = humanization_link.url
+    remote.humanization_password_link = humanization_link.urls[0]
     cache = ArtifactCache(settings.cache_dir / "results")
     af3_link = auth.create_user(
         "alphafold3-user@example.com", display_name="AlphaFold3 Browser User"
     )
     af3_session = auth.set_password(
-        af3_link.url.partition("#token=")[2], secrets.token_urlsafe(32)
+        af3_link.urls[0].partition("#token=")[2], secrets.token_urlsafe(32)
     )
     remote.alphafold3_password_link = auth.create_password_reset(
         "alphafold3-user@example.com"
-    ).url
+    ).urls[0]
     af3_archive = preview_archive()
     for preparation_failed in (False, True):
         af3_job = store.admit_job(
@@ -729,7 +729,7 @@ def _create_browser_app():
         remote=remote,
         lifecycle=lifecycle,
         cache=cache,
-        allowed_origin=ORIGIN,
+        allowed_origins=settings.allowed_origins,
         secure_cookies=False,
         reconcile_interval_seconds=settings.reconcile_interval_seconds,
     )

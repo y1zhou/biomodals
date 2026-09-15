@@ -37,7 +37,8 @@ def test_local_defaults_are_safe_and_cleanup_is_disabled(monkeypatch) -> None:
 
     assert settings.database_path.as_posix() == ".biomodals/state/service.sqlite3"
     assert settings.cache_dir.as_posix() == ".biomodals/cache"
-    assert settings.public_url == "http://localhost:5173"
+    assert settings.public_urls == ("http://localhost:5173",)
+    assert settings.allowed_origins == frozenset(settings.public_urls)
     assert settings.secure_cookies is False
     assert settings.modal_environment == "production"
     assert settings.modal_download_concurrency == 4
@@ -98,7 +99,7 @@ def test_explicit_env_file_is_loaded_and_process_environment_wins(
 
     settings = ServiceSettings.from_environment()
 
-    assert settings.public_url == "https://from-file.example"
+    assert settings.public_urls == ("https://from-file.example",)
     assert settings.modal_environment == "process-environment"
     assert settings.modal_token_id == "file-token-id"
     assert settings.modal_token_secret == "file-token-secret"
@@ -158,6 +159,70 @@ def test_public_url_and_cookie_mode_must_agree(
 
     with pytest.raises(ValueError, match="must agree"):
         ServiceSettings.from_environment()
+
+
+def test_public_urls_normalize_bare_hosts_preserve_order_and_require_http_cookies():
+    environment = {
+        "BIOMODALS_PUBLIC_URL": (
+            " HTTPS://ICP-AIDD.Y1ZHOU.COM:443/, 10.10.110.101, "
+            "internal.example:8080, http://10.10.110.101:80, [::1]:8080 "
+        ),
+        "BIOMODALS_SECURE_COOKIES": "false",
+    }
+    settings = ServiceSettings.from_environment(environment)
+    assert settings.public_urls == (
+        "https://icp-aidd.y1zhou.com",
+        "http://10.10.110.101",
+        "http://internal.example:8080",
+        "http://[::1]:8080",
+    )
+    assert settings.allowed_origins == frozenset(settings.public_urls)
+    assert settings.secure_cookies is False
+
+    environment["BIOMODALS_SECURE_COOKIES"] = "true"
+    with pytest.raises(ValueError, match="must agree"):
+        ServiceSettings.from_environment(environment)
+
+
+def test_public_url_lists_follow_configuration_precedence(tmp_path: Path):
+    config_path = tmp_path / "service.env"
+    config_path.write_text(
+        "BIOMODALS_PUBLIC_URL=https://first.example,https://second.example\n"
+        "BIOMODALS_SECURE_COOKIES=true\n"
+    )
+    config_path.chmod(0o600)
+    environment = {"BIOMODALS_API_CONF_ENV": str(config_path)}
+    assert ServiceSettings.from_environment(environment).public_urls == (
+        "https://first.example",
+        "https://second.example",
+    )
+    environment["BIOMODALS_PUBLIC_URL"] = "https://process.example"
+    assert ServiceSettings.from_environment(environment).public_urls == (
+        "https://process.example",
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "*",
+        "https://*.example",
+        "http://user:password@example",
+        "ftp://example",
+        "http://example/path",
+        "http://example?query=1",
+        "http://example#fragment",
+        "http://example:invalid",
+        "http://[invalid",
+        "http://example with space",
+        "http://example,",
+        ",http://example",
+    ],
+)
+def test_public_urls_reject_non_origins(value: str):
+    with pytest.raises(ValueError, match="BIOMODALS_PUBLIC_URL"):
+        ServiceSettings.from_environment({"BIOMODALS_PUBLIC_URL": value})
 
 
 def test_modal_credentials_are_required_for_backend_startup(monkeypatch) -> None:

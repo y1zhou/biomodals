@@ -84,24 +84,39 @@ def _required_text(sources: ConfigurationSources, name: str, default: str) -> st
     return value
 
 
-def _public_url(sources: ConfigurationSources) -> str:
-    value = _required_text(
-        sources,
-        "BIOMODALS_PUBLIC_URL",
-        "http://localhost:5173",
-    ).rstrip("/")
-    parsed = urlsplit(value)
+def _public_urls(sources: ConfigurationSources) -> tuple[str, ...]:
+    value = _required_text(sources, "BIOMODALS_PUBLIC_URL", "http://localhost:5173")
+    return tuple(dict.fromkeys(_origin(item) for item in value.split(",")))
+
+
+def _origin(value: str) -> str:
+    value = value.strip().rstrip("/")
+    error = "BIOMODALS_PUBLIC_URL must contain HTTP(S) origins or bare hosts"
+    if "://" not in value:
+        value = f"http://{value}"
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(error) from exc
     if (
         parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
+        or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
+        or "*" in value
+        or any(character.isspace() for character in value)
     ):
-        raise ValueError("BIOMODALS_PUBLIC_URL must be an HTTP(S) origin")
-    return value
+        raise ValueError(error)
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None and port != {"http": 80, "https": 443}[parsed.scheme]:
+        host = f"{host}:{port}"
+    return f"{parsed.scheme}://{host}"
 
 
 def _configuration_sources(
@@ -184,9 +199,9 @@ class AdminSettings:
         """Return the API service database path."""
         return self.state_dir / "service.sqlite3"
 
-    def password_link_origin(self) -> str:
-        """Validate the public origin only for commands that create a link."""
-        return _public_url(self.sources)
+    def password_link_origins(self) -> tuple[str, ...]:
+        """Validate public origins only for commands that create links."""
+        return _public_urls(self.sources)
 
     def default_user_limit(self) -> int:
         """Validate the default limit only when create-user actually needs it."""
@@ -205,7 +220,7 @@ class ServiceSettings:
     state_dir: Path
     cache_dir: Path
     cache_warning_bytes: int
-    public_url: str
+    public_urls: tuple[str, ...]
     secure_cookies: bool
     modal_environment: str
     modal_download_concurrency: int
@@ -214,6 +229,11 @@ class ServiceSettings:
     reconcile_interval_seconds: float
     modal_token_id: str | None
     modal_token_secret: str | None = field(repr=False)
+
+    @property
+    def allowed_origins(self) -> frozenset[str]:
+        """Accept mutations only from the configured public URLs."""
+        return frozenset(self.public_urls)
 
     @property
     def humanization_max_pairs(self) -> int:
@@ -250,7 +270,7 @@ class ServiceSettings:
                 "BIOMODALS_CACHE_WARNING_BYTES",
                 1024**4,
             ),
-            public_url=_public_url(sources),
+            public_urls=_public_urls(sources),
             secure_cookies=_boolean(sources, "BIOMODALS_SECURE_COOKIES", False),
             modal_environment=_required_text(
                 sources,
@@ -282,10 +302,13 @@ class ServiceSettings:
                 sources.value("MODAL_TOKEN_SECRET", "").strip() or None
             ),
         )
-        public_scheme = urlsplit(settings.public_url).scheme
-        if (public_scheme == "https") != settings.secure_cookies:
+        https_only = all(
+            urlsplit(origin).scheme == "https" for origin in settings.public_urls
+        )
+        if https_only != settings.secure_cookies:
             raise ValueError(
-                "BIOMODALS_PUBLIC_URL and BIOMODALS_SECURE_COOKIES must agree"
+                "Allowed origins and BIOMODALS_SECURE_COOKIES must agree: "
+                "use true for HTTPS-only access, false when any origin uses HTTP"
             )
         return settings
 

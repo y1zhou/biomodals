@@ -27,7 +27,7 @@ class Clock:
 
 
 def reset_token(link: IssuedPasswordLink) -> str:
-    fragment = parse_qs(urlparse(link.url).fragment)
+    fragment = parse_qs(urlparse(link.urls[0]).fragment)
     return fragment["token"][0]
 
 
@@ -37,7 +37,7 @@ def make_auth(tmp_path: Path, clock: Clock) -> tuple[AuthService, ServiceStore]:
     return (
         AuthService(
             store,
-            frontend_url="https://biomodals.internal",
+            frontend_urls=("https://biomodals.internal",),
             now=clock,
         ),
         store,
@@ -75,6 +75,37 @@ def test_setup_link_is_one_time_and_passwords_use_argon2id(tmp_path: Path) -> No
     assert user.password_hash.startswith("$argon2id$")
     with pytest.raises(InvalidPasswordTokenError):
         auth.set_password(token, "another correct horse staple")
+
+
+def test_alternative_password_urls_share_one_token_and_expiry(tmp_path: Path) -> None:
+    clock = Clock()
+    _auth, store = make_auth(tmp_path, clock)
+    origins = ("https://biomodals.internal", "http://10.10.110.101")
+    auth = AuthService(store, frontend_urls=origins, now=clock)
+    setup = auth.create_user("alice@example.com", display_name="Alice", is_admin=True)
+    assert setup.urls == tuple(
+        f"{origin}/set-password#token={reset_token(setup)}" for origin in origins
+    )
+    assert setup.expires_at == clock.now + 3600
+    # Redeem the HTTP alternative, then the HTTPS URL must also be spent.
+    http_token = parse_qs(urlparse(setup.urls[1]).fragment)["token"][0]
+    auth.set_password(http_token, "correct horse battery staple")
+    with pytest.raises(InvalidPasswordTokenError):
+        auth.set_password(reset_token(setup), "another correct horse staple")
+
+    reset = auth.create_password_reset("alice@example.com")
+    replacement = auth.create_password_reset("alice@example.com")
+    assert replacement.urls == tuple(
+        f"{origin}/set-password#token={reset_token(replacement)}" for origin in origins
+    )
+    for url in reset.urls:
+        with pytest.raises(InvalidPasswordTokenError):
+            auth.set_password(
+                parse_qs(urlparse(url).fragment)["token"][0],
+                "another correct horse staple",
+            )
+    auth.set_password(reset_token(replacement), "another correct horse staple")
+    assert auth.login("alice@example.com", "another correct horse staple").principal
 
 
 def test_create_user_rejects_an_oversized_display_name(tmp_path: Path) -> None:

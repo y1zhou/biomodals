@@ -50,6 +50,55 @@ in-container path. These file values remain database-overridable defaults.
 The humanization workflow deployment includes its four dependent apps; it
 does not require separate deployments of those generators.
 
+## Multiple origins and internal HTTP access
+
+The API allows browser mutations only from the origins in `BIOMODALS_PUBLIC_URL`.
+Caddy accepting another hostname or IP does not automatically authorize it.
+To serve both an HTTPS domain and an HTTP address on a trusted internal network,
+configure the API explicitly:
+
+```dotenv
+BIOMODALS_PUBLIC_URL=https://icp-aidd.y1zhou.com,10.10.110.101
+BIOMODALS_SECURE_COOKIES=false
+```
+
+Origins are comma-separated, with a host and optional port. Bare hostnames and
+IPs default to HTTP; use `https://` explicitly for HTTPS. Paths, credentials,
+wildcards, queries, fragments and other schemes are rejected. Surrounding
+whitespace and trailing slashes are removed; duplicate origins are collapsed
+in configured order. Hostname case and default ports are normalized to match
+browser origins. A single URL remains valid.
+
+User creation and password reset generate a URL for every configured origin.
+The CLI prints each on its own line; the admin UI offers each for copying.
+These are alternatives for the same one-time token and expiry, not separate
+password resets. Share the address the recipient can reach; using one link
+invalidates all alternatives. The token stays in the URL fragment.
+
+All-HTTPS deployments require secure cookies; any allowed HTTP origin requires
+the explicit insecure cookie mode shown above. This is not a CORS allowlist:
+each address must serve the frontend and reverse-proxy its own `/api/*` routes.
+Do not rewrite browser `Origin` headers to bypass the check.
+
+Cookie mode is service-wide: `false` removes the `Secure` attribute for both
+addresses and uses the ordinary session-cookie name. Host-only cookies,
+HttpOnly sessions, SameSite and CSRF checks remain enabled. Sessions are
+separate for the domain and IP, so sign in separately on each. Switching modes
+requires signing in again. HTTP exposes passwords and session tokens to
+network interception; enable this only on a network where that risk is
+explicitly accepted.
+
+Keep Caddy's HTTPS domain site, and configure an explicit `http://10.10.110.101`
+site with the same frontend and API routes, without redirecting that IP site
+to HTTPS. Install the updated backend and restart the API after changing these
+startup settings. Update the frontend alongside the backend: the admin API now
+returns `password_links` arrays instead of a singular `password_link`. No
+database migration or scientific deployment is needed.
+Update any systemd/container process overrides too: an existing
+`Environment=BIOMODALS_SECURE_COOKIES=true` takes precedence over `false` in the
+private configuration file. Keep the other deployment-example defaults for
+HTTPS-only installations.
+
 ## First-administrator bootstrap
 
 For unattended first deployment, generate an Argon2id password hash locally:

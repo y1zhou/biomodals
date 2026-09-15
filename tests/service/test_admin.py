@@ -79,6 +79,36 @@ def test_first_cli_user_requires_admin_flag(monkeypatch, tmp_path) -> None:
     assert store.list_users() == []
 
 
+def test_cli_prints_all_password_link_alternatives(monkeypatch, tmp_path) -> None:
+    """Setup and reset print every configured origin for the same token."""
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        "BIOMODALS_PUBLIC_URL", "https://biomodals.internal,10.10.110.101"
+    )
+    setup = runner.invoke(
+        app,
+        [
+            "api",
+            "admin",
+            "create-user",
+            "admin@example.com",
+            "--display-name",
+            "Administrator",
+            "--admin",
+        ],
+    )
+    assert setup.exit_code == 0, setup.output
+    reset = runner.invoke(app, ["api", "admin", "reset-password", "admin@example.com"])
+    assert reset.exit_code == 0, reset.output
+    for result in (setup, reset):
+        first, second, expiry = result.output.splitlines()
+        assert first.startswith("https://biomodals.internal/set-password#token=")
+        assert second.startswith("http://10.10.110.101/set-password#token=")
+        assert _token(first) == _token(second)
+        assert expiry.startswith("Expires at: ")
+    assert _token(_link(setup.output)) != _token(_link(reset.output))
+
+
 def test_cli_rejects_an_oversized_display_name(monkeypatch, tmp_path) -> None:
     """The offline CLI applies the same identity limit as the HTTP API."""
     store = _configure(monkeypatch, tmp_path)
@@ -128,7 +158,7 @@ def test_reset_password_replaces_prior_link(monkeypatch, tmp_path) -> None:
     second_link = _link(reset.output)
     assert second_link != first_link
     assert reset.output.count(second_link) == 1
-    auth = AuthService(store, frontend_url="https://biomodals.internal")
+    auth = AuthService(store, frontend_urls=("https://biomodals.internal",))
     with pytest.raises(InvalidPasswordTokenError):
         auth.set_password(_token(first_link), "a long unique passphrase")
     assert auth.set_password(_token(second_link), "a long unique passphrase")
@@ -161,7 +191,7 @@ def test_disable_user_revokes_access(monkeypatch, tmp_path) -> None:
             "Scientist",
         ],
     )
-    auth = AuthService(store, frontend_url="https://biomodals.internal")
+    auth = AuthService(store, frontend_urls=("https://biomodals.internal",))
     auth.set_password(_token(_link(created.output)), "a long unique passphrase")
     session = auth.login("scientist@example.com", "a long unique passphrase")
 
@@ -251,7 +281,7 @@ def test_cli_promotes_and_demotes_without_removing_last_admin(
         ],
     )
     assert first.exit_code == second.exit_code == 0
-    auth = AuthService(store, frontend_url="https://biomodals.internal")
+    auth = AuthService(store, frontend_urls=("https://biomodals.internal",))
     auth.set_password(_token(_link(first.output)), "first long unique passphrase")
     auth.set_password(_token(_link(second.output)), "second long unique passphrase")
 

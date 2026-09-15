@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import zipfile
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
 import httpx
@@ -283,7 +284,7 @@ class Adapter:
         raise AssertionError("No result is prepared in contract tests")
 
 
-def _app(tmp_path: Path):
+def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
     settings = ServiceSettings.from_environment({
@@ -291,6 +292,7 @@ def _app(tmp_path: Path):
         "MODAL_TOKEN_SECRET": "test-secret",
         "BIOMODALS_PUBLIC_URL": ORIGIN,
         "BIOMODALS_SECURE_COOKIES": "true",
+        **(environment or {}),
     })
     configuration = RuntimeConfiguration(
         store,
@@ -312,7 +314,7 @@ def _app(tmp_path: Path):
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     app = create_app(
         store=store,
-        auth=AuthService(store, frontend_url=ORIGIN),
+        auth=AuthService(store, frontend_urls=settings.public_urls),
         configuration=configuration,
         registrations=registrations,
         tool_routers=(
@@ -343,10 +345,154 @@ def _app(tmp_path: Path):
         remote=remote,
         lifecycle=lifecycle,
         cache=cache,
-        allowed_origin=ORIGIN,
-        secure_cookies=True,
+        allowed_origins=settings.allowed_origins,
+        secure_cookies=settings.secure_cookies,
     )
     return app
+
+
+@pytest.mark.parametrize(
+    ("origin", "public_urls", "secure"),
+    [
+        (ORIGIN, ORIGIN, True),
+        (ORIGIN, f"{ORIGIN},10.10.110.101", False),
+        ("http://10.10.110.101", f"{ORIGIN},10.10.110.101", False),
+    ],
+)
+def test_authentication_on_explicit_origins_preserves_csrf_and_cookie_scope(
+    tmp_path: Path, origin: str, public_urls: str, secure: bool
+):
+    app = _app(
+        tmp_path,
+        environment={
+            "BIOMODALS_PUBLIC_URL": public_urls,
+            "BIOMODALS_SECURE_COOKIES": str(secure),
+        },
+    )
+    link = app.state.auth.create_user(
+        "alice@example.com", display_name="Alice", is_admin=True
+    )
+    assert link.urls[0].startswith(f"{ORIGIN}/set-password#")
+    token = parse_qs(urlsplit(link.urls[0]).fragment)["token"][0]
+    credentials = {
+        "email": "alice@example.com",
+        "password": "correct horse battery staple",
+    }
+    setup = {"token": token, "password": credentials["password"]}
+
+    async def run():
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url=origin
+            ) as client,
+        ):
+            for rejected in (
+                None,
+                "null",
+                "https://untrusted.example",
+                f"{origin}:8123",
+            ):
+                headers = {"Origin": rejected} if rejected else {}
+                # Proxy headers cannot replace the browser's explicit Origin.
+                headers["X-Forwarded-Host"] = urlsplit(origin).netloc
+                for endpoint, payload in (
+                    ("login", credentials),
+                    ("set-password", setup),
+                ):
+                    response = await client.post(
+                        f"/api/v1/auth/{endpoint}", json=payload, headers=headers
+                    )
+                    assert response.status_code == 403
+                    assert response.json()["code"] == "origin_not_allowed"
+
+            response = await client.post(
+                "/api/v1/auth/set-password", json=setup, headers={"Origin": origin}
+            )
+            assert response.status_code == 200, response.text
+            expected_cookie = (
+                "__Host-biomodals-session" if secure else "biomodals-session"
+            )
+            assert set(client.cookies) == {expected_cookie, "biomodals-csrf"}
+            for cookie in client.cookies.jar:
+                assert cookie.secure == secure
+                assert not cookie.domain_specified
+            session_header = next(
+                header
+                for header in response.headers.get_list("set-cookie")
+                if header.startswith(f"{expected_cookie}=")
+            )
+            assert "HttpOnly" in session_header and "SameSite=lax" in session_header
+            assert (await client.get("/api/v1/auth/me")).status_code == 200
+            other_origin = ORIGIN if origin != ORIGIN else "http://10.10.110.101"
+            assert (
+                await client.get(f"{other_origin}/api/v1/auth/me")
+            ).status_code == 401
+
+            response = await client.post(
+                "/api/v1/auth/logout", headers={"Origin": origin}
+            )
+            assert response.status_code == 403
+            assert response.json()["code"] == "csrf_invalid"
+            csrf = client.cookies["biomodals-csrf"]
+            response = await client.post(
+                "/api/v1/auth/logout",
+                headers={
+                    "Origin": "https://untrusted.example",
+                    "X-CSRF-Token": csrf,
+                },
+            )
+            assert response.status_code == 403
+            assert response.json()["code"] == "origin_not_allowed"
+            response = await client.post(
+                "/api/v1/auth/logout",
+                headers={
+                    "Origin": origin,
+                    "X-CSRF-Token": csrf,
+                },
+            )
+            assert response.status_code == 204
+            assert not client.cookies
+            assert (await client.get("/api/v1/auth/me")).status_code == 401
+
+            response = await client.post(
+                "/api/v1/auth/login", json=credentials, headers={"Origin": origin}
+            )
+            assert response.status_code == 200
+            assert (await client.get("/api/v1/auth/me")).status_code == 200
+
+            headers = {
+                "Origin": origin,
+                "X-CSRF-Token": client.cookies["biomodals-csrf"],
+            }
+            created = await client.post(
+                "/api/v1/admin/users",
+                headers=headers,
+                json={
+                    "email": "colleague@example.com",
+                    "display_name": "Colleague",
+                },
+            )
+            assert created.status_code == 201, created.text
+            user_id = created.json()["user"]["user_id"]
+            reset = await client.post(
+                f"/api/v1/admin/users/{user_id}/password-link", headers=headers
+            )
+            assert reset.status_code == 200, reset.text
+            for response in (created, reset):
+                urls = response.json()["password_links"]
+                assert (
+                    tuple(
+                        f"{urlsplit(url).scheme}://{urlsplit(url).netloc}"
+                        for url in urls
+                    )
+                    == app.state.auth.frontend_urls
+                )
+                assert len({urlsplit(url).fragment for url in urls}) == 1
+                assert response.json()["expires_at"]
+            assert created.json()["password_links"] != reset.json()["password_links"]
+
+    asyncio.run(run())
 
 
 def _session(user_id: UUID | None = None) -> AuthenticatedSession:

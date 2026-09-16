@@ -28,6 +28,7 @@ from biomodals.app.bioinfo.gromacs.execution_runtime import (
     persist_execution_request,
 )
 from biomodals.execution import ContentBoundFileSet
+from biomodals.helper.cli_entrypoint import invoke_local_entrypoint
 from biomodals.schema import ArtifactFile
 
 
@@ -400,6 +401,35 @@ def test_read_only_source_evidence_uses_bounded_volume_reads(tmp_path, monkeypat
         asyncio.run(continuation.read_continuation_source(volume, RUN_ID))
 
 
+@pytest.mark.parametrize("positional", [False, True])
+def test_cli_fresh_simulation_accepts_named_or_positional_pdb(
+    tmp_path, monkeypatch, positional
+):
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_bytes(b"ATOM\n")
+    staged = []
+    monkeypatch.setattr(
+        app,
+        "stage_execution_request",
+        lambda _volume, _run_id, request: staged.append(request),
+    )
+    monkeypatch.setattr(
+        app, "submit_staged_execution_run", lambda *_args, **_kwargs: None
+    )
+    invoke_local_entrypoint(
+        module_name=app.__name__,
+        entrypoint_name="submit_gromacs_task",
+        flags=[str(pdb)] if positional else ["--input-pdb", str(pdb)],
+        overrides={"use_deployed_coordinator": True},
+        program_name="biomodals app run gromacs --",
+    )
+    assert len(staged) == 1
+    assert staged[0].pdb_content == b"ATOM\n"
+    assert staged[0].run_name == "protein"
+    assert staged[0].simulation_time_ns == 5
+    assert not staged[0].cpu_only
+
+
 def test_cli_continuation_reuses_source_without_input_pdb(tmp_path, monkeypatch):
     parent, child = _source(tmp_path)
 
@@ -420,8 +450,20 @@ def test_cli_continuation_reuses_source_without_input_pdb(tmp_path, monkeypatch)
         "submit_staged_execution_run",
         lambda _volume, **kwargs: captured.update(submission=kwargs),
     )
-    info = app.submit_gromacs_task.info
-    info.raw_f(continue_from=str(RUN_ID), additional_time_ns=250, run_name="child-cli")
+    invoke_local_entrypoint(
+        module_name=app.__name__,
+        entrypoint_name="submit_gromacs_task",
+        flags=[
+            "--continue-from",
+            str(RUN_ID),
+            "--additional-time-ns",
+            "250",
+            "--run-name",
+            "child-cli",
+        ],
+        overrides={"use_deployed_coordinator": True},
+        program_name="biomodals app run gromacs --",
+    )
     saved = captured["request"]
     assert saved.simulation_time_ns == 255
     assert saved.cpu_only == parent.cpu_only
@@ -430,6 +472,6 @@ def test_cli_continuation_reuses_source_without_input_pdb(tmp_path, monkeypatch)
     assert captured["submission"]["predecessor_execution_run_id"] is None
     assert captured["run_id"] != RUN_ID
     with pytest.raises(ValueError, match="cannot be combined"):
-        info.raw_f(
+        app.submit_gromacs_task.info.raw_f(
             continue_from=str(RUN_ID), additional_time_ns=1, restart_from=str(RUN_ID)
         )

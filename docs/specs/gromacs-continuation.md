@@ -128,6 +128,9 @@ authoritative for the new duration. Historical archive bytes remain unchanged.
 
 ## CLI and rollout
 
+Fresh runs accept either `biomodals app run gromacs -- input.pdb` or the explicit
+`--input-pdb input.pdb` spelling.
+
 Use `biomodals app run gromacs -- --continue-from <execution-run-id>
 --additional-time-ns 10 --run-name continued-example`.
 `--cpu-only` selects CPU; `--no-cpu-only` selects GPU; omission inherits.

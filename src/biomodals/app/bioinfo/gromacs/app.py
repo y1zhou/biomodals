@@ -1127,7 +1127,7 @@ def submit_gromacs_task(
     """Run GROMACS MD simulations on Modal and save results to a volume.
 
     Args:
-        input_pdb: Path to the input PDB file.
+        input_pdb: Path to the input PDB file; fresh runs also accept it positionally.
         run_name: Name for this simulation run. Defaults to input PDB filename
             stem. Note that if the name exists in the remote volume, files in
             the remote will be preferred over the local one. Make sure to use
@@ -1200,38 +1200,6 @@ def submit_gromacs_task(
     )
     execution_run_id = uuid4()
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    seed_run_id = (
-        execution_run_id
-        if predecessor_execution_run_id is None
-        else execution_lineage_root(CONF.output_volume, predecessor_execution_run_id)
-    )
-    request = GromacsExecutionRequest(
-        run_name=run_name,
-        pdb_content=pdb_str,
-        simulation_time_ns=simulation_time_ns,
-        run_pdbfixer=run_pdbfixer,
-        cpu_only=cpu_only,
-        num_threads=num_threads,
-        use_openmp_threads=use_openmp_threads,
-        ld_seed=concrete_gromacs_seed(
-            ld_seed,
-            run_identity=str(seed_run_id),
-            purpose="ld-seed",
-        ),
-        gen_seed=concrete_gromacs_seed(
-            gen_seed,
-            run_identity=str(seed_run_id),
-            purpose="gen-seed",
-        ),
-        genion_seed=concrete_gromacs_seed(
-            genion_seed,
-            run_identity=str(seed_run_id),
-            purpose="genion-seed",
-            random_sentinel=0,
-        ),
-        max_active_provider_calls=total_limit,
-        max_active_gpu_provider_calls=gpu_limit,
-    )
     if parent is not None and source is not None:
         request = replace(
             parent,
@@ -1240,6 +1208,41 @@ def submit_gromacs_task(
             cpu_only=cpu_only,
             continuation=source,
             execution_plan_version="3",
+            max_active_provider_calls=total_limit,
+            max_active_gpu_provider_calls=gpu_limit,
+        )
+    else:
+        seed_run_id = (
+            execution_run_id
+            if predecessor_execution_run_id is None
+            else execution_lineage_root(
+                CONF.output_volume, predecessor_execution_run_id
+            )
+        )
+        request = GromacsExecutionRequest(
+            run_name=run_name,
+            pdb_content=pdb_str,
+            simulation_time_ns=simulation_time_ns,
+            run_pdbfixer=run_pdbfixer,
+            cpu_only=cpu_only,
+            num_threads=num_threads,
+            use_openmp_threads=use_openmp_threads,
+            ld_seed=concrete_gromacs_seed(
+                ld_seed,
+                run_identity=str(seed_run_id),
+                purpose="ld-seed",
+            ),
+            gen_seed=concrete_gromacs_seed(
+                gen_seed,
+                run_identity=str(seed_run_id),
+                purpose="gen-seed",
+            ),
+            genion_seed=concrete_gromacs_seed(
+                genion_seed,
+                run_identity=str(seed_run_id),
+                purpose="genion-seed",
+                random_sentinel=0,
+            ),
             max_active_provider_calls=total_limit,
             max_active_gpu_provider_calls=gpu_limit,
         )

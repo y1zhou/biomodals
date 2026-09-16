@@ -182,6 +182,57 @@ def _build_archive(
     return output.getvalue(), result
 
 
+def test_continuation_archive_reads_child_directory_and_preserves_native_stem():
+    source_files = _remote_files()
+    files = {
+        path.replace(f"{RUN_NAME}/", "child/", 1): value
+        for path, value in source_files.items()
+    }
+    requested = []
+
+    async def read_file(path):
+        requested.append(path)
+        yield files[path]
+
+    output = io.BytesIO()
+    parameters = '{"simulation_time_ns":500,"cpu_only":true}'
+    lineage = {
+        "source_job_id": "parent",
+        "additional_time_ns": 250,
+        "target_time_ns": 500,
+        "trajectory_scope": "cumulative",
+        "equilibration_analysis": "inherited",
+    }
+    asyncio.run(
+        write_gromacs_archive(
+            output,
+            run_name=RUN_NAME,
+            remote_directory="child",
+            continuation=lineage,
+            parameters_json=parameters,
+            modal_app_name="Gromacs",
+            modal_app_version=2,
+            job_id="child",
+            stages_json="[]",
+            started_at=1,
+            completed_at=2,
+            read_file=read_file,
+            remote_mtimes=_mtimes_for_files(files),
+            expected_request_sha256=artifact_request_sha256(PDB, parameters),
+            published_files=_published_files(source_files),
+        )
+    )
+    assert all(path.startswith("child/") for path in requested)
+    with zipfile.ZipFile(output) as archive:
+        provenance = orjson.loads(archive.read("metadata/provenance.json"))
+        assert provenance["continuation"] == lineage
+        assert archive.read(f"outputs/production_{RUN_NAME}_nopbc.xtc") == XTC
+        assert (
+            orjson.loads(archive.read("metadata/parameters.json"))["simulation_time_ns"]
+            == 500
+        )
+
+
 def _rewrite_archive_member(
     archive_bytes: bytes,
     name: str,

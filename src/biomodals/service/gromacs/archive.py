@@ -769,6 +769,8 @@ async def write_gromacs_archive(
     expected_request_sha256: str,
     published_files: tuple[ArtifactFile, ...],
     run_bounded: RunBounded | None = None,
+    remote_directory: str | None = None,
+    continuation: dict[str, object] | None = None,
 ) -> BuiltGromacsArchive:
     """Package files that still match the authoritative app publication."""
 
@@ -794,7 +796,8 @@ async def write_gromacs_archive(
         _reset_handle(binary_handle)
     else:
         await run_bounded(_reset_handle, binary_handle)
-    input_path = f"{run_name}/{run_name}.pdb"
+    remote_directory = remote_directory or run_name
+    input_path = f"{remote_directory}/{run_name}.pdb"
     input_bytes = await _read_bounded(
         read_required,
         input_path,
@@ -857,7 +860,7 @@ async def write_gromacs_archive(
             )
         records.append(input_record)
         for name, role in _required_output_files(run_name):
-            remote_path = f"{run_name}/{PurePosixPath(name).name}"
+            remote_path = f"{remote_directory}/{PurePosixPath(name).name}"
             capture_prefix = (
                 topology_prefix
                 if name == f"outputs/production_{run_name}.tpr"
@@ -894,6 +897,7 @@ async def write_gromacs_archive(
                     "software_version": software_version,
                     "started_at": started_at,
                     "completed_at": completed_at,
+                    **({"continuation": continuation} if continuation else {}),
                 },
                 option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS,
             )
@@ -911,7 +915,7 @@ async def write_gromacs_archive(
                 archive,
                 read_file=read_file,
                 remote_mtimes=remote_mtimes,
-                remote_path=f"{run_name}/{remote_name}",
+                remote_path=f"{remote_directory}/{remote_name}",
                 name=name,
                 role=role,
                 run_bounded=run_bounded,

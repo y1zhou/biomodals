@@ -6,6 +6,7 @@ import hashlib
 import re
 import time
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated
@@ -23,6 +24,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import Response
+from modal.exception import NotFoundError
 
 from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
@@ -37,9 +39,12 @@ from biomodals.service.gromacs.archive import (
 )
 from biomodals.service.gromacs.contracts import (
     MAX_SIMULATION_TIME_NS,
+    GromacsContinuationInfo,
+    GromacsContinuationSubmission,
     GromacsJobOptions,
     gromacs_run_name,
 )
+from biomodals.service.gromacs.modal import GromacsToolAdapter
 from biomodals.service.http_contract import (
     CodedAPIError,
     CodedErrorResponse,
@@ -54,6 +59,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
+    JobRecord,
     JobState,
     ServiceStore,
     UserNotFoundError,
@@ -90,6 +96,7 @@ def create_router(
     pending: PendingRequestStore,
     remote: RemoteExecutionClient,
     cache: ArtifactCache,
+    adapter: GromacsToolAdapter,
     max_pdb_bytes: int = MAX_PDB_BYTES,
 ) -> APIRouter:
     """Create the GROMACS endpoint around shared admission."""
@@ -97,6 +104,190 @@ def create_router(
     previews = APIRouter(
         prefix="/jobs/{job_id}/trajectory", route_class=PrivateResultRoute
     )
+
+    def owner_job(job_id: UUID, session: AuthenticatedSession) -> JobRecord:
+        job = store.get_job(session.principal.user_id, job_id)
+        if job is None or job.tool != "gromacs":
+            raise HTTPException(404, "Job not found")
+        return job
+
+    def admit(
+        execution_request: GromacsExecutionRequest,
+        *,
+        job_id: UUID,
+        normalized_name: str,
+        digest: str,
+        session: AuthenticatedSession,
+        idempotency_key: UUID,
+        deployment: DeploymentIdentity,
+        request: Request,
+    ) -> JobView:
+        effective = configuration.tool("gromacs")
+        pending.put(job_id, execution_request.to_bytes())
+        try:
+            admission = store.admit_job(
+                owner_user_id=session.principal.user_id,
+                tool="gromacs",
+                display_name=normalized_name,
+                idempotency_key=str(idempotency_key),
+                request_digest=digest,
+                modal_environment=deployment.environment,
+                modal_app_name=deployment.deployment_name,
+                modal_app_version=deployment.deployment_version,
+                tool_active_job_limit=effective.active_job_limit.value,
+                global_active_job_limit=configuration.global_active_job_limit().value,
+                max_active_provider_calls=execution_request.max_active_provider_calls,
+                max_active_gpu_provider_calls=execution_request.max_active_gpu_provider_calls,
+                now=int(time.time()),
+                new_job_id=job_id,
+            )
+        except (IdempotencyConflictError, JobLimitExceededError) as error:
+            pending.delete(job_id)
+            raise CodedAPIError(409, "job_conflict", str(error)) from error
+        except UserNotFoundError as error:
+            pending.delete(job_id)
+            raise CodedAPIError(403, "account_disabled", str(error)) from error
+        if not admission.created:
+            pending.delete(job_id)
+        request.app.state.reconcile_wakeup.set()
+        return _view(admission.job, session, configuration)
+
+    async def preflight(deployment: DeploymentIdentity) -> None:
+        await remote.preflight(deployment)
+        try:
+            await adapter.preflight(deployment)
+        except NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin the updated GROMACS app before submitting jobs",
+            ) from error
+
+    @router.get("/jobs/{job_id}/continuation", response_model=GromacsContinuationInfo)
+    async def continuation_info(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> GromacsContinuationInfo:
+        job = owner_job(job_id, session)
+        info = GromacsContinuationInfo(
+            source_job_id=job_id,
+            source_display_name=job.display_name,
+            simulation_time_ns=None,
+            cpu_only=None,
+            parent_job_id=None,
+            eligible=False,
+            code="source_not_completed",
+            detail="Only completed GROMACS jobs can be continued",
+        )
+        if job.state != JobState.SUCCEEDED:
+            return info
+        try:
+            saved = await adapter.input_request(job)
+            info.simulation_time_ns = saved.simulation_time_ns
+            info.cpu_only = saved.cpu_only
+            info.parent_job_id = (
+                saved.continuation.execution_run_id if saved.continuation else None
+            )
+            await adapter.continuation_source(job)
+        except (FileNotFoundError, ValueError, TypeError):
+            info.code = "source_unavailable"
+            info.detail = (
+                "Retained checkpoint inputs are missing, invalid, or incompatible"
+            )
+            return info
+        if job.modal_environment != configuration.modal_environment().value:
+            info.code = "source_environment_mismatch"
+            info.detail = "Source and target must use the same Modal environment"
+            return info
+        info.eligible = True
+        info.code = None
+        info.detail = "Native inputs are available; the new job verifies checksums and checkpoint completion before production"
+        return info
+
+    @router.post("/jobs/{job_id}/continue", response_model=JobView, status_code=202)
+    async def continue_job(
+        job_id: UUID,
+        submission: GromacsContinuationSubmission,
+        request: Request,
+        session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
+        idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
+    ) -> JobView:
+        job = owner_job(job_id, session)
+        normalized_name = (
+            submission.display_name.strip() if submission.display_name else ""
+        )
+        normalized_name = normalized_name or f"{job.display_name[:100]} (continued)"
+        digest = hashlib.sha256(
+            orjson.dumps(
+                {
+                    "source_job_id": str(job_id),
+                    "display_name": normalized_name,
+                    "additional_time_ns": submission.additional_time_ns,
+                    "cpu_only": submission.cpu_only,
+                },
+                option=orjson.OPT_SORT_KEYS,
+            )
+        ).hexdigest()
+        replay = store.find_idempotent_job(
+            session.principal.user_id,
+            tool="gromacs",
+            idempotency_key=str(idempotency_key),
+        )
+        if replay is not None:
+            if replay.request_digest != digest:
+                raise CodedAPIError(
+                    409,
+                    "idempotency_conflict",
+                    "Idempotency key was already used for another request",
+                )
+            return _view(replay, session, configuration)
+        if job.state != JobState.SUCCEEDED:
+            raise CodedAPIError(
+                409, "source_not_completed", "Source job must be completed"
+            )
+        if job.modal_environment != configuration.modal_environment().value:
+            raise CodedAPIError(
+                409,
+                "source_environment_mismatch",
+                "Source and target must use the same Modal environment",
+            )
+        try:
+            source, parent = await adapter.continuation_source(job)
+        except (FileNotFoundError, ValueError, TypeError) as error:
+            raise CodedAPIError(
+                409,
+                "source_unavailable",
+                "Retained checkpoint inputs are missing, invalid, or incompatible",
+            ) from error
+        effective = configuration.tool("gromacs")
+        deployment = DeploymentIdentity(
+            job.modal_environment,
+            effective.modal_app_name,
+            effective.modal_app_version.value,
+        )
+        await preflight(deployment)
+        child_id = uuid4()
+        child = replace(
+            parent,
+            run_name=gromacs_run_name(normalized_name, child_id),
+            simulation_time_ns=parent.simulation_time_ns
+            + submission.additional_time_ns,
+            cpu_only=submission.cpu_only,
+            continuation=source,
+            execution_plan_version="3",
+            max_active_provider_calls=effective.max_active_provider_calls,
+            max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls,
+        )
+        return admit(
+            child,
+            job_id=child_id,
+            normalized_name=normalized_name,
+            digest=digest,
+            session=session,
+            idempotency_key=idempotency_key,
+            deployment=deployment,
+            request=request,
+        )
 
     @previews.get(
         "/{metric}.png",
@@ -210,7 +401,7 @@ def create_router(
             effective.modal_app_name,
             effective.modal_app_version.value,
         )
-        await remote.preflight(deployment)
+        await preflight(deployment)
         job_id = uuid4()
         run_name = gromacs_run_name(normalized_name, job_id)
         execution_request = GromacsExecutionRequest(
@@ -240,36 +431,16 @@ def create_router(
             max_active_provider_calls=effective.max_active_provider_calls,
             max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls,
         )
-        pending.put(job_id, execution_request.to_bytes())
-        try:
-            admission = store.admit_job(
-                owner_user_id=session.principal.user_id,
-                tool="gromacs",
-                display_name=normalized_name,
-                idempotency_key=str(idempotency_key),
-                request_digest=digest,
-                modal_environment=deployment.environment,
-                modal_app_name=deployment.deployment_name,
-                modal_app_version=deployment.deployment_version,
-                tool_active_job_limit=effective.active_job_limit.value,
-                global_active_job_limit=configuration.global_active_job_limit().value,
-                max_active_provider_calls=execution_request.max_active_provider_calls,
-                max_active_gpu_provider_calls=(
-                    execution_request.max_active_gpu_provider_calls
-                ),
-                now=int(time.time()),
-                new_job_id=job_id,
-            )
-        except (IdempotencyConflictError, JobLimitExceededError) as error:
-            pending.delete(job_id)
-            raise CodedAPIError(409, "job_conflict", str(error)) from error
-        except UserNotFoundError as error:
-            pending.delete(job_id)
-            raise CodedAPIError(403, "account_disabled", str(error)) from error
-        if not admission.created:
-            pending.delete(job_id)
-        request.app.state.reconcile_wakeup.set()
-        return _view(admission.job, session, configuration)
+        return admit(
+            execution_request,
+            job_id=job_id,
+            normalized_name=normalized_name,
+            digest=digest,
+            session=session,
+            idempotency_key=idempotency_key,
+            deployment=deployment,
+            request=request,
+        )
 
     return router
 

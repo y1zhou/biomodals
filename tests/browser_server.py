@@ -23,6 +23,7 @@ import polars as pl
 from service.alphafold3_preview_fixture import preview_archive
 from service.gromacs_preview_fixture import trajectory_archive
 
+from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
 from biomodals.execution import (
     ActiveProviderCallCounts,
@@ -74,6 +75,7 @@ class _FakeRemote:
     """Mimic a deployed coordinator while retaining the real service boundary."""
 
     _functions = {
+        "prepare_continuation": "prepare_continuation",
         "prepare_tpr_gpu": "prepare_tpr_gpu",
         "collect_traj_stats:nvt_": "collect_traj_stats",
         "collect_traj_stats:npt_": "collect_traj_stats",
@@ -244,9 +246,12 @@ class _FakeRemote:
             "union": (4, 4.5),
             "evaluate": (4.5, 6),
             "prepare_tpr_gpu": (0, 1),
+            "prepare_tpr_cpu": (0, 1),
+            "prepare_continuation": (0, 1),
             "collect_traj_stats:nvt_": (1, 5),
             "collect_traj_stats:npt_": (1, 5),
             "production_run_gpu": (1, 2.5),
+            "production_run_cpu": (1, 2.5),
             "collect_traj_stats:production_": (2.5, 5.5),
             "prepare_result": (5.5, 6),
         }
@@ -399,14 +404,36 @@ class _FakeAdapter:
         self.remote = remote
         self.pending = pending
         self.archive = archive
+        self.requests: dict[UUID, GromacsExecutionRequest] = {}
+
+    async def preflight(self, _deployment) -> None:
+        pass
+
+    async def input_request(self, job: JobRecord) -> GromacsExecutionRequest:
+        content = self.pending.get(job.job_id)
+        if content is not None:
+            return GromacsExecutionRequest.from_bytes(content)
+        return self.requests[job.job_id]
+
+    async def continuation_source(self, job: JobRecord):
+        request = await self.input_request(job)
+        return ContinuationSource(
+            execution_run_id=job.job_id,
+            run_name=request.run_name,
+            file_stem=request.file_stem,
+            simulation_time_ns=request.simulation_time_ns,
+            request_sha256=hashlib.sha256(request.to_bytes()).hexdigest(),
+            publication_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+        ), request
 
     async def stage(self, job: JobRecord) -> None:
         content = self.pending.get(job.job_id)
         if content is None:
             raise FileNotFoundError("Browser test request is unavailable")
-        self.remote.bind_plan(
-            job.job_id, GromacsExecutionRequest.from_bytes(content).execution_plan
-        )
+        request = GromacsExecutionRequest.from_bytes(content)
+        self.requests[job.job_id] = request
+        self.remote.bind_plan(job.job_id, request.execution_plan)
 
     async def discard_pending(self, job: JobRecord) -> None:
         self.pending.delete(job.job_id)
@@ -707,6 +734,7 @@ def _create_browser_app():
                 pending=pending,
                 remote=remote,
                 cache=cache,
+                adapter=registrations[0].adapter,
             ),
             af3_router(
                 store=store,

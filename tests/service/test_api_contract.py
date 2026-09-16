@@ -27,6 +27,7 @@ from biomodals.service.auth import (
 )
 from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import router as gromacs_routes
+from biomodals.service.gromacs.modal import GromacsToolAdapter
 from biomodals.service.gromacs.router import create_router as gromacs_router
 from biomodals.service.http_contract import require_session, require_unsafe_session
 from biomodals.service.humanization.modal import HumanizationToolAdapter
@@ -284,6 +285,11 @@ class Adapter:
         raise AssertionError("No result is prepared in contract tests")
 
 
+class GromacsAdapter(GromacsToolAdapter):
+    async def preflight(self, _deployment):
+        return None
+
+
 def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
@@ -324,6 +330,7 @@ def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
                 pending=pending,
                 remote=remote,
                 cache=cache,
+                adapter=GromacsAdapter(pending),
             ),
             af3_router(
                 store=store,

@@ -9,7 +9,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-MAX_SIMULATION_TIME_NS = 200
+from biomodals.app.bioinfo.gromacs.execution import MAX_SIMULATION_TIME_NS
+
 _RUN_NAME_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _RUN_NAME_SUFFIX = re.compile(r"[0-9a-f]{32}")
 _MAX_RUN_NAME_SLUG_LENGTH = 64
@@ -23,6 +24,31 @@ class GromacsJobOptions(BaseModel):
     simulation_time_ns: int = Field(default=5, ge=1, le=MAX_SIMULATION_TIME_NS)
     run_pdbfixer: bool = False
     cpu_only: bool = False
+
+
+class GromacsContinuationSubmission(BaseModel):
+    """One explicit new production interval; all physical settings are inherited."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    display_name: str | None = Field(default=None, max_length=120)
+    additional_time_ns: int = Field(ge=1, le=MAX_SIMULATION_TIME_NS, strict=True)
+    cpu_only: bool
+
+
+class GromacsContinuationInfo(BaseModel):
+    """Read-only source evidence and inherited defaults for the continuation form."""
+
+    source_job_id: UUID
+    source_display_name: str
+    simulation_time_ns: int | None
+    cpu_only: bool | None
+    parent_job_id: UUID | None
+    eligible: bool
+    code: str | None
+    detail: str
+    min_additional_time_ns: int = 1
+    max_additional_time_ns: int = MAX_SIMULATION_TIME_NS
 
 
 def gromacs_run_name(display_name: str, job_id: UUID) -> str:

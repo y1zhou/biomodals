@@ -209,7 +209,8 @@ def create_deployed_app() -> FastAPI:
     cache = ArtifactCache(settings.cache_dir / "results")
     remote = RemoteExecutionClient()
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
-    gromacs = ToolRegistration(GROMACS_TOOL, GromacsToolAdapter(pending))
+    gromacs_adapter = GromacsToolAdapter(pending)
+    gromacs = ToolRegistration(GROMACS_TOOL, gromacs_adapter)
     alphafold3_adapter = AlphaFold3ToolAdapter(
         validations,
         store,
@@ -230,6 +231,7 @@ def create_deployed_app() -> FastAPI:
             pending=pending,
             remote=remote,
             cache=cache,
+            adapter=gromacs_adapter,
         ),
         af3_router(
             store=store,

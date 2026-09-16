@@ -17,11 +17,11 @@ from uuid import UUID, uuid4
 
 import modal
 
-from biomodals.app.bioinfo.gromacs_execution import (
+from biomodals.app.bioinfo.gromacs.execution import (
     concrete_gromacs_seed,
     preparation_execution_paths,
 )
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
     stage_execution_request,
@@ -54,7 +54,7 @@ from biomodals.schema import ArtifactFile
 # Modal configs
 ##########################################
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name, "biomodals_tool": "gromacs"},
+    tags={"group": "bioinfo", "biomodals_tool": "gromacs"},
     name="Gromacs",
     repo_url="https://github.com/gromacs/gromacs",
     version="2026.1",
@@ -246,11 +246,11 @@ runtime_image = (
         "echo 'micromamba activate base' >> /etc/profile",
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
-    .add_local_dir(Path(__file__).parent / "gromacs", APP_INFO.gmx_scripts, copy=True)
+    .add_local_dir(Path(__file__).parent / "assets", APP_INFO.gmx_scripts, copy=True)
     .pipe(patch_image_for_helper)
     .add_local_python_source(
-        "biomodals.app.bioinfo.gromacs_execution",
-        "biomodals.app.bioinfo.gromacs_execution_runtime",
+        "biomodals.app.bioinfo.gromacs.execution",
+        "biomodals.app.bioinfo.gromacs.execution_runtime",
     )
 )
 
@@ -261,8 +261,8 @@ biotite_image = (
     .uv_pip_install("biotite", "numpy", "scipy", "matplotlib")
     .pipe(patch_image_for_helper)
     .add_local_python_source(
-        "biomodals.app.bioinfo.gromacs_execution",
-        "biomodals.app.bioinfo.gromacs_execution_runtime",
+        "biomodals.app.bioinfo.gromacs.execution",
+        "biomodals.app.bioinfo.gromacs.execution_runtime",
     )
 )
 

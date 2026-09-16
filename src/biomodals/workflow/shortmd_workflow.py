@@ -21,8 +21,8 @@ from uuid import UUID, uuid4
 
 import modal
 
-from biomodals.app.bioinfo import gromacs_app
-from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
+from biomodals.app.bioinfo.gromacs import app as gromacs_app
+from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
 from biomodals.execution import (
     CoordinatorNode,
     DeploymentIdentity,

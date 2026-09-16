@@ -11,7 +11,7 @@ from uuid import UUID
 
 import orjson
 
-from biomodals.app.bioinfo.gromacs_execution import (
+from biomodals.app.bioinfo.gromacs.execution import (
     EXECUTION_PLAN_SCHEMA_VERSION,
     GROMACS_SCIENTIFIC_VERSION,
     NPT_ANALYSIS,

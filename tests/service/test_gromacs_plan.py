@@ -4,7 +4,7 @@
 
 import pytest
 
-from biomodals.app.bioinfo.gromacs_execution import (
+from biomodals.app.bioinfo.gromacs.execution import (
     GROMACS_SCIENTIFIC_VERSION,
     PREPARE_RESULT,
     REQUIRED_FUNCTIONS,

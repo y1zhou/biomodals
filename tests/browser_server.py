@@ -23,7 +23,7 @@ import polars as pl
 from service.alphafold3_preview_fixture import preview_archive
 from service.gromacs_preview_fixture import trajectory_archive
 
-from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
+from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
 from biomodals.execution import (
     ActiveProviderCallCounts,
     DeploymentIdentity,

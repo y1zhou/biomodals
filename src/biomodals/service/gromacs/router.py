@@ -24,8 +24,8 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from biomodals.app.bioinfo.gromacs_execution import concrete_gromacs_seed
-from biomodals.app.bioinfo.gromacs_execution_runtime import GromacsExecutionRequest
+from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
+from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
 from biomodals.execution import DeploymentIdentity
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.artifacts import ArtifactCache

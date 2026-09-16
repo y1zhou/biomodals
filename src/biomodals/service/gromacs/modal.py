@@ -9,8 +9,8 @@ from typing import BinaryIO, cast
 import modal
 import orjson
 
-from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
     gromacs_publication_path,
     load_execution_request_from_volume,

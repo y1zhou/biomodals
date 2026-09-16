@@ -18,8 +18,8 @@ from threading import Event, Thread
 import orjson
 import pytest
 
-from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
     gromacs_node_paths,
     parse_gromacs_publication,

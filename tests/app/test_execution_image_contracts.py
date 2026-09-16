@@ -72,6 +72,8 @@ def test_humanization_coordinator_and_annotation_image_source_closures():
             {
                 "biomodals.app.bioinfo.gromacs.execution",
                 "biomodals.app.bioinfo.gromacs.execution_runtime",
+                "biomodals.app.bioinfo.gromacs.continuation",
+                "biomodals.app.bioinfo.gromacs.continue_run",
             },
         ),
         (
@@ -79,6 +81,7 @@ def test_humanization_coordinator_and_annotation_image_source_closures():
             {
                 "biomodals.app.bioinfo.gromacs.execution",
                 "biomodals.app.bioinfo.gromacs.execution_runtime",
+                "biomodals.app.bioinfo.gromacs.continuation",
             },
         ),
         (

@@ -5,8 +5,9 @@ from __future__ import annotations
 import math
 import re
 import shutil
-from hashlib import file_digest, md5, sha256
+from hashlib import md5, sha256
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import orjson
 
@@ -19,17 +20,10 @@ from biomodals.app.bioinfo.gromacs.execution_runtime import (
     parse_gromacs_publication,
 )
 from biomodals.execution import ContentBoundFileSet
-from biomodals.helper.artifacts import replace_bytes_atomic
+from biomodals.helper.artifacts import replace_bytes_atomic, sha256_file
 from biomodals.helper.io import require_safe_filename_component
 from biomodals.helper.shell import run_command
 from biomodals.schema import ArtifactFile
-
-
-def _digest(path: Path) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("Continuation evidence must be regular files")
-    with path.open("rb") as handle:
-        return file_digest(handle, "sha256").hexdigest()
 
 
 def native_endpoint(
@@ -150,13 +144,13 @@ def prepare_continuation_files(
         raise ValueError("Continuation source publication is invalid")
     prefix = f"production_{source.file_stem}"
     checkpoint = source_root / f"{prefix}.cpt"
-    if _digest(checkpoint) != source.checkpoint_sha256:
+    if sha256_file(checkpoint) != source.checkpoint_sha256:
         raise ValueError("Continuation source checkpoint changed")
     ready = root / "continuation.json"
     child_checkpoint = root / checkpoint.name
     if (
         child_checkpoint.exists()
-        and _digest(child_checkpoint) != source.checkpoint_sha256
+        and sha256_file(child_checkpoint) != source.checkpoint_sha256
     ):
         raise ValueError(
             "Cannot replace child progress after continuation preparation was lost"
@@ -165,8 +159,6 @@ def prepare_continuation_files(
     gmx = shutil.which("gmx")
     if gmx is None:
         raise FileNotFoundError("GROMACS binary not found")
-    scratch = root / ".biomodals" / "continuation"
-    scratch.mkdir(parents=True, exist_ok=True)
     source_tpr = source_root / f"{prefix}.tpr"
     # Validate only files we reuse. Production plots/processed XTC are regenerated.
     required = {
@@ -194,26 +186,35 @@ def prepare_continuation_files(
         path = source_root / name
         if (
             path.stat().st_size != file.size_bytes
-            or _digest(path) != file.content_sha256
+            or sha256_file(path) != file.content_sha256
         ):
             raise ValueError(f"Source file no longer matches its publication: {name}")
 
     input_pdb = source_root / f"{source.file_stem}.pdb"
-    if _digest(input_pdb) != sha256(parent.pdb_content).hexdigest():
+    if sha256_file(input_pdb) != sha256(parent.pdb_content).hexdigest():
         raise ValueError("Source input structure changed")
-    step, time_ps, append_files = native_endpoint(gmx, source_tpr, checkpoint, scratch)
+    with TemporaryDirectory(prefix="gromacs-continuation-") as scratch:
+        step, time_ps, append_files = native_endpoint(
+            gmx, source_tpr, checkpoint, Path(scratch)
+        )
     if not math.isclose(
         time_ps, source.simulation_time_ns * 1000, rel_tol=0, abs_tol=1e-5
     ):
         raise ValueError("Source native endpoint differs from its saved request")
     names = set(required) | {input_pdb.name, checkpoint.name, *append_files}
+    root.mkdir(parents=True, exist_ok=True)
     for name in sorted(names):
         path = source_root / name
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"Missing or unsafe native append file: {name}")
-        if name != source_tpr.name:
-            shutil.copyfile(path, root / name)
-    shutil.copyfile(source_tpr, root / "source.tpr")
+        destination = root / ("source.tpr" if name == source_tpr.name else name)
+        # A partial initial checkpoint must never look like child MD progress.
+        temporary = destination.with_name(f".{destination.name}.copy")
+        try:
+            shutil.copyfile(path, temporary)
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     additional_ns = request.simulation_time_ns - source.simulation_time_ns
     # Always extend the immutable source TPR, never an earlier child TPR.
     (root / source_tpr.name).unlink(missing_ok=True)
@@ -252,7 +253,7 @@ def prepare_continuation_files(
             ArtifactFile(
                 path=name,
                 size_bytes=(root / name).stat().st_size,
-                content_sha256=_digest(root / name),
+                content_sha256=sha256_file(root / name),
             )
             for name in prepared.expected_paths
         )

@@ -78,10 +78,14 @@ launching a container. A normal CPU provider Task then:
    TPR; extends the TPR once; publishes immutable preparation evidence.
 
 Checkpoint dumps are consumed completely: GROMACS can print a corruption
-warning without a failing exit code. Large dumps use local scratch files, not
-Python lists or streamed provider logs. Missing/corrupt/incompatible state
-fails explicitly, with no fallback to a fresh simulation.
+warning without a failing exit code. Large dumps use container-local temporary
+directories, removed after validation even on failure; they are not retained in
+the output Volume, Python lists or streamed provider logs.
+Missing/corrupt/incompatible state fails explicitly, with no fallback to a fresh
+simulation.
 
+Initial native files are copied to temporary siblings and atomically renamed,
+so an interrupted checkpoint copy cannot be mistaken for child MD progress.
 Preparation redelivery reuses its content-bound publication. It never copies
 the source over child progress. Production redelivery keeps the fixed target
 and current child checkpoint. Explicit append mode rejects a missing checkpoint.

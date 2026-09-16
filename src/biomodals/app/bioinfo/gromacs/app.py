@@ -14,6 +14,7 @@
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
 import modal
@@ -595,7 +596,7 @@ def production_run_gpu(
     # Modal adds this automatically but we want Gromacs to handle threading
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     if require_checkpoint or fixed_target:
-        _verify_production_endpoint(gmx, tpr_file_path, checkpoint_file_path, work_path)
+        _verify_production_endpoint(gmx, tpr_file_path, checkpoint_file_path)
     CONF.output_volume.commit()
     return str(work_path)
 
@@ -683,19 +684,16 @@ def production_run_cpu(
     # Modal adds this automatically but we want Gromacs to handle threading
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
     if require_checkpoint or fixed_target:
-        _verify_production_endpoint(gmx, tpr_file_path, checkpoint_file_path, work_path)
+        _verify_production_endpoint(gmx, tpr_file_path, checkpoint_file_path)
     CONF.output_volume.commit()
     return str(work_path)
 
 
-def _verify_production_endpoint(
-    gmx: str, tpr: Path, checkpoint: Path, root: Path
-) -> None:
+def _verify_production_endpoint(gmx: str, tpr: Path, checkpoint: Path) -> None:
     from biomodals.app.bioinfo.gromacs.continue_run import native_endpoint
 
-    scratch = root / ".biomodals" / "completion"
-    scratch.mkdir(parents=True, exist_ok=True)
-    native_endpoint(gmx, tpr, checkpoint, scratch)
+    with TemporaryDirectory(prefix="gromacs-completion-") as scratch:
+        native_endpoint(gmx, tpr, checkpoint, Path(scratch))
 
 
 @app.function(

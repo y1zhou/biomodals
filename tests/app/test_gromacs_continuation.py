@@ -226,6 +226,67 @@ def test_lost_preparation_cannot_overwrite_child_progress(tmp_path, monkeypatch)
     assert (root / "production_example.cpt").read_bytes() == b"child progress"
 
 
+def test_interrupted_checkpoint_import_can_be_redelivered(tmp_path, monkeypatch):
+    parent, child = _source(tmp_path)
+    _native(monkeypatch, parent.run_root(tmp_path))
+    copyfile = continue_run.shutil.copyfile
+
+    def interrupted_copy(source, destination):
+        if source.suffix == ".cpt":
+            destination.write_bytes(source.read_bytes()[:4])
+            raise KeyboardInterrupt("Provider interrupted during checkpoint copy")
+        return copyfile(source, destination)
+
+    monkeypatch.setattr(continue_run.shutil, "copyfile", interrupted_copy)
+    with pytest.raises(KeyboardInterrupt, match="checkpoint copy"):
+        continue_run.prepare_continuation_files(child, tmp_path)
+    monkeypatch.setattr(continue_run.shutil, "copyfile", copyfile)
+
+    root = continue_run.prepare_continuation_files(child, tmp_path)
+    assert (root / "production_example.cpt").read_bytes() == b"full checkpoint"
+    assert (parent.run_root(tmp_path) / "production_example.cpt").read_bytes() == (
+        b"full checkpoint"
+    )
+    assert continue_run.prepare_continuation_files(child, tmp_path) == root
+
+
+@pytest.mark.parametrize("phase", ["source", "completion"])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_checkpoint_scratch_is_temporary_and_outside_volume(
+    tmp_path, monkeypatch, phase, corrupt
+):
+    parent, child = _source(tmp_path)
+    parent_root = parent.run_root(tmp_path)
+    _native(monkeypatch, parent_root, bad_checksum=corrupt)
+    endpoint = continue_run.native_endpoint
+    scratch_paths = []
+
+    def inspect(gmx, tpr, checkpoint, scratch):
+        scratch_paths.append(scratch)
+        return endpoint(gmx, tpr, checkpoint, scratch)
+
+    monkeypatch.setattr(continue_run, "native_endpoint", inspect)
+
+    def verify():
+        if phase == "source":
+            continue_run.prepare_continuation_files(child, tmp_path)
+        else:
+            app._verify_production_endpoint(
+                "/bin/gmx",
+                parent_root / "production_example.tpr",
+                parent_root / "production_example.cpt",
+            )
+
+    if corrupt:
+        with pytest.raises(ValueError, match="checksum"):
+            verify()
+    else:
+        verify()
+    assert len(scratch_paths) == 1
+    assert not scratch_paths[0].is_relative_to(tmp_path)
+    assert not scratch_paths[0].exists()
+
+
 def test_multiple_branches_and_fixed_endpoint_dispatch(tmp_path):
     parent, child = _source(tmp_path)
     sibling = replace(child, run_name="sibling", simulation_time_ns=6)

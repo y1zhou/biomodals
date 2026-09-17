@@ -418,8 +418,9 @@ def test_multiple_branches_and_fixed_endpoint_dispatch(tmp_path):
 
 
 @pytest.mark.parametrize("function", [app.production_run_cpu, app.production_run_gpu])
+@pytest.mark.parametrize("use_openmp_threads", [False, True])
 def test_production_uses_fixed_tpr_and_requires_checkpoint(
-    tmp_path, monkeypatch, function
+    tmp_path, monkeypatch, function, use_openmp_threads
 ):
     root = tmp_path / "child"
     root.mkdir()
@@ -447,6 +448,8 @@ def test_production_uses_fixed_tpr_and_requires_checkpoint(
         "simulation_time_ns": 15,
         "file_stem": "parent",
         "require_checkpoint": True,
+        "num_threads": 4,
+        "use_openmp_threads": use_openmp_threads,
     }
     with pytest.raises(FileNotFoundError, match="checkpoint"):
         function.get_raw_f()(**kwargs)
@@ -457,6 +460,16 @@ def test_production_uses_fixed_tpr_and_requires_checkpoint(
     assert "-append" in command
     assert "-nsteps" not in command  # actual endpoint comes from the fixed TPR
     assert command[command.index("-cpi") + 1] == "production_parent.cpt"
+    backend = "cpu" if function is app.production_run_cpu else "gpu"
+    for flag in ("-nb", "-pmefft", "-pme", "-bonded", "-update"):
+        assert command[command.index(flag) + 1] == backend
+    if backend == "gpu":
+        assert command[command.index("-gpu_id") + 1] == "0"
+    else:
+        assert "-gpu_id" not in command
+    assert command[command.index("-ntomp" if use_openmp_threads else "-nt") + 1] == "4"
+    if use_openmp_threads:
+        assert command[command.index("-ntmpi") + 1] == "1"
     assert len(endpoint_checks) == len(commits) == 1
 
 

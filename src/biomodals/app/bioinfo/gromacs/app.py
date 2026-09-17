@@ -540,76 +540,16 @@ def production_run_gpu(
     fixed_target: bool = False,
 ) -> str:
     """Production Gromacs run."""
-    import shutil
-
-    work_path = AppRunLayout.from_run_root(
-        Path(CONF.output_volume_mountpoint) / run_name
-    ).run_root
-    deffnm = f"production_{file_stem or run_name}"
-    tpr_file_path = work_path / f"{deffnm}.tpr"
-    if not tpr_file_path.exists():
-        raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
-
-    # Pick up exisiting trajectory and continue simulation when checkpoint exists
-    traj_file_path = work_path / f"{deffnm}.xtc"
-    checkpoint_file_path = work_path / f"{deffnm}.cpt"
-    nsteps = -2  # default: use nsteps from the prepared TPR
-    if require_checkpoint and not checkpoint_file_path.is_file():
-        raise FileNotFoundError("Continuation checkpoint is required")
-    if (
-        not require_checkpoint
-        and not fixed_target
-        and traj_file_path.exists()
-        and checkpoint_file_path.exists()
-    ):
-        simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
-        nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep
-        if nsteps <= 0:
-            print("✅ Production run already completed, skipping.")
-            return str(work_path)
-
-    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
-    if gmx is None:
-        raise FileNotFoundError("Gromacs binary not found in PATH.")
-
-    cmd = [
-        gmx,
-        "mdrun",
-        "-deffnm",
-        deffnm,
-        "-cpi",
-        checkpoint_file_path.name,
-        "-nsteps",
-        str(nsteps),
-        "-gpu_id",
-        "0",
-        "-nb",
-        "gpu",
-        "-pmefft",
-        "gpu",
-        "-pme",
-        "gpu",
-        "-bonded",
-        "gpu",
-        "-update",
-        "gpu",
-    ]
-    if use_openmp_threads:
-        cmd.extend(["-ntmpi", "1", "-ntomp", str(num_threads)])
-    else:
-        cmd.extend(["-nt", str(num_threads)])
-    if require_checkpoint or fixed_target:
-        index = cmd.index("-nsteps")
-        del cmd[index : index + 2]
-    if require_checkpoint or (fixed_target and checkpoint_file_path.exists()):
-        cmd.append("-append")
-
-    # Modal adds this automatically but we want Gromacs to handle threading
-    _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
-    if require_checkpoint or fixed_target:
-        _verify_production_endpoint(gmx, tpr_file_path, checkpoint_file_path)
-    CONF.output_volume.commit()
-    return str(work_path)
+    return _run_production(
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        file_stem=file_stem,
+        require_checkpoint=require_checkpoint,
+        fixed_target=fixed_target,
+        cpu_only=False,
+    )
 
 
 @app.function(
@@ -628,6 +568,30 @@ def production_run_cpu(
     fixed_target: bool = False,
 ) -> str:
     """Production Gromacs run."""
+    return _run_production(
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        file_stem=file_stem,
+        require_checkpoint=require_checkpoint,
+        fixed_target=fixed_target,
+        cpu_only=True,
+    )
+
+
+def _run_production(
+    *,
+    run_name: str,
+    simulation_time_ns: int,
+    num_threads: int,
+    use_openmp_threads: bool,
+    file_stem: str | None,
+    require_checkpoint: bool,
+    fixed_target: bool,
+    cpu_only: bool,
+) -> str:
+    """Run either backend with the same checkpoint and fixed-endpoint policy."""
     import shutil
 
     work_path = AppRunLayout.from_run_root(
@@ -638,7 +602,7 @@ def production_run_cpu(
     if not tpr_file_path.exists():
         raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
 
-    # Pick up exisiting trajectory and continue simulation when checkpoint exists
+    # Pick up the existing trajectory when a legacy caller uses remaining steps.
     traj_file_path = work_path / f"{deffnm}.xtc"
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
     nsteps = -2  # default: use nsteps from the prepared TPR
@@ -656,12 +620,14 @@ def production_run_cpu(
             print("✅ Production run already completed, skipping.")
             return str(work_path)
 
-        print(f"Continuing production run for additional {nsteps} steps...")
+        if cpu_only:
+            print(f"Continuing production run for additional {nsteps} steps...")
 
     gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
     if gmx is None:
         raise FileNotFoundError("Gromacs binary not found in PATH.")
 
+    target = "cpu" if cpu_only else "gpu"
     cmd = [
         gmx,
         "mdrun",
@@ -669,26 +635,23 @@ def production_run_cpu(
         deffnm,
         "-cpi",
         checkpoint_file_path.name,
-        "-nsteps",
-        str(nsteps),
+        *([] if require_checkpoint or fixed_target else ["-nsteps", str(nsteps)]),
+        *([] if cpu_only else ["-gpu_id", "0"]),
         "-nb",
-        "cpu",
+        target,
         "-pmefft",
-        "cpu",
+        target,
         "-pme",
-        "cpu",
+        target,
         "-bonded",
-        "cpu",
+        target,
         "-update",
-        "cpu",
+        target,
     ]
     if use_openmp_threads:
         cmd.extend(["-ntmpi", "1", "-ntomp", str(num_threads)])
     else:
         cmd.extend(["-nt", str(num_threads)])
-    if require_checkpoint or fixed_target:
-        index = cmd.index("-nsteps")
-        del cmd[index : index + 2]
     if require_checkpoint or (fixed_target and checkpoint_file_path.exists()):
         cmd.append("-append")
 

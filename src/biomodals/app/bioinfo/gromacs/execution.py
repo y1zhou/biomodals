@@ -92,11 +92,20 @@ def _operation_plan(
 ) -> tuple[PlannedOperation, ...]:
     """Build the selected fixed plan from one CPU/GPU decision."""
     prepare = "prepare_tpr_cpu" if cpu_only else "prepare_tpr_gpu"
+    if continuation:
+        prepare = PREPARE_CONTINUATION
     production = "production_run_cpu" if cpu_only else "production_run_gpu"
-    operations = (
+    equilibration = (
+        ()
+        if continuation
+        else (
+            PlannedOperation(NVT_ANALYSIS, (prepare,), "collect_traj_stats", "nvt_"),
+            PlannedOperation(NPT_ANALYSIS, (prepare,), "collect_traj_stats", "npt_"),
+        )
+    )
+    return (
         PlannedOperation(prepare, (), prepare),
-        PlannedOperation(NVT_ANALYSIS, (prepare,), "collect_traj_stats", "nvt_"),
-        PlannedOperation(NPT_ANALYSIS, (prepare,), "collect_traj_stats", "npt_"),
+        *equilibration,
         PlannedOperation(
             production,
             (prepare,),
@@ -111,18 +120,6 @@ def _operation_plan(
             save_processed_traj=True,
         ),
     )
-    if continuation:
-        return (
-            PlannedOperation(PREPARE_CONTINUATION, (), PREPARE_CONTINUATION),
-            PlannedOperation(
-                production,
-                (PREPARE_CONTINUATION,),
-                production,
-                include_simulation_time=True,
-            ),
-            operations[-1],
-        )
-    return operations
 
 
 def execution_plan(

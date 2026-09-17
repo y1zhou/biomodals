@@ -5,7 +5,8 @@
 ## Outputs
 
 * All output files are saved to a Modal volume named `Gromacs-outputs`.
-* The production trajectory should be under the name `production_{run_name}.xtc`.
+* Fresh production trajectories use `production_{run_name}.xtc`; continuations
+  retain the source filename within their own new output directory.
 """
 # Ignore ruff warnings about import location
 # ruff: noqa: PLC0415
@@ -13,15 +14,17 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
 import modal
 
-from biomodals.app.bioinfo.gromacs_execution import (
+from biomodals.app.bioinfo.gromacs.execution import (
+    MAX_SIMULATION_TIME_NS,
     concrete_gromacs_seed,
     preparation_execution_paths,
 )
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
     stage_execution_request,
@@ -54,7 +57,7 @@ from biomodals.schema import ArtifactFile
 # Modal configs
 ##########################################
 CONF = AppConfig(
-    tags={"group": Path(__file__).parent.name, "biomodals_tool": "gromacs"},
+    tags={"group": "bioinfo", "biomodals_tool": "gromacs"},
     name="Gromacs",
     repo_url="https://github.com/gromacs/gromacs",
     version="2026.1",
@@ -246,11 +249,13 @@ runtime_image = (
         "echo 'micromamba activate base' >> /etc/profile",
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
-    .add_local_dir(Path(__file__).parent / "gromacs", APP_INFO.gmx_scripts, copy=True)
+    .add_local_dir(Path(__file__).parent / "assets", APP_INFO.gmx_scripts, copy=True)
     .pipe(patch_image_for_helper)
     .add_local_python_source(
-        "biomodals.app.bioinfo.gromacs_execution",
-        "biomodals.app.bioinfo.gromacs_execution_runtime",
+        "biomodals.app.bioinfo.gromacs.execution",
+        "biomodals.app.bioinfo.gromacs.execution_runtime",
+        "biomodals.app.bioinfo.gromacs.continuation",
+        "biomodals.app.bioinfo.gromacs.continue_run",
     )
 )
 
@@ -261,8 +266,20 @@ biotite_image = (
     .uv_pip_install("biotite", "numpy", "scipy", "matplotlib")
     .pipe(patch_image_for_helper)
     .add_local_python_source(
-        "biomodals.app.bioinfo.gromacs_execution",
-        "biomodals.app.bioinfo.gromacs_execution_runtime",
+        "biomodals.app.bioinfo.gromacs.execution",
+        "biomodals.app.bioinfo.gromacs.execution_runtime",
+        "biomodals.app.bioinfo.gromacs.continuation",
+    )
+)
+
+inspection_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.gromacs.execution",
+        "biomodals.app.bioinfo.gromacs.execution_runtime",
+        "biomodals.app.bioinfo.gromacs.continuation",
     )
 )
 
@@ -518,64 +535,21 @@ def production_run_gpu(
     simulation_time_ns: int,
     num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
+    file_stem: str | None = None,
+    require_checkpoint: bool = False,
+    fixed_target: bool = False,
 ) -> str:
     """Production Gromacs run."""
-    import shutil
-
-    work_path = AppRunLayout.from_run_root(
-        Path(CONF.output_volume_mountpoint) / run_name
-    ).run_root
-    deffnm = f"production_{run_name}"
-    tpr_file_path = work_path / f"{deffnm}.tpr"
-    if not tpr_file_path.exists():
-        raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
-
-    # Pick up exisiting trajectory and continue simulation when checkpoint exists
-    traj_file_path = work_path / f"{deffnm}.xtc"
-    checkpoint_file_path = work_path / f"{deffnm}.cpt"
-    nsteps = -2  # default: use nsteps from the prepared TPR
-    if traj_file_path.exists() and checkpoint_file_path.exists():
-        simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
-        nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep
-        if nsteps <= 0:
-            print("✅ Production run already completed, skipping.")
-            return str(work_path)
-
-    gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
-    if gmx is None:
-        raise FileNotFoundError("Gromacs binary not found in PATH.")
-
-    cmd = [
-        gmx,
-        "mdrun",
-        "-deffnm",
-        deffnm,
-        "-cpi",
-        checkpoint_file_path.name,
-        "-nsteps",
-        str(nsteps),
-        "-gpu_id",
-        "0",
-        "-nb",
-        "gpu",
-        "-pmefft",
-        "gpu",
-        "-pme",
-        "gpu",
-        "-bonded",
-        "gpu",
-        "-update",
-        "gpu",
-    ]
-    if use_openmp_threads:
-        cmd.extend(["-ntmpi", "1", "-ntomp", str(num_threads)])
-    else:
-        cmd.extend(["-nt", str(num_threads)])
-
-    # Modal adds this automatically but we want Gromacs to handle threading
-    _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
-    CONF.output_volume.commit()
-    return str(work_path)
+    return _run_production(
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        file_stem=file_stem,
+        require_checkpoint=require_checkpoint,
+        fixed_target=fixed_target,
+        cpu_only=False,
+    )
 
 
 @app.function(
@@ -589,35 +563,71 @@ def production_run_cpu(
     simulation_time_ns: int,
     num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
+    file_stem: str | None = None,
+    require_checkpoint: bool = False,
+    fixed_target: bool = False,
 ) -> str:
     """Production Gromacs run."""
+    return _run_production(
+        run_name=run_name,
+        simulation_time_ns=simulation_time_ns,
+        num_threads=num_threads,
+        use_openmp_threads=use_openmp_threads,
+        file_stem=file_stem,
+        require_checkpoint=require_checkpoint,
+        fixed_target=fixed_target,
+        cpu_only=True,
+    )
+
+
+def _run_production(
+    *,
+    run_name: str,
+    simulation_time_ns: int,
+    num_threads: int,
+    use_openmp_threads: bool,
+    file_stem: str | None,
+    require_checkpoint: bool,
+    fixed_target: bool,
+    cpu_only: bool,
+) -> str:
+    """Run either backend with the same checkpoint and fixed-endpoint policy."""
     import shutil
 
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
-    deffnm = f"production_{run_name}"
+    deffnm = f"production_{file_stem or run_name}"
     tpr_file_path = work_path / f"{deffnm}.tpr"
     if not tpr_file_path.exists():
         raise FileNotFoundError(f"Production topology file not found: {tpr_file_path}")
 
-    # Pick up exisiting trajectory and continue simulation when checkpoint exists
+    # Pick up the existing trajectory when a legacy caller uses remaining steps.
     traj_file_path = work_path / f"{deffnm}.xtc"
     checkpoint_file_path = work_path / f"{deffnm}.cpt"
     nsteps = -2  # default: use nsteps from the prepared TPR
-    if traj_file_path.exists() and checkpoint_file_path.exists():
+    if require_checkpoint and not checkpoint_file_path.is_file():
+        raise FileNotFoundError("Continuation checkpoint is required")
+    if (
+        not require_checkpoint
+        and not fixed_target
+        and traj_file_path.exists()
+        and checkpoint_file_path.exists()
+    ):
         simulated_ns = find_traj_last_time_ns.remote(str(traj_file_path))
         nsteps = int((simulation_time_ns - simulated_ns) * 500000)  # 2 fs timestep
         if nsteps <= 0:
             print("✅ Production run already completed, skipping.")
             return str(work_path)
 
-        print(f"Continuing production run for additional {nsteps} steps...")
+        if cpu_only:
+            print(f"Continuing production run for additional {nsteps} steps...")
 
     gmx = shutil.which("gmx_mpi") if use_openmp_threads else shutil.which("gmx")
     if gmx is None:
         raise FileNotFoundError("Gromacs binary not found in PATH.")
 
+    target = "cpu" if cpu_only else "gpu"
     cmd = [
         gmx,
         "mdrun",
@@ -625,28 +635,80 @@ def production_run_cpu(
         deffnm,
         "-cpi",
         checkpoint_file_path.name,
-        "-nsteps",
-        str(nsteps),
+        *([] if require_checkpoint or fixed_target else ["-nsteps", str(nsteps)]),
+        *([] if cpu_only else ["-gpu_id", "0"]),
         "-nb",
-        "cpu",
+        target,
         "-pmefft",
-        "cpu",
+        target,
         "-pme",
-        "cpu",
+        target,
         "-bonded",
-        "cpu",
+        target,
         "-update",
-        "cpu",
+        target,
     ]
     if use_openmp_threads:
         cmd.extend(["-ntmpi", "1", "-ntomp", str(num_threads)])
     else:
         cmd.extend(["-nt", str(num_threads)])
+    if require_checkpoint or (fixed_target and checkpoint_file_path.exists()):
+        cmd.append("-append")
 
     # Modal adds this automatically but we want Gromacs to handle threading
     _ = run_command(cmd, cwd=str(work_path), env={"OMP_NUM_THREADS": None})
+    if require_checkpoint or fixed_target:
+        _verify_production_endpoint(gmx, tpr_file_path, checkpoint_file_path)
     CONF.output_volume.commit()
     return str(work_path)
+
+
+def _verify_production_endpoint(gmx: str, tpr: Path, checkpoint: Path) -> None:
+    from biomodals.app.bioinfo.gromacs.continue_run import native_endpoint
+
+    with TemporaryDirectory(prefix="gromacs-completion-") as scratch:
+        native_endpoint(gmx, tpr, checkpoint, Path(scratch))
+
+
+@app.function(
+    image=inspection_image,
+    cpu=0.25,
+    memory=512,
+    timeout=40,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True, sub_path="/"
+        ),
+    },
+)
+def inspect_continuation_source(execution_run_id: str) -> str:
+    """Inspect source metadata in Modal; no writes, file transfers or simulation."""
+    from biomodals.app.bioinfo.gromacs.continuation import (
+        inspect_continuation_source as inspect,
+    )
+
+    CONF.output_volume.reload()
+    return inspect(
+        Path(CONF.output_volume_mountpoint), UUID(execution_run_id)
+    ).model_dump_json()
+
+
+@app.function(
+    image=runtime_image,
+    cpu=1,
+    memory=(1024, 4096),
+    timeout=CONF.timeout,
+    volumes=CONF.mounts(output_volume=True),
+)
+def prepare_continuation(request_content: bytes) -> str:
+    """Verify a completed native source and isolate cumulative child outputs."""
+    from biomodals.app.bioinfo.gromacs.continue_run import prepare_continuation_files
+
+    CONF.output_volume.reload()
+    request = GromacsExecutionRequest.from_bytes(request_content)
+    root = prepare_continuation_files(request, Path(CONF.output_volume_mountpoint))
+    CONF.output_volume.commit()
+    return str(root)
 
 
 @app.function(
@@ -701,6 +763,7 @@ def collect_traj_stats(
     run_name: str,
     save_processed_traj: bool = False,
     make_figures: bool = True,
+    file_stem: str | None = None,
 ) -> str:
     """Process Gromacs trajectory and generate analysis plots.
 
@@ -716,6 +779,7 @@ def collect_traj_stats(
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
+    run_name = file_stem or run_name
     traj_path = work_path / f"{traj_prefix}{run_name}.xtc"
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
@@ -1026,6 +1090,7 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
             "collect_traj_stats": collect_traj_stats,
             "production_run_cpu": production_run_cpu,
             "production_run_gpu": production_run_gpu,
+            "prepare_continuation": prepare_continuation,
         },
         workload_name="GROMACS",
     )
@@ -1036,11 +1101,11 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
 ##########################################
 @app.local_entrypoint()
 def submit_gromacs_task(
-    input_pdb: str,
+    input_pdb: str | None = None,
     run_name: str | None = None,
     simulation_time_ns: int = 5,
     run_pdbfixer: bool = False,
-    cpu_only: bool = False,
+    cpu_only: bool | None = None,
     num_threads: int = APP_INFO.gmx_threads,
     use_openmp_threads: bool = False,
     ld_seed: int = -1,
@@ -1053,20 +1118,22 @@ def submit_gromacs_task(
     deployment_name: str = CONF.name,
     deployment_version: int = 1,
     restart_from: str | None = None,
+    continue_from: str | None = None,
+    additional_time_ns: int | None = None,
 ) -> None:
     """Run GROMACS MD simulations on Modal and save results to a volume.
 
     Args:
-        input_pdb: Path to the input PDB file.
+        input_pdb: Path to the input PDB file; fresh runs also accept it positionally.
         run_name: Name for this simulation run. Defaults to input PDB filename
             stem. Note that if the name exists in the remote volume, files in
             the remote will be preferred over the local one. Make sure to use
             unique names if you want to start a new run!
-        simulation_time_ns: Length of the production MD simulation in nanoseconds.
+        simulation_time_ns: Fresh production duration, 1–250 whole nanoseconds.
         run_pdbfixer: Whether to run PDBFixer to clean the input PDB file
             before preparation.
-        cpu_only: Whether to run GROMACS on CPU only. If False, GROMACS will
-            use GPU acceleration.
+        cpu_only: Select CPU (True) or GPU (False). Omission inherits the source
+            for continuation and selects GPU for a fresh simulation.
         num_threads: Number of CPU threads to use for GROMACS.
         use_openmp_threads: Whether to use OpenMP threading in GROMACS.
         ld_seed: Random seed for the Langevin dynamics thermostat during
@@ -1083,12 +1150,56 @@ def submit_gromacs_task(
         deployment_name: Exact deployed Modal app name.
         deployment_version: Exact numeric deployment version.
         restart_from: Optional predecessor Execution Run ID for a Successor Run.
+        continue_from: Completed Execution Run to extend in a new output directory.
+        additional_time_ns: Additional whole nanoseconds (1–250), only with continue_from.
     """
-    # Load input PDB
-    pdb_path = Path(input_pdb).expanduser().resolve()
-    pdb_str = pdb_path.read_bytes()
-    if run_name is None:
-        run_name = pdb_path.stem
+    inspection = None
+    interval_ns = simulation_time_ns
+    if continue_from:
+        import asyncio
+
+        from biomodals.app.bioinfo.gromacs.continuation import (
+            ContinuationInspection,
+            read_continuation_source,
+        )
+
+        if restart_from or input_pdb:
+            raise ValueError(
+                "--continue-from cannot be combined with --restart-from or --input-pdb"
+            )
+        if (
+            additional_time_ns is None
+            or not 1 <= additional_time_ns <= MAX_SIMULATION_TIME_NS
+        ):
+            raise ValueError("--additional-time-ns must be between 1 and 250")
+        inspection = (
+            asyncio.run(
+                read_continuation_source(
+                    DeploymentIdentity(
+                        deployment_environment, deployment_name, deployment_version
+                    ),
+                    UUID(continue_from),
+                )
+            )
+            if use_deployed_coordinator
+            else ContinuationInspection.model_validate_json(
+                inspect_continuation_source.remote(str(UUID(continue_from)))
+            )
+        )
+        interval_ns = additional_time_ns
+        cpu_only = inspection.cpu_only if cpu_only is None else cpu_only
+        run_name = run_name or f"continued-{uuid4().hex}"
+    else:
+        if additional_time_ns is not None or not input_pdb:
+            raise ValueError(
+                "A fresh run requires --input-pdb; additional time requires --continue-from"
+            )
+        if not 1 <= simulation_time_ns <= MAX_SIMULATION_TIME_NS:
+            raise ValueError("--simulation-time-ns must be between 1 and 250")
+        pdb_path = Path(input_pdb).expanduser().resolve()
+        pdb_str = pdb_path.read_bytes()
+        run_name = run_name or pdb_path.stem
+        cpu_only = False if cpu_only is None else cpu_only
 
     total_limit, gpu_limit = resolve_provider_call_limits(
         default_max_containers=3,
@@ -1098,38 +1209,49 @@ def submit_gromacs_task(
     )
     execution_run_id = uuid4()
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    seed_run_id = (
-        execution_run_id
-        if predecessor_execution_run_id is None
-        else execution_lineage_root(CONF.output_volume, predecessor_execution_run_id)
-    )
-    request = GromacsExecutionRequest(
-        run_name=run_name,
-        pdb_content=pdb_str,
-        simulation_time_ns=simulation_time_ns,
-        run_pdbfixer=run_pdbfixer,
-        cpu_only=cpu_only,
-        num_threads=num_threads,
-        use_openmp_threads=use_openmp_threads,
-        ld_seed=concrete_gromacs_seed(
-            ld_seed,
-            run_identity=str(seed_run_id),
-            purpose="ld-seed",
-        ),
-        gen_seed=concrete_gromacs_seed(
-            gen_seed,
-            run_identity=str(seed_run_id),
-            purpose="gen-seed",
-        ),
-        genion_seed=concrete_gromacs_seed(
-            genion_seed,
-            run_identity=str(seed_run_id),
-            purpose="genion-seed",
-            random_sentinel=0,
-        ),
-        max_active_provider_calls=total_limit,
-        max_active_gpu_provider_calls=gpu_limit,
-    )
+    if inspection is not None:
+        request = inspection.request(
+            run_name=run_name,
+            additional_time_ns=interval_ns,
+            cpu_only=cpu_only,
+            max_active_provider_calls=total_limit,
+            max_active_gpu_provider_calls=gpu_limit,
+        )
+    else:
+        seed_run_id = (
+            execution_run_id
+            if predecessor_execution_run_id is None
+            else execution_lineage_root(
+                CONF.output_volume, predecessor_execution_run_id
+            )
+        )
+        request = GromacsExecutionRequest(
+            run_name=run_name,
+            pdb_content=pdb_str,
+            simulation_time_ns=simulation_time_ns,
+            run_pdbfixer=run_pdbfixer,
+            cpu_only=cpu_only,
+            num_threads=num_threads,
+            use_openmp_threads=use_openmp_threads,
+            ld_seed=concrete_gromacs_seed(
+                ld_seed,
+                run_identity=str(seed_run_id),
+                purpose="ld-seed",
+            ),
+            gen_seed=concrete_gromacs_seed(
+                gen_seed,
+                run_identity=str(seed_run_id),
+                purpose="gen-seed",
+            ),
+            genion_seed=concrete_gromacs_seed(
+                genion_seed,
+                run_identity=str(seed_run_id),
+                purpose="genion-seed",
+                random_sentinel=0,
+            ),
+            max_active_provider_calls=total_limit,
+            max_active_gpu_provider_calls=gpu_limit,
+        )
     deployment = DeploymentIdentity(
         deployment_environment,
         deployment_name,

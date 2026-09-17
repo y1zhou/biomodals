@@ -286,7 +286,7 @@ the app publishes a verified directory and exact file set rather than an
 end-user archive. The GROMACS Tool Adapter packages that publication into the
 existing `input.pdb`, `outputs/`, and `metadata/` schema. It does not infer
 successful files independently of the coordinator publication, and this API
-presentation behavior does not require changes to `gromacs_app.py`.
+presentation behavior does not require changes to `bioinfo/gromacs/app.py`.
 Publication records may have a different order from ZIP members. Validate the
 exact filenames and their multiplicities independently of order, while retaining
 the size and SHA-256 checks for every file and the existing deterministic ZIP order.

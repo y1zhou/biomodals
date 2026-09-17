@@ -220,11 +220,15 @@ The checklist must order these actions:
    App, adapter, or effective Modal configuration changed, an Administrator
    must approve the cost and submit one smallest valid, unmistakably named
    real-Modal Job.
-6. For a changed GROMACS path, verify one invocation of each expected deployed
+6. For a changed fresh GROMACS path, verify one invocation of each expected deployed
    Function: preparation first; NVT analysis, NPT analysis, and production
    overlapping; production analysis after production; and Result preparation
    only after all analyses. Verify the public timestamps, prepared download,
-   and ZIP schema. For a changed AlphaFold3 path, verify server validation and
+   and ZIP schema. For production continuation, verify source validation,
+   production and cumulative analysis without new equilibration, unchanged
+   source files, and the added/total time in archive provenance; follow the
+   [continuation rollout contract](../specs/gromacs-continuation.md#cli-and-rollout).
+   For a changed AlphaFold3 path, verify server validation and
    confirmation, Prepare environment, optional MSA and template searches,
    prediction, Prepare results, and the downloadable `.tar.zst` archive.
    For humanization, verify four independent generator stages, union/evaluation,

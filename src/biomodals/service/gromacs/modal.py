@@ -9,24 +9,25 @@ from typing import BinaryIO, cast
 import modal
 import orjson
 
-from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.continuation import (
+    ContinuationInspection,
+    read_continuation_source,
+)
+from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
     gromacs_publication_path,
     load_execution_request_from_volume,
     parse_gromacs_publication,
     stage_execution_request,
 )
+from biomodals.execution import DeploymentIdentity
 from biomodals.execution.modal import stage_execution_launch
 from biomodals.helper.modal_volume import read_modal_volume_file
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     write_gromacs_archive,
-)
-from biomodals.service.gromacs.contracts import (
-    GromacsJobOptions,
-    artifact_request_sha256,
 )
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobRecord
@@ -65,6 +66,22 @@ class GromacsToolAdapter:
     async def discard_pending(self, job: JobRecord) -> None:
         """Remove the local request after both remote files were verified."""
         self.pending.delete(job.job_id)
+
+    async def continuation_source(
+        self, job: JobRecord, deployment: DeploymentIdentity
+    ) -> ContinuationInspection:
+        """Inspect in Modal without transferring native files to the API host."""
+        return await read_continuation_source(deployment, job.job_id)
+
+    async def preflight(self, deployment: DeploymentIdentity) -> None:
+        """Reject older targets before admitting a version-three scientific plan."""
+        function = modal.Function.from_name(
+            deployment.deployment_name,
+            "prepare_continuation",
+            environment_name=deployment.environment,
+            version=deployment.deployment_version,
+        )
+        await function.hydrate.aio()
 
     async def prepare_result(
         self,
@@ -108,15 +125,30 @@ class GromacsToolAdapter:
                     if type(entry.mtime) is not int:
                         raise ValueError("GROMACS output metadata is invalid")
                     remote_mtimes[remote_path] = entry.mtime
-                options = GromacsJobOptions(
-                    simulation_time_ns=request.simulation_time_ns,
-                    run_pdbfixer=request.run_pdbfixer,
-                    cpu_only=request.cpu_only,
+                # The per-submission interval bound is not a cumulative cap.
+                parameters_json = orjson.dumps({
+                    "simulation_time_ns": request.simulation_time_ns,
+                    "run_pdbfixer": request.run_pdbfixer,
+                    "cpu_only": request.cpu_only,
+                }).decode()
+                continuation = (
+                    {
+                        "source": request.continuation.model_dump(mode="json"),
+                        "additional_time_ns": request.simulation_time_ns
+                        - request.continuation.simulation_time_ns,
+                        "target_time_ns": request.simulation_time_ns,
+                        "trajectory_scope": "cumulative",
+                        "equilibration_analysis": "inherited",
+                        "production_mdp": "original input; extended TPR is authoritative",
+                    }
+                    if request.continuation
+                    else None
                 )
-                parameters_json = options.model_dump_json()
                 built = await write_gromacs_archive(
                     handle,
-                    run_name=request.run_name,
+                    run_name=request.file_stem,
+                    remote_directory=request.run_name,
+                    continuation=continuation,
                     parameters_json=parameters_json,
                     modal_app_name=job.modal_app_name,
                     modal_app_version=job.modal_app_version,
@@ -129,10 +161,7 @@ class GromacsToolAdapter:
                     completed_at=completed_at,
                     read_file=read_file,
                     remote_mtimes=remote_mtimes,
-                    expected_request_sha256=artifact_request_sha256(
-                        request.pdb_content,
-                        parameters_json,
-                    ),
+                    expected_input_sha256=request.pdb_sha256,
                     published_files=published_files,
                     run_bounded=cache.run_bounded,
                 )

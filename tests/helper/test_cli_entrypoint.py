@@ -63,6 +63,58 @@ def test_parse_entrypoint_flags_accepts_required_positionals() -> None:
     }
 
 
+def test_parse_entrypoint_flags_requires_mandatory_input() -> None:
+    def callback(input_dir: str, replicates: int = 50) -> None:
+        pass
+
+    with pytest.raises(SystemExit) as error:
+        _parse_entrypoint_flags(
+            callback,
+            [],
+            hidden_parameters=frozenset(),
+            program_name="test",
+        )
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        ([], None),
+        (["input.pdb"], "input.pdb"),
+        (["--input-path", "input.pdb"], "input.pdb"),
+    ],
+)
+def test_nullable_leading_input_accepts_positional_or_named_value(flags, expected):
+    def callback(input_path: str | None = None, run_name: str | None = None) -> None:
+        pass
+
+    assert _parse_entrypoint_flags(
+        callback,
+        flags,
+        hidden_parameters=frozenset(),
+        program_name="test",
+    ) == {"input_path": expected, "run_name": None}
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["input.pdb", "extra.pdb"], ["--input-path", "input.pdb", "extra.pdb"]],
+)
+def test_nullable_leading_input_rejects_extra_or_duplicate_positionals(flags):
+    def callback(input_path: str | None = None, run_name: str | None = None) -> None:
+        pass
+
+    with pytest.raises(SystemExit) as error:
+        _parse_entrypoint_flags(
+            callback,
+            flags,
+            hidden_parameters=frozenset(),
+            program_name="test",
+        )
+    assert error.value.code == 2
+
+
 def test_invoke_local_entrypoint_hides_and_injects_deployment_parameters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

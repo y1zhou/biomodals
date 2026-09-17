@@ -49,6 +49,11 @@ GROMACS_TOOL = ToolDefinition(
     default_active_job_limit=2,
     stages=(
         ToolStageDefinition(
+            "prepare_continuation",
+            "Verify continuation source",
+            ("prepare_continuation",),
+        ),
+        ToolStageDefinition(
             "prepare_simulation",
             "Prepare simulation",
             ("prepare_tpr_cpu", "prepare_tpr_gpu"),

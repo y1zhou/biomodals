@@ -18,8 +18,8 @@ from threading import Event, Thread
 import orjson
 import pytest
 
-from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
     gromacs_node_paths,
     parse_gromacs_publication,
@@ -36,7 +36,6 @@ from biomodals.service.gromacs.archive import (
     validate_gromacs_archive,
     write_gromacs_archive,
 )
-from biomodals.service.gromacs.contracts import artifact_request_sha256
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
@@ -173,13 +172,64 @@ def _build_archive(
             remote_mtimes=(
                 _mtimes_for_files(files) if remote_mtimes is None else remote_mtimes
             ),
-            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
             published_files=(
                 _published_files(files) if published_files is None else published_files
             ),
         )
     )
     return output.getvalue(), result
+
+
+def test_continuation_archive_reads_child_directory_and_preserves_native_stem():
+    source_files = _remote_files()
+    files = {
+        path.replace(f"{RUN_NAME}/", "child/", 1): value
+        for path, value in source_files.items()
+    }
+    requested = []
+
+    async def read_file(path):
+        requested.append(path)
+        yield files[path]
+
+    output = io.BytesIO()
+    parameters = '{"simulation_time_ns":500,"cpu_only":true}'
+    lineage = {
+        "source_job_id": "parent",
+        "additional_time_ns": 250,
+        "target_time_ns": 500,
+        "trajectory_scope": "cumulative",
+        "equilibration_analysis": "inherited",
+    }
+    asyncio.run(
+        write_gromacs_archive(
+            output,
+            run_name=RUN_NAME,
+            remote_directory="child",
+            continuation=lineage,
+            parameters_json=parameters,
+            modal_app_name="Gromacs",
+            modal_app_version=2,
+            job_id="child",
+            stages_json="[]",
+            started_at=1,
+            completed_at=2,
+            read_file=read_file,
+            remote_mtimes=_mtimes_for_files(files),
+            expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
+            published_files=_published_files(source_files),
+        )
+    )
+    assert all(path.startswith("child/") for path in requested)
+    with zipfile.ZipFile(output) as archive:
+        provenance = orjson.loads(archive.read("metadata/provenance.json"))
+        assert provenance["continuation"] == lineage
+        assert archive.read(f"outputs/production_{RUN_NAME}_nopbc.xtc") == XTC
+        assert (
+            orjson.loads(archive.read("metadata/parameters.json"))["simulation_time_ns"]
+            == 500
+        )
 
 
 def _rewrite_archive_member(
@@ -363,7 +413,7 @@ def test_archive_writes_do_not_block_the_event_loop(
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(files),
-                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
                 published_files=_published_files(files),
                 run_bounded=cache.run_bounded,
             )
@@ -431,7 +481,7 @@ def test_service_preserves_remote_file_modification_times() -> None:
             completed_at=2,
             read_file=read_file,
             remote_mtimes=remote_mtimes,
-            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
             published_files=_published_files(remote_files),
         )
     )
@@ -616,7 +666,7 @@ def test_mandatory_scientific_outputs_must_be_nonempty_and_structurally_valid(
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(remote_files),
-                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
                 published_files=_published_files(remote_files),
             )
         )
@@ -654,7 +704,7 @@ def test_large_centered_structure_and_diagnostics_stream_without_a_size_cap() ->
             completed_at=2,
             read_file=read_file,
             remote_mtimes=_mtimes_for_files(remote_files),
-            expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+            expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
             published_files=_published_files(remote_files),
         )
     )
@@ -693,7 +743,7 @@ def test_missing_required_remote_output_has_a_distinct_failure() -> None:
                 completed_at=2,
                 read_file=read_file,
                 remote_mtimes=_mtimes_for_files(remote_files),
-                expected_request_sha256=artifact_request_sha256(PDB, PARAMETERS),
+                expected_input_sha256=hashlib.sha256(PDB).hexdigest(),
                 published_files=_published_files(),
             )
         )

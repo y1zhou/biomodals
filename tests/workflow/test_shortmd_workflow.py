@@ -11,7 +11,7 @@ from uuid import UUID
 
 import pytest
 
-from biomodals.app.bioinfo import gromacs_app
+from biomodals.app.bioinfo.gromacs import app as gromacs_app
 from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import persist_execution_launch
 from biomodals.execution.nodes import NodeRunContext

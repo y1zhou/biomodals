@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
-from biomodals.app.bioinfo import gromacs_app
+from biomodals.app.bioinfo.gromacs import app as gromacs_app
 from biomodals.execution import RunStatus
 
 

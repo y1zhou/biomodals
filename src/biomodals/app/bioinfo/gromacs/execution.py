@@ -17,15 +17,18 @@ NVT_ANALYSIS = "collect_traj_stats:nvt_"
 NPT_ANALYSIS = "collect_traj_stats:npt_"
 PRODUCTION_ANALYSIS = "collect_traj_stats:production_"
 PREPARE_RESULT = "prepare_result"
+PREPARE_CONTINUATION = "prepare_continuation"
+MAX_SIMULATION_TIME_NS = 250
 REQUIRED_FUNCTIONS = (
     "prepare_tpr_cpu",
     "prepare_tpr_gpu",
     "collect_traj_stats",
     "production_run_cpu",
     "production_run_gpu",
+    PREPARE_CONTINUATION,
 )
 GROMACS_SCIENTIFIC_VERSION = "2026.1"
-EXECUTION_PLAN_SCHEMA_VERSION = "2"
+EXECUTION_PLAN_SCHEMA_VERSION = "3"
 
 
 def concrete_gromacs_seed(
@@ -84,14 +87,25 @@ class PlannedOperation:
     save_processed_traj: bool = False
 
 
-def _operation_plan(*, cpu_only: bool) -> tuple[PlannedOperation, ...]:
+def _operation_plan(
+    *, cpu_only: bool, continuation: bool = False
+) -> tuple[PlannedOperation, ...]:
     """Build the selected fixed plan from one CPU/GPU decision."""
     prepare = "prepare_tpr_cpu" if cpu_only else "prepare_tpr_gpu"
+    if continuation:
+        prepare = PREPARE_CONTINUATION
     production = "production_run_cpu" if cpu_only else "production_run_gpu"
+    equilibration = (
+        ()
+        if continuation
+        else (
+            PlannedOperation(NVT_ANALYSIS, (prepare,), "collect_traj_stats", "nvt_"),
+            PlannedOperation(NPT_ANALYSIS, (prepare,), "collect_traj_stats", "npt_"),
+        )
+    )
     return (
         PlannedOperation(prepare, (), prepare),
-        PlannedOperation(NVT_ANALYSIS, (prepare,), "collect_traj_stats", "nvt_"),
-        PlannedOperation(NPT_ANALYSIS, (prepare,), "collect_traj_stats", "npt_"),
+        *equilibration,
         PlannedOperation(
             production,
             (prepare,),
@@ -120,17 +134,24 @@ def execution_plan(
     genion_seed: int,
     gromacs_version: str = GROMACS_SCIENTIFIC_VERSION,
     execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION,
+    continuation: dict[str, object] | None = None,
 ) -> ExecutionPlan:
     """Express the established service workflow as one immutable kernel plan."""
     if ld_seed == -1 or gen_seed == -1 or genion_seed == 0:
         raise ValueError(
             "GROMACS random sentinels must be materialized before planning"
         )
-    operations = _operation_plan(cpu_only=cpu_only)
+    operations = _operation_plan(
+        cpu_only=cpu_only, continuation=continuation is not None
+    )
     analysis_nodes = (
-        NVT_ANALYSIS,
-        NPT_ANALYSIS,
-        PRODUCTION_ANALYSIS,
+        (PRODUCTION_ANALYSIS,)
+        if continuation is not None
+        else (
+            NVT_ANALYSIS,
+            NPT_ANALYSIS,
+            PRODUCTION_ANALYSIS,
+        )
     )
     prepare_node = operations[0].operation
     nodes = tuple(
@@ -163,6 +184,7 @@ def execution_plan(
             "pdb_sha256": pdb_sha256,
             "run_pdbfixer": run_pdbfixer,
             "simulation_time_ns": simulation_time_ns,
+            **({"continuation": continuation} if continuation is not None else {}),
         },
         scientific_versions={
             "gromacs": gromacs_version,
@@ -217,12 +239,15 @@ def modal_invocation(
     cpu_only: bool,
     run_name: str,
     simulation_time_ns: int,
+    continuation: bool = False,
 ) -> ModalInvocation:
     """Build established Modal function arguments for one successor operation."""
     planned = next(
         (
             candidate
-            for candidate in _operation_plan(cpu_only=cpu_only)[1:]
+            for candidate in _operation_plan(
+                cpu_only=cpu_only, continuation=continuation
+            )[1:]
             if candidate.operation == operation
         ),
         None,

@@ -77,9 +77,9 @@ def _parse_entrypoint_flags(
     signature = inspect.signature(callback)
     type_hints = get_type_hints(callback)
     parser = argparse.ArgumentParser(prog=program_name)
-    required_positionals: list[tuple[str, Callable[[str], Any]]] = []
+    positional_parameters: list[tuple[str, Callable[[str], Any]]] = []
 
-    for name, parameter in signature.parameters.items():
+    for index, (name, parameter) in enumerate(signature.parameters.items()):
         if name in hidden_parameters:
             continue
         annotation = type_hints.get(name, parameter.annotation)
@@ -108,13 +108,20 @@ def _parse_entrypoint_flags(
             dest=name,
             type=converter,
         )
-        if parameter.default is inspect.Parameter.empty:
-            required_positionals.append((name, converter))
+        # A primary input can become optional when an app also supports resume
+        # or continuation; keep its positional spelling without exposing other
+        # optional settings positionally.
+        if parameter.default is inspect.Parameter.empty or (
+            index == 0
+            and parameter.default is None
+            and parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ):
+            positional_parameters.append((name, converter))
 
-    parser.add_argument("_required_positionals", nargs="*")
+    parser.add_argument("_positionals", nargs="*")
     parsed = vars(parser.parse_args(list(flags)))
-    positional_values = parsed.pop("_required_positionals")
-    missing = [item for item in required_positionals if parsed[item[0]] is None]
+    positional_values = parsed.pop("_positionals")
+    missing = [item for item in positional_parameters if parsed[item[0]] is None]
     if len(positional_values) > len(missing):
         parser.error("too many positional arguments")
     for raw_value, (name, converter) in zip(
@@ -124,7 +131,10 @@ def _parse_entrypoint_flags(
     ):
         parsed[name] = converter(raw_value)
     missing_names = [
-        name for name, _converter in required_positionals if parsed[name] is None
+        name
+        for name, _converter in positional_parameters
+        if parsed[name] is None
+        and signature.parameters[name].default is inspect.Parameter.empty
     ]
     if missing_names:
         parser.error(

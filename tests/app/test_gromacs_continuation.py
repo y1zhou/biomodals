@@ -21,7 +21,11 @@ from biomodals.app.bioinfo.gromacs.continuation import (
     ContinuationInspection,
     ContinuationSource,
 )
-from biomodals.app.bioinfo.gromacs.execution import PREPARE_CONTINUATION, PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs.execution import (
+    EXECUTION_PLAN_SCHEMA_VERSION,
+    PREPARE_CONTINUATION,
+    PREPARE_RESULT,
+)
 from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
     _operation_kwargs,
@@ -85,7 +89,7 @@ def _source(tmp_path, *, legacy=True):
         parent,
         run_name="child",
         simulation_time_ns=255,
-        execution_plan_version="3",
+        execution_plan_version=EXECUTION_PLAN_SCHEMA_VERSION,
         continuation=source,
         cpu_only=True,
     )

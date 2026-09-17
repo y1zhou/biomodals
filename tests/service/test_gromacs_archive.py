@@ -13,29 +13,41 @@ import time
 import zipfile
 import zlib
 from collections.abc import Buffer, Callable
+from dataclasses import replace
+from pathlib import Path
 from threading import Event, Thread
+from types import SimpleNamespace
+from uuid import UUID
 
 import orjson
 import pytest
 
+from biomodals.app.bioinfo.gromacs import continue_run
+from biomodals.app.bioinfo.gromacs.continuation import inspect_continuation_source
 from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
 from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
     gromacs_node_paths,
+    gromacs_publication_path,
+    load_execution_request,
     parse_gromacs_publication,
+    persist_execution_request,
 )
+from biomodals.execution import ContentBoundFileSet
 from biomodals.schema import ArtifactFile
 from biomodals.service.artifacts import (
     ArtifactCache,
     ArtifactIntegrityError,
     ArtifactSourceMissingError,
 )
+from biomodals.service.gromacs import modal as gromacs_modal
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     BuiltGromacsArchive,
     validate_gromacs_archive,
     write_gromacs_archive,
 )
+from biomodals.service.pending import PendingRequestStore
 
 RUN_NAME = "first-simulation-0123456789abcdef0123456789abcdef"
 PDB = b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000\n"
@@ -230,6 +242,155 @@ def test_continuation_archive_reads_child_directory_and_preserves_native_stem():
             orjson.loads(archive.read("metadata/parameters.json"))["simulation_time_ns"]
             == 500
         )
+
+
+@pytest.mark.parametrize("damage", [None, "content", "identity"])
+@pytest.mark.parametrize("plan_version", ["3", "4"])
+def test_adapter_exports_bound_preparation_evidence_from_legacy_source(
+    tmp_path, monkeypatch, damage, plan_version
+):
+    parent_id = UUID("11111111-1111-4111-8111-111111111111")
+    child_id = UUID("22222222-2222-4222-8222-222222222222")
+    parent = replace(REQUEST, execution_plan_version="2")
+    root = parent.run_root(tmp_path)
+    root.mkdir()
+    for name, content in _remote_files().items():
+        (tmp_path / name).write_bytes(content)
+    checkpoint = b"legacy checkpoint not recorded in publication"
+    (root / f"production_{RUN_NAME}.cpt").write_bytes(checkpoint)
+    (root / f"production_{RUN_NAME}.log").write_bytes(b"native log")
+
+    def publish(request, node):
+        paths = gromacs_node_paths(request, node)
+        ContentBoundFileSet(
+            root=request.run_root(tmp_path),
+            marker_path=tmp_path / gromacs_publication_path(request, node),
+            expected_paths=paths,
+            identity={
+                "node_key": node,
+                "workload_plan_fingerprint": request.execution_plan.workload_plan_fingerprint,
+            },
+        ).write(
+            tuple(
+                ArtifactFile(
+                    path=name,
+                    size_bytes=(request.run_root(tmp_path) / name).stat().st_size,
+                    content_sha256=hashlib.sha256(
+                        (request.run_root(tmp_path) / name).read_bytes()
+                    ).hexdigest(),
+                )
+                for name in paths
+            )
+        )
+
+    publish(parent, PREPARE_RESULT)
+    publish(parent, "production_run_gpu")
+    persist_execution_request(tmp_path, parent_id, parent)
+    inspection = inspect_continuation_source(tmp_path, parent_id)
+    assert inspection.source.checkpoint_sha256 is None
+    child = replace(
+        inspection.request(
+            run_name="child",
+            additional_time_ns=10,
+            cpu_only=True,
+            max_active_provider_calls=3,
+            max_active_gpu_provider_calls=0,
+        ),
+        execution_plan_version=plan_version,
+    )
+    saved_request = child.to_bytes()
+    persist_execution_request(tmp_path, child_id, child)
+    monkeypatch.setattr(continue_run.shutil, "which", lambda _: "/bin/gmx")
+    monkeypatch.setattr(
+        continue_run, "native_endpoint", lambda *args: (2500000, 5000.0, ())
+    )
+    monkeypatch.setattr(
+        continue_run,
+        "run_command",
+        lambda args, **kwargs: Path(args[args.index("-o") + 1]).write_bytes(TPR),
+    )
+    child_root = continue_run.prepare_continuation_files(child, tmp_path)
+    for name in gromacs_node_paths(parent, PREPARE_RESULT):
+        if (
+            name.startswith(("rmsd_production", "rg_production", "rmsf_production"))
+            or "_nopbc" in name
+        ):
+            (child_root / name).write_bytes((root / name).read_bytes())
+    evidence_path = child_root / "continuation.json"
+    if damage == "identity":
+        evidence = orjson.loads(evidence_path.read_bytes())
+        evidence["workload_plan_fingerprint"] = "0" * 64
+        evidence_path.write_bytes(orjson.dumps(evidence))
+    publish(child, PREPARE_RESULT)
+    if damage == "content":
+        evidence_path.write_bytes(evidence_path.read_bytes() + b" ")
+
+    async def read_file(path):
+        yield (tmp_path / path).read_bytes()
+
+    async def listdir(path):
+        return [
+            SimpleNamespace(path=str(p.relative_to(tmp_path)), mtime=1)
+            for p in (tmp_path / path).iterdir()
+            if p.is_file()
+        ]
+
+    adapter = gromacs_modal.GromacsToolAdapter(
+        PendingRequestStore(tmp_path / "pending")
+    )
+    volume = SimpleNamespace(
+        read_file=SimpleNamespace(aio=read_file), listdir=SimpleNamespace(aio=listdir)
+    )
+    monkeypatch.setattr(adapter, "_volume", lambda _: volume)
+    monkeypatch.setattr(
+        gromacs_modal,
+        "load_execution_request_from_volume",
+        lambda _, run_id: load_execution_request(tmp_path, run_id),
+    )
+    job = SimpleNamespace(
+        job_id=child_id,
+        modal_app_name="Gromacs",
+        modal_app_version=2,
+        projection={},
+        created_at=1,
+    )
+
+    async def prepare():
+        cache = ArtifactCache(tmp_path / "cache")
+        return await adapter.prepare_result(job, cache, completed_at=2)
+
+    if damage and plan_version == "4":
+        with pytest.raises(ArtifactIntegrityError, match="continuation evidence"):
+            asyncio.run(prepare())
+    else:
+        asyncio.run(prepare())
+        archive_path = next(
+            path for path in (tmp_path / "cache").iterdir() if path.is_file()
+        )
+        with zipfile.ZipFile(archive_path) as archive:
+            evidence = orjson.loads(archive.read("metadata/provenance.json"))[
+                "continuation"
+            ]
+            assert evidence["source"]["checkpoint_sha256"] is None
+            if plan_version == "4":
+                assert (
+                    evidence["source_checkpoint_sha256"]
+                    == hashlib.sha256(checkpoint).hexdigest()
+                )
+                assert evidence["source_checkpoint_step"] == 2500000
+                assert evidence["source_checkpoint_time_ps"] == 5000.0
+            else:
+                # Historical ZIP metadata is reconstructed from its old request,
+                # never from unbound preparation files, even if they exist.
+                assert evidence == {
+                    "source": child.continuation.model_dump(mode="json"),
+                    "additional_time_ns": 10,
+                    "target_time_ns": 15,
+                    "trajectory_scope": "cumulative",
+                    "equilibration_analysis": "inherited",
+                    "production_mdp": "original input; extended TPR is authoritative",
+                }
+    assert child.to_bytes() == saved_request
 
 
 def _rewrite_archive_member(

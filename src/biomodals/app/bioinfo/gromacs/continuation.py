@@ -5,7 +5,7 @@ from __future__ import annotations
 import errno
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 import orjson
@@ -113,6 +113,44 @@ class ContinuationInspection(BaseModel):
             max_active_gpu_provider_calls=max_active_gpu_provider_calls,
             continuation=self.source,
         )
+
+
+class ContinuationEvidence(BaseModel):
+    """Native checkpoint facts validated on the copied preparation snapshot."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+    workload_plan_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: ContinuationSource
+    source_checkpoint_step: int = Field(gt=0)
+    source_checkpoint_time_ps: float = Field(gt=0)
+    source_checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    additional_time_ns: int = Field(ge=1, le=250)
+    target_time_ns: int = Field(ge=1)
+    trajectory_scope: Literal["cumulative"] = "cumulative"
+    equilibration_analysis: Literal["inherited"] = "inherited"
+    production_mdp: Literal["original input; extended TPR is authoritative"] = (
+        "original input; extended TPR is authoritative"
+    )
+
+    def validate_request(self, request: GromacsExecutionRequest) -> None:
+        """Reject evidence for a different source, child plan or endpoint."""
+        if (
+            self.workload_plan_fingerprint
+            != request.execution_plan.workload_plan_fingerprint
+            or self.source != request.continuation
+            or self.target_time_ns != request.simulation_time_ns
+            or self.additional_time_ns
+            != self.target_time_ns - self.source.simulation_time_ns
+            or self.source_checkpoint_time_ps != self.source.simulation_time_ns * 1000
+            or (
+                self.source.checkpoint_sha256 is not None
+                and self.source_checkpoint_sha256 != self.source.checkpoint_sha256
+            )
+        ):
+            raise ValueError(
+                "Continuation preparation evidence differs from its request"
+            )
 
 
 def continuation_file_records(

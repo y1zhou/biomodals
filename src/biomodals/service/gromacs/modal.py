@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 from pathlib import PurePosixPath
 from typing import BinaryIO, cast
 
@@ -10,6 +11,7 @@ import modal
 import orjson
 
 from biomodals.app.bioinfo.gromacs.continuation import (
+    ContinuationEvidence,
     ContinuationInspection,
     read_continuation_source,
 )
@@ -74,7 +76,7 @@ class GromacsToolAdapter:
         return await read_continuation_source(deployment, job.job_id)
 
     async def preflight(self, deployment: DeploymentIdentity) -> None:
-        """Reject older targets before admitting a version-three scientific plan."""
+        """Require the continuation entrypoint before admitting a scientific plan."""
         function = modal.Function.from_name(
             deployment.deployment_name,
             "prepare_continuation",
@@ -110,6 +112,33 @@ class GromacsToolAdapter:
         )
         if published_files is None:
             raise ArtifactIntegrityError("GROMACS final publication marker is invalid")
+        evidence = None
+        if request.continuation and request.execution_plan_version == "4":
+            record = next(
+                file for file in published_files if file.path == "continuation.json"
+            )
+            content = await read_modal_volume_file(
+                volume, f"{request.run_name}/{record.path}", max_bytes=1024 * 1024
+            )
+            if (
+                len(content) != record.size_bytes
+                or sha256(content).hexdigest() != record.content_sha256
+            ):
+                raise ArtifactIntegrityError(
+                    "GROMACS continuation evidence changed after publication"
+                )
+            try:
+                evidence = ContinuationEvidence.model_validate_json(content)
+                evidence.validate_request(request)
+            except ValueError as error:
+                raise ArtifactIntegrityError(
+                    "GROMACS continuation evidence is invalid"
+                ) from error
+            # Embed the verified evidence once in metadata/provenance.json, not
+            # as a duplicate native JSON member in the download.
+            published_files = tuple(
+                file for file in published_files if file.path != record.path
+            )
         path = cache.staging_path(str(job.job_id))
         try:
             with path.open("w+b") as raw:
@@ -132,7 +161,9 @@ class GromacsToolAdapter:
                     "cpu_only": request.cpu_only,
                 }).decode()
                 continuation = (
-                    {
+                    evidence.model_dump(mode="json")
+                    if evidence is not None
+                    else {
                         "source": request.continuation.model_dump(mode="json"),
                         "additional_time_ns": request.simulation_time_ns
                         - request.continuation.simulation_time_ns,

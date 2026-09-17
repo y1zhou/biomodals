@@ -69,7 +69,7 @@ Continuation reads each publication's own inventory, not today's exact list or
 ordering. Scientific identity, record validity, unique safe filenames and
 recorded sizes/hashes remain enforced; conflicting records fail rather than
 fall back. Historical records that omit energy/checkpoint/log can therefore use
-retained native files without rewriting the old publication. Version 3
+retained native files without rewriting the old publication. Version 3 and later
 production publications additionally bind checkpoint and log. This policy is
 local to continuation: ordinary cache and result-publication validation stays
 unchanged.
@@ -112,12 +112,28 @@ simulation.
 
 Only a validated staging snapshot is promoted, with atomic per-file renames,
 so an interrupted checkpoint copy cannot be mistaken for child MD progress.
-Staging is child-owned and cleaned on normal exit/interruption; it is never
+Staging is child-owned and cleaned on normal exit/interruption. Recovery by the
+sole admitted preparation writer also removes abandoned child staging left by
+hard termination. This does not sweep sibling directories, infer ownership
+from elapsed time, or remove promoted checkpoint progress. Staging is never
 created by form reads and never moves or modifies the completed source.
 Preparation redelivery reuses its content-bound publication. It never copies
 the source over child progress. Production redelivery keeps the fixed target
 and current child checkpoint. Explicit append mode rejects a missing checkpoint.
 Native endpoint validation precedes completed production publication.
+
+Workers reload the Volume before reading another worker's outputs. Analysis
+commits stale processed-trajectory deletion before remote postprocessing, then
+reloads the postprocessor's committed outputs before opening them.
+
+Plan version 4 includes immutable `continuation.json` in the child's final
+content-bound publication. The API verifies its size, SHA-256 and plan/source
+identity, then embeds it once in the archive's existing
+`metadata/provenance.json`. It includes the actual validated source checkpoint
+SHA-256, step and time even when the original source publication omitted its
+checkpoint. The submitted request is never rewritten. Older plan publications
+keep their exact inventories and historical archives keep their original
+request-derived metadata; unbound JSON is not retroactively trusted.
 
 ## API and website
 
@@ -184,7 +200,7 @@ Use `biomodals run restart` for same-plan recovery of a continuation.
 
 Deploy the updated GROMACS app including `inspect_continuation_source`, pin its
 version in the API, restart the API and
-deploy the matching frontend. Version-three requests cannot use an old
+deploy the matching frontend. New plan-version-four requests cannot use an old
 coordinator: API preflight resolves the new preparation function without
 starting simulation. Source metadata reads also require the updated inspector;
 they use the current target, not the source Job's historical deployment.

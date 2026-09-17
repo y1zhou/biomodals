@@ -10,10 +10,9 @@ from hashlib import md5, sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-import orjson
-
 from biomodals.app.bioinfo.gromacs.continuation import (
     MAX_CHECKPOINT_BYTES,
+    ContinuationEvidence,
     continuation_file_records,
 )
 from biomodals.app.bioinfo.gromacs.execution import PREPARE_CONTINUATION, PREPARE_RESULT
@@ -254,24 +253,17 @@ def prepare_continuation_files(
         ],
         output_mode="capture",
     )
-    replace_bytes_atomic(
-        ready,
-        orjson.dumps(
-            {
-                "workload_plan_fingerprint": request.execution_plan.workload_plan_fingerprint,
-                "source": source.model_dump(mode="json"),
-                "source_checkpoint_step": step,
-                "source_checkpoint_time_ps": time_ps,
-                "source_checkpoint_sha256": checkpoint_digest,
-                "additional_time_ns": additional_ns,
-                "target_time_ns": request.simulation_time_ns,
-                "trajectory_scope": "cumulative",
-                "equilibration_analysis": "inherited",
-                "production_mdp": "original input; extended TPR is authoritative",
-            },
-            option=orjson.OPT_SORT_KEYS,
-        ),
+    evidence = ContinuationEvidence(
+        workload_plan_fingerprint=request.execution_plan.workload_plan_fingerprint,
+        source=source,
+        source_checkpoint_step=step,
+        source_checkpoint_time_ps=time_ps,
+        source_checkpoint_sha256=checkpoint_digest,
+        additional_time_ns=additional_ns,
+        target_time_ns=request.simulation_time_ns,
     )
+    evidence.validate_request(request)
+    replace_bytes_atomic(ready, evidence.model_dump_json().encode())
     prepared.write(
         tuple(
             ArtifactFile(

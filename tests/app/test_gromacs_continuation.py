@@ -355,6 +355,53 @@ def test_interrupted_checkpoint_import_can_be_redelivered(tmp_path, monkeypatch)
     assert continue_run.prepare_continuation_files(child, tmp_path) == root
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_recovery_cleans_hard_interruption_staging_only(
+    tmp_path, monkeypatch, prepared
+):
+    parent, child = _source(tmp_path)
+    parent_root = parent.run_root(tmp_path)
+    _native(monkeypatch, parent_root)
+    root = child.run_root(tmp_path)
+    if prepared:
+        continue_run.prepare_continuation_files(child, tmp_path)
+        (root / "production_example.cpt").write_bytes(b"legitimate child progress")
+    # Simulate the persisted filesystem left by SIGKILL, not exception unwinding.
+    orphan = root / ".continuation-abandoned"
+    orphan.mkdir(parents=True)
+    (orphan / "production_example.xtc").write_bytes(b"partial copy")
+    sibling = tmp_path / "sibling" / ".continuation-active"
+    sibling.mkdir(parents=True)
+    (sibling / "production_example.xtc").write_bytes(b"another child is copying")
+    original = {p.name: p.read_bytes() for p in parent_root.iterdir() if p.is_file()}
+
+    assert continue_run.prepare_continuation_files(child, tmp_path) == root
+    assert not orphan.exists()
+    assert (
+        sibling / "production_example.xtc"
+    ).read_bytes() == b"another child is copying"
+    assert original == {
+        p.name: p.read_bytes() for p in parent_root.iterdir() if p.is_file()
+    }
+    assert (root / "production_example.cpt").read_bytes() == (
+        b"legitimate child progress" if prepared else b"full checkpoint"
+    )
+
+
+def test_staging_cleanup_refuses_symlink_escape(tmp_path):
+    parent, child = _source(tmp_path)
+    root = child.run_root(tmp_path)
+    root.mkdir()
+    (root / ".continuation-unsafe").symlink_to(
+        parent.run_root(tmp_path), target_is_directory=True
+    )
+    with pytest.raises(ValueError, match="child-owned"):
+        continue_run.prepare_continuation_files(child, tmp_path)
+    assert (
+        parent.run_root(tmp_path) / "production_example.cpt"
+    ).read_bytes() == b"full checkpoint"
+
+
 @pytest.mark.parametrize("phase", ["source", "completion"])
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_checkpoint_scratch_is_temporary_and_outside_volume(

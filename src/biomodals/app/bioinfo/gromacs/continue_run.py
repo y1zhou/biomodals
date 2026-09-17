@@ -123,6 +123,14 @@ def prepare_continuation_files(
     root = request.run_root(volume_root)
     if source_root.is_symlink() or root.is_symlink():
         raise ValueError("Continuation directories cannot be symlinks")
+    # The admitted preparation call is the sole writer of this child directory.
+    # Provider redelivery (or a fenced Successor) may find staging persisted by
+    # a hard kill, which cannot unwind TemporaryDirectory. Never sweep siblings
+    # or promoted files, and never infer ownership from an age/timeout.
+    for staging in root.glob(".continuation-*"):
+        if staging.is_symlink() or not staging.is_dir():
+            raise ValueError("Continuation staging must be a child-owned directory")
+        shutil.rmtree(staging)
     prepared = ContentBoundFileSet(
         root=root,
         marker_path=volume_root

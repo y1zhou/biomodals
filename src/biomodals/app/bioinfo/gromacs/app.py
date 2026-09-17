@@ -348,6 +348,7 @@ def prepare_tpr_gpu(
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
+    CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
@@ -419,6 +420,7 @@ def prepare_tpr_cpu(
     solvate, add ions, minimize (em and cg), equilibrate (NVT and NPT), and
     generate production TPR file.
     """
+    CONF.output_volume.reload()
     layout = AppRunLayout.from_run_root(Path(CONF.output_volume_mountpoint) / run_name)
     work_path = layout.run_root
     work_path.mkdir(parents=True, exist_ok=True)
@@ -489,6 +491,7 @@ def find_traj_last_time_ns(traj_file: str) -> float:
     """
     import shutil
 
+    CONF.output_volume.reload()
     traj_path = Path(traj_file)
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
@@ -594,6 +597,7 @@ def _run_production(
     """Run either backend with the same checkpoint and fixed-endpoint policy."""
     import shutil
 
+    CONF.output_volume.reload()
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
@@ -727,6 +731,7 @@ def postprocess_traj(
 
     Remove PBC for the protein chains (best-effort), and dump centered structures.
     """
+    CONF.output_volume.reload()
     script_path = Path(APP_INFO.gmx_scripts) / "postprocess-traj.sh"
     if not script_path.exists():
         raise FileNotFoundError(f"Gromacs script not found: {script_path}")
@@ -776,6 +781,8 @@ def collect_traj_stats(
     import matplotlib.pyplot as plt  # type: ignore[ty:unresolved-import]
     import numpy as np
 
+    out_vol = CONF.output_volume
+    out_vol.reload()
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
@@ -786,9 +793,12 @@ def collect_traj_stats(
 
     # Remove PBC and align to reference structure
     processed_traj_path = work_path / f"{traj_prefix}{run_name}_nopbc.xtc"
-    if file1_needs_update(processed_traj_path, traj_path):
-        # remove outdated processed trajectory
-        processed_traj_path.unlink(missing_ok=True)
+    if processed_traj_path.exists() and file1_needs_update(
+        processed_traj_path, traj_path
+    ):
+        processed_traj_path.unlink()
+        # The postprocessing worker must see this deletion, not skip its stale XTC.
+        out_vol.commit()
     if not processed_traj_path.exists():
         postprocess_traj.remote(
             str(traj_path),
@@ -797,7 +807,6 @@ def collect_traj_stats(
             ref_struct_file=str(work_path / f"{run_name}.pdb"),
         )
 
-    out_vol = CONF.output_volume
     out_vol.reload()
     traj_1st_frame_pdb_path = work_path / f"{traj_prefix}{run_name}_nopbc_centered.pdb"
     if not traj_1st_frame_pdb_path.exists():

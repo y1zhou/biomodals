@@ -431,7 +431,9 @@ def test_production_uses_fixed_tpr_and_requires_checkpoint(
         "CONF",
         SimpleNamespace(
             output_volume_mountpoint=str(tmp_path),
-            output_volume=SimpleNamespace(commit=lambda: commits.append(True)),
+            output_volume=SimpleNamespace(
+                commit=lambda: commits.append(True), reload=lambda: None
+            ),
         ),
     )
     monkeypatch.setattr(continue_run.shutil, "which", lambda _: "/bin/gmx")

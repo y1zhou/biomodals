@@ -171,7 +171,7 @@ def test_real_native_copy_extend_append_and_completed_redelivery(
         "CONF",
         SimpleNamespace(
             output_volume_mountpoint=str(tmp_path),
-            output_volume=SimpleNamespace(commit=lambda: None),
+            output_volume=SimpleNamespace(commit=lambda: None, reload=lambda: None),
         ),
     )
     for _ in range(2):

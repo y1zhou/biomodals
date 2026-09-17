@@ -4,9 +4,12 @@
 
 import os
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
+
+import pytest
 
 from biomodals.app.bioinfo.gromacs import app as gromacs_app
 from biomodals.execution import RunStatus
@@ -114,7 +117,7 @@ def test_gromacs_preparation_rebuilds_an_incomplete_publication(
     monkeypatch.setattr(
         gromacs_app.CONF,
         "output_volume",
-        SimpleNamespace(commit=lambda: None),
+        SimpleNamespace(commit=lambda: None, reload=lambda: None),
     )
     monkeypatch.setattr(gromacs_app.APP_INFO, "gmx_scripts", str(scripts))
     monkeypatch.setattr(gromacs_app, "run_command", run_command)
@@ -208,6 +211,9 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
         def commit(self) -> None:
             self.commit_count += 1
 
+        def reload(self) -> None:
+            pass
+
     volume = FakeVolume()
     monkeypatch.setattr(
         gromacs_app,
@@ -249,8 +255,6 @@ def test_prepare_tpr_cpu_stages_input_with_app_run_layout(
 
 def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> None:
     work_path = tmp_path / "fresh"
-    work_path.mkdir()
-    work_path.joinpath("production_fresh.tpr").write_text("tpr\n", encoding="utf-8")
     captured = {}
 
     class FakeVolume:
@@ -259,6 +263,11 @@ def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> No
 
         def commit(self) -> None:
             self.commit_count += 1
+
+        def reload(self) -> None:
+            # Model a warm mount that sees prepared inputs only after reload.
+            work_path.mkdir(exist_ok=True)
+            work_path.joinpath("production_fresh.tpr").write_bytes(b"tpr")
 
     volume = FakeVolume()
     monkeypatch.setattr(
@@ -286,3 +295,94 @@ def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> No
     assert captured["cwd"] == str(work_path)
     assert result == str(work_path)
     assert volume.commit_count == 1
+
+
+def test_analysis_volume_handoff_refreshes_inputs_and_stale_deletion(
+    tmp_path, monkeypatch
+):
+    """Model distinct warm analysis/postprocessing mounts across two jobs."""
+    events = []
+    active_root = tmp_path
+
+    class StopAfterHandoff(Exception):
+        pass
+
+    def load_structure(path):
+        assert Path(path).read_bytes() == b"new centered structure"
+        events.append("read")
+        raise StopAfterHandoff
+
+    structure_io = SimpleNamespace(load_structure=load_structure, xtc=SimpleNamespace())
+    structure = SimpleNamespace(io=structure_io)
+    monkeypatch.setitem(sys.modules, "biotite", SimpleNamespace(structure=structure))
+    monkeypatch.setitem(sys.modules, "biotite.structure", structure)
+    monkeypatch.setitem(sys.modules, "biotite.structure.io", structure_io)
+    monkeypatch.setitem(sys.modules, "biotite.structure.io.xtc", structure_io.xtc)
+    monkeypatch.setitem(
+        sys.modules, "matplotlib", SimpleNamespace(pyplot=SimpleNamespace())
+    )
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", SimpleNamespace())
+
+    def analysis_reload():
+        events.append("analysis reload")
+        active_root.mkdir(exist_ok=True)
+        raw = active_root / "production_parent.xtc"
+        if not raw.exists():
+            raw.write_bytes(b"new raw trajectory")
+            os.utime(raw, (20, 20))
+            stale = active_root / "production_parent_nopbc.xtc"
+            stale.write_bytes(b"old processed trajectory")
+            os.utime(stale, (10, 10))
+
+    volume = SimpleNamespace(
+        reload=analysis_reload, commit=lambda: events.append("analysis commit")
+    )
+    monkeypatch.setattr(gromacs_app.CONF, "output_volume_mountpoint", str(tmp_path))
+    monkeypatch.setattr(gromacs_app.CONF, "output_volume", volume)
+    monkeypatch.setattr(gromacs_app.APP_INFO, "gmx_scripts", str(tmp_path))
+    (tmp_path / "postprocess-traj.sh").write_bytes(b"script")
+
+    def native_command(command, **kwargs):
+        assert events[-1] == "postprocess reload"
+        output = Path(command[command.index("--output-file") + 1])
+        assert not output.exists()
+        assert Path(command[command.index("--xtc-file") + 1]).is_file()
+        output.write_bytes(b"new processed trajectory")
+        output.with_name(output.stem + "_centered.pdb").write_bytes(
+            b"new centered structure"
+        )
+        events.append("postprocess")
+
+    monkeypatch.setattr(gromacs_app, "run_command", native_command)
+    postprocess = gromacs_app.postprocess_traj.get_raw_f()
+
+    def remote(*args, **kwargs):
+        assert events[-1] == "analysis commit"
+        with monkeypatch.context() as worker:
+            worker.setattr(
+                gromacs_app.CONF,
+                "output_volume",
+                SimpleNamespace(
+                    reload=lambda: events.append("postprocess reload"),
+                    commit=lambda: events.append("postprocess commit"),
+                ),
+            )
+            postprocess(*args, **kwargs)
+
+    monkeypatch.setattr(gromacs_app, "postprocess_traj", SimpleNamespace(remote=remote))
+    for name in ("child-one", "child-two"):
+        active_root = tmp_path / name
+        events.clear()
+        with pytest.raises(StopAfterHandoff):
+            gromacs_app.collect_traj_stats.get_raw_f()(
+                "production_", name, file_stem="parent"
+            )
+        assert events == [
+            "analysis reload",
+            "analysis commit",
+            "postprocess reload",
+            "postprocess",
+            "postprocess commit",
+            "analysis reload",
+            "read",
+        ]

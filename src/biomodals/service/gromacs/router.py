@@ -27,6 +27,7 @@ from fastapi.responses import Response
 from modal.exception import NotFoundError
 from modal.exception import TimeoutError as ModalTimeoutError
 
+from biomodals.app.bioinfo.gromacs.continuation import ContinuationInspection
 from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
 from biomodals.execution import DeploymentIdentity
@@ -117,6 +118,9 @@ def create_router(
     previews = APIRouter(
         prefix="/jobs/{job_id}/trajectory", route_class=PrivateResultRoute
     )
+    source_checks: dict[
+        tuple[UUID, DeploymentIdentity], asyncio.Task[ContinuationInspection]
+    ] = {}
 
     def owner_job(job_id: UUID, session: AuthenticatedSession) -> JobRecord:
         job = store.get_job(session.principal.user_id, job_id)
@@ -176,6 +180,46 @@ def create_router(
                 "Deploy and pin the updated GROMACS app before submitting jobs",
             ) from error
 
+    async def inspect_source(
+        job: JobRecord, deployment: DeploymentIdentity
+    ) -> ContinuationInspection:
+        """Share only in-flight checks, with one deadline independent of callers."""
+        key = (job.job_id, deployment)
+        task = source_checks.get(key)
+        if task is None:
+
+            async def inspect() -> ContinuationInspection:
+                try:
+                    async with asyncio.timeout(SOURCE_CHECK_TIMEOUT_SECONDS):
+                        return await adapter.continuation_source(job, deployment)
+                finally:
+                    source_checks.pop(key, None)
+
+            task = asyncio.create_task(inspect())
+            source_checks[key] = task
+            # Observe failures even when every waiting HTTP request disconnects.
+            task.add_done_callback(
+                lambda done: None if done.cancelled() else done.exception()
+            )
+        try:
+            return await asyncio.shield(task)
+        except NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin the updated GROMACS app before extending simulations",
+            ) from error
+        except ModalTimeoutError as error:
+            raise CodedAPIError(
+                504,
+                "source_check_timeout",
+                "Remote source check timed out. Please try again.",
+            ) from error
+        except TimeoutError as error:
+            raise CodedAPIError(
+                504, "source_check_timeout", SOURCE_CHECK_TIMEOUT_DETAIL
+            ) from error
+
     @router.get(
         "/jobs/{job_id}/continuation",
         response_model=GromacsContinuationInfo,
@@ -212,31 +256,14 @@ def create_router(
             effective.modal_app_version.value,
         )
         try:
-            async with asyncio.timeout(SOURCE_CHECK_TIMEOUT_SECONDS):
-                saved = await adapter.continuation_source(job, deployment)
-                info.simulation_time_ns = saved.source.simulation_time_ns
-                info.cpu_only = saved.cpu_only
-                info.parent_job_id = saved.parent_job_id
-        except NotFoundError as error:
-            raise CodedAPIError(
-                409,
-                "deployment_incompatible",
-                "Deploy and pin the updated GROMACS app before extending simulations",
-            ) from error
-        except ModalTimeoutError as error:
-            raise CodedAPIError(
-                504,
-                "source_check_timeout",
-                "Remote source check timed out. Please try again.",
-            ) from error
-        except TimeoutError as error:
-            raise CodedAPIError(
-                504, "source_check_timeout", SOURCE_CHECK_TIMEOUT_DETAIL
-            ) from error
+            saved = await inspect_source(job, deployment)
         except (FileNotFoundError, ValueError, TypeError) as error:
             info.code = "source_unavailable"
             info.detail = _source_error_detail(error)
             return info
+        info.simulation_time_ns = saved.source.simulation_time_ns
+        info.cpu_only = saved.cpu_only
+        info.parent_job_id = saved.parent_job_id
         info.eligible = True
         info.code = None
         info.detail = "Native inputs are available; the new job verifies checksums and checkpoint completion before production"
@@ -304,24 +331,7 @@ def create_router(
             effective.modal_app_version.value,
         )
         try:
-            async with asyncio.timeout(SOURCE_CHECK_TIMEOUT_SECONDS):
-                inspection = await adapter.continuation_source(job, deployment)
-        except NotFoundError as error:
-            raise CodedAPIError(
-                409,
-                "deployment_incompatible",
-                "Deploy and pin the updated GROMACS app before extending simulations",
-            ) from error
-        except ModalTimeoutError as error:
-            raise CodedAPIError(
-                504,
-                "source_check_timeout",
-                "Remote source check timed out. Please try again.",
-            ) from error
-        except TimeoutError as error:
-            raise CodedAPIError(
-                504, "source_check_timeout", SOURCE_CHECK_TIMEOUT_DETAIL
-            ) from error
+            inspection = await inspect_source(job, deployment)
         except (FileNotFoundError, ValueError, TypeError) as error:
             raise CodedAPIError(
                 409,

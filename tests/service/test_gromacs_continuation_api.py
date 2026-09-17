@@ -9,6 +9,7 @@ from hashlib import sha256
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from modal.exception import NotFoundError
 from test_api_contract import (
@@ -128,6 +129,104 @@ def test_source_metadata_owner_scope_and_read_only_validation(setup):
     assert reads == [parent.job_id]
     app.dependency_overrides[require_unsafe_session] = _session
     assert _submit(app, parent.job_id).status_code == 404
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_overlapping_checks_share_work_survive_disconnect_and_expire(
+    setup, monkeypatch, unavailable
+):
+    app, session, parent, _, _ = setup
+    original = GromacsAdapter.continuation_source
+
+    async def run():
+        entered, joined, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls, callers = [], []
+
+        async def authenticate():
+            callers.append(True)
+            if len(callers) == 3:
+                joined.set()
+            return session
+
+        async def source(self, job, deployment):
+            calls.append(job.job_id)
+            entered.set()
+            await release.wait()
+            if unavailable:
+                raise FileNotFoundError("Source unavailable")
+            return await original(self, job, deployment)
+
+        app.dependency_overrides[require_session] = authenticate
+        app.dependency_overrides[require_unsafe_session] = authenticate
+        monkeypatch.setattr(GromacsAdapter, "continuation_source", source)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=ORIGIN
+        ) as client:
+            path = f"/api/v1/gromacs/jobs/{parent.job_id}"
+            first = asyncio.create_task(client.get(f"{path}/continuation"))
+            await entered.wait()
+            second = asyncio.create_task(client.get(f"{path}/continuation"))
+            submission = asyncio.create_task(
+                client.post(
+                    f"{path}/continue",
+                    json={"additional_time_ns": 1, "cpu_only": True},
+                    headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+                )
+            )
+            await joined.wait()
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            release.set()
+            metadata, submitted = await asyncio.gather(second, submission)
+            assert calls == [parent.job_id]
+            assert metadata.json()["eligible"] is not unavailable
+            assert submitted.status_code == (409 if unavailable else 202)
+            # Neither successful nor failed checks remain cached.
+            pending_reads = len(callers)
+            await client.get(f"{path}/continuation")
+            assert len(callers) == pending_reads + 1
+            assert calls == [parent.job_id, parent.job_id]
+            assert app.state.store.get_job_by_id(parent.job_id) == parent
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+
+def test_source_sharing_is_scoped_to_job_and_target_deployment(setup, monkeypatch):
+    app, session, parent, pending, _ = setup
+    other = _completed(app, session)
+    pending.put(other.job_id, pending.get(parent.job_id))
+    original = GromacsAdapter.continuation_source
+
+    async def run():
+        entered = asyncio.Queue()
+        release = asyncio.Event()
+
+        async def source(self, job, deployment):
+            entered.put_nowait((job.job_id, deployment.deployment_version))
+            await release.wait()
+            return await original(self, job, deployment)
+
+        monkeypatch.setattr(GromacsAdapter, "continuation_source", source)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=ORIGIN
+        ) as client:
+            path = f"/api/v1/gromacs/jobs/{parent.job_id}/continuation"
+            first = asyncio.create_task(client.get(path))
+            original_key = await entered.get()
+            version = original_key[1] + 1
+            app.state.configuration.set_tool("gromacs", modal_app_version=version)
+            new_target = asyncio.create_task(client.get(path))
+            assert await entered.get() == (parent.job_id, version)
+            new_source = asyncio.create_task(
+                client.get(f"/api/v1/gromacs/jobs/{other.job_id}/continuation")
+            )
+            assert await entered.get() == (other.job_id, version)
+            release.set()
+            responses = await asyncio.gather(first, new_target, new_source)
+            assert all(response.json()["eligible"] for response in responses)
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])

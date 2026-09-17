@@ -149,6 +149,11 @@ exact submission replay still precedes source I/O. The API stops waiting on
 expiry; an already-running read-only inspector remains bounded by its own
 timeout. The form visibly indicates an active check and
 offers an explicit retry after failure; it never automatically submits science.
+Overlapping GET/POST checks for the same source and target deployment share one
+in-flight inspection per API process. A caller disconnect does not cancel the
+shared check or extend its deadline. Completed and failed checks are discarded;
+later requests inspect again. Different sources/targets remain independent,
+without an additional inspection concurrency setting.
 
 Extend simulation opens a dedicated form: source link/endpoint, optional
 name, blank added-time input and inherited CPU/GPU mode. Eligibility is checked

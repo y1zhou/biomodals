@@ -16,9 +16,11 @@ from biomodals.app.bioinfo.gromacs import (
     app,
     continuation,
     continue_run,
-    execution_runtime,
 )
-from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
+from biomodals.app.bioinfo.gromacs.continuation import (
+    ContinuationInspection,
+    ContinuationSource,
+)
 from biomodals.app.bioinfo.gromacs.execution import PREPARE_CONTINUATION, PREPARE_RESULT
 from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionRequest,
@@ -27,7 +29,7 @@ from biomodals.app.bioinfo.gromacs.execution_runtime import (
     gromacs_publication_path,
     persist_execution_request,
 )
-from biomodals.execution import ContentBoundFileSet
+from biomodals.execution import ContentBoundFileSet, DeploymentIdentity
 from biomodals.helper.cli_entrypoint import invoke_local_entrypoint
 from biomodals.schema import ArtifactFile
 
@@ -88,6 +90,28 @@ def _source(tmp_path, *, legacy=True):
         cpu_only=True,
     )
     return parent, child
+
+
+def _without_energy_records(tmp_path, parent, child):
+    for node in (
+        PREPARE_RESULT,
+        "production_run_cpu" if parent.cpu_only else "production_run_gpu",
+    ):
+        path = tmp_path / gromacs_publication_path(parent, node)
+        marker = orjson.loads(path.read_bytes())
+        marker["files"] = [
+            file for file in marker["files"] if not file["path"].endswith(".edr")
+        ]
+        path.write_bytes(orjson.dumps(marker))
+    marker = (tmp_path / gromacs_publication_path(parent, PREPARE_RESULT)).read_bytes()
+    return replace(
+        child,
+        continuation=child.continuation.model_copy(
+            update={
+                "publication_sha256": sha256(marker).hexdigest(),
+            }
+        ),
+    )
 
 
 def _dump(root, *, step=2500000, time=5000, warning="", bad_checksum=False):
@@ -167,7 +191,7 @@ def test_isolated_cumulative_import_and_redelivery(tmp_path, monkeypatch, legacy
     )
     (child_root / "production_example.cpt").write_bytes(b"later child checkpoint")
     assert continue_run.prepare_continuation_files(child, tmp_path) == child_root
-    assert len(calls) == 3  # no recopies, conversion or endpoint reset
+    assert len(calls) == 5  # source + staged verification, one conversion
     assert (
         child_root / "production_example.cpt"
     ).read_bytes() == b"later child checkpoint"
@@ -176,6 +200,86 @@ def test_isolated_cumulative_import_and_redelivery(tmp_path, monkeypatch, legacy
         for p in parent_root.rglob("*")
         if p.is_file()
     }
+
+
+def test_historical_records_find_unlisted_native_files_and_copy_for_append(
+    tmp_path, monkeypatch
+):
+    parent, child = _source(tmp_path)
+    child = _without_energy_records(tmp_path, parent, child)
+    source_root = parent.run_root(tmp_path)
+    # Regenerated outputs are not restart prerequisites.
+    (source_root / "rmsd_production_example.png").unlink()
+    (source_root / "production_example_nopbc.xtc").unlink()
+    original = {
+        path.relative_to(source_root): path.read_bytes()
+        for path in source_root.rglob("*")
+        if path.is_file()
+    }
+    found = continuation.inspect_continuation_source(tmp_path, RUN_ID)
+    assert found.source == child.continuation.model_copy(
+        update={"checkpoint_sha256": None}
+    )
+    assert found.pdb_sha256 == parent.pdb_sha256
+    _native(monkeypatch, source_root)
+    root = continue_run.prepare_continuation_files(child, tmp_path)
+    for suffix in (".cpt", ".xtc", ".edr", ".log"):
+        name = f"production_example{suffix}"
+        assert (root / name).read_bytes() == original[Path(name)]
+        assert (root / name).stat().st_ino != (source_root / name).stat().st_ino
+    assert original == {
+        path.relative_to(source_root): path.read_bytes()
+        for path in source_root.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("suffix", [".tpr", ".xtc", ".cpt", ".edr", ".log"])
+def test_missing_native_file_is_named_after_directory_fallback(tmp_path, suffix):
+    parent, child = _source(tmp_path)
+    _without_energy_records(tmp_path, parent, child)
+    name = f"production_example{suffix}"
+    (parent.run_root(tmp_path) / name).unlink()
+    with pytest.raises(FileNotFoundError) as caught:
+        continuation.inspect_continuation_source(tmp_path, RUN_ID)
+    assert caught.value.filename == name
+
+
+@pytest.mark.parametrize(
+    "damage", ["identity", "duplicate", "escape", "digest", "conflict"]
+)
+def test_source_record_fallback_does_not_accept_invalid_evidence(tmp_path, damage):
+    parent, _ = _source(tmp_path)
+    final_path = tmp_path / gromacs_publication_path(parent, PREPARE_RESULT)
+    marker = orjson.loads(final_path.read_bytes())
+    if damage == "identity":
+        marker["identity"]["workload_plan_fingerprint"] = "0" * 64
+    elif damage == "duplicate":
+        marker["files"].append(marker["files"][0])
+    elif damage == "escape":
+        marker["files"][0]["path"] = "../outside"
+    elif damage == "digest":
+        marker["files"][0].pop("content_sha256")
+    else:
+        next(file for file in marker["files"] if file["path"].endswith(".edr"))[
+            "content_sha256"
+        ] = "0" * 64
+    final_path.write_bytes(orjson.dumps(marker))
+    with pytest.raises(ValueError):
+        continuation.inspect_continuation_source(tmp_path, RUN_ID)
+
+
+def test_record_order_does_not_change_restart_file_discovery(tmp_path):
+    parent, _ = _source(tmp_path)
+    final_path = tmp_path / gromacs_publication_path(parent, PREPARE_RESULT)
+    marker = orjson.loads(final_path.read_bytes())
+    marker["files"].reverse()
+    final_path.write_bytes(orjson.dumps(marker))
+    found = continuation.inspect_continuation_source(tmp_path, RUN_ID)
+    assert found.pdb_sha256 == parent.pdb_sha256
+    assert (
+        found.source.publication_sha256 == sha256(final_path.read_bytes()).hexdigest()
+    )
 
 
 @pytest.mark.parametrize("damage", ["checkpoint", "trajectory", "topology", "input"])
@@ -191,7 +295,7 @@ def test_source_corruption_blocks_import(tmp_path, monkeypatch, damage):
     calls = _native(monkeypatch, parent.run_root(tmp_path))
     with pytest.raises(ValueError, match="changed|publication"):
         continue_run.prepare_continuation_files(child, tmp_path)
-    assert calls == []
+    assert all("convert-tpr" not in call for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -283,9 +387,11 @@ def test_checkpoint_scratch_is_temporary_and_outside_volume(
             verify()
     else:
         verify()
-    assert len(scratch_paths) == 1
-    assert not scratch_paths[0].is_relative_to(tmp_path)
-    assert not scratch_paths[0].exists()
+    assert len(scratch_paths) == (2 if phase == "source" and not corrupt else 1)
+    assert all(
+        not path.is_relative_to(tmp_path) and not path.exists()
+        for path in scratch_paths
+    )
 
 
 def test_multiple_branches_and_fixed_endpoint_dispatch(tmp_path):
@@ -365,40 +471,118 @@ def test_interval_limits_do_not_become_a_cumulative_cap(tmp_path, duration):
         replace(_request(), simulation_time_ns=duration)
 
 
-def test_read_only_source_evidence_uses_bounded_volume_reads(tmp_path, monkeypatch):
+def test_inspection_reads_only_metadata_and_never_copies_native_files(
+    tmp_path, monkeypatch
+):
     parent, child = _source(tmp_path, legacy=False)
     reads = []
+    original_open = Path.open
 
-    async def read(path):
+    def metadata_only(path, *args, **kwargs):
+        assert path.suffix == ".json", "Inspection must not read native file content"
         reads.append(path)
-        yield (tmp_path / path).read_bytes()
+        return original_open(path, *args, **kwargs)
 
-    async def listdir(path):
-        return [
-            SimpleNamespace(
-                path=p.relative_to(tmp_path).as_posix(), size=p.stat().st_size
-            )
-            for p in (tmp_path / path).iterdir()
-            if p.is_file()
-        ]
-
-    volume = SimpleNamespace(
-        read_file=SimpleNamespace(aio=read), listdir=SimpleNamespace(aio=listdir)
-    )
-    monkeypatch.setattr(
-        execution_runtime, "load_execution_request_from_volume", lambda *_: parent
-    )
-    source, saved = asyncio.run(continuation.read_continuation_source(volume, RUN_ID))
-    assert saved == parent
-    assert source == child.continuation
-    assert reads == [
-        gromacs_publication_path(parent, PREPARE_RESULT).as_posix(),
-        gromacs_publication_path(parent, "production_run_gpu").as_posix(),
-        "example/production_example.cpt",
-    ]
+    before = set(tmp_path.rglob("*"))
+    monkeypatch.setattr(Path, "open", metadata_only)
+    found = continuation.inspect_continuation_source(tmp_path, RUN_ID)
+    assert found.source == child.continuation
+    assert found.pdb_sha256 == parent.pdb_sha256
+    assert len(reads) == 3
+    assert set(tmp_path.rglob("*")) == before
+    assert len(found.model_dump_json()) < 2048
     monkeypatch.setattr(continuation, "MAX_CHECKPOINT_BYTES", 2)
     with pytest.raises(ValueError, match="exceeds"):
-        asyncio.run(continuation.read_continuation_source(volume, RUN_ID))
+        continuation.inspect_continuation_source(tmp_path, RUN_ID)
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_metadata_only_child_preserves_identity_and_prepares_inside_volume(
+    tmp_path, monkeypatch, legacy
+):
+    parent, previous_child = _source(tmp_path, legacy=legacy)
+    found = continuation.inspect_continuation_source(tmp_path, RUN_ID)
+    child = found.request(
+        run_name="child",
+        additional_time_ns=250,
+        cpu_only=True,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=1,
+    )
+    assert child.pdb_content == b""  # No source bytes staged through the API.
+    assert child.pdb_sha256 == parent.pdb_sha256
+    assert (
+        child.execution_plan.workload_plan_fingerprint
+        == replace(
+            previous_child, continuation=found.source
+        ).execution_plan.workload_plan_fingerprint
+    )
+    assert GromacsExecutionRequest.from_bytes(child.to_bytes()) == child
+    _native(monkeypatch, parent.run_root(tmp_path))
+    root = continue_run.prepare_continuation_files(child, tmp_path)
+    assert (root / "example.pdb").read_bytes() == parent.pdb_content
+    assert (
+        orjson.loads((root / "continuation.json").read_bytes())[
+            "source_checkpoint_sha256"
+        ]
+        == sha256(b"full checkpoint").hexdigest()
+    )
+
+
+def test_remote_inspection_transfers_metadata_only(tmp_path, monkeypatch):
+    import modal
+
+    _, _ = _source(tmp_path)
+    reloads = []
+    monkeypatch.setattr(
+        app,
+        "CONF",
+        SimpleNamespace(
+            output_volume_mountpoint=str(tmp_path),
+            output_volume=SimpleNamespace(reload=lambda: reloads.append(True)),
+        ),
+    )
+    lookups = []
+
+    async def remote(run_id):
+        return app.inspect_continuation_source.get_raw_f()(run_id)
+
+    def lookup(*args, **kwargs):
+        lookups.append((args, kwargs))
+        return SimpleNamespace(remote=SimpleNamespace(aio=remote))
+
+    monkeypatch.setattr(modal.Function, "from_name", lookup)
+    found = asyncio.run(
+        continuation.read_continuation_source(
+            DeploymentIdentity("production", "Gromacs", 7), RUN_ID
+        )
+    )
+    assert found.source.execution_run_id == RUN_ID
+    assert reloads == [True]
+    assert lookups == [
+        (
+            ("Gromacs", "inspect_continuation_source"),
+            {"environment_name": "production", "version": 7},
+        )
+    ]
+
+
+def test_corrupt_staged_append_file_is_not_promoted(tmp_path, monkeypatch):
+    parent, child = _source(tmp_path)
+    child = _without_energy_records(tmp_path, parent, child)
+    _native(monkeypatch, parent.run_root(tmp_path))
+    original_copy = continue_run.shutil.copyfile
+
+    def corrupt_copy(source, destination):
+        original_copy(source, destination)
+        if source.suffix == ".edr":
+            destination.write_bytes(b"x" * destination.stat().st_size)
+
+    monkeypatch.setattr(continue_run.shutil, "copyfile", corrupt_copy)
+    with pytest.raises(ValueError, match="append checksum"):
+        continue_run.prepare_continuation_files(child, tmp_path)
+    assert not (child.run_root(tmp_path) / "production_example.cpt").exists()
+    assert not list(child.run_root(tmp_path).glob(".continuation-*"))
 
 
 @pytest.mark.parametrize("positional", [False, True])
@@ -434,7 +618,7 @@ def test_cli_continuation_reuses_source_without_input_pdb(tmp_path, monkeypatch)
     parent, child = _source(tmp_path)
 
     async def source(*_):
-        return child.continuation, parent
+        return ContinuationInspection.from_request(child.continuation, parent)
 
     monkeypatch.setattr(continuation, "read_continuation_source", source)
     captured = {}

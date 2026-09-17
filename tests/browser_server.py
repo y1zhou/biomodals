@@ -415,9 +415,11 @@ class _FakeAdapter:
             return GromacsExecutionRequest.from_bytes(content)
         return self.requests[job.job_id]
 
-    async def continuation_source(self, job: JobRecord):
+    async def continuation_source(self, job: JobRecord, _deployment):
+        from biomodals.app.bioinfo.gromacs.continuation import ContinuationInspection
+
         request = await self.input_request(job)
-        return ContinuationSource(
+        source = ContinuationSource(
             execution_run_id=job.job_id,
             run_name=request.run_name,
             file_stem=request.file_stem,
@@ -425,7 +427,8 @@ class _FakeAdapter:
             request_sha256=hashlib.sha256(request.to_bytes()).hexdigest(),
             publication_sha256="a" * 64,
             checkpoint_sha256="b" * 64,
-        ), request
+        )
+        return ContinuationInspection.from_request(source, request)
 
     async def stage(self, job: JobRecord) -> None:
         content = self.pending.get(job.job_id)

@@ -53,29 +53,55 @@ No new preparation, minimization, NVT or NPT simulation Tasks run.
 
 ### Source validation and recovery
 
-Completed status alone is insufficient. Retained request, final and production
-publications, TPR, raw XTC, energy, checkpoint and log must be available.
-Checkpoint reads are bounded to 64 MiB. Source and target must share a Modal
-environment and the pinned GROMACS scientific version.
+Completed status alone is insufficient. A small read-only Modal CPU function on
+the current target deployment reads the saved request inside the mounted Volume
+and uses its final/production file records to locate production TPR, raw
+XTC, energy, checkpoint and log. A required file absent from a record is resolved
+by its native filename in the same source run directory. No other runs are
+searched, and missing or empty files fail with the filename in the error.
+Only file metadata is inspected: no checkpoint/trajectory content is read or
+copied. The function returns compact settings, source locators and recorded
+digests; no PDB, checkpoint, trajectory or other file payload reaches the API
+host. Checkpoints larger than 64 MiB are rejected by size. Source and target
+must share a Modal environment and the pinned GROMACS scientific version.
 
-Historical execution-plan version 2 publications keep their original inventory.
-They did not bind checkpoint/log, so explicit continuation validates retained
-native state without changing the historical publication. Version 3 production
-publications additionally bind checkpoint and log.
+Continuation reads each publication's own inventory, not today's exact list or
+ordering. Scientific identity, record validity, unique safe filenames and
+recorded sizes/hashes remain enforced; conflicting records fail rather than
+fall back. Historical records that omit energy/checkpoint/log can therefore use
+retained native files without rewriting the old publication. Version 3
+production publications additionally bind checkpoint and log. This policy is
+local to continuation: ordinary cache and result-publication validation stays
+unchanged.
 
 The child request binds source Execution Run ID, directory, native stem,
 cumulative endpoint, canonical request digest, final-publication digest and
-checkpoint SHA-256. Read-only form metadata checks retained evidence without
-launching a container. A normal CPU provider Task then:
+published checkpoint SHA-256 when available. Historical sources without a
+published checkpoint digest are verified by native append checks and have their
+actual digest recorded during preparation. New child requests reference the
+original PDB by digest instead of embedding it. Existing inline-input requests
+retain their encoding and remain readable. No files are copied until the new
+Job is admitted. Its normal CPU preparation Task then:
 
-1. Validates source publications and hashes for every reused published file.
+1. Rechecks source records, the saved request identity and required files.
+   Unlisted files use the same-directory fallback; invalid records never do.
 2. Reads the TPR parameters and checkpoint through the pinned native binary.
    Checkpoint step/time must equal the completed TPR endpoint and saved time.
 3. Checks native append filenames, offsets, sizes and checksums. GROMACS uses
    MD5 over up to the last 1 MiB ending at the saved offset; this is native
    compatibility checking, not the application's SHA-256 content identity.
 4. Copies native state, original PDB/MDP, inherited NVT/NPT analyses and source
-   TPR; extends the TPR once; publishes immutable preparation evidence.
+   TPR into a child-specific temporary directory on the Volume. Validates all
+   recorded hashes, the original-input and checkpoint digests and native append
+   compatibility on that copied snapshot before promoting files into the child
+   directory. Extends the TPR once and publishes immutable preparation evidence.
+
+The checkpoint's complete append inventory is authoritative, including any
+additional output beyond XTC/energy/log. All those files are copied, with no
+`-noappend` or trajectory-concatenation fallback. PDB/MDP and inherited analyses
+are retained for the existing archive contract, not as MD restart prerequisites;
+old production figures and processed trajectories are regenerated and do not
+gate restart discovery.
 
 Checkpoint dumps are consumed completely: GROMACS can print a corruption
 warning without a failing exit code. Large dumps use container-local temporary
@@ -84,8 +110,10 @@ the output Volume, Python lists or streamed provider logs.
 Missing/corrupt/incompatible state fails explicitly, with no fallback to a fresh
 simulation.
 
-Initial native files are copied to temporary siblings and atomically renamed,
+Only a validated staging snapshot is promoted, with atomic per-file renames,
 so an interrupted checkpoint copy cannot be mistaken for child MD progress.
+Staging is child-owned and cleaned on normal exit/interruption; it is never
+created by form reads and never moves or modifies the completed source.
 Preparation redelivery reuses its content-bound publication. It never copies
 the source over child progress. Production redelivery keeps the fixed target
 and current child checkpoint. Explicit append mode rejects a missing checkpoint.
@@ -112,7 +140,17 @@ Nonexistent/foreign sources return 404. Ineligibility codes are
 an old target returns `deployment_incompatible` before admission. Client-supplied
 source paths or endpoints are never accepted.
 
-Continue production opens a dedicated form: source link/endpoint, optional
+The source check has a 45-second API deadline, including lookup, queue/cold-start
+latency and the metadata RPC. The read-only inspector has a 40-second execution
+timeout and may incur a small CPU charge; it does not launch molecular dynamics.
+Both metadata GET and the submission's pre-admission source recheck return HTTP
+504 with code `source_check_timeout` on expiry. No Job is admitted on timeout;
+exact submission replay still precedes source I/O. The API stops waiting on
+expiry; an already-running read-only inspector remains bounded by its own
+timeout. The form visibly indicates an active check and
+offers an explicit retry after failure; it never automatically submits science.
+
+Extend simulation opens a dedicated form: source link/endpoint, optional
 name, blank added-time input and inherited CPU/GPU mode. Eligibility is checked
 there, not on every Job-detail read. Opening/reloading never submits.
 Lost-response recovery keeps exact JSON/key per owner/source, separately from
@@ -139,10 +177,13 @@ the outer `--restart-from` compatible-recovery flag. Physical settings remain
 inherited. Normal global container limits apply to the new root.
 Use `biomodals run restart` for same-plan recovery of a continuation.
 
-Deploy the updated GROMACS app, pin its version in the API, restart the API and
+Deploy the updated GROMACS app including `inspect_continuation_source`, pin its
+version in the API, restart the API and
 deploy the matching frontend. Version-three requests cannot use an old
 coordinator: API preflight resolves the new preparation function without
-starting a container. Existing Jobs retain their deployment snapshots; do not
+starting simulation. Source metadata reads also require the updated inspector;
+they use the current target, not the source Job's historical deployment.
+Existing Jobs retain their deployment snapshots; do not
 delete deployments they still need.
 
 Offline verification covers package discovery/ShortMD imports, source integrity,

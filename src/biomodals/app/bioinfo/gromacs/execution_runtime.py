@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from hashlib import sha256
@@ -92,11 +93,22 @@ class GromacsExecutionRequest:
     gromacs_version: str = GROMACS_SCIENTIFIC_VERSION
     execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION
     continuation: ContinuationSource | None = None
+    retained_pdb_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
         require_safe_filename_component(self.run_name, field_name="run_name")
-        if not self.pdb_content:
+        if self.retained_pdb_sha256 is not None:
+            if not re.fullmatch(r"[0-9a-f]{64}", self.retained_pdb_sha256):
+                raise ValueError("Retained input digest is invalid")
+            if not self.continuation:
+                raise ValueError("Only continuations can refer to a retained input")
+            if (
+                self.pdb_content
+                and sha256(self.pdb_content).hexdigest() != self.retained_pdb_sha256
+            ):
+                raise ValueError("Retained input digest differs from PDB content")
+        elif not self.pdb_content:
             raise ValueError("pdb_content cannot be empty")
         if self.simulation_time_ns < 1 or self.num_threads < 1:
             raise ValueError("simulation time and thread count must be positive")
@@ -129,7 +141,7 @@ class GromacsExecutionRequest:
         return execution_plan(
             cpu_only=self.cpu_only,
             workload_run_key=self.run_name,
-            pdb_sha256=sha256(self.pdb_content).hexdigest(),
+            pdb_sha256=self.pdb_sha256,
             simulation_time_ns=self.simulation_time_ns,
             run_pdbfixer=self.run_pdbfixer,
             ld_seed=self.ld_seed,
@@ -141,6 +153,11 @@ class GromacsExecutionRequest:
                 self.continuation.model_dump(mode="json") if self.continuation else None
             ),
         )
+
+    @property
+    def pdb_sha256(self) -> str:
+        """Identify either a fresh inline input or a retained continuation input."""
+        return self.retained_pdb_sha256 or sha256(self.pdb_content).hexdigest()
 
     @property
     def file_stem(self) -> str:
@@ -173,6 +190,11 @@ class GromacsExecutionRequest:
                 **(
                     {"continuation": self.continuation.model_dump(mode="json")}
                     if self.continuation
+                    else {}
+                ),
+                **(
+                    {"retained_pdb_sha256": self.retained_pdb_sha256}
+                    if self.retained_pdb_sha256
                     else {}
                 ),
             },

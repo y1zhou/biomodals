@@ -766,7 +766,7 @@ async def write_gromacs_archive(
     completed_at: int,
     read_file: ReadRemoteFile,
     remote_mtimes: Mapping[str, int],
-    expected_request_sha256: str,
+    expected_input_sha256: str,
     published_files: tuple[ArtifactFile, ...],
     run_bounded: RunBounded | None = None,
     remote_directory: str | None = None,
@@ -804,7 +804,7 @@ async def write_gromacs_archive(
         max_bytes=_MAX_PDB_BYTES,
     )
     parameters_bytes = parameters_json.encode()
-    if artifact_request_sha256(input_bytes, parameters_json) != expected_request_sha256:
+    if hashlib.sha256(input_bytes).hexdigest() != expected_input_sha256:
         raise ArtifactIntegrityError(
             "GROMACS result input does not match the staged request"
         )

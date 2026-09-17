@@ -12,7 +12,7 @@
 # ruff: noqa: PLC0415
 
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
@@ -264,6 +264,17 @@ biotite_image = (
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
     .uv_pip_install("biotite", "numpy", "scipy", "matplotlib")
+    .pipe(patch_image_for_helper)
+    .add_local_python_source(
+        "biomodals.app.bioinfo.gromacs.execution",
+        "biomodals.app.bioinfo.gromacs.execution_runtime",
+        "biomodals.app.bioinfo.gromacs.continuation",
+    )
+)
+
+inspection_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
     .pipe(patch_image_for_helper)
     .add_local_python_source(
         "biomodals.app.bioinfo.gromacs.execution",
@@ -694,6 +705,29 @@ def _verify_production_endpoint(gmx: str, tpr: Path, checkpoint: Path) -> None:
 
     with TemporaryDirectory(prefix="gromacs-completion-") as scratch:
         native_endpoint(gmx, tpr, checkpoint, Path(scratch))
+
+
+@app.function(
+    image=inspection_image,
+    cpu=0.25,
+    memory=512,
+    timeout=40,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True, sub_path="/"
+        ),
+    },
+)
+def inspect_continuation_source(execution_run_id: str) -> str:
+    """Inspect source metadata in Modal; no writes, file transfers or simulation."""
+    from biomodals.app.bioinfo.gromacs.continuation import (
+        inspect_continuation_source as inspect,
+    )
+
+    CONF.output_volume.reload()
+    return inspect(
+        Path(CONF.output_volume_mountpoint), UUID(execution_run_id)
+    ).model_dump_json()
 
 
 @app.function(
@@ -1156,13 +1190,15 @@ def submit_gromacs_task(
         continue_from: Completed Execution Run to extend in a new output directory.
         additional_time_ns: Additional whole nanoseconds (1–250), only with continue_from.
     """
-    source = None
-    parent = None
+    inspection = None
     interval_ns = simulation_time_ns
     if continue_from:
         import asyncio
 
-        from biomodals.app.bioinfo.gromacs.continuation import read_continuation_source
+        from biomodals.app.bioinfo.gromacs.continuation import (
+            ContinuationInspection,
+            read_continuation_source,
+        )
 
         if restart_from or input_pdb:
             raise ValueError(
@@ -1173,12 +1209,22 @@ def submit_gromacs_task(
             or not 1 <= additional_time_ns <= MAX_SIMULATION_TIME_NS
         ):
             raise ValueError("--additional-time-ns must be between 1 and 250")
-        source, parent = asyncio.run(
-            read_continuation_source(CONF.output_volume, UUID(continue_from))
+        inspection = (
+            asyncio.run(
+                read_continuation_source(
+                    DeploymentIdentity(
+                        deployment_environment, deployment_name, deployment_version
+                    ),
+                    UUID(continue_from),
+                )
+            )
+            if use_deployed_coordinator
+            else ContinuationInspection.model_validate_json(
+                inspect_continuation_source.remote(str(UUID(continue_from)))
+            )
         )
         interval_ns = additional_time_ns
-        cpu_only = parent.cpu_only if cpu_only is None else cpu_only
-        pdb_str = parent.pdb_content
+        cpu_only = inspection.cpu_only if cpu_only is None else cpu_only
         run_name = run_name or f"continued-{uuid4().hex}"
     else:
         if additional_time_ns is not None or not input_pdb:
@@ -1200,14 +1246,11 @@ def submit_gromacs_task(
     )
     execution_run_id = uuid4()
     predecessor_execution_run_id = None if restart_from is None else UUID(restart_from)
-    if parent is not None and source is not None:
-        request = replace(
-            parent,
+    if inspection is not None:
+        request = inspection.request(
             run_name=run_name,
-            simulation_time_ns=source.simulation_time_ns + interval_ns,
+            additional_time_ns=interval_ns,
             cpu_only=cpu_only,
-            continuation=source,
-            execution_plan_version="3",
             max_active_provider_calls=total_limit,
             max_active_gpu_provider_calls=gpu_limit,
         )

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import time
 import zipfile
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated
@@ -25,6 +25,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from modal.exception import NotFoundError
+from modal.exception import TimeoutError as ModalTimeoutError
 
 from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
@@ -67,6 +68,18 @@ from biomodals.service.store import (
 
 MAX_PDB_BYTES = 10 * 1024 * 1024
 MAX_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+SOURCE_CHECK_TIMEOUT_SECONDS = 45
+SOURCE_CHECK_TIMEOUT_DETAIL = (
+    "Checking the source simulation timed out after 45 seconds. Please try again."
+)
+
+
+def _source_error_detail(error: Exception) -> str:
+    if isinstance(error, FileNotFoundError) and error.filename:
+        return (
+            f"Required source file is unavailable: {PurePosixPath(error.filename).name}"
+        )
+    return "Retained checkpoint inputs are missing, invalid, or incompatible"
 
 
 async def _read_pdb(upload: UploadFile, *, max_bytes: int) -> bytes:
@@ -163,7 +176,14 @@ def create_router(
                 "Deploy and pin the updated GROMACS app before submitting jobs",
             ) from error
 
-    @router.get("/jobs/{job_id}/continuation", response_model=GromacsContinuationInfo)
+    @router.get(
+        "/jobs/{job_id}/continuation",
+        response_model=GromacsContinuationInfo,
+        responses={
+            409: {"model": CodedErrorResponse},
+            504: {"model": CodedErrorResponse},
+        },
+    )
     async def continuation_info(
         job_id: UUID,
         session: Annotated[AuthenticatedSession, Depends(require_session)],
@@ -181,30 +201,56 @@ def create_router(
         )
         if job.state != JobState.SUCCEEDED:
             return info
-        try:
-            saved = await adapter.input_request(job)
-            info.simulation_time_ns = saved.simulation_time_ns
-            info.cpu_only = saved.cpu_only
-            info.parent_job_id = (
-                saved.continuation.execution_run_id if saved.continuation else None
-            )
-            await adapter.continuation_source(job)
-        except (FileNotFoundError, ValueError, TypeError):
-            info.code = "source_unavailable"
-            info.detail = (
-                "Retained checkpoint inputs are missing, invalid, or incompatible"
-            )
-            return info
         if job.modal_environment != configuration.modal_environment().value:
             info.code = "source_environment_mismatch"
             info.detail = "Source and target must use the same Modal environment"
+            return info
+        effective = configuration.tool("gromacs")
+        deployment = DeploymentIdentity(
+            job.modal_environment,
+            effective.modal_app_name,
+            effective.modal_app_version.value,
+        )
+        try:
+            async with asyncio.timeout(SOURCE_CHECK_TIMEOUT_SECONDS):
+                saved = await adapter.continuation_source(job, deployment)
+                info.simulation_time_ns = saved.source.simulation_time_ns
+                info.cpu_only = saved.cpu_only
+                info.parent_job_id = saved.parent_job_id
+        except NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin the updated GROMACS app before extending simulations",
+            ) from error
+        except ModalTimeoutError as error:
+            raise CodedAPIError(
+                504,
+                "source_check_timeout",
+                "Remote source check timed out. Please try again.",
+            ) from error
+        except TimeoutError as error:
+            raise CodedAPIError(
+                504, "source_check_timeout", SOURCE_CHECK_TIMEOUT_DETAIL
+            ) from error
+        except (FileNotFoundError, ValueError, TypeError) as error:
+            info.code = "source_unavailable"
+            info.detail = _source_error_detail(error)
             return info
         info.eligible = True
         info.code = None
         info.detail = "Native inputs are available; the new job verifies checksums and checkpoint completion before production"
         return info
 
-    @router.post("/jobs/{job_id}/continue", response_model=JobView, status_code=202)
+    @router.post(
+        "/jobs/{job_id}/continue",
+        response_model=JobView,
+        status_code=202,
+        responses={
+            409: {"model": CodedErrorResponse},
+            504: {"model": CodedErrorResponse},
+        },
+    )
     async def continue_job(
         job_id: UUID,
         submission: GromacsContinuationSubmission,
@@ -251,30 +297,43 @@ def create_router(
                 "source_environment_mismatch",
                 "Source and target must use the same Modal environment",
             )
-        try:
-            source, parent = await adapter.continuation_source(job)
-        except (FileNotFoundError, ValueError, TypeError) as error:
-            raise CodedAPIError(
-                409,
-                "source_unavailable",
-                "Retained checkpoint inputs are missing, invalid, or incompatible",
-            ) from error
         effective = configuration.tool("gromacs")
         deployment = DeploymentIdentity(
             job.modal_environment,
             effective.modal_app_name,
             effective.modal_app_version.value,
         )
+        try:
+            async with asyncio.timeout(SOURCE_CHECK_TIMEOUT_SECONDS):
+                inspection = await adapter.continuation_source(job, deployment)
+        except NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin the updated GROMACS app before extending simulations",
+            ) from error
+        except ModalTimeoutError as error:
+            raise CodedAPIError(
+                504,
+                "source_check_timeout",
+                "Remote source check timed out. Please try again.",
+            ) from error
+        except TimeoutError as error:
+            raise CodedAPIError(
+                504, "source_check_timeout", SOURCE_CHECK_TIMEOUT_DETAIL
+            ) from error
+        except (FileNotFoundError, ValueError, TypeError) as error:
+            raise CodedAPIError(
+                409,
+                "source_unavailable",
+                _source_error_detail(error),
+            ) from error
         await preflight(deployment)
         child_id = uuid4()
-        child = replace(
-            parent,
+        child = inspection.request(
             run_name=gromacs_run_name(normalized_name, child_id),
-            simulation_time_ns=parent.simulation_time_ns
-            + submission.additional_time_ns,
+            additional_time_ns=submission.additional_time_ns,
             cpu_only=submission.cpu_only,
-            continuation=source,
-            execution_plan_version="3",
             max_active_provider_calls=effective.max_active_provider_calls,
             max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls,
         )

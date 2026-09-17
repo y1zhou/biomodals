@@ -2,8 +2,11 @@
 
 # ruff: noqa: D103
 
+import asyncio
+import errno
 from dataclasses import replace
 from hashlib import sha256
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -18,8 +21,13 @@ from test_api_contract import (
 )
 from test_gromacs_archive import REQUEST
 
-from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
+from biomodals.app.bioinfo.gromacs.continuation import (
+    ContinuationInspection,
+    ContinuationSource,
+)
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
+from biomodals.service.gromacs import router
+from biomodals.service.gromacs.modal import GromacsToolAdapter
 from biomodals.service.http_contract import require_session, require_unsafe_session
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobState
@@ -66,13 +74,13 @@ def setup(tmp_path, monkeypatch):
     pending.put(parent.job_id, original.to_bytes())
     reads = []
 
-    async def source(self, job):
+    async def source(self, job, deployment):
         reads.append(job.job_id)
         content = pending.get(job.job_id)
         if content is None:
             raise FileNotFoundError("Source inputs unavailable")
         saved = GromacsExecutionRequest.from_bytes(content)
-        return ContinuationSource(
+        source = ContinuationSource(
             execution_run_id=job.job_id,
             run_name=saved.run_name,
             file_stem=saved.file_stem,
@@ -80,7 +88,8 @@ def setup(tmp_path, monkeypatch):
             request_sha256=sha256(saved.to_bytes()).hexdigest(),
             publication_sha256="c" * 64,
             checkpoint_sha256="d" * 64,
-        ), saved
+        )
+        return ContinuationInspection.from_request(source, saved)
 
     monkeypatch.setattr(GromacsAdapter, "continuation_source", source)
     return app, session, parent, pending, reads
@@ -119,6 +128,106 @@ def test_source_metadata_owner_scope_and_read_only_validation(setup):
     assert reads == [parent.job_id]
     app.dependency_overrides[require_unsafe_session] = _session
     assert _submit(app, parent.job_id).status_code == 404
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_source_check_deadline_cancels_reads_and_allows_manual_retry(
+    setup, monkeypatch, method
+):
+    app, _, parent, pending, _ = setup
+    original = GromacsAdapter.continuation_source
+    original_input = pending.get(parent.job_id)
+    cancelled = []
+
+    async def slow(self, job, deployment):
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            cancelled.append(job.job_id)
+            raise
+        return await original(self, job, deployment)
+
+    monkeypatch.setattr(router, "SOURCE_CHECK_TIMEOUT_SECONDS", 0.005)
+    monkeypatch.setattr(GromacsAdapter, "continuation_source", slow)
+    path = f"/api/v1/gromacs/jobs/{parent.job_id}/continuation"
+    response = (
+        _request(app, "GET", path) if method == "GET" else _submit(app, parent.job_id)
+    )
+    assert response.status_code == 504
+    assert response.json() == {
+        "code": "source_check_timeout",
+        "detail": "Checking the source simulation timed out after 45 seconds. Please try again.",
+    }
+    assert cancelled == [parent.job_id]
+    assert app.state.store.get_job_by_id(parent.job_id) == parent
+    assert pending.get(parent.job_id) == original_input
+    monkeypatch.setattr(GromacsAdapter, "continuation_source", original)
+    monkeypatch.setattr(router, "SOURCE_CHECK_TIMEOUT_SECONDS", 45)
+    assert _request(app, "GET", path).json()["eligible"] is True
+
+
+def test_source_deadline_stops_waiting_for_metadata_rpc(setup, monkeypatch):
+    app, _, parent, pending, _ = setup
+    pending.delete(parent.job_id)
+    cancelled = []
+
+    async def inspect(run_id):
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            cancelled.append(run_id)
+            raise
+
+    import modal
+
+    monkeypatch.setattr(
+        modal.Function,
+        "from_name",
+        lambda *args, **kwargs: SimpleNamespace(remote=SimpleNamespace(aio=inspect)),
+    )
+    monkeypatch.setattr(
+        GromacsAdapter, "continuation_source", GromacsToolAdapter.continuation_source
+    )
+    monkeypatch.setattr(router, "SOURCE_CHECK_TIMEOUT_SECONDS", 0.005)
+    response = _request(
+        app, "GET", f"/api/v1/gromacs/jobs/{parent.job_id}/continuation"
+    )
+    assert response.status_code == 504
+    assert cancelled == [str(parent.job_id)]
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    "failure,code,status",
+    [("old", "deployment_incompatible", 409), ("timeout", "source_check_timeout", 504)],
+)
+def test_remote_inspector_failures_are_actionable_without_admission(
+    setup, monkeypatch, method, failure, code, status
+):
+    from modal.exception import FunctionTimeoutError
+
+    app, _, parent, pending, _ = setup
+    original = pending.get(parent.job_id)
+
+    async def fail(self, job, deployment):
+        assert job.job_id == parent.job_id
+        assert (
+            deployment.deployment_version
+            == app.state.configuration.tool("gromacs").modal_app_version.value
+        )
+        if failure == "old":
+            raise NotFoundError("Missing inspector")
+        raise FunctionTimeoutError("Read-only inspection timed out")
+
+    monkeypatch.setattr(GromacsAdapter, "continuation_source", fail)
+    response = (
+        _request(app, "GET", f"/api/v1/gromacs/jobs/{parent.job_id}/continuation")
+        if method == "GET"
+        else _submit(app, parent.job_id)
+    )
+    assert response.status_code == status
+    assert response.json()["code"] == code
+    assert pending.get(parent.job_id) == original
 
 
 def test_new_roots_inherit_physics_and_allow_chain_branch_and_replay(setup):
@@ -195,6 +304,31 @@ def test_missing_source_and_incompatible_target_never_admit(setup, monkeypatch):
     result = _submit(app, parent.job_id)
     assert result.status_code == 409
     assert result.json()["code"] == "source_unavailable"
+
+
+def test_missing_native_file_is_explained_on_form_and_submission(setup, monkeypatch):
+    app, _, parent, _, _ = setup
+
+    async def missing(self, _job, _deployment):
+        raise FileNotFoundError(
+            errno.ENOENT, "Missing restart file", "private/run/production_source.edr"
+        )
+
+    monkeypatch.setattr(GromacsAdapter, "continuation_source", missing)
+    metadata = _request(
+        app, "GET", f"/api/v1/gromacs/jobs/{parent.job_id}/continuation"
+    )
+    assert metadata.json()["eligible"] is False
+    assert (
+        metadata.json()["detail"]
+        == "Required source file is unavailable: production_source.edr"
+    )
+    submission = _submit(app, parent.job_id)
+    assert submission.status_code == 409
+    assert submission.json() == {
+        "code": "source_unavailable",
+        "detail": metadata.json()["detail"],
+    }
 
 
 def test_fresh_schema_uses_same_250ns_limit(setup):

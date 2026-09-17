@@ -6,16 +6,16 @@
 import shutil
 import subprocess
 from dataclasses import replace
-from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
+import orjson
 import pytest
 from test_gromacs_continuation import _publish
 from test_gromacs_execution_runtime import RUN_ID, _request
 
 from biomodals.app.bioinfo.gromacs import app
-from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
+from biomodals.app.bioinfo.gromacs.continuation import inspect_continuation_source
 from biomodals.app.bioinfo.gromacs.continue_run import (
     native_endpoint,
     prepare_continuation_files,
@@ -28,7 +28,10 @@ from biomodals.app.bioinfo.gromacs.execution_runtime import (
 )
 
 
-def test_real_native_copy_extend_append_and_completed_redelivery(tmp_path, monkeypatch):
+@pytest.mark.parametrize("unlisted_energy", [False, True])
+def test_real_native_copy_extend_append_and_completed_redelivery(
+    tmp_path, monkeypatch, unlisted_energy
+):
     """A noninteracting atom exercises native state and time, not MD quality."""
     gmx = shutil.which("gmx")
     if gmx is None:
@@ -111,29 +114,24 @@ def test_real_native_copy_extend_append_and_completed_redelivery(tmp_path, monke
                 )
         _publish(tmp_path, parent, node.node_key)
     persist_execution_request(tmp_path, RUN_ID, parent)
-    source = ContinuationSource(
-        execution_run_id=RUN_ID,
-        run_name="parent",
-        file_stem="parent",
-        simulation_time_ns=1,
-        request_sha256=sha256(parent.to_bytes()).hexdigest(),
-        publication_sha256=sha256(
-            (tmp_path / gromacs_publication_path(parent, PREPARE_RESULT)).read_bytes()
-        ).hexdigest(),
-        checkpoint_sha256=sha256(
-            (root / "production_parent.cpt").read_bytes()
-        ).hexdigest(),
+    if unlisted_energy:
+        for node in (PREPARE_RESULT, "production_run_cpu"):
+            path = tmp_path / gromacs_publication_path(parent, node)
+            marker = orjson.loads(path.read_bytes())
+            marker["files"] = [
+                file for file in marker["files"] if not file["path"].endswith(".edr")
+            ]
+            path.write_bytes(orjson.dumps(marker))
+    child = inspect_continuation_source(tmp_path, RUN_ID).request(
+        run_name="child",
+        additional_time_ns=1,
+        cpu_only=True,
+        max_active_provider_calls=3,
+        max_active_gpu_provider_calls=0,
     )
     original = {
         p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()
     }
-    child = replace(
-        parent,
-        run_name="child",
-        simulation_time_ns=2,
-        execution_plan_version="3",
-        continuation=source,
-    )
     child_root = prepare_continuation_files(child, tmp_path)
     # Simulate an interrupted provider input after half of the added interval.
     subprocess.run(

@@ -10,7 +10,7 @@ import modal
 import orjson
 
 from biomodals.app.bioinfo.gromacs.continuation import (
-    ContinuationSource,
+    ContinuationInspection,
     read_continuation_source,
 )
 from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
@@ -28,9 +28,6 @@ from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
     write_gromacs_archive,
-)
-from biomodals.service.gromacs.contracts import (
-    artifact_request_sha256,
 )
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobRecord
@@ -70,20 +67,11 @@ class GromacsToolAdapter:
         """Remove the local request after both remote files were verified."""
         self.pending.delete(job.job_id)
 
-    async def input_request(self, job: JobRecord) -> GromacsExecutionRequest:
-        """Read retained inputs without reopening a scientific coordinator."""
-        content = self.pending.get(job.job_id)
-        if content is not None:
-            return GromacsExecutionRequest.from_bytes(content)
-        return await asyncio.to_thread(
-            load_execution_request_from_volume, self._volume(job), job.job_id
-        )
-
     async def continuation_source(
-        self, job: JobRecord
-    ) -> tuple[ContinuationSource, GromacsExecutionRequest]:
-        """Check retained checkpoint evidence without submitting any compute."""
-        return await read_continuation_source(self._volume(job), job.job_id)
+        self, job: JobRecord, deployment: DeploymentIdentity
+    ) -> ContinuationInspection:
+        """Inspect in Modal without transferring native files to the API host."""
+        return await read_continuation_source(deployment, job.job_id)
 
     async def preflight(self, deployment: DeploymentIdentity) -> None:
         """Reject older targets before admitting a version-three scientific plan."""
@@ -173,10 +161,7 @@ class GromacsToolAdapter:
                     completed_at=completed_at,
                     read_file=read_file,
                     remote_mtimes=remote_mtimes,
-                    expected_request_sha256=artifact_request_sha256(
-                        request.pdb_content,
-                        parameters_json,
-                    ),
+                    expected_input_sha256=request.pdb_sha256,
                     published_files=published_files,
                     run_bounded=cache.run_bounded,
                 )

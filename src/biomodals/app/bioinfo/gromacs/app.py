@@ -786,13 +786,13 @@ def collect_traj_stats(
     work_path = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / run_name
     ).run_root
-    run_name = file_stem or run_name
-    traj_path = work_path / f"{traj_prefix}{run_name}.xtc"
+    stem = file_stem or run_name
+    traj_path = work_path / f"{traj_prefix}{stem}.xtc"
     if not traj_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
 
     # Remove PBC and align to reference structure
-    processed_traj_path = work_path / f"{traj_prefix}{run_name}_nopbc.xtc"
+    processed_traj_path = work_path / f"{traj_prefix}{stem}_nopbc.xtc"
     if processed_traj_path.exists() and file1_needs_update(
         processed_traj_path, traj_path
     ):
@@ -802,13 +802,13 @@ def collect_traj_stats(
     if not processed_traj_path.exists():
         postprocess_traj.remote(
             str(traj_path),
-            str(work_path / f"{traj_prefix}{run_name}.tpr"),
+            str(work_path / f"{traj_prefix}{stem}.tpr"),
             str(processed_traj_path),
-            ref_struct_file=str(work_path / f"{run_name}.pdb"),
+            ref_struct_file=str(work_path / f"{stem}.pdb"),
         )
 
     out_vol.reload()
-    traj_1st_frame_pdb_path = work_path / f"{traj_prefix}{run_name}_nopbc_centered.pdb"
+    traj_1st_frame_pdb_path = work_path / f"{traj_prefix}{stem}_nopbc_centered.pdb"
     if not traj_1st_frame_pdb_path.exists():
         raise RuntimeError(
             f"Postprocessing trajectory did not generate expected PDB: {traj_1st_frame_pdb_path}"
@@ -846,14 +846,14 @@ def collect_traj_stats(
     trajectory, _ = struc.superimpose(trajectory[0], trajectory)
 
     # Dump the last frame of the processed trajectory as PDB
-    last_frame_path = work_path / f"{traj_prefix}{run_name}_last_frame.pdb"
+    last_frame_path = work_path / f"{traj_prefix}{stem}_last_frame.pdb"
     if file1_needs_update(last_frame_path, traj_path):
         last_frame_path.unlink(missing_ok=True)  # remove outdated last frame
     if not last_frame_path.exists():
         strucio.save_structure(last_frame_path, trajectory[-1])
 
     # RMSD vs. the initial frame
-    rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{run_name}.png"
+    rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{stem}.png"
     rmsd_csv_path = rmsd_fig_path.with_suffix(".csv")
     remove_stale_analysis_outputs(
         rmsd_csv_path,
@@ -880,7 +880,7 @@ def collect_traj_stats(
             plt.close(figure)
 
     # Radius of gyration
-    rg_fig_path = work_path / f"rg_{traj_prefix}{run_name}.png"
+    rg_fig_path = work_path / f"rg_{traj_prefix}{stem}.png"
     rg_csv_path = rg_fig_path.with_suffix(".csv")
     remove_stale_analysis_outputs(
         rg_csv_path,
@@ -906,7 +906,7 @@ def collect_traj_stats(
             plt.close(figure)
 
     # RMSF of each residue
-    rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{run_name}.png"
+    rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{stem}.png"
     rmsf_csv_path = rmsf_fig_path.with_suffix(".csv")
     remove_stale_analysis_outputs(
         rmsf_csv_path,
@@ -1112,14 +1112,14 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
 def submit_gromacs_task(
     input_pdb: str | None = None,
     run_name: str | None = None,
-    simulation_time_ns: int = 5,
-    run_pdbfixer: bool = False,
+    simulation_time_ns: int | None = None,
+    run_pdbfixer: bool | None = None,
     cpu_only: bool | None = None,
-    num_threads: int = APP_INFO.gmx_threads,
-    use_openmp_threads: bool = False,
-    ld_seed: int = -1,
-    gen_seed: int = -1,
-    genion_seed: int = 0,
+    num_threads: int | None = None,
+    use_openmp_threads: bool | None = None,
+    ld_seed: int | None = None,
+    gen_seed: int | None = None,
+    genion_seed: int | None = None,
     max_containers: int | None = None,
     max_gpu_containers: int | None = None,
     use_deployed_coordinator: bool = False,
@@ -1138,18 +1138,18 @@ def submit_gromacs_task(
             stem. Note that if the name exists in the remote volume, files in
             the remote will be preferred over the local one. Make sure to use
             unique names if you want to start a new run!
-        simulation_time_ns: Fresh production duration, 1–250 whole nanoseconds.
+        simulation_time_ns: Fresh production duration, 1–250 whole nanoseconds (default 5).
         run_pdbfixer: Whether to run PDBFixer to clean the input PDB file
-            before preparation.
+            before preparation (fresh only; default False).
         cpu_only: Select CPU (True) or GPU (False). Omission inherits the source
             for continuation and selects GPU for a fresh simulation.
-        num_threads: Number of CPU threads to use for GROMACS.
-        use_openmp_threads: Whether to use OpenMP threading in GROMACS.
+        num_threads: Fresh-run CPU thread count (default 16). Continuations inherit it.
+        use_openmp_threads: Fresh-run OpenMP threading (default False).
         ld_seed: Random seed for the Langevin dynamics thermostat during
-            equilibration. -1 derives a stable seed from the scientific input.
+            equilibration (fresh only; default -1 derives a seed from the root Run).
         gen_seed: Random seed for initial velocity generation during
-            equilibration. -1 derives a stable seed from the scientific input.
-        genion_seed: Random seed for ion placement during system neutralization.
+            equilibration (fresh only; default -1 derives a seed from the root Run).
+        genion_seed: Fresh-run ion placement seed (default 0 derives a seed from the root Run).
         max_containers: Maximum active workload containers for this Run.
         max_gpu_containers: Maximum active GPU workload containers within the
             total container limit.
@@ -1163,7 +1163,6 @@ def submit_gromacs_task(
         additional_time_ns: Additional whole nanoseconds (1–250), only with continue_from.
     """
     inspection = None
-    interval_ns = simulation_time_ns
     if continue_from:
         import asyncio
 
@@ -1176,11 +1175,31 @@ def submit_gromacs_task(
             raise ValueError(
                 "--continue-from cannot be combined with --restart-from or --input-pdb"
             )
+        incompatible = [
+            flag
+            for flag, value in (
+                ("--simulation-time-ns", simulation_time_ns),
+                ("--run-pdbfixer", run_pdbfixer),
+                ("--num-threads", num_threads),
+                ("--use-openmp-threads", use_openmp_threads),
+                ("--ld-seed", ld_seed),
+                ("--gen-seed", gen_seed),
+                ("--genion-seed", genion_seed),
+            )
+            if value is not None
+        ]
+        if incompatible:
+            raise ValueError(
+                "--continue-from inherits settings and cannot be combined with "
+                + ", ".join(incompatible)
+                + "; use --additional-time-ns for the extension duration"
+            )
         if (
             additional_time_ns is None
             or not 1 <= additional_time_ns <= MAX_SIMULATION_TIME_NS
         ):
             raise ValueError("--additional-time-ns must be between 1 and 250")
+        interval_ns = additional_time_ns
         inspection = (
             asyncio.run(
                 read_continuation_source(
@@ -1195,7 +1214,6 @@ def submit_gromacs_task(
                 inspect_continuation_source.remote(str(UUID(continue_from)))
             )
         )
-        interval_ns = additional_time_ns
         cpu_only = inspection.cpu_only if cpu_only is None else cpu_only
         run_name = run_name or f"continued-{uuid4().hex}"
     else:
@@ -1203,7 +1221,8 @@ def submit_gromacs_task(
             raise ValueError(
                 "A fresh run requires --input-pdb; additional time requires --continue-from"
             )
-        if not 1 <= simulation_time_ns <= MAX_SIMULATION_TIME_NS:
+        interval_ns = 5 if simulation_time_ns is None else simulation_time_ns
+        if not 1 <= interval_ns <= MAX_SIMULATION_TIME_NS:
             raise ValueError("--simulation-time-ns must be between 1 and 250")
         pdb_path = Path(input_pdb).expanduser().resolve()
         pdb_str = pdb_path.read_bytes()
@@ -1237,23 +1256,25 @@ def submit_gromacs_task(
         request = GromacsExecutionRequest(
             run_name=run_name,
             pdb_content=pdb_str,
-            simulation_time_ns=simulation_time_ns,
-            run_pdbfixer=run_pdbfixer,
+            simulation_time_ns=interval_ns,
+            run_pdbfixer=False if run_pdbfixer is None else run_pdbfixer,
             cpu_only=cpu_only,
-            num_threads=num_threads,
-            use_openmp_threads=use_openmp_threads,
+            num_threads=APP_INFO.gmx_threads if num_threads is None else num_threads,
+            use_openmp_threads=False
+            if use_openmp_threads is None
+            else use_openmp_threads,
             ld_seed=concrete_gromacs_seed(
-                ld_seed,
+                -1 if ld_seed is None else ld_seed,
                 run_identity=str(seed_run_id),
                 purpose="ld-seed",
             ),
             gen_seed=concrete_gromacs_seed(
-                gen_seed,
+                -1 if gen_seed is None else gen_seed,
                 run_identity=str(seed_run_id),
                 purpose="gen-seed",
             ),
             genion_seed=concrete_gromacs_seed(
-                genion_seed,
+                0 if genion_seed is None else genion_seed,
                 run_identity=str(seed_run_id),
                 purpose="genion-seed",
                 random_sentinel=0,

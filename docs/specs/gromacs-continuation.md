@@ -196,6 +196,10 @@ Use `biomodals app run gromacs -- --continue-from <execution-run-id>
 No PDB is needed. Continuation is mutually exclusive with `--input-pdb` and
 the outer `--restart-from` compatible-recovery flag. Physical settings remain
 inherited. Normal global container limits apply to the new root.
+Explicit fresh-only duration, PDBFixer, seed, thread-count or OpenMP options
+are rejected in continuation mode rather than silently ignored, even when they
+equal a fresh-run default. Plot titles use the child run identity; filenames
+retain the native source stem for checkpoint compatibility.
 Use `biomodals run restart` for same-plan recovery of a continuation.
 
 Deploy the updated GROMACS app including `inspect_continuation_source`, pin its

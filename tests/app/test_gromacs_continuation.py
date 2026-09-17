@@ -725,3 +725,34 @@ def test_cli_continuation_reuses_source_without_input_pdb(tmp_path, monkeypatch)
         app.submit_gromacs_task.info.raw_f(
             continue_from=str(RUN_ID), additional_time_ns=1, restart_from=str(RUN_ID)
         )
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--simulation-time-ns", "5"],
+        ["--num-threads", "16"],
+        ["--run-pdbfixer"],
+        ["--no-run-pdbfixer"],
+        ["--use-openmp-threads"],
+        ["--no-use-openmp-threads"],
+        ["--ld-seed", "-1"],
+        ["--gen-seed", "-1"],
+        ["--genion-seed", "0"],
+    ],
+)
+def test_cli_continuation_rejects_explicit_ignored_options_before_remote_read(
+    monkeypatch, flags
+):
+    async def unexpected_read(*args):
+        raise AssertionError("Invalid arguments must fail before inspecting a source")
+
+    monkeypatch.setattr(continuation, "read_continuation_source", unexpected_read)
+    with pytest.raises(ValueError, match="inherits settings"):
+        invoke_local_entrypoint(
+            module_name=app.__name__,
+            entrypoint_name="submit_gromacs_task",
+            flags=["--continue-from", str(RUN_ID), "--additional-time-ns", "1", *flags],
+            overrides={"use_deployed_coordinator": True},
+            program_name="biomodals app run gromacs --",
+        )

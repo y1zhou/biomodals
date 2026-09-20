@@ -29,6 +29,14 @@ REQUIRED_FUNCTIONS = (
 )
 GROMACS_SCIENTIFIC_VERSION = "2026.1"
 EXECUTION_PLAN_SCHEMA_VERSION = "4"
+ANALYSIS_POLICY_VERSION = "streaming-v1"
+ANALYSIS_PACKAGES = (
+    "biotite==1.6.0",
+    "biotraj==1.2.2",
+    "numpy==2.5.1",
+    "scipy==1.18.1",
+    "matplotlib==3.10.8",
+)
 
 
 def concrete_gromacs_seed(

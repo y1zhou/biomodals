@@ -22,7 +22,10 @@ from uuid import UUID, uuid4
 import modal
 
 from biomodals.app.bioinfo.gromacs import app as gromacs_app
-from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
+from biomodals.app.bioinfo.gromacs.execution import (
+    ANALYSIS_POLICY_VERSION,
+    concrete_gromacs_seed,
+)
 from biomodals.execution import (
     CoordinatorNode,
     DeploymentIdentity,
@@ -702,6 +705,7 @@ def build_shortmd_workflow(
         scientific_versions={
             "biomodals.workflow.shortmd": _SCIENTIFIC_SCHEMA_VERSION,
             "gromacs": app_scientific_version(gromacs_app.CONF),
+            "biomodals.gromacs.analysis": ANALYSIS_POLICY_VERSION,
         },
     )
     safe_run_namespace = (

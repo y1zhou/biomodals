@@ -79,6 +79,7 @@ def test_humanization_coordinator_and_annotation_image_source_closures():
         (
             gromacs_app.biotite_image,
             {
+                "biomodals.app.bioinfo.gromacs.analysis",
                 "biomodals.app.bioinfo.gromacs.execution",
                 "biomodals.app.bioinfo.gromacs.execution_runtime",
                 "biomodals.app.bioinfo.gromacs.continuation",

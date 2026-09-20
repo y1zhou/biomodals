@@ -4,69 +4,15 @@
 
 import os
 import shutil
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 
+from biomodals.app.bioinfo.gromacs import analysis
 from biomodals.app.bioinfo.gromacs import app as gromacs_app
 from biomodals.execution import RunStatus
-
-
-def test_analysis_csv_preserves_the_established_checkpoint_format(
-    tmp_path: Path,
-) -> None:
-    output = tmp_path / "rmsf.csv"
-
-    gromacs_app.write_analysis_csv(
-        output,
-        {
-            "residue_index": [1.0, 2.0],
-            "rmsf": [0.123456, 2.0],
-        },
-    )
-
-    assert output.read_text(encoding="utf-8") == (
-        "residue_index,rmsf\n1.00000,0.12346\n2.00000,2.00000\n"
-    )
-
-
-def test_analysis_pair_invalidates_each_stale_member_independently(
-    tmp_path: Path,
-) -> None:
-    trajectory = tmp_path / "trajectory.xtc"
-    csv = tmp_path / "analysis.csv"
-    figure = tmp_path / "analysis.png"
-    for path in (trajectory, csv, figure):
-        path.write_bytes(b"data")
-    os.utime(trajectory, (20, 20))
-    os.utime(csv, (10, 10))
-    os.utime(figure, (30, 30))
-
-    gromacs_app.remove_stale_analysis_outputs(
-        csv,
-        figure,
-        trajectory,
-        make_figures=True,
-    )
-
-    assert not csv.exists()
-    assert figure.exists()
-
-    csv.write_bytes(b"new")
-    os.utime(csv, (30, 30))
-    os.utime(figure, (10, 10))
-    gromacs_app.remove_stale_analysis_outputs(
-        csv,
-        figure,
-        trajectory,
-        make_figures=True,
-    )
-
-    assert csv.exists()
-    assert not figure.exists()
 
 
 def test_gromacs_declares_workflow_expected_files() -> None:
@@ -307,21 +253,14 @@ def test_analysis_volume_handoff_refreshes_inputs_and_stale_deletion(
     class StopAfterHandoff(Exception):
         pass
 
-    def load_structure(path):
+    def analyze_trajectory(_trajectory, path, **kwargs):
         assert Path(path).read_bytes() == b"new centered structure"
+        assert kwargs["run_name"] == active_root.name
+        assert kwargs["prefix"] == "production_parent"
         events.append("read")
         raise StopAfterHandoff
 
-    structure_io = SimpleNamespace(load_structure=load_structure, xtc=SimpleNamespace())
-    structure = SimpleNamespace(io=structure_io)
-    monkeypatch.setitem(sys.modules, "biotite", SimpleNamespace(structure=structure))
-    monkeypatch.setitem(sys.modules, "biotite.structure", structure)
-    monkeypatch.setitem(sys.modules, "biotite.structure.io", structure_io)
-    monkeypatch.setitem(sys.modules, "biotite.structure.io.xtc", structure_io.xtc)
-    monkeypatch.setitem(
-        sys.modules, "matplotlib", SimpleNamespace(pyplot=SimpleNamespace())
-    )
-    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", SimpleNamespace())
+    monkeypatch.setattr(analysis, "analyze_trajectory", analyze_trajectory)
 
     def analysis_reload():
         events.append("analysis reload")

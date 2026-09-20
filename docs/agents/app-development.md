@@ -10,9 +10,9 @@ explicitly approved.
 - [AlphaFold3 cache integrity and run layout](alphafold3-app-deviations.md)
   documents the intentionally trusted immutable stores, marker-only seed cache,
   and multi-request run layout used by `alphafold3_app.py`.
-- [GROMACS analysis checkpoints](gromacs-analysis-checkpoints.md) retain the
-  established run-directory and timestamp contract for narrow CSV/PNG restart
-  repair. Do not extend that exception to new cache stages.
+- [GROMACS analysis publication](gromacs-analysis-checkpoints.md) documents
+  content-bound statistics and the remaining native PBC postprocessing
+  timestamp exception. Do not extend that exception to new cache stages.
 - [p-AbNatiV2 upstream compatibility patches](pabnativ2-app-deviations.md)
   document the two guarded Python 3.12 compatibility edits applied to pinned
   AbNatiV and ABodyBuilder3 sources.

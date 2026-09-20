@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import modal
 
 from biomodals.app.bioinfo.gromacs.execution import (
+    ANALYSIS_PACKAGES,
     MAX_SIMULATION_TIME_NS,
     concrete_gromacs_seed,
     preparation_execution_paths,
@@ -263,12 +264,13 @@ biotite_image = (
     modal.Image
     .debian_slim(python_version=CONF.python_version)
     .apt_install("git", "build-essential")
-    .uv_pip_install("biotite", "numpy", "scipy", "matplotlib")
+    .uv_pip_install(*ANALYSIS_PACKAGES)
     .pipe(patch_image_for_helper)
     .add_local_python_source(
         "biomodals.app.bioinfo.gromacs.execution",
         "biomodals.app.bioinfo.gromacs.execution_runtime",
         "biomodals.app.bioinfo.gromacs.continuation",
+        "biomodals.app.bioinfo.gromacs.analysis",
     )
 )
 
@@ -298,27 +300,6 @@ def file1_needs_update(file1: Path, file2: Path) -> bool:
     if not file2.exists():
         raise FileNotFoundError(f"File not found for timestamp comparison: {file2}")
     return file1.stat().st_mtime < file2.stat().st_mtime
-
-
-def write_analysis_csv(path: Path, columns: dict[str, object]) -> None:
-    """Write one stable five-decimal analysis checkpoint with Polars."""
-    import polars as pl
-
-    pl.DataFrame(columns).write_csv(path, float_precision=5)
-
-
-def remove_stale_analysis_outputs(
-    csv_path: Path,
-    figure_path: Path,
-    trajectory_path: Path,
-    *,
-    make_figures: bool,
-) -> None:
-    """Invalidate each stale analysis member independently."""
-    if file1_needs_update(csv_path, trajectory_path):
-        csv_path.unlink(missing_ok=True)
-    if make_figures and file1_needs_update(figure_path, trajectory_path):
-        figure_path.unlink(missing_ok=True)
 
 
 ##########################################
@@ -774,12 +755,7 @@ def collect_traj_stats(
 
     Ref: https://www.biotite-python.org/latest/examples/gallery/structure/modeling/md_analysis.html
     """
-    import biotite  # type: ignore[ty:unresolved-import]
-    import biotite.structure as struc  # type: ignore[ty:unresolved-import]
-    import biotite.structure.io as strucio  # type: ignore[ty:unresolved-import]
-    import biotite.structure.io.xtc as xtc  # type: ignore[ty:unresolved-import]
-    import matplotlib.pyplot as plt  # type: ignore[ty:unresolved-import]
-    import numpy as np
+    from biomodals.app.bioinfo.gromacs.analysis import analyze_trajectory
 
     out_vol = CONF.output_volume
     out_vol.reload()
@@ -814,131 +790,15 @@ def collect_traj_stats(
             f"Postprocessing trajectory did not generate expected PDB: {traj_1st_frame_pdb_path}"
         )
 
-    # Gromacs does not set the element symbol in its PDB files,
-    # but Biotite guesses the element names from the atom names,
-    # emitting a warning
-    template = strucio.load_structure(traj_1st_frame_pdb_path)
-    # The structure still has water and ions, that are not needed for our
-    # calculations, we are only interested in the protein itself
-    # These are removed for the sake of computational speed using a boolean
-    # mask
-    protein_mask = struc.filter_amino_acids(template)
-    template = template[protein_mask]
-
-    # We could have loaded the trajectory also with
-    # 'strucio.load_structure()', but in this case we only want to load
-    # those coordinates that belong to the already selected atoms of the
-    # template structure.
-    # Hence, we use the 'XTCFile' class directly to load the trajectory
-    # This gives us the additional option that allows us to select the
-    # coordinates belonging to the amino acids.
-    xtc_file = xtc.XTCFile.read(processed_traj_path, atom_i=np.where(protein_mask)[0])
-    trajectory = xtc_file.get_structure(template)
+    analyze_trajectory(
+        processed_traj_path,
+        traj_1st_frame_pdb_path,
+        prefix=f"{traj_prefix}{stem}",
+        run_name=run_name,
+        make_figures=make_figures,
+    )
     if not save_processed_traj:
         processed_traj_path.unlink()
-
-    # Get simulation time (ns) for plotting purposes
-    time = xtc_file.get_time() / 1000.0
-    print(f"Simulated {time[-1]:.1f} ns in {traj_path}")
-
-    # Remove PBC (gmx trjconv)
-    # trajectory = struc.remove_pbc(trajectory)
-    trajectory, _ = struc.superimpose(trajectory[0], trajectory)
-
-    # Dump the last frame of the processed trajectory as PDB
-    last_frame_path = work_path / f"{traj_prefix}{stem}_last_frame.pdb"
-    if file1_needs_update(last_frame_path, traj_path):
-        last_frame_path.unlink(missing_ok=True)  # remove outdated last frame
-    if not last_frame_path.exists():
-        strucio.save_structure(last_frame_path, trajectory[-1])
-
-    # RMSD vs. the initial frame
-    rmsd_fig_path = work_path / f"rmsd_{traj_prefix}{stem}.png"
-    rmsd_csv_path = rmsd_fig_path.with_suffix(".csv")
-    remove_stale_analysis_outputs(
-        rmsd_csv_path,
-        rmsd_fig_path,
-        traj_path,
-        make_figures=make_figures,
-    )
-    if not rmsd_csv_path.exists() or (make_figures and not rmsd_fig_path.exists()):
-        rmsd = struc.rmsd(trajectory[0], trajectory)
-        if not rmsd_csv_path.exists():
-            write_analysis_csv(
-                rmsd_csv_path,
-                {"time_ns": time, "rmsd": rmsd},
-            )
-
-        if not rmsd_fig_path.exists() and make_figures:
-            figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
-            ax.plot(time, rmsd, color=biotite.colors["dimorange"])
-            ax.set_xlim(time[0], time[-1])
-            ax.set_title(run_name)
-            ax.set_xlabel("Time (ns)")
-            ax.set_ylabel("RMSD (Å)")
-            figure.savefig(rmsd_fig_path)
-            plt.close(figure)
-
-    # Radius of gyration
-    rg_fig_path = work_path / f"rg_{traj_prefix}{stem}.png"
-    rg_csv_path = rg_fig_path.with_suffix(".csv")
-    remove_stale_analysis_outputs(
-        rg_csv_path,
-        rg_fig_path,
-        traj_path,
-        make_figures=make_figures,
-    )
-    if not rg_csv_path.exists() or (make_figures and not rg_fig_path.exists()):
-        rg = struc.gyration_radius(trajectory)
-        if not rg_csv_path.exists():
-            write_analysis_csv(
-                rg_csv_path,
-                {"time_ns": time, "rg": rg},
-            )
-        if not rg_fig_path.exists() and make_figures:
-            figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
-            ax.plot(time, rg, color=biotite.colors["dimgreen"])
-            ax.set_xlim(time[0], time[-1])
-            ax.set_title(run_name)
-            ax.set_xlabel("Time (ns)")
-            ax.set_ylabel("Radius of Gyration (Å)")
-            figure.savefig(rg_fig_path)
-            plt.close(figure)
-
-    # RMSF of each residue
-    rmsf_fig_path = work_path / f"rmsf_{traj_prefix}{stem}.png"
-    rmsf_csv_path = rmsf_fig_path.with_suffix(".csv")
-    remove_stale_analysis_outputs(
-        rmsf_csv_path,
-        rmsf_fig_path,
-        traj_path,
-        make_figures=make_figures,
-    )
-    if not rmsf_csv_path.exists() or (make_figures and not rmsf_fig_path.exists()):
-        # Sidechain atoms fluctuate too much, so we only consider CA atoms
-        ca_trajectory = trajectory[:, trajectory.atom_name == "CA"]
-        rmsf = struc.rmsf(struc.average(ca_trajectory), ca_trajectory)
-        res_count = struc.get_residue_count(trajectory)
-        res_idx = np.arange(1, res_count + 1)
-        if not rmsf_csv_path.exists():
-            write_analysis_csv(
-                rmsf_csv_path,
-                {
-                    "residue_index": res_idx.astype(float),
-                    "rmsf": rmsf,
-                },
-            )
-        if not rmsf_fig_path.exists() and make_figures:
-            # Sidechain atoms fluctuate too much, so we only consider CA atoms
-            figure, ax = plt.subplots(figsize=(6, 3), dpi=200, layout="constrained")
-            ax.plot(res_idx, rmsf, color=biotite.colors["dimorange"])
-            ax.set_xlim(1, res_count)
-            ax.set_title(run_name)
-            ax.set_xlabel("Residue Index")
-            ax.set_ylabel("RMSF (Å)")
-            figure.savefig(rmsf_fig_path)
-            plt.close(figure)
-
     out_vol.commit()
     return str(work_path)
 

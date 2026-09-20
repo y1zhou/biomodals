@@ -38,9 +38,11 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "biotite==1.6.0",
     "fastapi>=0.140.0,<1",
     "httpx>=0.28.1,<1",
     "ipykernel>=7.2.0",
+    "matplotlib==3.10.8",
     "pwdlib[argon2]>=0.3.0,<0.4",
     "python-multipart>=0.0.22,<1",
     "pytest>=9.0.3",

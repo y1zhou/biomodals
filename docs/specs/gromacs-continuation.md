@@ -25,9 +25,9 @@ structure, compatible kernel restart, or Retry fetching results.
 
 See [ADR 0011](../adr/0011-gromacs-continuations-preserve-source-runs.md) for the
 immutable-source trade-off. Accumulated storage and analysis cost grow with
-history. The existing analysis implementation retains its 64 GiB container
-memory limit; this feature does not claim constant-memory processing or add
-a hidden lifetime-duration cap. Service admission requires a Completed source;
+history. Coordinate analysis is streamed in bounded chunks, but copying,
+postprocessing, hashing and output size still grow with cumulative history.
+There is no hidden lifetime-duration cap. Service admission requires a Completed source;
 repair failed local Result preparation first using Retry fetching results.
 
 ## Native implementation
@@ -135,6 +135,60 @@ checkpoint. The submitted request is never rewritten. Older plan publications
 keep their exact inventories and historical archives keep their original
 request-derived metadata; unbound JSON is not retroactively trusted.
 
+### Streaming analysis
+
+`analysis.py` reads the processed XTC in 128-frame chunks with Biotite's
+`XTCFile.read_iter`, selecting the same amino-acid atoms as before. Every chunk
+is superimposed on the original first frame using all selected protein atoms,
+never its own first frame. RMSD uses that fixed reference; radius of gyration
+keeps Biotite's standard atomic-mass weighting. Coordinates and scores remain
+in angstroms; time is converted from ps to ns.
+
+Cα RMSF uses float64, chunk-merged central moments (Welford/parallel variance)
+after full-protein alignment, with population variance over every frame. It
+does not average per-chunk RMSFs. Only a chunk, fixed reference, last frame and
+per-Cα mean/M2 state are retained: coordinate memory is independent of the
+number of frames. Streaming changes reduction order, so equivalence is
+numerical within tested tolerance, not a bitwise guarantee.
+
+RMSD/Rg CSVs are written incrementally; RMSF is written after the final frame.
+All rows and the established five-decimal CSV format remain. PNGs use at most
+5000 evenly spaced rows, including both endpoints; sampled plots explicitly
+say they are overviews and point to the full-resolution CSV. Sampling may omit
+brief extrema; it never changes CSV statistics. The aligned final-frame PDB
+and all public output filenames remain unchanged.
+
+Analysis publications bind processed-XTC/template SHA-256, `streaming-v1`,
+pinned numerical/plotting packages and the child title to exact output digests.
+Temporary CSV names are stable and overwritten after interruption; incomplete
+or old-policy outputs cannot become a cache hit. Plan version 4 covers this
+analysis and validated continuation provenance. ShortMD also declares the
+analysis policy in its scientific identity. Historical plans retain their
+fingerprints; a new deployment does not silently upgrade an old Run.
+
+Offline tests compare streamed statistics to pinned Biotite 1.6.0 batch
+calculations across chunk sizes 1, 2, 7 and 128, with rigid displacement,
+internal motion, non-protein exclusion, XTC quantization and uneven tails.
+They also check units, complete CSV rows, child plot titles, final-frame
+coordinates, bounded plots, cache tampering and interrupted-write recovery.
+
+A local synthetic reducer benchmark (2026-09-17, Python 3.12, pinned analysis
+packages, 2000 protein atoms, 128-frame chunks, median of three fresh processes)
+measured the following whole-process peak RSS:
+
+| Frames | Previous batch reducer | Streaming reducer |
+| --- | --- | --- |
+| 1000 | 285 MiB / 0.150 s | 146 MiB / 0.151 s |
+| 8000 | 1226 MiB / 1.064 s | 146 MiB / 1.008 s |
+
+The harness generated deterministic float32 coordinates with internal motion,
+then computed first-frame alignment, RMSD, mass-weighted Rg and Cα RMSF. It
+excluded XTC decoding, filesystem hashing, CSV/PNG output and GROMACS; these
+are reducer measurements, not end-to-end or deployed throughput guarantees.
+The new cache identity adds one sequential processed-XTC hash pass before
+decoding; output validation hashes the much smaller analysis files. Benchmark
+code is not part of production or the committed test suite.
+
 ## API and website
 
 Owner-scoped routes under `/api/v1/gromacs`:
@@ -204,9 +258,11 @@ Use `biomodals run restart` for same-plan recovery of a continuation.
 
 Deploy the updated GROMACS app including `inspect_continuation_source`, pin its
 version in the API, restart the API and
-deploy the matching frontend. New plan-version-four requests cannot use an old
-coordinator: API preflight resolves the new preparation function without
-starting simulation. Source metadata reads also require the updated inspector;
+deploy the matching frontend. New plan-version-four requests require the updated
+coordinator and analysis image. API preflight checks for the preparation
+entrypoint; the coordinator additionally checks scientific versions before
+admitting work. Upgrade the API and pinned deployment together. Source metadata
+reads also require the updated inspector;
 they use the current target, not the source Job's historical deployment.
 Existing Jobs retain their deployment snapshots; do not
 delete deployments they still need.
@@ -217,11 +273,13 @@ owner/idempotency/admission, archive provenance and browser lifecycle.
 A tiny local GROMACS 2026.1 CPU fixture exercises real checkpoints, cumulative
 append, interrupted-child recovery and completed-input redelivery without
 changing the source. It tests native contracts, not protein MD quality or
-numerical equivalence. Full protein analysis and Modal Volume/coordinator
+numerical equivalence. Deployed protein analysis and Modal Volume/coordinator
 redelivery still require an explicitly authorized deployed smoke test.
 
 ## Primary sources
 
+- [Biotite trajectory iterator](https://www.biotite-python.org/latest/apidoc/biotite.structure.io.TrajectoryFile.html#biotite.structure.io.TrajectoryFile.read_iter)
+  and [pinned Biotite 1.6.0 source](https://github.com/biotite-dev/biotite/tree/v1.6.0/src/biotite/structure).
 - [2026.1 continuation](https://manual.gromacs.org/documentation/2026.1/user-guide/managing-simulations.html)
   and [convert-tpr](https://manual.gromacs.org/documentation/2026.1/onlinehelp/gmx-convert-tpr.html).
 - [Checkpoint step accounting](https://github.com/gromacs/gromacs/blob/v2026.1/src/gromacs/fileio/checkpoint.cpp#L2875-L2904)

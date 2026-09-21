@@ -21,6 +21,7 @@ from uuid import UUID, uuid4, uuid5
 import orjson
 import polars as pl
 from service.alphafold3_preview_fixture import preview_archive
+from service.antibody_fixture import reference_csv
 from service.gromacs_preview_fixture import trajectory_archive
 
 from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
@@ -42,6 +43,7 @@ from biomodals.execution import (
 from biomodals.execution.model import ProviderCallOverview
 from biomodals.service.alphafold3.router import create_router as af3_router
 from biomodals.service.alphafold3.validation import ValidatedInputStore
+from biomodals.service.antibody_sequence_analysis.reference import TherapeuticReference
 from biomodals.service.api import create_app
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService
@@ -767,6 +769,10 @@ def _create_browser_app():
     app.state.pending_requests = pending
     app.state.validated_inputs = validations
     app.state.billing = _FakeBilling()
+    app.state.antibody_analysis.reference = TherapeuticReference(
+        cache.directory.parent / "offline-therapeutic-reference.json",
+        download=reference_csv,
+    )
     return app
 
 

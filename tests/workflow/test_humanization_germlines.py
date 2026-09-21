@@ -6,6 +6,7 @@ import orjson
 import polars as pl
 import pytest
 
+from biomodals.schema import AppRunResult
 from biomodals.workflow.humanization.annotation import annotate_humanization_candidate
 from biomodals.workflow.humanization.contracts import AntibodyPair, CandidateAnnotation
 from biomodals.workflow.humanization.germlines import (
@@ -50,7 +51,7 @@ def test_gene_evidence_bound_to_sequences_and_joined_after_rank():
 
 
 def test_imgt_failure_does_not_discard_independent_germlines(monkeypatch):
-    """CPU Task publishes both outcomes; finalization owns partial-result policy."""
+    """One CPU call publishes independent Task outcomes, including on recovery."""
     parent = AntibodyPair(id="parent", vh=VH, vl=VL)
     candidate = candidate_union([parent], [])[0]
     monkeypatch.setattr(
@@ -68,9 +69,19 @@ def test_imgt_failure_does_not_discard_independent_germlines(monkeypatch):
     result = annotate_humanization_candidate(
         parent.model_dump(), candidate.model_dump()
     )
-    assert result.status == "succeeded"
+    assert result["annotation"]["status"] == "failed"
+    assert result["germline"]["status"] == "succeeded"
     outputs = {
-        output.name: orjson.loads(output.storage.data) for output in result.outputs
+        output.name: orjson.loads(output.storage.data)
+        for output in AppRunResult.model_validate(result["germline"]).outputs
     }
-    assert outputs["annotation"]["cdr_preservation"] == "unknown"
     assert outputs["germlines"][0]["v_gene"] == "IGHV1-2"
+    monkeypatch.setattr(
+        "biomodals.workflow.humanization.annotation.candidate_germlines",
+        lambda *_: pytest.fail("Recovery must reuse successful germline evidence"),
+    )
+    assert set(
+        annotate_humanization_candidate(
+            parent.model_dump(), candidate.model_dump(), operations=("annotation",)
+        )
+    ) == {"annotation"}

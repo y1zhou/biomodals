@@ -135,7 +135,7 @@ def test_sapiens_iteration_union_evaluates_every_distinct_pair():
         *[
             f"{method}-{candidate.candidate_id}"
             for candidate in candidates
-            for method in ("sapiens", "humatch", "pabnativ2", "annotation")
+            for method in ("sapiens", "humatch", "pabnativ2", "annotation", "germline")
         ],
     }
     with pytest.raises(ValueError, match="parent"):

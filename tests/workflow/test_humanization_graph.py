@@ -25,12 +25,16 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.workflow.humanization.artifacts import json_output
-from biomodals.workflow.humanization.contracts import AntibodyPair
+from biomodals.workflow.humanization.contracts import (
+    AntibodyPair,
+    HumanizationCandidate,
+)
 from biomodals.workflow.humanization.execution import (
     HumanizationExecutionCoordinator,
     HumanizationExecutionRequest,
     persist_execution_request,
 )
+from biomodals.workflow.humanization.germlines import candidate_germlines
 from biomodals.workflow.humanization.scoring import scoring_result
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import SCORE_COLUMNS
@@ -197,8 +201,9 @@ def test_generation_failures_preserve_baselines_and_successful_replicas(
 
 @pytest.mark.parametrize("fail_first", [False, True])
 @pytest.mark.parametrize("num_seeds", [1, 3])
+@pytest.mark.parametrize("annotation_unknown", [False, True])
 def test_full_graph_joins_successful_native_results_into_sortable_table(
-    tmp_path, monkeypatch, fail_first, num_seeds
+    tmp_path, fail_first, num_seeds, annotation_unknown
 ):
     """Exercise actual artifact materialization and candidate/evaluator joins."""
 
@@ -239,6 +244,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         def __init__(self):
             self.results = {}
             self.operations = []
+            self.annotation_operations = []
             self.fail = fail_first
 
         def resolve(self, binding):
@@ -286,6 +292,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                     ],
                 )
             elif operation == "annotate_humanization_candidate":
+                self.annotation_operations.append(kwargs["operations"])
                 candidate = kwargs["candidate"]
                 changed = candidate["vh"] != kwargs["parent"]["vh"]
                 result = AppRunResult(
@@ -322,6 +329,28 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
                         ),
                     ],
                 )
+                if annotation_unknown:
+                    result = AppRunResult(
+                        status=AppRunStatus.FAILED, warnings=["IMGT unavailable"]
+                    )
+                outcomes = {
+                    "annotation": result,
+                    "germline": AppRunResult(
+                        status=AppRunStatus.SUCCEEDED,
+                        outputs=[
+                            json_output(
+                                "germlines",
+                                candidate_germlines(
+                                    HumanizationCandidate.model_validate(candidate)
+                                ),
+                            )
+                        ],
+                    ),
+                }
+                result = {
+                    method: outcomes[method].model_dump(mode="json")
+                    for method in kwargs["operations"]
+                }
             else:
                 method = operation.removesuffix("_score")
                 frame = pl.read_csv(BytesIO(kwargs["csv_bytes"]), infer_schema=False)
@@ -394,7 +423,9 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
     try:
         result = runtime.run(workload_run_key="test")
         assert result.status == (
-            AppRunStatus.PARTIAL if fail_first else AppRunStatus.SUCCEEDED
+            AppRunStatus.PARTIAL
+            if fail_first or annotation_unknown
+            else AppRunStatus.SUCCEEDED
         ), result
         publication = store.artifacts.load_node_result("evaluate")
         directory = next(
@@ -405,15 +436,26 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         root = tmp_path / directory.storage.path
         table = pl.read_csv(root / "selection.csv")
         assert table.height == 2
-        assert table["panel_order"].to_list() == [None, None if fail_first else 1]
-        assert table["quality_tier"].to_list() == [None, None if fail_first else 1]
-        assert table["evaluation_complete"].to_list() == [not fail_first] * 2
+        assert table["panel_order"].to_list() == [
+            None,
+            None if fail_first or annotation_unknown else 1,
+        ]
+        assert table["quality_tier"].to_list() == [
+            None,
+            None if fail_first or annotation_unknown else 1,
+        ]
+        assert (
+            table["evaluation_complete"].to_list()
+            == [not (fail_first or annotation_unknown)] * 2
+        )
         assert table["generating_methods"].to_list() == [None, "humatch;sapiens"]
         assert (
             table["sapiens_vh_mean_probability_delta"].to_list()
             == [None if fail_first else 0.0] * 2
         )
         assert len(driver.results) == expected_calls
+        assert driver.annotation_operations == [("annotation", "germline")] * 2
+        assert pl.read_parquet(root / "germlines.parquet").height == 4
         manifest = orjson.loads((root / "manifest.json").read_bytes())
         assert manifest["generation_seeds"]["pabnativ2"] == list(
             settings.pabnativ2_seeds
@@ -504,6 +546,8 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         poll_interval_seconds=0,
     )
     driver.fail = False
+    failed_annotation = annotation_unknown
+    annotation_unknown = False
     try:
         with pytest.raises(ValueError):
             successor.prepare_restart(
@@ -523,8 +567,12 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         )
         result = successor.drive_prepared()
         assert result.run.status.value == "succeeded"
-        assert driver.operations[expected_calls:] == (
-            ["sapiens_score"] * 2 if fail_first else []
+        assert sorted(driver.operations[expected_calls:]) == sorted(
+            (["sapiens_score"] * 2 if fail_first else [])
+            + (["annotate_humanization_candidate"] * 2 if failed_annotation else [])
+        )
+        assert driver.annotation_operations[2:] == (
+            [("annotation",)] * 2 if failed_annotation else []
         )
         publication = successor.result()
         directory = next(

@@ -5,7 +5,7 @@ the sequence-distinct union. Research-use candidates require experimental testin
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -364,7 +364,7 @@ class HumanizationEvaluateNode(TaskProviderNode):
             TaskDefinition("generation_complete", errors),
         ]
         for candidate in candidates:
-            for method in (*SCORE_COLUMNS, "annotation"):
+            for method in (*SCORE_COLUMNS, "annotation", "germline"):
                 tasks.append(
                     TaskDefinition(
                         f"{method}-{candidate['candidate_id']}",
@@ -407,12 +407,18 @@ class HumanizationEvaluateNode(TaskProviderNode):
             payload["parent"],
             payload["method"],
         )
-        if method == "annotation":
+        if method in {"annotation", "germline"}:
             return ProviderCallSpec(
                 function_name="annotate_humanization_candidate",
                 uses_gpu=False,
-                kwargs={"parent": parent, "candidate": candidate},
+                kwargs={
+                    "parent": parent,
+                    "candidate": candidate,
+                    "operations": (method,),
+                },
                 metadata=payload,
+                compatibility_key=f"annotation-{candidate['candidate_id']}",
+                max_tasks_per_call=2,
             )
         kwargs = {
             "csv_bytes": pl
@@ -440,15 +446,42 @@ class HumanizationEvaluateNode(TaskProviderNode):
             metadata=payload,
         )
 
+    def prepare_remote_task_batch(
+        self, context: NodeRunContext, tasks: tuple[TaskDefinition, ...]
+    ) -> ProviderCallSpec:
+        """Batch two independent annotations into the existing per-candidate call."""
+        call = self.prepare_remote_task(context, tasks[0])
+        if call.function_name != "annotate_humanization_candidate":
+            return call
+        return replace(
+            call,
+            kwargs={
+                **call.kwargs,
+                "operations": tuple(
+                    task.scientific_payload["method"] for task in tasks
+                ),
+            },
+        )
+
+    def process_remote_task_batch_result(
+        self, task_keys: tuple[str, ...], result: Any, metadata: Mapping[str, Any]
+    ) -> Mapping[str, AppRunResult]:
+        """Keep an IMGT failure from discarding a successful germline publication."""
+        if task_keys[0].split("-", 1)[0] not in {"annotation", "germline"}:
+            return super().process_remote_task_batch_result(task_keys, result, metadata)
+        if set(result) != {key.split("-", 1)[0] for key in task_keys}:
+            raise ValueError("Annotation response does not match the owned Tasks")
+        return {
+            key: AppRunResult.model_validate(result[key.split("-", 1)[0]])
+            for key in task_keys
+        }
+
     def process_remote_task_result(
         self, task_key: str, result: Any, metadata: Mapping[str, Any]
     ) -> AppRunResult:
         """Normalize scalar summaries while retaining the native detailed publication."""
         result = AppRunResult.model_validate(result)
-        if (
-            result.status != AppRunStatus.SUCCEEDED
-            or metadata["method"] == "annotation"
-        ):
+        if result.status != AppRunStatus.SUCCEEDED:
             return result
         method, candidate = metadata["method"], metadata["candidate"]
         if len(result.outputs) != 1 or not isinstance(
@@ -552,13 +585,6 @@ class HumanizationEvaluateNode(TaskProviderNode):
                         cdr_preservation="unknown",
                         error=message,
                     )
-                )
-        errors = dict(errors)
-        for annotation in annotations:
-            if annotation.cdr_preservation == "unknown":
-                errors.setdefault(
-                    f"annotation-{annotation.candidate_id}",
-                    annotation.error or "IMGT annotation unavailable",
                 )
         mutations = (
             pl.concat(mutation_frames)

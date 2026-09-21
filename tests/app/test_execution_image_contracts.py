@@ -11,7 +11,8 @@ from types import ModuleType
 
 import pytest
 
-from biomodals.app.bioinfo import gromacs_app, rosetta_app
+from biomodals.app.bioinfo import rosetta_app
+from biomodals.app.bioinfo.gromacs import app as gromacs_app
 from biomodals.app.design import boltzgen_app
 from biomodals.app.fold import (
     abcfold2_app,
@@ -69,15 +70,19 @@ def test_humanization_coordinator_and_annotation_image_source_closures():
         (
             gromacs_app.runtime_image,
             {
-                "biomodals.app.bioinfo.gromacs_execution",
-                "biomodals.app.bioinfo.gromacs_execution_runtime",
+                "biomodals.app.bioinfo.gromacs.execution",
+                "biomodals.app.bioinfo.gromacs.execution_runtime",
+                "biomodals.app.bioinfo.gromacs.continuation",
+                "biomodals.app.bioinfo.gromacs.continue_run",
             },
         ),
         (
             gromacs_app.biotite_image,
             {
-                "biomodals.app.bioinfo.gromacs_execution",
-                "biomodals.app.bioinfo.gromacs_execution_runtime",
+                "biomodals.app.bioinfo.gromacs.analysis",
+                "biomodals.app.bioinfo.gromacs.execution",
+                "biomodals.app.bioinfo.gromacs.execution_runtime",
+                "biomodals.app.bioinfo.gromacs.continuation",
             },
         ),
         (

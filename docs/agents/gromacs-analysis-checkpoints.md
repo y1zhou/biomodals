@@ -1,27 +1,18 @@
-# GROMACS analysis checkpoint exception
+# GROMACS analysis publication
 
-`collect_traj_stats` predates the staged-cache manifest standard and is shared
-by the established GROMACS CLI entrypoint and API workflow. Within one fixed
-run directory, it treats the RMSD, radius-of-gyration, and RMSF CSV/PNG members
-as restart checkpoints and uses their modification times relative to the input
-trajectory to identify stale members.
+`collect_traj_stats` is shared by standalone GROMACS, the service and ShortMD.
+The streaming statistics implementation uses an app-owned `ContentBoundFileSet`
+covering all CSVs, requested PNGs and the aligned final-frame PDB. Identity binds
+the processed XTC and template digests, analysis policy, pinned analysis packages
+and child plot title. Stable per-output temporary paths are overwritten on
+recovery; the complete marker is published last. Missing or corrupt output
+replays analysis, never MD. Unmarked historical CSV/PNG files are not cache hits.
 
-For the pre-release MVP, this behavior is intentionally retained so the API can
-repair a missing plot without changing the standalone CLI contract or
-recomputing completed molecular dynamics. The exception is narrow:
+The old timestamp-only CSV/PNG exception is retired. Only the established native
+PBC postprocessing path retains its raw-XTC modification-time invalidation.
+Cross-worker input reads reload the Volume. A stale processed-XTC deletion is
+committed before remote postprocessing, and the caller reloads its outputs.
+Same-container CSV/plot work adds no intermediate Volume barriers.
 
-- it does not reuse outputs across run names or Inputs;
-- a missing or stale member is regenerated and the pair is written together by
-  one worker;
-- no explicit Volume commit/reload is added when the next consumer is the same
-  container; successful function exit provides the later-container publication
-  boundary;
-- the API structurally validates every required CSV and PNG before publishing a
-  successful Result; and
-- no new GROMACS cache stage may copy this timestamp-only contract.
-
-A future change that shares analysis outputs across identities, changes their
-scientific policy, or adds another reusable stage must replace this exception
-with a versioned manifest containing the trajectory identity, analysis policy,
-expected members, and validated artifact facts described by the app-development
-staged-cache standard.
+See the [continuation specification](../specs/gromacs-continuation.md#streaming-analysis)
+for scientific definitions, versioning, bounded plotting and verification.

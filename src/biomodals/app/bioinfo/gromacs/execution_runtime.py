@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from hashlib import sha256
@@ -11,11 +12,14 @@ from uuid import UUID
 
 import orjson
 
-from biomodals.app.bioinfo.gromacs_execution import (
+from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
+from biomodals.app.bioinfo.gromacs.execution import (
     EXECUTION_PLAN_SCHEMA_VERSION,
     GROMACS_SCIENTIFIC_VERSION,
+    MAX_SIMULATION_TIME_NS,
     NPT_ANALYSIS,
     NVT_ANALYSIS,
+    PREPARE_CONTINUATION,
     PREPARE_RESULT,
     PRODUCTION_ANALYSIS,
     execution_plan,
@@ -88,14 +92,36 @@ class GromacsExecutionRequest:
     max_active_gpu_provider_calls: int
     gromacs_version: str = GROMACS_SCIENTIFIC_VERSION
     execution_plan_version: str = EXECUTION_PLAN_SCHEMA_VERSION
+    continuation: ContinuationSource | None = None
+    retained_pdb_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid identities and unusable operational limits."""
         require_safe_filename_component(self.run_name, field_name="run_name")
-        if not self.pdb_content:
+        if self.retained_pdb_sha256 is not None:
+            if not re.fullmatch(r"[0-9a-f]{64}", self.retained_pdb_sha256):
+                raise ValueError("Retained input digest is invalid")
+            if not self.continuation:
+                raise ValueError("Only continuations can refer to a retained input")
+            if (
+                self.pdb_content
+                and sha256(self.pdb_content).hexdigest() != self.retained_pdb_sha256
+            ):
+                raise ValueError("Retained input digest differs from PDB content")
+        elif not self.pdb_content:
             raise ValueError("pdb_content cannot be empty")
         if self.simulation_time_ns < 1 or self.num_threads < 1:
             raise ValueError("simulation time and thread count must be positive")
+        interval = self.simulation_time_ns - (
+            self.continuation.simulation_time_ns if self.continuation else 0
+        )
+        if (
+            self.execution_plan_version in {"3", "4"}
+            and not 1 <= interval <= MAX_SIMULATION_TIME_NS
+        ):
+            raise ValueError("Production interval must be 1–250 whole nanoseconds")
+        if self.continuation and self.continuation.run_name == self.run_name:
+            raise ValueError("Continuation must use a new output directory")
         if self.ld_seed == -1 or self.gen_seed == -1 or self.genion_seed == 0:
             raise ValueError("GROMACS random sentinels must be materialized")
         if self.max_active_provider_calls < 1:
@@ -115,7 +141,7 @@ class GromacsExecutionRequest:
         return execution_plan(
             cpu_only=self.cpu_only,
             workload_run_key=self.run_name,
-            pdb_sha256=sha256(self.pdb_content).hexdigest(),
+            pdb_sha256=self.pdb_sha256,
             simulation_time_ns=self.simulation_time_ns,
             run_pdbfixer=self.run_pdbfixer,
             ld_seed=self.ld_seed,
@@ -123,7 +149,20 @@ class GromacsExecutionRequest:
             genion_seed=self.genion_seed,
             gromacs_version=self.gromacs_version,
             execution_plan_version=self.execution_plan_version,
+            continuation=(
+                self.continuation.model_dump(mode="json") if self.continuation else None
+            ),
         )
+
+    @property
+    def pdb_sha256(self) -> str:
+        """Identify either a fresh inline input or a retained continuation input."""
+        return self.retained_pdb_sha256 or sha256(self.pdb_content).hexdigest()
+
+    @property
+    def file_stem(self) -> str:
+        """Keep native checkpoint append names while isolating the child directory."""
+        return self.continuation.file_stem if self.continuation else self.run_name
 
     def run_root(self, volume_root: str | Path) -> Path:
         """Return the established app-owned output directory."""
@@ -148,6 +187,16 @@ class GromacsExecutionRequest:
                 "max_active_gpu_provider_calls": self.max_active_gpu_provider_calls,
                 "gromacs_version": self.gromacs_version,
                 "execution_plan_version": self.execution_plan_version,
+                **(
+                    {"continuation": self.continuation.model_dump(mode="json")}
+                    if self.continuation
+                    else {}
+                ),
+                **(
+                    {"retained_pdb_sha256": self.retained_pdb_sha256}
+                    if self.retained_pdb_sha256
+                    else {}
+                ),
             },
             option=orjson.OPT_SORT_KEYS,
         )
@@ -170,6 +219,10 @@ class GromacsExecutionRequest:
         if not isinstance(encoded_pdb, str):
             raise TypeError("GROMACS PDB content must be base64 text")
         value["pdb_content"] = b64decode(encoded_pdb, validate=True)
+        if value.get("continuation") is not None:
+            value["continuation"] = ContinuationSource.model_validate(
+                value["continuation"]
+            )
         return cls(**value)
 
 
@@ -187,7 +240,7 @@ def gromacs_node_paths(
     node_key: str,
 ) -> tuple[str, ...]:
     """Return the exact run-relative scientific files for one operation."""
-    name = request.run_name
+    name = request.file_stem
     prepare = preparation_execution_paths(name)
 
     def analysis(prefix: str) -> tuple[str, ...]:
@@ -199,6 +252,18 @@ def gromacs_node_paths(
 
     if node_key.startswith("prepare_tpr_"):
         return prepare
+    if node_key == PREPARE_CONTINUATION:
+        return (
+            (
+                f"{name}.pdb",
+                "production.mdp",
+                f"production_{name}.tpr",
+                "continuation.json",
+                "source.tpr",
+            )
+            + analysis("nvt_")
+            + analysis("npt_")
+        )
     if node_key == NVT_ANALYSIS:
         return analysis("nvt_")
     if node_key == NPT_ANALYSIS:
@@ -207,6 +272,10 @@ def gromacs_node_paths(
         return (
             f"production_{name}.xtc",
             f"production_{name}.edr",
+        ) + (
+            (f"production_{name}.cpt", f"production_{name}.log")
+            if request.execution_plan_version in {"3", "4"}
+            else ()
         )
     if node_key == PRODUCTION_ANALYSIS:
         return analysis("production_") + (
@@ -224,6 +293,11 @@ def gromacs_node_paths(
                 f"production_{name}.edr",
                 f"production_{name}_nopbc.xtc",
                 f"production_{name}_nopbc_centered.pdb",
+            )
+            + (
+                ("continuation.json",)
+                if request.continuation and request.execution_plan_version == "4"
+                else ()
             )
         )
     raise ValueError(f"Unknown GROMACS Node {node_key!r}")
@@ -503,10 +577,15 @@ class GromacsPublications:
 
     def invalidate(self, node_key: str) -> None:
         """Remove digest-invalid outputs and their checkpoint-bound siblings."""
+        if self.request.continuation and node_key.startswith("production_run_"):
+            # Preserve child checkpoint progress. Native append validation, not
+            # resetting the child from its source, decides whether it is usable.
+            self.publication_path(node_key).unlink(missing_ok=True)
+            return
         paths = list(self.node_paths(node_key))
         if node_key.startswith("production_run_"):
             root = self.request.run_root(self.output_root)
-            prefix = root / f"production_{self.request.run_name}"
+            prefix = root / f"production_{self.request.file_stem}"
             paths.extend(
                 Path(f"{prefix}{suffix}")
                 for suffix in (".cpt", "_prev.cpt", ".log", ".gro", ".trr", ".tng")
@@ -651,6 +730,8 @@ def _operation_kwargs(
     request: GromacsExecutionRequest,
     operation: str,
 ) -> dict[str, object]:
+    if operation == PREPARE_CONTINUATION:
+        return {"request_content": request.to_bytes()}
     if operation.startswith("prepare_tpr_"):
         return {
             "pdb_content": request.pdb_content,
@@ -668,12 +749,19 @@ def _operation_kwargs(
         cpu_only=request.cpu_only,
         run_name=request.run_name,
         simulation_time_ns=request.simulation_time_ns,
+        continuation=request.continuation is not None,
     )
+    if request.continuation:
+        invocation.kwargs["file_stem"] = request.file_stem
+    if invocation.function_name.startswith("production_run_") and request.continuation:
+        invocation.kwargs["require_checkpoint"] = True
     if invocation.function_name.startswith("production_run_"):
         invocation.kwargs.update({
             "num_threads": request.num_threads,
             "use_openmp_threads": request.use_openmp_threads,
         })
+        if request.execution_plan_version in {"3", "4"}:
+            invocation.kwargs["fixed_target"] = True
     return invocation.kwargs
 
 

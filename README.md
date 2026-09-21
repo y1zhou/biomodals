@@ -256,6 +256,17 @@ provide an owner-private highest-ranked structure and interactive PAE preview.
 Completed GROMACS Jobs show their production RMSD, radius-of-gyration and RMSF
 figures in a **Trajectory overview** panel above Execution stages, using the
 original PNGs from the result archive without rerunning the simulation.
+**Extend simulation** creates a new Job from a completed GROMACS checkpoint.
+Fresh runs and added intervals accept 1–250 whole nanoseconds; continuations
+can be chained or branched and produce the complete cumulative trajectory.
+Only the name, added time and CPU/GPU mode change. Missing or incompatible
+checkpoint state is explained instead of starting a new simulation. The form
+checks availability inside Modal without downloading simulation files; copying
+and full validation run only after submission, leaving the original unchanged.
+An active check shows progress and times out after 45 seconds with a manual
+retry option. See the
+[continuation specification](docs/specs/gromacs-continuation.md) for CLI usage
+and the required GROMACS deployment/API update.
 Large or unavailable previews do not prevent native archive downloads; see
 the [AlphaFold3 viewer specification](docs/specs/alphafold3-ux.md) for preview
 limits. AlphaFold3 input documents are

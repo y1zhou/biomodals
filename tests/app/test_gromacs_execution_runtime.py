@@ -12,8 +12,8 @@ from uuid import UUID
 import orjson
 import pytest
 
-from biomodals.app.bioinfo.gromacs_execution import PREPARE_RESULT
-from biomodals.app.bioinfo.gromacs_execution_runtime import (
+from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
     GromacsPublications,
@@ -106,6 +106,8 @@ class CompletingDriver:
         if function_name.startswith("production_run_"):
             (self.root / f"production_{self.run_name}.xtc").write_bytes(b"xtc")
             (self.root / f"production_{self.run_name}.edr").write_bytes(b"edr")
+            (self.root / f"production_{self.run_name}.cpt").write_bytes(b"checkpoint")
+            (self.root / f"production_{self.run_name}.log").write_bytes(b"log")
             return
         prefix = str(kwargs["traj_prefix"])
         for metric in ("rmsd", "rg", "rmsf"):

@@ -224,3 +224,78 @@ def test_real_fixture_reference_can_be_built_without_modal():
     snapshot = build_reference(reference_csv())
     assert snapshot.info.heavy_sequences == snapshot.info.light_sequences == 2
     assert snapshot.usage
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_humanization_page_bounded_frozen_assignments_and_usage(tmp_path, tamper):
+    """Serve only selected evidence and reject assignments for different chains."""
+    from uuid import UUID, uuid4
+
+    import polars as pl
+    from antibody_fixture import annotated_archive
+
+    from biomodals.service.humanization.results import SELECTION_SCHEMA
+    from biomodals.service.store import JobState
+    from biomodals.workflow.humanization.settings import HumanizationSettings
+
+    app = _app(tmp_path)
+    _humanization_session(app)
+    app.state.antibody_analysis.reference = TherapeuticReference(
+        tmp_path / "reference.json", download=reference_csv
+    )
+    submitted = _request(
+        app,
+        "POST",
+        "/api/v1/humanization/jobs",
+        json={"pairs": [{"id": "a", "vh": VH, "vl": VL}]},
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    job_id = UUID(submitted.json()["job_id"])
+    table = pl.DataFrame(
+        [
+            {"parent_id": "a", "candidate_id": "c1", "vh": VH, "vl": VL},
+            {"parent_id": "b", "candidate_id": "c2", "vh": VH, "vl": VL},
+        ],
+        schema=SELECTION_SCHEMA,
+    )
+    content = annotated_archive(
+        table, job_id, HumanizationSettings(), {}, tamper=tamper
+    )
+    cache = app.state.cache
+    staging = cache.staging_path(str(job_id))
+    staging.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    asyncio.run(
+        cache.publish_staged(
+            str(job_id), staging, size_bytes=len(content), sha256=digest
+        )
+    )
+    app.state.store.complete_job(
+        job_id,
+        result_state=JobState.SUCCEEDED,
+        result_filename="humanization.zip",
+        result_media_type="application/zip",
+        result_size_bytes=len(content),
+        result_sha256=digest,
+        result_archive_schema="humanization/1",
+        now=110,
+    )
+    response = _request(
+        app,
+        "GET",
+        f"/api/v1/humanization/jobs/{job_id}/selection?limit=1&parent_id=a&sort_by=vh_v_gene",
+    )
+    if tamper:
+        assert response.status_code == 409
+        assert response.json()["code"] == "result_invalid"
+    else:
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert set(result["germlines"]) == {"c1"}
+        assert result["rows"][0]["vh_v_gene"] == "IGHV1-2"
+        assert result["germlines"]["c1"]["vh"]["assignment"]["v_gene"] == "IGHV1-2"
+        assert result["reference"]["status"] == "available"
+        csv = _request(app, "GET", f"/api/v1/humanization/jobs/{job_id}/selection.csv")
+        assert csv.status_code == 200
+        assert "vh_v_gene" in csv.text.splitlines()[0]
+    asyncio.run(app.state.antibody_analysis.shutdown())

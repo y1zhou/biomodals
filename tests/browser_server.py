@@ -6,11 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import os
 import secrets
 import time
-import zipfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -21,7 +19,7 @@ from uuid import UUID, uuid4, uuid5
 import orjson
 import polars as pl
 from service.alphafold3_preview_fixture import preview_archive
-from service.antibody_fixture import reference_csv
+from service.antibody_fixture import annotated_archive, reference_csv
 from service.gromacs_preview_fixture import trajectory_archive
 
 from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
@@ -547,21 +545,10 @@ class _FakeHumanizationAdapter(_FakeAdapter):
             "panel_order",
             pl.exclude("parent_id", "candidate_id", "quality_tier", "panel_order"),
         )
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("selection.csv", table.write_csv())
-            archive.writestr(
-                "manifest.json",
-                orjson.dumps({
-                    "schema_version": 2,
-                    "execution_run_id": str(job.job_id),
-                    "parameters": request.settings.model_dump(),
-                    "scientific_versions": request.scientific_versions,
-                    "candidate_count": len(rows),
-                    "status": "succeeded",
-                }),
-            )
-        publisher = _FakeAdapter(self.remote, self.pending, buffer.getvalue())
+        content = annotated_archive(
+            table, job.job_id, request.settings, request.scientific_versions
+        )
+        publisher = _FakeAdapter(self.remote, self.pending, content)
         result = await publisher.prepare_result(job, cache, completed_at=completed_at)
         return replace(
             result,

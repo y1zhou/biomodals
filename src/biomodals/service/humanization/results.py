@@ -11,6 +11,11 @@ from uuid import UUID
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from biomodals.service.antibody_sequence_analysis.contracts import (
+    GermlinePresentation,
+    ReferenceInfo,
+)
+from biomodals.workflow.humanization.germlines import GENE_COLUMNS
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import selection_table
 
@@ -19,6 +24,14 @@ SELECTION_SCHEMA = {
     "quality_tier": pl.Int64,
     "panel_order": pl.Int64,
 }
+ANNOTATED_SELECTION_SCHEMA = {**SELECTION_SCHEMA, **GENE_COLUMNS}
+
+
+class CandidateGermlines(BaseModel):
+    """Page-bounded heavy/light assignments and therapeutic usage."""
+
+    vh: GermlinePresentation
+    vl: GermlinePresentation
 
 
 class SelectionColumn(BaseModel):
@@ -50,6 +63,14 @@ class SelectionPage(BaseModel):
     nativeness_ranges: dict[str, NativenessRange] = Field(
         description="Full-result finite min/max for the three original p-AbNatiV2 nativeness columns, before filtering or pagination. Both zero when no finite values exist. Original scores and their deltas share this range; visualization only."
     )
+    germlines: dict[str, CandidateGermlines] | None = Field(
+        default=None,
+        description="Page-only evidence keyed by candidate_id; null for historical publications.",
+    )
+    reference: ReferenceInfo | None = Field(
+        default=None,
+        description="One therapeutic reference provenance block for new germline-annotated publications.",
+    )
 
 
 def query_selection(
@@ -64,11 +85,18 @@ def query_selection(
     """Keep parsing, filtering and sorting native; serialize only the page."""
     if offset < 0 or not 1 <= limit <= 200:
         raise ValueError("offset must be nonnegative and limit between 1 and 200")
-    if sort_by is not None and sort_by not in SELECTION_SCHEMA:
+    if sort_by is not None and sort_by not in ANNOTATED_SELECTION_SCHEMA:
         raise ValueError(f"Unknown selection column: {sort_by}")
-    table = pl.read_csv(path, schema_overrides=SELECTION_SCHEMA)
-    if set(table.columns) != set(SELECTION_SCHEMA):
+    table = pl.read_csv(path, schema_overrides=ANNOTATED_SELECTION_SCHEMA)
+    if set(table.columns) not in (
+        set(SELECTION_SCHEMA),
+        set(ANNOTATED_SELECTION_SCHEMA),
+    ):
         raise ValueError("Selection table columns do not match the workflow schema")
+    if sort_by is not None and sort_by not in table.columns:
+        raise ValueError(
+            f"Selection column not available in this publication: {sort_by}"
+        )
     parent_ids = table.get_column("parent_id").unique().sort().to_list()
     hidden = table.select(
         *(
@@ -153,7 +181,7 @@ class HumanizationManifestFile(BaseModel):
 class HumanizationManifest(BaseModel):
     """Publication identity and safe membership, shared by download and packaging."""
 
-    schema_version: Literal[2, 3]
+    schema_version: Literal[2, 3, 4]
     execution_run_id: UUID
     parameters: HumanizationSettings
     scientific_versions: dict[str, str]
@@ -175,8 +203,10 @@ class HumanizationManifest(BaseModel):
             ):
                 raise ValueError(f"Unsafe result path: {name}")
         required = {"selection.csv", "imgt_mutations.parquet"}
-        if self.schema_version == 3:
+        if self.schema_version >= 3:
             required.add("generation.parquet")
+        if self.schema_version >= 4:
+            required.add("germlines.parquet")
         if not required <= set(names):
             raise ValueError("Scientific publication is missing required tables")
         return self

@@ -12,26 +12,26 @@ from biomodals.workflow.humanization.contracts import (
     CandidateAnnotation,
     HumanizationCandidate,
 )
+from biomodals.workflow.humanization.germlines import candidate_germlines
 
 
 def annotate_humanization_candidate(
     parent: dict[str, Any], candidate: dict[str, Any]
 ) -> AppRunResult:
     """Remote operation bound to a numbering-enabled image by the workflow root."""
+    candidate_model = HumanizationCandidate.model_validate(candidate)
     annotation, mutations = annotate_candidate(
         AntibodyPair.model_validate(parent),
-        HumanizationCandidate.model_validate(candidate),
+        candidate_model,
     )
-    if annotation.cdr_preservation == "unknown":
-        return AppRunResult(
-            status=AppRunStatus.FAILED,
-            warnings=[annotation.error or "IMGT annotation unavailable"],
-        )
+    # The operation publishes independent annotation outcomes. The finalizer
+    # retains the established partial-result policy for unavailable IMGT checks.
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
             json_output("annotation", annotation.model_dump()),
             json_output("imgt_mutations", mutations),
+            json_output("germlines", candidate_germlines(candidate_model)),
         ],
     )
 

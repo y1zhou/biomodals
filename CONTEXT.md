@@ -412,21 +412,22 @@ persisting a duplicate compute state.
 _Avoid_: Execution Run, Task, provider call
 
 **Tool**:
-A user-facing scientific capability registered with the API service, such as
-GROMACS MD simulation or AlphaFold3 structure prediction. A Tool owns its
-typed submission and Result contract and selects one deployed app or workflow;
-the selected execution plan remains a Workload in kernel vocabulary.
+A user-facing scientific capability, such as GROMACS MD simulation or Antibody
+Sequence Analysis. Job-producing Tools have durable execution and Results;
+immediate sequence analysis does not create a Service Job.
 _Avoid_: Workload, Modal App, individual provider function
 
 **Tool Definition**:
-The static service metadata for one Tool: stable key, display name, ordered
-semantic stages, default deployment and limits, and log-visibility default.
+The static service metadata for one Job-producing Tool: stable key, display
+name, ordered semantic stages, default deployment and limits, and log-visibility
+default.
 _Avoid_: scientific request parser, runtime client, dynamic plugin
 
 **Tool Adapter**:
-The narrow service integration that validates and stages one Tool's scientific
-request and retrieves its published Result. Shared remote execution lifecycle,
-status, cancellation, logs, and deployment lookup do not belong here.
+The narrow service integration that validates and stages one Job-producing
+Tool's scientific request and retrieves its published Result. Shared remote
+execution lifecycle, status, cancellation, logs, and deployment lookup do not
+belong here.
 _Avoid_: Execution Coordinator, per-Tool reconciler, generic artifact framework
 
 **Remote Execution Client**:
@@ -803,6 +804,39 @@ antibody candidate. Sapiens evaluates the two regions independently rather
 than as a jointly conditioned pair; Humatch evaluates both chain-specific and
 joint pairing properties.
 _Avoid_: paired Sapiens model, full antibody
+
+**Antibody Sequence Analysis**:
+Sequence-derived characterization of an Antibody Variable Region or an explicit
+VH-VL Pair, including estimated physicochemical properties, germline reference
+matches, numbering and potential liability motifs. It is not humanization or
+experimental validation of developability.
+_Avoid_: Humanization Cross-Evaluation, measured antibody properties
+
+**Recombined VH-VL Pair**:
+A VH-VL Pair formed by independently selecting its heavy and light variable
+regions from candidates of the same parental antibody. It does not inherit
+the pairing scores or ranking of either source candidate and need not belong
+to the original Humanization Candidate Union.
+_Avoid_: cross-parent pairing, generated humanization candidate, independently validated pair
+
+**VH+VL Sequence pI**:
+The theoretical isoelectric point of the heavy variable-region sequence
+followed directly by the light variable-region sequence, treated as one
+continuous chain without a linker.
+_Avoid_: mean chain pI, two-chain complex pI, full-antibody pI
+
+**Therapeutic Germline Usage**:
+The weighted frequency of a species-qualified V or J gene assignment among
+unique variable-region sequences in the approved therapeutic reference cohort.
+Equal best gene assignments share one sequence's credit; synonymous alleles
+do not receive additional weight.
+_Avoid_: allele frequency, clinical success rate, natural repertoire frequency
+
+**Approved Therapeutic Reference Cohort**:
+The therapeutics marked exactly Approved in the selected Thera-SAbDab snapshot,
+excluding withdrawn-approval labels but not requiring an Active development
+status. This is a snapshot-defined cohort, not a claim of current approval.
+_Avoid_: all Thera-SAbDab entries, currently approved medicines
 
 **Complete VH-VL Pair**:
 A VH-VL Pair whose heavy domain and kappa or lambda light domain contain only

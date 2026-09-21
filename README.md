@@ -188,6 +188,10 @@ web interface. It exposes GROMACS MD simulation, AlphaFold3 structure
 prediction and [antibody humanization](docs/humanization.md) through shared
 account and Job routes.
 
+[Antibody sequence analysis](docs/antibody-sequence-analysis.md) provides local
+sequence metrics, germline usage and numbered CDR/liability displays through the
+same authenticated API. It creates no Job and submits no Modal compute.
+
 The service owns Users, Sessions, lean Job locators and projections, runtime
 settings, retained AlphaFold3 validation resources, and Result staging. Each
 Job points to an exact deployed Tool coordinator, which remains the sole

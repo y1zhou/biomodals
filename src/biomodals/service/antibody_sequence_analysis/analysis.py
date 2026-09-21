@@ -8,7 +8,12 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from biomodals.helper.antibody import analyze_chain, combined_pi, normalize_sequence
+from biomodals.helper.antibody import (
+    ChainAnalysis,
+    analyze_chain,
+    combined_pi,
+    normalize_sequence,
+)
 from biomodals.service.antibody_sequence_analysis.contracts import (
     MAX_ENTRIES,
     AnalysisEntry,
@@ -160,15 +165,17 @@ class AnalysisService:
             self._reference_task = asyncio.create_task(
                 asyncio.to_thread(self.reference.get)
             )
+        task = self._reference_task
         try:
-            snapshot = await asyncio.shield(self._reference_task)
+            snapshot = await asyncio.shield(task)
         except Exception:
             LOGGER.warning(
                 "Therapeutic germline reference is unavailable", exc_info=True
             )
             # A later explicit analysis can retry an absent cache; an invalid file
             # remains untouched and continues to report unavailable.
-            self._reference_task = None
+            if self._reference_task is task:
+                self._reference_task = None
             return None, ReferenceInfo(
                 status="unavailable",
                 source_url=SOURCE_URL,
@@ -185,6 +192,18 @@ class AnalysisService:
             for entry in entries
             for sequence in entry.sequences.values()
         })
+        if not sequences:
+            return self._assemble(
+                request,
+                parsed,
+                {},
+                None,
+                ReferenceInfo(
+                    status="unavailable",
+                    source_url=SOURCE_URL,
+                    detail="No valid sequences to analyze; reference data were not requested.",
+                ),
+            )
         loop = asyncio.get_running_loop()
         computations = [
             loop.run_in_executor(self.pool, analyze_chain, sequence)
@@ -193,6 +212,38 @@ class AnalysisService:
         reference_future = asyncio.create_task(self.reference_snapshot())
         results = dict(zip(sequences, await asyncio.gather(*computations), strict=True))
         snapshot, info = await reference_future
+        return await loop.run_in_executor(
+            self.pool, self._assemble, request, parsed, results, snapshot, info
+        )
+
+    @staticmethod
+    def _assemble(
+        request: AnalysisRequest,
+        parsed: list[tuple[list[ParsedEntry], list[AnalysisIssue]]],
+        results: dict[str, ChainAnalysis],
+        snapshot: ReferenceSnapshot | None,
+        info: ReferenceInfo,
+    ) -> AnalysisResponse:
+        """Reuse per-chain presentations and per-pair pI off the event loop."""
+        chains = {}
+        for sequence, analyzed in results.items():
+            chain_type = analyzed["germlines"]["chain_type"]
+            role = (
+                "vh"
+                if chain_type == "H"
+                else "vl"
+                if chain_type in ("K", "L")
+                else "unassigned"
+            )
+            chains[sequence] = (
+                role,
+                AnalyzedChain(
+                    sequence=sequence,
+                    metrics=analyzed["metrics"],
+                    germlines=present_germlines(analyzed["germlines"], role, snapshot),
+                ),
+            )
+        pair_pis = {}
         groups = []
         for group, (entries, issues) in zip(request.groups, parsed, strict=True):
             output = AnalysisGroup(id=group.id, entries=[], issues=issues)
@@ -203,21 +254,8 @@ class AnalysisService:
                 for role, sequence in entry.sequences.items():
                     analyzed = results[sequence]
                     chain_type = analyzed["germlines"]["chain_type"]
-                    detected_role = (
-                        "vh"
-                        if chain_type == "H"
-                        else "vl"
-                        if chain_type in ("K", "L")
-                        else "unassigned"
-                    )
+                    detected_role, chain = chains[sequence]
                     target = detected_role if role == "sequence" else role
-                    chain = AnalyzedChain(
-                        sequence=sequence,
-                        metrics=analyzed["metrics"],
-                        germlines=present_germlines(
-                            analyzed["germlines"], detected_role, snapshot
-                        ),
-                    )
                     setattr(row, target, chain)
                     if role != "sequence" and detected_role not in (role, "unassigned"):
                         row.issues.append(
@@ -240,7 +278,10 @@ class AnalysisService:
                         issue.code == "wrong_chain_role" for issue in row.issues
                     )
                 ):
-                    row.vh_vl_pi = combined_pi(row.vh.sequence, row.vl.sequence)
+                    pair = row.vh.sequence, row.vl.sequence
+                    if pair not in pair_pis:
+                        pair_pis[pair] = combined_pi(*pair)
+                    row.vh_vl_pi = pair_pis[pair]
         return AnalysisResponse(groups=groups, reference=info)
 
     async def shutdown(self) -> None:

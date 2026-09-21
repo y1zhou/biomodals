@@ -7,6 +7,7 @@ import pytest
 from biomodals.helper.antibody import (
     SCHEMES,
     analyze_chain,
+    analyze_pair,
     assign_germlines,
     combined_pi,
     normalize_sequence,
@@ -79,6 +80,18 @@ def test_native_germline_evidence_and_chain_roles():
     assert heavy["v"][0]["species"] == "Homo sapiens"
     assert heavy["v"][0]["known_pairs"] >= heavy["v"][0]["known_matches"] > 0
     assert heavy["j"] and light["j"]
+
+
+def test_importable_pair_api_is_plain_data_and_does_not_swap_roles():
+    """Standalone Python consumers get the same scientific definitions."""
+    pair = analyze_pair(VH, VL)
+    assert pair["vh"]["sequence"] == VH
+    assert pair["vl"]["sequence"] == VL
+    assert pair["vh_vl_pi"] == combined_pi(VH, VL)
+    assert pair["errors"] == []
+    swapped = analyze_pair(VL, VH)
+    assert len(swapped["errors"]) == 2
+    assert swapped["vh_vl_pi"] is None
 
 
 def test_gene_display_collapses_alleles_but_preserves_all_tied_evidence(monkeypatch):

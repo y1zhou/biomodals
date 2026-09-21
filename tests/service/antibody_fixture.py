@@ -81,8 +81,8 @@ def reference_csv() -> bytes:
             "Est. Status": ["Active", "NFD", "Active"],
             "HeavySequence": [VH, VH.lower(), VH + "C"],
             "LightSequence": [VL, VL.lower(), VL + "C"],
-            "HeavySequence(ifbispec)": [None, VH + "H", None],
-            "LightSequence(ifbispec)": [None, VL + "H", None],
+            "HeavySequence(ifbispec)": ["na", VH + "H", None],
+            "LightSequence(ifbispec)": ["na", VL + "H", None],
         })
         .write_csv()
         .encode()

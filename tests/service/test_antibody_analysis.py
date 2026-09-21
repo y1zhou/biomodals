@@ -110,12 +110,19 @@ def test_analysis_deduplicates_native_work_and_preserves_partial_groups(
 
     calls = []
     original = analysis.analyze_chain
+    pair_calls = []
+    original_pi = analysis.combined_pi
 
     def counted(sequence):
         calls.append(sequence)
         return original(sequence)
 
+    def counted_pi(vh, vl):
+        pair_calls.append((vh, vl))
+        return original_pi(vh, vl)
+
     monkeypatch.setattr(analysis, "analyze_chain", counted)
+    monkeypatch.setattr(analysis, "combined_pi", counted_pi)
     service = AnalysisService(
         TherapeuticReference(tmp_path / "reference.json", download=reference_csv)
     )
@@ -138,6 +145,7 @@ def test_analysis_deduplicates_native_work_and_preserves_partial_groups(
 
     response = asyncio.run(run())
     assert sorted(calls) == sorted([VH, VL, "ACD"])
+    assert pair_calls == [(VH, VL)]
     first, repeated, invalid, swapped, short = response.groups[0].entries
     assert first.vh_vl_pi == repeated.vh_vl_pi
     assert invalid.issues[0].code == "invalid_sequence"
@@ -224,6 +232,27 @@ def test_real_fixture_reference_can_be_built_without_modal():
     snapshot = build_reference(reference_csv())
     assert snapshot.info.heavy_sequences == snapshot.info.light_sequences == 2
     assert snapshot.usage
+
+
+def test_all_invalid_inputs_do_not_trigger_reference_download(tmp_path):
+    """Validation-only responses avoid unrelated public-reference work."""
+    service = AnalysisService(
+        TherapeuticReference(
+            tmp_path / "reference.json",
+            download=lambda: pytest.fail("invalid request must not download"),
+        )
+    )
+
+    async def run():
+        try:
+            return await service.analyze(
+                AnalysisRequest(groups=[FastaGroup(id="a", fasta=">bad\nX")])
+            )
+        finally:
+            await service.shutdown()
+
+    response = asyncio.run(run())
+    assert response.groups[0].entries[0].issues[0].code == "invalid_sequence"
 
 
 @pytest.mark.parametrize("tamper", [False, True])

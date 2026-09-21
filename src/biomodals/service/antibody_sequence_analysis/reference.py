@@ -75,7 +75,7 @@ def download_reference() -> bytes:
 
 def build_reference(content: bytes) -> ReferenceSnapshot:
     """Count exact unique chains, splitting credit over species/gene ties."""
-    frame = pl.read_csv(BytesIO(content), infer_schema_length=0)
+    frame = pl.read_csv(BytesIO(content), infer_schema_length=0, null_values=["na"])
     approved = frame.filter(pl.col("Highest_Clin_Trial (Feb '25)") == "Approved")
     chains = (
         pl

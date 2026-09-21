@@ -89,6 +89,7 @@ class _FakeRemote:
         self.secondary_password_link = ""
         self.humanization_password_link = ""
         self.alphafold3_password_link = ""
+        self.antibody_analysis_password_link = ""
         self.alphafold3_job_id = ""
         self.alphafold3_retry_job_id = ""
         self.preflight_versions: list[int] = []
@@ -113,6 +114,7 @@ class _FakeRemote:
                     "secondary_password_link": self.secondary_password_link,
                     "humanization_password_link": self.humanization_password_link,
                     "alphafold3_password_link": self.alphafold3_password_link,
+                    "antibody_analysis_password_link": self.antibody_analysis_password_link,
                     "alphafold3_job_id": self.alphafold3_job_id,
                     "alphafold3_retry_job_id": self.alphafold3_retry_job_id,
                     "preflight_versions": self.preflight_versions,
@@ -635,6 +637,11 @@ def _create_browser_app():
         "humanization-user@example.com", display_name="Humanization Browser User"
     )
     remote.humanization_password_link = humanization_link.urls[0]
+    analysis_link = auth.create_user(
+        "antibody-analysis-user@example.com",
+        display_name="Antibody Analysis Browser User",
+    )
+    remote.antibody_analysis_password_link = analysis_link.urls[0]
     cache = ArtifactCache(settings.cache_dir / "results")
     af3_link = auth.create_user(
         "alphafold3-user@example.com", display_name="AlphaFold3 Browser User"

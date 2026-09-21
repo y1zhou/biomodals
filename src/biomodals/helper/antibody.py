@@ -69,6 +69,15 @@ class ChainAnalysis(TypedDict):
     germlines: GermlineAssignment
 
 
+class PairAnalysis(TypedDict):
+    """Ordinary Python result for an explicitly ordered VH/VL pair."""
+
+    vh: ChainAnalysis
+    vl: ChainAnalysis
+    vh_vl_pi: float | None
+    errors: list[str]
+
+
 class NumberedResidue(TypedDict):
     """One supplied residue in native order; no imputed positions."""
 
@@ -192,6 +201,31 @@ def analyze_chain(sequence: str) -> ChainAnalysis:
         "sequence": sequence,
         "metrics": protein_metrics(sequence),
         "germlines": assign_germlines(sequence),
+    }
+
+
+def analyze_pair(vh: str, vl: str) -> PairAnalysis:
+    """Analyze an explicit pair without swapping chains or creating a Job.
+
+    Batch consumers may call the lower-level chain/pI functions to share work
+    across repeated sequences within their request.
+    """
+    heavy, light = analyze_chain(vh), analyze_chain(vl)
+    errors = [
+        f"{role}: detected chain role {analysis['germlines']['chain_type']}"
+        for role, analysis, allowed in (
+            ("vh", heavy, (None, "H")),
+            ("vl", light, (None, "K", "L")),
+        )
+        if analysis["germlines"]["chain_type"] not in allowed
+    ]
+    return {
+        "vh": heavy,
+        "vl": light,
+        "vh_vl_pi": None
+        if errors
+        else combined_pi(heavy["sequence"], light["sequence"]),
+        "errors": errors,
     }
 
 

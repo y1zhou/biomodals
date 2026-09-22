@@ -812,6 +812,26 @@ matches, numbering and potential liability motifs. It is not humanization or
 experimental validation of developability.
 _Avoid_: Humanization Cross-Evaluation, measured antibody properties
 
+**Nanobody Humanization**:
+Humanization of a VH domain, including but not restricted to camelid VHH,
+that considers human-VH resemblance and VHH compatibility as distinct
+properties. Neither property establishes retained function, autonomous
+single-domain behavior or reduced immunogenicity.
+_Avoid_: paired antibody humanization, heavy-chain-only pairing optimization
+
+**Prepared VH Domain**:
+The VH domain supplied to humanization models after removal of flanking
+non-variable sequence and germline-based completion of missing terminal
+FR1/FR4 residues. It is the parental comparison baseline, distinct from the
+original submitted sequence.
+_Avoid_: original input, experimentally verified parental sequence
+
+**Nanobody Candidate Union**:
+The sequence-distinct VH candidates collected from independent generators for
+one Prepared VH Domain, retaining every generating method's provenance and
+the unchanged prepared parent as a baseline. It is not a VH-VL pairing set.
+_Avoid_: consensus sequence, experimentally validated panel, Humanization Candidate Union
+
 **Recombined VH-VL Pair**:
 A VH-VL Pair formed by independently selecting its heavy and light variable
 regions from candidates of the same parental antibody. It does not inherit

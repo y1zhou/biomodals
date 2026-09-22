@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from hashlib import md5, sha256
 from pathlib import Path
 from tarfile import open as open_tar
-from urllib.request import urlopen
 from uuid import uuid4
 
 import orjson
+
+from biomodals.helper.model_download import DownloadSpec, download_model_asset
 
 MODEL_MANIFEST = "manifest.json"
 PAIRED_CHECKPOINT = "vpaired2_model.ckpt"
@@ -43,16 +44,6 @@ class PAbNatiV2Identity:
     pssm_frequency_cutoff: float = 0.01
     nativeness_weight: float = 10.0
     pairing_weight: float = 1.0
-
-
-@dataclass(frozen=True, slots=True)
-class DownloadSpec:
-    """One immutable published artifact downloaded during explicit staging."""
-
-    filename: str
-    url: str
-    size_bytes: int
-    md5_hex: str
 
 
 IDENTITY = PAbNatiV2Identity()
@@ -119,34 +110,6 @@ def _digest_file(path: Path, algorithm: str) -> str:
         while chunk := stream.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _download(root: Path, spec: DownloadSpec) -> Path:
-    target = root / spec.filename
-    temporary = root / f".{spec.filename}.{uuid4().hex}.part"
-    digest = md5(usedforsecurity=False)
-    size = 0
-    try:
-        with (
-            urlopen(  # noqa: S310 - both immutable specifications use HTTPS
-                spec.url, timeout=180
-            ) as response,
-            temporary.open("wb") as out,
-        ):
-            while chunk := response.read(8 * 1024 * 1024):
-                size += len(chunk)
-                if size > spec.size_bytes:
-                    raise ValueError(
-                        f"Downloaded {spec.filename} exceeds expected size"
-                    )
-                digest.update(chunk)
-                out.write(chunk)
-        if size != spec.size_bytes or digest.hexdigest() != spec.md5_hex:
-            raise ValueError(f"Downloaded {spec.filename} failed checksum validation")
-        temporary.replace(target)
-        return target
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _extract_structure_checkpoint(root: Path, archive: Path) -> dict[str, str | int]:
@@ -236,8 +199,8 @@ def stage_pabnativ2_assets(root: Path) -> dict[str, object]:
     except RuntimeError:
         pass
 
-    paired = _download(root, PAIRED_MODEL)
-    archive = _download(root, STRUCTURE_MODEL_ARCHIVE)
+    paired = download_model_asset(root, PAIRED_MODEL)
+    archive = download_model_asset(root, STRUCTURE_MODEL_ARCHIVE)
     structure = _extract_structure_checkpoint(root, archive)
     archive.unlink()
     manifest: dict[str, object] = {

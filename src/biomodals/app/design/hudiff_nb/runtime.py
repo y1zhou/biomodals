@@ -14,6 +14,18 @@ from biomodals.app.design.vhh import VHHInput
 BATCH_SIZE = 10
 
 
+def protect_tokens(
+    parent: VHHInput, input_grid: str, tokens: Any, mutable: Any, tokenizer: Any
+) -> list[int]:
+    """Restore protected native tokens before removing their positions from sampling."""
+    occupied = [index for index, residue in enumerate(input_grid) if residue != "-"]
+    protected_grid = {occupied[index] for index in parent.protected_indices}
+    original_tokens = tokenizer.seq2idx(list(input_grid))
+    for index in protected_grid:
+        tokens[:, index] = original_tokens[index]
+    return [index for index in mutable if index not in protected_grid]
+
+
 def native_grid(sequence: str, positions: dict[str, int]) -> str:
     """Reject silent native truncation, unsupported positions or non-heavy input."""
     from anarci import anarci  # type: ignore[ty:unresolved-import]
@@ -138,12 +150,7 @@ def run(request: dict[str, Any], checkpoint_path: str) -> dict[str, Any]:
     tokens, regions, mutable, tokenizer = batch_input_element(
         parent.sequence, inpaint_sample=True, batch_size=BATCH_SIZE
     )
-    occupied = [index for index, residue in enumerate(input_grid) if residue != "-"]
-    protected_grid = {occupied[index] for index in parent.protected_indices}
-    original_tokens = tokenizer.seq2idx(list(input_grid))
-    for index in protected_grid:
-        tokens[:, index] = original_tokens[index]
-    mutable = np.array([index for index in mutable if index not in protected_grid])
+    mutable = np.array(protect_tokens(parent, input_grid, tokens, mutable, tokenizer))
     np.random.shuffle(mutable)
     attempts = sample_attempts(
         model=model,

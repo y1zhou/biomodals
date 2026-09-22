@@ -121,13 +121,27 @@ def test_fixed_batch_carry_over_matches_pinned_native_loop(
             assert [row["attempt_index"] for row in attempts] == list(
                 range(1, count + 1)
             )
-            assert len({row["sequence"] for row in attempts}) <= count
         histories.append(history)
         decodings.append(tokenizer.decoded[:count])
     assert decodings[0] == decodings[1]
     assert len(histories[0]) == len(histories[1]) == 2 * ((count + 9) // 10)
     for expected, observed in zip(*histories, strict=True):
         np.testing.assert_array_equal(expected, observed)
+
+
+def test_extra_protection_restores_parent_tokens_before_sampling():
+    """Removing a mutable index alone would leave the native mask token in output."""
+    parent = VHHInput(sequence="ACDE", protected_indices=(1, 3))
+    grid = "A-CD-E"
+    tokenizer = SimpleNamespace(
+        seq2idx=lambda values: ["ACDE-?".index(aa) for aa in values]
+    )
+    tokens = np.full((10, len(grid)), 5)
+    mutable = runtime.protect_tokens(parent, grid, tokens, [0, 2, 3, 5], tokenizer)
+    assert mutable == [0, 3]
+    np.testing.assert_array_equal(tokens[:, 2], np.full(10, 1))
+    np.testing.assert_array_equal(tokens[:, 5], np.full(10, 3))
+    np.testing.assert_array_equal(tokens[:, 0], np.full(10, 5))
 
 
 def test_native_grid_rejects_truncation_unknown_positions_and_light_chains(monkeypatch):

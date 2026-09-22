@@ -16,6 +16,7 @@ from biomodals.app.design.hudiff_ab.models import (
     RUNTIME_IDENTITY,
     SOURCE_COMMIT,
     assert_hudiff_assets,
+    stage_hudiff_assets,
 )
 from biomodals.app.design.hudiff_nb.patches import (
     apply_nanobody_patches,
@@ -36,6 +37,16 @@ CHECKPOINT = next(
     item for item in CHECKPOINTS if item.path == "checkpoints/nanobody/hudiffnb.pt"
 )
 MAX_RESULT_BYTES = 1024 * 1024
+
+
+def stage_hudiff_nb_models() -> dict[str, object]:
+    """CPU-only reuse of the verified HuDiff assets; never run paired inference."""
+    from biomodals.helper.constant import MODEL_VOLUME
+
+    MODEL_VOLUME.reload()
+    manifest = stage_hudiff_assets(MODEL_ROOT)
+    MODEL_VOLUME.commit()
+    return manifest
 
 
 @cache

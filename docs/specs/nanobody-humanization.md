@@ -191,8 +191,11 @@ scores to zero to accommodate single-domain candidates.
 
 Keep reusable scientific analysis in the existing helper and general execution
 in the kernel. VHH-specific generation, candidates, validation,
-ranking and publication belong to a separate workflow package. Exact app
-boundaries and any extraction from paired implementations remain undecided.
+ranking and publication belong to a separate workflow package. The
+`abnativ2_vhh` and `hudiff_nb` apps own native generation/evaluation workers;
+the workflow owns production admission and recovery. Each app also exposes a
+one-call, development-only diagnostic entrypoint for an already prepared
+sequence and protected-index JSON. These do not create nested coordinators.
 
 Frontend inspection at `0462dde` confirms that shared Job detail, server stages,
 authentication, cancellation and downloads can support another Tool. Catalog
@@ -273,7 +276,7 @@ weights. Do not allow these defaults to choose scientific behavior implicitly.
 
 The [2.0.9 packaging update](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/commit/413ebd3995f9383bcb225638810d7fa0b5a3dbe4)
 changes the version and package-data paths, not the audited VHH search logic.
-It is a candidate pin for the new VHH app, not authorization to upgrade the
+It is the pin for the new VHH app, not authorization to upgrade the
 existing paired runtime. Native exhaustive search has no effective combination
 cap: it materializes combinations, scores them and predicts frontier-member
 structures. Enhanced endpoint generation is the accepted first scope;
@@ -293,8 +296,11 @@ solvent-exposure selection and for final parental/candidate structures. Setting
 the exposure threshold to zero does not eliminate final structure prediction.
 Standalone unpaired VH2/VHH2 scoring does not require that structural pipeline.
 A sequence-input interface is therefore not a promise of structure-free compute.
-The exact source, predictor, weights and defaults are a later interview decision;
-the new release must not silently upgrade the existing paired app.
+The new app pins this implementation and NbForge 0.1.1 separately from the
+existing paired app. Its explicit defaults are VH2/VHH2, enhanced search,
+thresholds 0.98/0.15, per-step loss tolerance 0.05, weights 2/1 and forbidden
+substitution targets C/M. Native structure generation is retained; its output
+is an operational artifact, not copied into the final selection ZIP.
 
 The inspected [NbForge 0.1.1 dependency declarations](https://gitlab.doc.ic.ac.uk/sormanni-lab/nbforge/-/blob/f5c90aa6a81968759890ae269d4ba137d0a6a61b/setup.cfg)
 require NumPy >=2.2.6 and Lightning >=2.5.6, conflicting with the existing paired
@@ -327,6 +333,24 @@ parental cysteines and hallmark residues. This is an accepted additional
 workflow restriction, not native equivalence of the two masks.
 For HuDiff, extra protection must preserve parental tokens as well as remove
 those sites from sampling; output validation alone is not a generation mask.
+
+The wrapper explicitly seeds the released sampler, retains its fixed batch of
+10 and cross-batch token carry-over, and records exactly the requested number
+of attempts before duplicate filtering. The offline pinned-loop oracle compares
+model inputs and sampling draws at budgets 1, 10, 11 and 25. This verifies loop
+semantics, not full model inference. Guarded import-only patches avoid loading
+training-only preprocessing/scorer dependencies; their source identity is
+recorded alongside the released checkpoint.
+
+Both apps check native numbering before inference and revalidate generated
+sequences afterward. AbNatiV raw mean/profile tables are preserved as Parquet
+inside small execution archives; missing/nonfinite scores become null in the
+scalar summary, while finite raw values are never clipped. Runtime model
+downloads are explicit CPU preparation, with byte identities in
+[AbNatiV2-VHH models](../../src/biomodals/app/design/abnativ2_vhh/models.py)
+and the existing HuDiff asset manifest. Offline invocation, image build-order,
+source-closure and integrity tests do not substitute for a deployed image/model
+smoke test; that remains subject to separate authorization.
 
 The [implementation protocol](https://bio-protocol.org/en/bpdetail?id=5816&type=0)
 uses AbNatiV during nanobody fine-tuning. Consequently, favorable AbNatiV scores

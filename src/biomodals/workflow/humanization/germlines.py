@@ -14,6 +14,7 @@ from biomodals.helper.antibody import (
     combined_pi,
     sequence_pi,
 )
+from biomodals.helper.antibody_tables import GERMLINE_TABLE_SCHEMA
 from biomodals.workflow.humanization.contracts import HumanizationCandidate
 
 GENE_COLUMNS = {
@@ -27,34 +28,7 @@ SEQUENCE_COLUMNS = {
     "vh_vl_pI": pl.Float64,
     **GENE_COLUMNS,
 }
-_EVIDENCE = pl.Struct({
-    "reference_id": pl.String,
-    "species": pl.String,
-    "gene": pl.String,
-    "allele": pl.String,
-    "accession": pl.String,
-    "score": pl.Float64,
-    "known_pairs": pl.Int64,
-    "known_matches": pl.Int64,
-    "known_fr4_pairs": pl.Int64,
-    "reference_coverage": pl.Float64,
-    "query_coverage": pl.Float64,
-    "query_input_start": pl.Int64,
-    "imgt_span": pl.List(pl.Int64),
-})
-GERMLINE_SCHEMA = {
-    "parent_id": pl.String,
-    "candidate_id": pl.String,
-    "chain": pl.String,
-    "sequence_sha256": pl.String,
-    "chain_type": pl.String,
-    "v_gene": pl.String,
-    "j_gene": pl.String,
-    "v": pl.List(_EVIDENCE),
-    "j": pl.List(_EVIDENCE),
-    "diagnostics": pl.List(pl.String),
-    "error": pl.String,
-}
+GERMLINE_SCHEMA = GERMLINE_TABLE_SCHEMA
 ASSIGNMENT_COLUMNS = tuple(
     key
     for key in GERMLINE_SCHEMA

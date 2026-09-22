@@ -22,6 +22,7 @@ from biomodals.app.fold import (
 )
 from biomodals.app.score import af3score_app, ensirna_app, oligoformer_app
 from biomodals.workflow.humanization import workflow as humanization_workflow
+from biomodals.workflow.nanobody_humanization import workflow as nanobody_workflow
 from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
 
 
@@ -64,10 +65,32 @@ def test_humanization_coordinator_and_annotation_image_source_closures():
         ast.parse(path.read_text(), feature_version=(3, 12))
 
 
+def test_nanobody_coordinator_and_annotation_source_closures():
+    assert {"biomodals.workflow", "biomodals.app"} <= _source_modules(
+        nanobody_workflow.runtime_image
+    )
+    assert "biomodals.workflow.nanobody_humanization" in _source_modules(
+        nanobody_workflow.annotation_image
+    )
+    assert nanobody_workflow.CONF.python_version == "3.13"
+    assert nanobody_workflow.CONF.depends_on_apps == ("abnativ2_vhh", "hudiff_nb")
+    assert nanobody_workflow.CONF.tags["biomodals_tool"] == "nanobody_humanization"
+
+
 @pytest.mark.parametrize(
     "image",
-    (humanization_workflow.app.image, humanization_workflow.annotation_image),
-    ids=("coordinator", "annotation"),
+    (
+        humanization_workflow.app.image,
+        humanization_workflow.annotation_image,
+        nanobody_workflow.runtime_image,
+        nanobody_workflow.annotation_image,
+    ),
+    ids=(
+        "paired-coordinator",
+        "paired-annotation",
+        "nanobody-coordinator",
+        "nanobody-annotation",
+    ),
 )
 def test_humanization_images_install_before_source_mounts(image):
     """Check the real SDK build graph without resolving any remote images."""

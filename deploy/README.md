@@ -25,10 +25,10 @@ through the host package manager.
 Replace every Modal token placeholder before starting a service. The backend
 refuses to start when either credential is missing.
 
-A fresh database initially uses `Gromacs`, `AlphaFold3`, and
-`HumanizationWorkflow` at version `1`. These are defaults, not a guarantee that
-those historical deployments support the current API. Startup resolves the
-exact configured deployments of all three Tools before reporting ready.
+A fresh database initially uses `Gromacs`, `AlphaFold3`, `HumanizationWorkflow`,
+and `NanobodyHumanizationWorkflow` at version `1`. These are defaults, not a
+guarantee that those historical deployments support the current API. Startup resolves the
+exact configured deployments of all registered Tools before reporting ready.
 Identify deployments built from the matching backend release, then save
 their positive versions in Admin → Modal → Tools:
 
@@ -36,19 +36,25 @@ their positive versions in Admin → Modal → Tools:
 modal app history Gromacs --env <environment> --json
 modal app history AlphaFold3 --env <environment> --json
 modal app history HumanizationWorkflow --env <environment> --json
+modal app history NanobodyHumanizationWorkflow --env <environment> --json
 ```
 
 The production examples deliberately do not set those deployment versions as
 process environment variables, because doing so would make the Admin fields
 read-only. Supply matching versions from a private `BIOMODALS_API_CONF_ENV`
 file for first boot; do not depend on version `1` merely existing. Set
-`BIOMODALS_GROMACS_APP_VERSION`, `BIOMODALS_ALPHAFOLD3_APP_VERSION`, and
-`BIOMODALS_HUMANIZATION_APP_VERSION` there, along with the intended
+`BIOMODALS_GROMACS_APP_VERSION`, `BIOMODALS_ALPHAFOLD3_APP_VERSION`,
+`BIOMODALS_HUMANIZATION_APP_VERSION`, and
+`BIOMODALS_NANOBODY_HUMANIZATION_APP_VERSION` there, along with the intended
 `BIOMODALS_MODAL_ENVIRONMENT`. The file must be owned by the service user with
 mode `0600`; container deployments must mount it privately and use its
 in-container path. These file values remain database-overridable defaults.
-The humanization workflow deployment includes its four dependent apps; it
-does not require separate deployments of those generators.
+The paired humanization workflow includes its four dependent apps; the nanobody
+workflow includes AbNatiV2-VHH and HuDiff-Nb. Deploy the containing workflows,
+not separate generator deployments. Introducing nanobody humanization requires
+deploying and pinning that new workflow before restarting the matching API;
+a zero active-job limit pauses admission but does not bypass startup preflight.
+See the [nanobody usage and rollout notes](../docs/nanobody-humanization.md).
 
 ## Multiple origins and internal HTTP access
 

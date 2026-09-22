@@ -1,8 +1,10 @@
 # Nanobody humanization
 
-Status: implementation approved 22 September 2026; deployment remains separate.
-Branch `feat/nanobody-humanization` starts at `d57de18`. The supplied research
-report is design input, not an accepted implementation specification.
+Status: implementation approved 22 September 2026; backend workflow and service
+implemented, frontend integration/verification in progress. Deployment remains
+separately authorized and unverified. Branch `feat/nanobody-humanization` was
+rebased onto paired display/publication fix `297c579` before implementation.
+The supplied research report is design input, not an accepted specification.
 
 ## Goal and agreed release boundary
 
@@ -454,10 +456,10 @@ preview/admission contracts so edited or stale previews cannot submit a
 different sequence. Keep this distinct from general analysis's no-trimming
 contract.
 
-Add focused package-based AbNatiV2-VHH and HuDiff-Nb apps using existing
-execution primitives and reusable assets. Plan to pin the audited AbNatiV
-2.0.9 packaging fix and separate NbForge-compatible runtime, and the inspected
-HuDiff nanobody source/checkpoint. Implement explicit model preparation,
+The package-based AbNatiV2-VHH and HuDiff-Nb apps use existing execution
+primitives and reusable assets. They pin the audited AbNatiV 2.0.9 packaging
+fix and separate NbForge-compatible runtime, and the inspected HuDiff
+nanobody source/checkpoint. Keep explicit model preparation,
 native position checks, accepted masks, seed/batch semantics and content-bound
 publications without upgrading existing paired apps. Verify observational
 wrappers and restrictions against native behavior.
@@ -495,3 +497,51 @@ such validation needs an explicit budget/authorization first.
 The supplied report's hundreds/thousands of candidates, illustrative
 32-construct panel, structural ensembles and deimmunization branch are proposals,
 not default counts or requirements.
+
+## Implemented service and execution boundary
+
+The Tool key is `nanobody_humanization`, the website slug is
+`nanobody-humanization`, and routes live under `/api/v1/nanobody-humanization`.
+The authoritative schemas are in
+`service/nanobody_humanization/contracts.py` and `results.py`:
+
+- `GET /options`: complete defaults/schema, preparation version and host limits.
+- `POST /prepare`: bounded local work, original-row correspondence, row errors,
+  prepared VH previews and a digest only for a wholly valid batch; no Job.
+- `POST /jobs`: originals, settings and reviewed digest plus Idempotency-Key.
+  Exact replay precedes new preparation/provider I/O. New intents re-prepare and
+  reject mismatched previews with `409 preparation_changed`; row failures are
+  `422 NanobodyInputErrors`. Admission snapshots existing shared limits.
+- `GET /jobs/{id}/inputs`: owner-only originals/settings and frozen prepared
+  parents. Never re-impute here. Popups use prepared parents; editable reruns use
+  originals and require a fresh review. Missing retained input returns
+  `404 job_input_unavailable` without preventing candidate inspection.
+- `GET /jobs/{id}/selection` and `/selection.csv`: owner-only cached results.
+  The page accepts offset/limit (default 50, maximum 200), parent_id, sort_by and
+  descending. Preserve scientific order without sort; sort nulls last both ways.
+  Visibility defaults/ranges describe the full table, while germline evidence
+  covers only page candidate IDs. Both reads return `409 result_not_cached`
+  when the shared prepare-download path must restore local cache.
+
+The scientific graph has independent `generate_abnativ2_vhh` and
+`generate_hudiff_nb` Nodes, followed by `union`, `evaluate` and `publish`.
+The service combines the last two into one Evaluate and rank stage. Evaluation
+uses at most 27 sequences per parent/model call and one CPU annotation call
+deduplicated by sequence. `publish` is local: it preserves the complete bundle
+while reflecting row-level incompleteness as Partial using existing kernel
+Task outcomes. It never submits another scientific operation.
+
+Immutable requests retain original/prepared correspondence, masks, references,
+parameters and scientific identities. Publication schema 1 contains the
+19-column ordered CSV defined by `export.SELECTION_COLUMNS`, consolidated
+evidence and a sorted content inventory. Service packaging checks request,
+preparation and file identities before publishing a deterministic ZIP. Native
+model output trees stay in execution storage rather than the user archive.
+
+Offline coverage includes native preparation/annotation, fake-provider execution
+through the real scheduler, frozen request recovery, owner/CSRF/idempotency
+contracts, stale-preview rejection, manifest tampering, shared CPU model staging
+and bounded table delivery. The browser fixture supplies a dedicated nanobody
+account and real local result production with fake scientific scores. Neither
+this fixture nor the native sampling-boundary oracle establishes successful
+GPU inference; image installation and an authorized deployed smoke remain open.

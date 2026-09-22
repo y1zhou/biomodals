@@ -38,6 +38,7 @@ BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT=1
 BIOMODALS_GROMACS_ACTIVE_LIMIT=1
 BIOMODALS_ALPHAFOLD3_ACTIVE_LIMIT=1
 BIOMODALS_HUMANIZATION_ACTIVE_LIMIT=1
+BIOMODALS_NANOBODY_HUMANIZATION_ACTIVE_LIMIT=1
 BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=1
 ```
 
@@ -235,6 +236,11 @@ The checklist must order these actions:
    useful partial outcomes, bounded table reads and CSV/ZIP downloads. Match the
    containing workflow's scientific identity to the API before submission; older
    archives retain their published schema and ranking.
+   For nanobody humanization, review the prepared parent before explicit Submit,
+   verify concurrent AbNatiV2-VHH/HuDiff-Nb stages, the union, dual scoring and
+   per-parent ordering. Check the popup against the saved prepared parent,
+   bounded pages, standalone analysis transfer and CSV/ZIP downloads. Use a
+   separate authorized budget for the first native image/inference smoke test.
 7. Stop on any unexpected invocation, stage, archive member, permission error,
    or configuration error. Capture the Job ID, request ID, safe stage, and
    timestamps before retrying; do not blindly resubmit paid work.

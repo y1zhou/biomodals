@@ -1,8 +1,8 @@
 # Nanobody humanization
 
-Status: implementation approved 22 September 2026; backend workflow and service
-implemented, frontend integration/verification in progress. Deployment remains
-separately authorized and unverified. Branch `feat/nanobody-humanization` was
+Status: implemented and verified offline on 22 September 2026; ready for user
+review. Deployment remains separately authorized and unverified.
+Branch `feat/nanobody-humanization` was
 rebased onto paired display/publication fix `297c579` before implementation.
 The supplied research report is design input, not an accepted specification.
 
@@ -545,3 +545,11 @@ and bounded table delivery. The browser fixture supplies a dedicated nanobody
 account and real local result production with fake scientific scores. Neither
 this fixture nor the native sampling-boundary oracle establishes successful
 GPU inference; image installation and an authorized deployed smoke remain open.
+
+The completed implementation passed 1,995 backend tests, repository hooks,
+targeted type checks, CLI discovery/help and the local-only example. Frontend
+commit `d88f111` passed 117 unit tests, all 78 offline browser tests in one run,
+lint, build and exact exported-schema checks. The native local browser fixture
+covered 100 prepared parents, 300 candidate rows, bounded pages, frozen-parent
+inspection, downloads and standalone analysis transfer. No cloud deployment,
+server restart or scientific submission was performed for these checks.

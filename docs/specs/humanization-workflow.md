@@ -266,8 +266,10 @@ retains the supporting observed-yield evidence.
 - Keep `selection.csv`, `imgt_mutations.parquet`, and all four consolidated
   `scores/*.parquet` files. They answer final candidate selection and detailed
   evaluation questions without rerunning models.
-- Schema 4 adds four V/J gene columns after ranking and one candidate/sequence-
-  bound `germlines.parquet`, produced alongside IMGT checks in the existing
+- Schema 5 places three full-input pIs (VH, VL, VH+VL) and four V/J gene columns
+  immediately after `vh`, joined after ranking. Unique-chain/pair pI work runs
+  locally in the coordinator with pinned Biopython. Keep the candidate/sequence-
+  bound `germlines.parquet` from schema 4, produced alongside IMGT checks in the existing
   per-candidate CPU call, with independently reusable annotation Tasks.
   Germline matching and local therapeutic reference semantics are specified in
   [antibody sequence analysis](antibody-sequence-analysis.md); they do not change

@@ -15,7 +15,7 @@ from biomodals.service.antibody_sequence_analysis.contracts import (
     GermlinePresentation,
     ReferenceInfo,
 )
-from biomodals.workflow.humanization.germlines import GENE_COLUMNS
+from biomodals.workflow.humanization.germlines import GENE_COLUMNS, SEQUENCE_COLUMNS
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import selection_table
 
@@ -25,6 +25,7 @@ SELECTION_SCHEMA = {
     "panel_order": pl.Int64,
 }
 ANNOTATED_SELECTION_SCHEMA = {**SELECTION_SCHEMA, **GENE_COLUMNS}
+CURRENT_SELECTION_SCHEMA = {**SELECTION_SCHEMA, **SEQUENCE_COLUMNS}
 
 
 class CandidateGermlines(BaseModel):
@@ -85,12 +86,13 @@ def query_selection(
     """Keep parsing, filtering and sorting native; serialize only the page."""
     if offset < 0 or not 1 <= limit <= 200:
         raise ValueError("offset must be nonnegative and limit between 1 and 200")
-    if sort_by is not None and sort_by not in ANNOTATED_SELECTION_SCHEMA:
+    if sort_by is not None and sort_by not in CURRENT_SELECTION_SCHEMA:
         raise ValueError(f"Unknown selection column: {sort_by}")
-    table = pl.read_csv(path, schema_overrides=ANNOTATED_SELECTION_SCHEMA)
+    table = pl.read_csv(path, schema_overrides=CURRENT_SELECTION_SCHEMA)
     if set(table.columns) not in (
         set(SELECTION_SCHEMA),
         set(ANNOTATED_SELECTION_SCHEMA),
+        set(CURRENT_SELECTION_SCHEMA),
     ):
         raise ValueError("Selection table columns do not match the workflow schema")
     if sort_by is not None and sort_by not in table.columns:
@@ -181,7 +183,7 @@ class HumanizationManifestFile(BaseModel):
 class HumanizationManifest(BaseModel):
     """Publication identity and safe membership, shared by download and packaging."""
 
-    schema_version: Literal[2, 3, 4]
+    schema_version: Literal[2, 3, 4, 5]
     execution_run_id: UUID
     parameters: HumanizationSettings
     scientific_versions: dict[str, str]

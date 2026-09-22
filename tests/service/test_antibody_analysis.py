@@ -178,7 +178,7 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
     options = _request(app, "GET", root + "/options")
     assert options.json()["max_entries_per_group"] == 1000
     assert options.json()["max_chain_length"] == 512
-    assert options.json()["analysis_version"] == "3"
+    assert options.json()["analysis_version"] == "4"
     response = _request(
         app,
         "POST",
@@ -200,10 +200,29 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
         app, "POST", root + "/sequence", json={"sequence": VH, "scheme": "kabat"}
     )
     assert detail.status_code == 200 and detail.json()["residues"]
-    assert [row["segment"] for row in detail.json()["germline_alignments"]] == [
+    assert [row["segment"] for row in detail.json()["germlines"]] == [
         "v",
         "j",
     ]
+    comparison = _request(
+        app,
+        "POST",
+        root + "/sequence",
+        json={"sequence": VH, "scheme": "kabat", "parental_sequence": "GG" + VH},
+    )
+    assert comparison.status_code == 200
+    alignment = comparison.json()["alignment"]
+    assert alignment["input"].replace("-", "") == VH
+    assert alignment["parental"].replace(" ", "").replace("-", "") == "GG" + VH
+    assert (
+        _request(
+            app,
+            "POST",
+            root + "/sequence",
+            json={"sequence": VH, "parental_sequence": "X"},
+        ).status_code
+        == 422
+    )
     oversized = _request(
         app, "POST", root + "/analyze", content=b" " * (4 * 1024 * 1024 + 1)
     )
@@ -264,7 +283,10 @@ def test_all_invalid_inputs_do_not_trigger_reference_download(tmp_path):
 
 
 @pytest.mark.parametrize("tamper", [False, True])
-def test_humanization_page_bounded_frozen_assignments_and_usage(tmp_path, tamper):
+@pytest.mark.parametrize("schema_version", [4, 5])
+def test_humanization_page_bounded_frozen_assignments_and_usage(
+    tmp_path, tamper, schema_version
+):
     """Serve only selected evidence and reject assignments for different chains."""
     from uuid import UUID, uuid4
 
@@ -296,7 +318,12 @@ def test_humanization_page_bounded_frozen_assignments_and_usage(tmp_path, tamper
         schema=SELECTION_SCHEMA,
     )
     content = annotated_archive(
-        table, job_id, HumanizationSettings(), {}, tamper=tamper
+        table,
+        job_id,
+        HumanizationSettings(),
+        {},
+        tamper=tamper,
+        schema_version=schema_version,
     )
     cache = app.state.cache
     staging = cache.staging_path(str(job_id))
@@ -335,4 +362,22 @@ def test_humanization_page_bounded_frozen_assignments_and_usage(tmp_path, tamper
         csv = _request(app, "GET", f"/api/v1/humanization/jobs/{job_id}/selection.csv")
         assert csv.status_code == 200
         assert "vh_v_gene" in csv.text.splitlines()[0]
+        if schema_version == 5:
+            from biomodals.helper.antibody import combined_pi, sequence_pi
+            from biomodals.workflow.humanization.germlines import SEQUENCE_COLUMNS
+
+            names = [column["name"] for column in result["columns"]]
+            at = names.index("vh") + 1
+            assert names[at : at + 7] == list(SEQUENCE_COLUMNS)
+            assert csv.text.splitlines()[0].split(",") == names
+            assert result["rows"][0]["vh_pi"] == sequence_pi(VH)
+            assert result["rows"][0]["vl_pi"] == sequence_pi(VL)
+            assert result["rows"][0]["vh_vl_pi"] == combined_pi(VH, VL)
+            sorted_page = _request(
+                app,
+                "GET",
+                f"/api/v1/humanization/jobs/{job_id}/selection?limit=1&sort_by=vh_pi&descending=true",
+            )
+            assert sorted_page.status_code == 200
+            assert sorted_page.json()["rows"][0]["candidate_id"] == "c1"
     asyncio.run(app.state.antibody_analysis.shutdown())

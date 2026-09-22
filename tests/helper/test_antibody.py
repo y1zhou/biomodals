@@ -83,30 +83,75 @@ def test_native_germline_alignment_retains_operations_and_full_input_offsets(sch
     result = sequence_detail(sequence, scheme)
     native = number_antibody(sequence)
     assert result["error"] is None
-    alignments = result["germline_alignments"]
-    assert [row["segment"] for row in alignments] == ["v", "j"]
-    for row, match in zip(alignments, (native.v_match, native.j_match), strict=True):
+    references = result["germlines"]
+    assert [row["segment"] for row in references] == ["v", "j"]
+    merged = result["alignment"]
+    assert merged["input"].replace("-", "") == sequence
+    assert [i for i in merged["input_indices"] if i is not None] == list(
+        range(len(sequence))
+    )
+    assert (
+        len(merged["germline"])
+        == len(merged["input"])
+        == len(merged["germline_diffs"])
+        == len(merged["input_indices"])
+    )
+    columns = {
+        input_index: index
+        for index, input_index in enumerate(merged["input_indices"])
+        if input_index is not None
+    }
+    covered = set()
+    for row, match in zip(references, (native.v_match, native.j_match), strict=True):
         hit = match.hits[0]
         alignment = hit.alignment
         assert row["reference_ids"] == [ref.id for ref in hit.references]
         assert row["tied_reference_count"] == sum(len(h.references) for h in match.hits)
-        assert row["aligned_reference"] == alignment.aligned_reference
-        assert row["aligned_query"] == alignment.aligned_query
-        assert row["operations"] == alignment.operations
-        assert row["reference_start"] == alignment.reference_span[0]
-        assert (
-            row["query_input_start"] == hit.query_input_start + alignment.query_span[0]
-        )
-        query = row["aligned_query"].replace("-", "")
-        start = row["query_input_start"]
-        assert sequence[start : start + len(query)] == query
-        assert (
-            len(row["aligned_reference"])
-            == len(row["aligned_query"])
-            == len(row["operations"])
-        )
-    assert {"+", "-", "x"} <= set(alignments[0]["operations"])
-    assert alignments[0]["query_input_start"] == 3
+        start = hit.query_input_start + alignment.query_span[0]
+        # The complete local block survives contiguously, including true deletions.
+        offset = columns[start]
+        while offset and merged["input_indices"][offset - 1] is None:
+            offset -= 1
+        end = offset + len(alignment.aligned_query)
+        assert merged["input"][offset:end] == alignment.aligned_query
+        assert merged["germline"][offset:end] == alignment.aligned_reference
+        assert merged["germline_diffs"][offset:end] == alignment.operations
+        covered.update(range(offset, end))
+    assert {"+", "-", "x"} <= set(merged["germline_diffs"])
+    assert all(
+        op == " " for i, op in enumerate(merged["germline_diffs"]) if i not in covered
+    )
+
+
+@pytest.mark.parametrize("scheme", SCHEMES)
+def test_parental_and_germline_comparisons_share_input_without_invented_homology(
+    scheme,
+):
+    """Native global parent differences survive independent reference-only gaps."""
+    from arpeggia import align_seqs
+
+    sequence = "GGG" + VH[:35] + "GG" + VH[35:62] + VH[64:] + "HHHHHH"
+    parent = "GG" + VH[:40] + "CC" + VH[40:] + "HHHHHH"
+    native = align_seqs(parent, sequence, mode="global")
+    alignment = sequence_detail(sequence, scheme, parent)["alignment"]
+    assert (
+        len({len(value) for key, value in alignment.items() if key != "input_indices"})
+        == 1
+    )
+    assert len(alignment["input_indices"]) == len(alignment["input"])
+    assert alignment["parental"].replace("-", "").replace(" ", "") == parent
+    assert alignment["input"].replace("-", "") == sequence
+    # Blank parent cells belong only to independent germline-only columns.
+    parent_columns = [i for i, ref in enumerate(alignment["parental"]) if ref != " "]
+    for key, expected in (
+        ("parental", native.aligned_reference),
+        ("input", native.aligned_query),
+        ("parental_diffs", native.operations),
+    ):
+        assert "".join(alignment[key][i] for i in parent_columns) == expected
+    same = sequence_detail(VH, scheme, VH)["alignment"]
+    assert same["parental"].replace(" ", "") == VH
+    assert set(same["parental_diffs"]) == {" "}
 
 
 @pytest.mark.parametrize("chain", [VH, VL])

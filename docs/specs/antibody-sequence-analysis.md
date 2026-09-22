@@ -55,10 +55,12 @@ Numbering/germline failures make those annotations unavailable but retain physic
 metrics for valid canonical sequences.
 
 GET /options supplies authoritative limits, schemes and versions. The frontend
-requires analysis version 3 before analysis or sequence-detail requests, so an
+requires analysis version 4 before analysis or sequence-detail requests, so an
 older API cannot be mislabeled as the current scientific/display contract.
 Full-sequence copying remains available during a version mismatch.
-POST /sequence accepts one sequence/scheme for lazy details. All routes use
+POST /sequence accepts one sequence/scheme and optional parental_sequence for
+lazy details. Both supplied sequences use the same canonical-residue/length
+validation. All routes use
 existing authentication; POST also uses Origin/CSRF protection. Responses are
 private/no-store. No endpoint logs or persists user sequences.
 
@@ -78,7 +80,8 @@ tags/tails. Values remain full precision in data and CSV.
 Label the combined value **VH+VL pI**. It is not mean chain pI,
 two-chain charge-sum pI, full-IgG pI or an unspecified scFv/linker estimate.
 No unprovided constant regions, glycans or conjugates are included. Analysis
-version 3 retains BlackMould and adds germline pI and native local alignments;
+version 4 retains BlackMould, germline pI and native local alignments, with a
+common-axis parental comparison in the sequence inspector;
 extinction coefficients are not calculated.
 Sources: [Biopython 1.86 ProtParam](https://github.com/biopython/biopython/blob/biopython-186/Bio/SeqUtils/ProtParam.py),
 [terminal accounting](https://github.com/biopython/biopython/blob/biopython-186/Bio/SeqUtils/IsoelectricPoint.py).
@@ -169,15 +172,33 @@ Use native residue order and zero-based input_index, not sorted numeric labels.
 domain_span is half-open. Keep original sequences and visibly identify unnumbered
 tails. Show CDR1/2/3 separately; do not impute, graft or edit residues.
 
-Within Numbered domain, show the representative native V/J local alignment
-blocks without parsing terminal-formatted output or realigning in the browser.
-Expose reference identities/names, total tied reference counts, the three
-equal-length native aligned_reference/aligned_query/operations strings, and
-zero-based reference_start/query_input_start. The latter already includes
-the local alignment offset in the complete original input. Query deletions
-occupy gap columns, not input indices. Keep the full numbered input visible:
-regions outside local matches, including the unknown V/J junction, must not
-be relabeled as insertions. Operations are blank for exact matches, + for input
+Use one common-axis table labeled Germline, Diffs, **Input**, with both V/J
+reference names/species and tie notes above it. The backend projects native local
+V/J columns onto the full original input, preserving native gaps and operations;
+it does not parse terminal output or realign the references. Unmatched junction
+positions are implicit gaps with blank differences, not an inferred D gene.
+Outer uncovered positions are blank. Input is bold and retains its numbering,
+CDRs, liabilities and visibly unnumbered tails without duplicating the sequence.
+
+On humanization results append Diffs and Parental rows. Fetch the exact same
+parent ID/chain from the existing owner-scoped retained-input endpoint lazily
+when inspecting a sequence, not on table opening or pagination. Keep that query
+only for the mounted result's lifetime. Missing retained input leaves ordinary
+inspection/copying usable with a parental-comparison-unavailable notice; shared
+authentication failures still trigger reauthentication.
+
+Compare the full parent/input with arpeggia's native global BLOSUM62 alignment
+(gap-open 10, extension 0.5). Both Diffs rows describe Input relative to their
+reference. Project the two comparisons onto one input axis; keep independent
+germline-only/parent-only columns separate rather than implying reference-to-
+reference homology. This display does not replace the workflow's IMGT mutation
+counts or preservation policy. No browser alignment calculation is needed.
+
+SequenceDetail contains germlines (reference identities/names and tie counts)
+and alignment (equal-width germline/germline_diffs/input strings, nullable
+parental/parental_diffs, and input_indices). Input indices are zero-based in the
+full supplied sequence, null for reference-only gap columns. Numbering failures
+return a null alignment rather than fabricate one. Operations are blank for exact matches, + for input
 insertions, - for deletions, : for positive-BLOSUM62 substitutions and x for
 other mismatches, following the pinned
 [arpeggia display contract](https://github.com/y1zhou/arpeggia/blob/v0.10.1/docs/antibody-numbering.md#display-and-antibody-alignments).
@@ -207,8 +228,14 @@ Odd cysteine count cannot identify an unpaired bond. See
 
 ## Workflow publication and compatibility
 
-New schema **4** adds vh_v_gene, vh_j_gene, vl_v_gene and vl_j_gene to ordinary
-selection.csv, plus one typed germlines.parquet. Each evidence row binds parent,
+New schema **5** places vh_pi, vl_pi, vh_vl_pi, vh_v_gene, vh_j_gene, vl_v_gene
+and vl_j_gene immediately after vh in ordinary selection.csv. Germline pIs remain
+exclusive to standalone analysis. Physical pIs use the full input and literal
+VH+VL definitions above, computed once per unique chain/pair and joined after
+ranking with Polars. Missing germline assignments do not suppress physical pI.
+The coordinator image pins Biopython and records its scientific version.
+
+Retain the typed germlines.parquet introduced in schema 4. Each evidence row binds parent,
 candidate, chain role and exact sequence SHA-256. Scientific versions record
 arpeggia/reference identity; the manifest binds the sidecar bytes. CLI and website
 download the same scientific tables.
@@ -217,12 +244,12 @@ The existing per-candidate CPU Provider Call batches independent ANARCI and
 arpeggia Tasks. Each retains its own publication and failure status; a Successor
 reuses successful evidence and runs only missing work. No extra Provider Call,
 generator, GPU or therapeutic-network dependency is added to a normal run.
-Labels join **after ranking**. Missing genes do not change evaluation_complete;
+Annotations join **after ranking**. Missing genes do not change evaluation_complete;
 unavailable IMGT checks retain partial-result/eligibility behavior while
 independent gene evidence remains available.
 
-Keep historical schema 2/3 readers and original CSV/archive bytes. Do not backfill
-genes or rerank old jobs. Explicit local inspection or transfer to analysis is
+Keep historical schema 2/3/4 readers and original CSV/archive bytes. Do not backfill
+genes/pIs or rerank old jobs. Explicit local inspection or transfer to analysis is
 allowed on historical rows. New SelectionPage metadata contains only its page's
 candidate assignments and one reference provenance block. Gene sorting remains
 full-table Polars sorting before paging. Verify sidecar evidence against selected
@@ -285,7 +312,7 @@ Offline tests cover native numbering, metric units, overlapping motifs/tails,
 roles, species/gene ties, exact Approved filtering, missing na, build-once/corrupt
 caches, partial inputs, auth/body bounds, no Job admission, identity rejection,
 historical schemas and unchanged ranks. The 11,400-candidate website envelope
-remains below the 32 MiB CSV bound with the four new scalar columns.
+remains below the 32 MiB CSV bound with the seven added scalar columns.
 
 Local measurements on 21 September 2026 (analysis version 1, before the metric
 amendments), not deployment latency or current response-size promises:

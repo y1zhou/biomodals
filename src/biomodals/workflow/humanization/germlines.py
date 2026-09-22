@@ -8,13 +8,24 @@ from typing import Any
 
 import polars as pl
 
-from biomodals.helper.antibody import GermlineAssignment, assign_germlines
+from biomodals.helper.antibody import (
+    GermlineAssignment,
+    assign_germlines,
+    combined_pi,
+    sequence_pi,
+)
 from biomodals.workflow.humanization.contracts import HumanizationCandidate
 
 GENE_COLUMNS = {
     f"{chain}_{segment}_gene": pl.String
     for chain in ("vh", "vl")
     for segment in ("v", "j")
+}
+SEQUENCE_COLUMNS = {
+    "vh_pi": pl.Float64,
+    "vl_pi": pl.Float64,
+    "vh_vl_pi": pl.Float64,
+    **GENE_COLUMNS,
 }
 _EVIDENCE = pl.Struct({
     "reference_id": pl.String,
@@ -143,3 +154,53 @@ def add_gene_columns(selection: pl.DataFrame, germlines: pl.DataFrame) -> pl.Dat
             maintain_order="left",
         )
     return result
+
+
+def add_sequence_columns(
+    selection: pl.DataFrame, germlines: pl.DataFrame
+) -> pl.DataFrame:
+    """Join unique-sequence pIs after ranking and place annotations after VH."""
+    # Native scientific work runs once per unique chain/pair. Polars owns the
+    # deduplication and joins; scores, rank and original row order are untouched.
+    chains = (
+        pl
+        .concat([
+            selection.select(pl.col(chain).alias("sequence")) for chain in ("vh", "vl")
+        ])
+        .unique()
+        .with_columns(
+            pl
+            .col("sequence")
+            .map_elements(sequence_pi, return_dtype=pl.Float64)
+            .alias("pi")
+        )
+    )
+    result = add_gene_columns(selection, germlines)
+    for chain in ("vh", "vl"):
+        result = result.join(
+            chains.rename({"sequence": chain, "pi": f"{chain}_pi"}),
+            on=chain,
+            how="left",
+            validate="m:1",
+            maintain_order="left",
+        )
+    pairs = (
+        selection
+        .select("vh", "vl")
+        .unique()
+        .with_columns(
+            pl
+            .struct("vh", "vl")
+            .map_elements(
+                lambda pair: combined_pi(pair["vh"], pair["vl"]),
+                return_dtype=pl.Float64,
+            )
+            .alias("vh_vl_pi")
+        )
+    )
+    result = result.join(
+        pairs, on=["vh", "vl"], how="left", validate="m:1", maintain_order="left"
+    )
+    columns = selection.columns
+    at = columns.index("vh") + 1
+    return result.select(*columns[:at], *SEQUENCE_COLUMNS, *columns[at:])

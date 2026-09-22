@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 if TYPE_CHECKING:
     from arpeggia import GermlineMatch, NumberedAntibody
 
-ANALYSIS_VERSION = "3"
+ANALYSIS_VERSION = "4"
 ARPEGGIA_VERSION = "0.10.1"
+BIOPYTHON_VERSION = "1.86"
 GERMLINE_REFERENCE = "IMGT-202636-7+llama-supplement"
 MAX_CHAIN_LENGTH = 512
 SCHEMES = ("imgt", "kabat", "chothia", "martin", "aho")
@@ -93,22 +94,29 @@ class Liability(TypedDict):
     end: int
 
 
-class GermlineAlignment(TypedDict):
-    """Native local alignment for one display-representative V/J sequence.
-
-    Starts are zero-based ungapped coordinates; query_input_start already
-    includes the local alignment offset within the full supplied input.
-    """
+class GermlineReference(TypedDict):
+    """Identity of one native display-representative V/J sequence."""
 
     segment: Literal["v", "j"]
     reference_ids: list[str]
     reference_names: list[str]
     tied_reference_count: int
-    reference_start: int
-    query_input_start: int
-    aligned_reference: str
-    aligned_query: str
-    operations: str
+
+
+class SequenceAlignment(TypedDict):
+    """Native comparisons projected onto one full-input display axis.
+
+    Spaces mean unavailable reference coverage, not a match or deletion.
+    Both difference rows describe Input relative to their reference. Independent
+    reference-only columns are separate: no germline/parent homology is inferred.
+    """
+
+    germline: str
+    germline_diffs: str
+    input: str
+    input_indices: list[int | None]
+    parental: str | None
+    parental_diffs: str | None
 
 
 class SequenceDetail(TypedDict):
@@ -120,7 +128,8 @@ class SequenceDetail(TypedDict):
     chain_type: str | None
     domain_span: tuple[int, int] | None
     residues: list[NumberedResidue]
-    germline_alignments: list[GermlineAlignment]
+    germlines: list[GermlineReference]
+    alignment: SequenceAlignment | None
     liabilities: list[Liability]
     diagnostics: list[str]
     error: str | None
@@ -155,6 +164,13 @@ def combined_pi(vh: str, vl: str) -> float:
     return ProteinAnalysis(
         normalize_sequence(vh) + normalize_sequence(vl)
     ).isoelectric_point()
+
+
+def sequence_pi(sequence: str) -> float:
+    """Compute full-input pI without calculating unrelated protein metrics."""
+    from Bio.SeqUtils.ProtParam import ProteinAnalysis
+
+    return ProteinAnalysis(normalize_sequence(sequence)).isoelectric_point()
 
 
 def _evidence(match: GermlineMatch | None) -> list[GermlineEvidence]:
@@ -234,14 +250,13 @@ def _germline_pi(numbered: NumberedAntibody | None) -> float | None:
     return ProteinAnalysis(sequence).isoelectric_point()
 
 
-def _germline_alignments(numbered: NumberedAntibody) -> list[GermlineAlignment]:
-    """Expose native strings, without re-alignment or invented junction edits."""
-    result: list[GermlineAlignment] = []
+def _germline_references(numbered: NumberedAntibody) -> list[GermlineReference]:
+    """Identify the native representatives, retaining total tie counts."""
+    result: list[GermlineReference] = []
     for segment, match in (("v", numbered.v_match), ("j", numbered.j_match)):
         if match is None:
             continue
         hit = match.hits[0]
-        alignment = hit.alignment
         result.append({
             "segment": segment,
             "reference_ids": [ref.id for ref in hit.references],
@@ -249,13 +264,92 @@ def _germline_alignments(numbered: NumberedAntibody) -> list[GermlineAlignment]:
                 f"{ref.species} {ref.gene}*{ref.allele}" for ref in hit.references
             ],
             "tied_reference_count": sum(len(hit.references) for hit in match.hits),
-            "reference_start": alignment.reference_span[0],
-            "query_input_start": hit.query_input_start + alignment.query_span[0],
-            "aligned_reference": alignment.aligned_reference,
-            "aligned_query": alignment.aligned_query,
-            "operations": alignment.operations,
         })
     return result
+
+
+def _project_alignment(reference: str, query: str, operations: str, start: int):
+    """Index native columns by input residue, retaining reference-only gaps."""
+    residues: dict[int, tuple[str, str]] = {}
+    before: dict[int, list[tuple[str, str]]] = {}
+    for ref, residue, operation in zip(reference, query, operations, strict=True):
+        if residue == "-":
+            before.setdefault(start, []).append((ref, operation))
+        else:
+            residues[start] = (ref, operation)
+            start += 1
+    return residues, before
+
+
+def _sequence_alignment(
+    numbered: NumberedAntibody, parental_sequence: str | None
+) -> SequenceAlignment:
+    """Merge local V/J and optional native global parent comparisons, not MSA."""
+    from arpeggia import align_seqs
+
+    germline: dict[int, tuple[str, str]] = {}
+    germline_gaps: dict[int, list[tuple[str, str]]] = {}
+    for match in (numbered.v_match, numbered.j_match):
+        if match is None:
+            continue
+        hit = match.hits[0]
+        alignment = hit.alignment
+        residues, gaps = _project_alignment(
+            alignment.aligned_reference,
+            alignment.aligned_query,
+            alignment.operations,
+            hit.query_input_start + alignment.query_span[0],
+        )
+        germline.update(residues)
+        for index, values in gaps.items():
+            germline_gaps.setdefault(index, []).extend(values)
+    parent, parent_gaps = {}, {}
+    if parental_sequence is not None:
+        alignment = align_seqs(
+            parental_sequence, numbered.input_sequence, mode="global"
+        )
+        parent, parent_gaps = _project_alignment(
+            alignment.aligned_reference,
+            alignment.aligned_query,
+            alignment.operations,
+            0,
+        )
+
+    # Unmatched V/J junctions are implicit gaps with no asserted edit. Outer
+    # unaligned reference ends are not grafted onto the supplied input.
+    first, last = min(germline, default=0), max(germline, default=-1)
+    rows: list[tuple[str, str, str, str, str]] = []
+    indices: list[int | None] = []
+    for index in range(len(numbered.input_sequence) + 1):
+        for ref, operation in germline_gaps.get(index, ()):
+            rows.append((ref, operation, "-", " ", " "))
+            indices.append(None)
+        for ref, operation in parent_gaps.get(index, ()):
+            rows.append((" ", " ", "-", operation, ref))
+            indices.append(None)
+        if index == len(numbered.input_sequence):
+            break
+        ref, operation = germline.get(
+            index, ("-" if first < index < last else " ", " ")
+        )
+        parent_ref, parent_operation = parent.get(index, (" ", " "))
+        rows.append((
+            ref,
+            operation,
+            numbered.input_sequence[index],
+            parent_operation,
+            parent_ref,
+        ))
+        indices.append(index)
+    strings = ["".join(row[i] for row in rows) for i in range(5)]
+    return {
+        "germline": strings[0],
+        "germline_diffs": strings[1],
+        "input": strings[2],
+        "input_indices": indices,
+        "parental_diffs": strings[3] if parental_sequence is not None else None,
+        "parental": strings[4] if parental_sequence is not None else None,
+    }
 
 
 def analyze_chain(sequence: str) -> ChainAnalysis:
@@ -341,11 +435,15 @@ def sequence_liabilities(sequence: str) -> list[Liability]:
     return sorted(result, key=lambda row: (row["start"], row["end"], row["kind"]))
 
 
-def sequence_detail(sequence: str, scheme: Scheme = "imgt") -> SequenceDetail:
+def sequence_detail(
+    sequence: str, scheme: Scheme = "imgt", parental_sequence: str | None = None
+) -> SequenceDetail:
     """Number on demand with matching CDR convention; never impute or trim."""
     from arpeggia import number_antibody
 
     sequence = normalize_sequence(sequence)
+    if parental_sequence is not None:
+        parental_sequence = normalize_sequence(parental_sequence)
     if scheme not in SCHEMES:
         raise ValueError("Unsupported numbering scheme")
     result: SequenceDetail = {
@@ -355,7 +453,8 @@ def sequence_detail(sequence: str, scheme: Scheme = "imgt") -> SequenceDetail:
         "chain_type": None,
         "domain_span": None,
         "residues": [],
-        "germline_alignments": [],
+        "germlines": [],
+        "alignment": None,
         "liabilities": sequence_liabilities(sequence),
         "diagnostics": [],
         "error": None,
@@ -370,7 +469,8 @@ def sequence_detail(sequence: str, scheme: Scheme = "imgt") -> SequenceDetail:
         domain_span=numbered.domain_span,
         cdr_definition=numbered.cdr_definition,
         diagnostics=numbered.diagnostics,
-        germline_alignments=_germline_alignments(numbered),
+        germlines=_germline_references(numbered),
+        alignment=_sequence_alignment(numbered, parental_sequence),
         residues=[
             {
                 "input_index": residue.input_index,

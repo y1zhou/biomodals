@@ -186,7 +186,7 @@ def export_results(
             "content_sha256": digest,
         })
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "execution_run_id": str(context.execution_run_id),
         "status": "partial" if errors else "succeeded",
         "parameters": settings.model_dump(),

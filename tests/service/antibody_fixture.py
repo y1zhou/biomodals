@@ -9,11 +9,17 @@ import polars as pl
 
 from biomodals.helper.antibody import assign_germlines
 from biomodals.workflow.humanization.export import IMGT_MUTATION_SCHEMA
-from biomodals.workflow.humanization.germlines import GERMLINE_SCHEMA, add_gene_columns
+from biomodals.workflow.humanization.germlines import (
+    GERMLINE_SCHEMA,
+    add_gene_columns,
+    add_sequence_columns,
+)
 
 
-def annotated_archive(table, run_id, settings, versions, *, tamper=False):
-    """Build a schema-4 native-shaped result without any cloud/model operation."""
+def annotated_archive(
+    table, run_id, settings, versions, *, tamper=False, schema_version=5
+):
+    """Build native-shaped annotated results without any cloud/model operation."""
     assignments = {
         sequence: assign_germlines(sequence)
         for sequence in set(table["vh"]) | set(table["vl"])
@@ -30,7 +36,9 @@ def annotated_archive(table, run_id, settings, versions, *, tamper=False):
         for chain in ("vh", "vl")
     ]
     evidence = pl.DataFrame(rows, schema=GERMLINE_SCHEMA)
-    table = add_gene_columns(table, evidence)
+    table = (add_sequence_columns if schema_version == 5 else add_gene_columns)(
+        table, evidence
+    )
     if tamper:
         evidence = evidence.with_columns(pl.lit("incorrect").alias("sequence_sha256"))
     parquet = BytesIO()
@@ -46,7 +54,7 @@ def annotated_archive(table, run_id, settings, versions, *, tamper=False):
         "generation.parquet": generation.getvalue(),
     }
     members["manifest.json"] = orjson.dumps({
-        "schema_version": 4,
+        "schema_version": schema_version,
         "execution_run_id": str(run_id),
         "parameters": settings.model_dump(),
         "scientific_versions": versions,

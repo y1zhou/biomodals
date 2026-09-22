@@ -12,7 +12,9 @@ from biomodals.workflow.humanization.contracts import AntibodyPair, CandidateAnn
 from biomodals.workflow.humanization.germlines import (
     GENE_COLUMNS,
     GERMLINE_SCHEMA,
+    SEQUENCE_COLUMNS,
     add_gene_columns,
+    add_sequence_columns,
     candidate_germlines,
     complete_germline_table,
 )
@@ -85,3 +87,47 @@ def test_imgt_failure_does_not_discard_independent_germlines(monkeypatch):
             parent.model_dump(), candidate.model_dump(), operations=("annotation",)
         )
     ) == {"annotation"}
+
+
+def test_sequence_columns_preserve_rank_and_compute_each_unique_input_once(monkeypatch):
+    """Native pIs join by exact sequence without affecting candidate ranking."""
+    from biomodals.helper.antibody import combined_pi, sequence_pi
+
+    candidates = candidate_union(
+        [AntibodyPair(id=parent, vh=VH, vl=VL) for parent in ("one", "two")], []
+    )
+    evidence = pl.DataFrame(
+        [row for candidate in candidates for row in candidate_germlines(candidate)],
+        schema=GERMLINE_SCHEMA,
+    )
+    chains, pairs = [], []
+
+    def chain_pi(sequence):
+        chains.append(sequence)
+        return sequence_pi(sequence)
+
+    def pair_pi(vh, vl):
+        pairs.append((vh, vl))
+        return combined_pi(vh, vl)
+
+    monkeypatch.setattr(
+        "biomodals.workflow.humanization.germlines.sequence_pi", chain_pi
+    )
+    monkeypatch.setattr(
+        "biomodals.workflow.humanization.germlines.combined_pi", pair_pi
+    )
+    original = selection_table(candidates, [], []).with_columns(
+        pl.lit(3).alias("quality_tier")
+    )
+    table = add_sequence_columns(original, evidence)
+    assert table.select(original.columns).equals(original)
+    at = table.columns.index("vh") + 1
+    assert table.columns[at : at + 7] == list(SEQUENCE_COLUMNS)
+    assert set(chains) == {VH, VL} and len(chains) == 2
+    assert pairs == [(VH, VL)]
+    assert table["vh_pi"].to_list() == [sequence_pi(VH)] * 2
+    assert table["vl_pi"].to_list() == [sequence_pi(VL)] * 2
+    assert table["vh_vl_pi"].to_list() == [combined_pi(VH, VL)] * 2
+    assert table["vh_v_gene"].to_list() == ["IGHV1-2"] * 2
+    empty = add_sequence_columns(original.clear(), evidence.clear())
+    assert empty.schema == table.schema and empty.height == 0

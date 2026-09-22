@@ -54,6 +54,9 @@ class SequenceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     sequence: str = Field(min_length=1, max_length=MAX_REQUEST_BYTES)
     scheme: Scheme = "imgt"
+    parental_sequence: str | None = Field(
+        default=None, min_length=1, max_length=MAX_REQUEST_BYTES
+    )
 
 
 class AnalysisIssue(BaseModel):

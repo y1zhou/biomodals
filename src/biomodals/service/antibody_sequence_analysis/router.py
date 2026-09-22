@@ -56,7 +56,11 @@ def create_router(service: AnalysisService) -> APIRouter:
     ) -> SequenceDetail:
         try:
             return await asyncio.get_running_loop().run_in_executor(
-                service.pool, sequence_detail, body.sequence, body.scheme
+                service.pool,
+                sequence_detail,
+                body.sequence,
+                body.scheme,
+                body.parental_sequence,
             )
         except ValueError as error:
             raise CodedAPIError(422, "invalid_sequence", str(error)) from error

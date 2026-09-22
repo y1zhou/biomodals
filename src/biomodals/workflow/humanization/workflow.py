@@ -42,7 +42,12 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.model import NodeAggregationPolicy
 from biomodals.execution.nodes import ProviderCallSpec, TaskDefinition, TaskProviderNode
-from biomodals.helper.antibody import ARPEGGIA_VERSION, GERMLINE_REFERENCE
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.antibody import (
+    ARPEGGIA_VERSION,
+    BIOPYTHON_VERSION,
+    GERMLINE_REFERENCE,
+)
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
@@ -79,7 +84,7 @@ from biomodals.workflow.humanization.execution import (
 from biomodals.workflow.humanization.export import IMGT_MUTATION_SCHEMA, export_results
 from biomodals.workflow.humanization.germlines import (
     GERMLINE_SCHEMA,
-    add_gene_columns,
+    add_sequence_columns,
     complete_germline_table,
 )
 from biomodals.workflow.humanization.ranking import RANKING_VERSION, rank_panel
@@ -94,7 +99,8 @@ from biomodals.workflow.humanization.tables import (
 
 METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
-    "result_schema": "4",
+    "result_schema": "5",
+    "sequence_metrics": f"biopython={BIOPYTHON_VERSION}|full-input-pi-v1",
     "germline_annotation": f"arpeggia={ARPEGGIA_VERSION}|{GERMLINE_REFERENCE}|all-species-v1",
     "panel_ranking": RANKING_VERSION,
     "biomodals.workflow.humanization": "2",
@@ -126,11 +132,27 @@ CONF = AppConfig(
 OUT_VOLUME = orchestrator.OUT_VOLUME
 OUT_VOLUME_NAME = orchestrator.OUT_VOLUME_NAME
 OUT_VOLUME_MOUNTPOINT = orchestrator.CONF.output_volume_mountpoint
-app = modal.App(CONF.name, image=orchestrator.runtime_image, tags=CONF.tags)
+# Install workflow dependencies before the helper's deferred source mounts.
+runtime_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .env(CONF.default_env)
+    .uv_pip_install(f"biopython=={BIOPYTHON_VERSION}")
+    .pipe(patch_image_for_helper, include_workflow_modules=True)
+)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 app = include_dependency_apps(app, CONF.depends_on_apps)
-annotation_image = hudiff_app.coordinator_image.uv_pip_install(
-    f"arpeggia=={ARPEGGIA_VERSION}"
-).add_local_python_source("biomodals.workflow.humanization")
+annotation_image = (
+    modal.Image
+    .micromamba(python_version="3.12")
+    .micromamba_install(
+        ["anarci==2020.04.23", "hmmer==3.3.2"],
+        channels=["bioconda", "conda-forge"],
+    )
+    .uv_pip_install(f"arpeggia=={ARPEGGIA_VERSION}")
+    .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.workflow.humanization")
+)
 annotate_humanization_candidate = app.function(
     image=annotation_image, cpu=1, memory=2048, timeout=600
 )(_annotate_candidate)
@@ -595,7 +617,7 @@ class HumanizationEvaluateNode(TaskProviderNode):
             selection_table(candidates, evaluations, annotations), mutations
         )
         germlines = complete_germline_table(candidates, germline_frames)
-        table = add_gene_columns(table, germlines)
+        table = add_sequence_columns(table, germlines)
         bundle = export_results(
             context,
             candidates,

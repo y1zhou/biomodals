@@ -99,7 +99,7 @@ from biomodals.workflow.humanization.tables import (
 
 METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
-    "result_schema": "5",
+    "result_schema": "6",
     "sequence_metrics": f"biopython={BIOPYTHON_VERSION}|full-input-pi-v1",
     "germline_annotation": f"arpeggia={ARPEGGIA_VERSION}|{GERMLINE_REFERENCE}|all-species-v1",
     "panel_ranking": RANKING_VERSION,

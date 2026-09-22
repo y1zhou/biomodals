@@ -35,7 +35,7 @@ from biomodals.service.humanization.contracts import (
 )
 from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.humanization.results import (
-    CURRENT_SELECTION_SCHEMA,
+    READ_SELECTION_SCHEMA,
     SELECTION_SCHEMA,
     CandidateGermlines,
     HumanizationManifest,
@@ -283,7 +283,7 @@ def create_router(
         sort_by: str | None = None,
         descending: bool = False,
     ) -> SelectionPage:
-        if sort_by is not None and sort_by not in CURRENT_SELECTION_SCHEMA:
+        if sort_by is not None and sort_by not in READ_SELECTION_SCHEMA:
             raise CodedAPIError(422, "sort_invalid", "Unknown selection column")
 
         def read_page(source: IO[bytes], archive: zipfile.ZipFile):
@@ -305,9 +305,15 @@ def create_router(
             )
             if manifest.schema_version < 4:
                 raise ValueError("Gene columns require an annotated publication")
-            if (manifest.schema_version >= 5) != any(
-                c.name == "vh_pi" for c in page.columns
-            ):
+            names = {column.name for column in page.columns}
+            expected_pi = (
+                {"vh_pi", "vl_pi", "vh_vl_pi"}
+                if manifest.schema_version == 5
+                else {"vh_pI", "vl_pI", "vh_vl_pI"}
+                if manifest.schema_version >= 6
+                else set()
+            )
+            if {name for name in names if name.endswith(("_pi", "_pI"))} != expected_pi:
                 raise ValueError(
                     "Sequence metrics do not match the publication version"
                 )

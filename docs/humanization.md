@@ -95,8 +95,8 @@ preservation and error columns before choosing a characterization panel.
 
 ## Downloaded results
 
-New schema 5 archives contain the selection CSV with VH pI, VL pI, VH+VL pI
-and four V/J gene columns immediately after `vh`,
+New schema 6 archives contain the selection CSV with adjacent `vh` and `vl`,
+followed by `vh_pI`, `vl_pI`, `vh_vl_pI` and four V/J gene columns,
 one consolidated germline-evidence Parquet, detailed score Parquets,
 IMGT mutations, a compact generation ledger, and a digest manifest. The ledger
 links generation outcomes to retained candidates, including parental no-ops,
@@ -106,9 +106,11 @@ layout and stored ranking.
 
 Hover genes for matched reference species and approved-therapeutic usage, with
 source/date information once above the table. Click sequences for numbering,
-CDR and potential-liability annotations, plus one Germline / Diffs / **Input** /
-Diffs / Parental alignment. The parent is read from this job's retained inputs;
-if unavailable, the germline display remains usable. pIs use the complete supplied
+CDR and potential-liability annotations, plus one Germline (humanized) /
+**Humanized** / Parental / Germline (parental) alignment with unlabeled comparison
+strips. Both before/after V/J genes and species are shown. The parent is read
+from this job's retained inputs; if unavailable, the candidate's germline display
+remains usable. pIs use the complete supplied
 chains; VH+VL treats their direct concatenation as one chain without a linker.
 Neither pIs nor genes change ranking. VH/VL checkboxes let you send selected
 chains to [Antibody sequence analysis](antibody-sequence-analysis.md), pairing

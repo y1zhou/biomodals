@@ -121,13 +121,14 @@ def test_sequence_columns_preserve_rank_and_compute_each_unique_input_once(monke
     )
     table = add_sequence_columns(original, evidence)
     assert table.select(original.columns).equals(original)
-    at = table.columns.index("vh") + 1
+    at = table.columns.index("vh") + 2
+    assert table.columns[at - 1] == "vl"
     assert table.columns[at : at + 7] == list(SEQUENCE_COLUMNS)
     assert set(chains) == {VH, VL} and len(chains) == 2
     assert pairs == [(VH, VL)]
-    assert table["vh_pi"].to_list() == [sequence_pi(VH)] * 2
-    assert table["vl_pi"].to_list() == [sequence_pi(VL)] * 2
-    assert table["vh_vl_pi"].to_list() == [combined_pi(VH, VL)] * 2
+    assert table["vh_pI"].to_list() == [sequence_pi(VH)] * 2
+    assert table["vl_pI"].to_list() == [sequence_pi(VL)] * 2
+    assert table["vh_vl_pI"].to_list() == [combined_pi(VH, VL)] * 2
     assert table["vh_v_gene"].to_list() == ["IGHV1-2"] * 2
     empty = add_sequence_columns(original.clear(), evidence.clear())
     assert empty.schema == table.schema and empty.height == 0

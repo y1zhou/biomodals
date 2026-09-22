@@ -22,9 +22,9 @@ GENE_COLUMNS = {
     for segment in ("v", "j")
 }
 SEQUENCE_COLUMNS = {
-    "vh_pi": pl.Float64,
-    "vl_pi": pl.Float64,
-    "vh_vl_pi": pl.Float64,
+    "vh_pI": pl.Float64,
+    "vl_pI": pl.Float64,
+    "vh_vl_pI": pl.Float64,
     **GENE_COLUMNS,
 }
 _EVIDENCE = pl.Struct({
@@ -159,7 +159,7 @@ def add_gene_columns(selection: pl.DataFrame, germlines: pl.DataFrame) -> pl.Dat
 def add_sequence_columns(
     selection: pl.DataFrame, germlines: pl.DataFrame
 ) -> pl.DataFrame:
-    """Join unique-sequence pIs after ranking and place annotations after VH."""
+    """Join unique-sequence pIs after ranking, following adjacent VH/VL."""
     # Native scientific work runs once per unique chain/pair. Polars owns the
     # deduplication and joins; scores, rank and original row order are untouched.
     chains = (
@@ -178,7 +178,7 @@ def add_sequence_columns(
     result = add_gene_columns(selection, germlines)
     for chain in ("vh", "vl"):
         result = result.join(
-            chains.rename({"sequence": chain, "pi": f"{chain}_pi"}),
+            chains.rename({"sequence": chain, "pi": f"{chain}_pI"}),
             on=chain,
             how="left",
             validate="m:1",
@@ -195,12 +195,12 @@ def add_sequence_columns(
                 lambda pair: combined_pi(pair["vh"], pair["vl"]),
                 return_dtype=pl.Float64,
             )
-            .alias("vh_vl_pi")
+            .alias("vh_vl_pI")
         )
     )
     result = result.join(
         pairs, on=["vh", "vl"], how="left", validate="m:1", maintain_order="left"
     )
-    columns = selection.columns
+    columns = [name for name in selection.columns if name != "vl"]
     at = columns.index("vh") + 1
-    return result.select(*columns[:at], *SEQUENCE_COLUMNS, *columns[at:])
+    return result.select(*columns[:at], "vl", *SEQUENCE_COLUMNS, *columns[at:])

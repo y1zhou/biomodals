@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict
 if TYPE_CHECKING:
     from arpeggia import GermlineMatch, NumberedAntibody
 
-ANALYSIS_VERSION = "4"
+ANALYSIS_VERSION = "5"
 ARPEGGIA_VERSION = "0.10.1"
 BIOPYTHON_VERSION = "1.86"
 GERMLINE_REFERENCE = "IMGT-202636-7+llama-supplement"
@@ -107,7 +107,8 @@ class SequenceAlignment(TypedDict):
     """Native comparisons projected onto one full-input display axis.
 
     Spaces mean unavailable reference coverage, not a match or deletion.
-    Both difference rows describe Input relative to their reference. Independent
+    Differences describe Input relative to its germline or parent, and Parent
+    relative to its own germline. Independent
     reference-only columns are separate: no germline/parent homology is inferred.
     """
 
@@ -117,6 +118,8 @@ class SequenceAlignment(TypedDict):
     input_indices: list[int | None]
     parental: str | None
     parental_diffs: str | None
+    parental_germline: str | None
+    parental_germline_diffs: str | None
 
 
 class SequenceDetail(TypedDict):
@@ -129,6 +132,8 @@ class SequenceDetail(TypedDict):
     domain_span: tuple[int, int] | None
     residues: list[NumberedResidue]
     germlines: list[GermlineReference]
+    parental_germlines: list[GermlineReference]
+    parental_germline_error: str | None
     alignment: SequenceAlignment | None
     liabilities: list[Liability]
     diagnostics: list[str]
@@ -281,12 +286,8 @@ def _project_alignment(reference: str, query: str, operations: str, start: int):
     return residues, before
 
 
-def _sequence_alignment(
-    numbered: NumberedAntibody, parental_sequence: str | None
-) -> SequenceAlignment:
-    """Merge local V/J and optional native global parent comparisons, not MSA."""
-    from arpeggia import align_seqs
-
+def _germline_projection(numbered: NumberedAntibody):
+    """Keep native V/J local columns indexed by their own full input sequence."""
     germline: dict[int, tuple[str, str]] = {}
     germline_gaps: dict[int, list[tuple[str, str]]] = {}
     for match in (numbered.v_match, numbered.j_match):
@@ -303,6 +304,18 @@ def _sequence_alignment(
         germline.update(residues)
         for index, values in gaps.items():
             germline_gaps.setdefault(index, []).extend(values)
+    return germline, germline_gaps
+
+
+def _sequence_alignment(
+    numbered: NumberedAntibody,
+    parental_sequence: str | None,
+    parental_numbered: NumberedAntibody | None,
+) -> SequenceAlignment:
+    """Compose native pairwise comparisons, without inventing a four-way MSA."""
+    from arpeggia import align_seqs
+
+    germline, germline_gaps = _germline_projection(numbered)
     parent, parent_gaps = {}, {}
     if parental_sequence is not None:
         alignment = align_seqs(
@@ -341,14 +354,43 @@ def _sequence_alignment(
             parent_ref,
         ))
         indices.append(index)
-    strings = ["".join(row[i] for row in rows) for i in range(5)]
+    # Project the parent's own germline THROUGH its actual residues, not by
+    # aligning that germline to the humanized input. Reference-only columns
+    # remain separate even when the two germlines have gaps at similar sites.
+    extended = []
+    extended_indices = []
+    parent_index = 0
+    parent_gl, parent_gl_gaps = (
+        _germline_projection(parental_numbered)
+        if parental_numbered is not None
+        else ({}, {})
+    )
+    first, last = min(parent_gl, default=0), max(parent_gl, default=-1)
+    for row, input_index in zip(rows, indices, strict=True):
+        reference, operation = " ", " "
+        if row[4] not in (" ", "-"):
+            for ref, op in parent_gl_gaps.get(parent_index, ()):
+                extended.append((" ", " ", " ", " ", "-", op, ref))
+                extended_indices.append(None)
+            reference, operation = parent_gl.get(
+                parent_index, ("-" if first < parent_index < last else " ", " ")
+            )
+            parent_index += 1
+        extended.append((*row, operation, reference))
+        extended_indices.append(input_index)
+    for ref, op in parent_gl_gaps.get(parent_index, ()):
+        extended.append((" ", " ", " ", " ", "-", op, ref))
+        extended_indices.append(None)
+    strings = ["".join(row[i] for row in extended) for i in range(7)]
     return {
         "germline": strings[0],
         "germline_diffs": strings[1],
         "input": strings[2],
-        "input_indices": indices,
+        "input_indices": extended_indices,
         "parental_diffs": strings[3] if parental_sequence is not None else None,
         "parental": strings[4] if parental_sequence is not None else None,
+        "parental_germline_diffs": strings[5] if parent_gl else None,
+        "parental_germline": strings[6] if parent_gl else None,
     }
 
 
@@ -454,6 +496,8 @@ def sequence_detail(
         "domain_span": None,
         "residues": [],
         "germlines": [],
+        "parental_germlines": [],
+        "parental_germline_error": None,
         "alignment": None,
         "liabilities": sequence_liabilities(sequence),
         "diagnostics": [],
@@ -464,13 +508,25 @@ def sequence_detail(
     except (ValueError, RuntimeError) as error:
         result["error"] = str(error)
         return result
+    parental_numbered = None
+    if parental_sequence is not None:
+        try:
+            parental_numbered = (
+                numbered
+                if parental_sequence == sequence
+                else number_antibody(parental_sequence, scheme=scheme)
+            )
+        except (ValueError, RuntimeError) as error:
+            result["parental_germline_error"] = str(error)
+        else:
+            result["parental_germlines"] = _germline_references(parental_numbered)
     result.update(
         chain_type=numbered.chain,
         domain_span=numbered.domain_span,
         cdr_definition=numbered.cdr_definition,
         diagnostics=numbered.diagnostics,
         germlines=_germline_references(numbered),
-        alignment=_sequence_alignment(numbered, parental_sequence),
+        alignment=_sequence_alignment(numbered, parental_sequence, parental_numbered),
         residues=[
             {
                 "input_index": residue.input_index,

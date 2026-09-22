@@ -95,9 +95,11 @@ with the selected V/J reference genes, species and tie counts above it.
 Blank differences in covered positions mean exact matches;
 `+` means an input insertion, `-` a deletion, `:` a similar substitution and
 `x` another mismatch. These are local matches: omitted flanks and the unknown
-V/J junction are not called insertions or mutations. In humanization results,
-two extra rows compare Input against its exact Parental sequence. If retained
-parent inputs are unavailable, the rest of the inspector remains usable.
+V/J junction are not called insertions or mutations. Humanization results show
+Germline (humanized), **Humanized**, Parental and Germline (parental), separated
+by unlabeled comparison strips. Both before/after V/J genes and species appear
+above the alignment. If retained parent inputs or their germline assignments
+are unavailable, the rest of the inspector remains usable.
 
 ## Analyze humanization selections
 
@@ -134,7 +136,7 @@ repair; other sequence metrics remain usable. The cache lives under
 BIOMODALS_CACHE_DIR/antibody-sequence-analysis/therapeutic-gene-usage.json.
 
 Roll out the updated API extras/service and frontend together. The page requires
-analysis version 4; an update notice blocks calculations against an older API
+analysis version 5; an update notice blocks calculations against an older API
 rather than mislabeling its metric scale or liability rules. Sequence copying
 remains available. New humanization
 gene publications additionally require deploying and pinning the updated

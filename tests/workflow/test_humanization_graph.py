@@ -465,7 +465,7 @@ def test_full_graph_joins_successful_native_results_into_sortable_table(
         assert manifest["protocols"]["pabnativ2"]["pssm_frequency_cutoff"] == 0.01
         assert manifest["protocols"]["pabnativ2"]["nativeness_weight"] == 10.0
         assert manifest["protocols"]["pabnativ2"]["pairing_weight"] == 1.0
-        assert manifest["schema_version"] == 5
+        assert manifest["schema_version"] == 6
         generation = pl.read_parquet(root / "generation.parquet")
         baseline = generation.filter(pl.col("candidate_id") == table["candidate_id"][0])
         assert baseline["method"].to_list() == ["pabnativ2"] * num_seeds

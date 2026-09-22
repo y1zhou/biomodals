@@ -128,30 +128,92 @@ def test_parental_and_germline_comparisons_share_input_without_invented_homology
     scheme,
 ):
     """Native global parent differences survive independent reference-only gaps."""
-    from arpeggia import align_seqs
+    from arpeggia import align_seqs, number_antibody
 
     sequence = "GGG" + VH[:35] + "GG" + VH[35:62] + VH[64:] + "HHHHHH"
     parent = "GG" + VH[:40] + "CC" + VH[40:] + "HHHHHH"
     native = align_seqs(parent, sequence, mode="global")
-    alignment = sequence_detail(sequence, scheme, parent)["alignment"]
+    detail = sequence_detail(sequence, scheme, parent)
+    alignment = detail["alignment"]
     assert (
         len({len(value) for key, value in alignment.items() if key != "input_indices"})
         == 1
     )
     assert len(alignment["input_indices"]) == len(alignment["input"])
     assert alignment["parental"].replace("-", "").replace(" ", "") == parent
-    assert alignment["input"].replace("-", "") == sequence
-    # Blank parent cells belong only to independent germline-only columns.
-    parent_columns = [i for i, ref in enumerate(alignment["parental"]) if ref != " "]
+    assert alignment["input"].replace("-", "").replace(" ", "") == sequence
+    # Each native comparison survives after unrelated reference-only columns
+    # are removed; independent gaps never assert four-way homology.
+    parent_columns = [
+        i
+        for i, ref in enumerate(alignment["parental"])
+        if ref != " " and alignment["input"][i] != " "
+    ]
     for key, expected in (
         ("parental", native.aligned_reference),
         ("input", native.aligned_query),
         ("parental_diffs", native.operations),
     ):
         assert "".join(alignment[key][i] for i in parent_columns) == expected
+    for original, ref_key, query_key, diff_key, references in (
+        (sequence, "germline", "input", "germline_diffs", detail["germlines"]),
+        (
+            parent,
+            "parental_germline",
+            "parental",
+            "parental_germline_diffs",
+            detail["parental_germlines"],
+        ),
+    ):
+        numbered = number_antibody(original, scheme=scheme)
+        projected = [
+            (ref, query, op)
+            for ref, query, op in zip(
+                alignment[ref_key],
+                alignment[query_key],
+                alignment[diff_key],
+                strict=True,
+            )
+            if ref != " " and query != " "
+        ]
+        for match, identity in zip(
+            (numbered.v_match, numbered.j_match), references, strict=True
+        ):
+            hit = match.hits[0]
+            assert identity["reference_ids"] == [ref.id for ref in hit.references]
+            expected = list(
+                zip(
+                    hit.alignment.aligned_reference,
+                    hit.alignment.aligned_query,
+                    hit.alignment.operations,
+                    strict=True,
+                )
+            )
+            assert any(
+                projected[start : start + len(expected)] == expected
+                for start in range(len(projected))
+            )
     same = sequence_detail(VH, scheme, VH)["alignment"]
-    assert same["parental"].replace(" ", "") == VH
+    assert same["parental"].replace(" ", "").replace("-", "") == VH
     assert set(same["parental_diffs"]) == {" "}
+
+
+def test_parent_germline_failure_preserves_candidate_and_parent_comparison():
+    """An unnumberable retained parent does not hide usable candidate evidence."""
+    detail = sequence_detail(VH, parental_sequence="ACDE")
+    assert detail["error"] is None and detail["germlines"]
+    assert detail["parental_germline_error"]
+    assert detail["alignment"]["parental"].replace("-", "").replace(" ", "") == "ACDE"
+    assert detail["alignment"]["input"].replace("-", "") == VH
+
+
+def test_candidate_and_parent_assign_germlines_independently():
+    """Before/after references are not copied from the humanized assignment."""
+    okt3 = "QVQLQQSGAELARPGASVKMSCKASGYTFTRYTMHWVKQRPGQGLEWIGYINPSRGYTNYNQKFKDKATLTTDKSSSTAYMQLSSLTSEDSAVYYCARYYDDHYCLDYWGQGTTLTVSS"
+    detail = sequence_detail(VH, parental_sequence=okt3)
+    assert detail["germlines"] != detail["parental_germlines"]
+    assert "Homo sapiens" in detail["germlines"][0]["reference_names"][0]
+    assert "Mus musculus" in detail["parental_germlines"][0]["reference_names"][0]
 
 
 @pytest.mark.parametrize("chain", [VH, VL])

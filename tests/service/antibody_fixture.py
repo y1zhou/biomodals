@@ -17,7 +17,7 @@ from biomodals.workflow.humanization.germlines import (
 
 
 def annotated_archive(
-    table, run_id, settings, versions, *, tamper=False, schema_version=5
+    table, run_id, settings, versions, *, tamper=False, schema_version=6
 ):
     """Build native-shaped annotated results without any cloud/model operation."""
     assignments = {
@@ -36,9 +36,19 @@ def annotated_archive(
         for chain in ("vh", "vl")
     ]
     evidence = pl.DataFrame(rows, schema=GERMLINE_SCHEMA)
-    table = (add_sequence_columns if schema_version == 5 else add_gene_columns)(
+    original_columns = table.columns
+    table = (add_sequence_columns if schema_version >= 5 else add_gene_columns)(
         table, evidence
     )
+    if schema_version == 5:
+        # Retained historical layout, not a rewrite performed by the service.
+        annotations = [name for name in table.columns if name not in original_columns]
+        at = original_columns.index("vh") + 1
+        table = table.select(
+            *original_columns[:at], *annotations, *original_columns[at:]
+        ).rename({
+            name: name[:-2] + "pi" for name in annotations if name.endswith("pI")
+        })
     if tamper:
         evidence = evidence.with_columns(pl.lit("incorrect").alias("sequence_sha256"))
     parquet = BytesIO()

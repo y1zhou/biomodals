@@ -178,7 +178,7 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
     options = _request(app, "GET", root + "/options")
     assert options.json()["max_entries_per_group"] == 1000
     assert options.json()["max_chain_length"] == 512
-    assert options.json()["analysis_version"] == "4"
+    assert options.json()["analysis_version"] == "5"
     response = _request(
         app,
         "POST",
@@ -283,7 +283,7 @@ def test_all_invalid_inputs_do_not_trigger_reference_download(tmp_path):
 
 
 @pytest.mark.parametrize("tamper", [False, True])
-@pytest.mark.parametrize("schema_version", [4, 5])
+@pytest.mark.parametrize("schema_version", [4, 5, 6])
 def test_humanization_page_bounded_frozen_assignments_and_usage(
     tmp_path, tamper, schema_version
 ):
@@ -362,21 +362,29 @@ def test_humanization_page_bounded_frozen_assignments_and_usage(
         csv = _request(app, "GET", f"/api/v1/humanization/jobs/{job_id}/selection.csv")
         assert csv.status_code == 200
         assert "vh_v_gene" in csv.text.splitlines()[0]
-        if schema_version == 5:
+        if schema_version >= 5:
             from biomodals.helper.antibody import combined_pi, sequence_pi
             from biomodals.workflow.humanization.germlines import SEQUENCE_COLUMNS
 
             names = [column["name"] for column in result["columns"]]
-            at = names.index("vh") + 1
-            assert names[at : at + 7] == list(SEQUENCE_COLUMNS)
+            annotations = list(SEQUENCE_COLUMNS)
+            suffix = "pI"
+            at = names.index("vh") + 2
+            if schema_version == 5:
+                suffix = "pi"
+                at -= 1
+                annotations = [name.replace("_pI", "_pi") for name in annotations]
+            else:
+                assert names[at - 1] == "vl"
+            assert names[at : at + 7] == annotations
             assert csv.text.splitlines()[0].split(",") == names
-            assert result["rows"][0]["vh_pi"] == sequence_pi(VH)
-            assert result["rows"][0]["vl_pi"] == sequence_pi(VL)
-            assert result["rows"][0]["vh_vl_pi"] == combined_pi(VH, VL)
+            assert result["rows"][0][f"vh_{suffix}"] == sequence_pi(VH)
+            assert result["rows"][0][f"vl_{suffix}"] == sequence_pi(VL)
+            assert result["rows"][0][f"vh_vl_{suffix}"] == combined_pi(VH, VL)
             sorted_page = _request(
                 app,
                 "GET",
-                f"/api/v1/humanization/jobs/{job_id}/selection?limit=1&sort_by=vh_pi&descending=true",
+                f"/api/v1/humanization/jobs/{job_id}/selection?limit=1&sort_by=vh_{suffix}&descending=true",
             )
             assert sorted_page.status_code == 200
             assert sorted_page.json()["rows"][0]["candidate_id"] == "c1"

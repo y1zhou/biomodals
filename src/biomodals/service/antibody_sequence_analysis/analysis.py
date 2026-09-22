@@ -241,6 +241,7 @@ class AnalysisService:
                     sequence=sequence,
                     metrics=analyzed["metrics"],
                     germlines=present_germlines(analyzed["germlines"], role, snapshot),
+                    germline_pi=analyzed["germline_pi"],
                 ),
             )
         pair_pis = {}

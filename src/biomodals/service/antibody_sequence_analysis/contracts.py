@@ -85,6 +85,7 @@ class AnalyzedChain(BaseModel):
     sequence: str
     metrics: ProteinMetrics
     germlines: GermlinePresentation
+    germline_pi: float | None
 
 
 class AnalysisEntry(BaseModel):

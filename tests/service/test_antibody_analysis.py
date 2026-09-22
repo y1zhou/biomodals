@@ -8,7 +8,7 @@ import pytest
 from antibody_fixture import VH, VL, reference_csv
 from test_api_contract import ORIGIN, _app, _humanization_session, _request
 
-from biomodals.helper.antibody import assign_germlines
+from biomodals.helper.antibody import analyze_chain, assign_germlines
 from biomodals.service.antibody_sequence_analysis.analysis import (
     AnalysisService,
     parse_fasta,
@@ -178,6 +178,7 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
     options = _request(app, "GET", root + "/options")
     assert options.json()["max_entries_per_group"] == 1000
     assert options.json()["max_chain_length"] == 512
+    assert options.json()["analysis_version"] == "3"
     response = _request(
         app,
         "POST",
@@ -186,6 +187,9 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
     )
     assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "private, no-store"
+    pair = response.json()["groups"][0]["entries"][0]
+    assert pair["vh"]["germline_pi"] == analyze_chain(VH)["germline_pi"]
+    assert pair["vl"]["germline_pi"] == analyze_chain(VL)["germline_pi"]
     assert (
         response.json()["groups"][0]["entries"][0]["vh"]["germlines"]["assignment"][
             "v_gene"
@@ -196,6 +200,10 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
         app, "POST", root + "/sequence", json={"sequence": VH, "scheme": "kabat"}
     )
     assert detail.status_code == 200 and detail.json()["residues"]
+    assert [row["segment"] for row in detail.json()["germline_alignments"]] == [
+        "v",
+        "j",
+    ]
     oversized = _request(
         app, "POST", root + "/analyze", content=b" " * (4 * 1024 * 1024 + 1)
     )

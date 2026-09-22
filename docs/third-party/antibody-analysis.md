@@ -1,10 +1,10 @@
 # Antibody analysis acknowledgements
 
 The potential sequence-liability detector in `biomodals.helper.antibody`
-adapts the active rules of [LAMBS v0.12.0](https://github.com/dcroote/lambs/tree/61d6f28f3c666778fc06ed05a8a2d50faef4d715)
+adapts selected rules of [LAMBS v0.12.0](https://github.com/dcroote/lambs/tree/61d6f28f3c666778fc06ed05a8a2d50faef4d715)
 by Daniel Croote and contributors. The Python implementation uses explicit,
-overlap-preserving input intervals and Biopython's Kyte–Doolittle constants;
-it does not embed the LAMBS web application. The upstream
+overlap-preserving input intervals and excludes conserved numbered cysteines
+from odd-count markers; it does not embed the LAMBS web application. The upstream
 [Apache-2.0 license](LAMBS-LICENSE.txt) is retained alongside this notice.
 
 [Arpeggia](https://github.com/y1zhou/arpeggia/tree/v0.10.1) is distributed under

@@ -1,6 +1,6 @@
 # Antibody sequence analysis and humanization annotations
 
-Status: accepted and implemented for offline verification, 21 September 2026.
+Status: accepted and implemented for offline verification, amended 22 September 2026.
 Deployment and paid scientific verification require separate authorization.
 The [user guide](../antibody-sequence-analysis.md) owns website instructions;
 this document owns scientific definitions and implementation boundaries.
@@ -54,7 +54,10 @@ ones. An unsplittable group gets a group error while the other remains analyzabl
 Numbering/germline failures make those annotations unavailable but retain physical
 metrics for valid canonical sequences.
 
-GET /options supplies authoritative limits, schemes and versions.
+GET /options supplies authoritative limits, schemes and versions. The frontend
+requires analysis version 3 before analysis or sequence-detail requests, so an
+older API cannot be mislabeled as the current scientific/display contract.
+Full-sequence copying remains available during a version mismatch.
 POST /sequence accepts one sequence/scheme for lazy details. All routes use
 existing authentication; POST also uses Origin/CSRF protection. Responses are
 private/no-store. No endpoint logs or persists user sequences.
@@ -68,15 +71,15 @@ tags/tails. Values remain full precision in data and CSV.
 | --- | --- |
 | pi | Theoretical sequence pI |
 | molecular_weight_kda | Average unmodified mass, not monoisotopic, divided by 1000 |
-| gravy | Kyte–Doolittle GRAVY, dimensionless |
-| extinction_reduced | Reduced-chain molar ε280, M⁻¹ cm⁻¹ |
-| extinction_oxidized | ε280 with Biopython's cystine assumption, M⁻¹ cm⁻¹ |
+| gravy | Black–Mould GRAVY via Biopython's BlackMould scale, dimensionless |
 | vh_vl_pi | Literal VH followed by VL, one continuous sequence without a linker |
+| germline_pi | Each chain's full representative V-reference followed by J-reference, with no D/junction sequence or linker |
 
-Label the combined value **VH+VL sequence pI**. It is not mean chain pI,
+Label the combined value **VH+VL pI**. It is not mean chain pI,
 two-chain charge-sum pI, full-IgG pI or an unspecified scFv/linker estimate.
-Extinction assumptions do not establish disulfide bonds. No unprovided constant
-regions, glycans or conjugates are included.
+No unprovided constant regions, glycans or conjugates are included. Analysis
+version 3 retains BlackMould and adds germline pI and native local alignments;
+extinction coefficients are not calculated.
 Sources: [Biopython 1.86 ProtParam](https://github.com/biopython/biopython/blob/biopython-186/Bio/SeqUtils/ProtParam.py),
 [terminal accounting](https://github.com/biopython/biopython/blob/biopython-186/Bio/SeqUtils/IsoelectricPoint.py).
 
@@ -91,7 +94,17 @@ Keep all best hits with species/gene/allele/accession/reference identity, score,
 known-pair counts, coverage and query/IMGT spans. Main columns contain gene names
 without alleles, deduplicated and slash-joined in deterministic order. Hover shows
 all tied **matched reference species** and gene-level usage. Never pick an
-arbitrary winner or turn missing assignments into a zero score.
+arbitrary winner for those assignments or turn missing assignments into a zero score.
+
+The scalar germline pI and displayed alignment use arpeggia's deterministic
+display representative (hits[0]) independently for V and J. This is a display
+choice among equal scores, not stronger evidence of ancestry; disclose it near
+the table and identify the selected references and tie counts in the inspector.
+Compute pI on alignment.reference for the full V and J segments, including
+unaligned reference ends, not on the gapped alignment strings. Do not average
+ties or chain pIs. Missing V/J assignments or noncanonical reference residues
+yield null rather than trimming residues or fabricating a sequence. All tied
+reference evidence remains available in the gene popovers.
 
 Reference identity: IMGT 202636-7 plus arpeggia's small llama supplement.
 Coverage is human/mouse/rat/rabbit H/K/L and alpaca/llama H. Llama has six V and
@@ -147,28 +160,47 @@ dates/source labels in gene cells.
 Clicking a sequence opens a wide dialog; load details only on opening or scheme
 change. Default IMGT; offer IMGT, Kabat, Chothia, Martin and AHo with matching CDR
 conventions. No independent CDR selector. Display changes do not reinterpret
-workflow IMGT preservation or ranking.
+workflow IMGT preservation or ranking. Include Copy sequence for the full
+normalized input; clicking outside the dialog dismisses it. Place the CDR1/2/3
+and potential-liability legends to the right of Copy sequence, without the
+repeated numbering-convention paragraph.
 
 Use native residue order and zero-based input_index, not sorted numeric labels.
 domain_span is half-open. Keep original sequences and visibly identify unnumbered
 tails. Show CDR1/2/3 separately; do not impute, graft or edit residues.
 
+Within Numbered domain, show the representative native V/J local alignment
+blocks without parsing terminal-formatted output or realigning in the browser.
+Expose reference identities/names, total tied reference counts, the three
+equal-length native aligned_reference/aligned_query/operations strings, and
+zero-based reference_start/query_input_start. The latter already includes
+the local alignment offset in the complete original input. Query deletions
+occupy gap columns, not input indices. Keep the full numbered input visible:
+regions outside local matches, including the unknown V/J junction, must not
+be relabeled as insertions. Operations are blank for exact matches, + for input
+insertions, - for deletions, : for positive-BLOSUM62 substitutions and x for
+other mismatches, following the pinned
+[arpeggia display contract](https://github.com/y1zhou/arpeggia/blob/v0.10.1/docs/antibody-numbering.md#display-and-antibody-alignments).
+
 Liability intervals are zero-based, half-open and overlap-preserving across the
-entire supplied chain. Follow active
+entire supplied chain. Use the following selected
 [LAMBS v0.12.0 rules](https://github.com/dcroote/lambs/blob/61d6f28f3c666778fc06ed05a8a2d50faef4d715/index.html#L3052):
 
 | Kind | Detection / highlighted positions |
 | --- | --- |
-| Odd cysteine count | All C positions when the total count is odd |
+| Odd cysteine count | Non-conserved C positions when the full-input count is odd |
 | Methionine | Every M |
 | N-glycosylation | N-X-S/T where X is not P; all three residues |
 | Asn deamidation | NG, NS, NT, NN, NH; both residues |
 | Asp isomerization | DG, DS; both residues |
 | Acid cleavage | DP; both residues |
-| N-terminal glutamine | Q at the supplied sequence's first position only |
-| Hydrophobic patch | All positions in seven-residue KD windows with mean ≥1.6 |
 
-No W oxidation rule: it is disabled upstream. Label **potential sequence
+Exclude conserved Cys at native IMGT 23 and 104 from odd-count markers,
+using their original input indices even when another display scheme is selected.
+These conserved positions apply to both H and L variable domains; see
+[IMGT V-domain anchors](https://pmc.ncbi.nlm.nih.gov/articles/PMC3358611/).
+If numbering fails, no conserved positions are inferred. N-terminal glutamine,
+hydrophobic patches and W oxidation are not screened. Label **potential sequence
 liabilities**, not measured modifications, accessibility or aggregation risk.
 Odd cysteine count cannot identify an unpaired bond. See
 [third-party notices](../third-party/antibody-analysis.md).
@@ -213,11 +245,29 @@ confirmation. Normal standalone input requires explicit Analyze. No sequences in
 URLs, browser storage or My Jobs. Mounted reauthentication preserves input;
 reload loses it. Recompute on each explicit new analysis request.
 
+Load example sequences populates Group 1 with the user-supplied pembrolizumab
+and OKT3 pairs and Ozoralizumab single domain, retaining the optional second
+group. Loading is an input edit, not an analysis request; it invalidates any
+pending file read for that group. After explicit analysis returns new results,
+bring the results heading into view with accessible focus and reduced-motion
+support. Sorting/paging or inspecting a sequence must not retrigger scrolling.
+
 Two groups have independent tables, not matched-ID comparisons/deltas. Share
 column visibility, with independent sorts and 50-row browser pages. Order ID,
-VH pI, VL pI, VH+VL pI, four genes, then remaining chain metrics. Unassigned
+VH pI, VL pI, VH+VL pI, four genes, VH germline pI, VL germline pI, then remaining
+chain metrics. The two germline columns follow VL J gene. Unassigned
 sequences retain honestly labeled metrics. Display pI/kDa to two decimals, GRAVY
-to three, EC as integers and usage percentages to one; retain raw sorting/CSV.
+to three and usage percentages to one; retain raw sorting/CSV. Use compact VH/VL
+sequence buttons and a Columns (shown/all) visibility button, shared across groups.
+Gene popovers show evidence without repeating generic V/J match descriptions.
+The Issues column contains input/annotation diagnostics, not liability flags or
+quality assessments.
+
+Each analysis group has independent row selection, retained through sorting and
+paging and reset with new results. Download selected pairs exports FASTA in
+original input order: VH:VL for pairs, one sequence for standalone entries.
+Only entries with analyzed sequences are selectable; never invent missing
+partners. This is distinct from humanization's within-parent recombination.
 Humanization keeps backend sorting/paging. No mobile-specific scope.
 
 Configuration guidance explains independent generation, exact-pair union and
@@ -237,7 +287,8 @@ caches, partial inputs, auth/body bounds, no Job admission, identity rejection,
 historical schemas and unchanged ranks. The 11,400-candidate website envelope
 remains below the 32 MiB CSV bound with the four new scalar columns.
 
-Local measurements on 21 September 2026, not deployment latency promises:
+Local measurements on 21 September 2026 (analysis version 1, before the metric
+amendments), not deployment latency or current response-size promises:
 
 - Cached public CSV: 636,357 bytes, 1,133 rows, SHA-256
   cc9402788297ed7b6ab3d676daa21953a6d28ebbd9cc78ec7248b19f74d49d6d.

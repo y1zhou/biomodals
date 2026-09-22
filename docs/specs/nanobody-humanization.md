@@ -101,10 +101,14 @@ scores to zero to accommodate single-domain candidates.
 
 - Rank independently per parent using Pareto objectives that maximize VH2
   and VHH2 nativeness and minimize mutation count from the prepared parent.
-  Within a Pareto tier, prefer distinct mutation patterns. Retain deterministic
-  tie-breaking and reuse applicable paired-workflow ranking mechanics without
-  inventing pairing scores. Detailed tie-breaking will be frozen in the
-  implementation contract and tests.
+  Within a Pareto tier, prefer distinct mutation patterns. Ranking version 1
+  rounds objective scores to six decimals for comparisons, leaving published
+  values intact. Finish the best remaining tier before considering the next;
+  greedily maximize minimum position-wise mutation distance to already selected
+  candidates. Seed/ties prefer higher VH2, then higher VHH2, fewer mutations,
+  then ascending candidate ID. Distinct replacements at one position differ
+  once. This reuses the paired workflow's Pareto/distance primitives, not its
+  paired guardrails or two-tier selection window.
 - Publish each prepared parent first as an unranked reference, followed by
   ranked candidates, then candidates with incomplete evaluations and no
   numeric rank. Do not turn missing scores into zero or imply ranking by a

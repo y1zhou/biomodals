@@ -25,17 +25,32 @@ def _configuration(tmp_path: Path) -> RuntimeConfiguration:
 def test_registered_tool_defaults_are_explicit(tmp_path: Path) -> None:
     configuration = _configuration(tmp_path)
 
-    assert configuration.tool_names() == ("gromacs", "alphafold3", "humanization")
+    assert configuration.tool_names() == (
+        "gromacs",
+        "alphafold3",
+        "humanization",
+        "nanobody_humanization",
+    )
     assert configuration.tool("gromacs").max_active_provider_calls == 16
     assert configuration.tool("gromacs").max_active_gpu_provider_calls == 2
     assert configuration.tool("alphafold3").max_active_provider_calls == 16
     assert configuration.tool("alphafold3").max_active_gpu_provider_calls == 2
     assert configuration.tool("humanization").max_active_provider_calls == 16
     assert configuration.tool("humanization").max_active_gpu_provider_calls == 10
+    assert configuration.tool("nanobody_humanization").max_active_provider_calls == 16
+    assert (
+        configuration.tool("nanobody_humanization").max_active_gpu_provider_calls == 4
+    )
 
 
 @pytest.mark.parametrize(
-    "tool,gpu_limit", [("gromacs", 3), ("alphafold3", 3), ("humanization", 15)]
+    "tool,gpu_limit",
+    [
+        ("gromacs", 3),
+        ("alphafold3", 3),
+        ("humanization", 15),
+        ("nanobody_humanization", 6),
+    ],
 )
 def test_container_limits_follow_active_job_limit(
     tmp_path: Path, tool, gpu_limit

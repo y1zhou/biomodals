@@ -153,6 +153,8 @@ def create_app(
         max_body_bytes=256 * 1024 * 1024,
         path_limits={
             "/api/v1/humanization/jobs": 4 * 1024 * 1024,
+            "/api/v1/nanobody-humanization/jobs": 1024 * 1024,
+            "/api/v1/nanobody-humanization/prepare": 1024 * 1024,
             "/api/v1/antibody-sequence-analysis/analyze": MAX_REQUEST_BYTES,
             "/api/v1/antibody-sequence-analysis/sequence": MAX_REQUEST_BYTES,
         },
@@ -199,11 +201,16 @@ def create_deployed_app() -> FastAPI:
     from biomodals.service.humanization.router import (
         create_router as humanization_router,
     )
+    from biomodals.service.nanobody_humanization.modal import NanobodyToolAdapter
+    from biomodals.service.nanobody_humanization.router import (
+        create_router as nanobody_router,
+    )
     from biomodals.service.pending import PendingRequestStore
     from biomodals.service.tools import (
         ALPHAFOLD3_TOOL,
         GROMACS_TOOL,
         HUMANIZATION_TOOL,
+        NANOBODY_TOOL,
         TOOLS,
     )
 
@@ -242,7 +249,15 @@ def create_deployed_app() -> FastAPI:
         modal_download_concurrency=settings.modal_download_concurrency,
     )
     humanization = ToolRegistration(HUMANIZATION_TOOL, humanization_adapter)
-    registrations = (gromacs, alphafold3, humanization)
+    nanobody_adapter = NanobodyToolAdapter(
+        pending, modal_download_concurrency=settings.modal_download_concurrency
+    )
+    registrations = (
+        gromacs,
+        alphafold3,
+        humanization,
+        ToolRegistration(NANOBODY_TOOL, nanobody_adapter),
+    )
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     routers = (
         gromacs_router(
@@ -269,6 +284,15 @@ def create_deployed_app() -> FastAPI:
             cache=cache,
             adapter=humanization_adapter,
             max_pairs=settings.humanization_max_pairs,
+        ),
+        nanobody_router(
+            store=store,
+            configuration=configuration,
+            pending=pending,
+            remote=remote,
+            cache=cache,
+            adapter=nanobody_adapter,
+            max_parents=settings.nanobody_max_parents,
         ),
     )
     app = create_app(

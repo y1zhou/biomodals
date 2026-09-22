@@ -12,7 +12,9 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
@@ -21,6 +23,7 @@ import polars as pl
 from service.alphafold3_preview_fixture import preview_archive
 from service.antibody_fixture import annotated_archive, reference_csv
 from service.gromacs_preview_fixture import trajectory_archive
+from service.nanobody_fixture import result_directory as nanobody_result_directory
 
 from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
@@ -50,6 +53,10 @@ from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs.router import create_router as gromacs_router
 from biomodals.service.humanization.results import SELECTION_SCHEMA
 from biomodals.service.humanization.router import create_router as humanization_router
+from biomodals.service.nanobody_humanization.results import build_nanobody_archive
+from biomodals.service.nanobody_humanization.router import (
+    create_router as nanobody_router,
+)
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.remote_execution import ExecutionLocator
 from biomodals.service.runtime_config import RuntimeConfiguration
@@ -63,9 +70,11 @@ from biomodals.service.tools import (
     ALPHAFOLD3_TOOL,
     GROMACS_TOOL,
     HUMANIZATION_TOOL,
+    NANOBODY_TOOL,
     TOOLS,
 )
 from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
+from biomodals.workflow.nanobody_humanization.execution import NanobodyExecutionRequest
 
 ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
 _CALL_NAMESPACE = UUID("156d600f-2a56-4ce7-8d0c-886bfa35698a")
@@ -88,6 +97,7 @@ class _FakeRemote:
         self.password_link = ""
         self.secondary_password_link = ""
         self.humanization_password_link = ""
+        self.nanobody_password_link = ""
         self.alphafold3_password_link = ""
         self.antibody_analysis_password_link = ""
         self.alphafold3_job_id = ""
@@ -113,6 +123,7 @@ class _FakeRemote:
                     "password_link": self.password_link,
                     "secondary_password_link": self.secondary_password_link,
                     "humanization_password_link": self.humanization_password_link,
+                    "nanobody_password_link": self.nanobody_password_link,
                     "alphafold3_password_link": self.alphafold3_password_link,
                     "antibody_analysis_password_link": self.antibody_analysis_password_link,
                     "alphafold3_job_id": self.alphafold3_job_id,
@@ -240,13 +251,18 @@ class _FakeRemote:
         return max(0, time.monotonic() - started) if started else 0
 
     def _node_window(self, run_id: UUID, node_key: str) -> tuple[float, float]:
+        if node_key == "evaluate" and "publish" in self.started[run_id][2].node_keys:
+            return 4.5, 5.9
         windows = {
             "generate_sapiens": (0, 1),
             "generate_humatch": (0, 2),
             "generate_pabnativ2": (0, 4),
             "generate_hudiff_ab": (0, 3),
+            "generate_abnativ2_vhh": (0, 4),
+            "generate_hudiff_nb": (0, 3),
             "union": (4, 4.5),
             "evaluate": (4.5, 6),
+            "publish": (5.9, 6),
             "prepare_tpr_gpu": (0, 1),
             "prepare_tpr_cpu": (0, 1),
             "prepare_continuation": (0, 1),
@@ -280,13 +296,15 @@ class _FakeRemote:
         calls = []
         for node in plan.nodes:
             node_key = node.node_key
-            if node_key in {"union", "prepare_result"}:
+            if node_key in {"union", "prepare_result", "publish"}:
                 continue
             function_name = {
                 "generate_sapiens": "sapiens_humanize",
                 "generate_humatch": "humatch_humanize",
                 "generate_pabnativ2": "pabnativ2_humanize_pair",
                 "generate_hudiff_ab": "hudiff_ab_humanize_pair",
+                "generate_abnativ2_vhh": "abnativ2_vhh_humanize",
+                "generate_hudiff_nb": "hudiff_nb_humanize",
             }.get(node_key, self._functions.get(node_key, node_key))
             status = self._node_status(run_id, node_key)
             if status == NodeStatus.PENDING:
@@ -559,6 +577,53 @@ class _FakeHumanizationAdapter(_FakeAdapter):
         )
 
 
+class _FakeNanobodyAdapter(_FakeAdapter):
+    """Real local preparation, saved inputs and result tables; fake remote science."""
+
+    def __init__(self, remote: _FakeRemote, pending: PendingRequestStore) -> None:
+        super().__init__(remote, pending, b"")
+        self.requests: dict[UUID, NanobodyExecutionRequest] = {}
+
+    async def stage(self, job: JobRecord) -> None:
+        content = self.pending.get(job.job_id)
+        if content is None:
+            raise FileNotFoundError("Nanobody fixture input unavailable")
+        request = NanobodyExecutionRequest.from_bytes(content)
+        self.requests[job.job_id] = request
+        self.remote.bind_plan(job.job_id, request.execution_plan)
+
+    async def input_request(self, job: JobRecord) -> NanobodyExecutionRequest:
+        content = self.pending.get(job.job_id)
+        if content is not None:
+            return NanobodyExecutionRequest.from_bytes(content)
+        try:
+            return self.requests[job.job_id]
+        except KeyError as error:
+            raise FileNotFoundError("Input unavailable") from error
+
+    async def prepare_result(
+        self, job: JobRecord, cache: ArtifactCache, *, completed_at: int
+    ) -> PreparedResult:
+        def content():
+            with TemporaryDirectory(prefix="offline-nanobody-") as directory:
+                root = nanobody_result_directory(
+                    Path(directory), job.job_id, self.requests[job.job_id]
+                )
+                archive = BytesIO()
+                build_nanobody_archive(root, archive)
+                return archive.getvalue()
+
+        publisher = _FakeAdapter(
+            self.remote, self.pending, await asyncio.to_thread(content)
+        )
+        result = await publisher.prepare_result(job, cache, completed_at=completed_at)
+        return replace(
+            result,
+            filename=f"nanobody-humanization-{job.job_id}.zip",
+            archive_schema="nanobody_humanization/1",
+        )
+
+
 class _FakeAlphaFold3Adapter(_FakeAdapter):
     async def stage(self, job: JobRecord) -> None:
         raise AssertionError("AlphaFold3 is not submitted by this browser fixture")
@@ -637,6 +702,9 @@ def _create_browser_app():
         "humanization-user@example.com", display_name="Humanization Browser User"
     )
     remote.humanization_password_link = humanization_link.urls[0]
+    remote.nanobody_password_link = auth.create_user(
+        "nanobody-user@example.com", display_name="Nanobody Browser User"
+    ).urls[0]
     analysis_link = auth.create_user(
         "antibody-analysis-user@example.com",
         display_name="Antibody Analysis Browser User",
@@ -718,6 +786,7 @@ def _create_browser_app():
             ALPHAFOLD3_TOOL, _FakeAlphaFold3Adapter(remote, pending, af3_archive)
         ),
         ToolRegistration(HUMANIZATION_TOOL, _FakeHumanizationAdapter(remote, pending)),
+        ToolRegistration(NANOBODY_TOOL, _FakeNanobodyAdapter(remote, pending)),
     )
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
     lifecycle = JobLifecycle(store, remote, registrations, cache)
@@ -751,6 +820,15 @@ def _create_browser_app():
                 cache=cache,
                 adapter=registrations[2].adapter,
                 max_pairs=settings.humanization_max_pairs,
+            ),
+            nanobody_router(
+                store=store,
+                configuration=configuration,
+                pending=pending,
+                remote=remote,
+                cache=cache,
+                adapter=registrations[3].adapter,
+                max_parents=settings.nanobody_max_parents,
             ),
         ),
         remote=remote,

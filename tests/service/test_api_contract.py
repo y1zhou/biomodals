@@ -33,6 +33,10 @@ from biomodals.service.http_contract import require_session, require_unsafe_sess
 from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.humanization.results import SELECTION_SCHEMA
 from biomodals.service.humanization.router import create_router as humanization_router
+from biomodals.service.nanobody_humanization.modal import NanobodyToolAdapter
+from biomodals.service.nanobody_humanization.router import (
+    create_router as nanobody_router,
+)
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import JobState, ServiceStore
@@ -41,6 +45,7 @@ from biomodals.service.tools import (
     ALPHAFOLD3_TOOL,
     GROMACS_TOOL,
     HUMANIZATION_TOOL,
+    NANOBODY_TOOL,
     TOOLS,
 )
 
@@ -316,6 +321,7 @@ def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
         ToolRegistration(GROMACS_TOOL, Adapter()),
         ToolRegistration(ALPHAFOLD3_TOOL, Adapter()),
         ToolRegistration(HUMANIZATION_TOOL, Adapter()),
+        ToolRegistration(NANOBODY_TOOL, Adapter()),
     )
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     app = create_app(
@@ -347,6 +353,15 @@ def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
                 remote=remote,
                 cache=cache,
                 adapter=HumanizationToolAdapter(pending),
+            ),
+            nanobody_router(
+                store=store,
+                configuration=configuration,
+                pending=pending,
+                remote=remote,
+                cache=cache,
+                adapter=NanobodyToolAdapter(pending),
+                max_parents=settings.nanobody_max_parents,
             ),
         ),
         remote=remote,

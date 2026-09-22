@@ -144,6 +144,15 @@ def load_execution_request_from_volume(
     )
 
 
+def result_directory(execution_run_id: UUID) -> PurePosixPath:
+    """Return the root Run's consolidated scientific publication directory."""
+    return (
+        PurePosixPath("workflow-runs")
+        / str(execution_run_id)
+        / "nodes/evaluate/result/nanobody_humanization"
+    )
+
+
 class NanobodyExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
     """Bind a single-domain graph to the established coordinator and recovery rules."""
 

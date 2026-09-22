@@ -102,3 +102,9 @@ class RetainedNanobodyInputs(BaseModel):
     settings: NanobodySettings
     prepared_parents: list[PreparedVHPreview]
     preparation_version: str
+
+
+class NanobodyInputErrors(BaseModel):
+    """Submission validation keeps the same zero-based row errors as preparation."""
+
+    errors: list[PreparationIssue]

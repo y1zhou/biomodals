@@ -243,6 +243,18 @@ class ServiceSettings:
             raise ValueError("BIOMODALS_HUMANIZATION_MAX_PAIRS must not exceed 200")
         return value
 
+    @property
+    def nanobody_max_parents(self) -> int:
+        """Server-owned admission bound for reviewed single-domain batches."""
+        value = _positive_integer(
+            self.sources, "BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS", 100
+        )
+        if value > 200:
+            raise ValueError(
+                "BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS must not exceed 200"
+            )
+        return value
+
     @classmethod
     def from_environment(
         cls,

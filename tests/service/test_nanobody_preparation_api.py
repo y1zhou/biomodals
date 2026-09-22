@@ -4,8 +4,6 @@ import asyncio
 
 from test_api_contract import ORIGIN, _app, _humanization_session, _request
 
-from biomodals.service.nanobody_humanization.router import create_router
-
 VHH = "EVQLVESGGGLVQPGGSLRLSCAASGFTFSDYWMYWVRQAPGKGLEWVSEINTNGLITKYPDSVKGRFTISRDNAKNTLYLQMNSLRPEDTAVYYCARSPSGFNRGQGTLVTVSS"
 ROOT = "/api/v1/nanobody-humanization"
 
@@ -13,7 +11,6 @@ ROOT = "/api/v1/nanobody-humanization"
 def test_native_preview_rows_digest_and_authentication(tmp_path):
     """An invalid sibling keeps its row; only a wholly valid review can submit."""
     app = _app(tmp_path)
-    app.include_router(create_router())
     try:
         assert _request(app, "GET", ROOT + "/options").status_code == 401
         assert (
@@ -63,8 +60,9 @@ def test_native_preview_rows_digest_and_authentication(tmp_path):
 
 def test_server_parent_bound_and_duplicate_id_preview(tmp_path):
     """Enforce the configured bound before numbering; retain both duplicate rows."""
-    app = _app(tmp_path)
-    app.include_router(create_router(max_parents=2))
+    app = _app(
+        tmp_path, environment={"BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS": "2"}
+    )
     _humanization_session(app)
     try:
         response = _request(

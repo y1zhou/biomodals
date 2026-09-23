@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import polars as pl
 
-from biomodals.helper.panel import mutation_distances, pareto_layers
-
 RANKING_VERSION = "2"
 SCORE_DECIMALS = 6
 MAX_PAIRING_DROP = 0.10
@@ -158,16 +156,64 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
 
 def _rank_parent(group: pl.DataFrame, patterns: pl.DataFrame) -> pl.DataFrame:
     objectives = [*OBJECTIVES, "_negative_edits"]
-    distances = mutation_distances(
-        group.select(
-            "candidate_id", (-pl.col("_negative_edits")).alias("mutation_count")
+    pairs = group.select("candidate_id", *objectives).join(
+        group.select("candidate_id", *objectives), how="cross", suffix="_other"
+    )
+    edges = pairs.filter(
+        pl.all_horizontal(
+            pl.col(name) >= pl.col(f"{name}_other") for name in objectives
         ),
-        patterns.drop("parent_id"),
-        POSITION,
+        pl.any_horizontal(
+            pl.col(name) > pl.col(f"{name}_other") for name in objectives
+        ),
+    ).select("candidate_id", "candidate_id_other")
+    pairs = pairs.select(
+        "candidate_id", "candidate_id_other", "_negative_edits", "_negative_edits_other"
     )
-    remaining = pareto_layers(group, objectives).with_columns(
-        pl.lit(2**31 - 1).alias("_nearest")
+    remaining, fronts = group, []
+    while remaining.height:
+        front = remaining.join(
+            edges.select(pl.col("candidate_id_other").alias("candidate_id")).unique(),
+            on="candidate_id",
+            how="anti",
+        )
+        fronts.append(
+            front.with_columns(
+                pl.lit(len(fronts) + 1, dtype=pl.Int64).alias("quality_tier")
+            )
+        )
+        remaining = remaining.join(
+            front.select("candidate_id"), on="candidate_id", how="anti"
+        )
+        edges = edges.join(front.select("candidate_id"), on="candidate_id", how="anti")
+    patterns = patterns.drop("parent_id")
+    overlap = (
+        patterns
+        .join(patterns, on=POSITION, how="inner", suffix="_other")
+        .group_by("candidate_id", "candidate_id_other")
+        .agg(
+            pl.len().cast(pl.Int64).alias("_shared"),
+            (pl.col("candidate_residue") == pl.col("candidate_residue_other"))
+            .sum()
+            .cast(pl.Int64)
+            .alias("_same"),
+        )
     )
+    # Reuse the thin numeric pairs; distinct replacements at one site count once.
+    distances = pairs.join(
+        overlap, on=["candidate_id", "candidate_id_other"], how="left"
+    ).select(
+        "candidate_id",
+        "candidate_id_other",
+        (
+            -pl.col("_negative_edits")
+            - pl.col("_negative_edits_other")
+            - pl.col("_shared").fill_null(0)
+            - pl.col("_same").fill_null(0)
+        ).alias("_distance"),
+    )
+    del pairs
+    remaining = pl.concat(fronts).with_columns(pl.lit(2**31 - 1).alias("_nearest"))
     picks = []
     while remaining.height:
         chosen = (

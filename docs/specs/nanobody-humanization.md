@@ -85,7 +85,10 @@ scores to zero to accommodate single-domain candidates.
   10 and cross-batch token carry-over. A single parent budget is not split
   into independently remasked calls. Counts describe attempts, not guaranteed
   unique sequences; do not automatically sample replacements for duplicates.
-- Run the two methods concurrently within the configured execution limits.
+- Both methods are concurrently eligible within the configured execution
+  limits. The shared scheduler's stable image-cohort policy can fill a limited
+  GPU allowance with one method before starting the other; simultaneous method
+  progress is not guaranteed. No workflow-specific fairness scheduler is added.
   Collect valid candidates and the prepared parent, deduplicating by exact
   sequence within each parent while retaining all method provenance. Do not
   merge distinct parent identities even when their sequences are identical.
@@ -394,110 +397,6 @@ do not infer permission from public availability or an existing paired app.
 The user asked to ignore licensing during this design cycle. Do not infer
 permission or reintroduce it as an unresolved implementation interview question.
 
-## Interview decision tree
-
-Release depth, product surfaces, broad VH input scope, manual/CSV entry,
-preparation, generation, evaluation, ranking and resource/control policy are
-accepted above; licensing is deferred.
-
-The presentation, transfer, failure policy and complete implementation plan
-are approved. The preceding antibody display fix must land before nanobody
-implementation.
-
-## Approved implementation plan
-
-### 1. Antibody display fix first
-
-Both backend branches currently point to d57de18; only nanobody planning docs
-are uncommitted. After approval, checkpoint these docs on the nanobody branch
-without mixing them into the antibody fix, then work on
-feat/antibody-sequence-analysis. The frontend is already on its corresponding
-antibody branch and has no nanobody branch yet.
-
-- New selection publications order vh, vl, vh_pI, vl_pI, vh_vl_pI, then the
-  four existing V/J gene columns. Preserve the Polars deduplication/joins,
-  pI values, gene assignments, ranking and row order. This change applies to
-  newly generated CSVs and website presentation, not only header labels.
-- Advance result schema 5 to 6 and preserve immutable schema 2–5 reads and
-  their actual sort keys. Historical webpage presentation can show adjacent
-  chains and pI casing without rewriting old archives.
-- Extend the shared sequence-detail response to independently assign the
-  original parent's V/J references and project its germline comparison through
-  the native parent-to-humanized alignment. Keep both full sequences, exact
-  indices, independent reference-only gaps and unavailable coverage; do not
-  infer direct homology between the two germline references.
-- Render four biological rows in the requested order, retaining three
-  unlabeled difference strips with accessible comparison descriptions. Bold
-  the Humanized row, label the final row Germline (parental), and identify both
-  before/after V/J genes and species.
-  Paired humanization uses the original submitted chain as parent; nanobody
-  humanization will supply its saved prepared parent. No-parent standalone
-  analysis retains its Input terminology and existing behavior.
-- Advance analysis contract 4 to 5, export exact offline OpenAPI for frontend
-  generation, and preserve candidate inspection when parent evidence is
-  unavailable. No new parent-fetch endpoint or alignment dependency is needed.
-- Test native alignment reconstruction across all five schemes, independent
-  before/after assignments, indels/tails, missing parent evidence, historical
-  sorting and new CSV column order/case. Run backend/frontend offline gates
-  and commit the coherent fix in each antibody branch.
-
-### 2. Rebase before nanobody implementation
-
-Rebase the backend nanobody planning branch onto the antibody fix commit,
-preserving its documentation. Create the frontend nanobody branch from its
-fixed antibody tip. Verify clean worktrees and the intended ancestry; do not
-push or force-update remote branches as part of this operation.
-
-### 3. Build preparation and pinned model apps
-
-Implement shared VH preparation using arpeggia, preserving original/prepared
-identities and exact internal imputation evidence. Add version-bound local
-preview/admission contracts so edited or stale previews cannot submit a
-different sequence. Keep this distinct from general analysis's no-trimming
-contract.
-
-The package-based AbNatiV2-VHH and HuDiff-Nb apps use existing execution
-primitives and reusable assets. They pin the audited AbNatiV 2.0.9 packaging
-fix and separate NbForge-compatible runtime, and the inspected HuDiff
-nanobody source/checkpoint. Keep explicit model preparation,
-native position checks, accepted masks, seed/batch semantics and content-bound
-publications without upgrading existing paired apps. Verify observational
-wrappers and restrictions against native behavior.
-
-### 4. Build the workflow and publication
-
-Implement preparation-bound parallel generation, per-parent exact union,
-common VH2/VHH2 evaluation, mutation/germline/pI annotation, three-objective
-Pareto ranking and mutation-pattern diversity. Keep tabular work Polars-native
-and avoid duplicated reads/conversions. Reuse ranking mechanics only where
-their scientific meaning agrees. Implement the accepted no-op/partial/failure
-rules and lean result files with frozen scientific/publication identities.
-
-### 5. Integrate service and frontend together
-
-Register the new Tool with shared auth, idempotent admission, owner-scoped
-inputs/results, limit snapshots, stages, cancellation, downloads, recovery and
-billing attribution. Export exact contracts and deterministic offline fixtures
-for the frontend agent. Build manual/CSV input, inline preparation, known
-Advanced controls, bounded result table, corrected common popup and standalone
-analysis transfer. Retain per-user/source isolation and stale-response guards.
-
-### 6. Verify, document and request review
-
-Commit self-contained milestones for preparation, each app, workflow, service
-and coordinated frontend work. Test native mapping/protection/sampling, result
-integrity, ranking/partial outcomes, authorization, idempotency and browser
-integration; run discovery/help checks, type guidance and repository hooks.
-Update specs, ADR/glossary where needed, human-facing instructions and deploy
-guidance without duplicating content. Report exact test evidence and any
-unverified native/deployment behavior, then request user review. No push,
-deployment or paid cloud validation is implied by this plan approval; any
-such validation needs an explicit budget/authorization first.
-
-The supplied report's hundreds/thousands of candidates, illustrative
-32-construct panel, structural ensembles and deimmunization branch are proposals,
-not default counts or requirements.
-
 ## Implemented service and execution boundary
 
 The Tool key is `nanobody_humanization`, the website slug is
@@ -522,6 +421,9 @@ The authoritative schemas are in
   Visibility defaults/ranges describe the full table, while germline evidence
   covers only page candidate IDs. Both reads return `409 result_not_cached`
   when the shared prepare-download path must restore local cache.
+  Required `nonparent_count` counts changed designs across the whole result
+  before filtering or paging. Zero triggers the explicit successful no-op
+  message; a parent-only page in a result with other designs must not do so.
 
 The scientific graph has independent `generate_abnativ2_vhh` and
 `generate_hudiff_nb` Nodes, followed by `union`, `evaluate` and `publish`.

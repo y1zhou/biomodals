@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import time
 import zipfile
-from collections.abc import Callable
 from io import BytesIO
 from typing import IO, Annotated
 from uuid import UUID, uuid4
@@ -27,6 +26,7 @@ from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
+    CodedErrorResponse,
     PrivateResultRoute,
     require_session,
     require_unsafe_session,
@@ -54,10 +54,10 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobRecord,
-    JobState,
     ServiceStore,
     UserNotFoundError,
 )
+from biomodals.service.table_archive import read_cached_selection
 from biomodals.workflow.nanobody_humanization.execution import NanobodyExecutionRequest
 from biomodals.workflow.nanobody_humanization.preparation import (
     VHInput,
@@ -91,7 +91,11 @@ def create_router(
     ) -> NanobodyOptions:
         return NanobodyOptions(max_parents=max_parents)
 
-    @router.post("/prepare", response_model=NanobodyPreparation)
+    @router.post(
+        "/prepare",
+        response_model=NanobodyPreparation,
+        responses={503: {"model": CodedErrorResponse}},
+    )
     async def prepare(
         body: NanobodyPreparationRequest,
         request: Request,
@@ -103,8 +107,8 @@ def create_router(
                 "batch_too_large",
                 f"At most {max_parents} parents are allowed per job",
             )
-        parents, issues = await asyncio.get_running_loop().run_in_executor(
-            request.app.state.antibody_analysis.pool, prepare_batch, body.parents
+        parents, issues = await request.app.state.antibody_analysis.run(
+            prepare_batch, body.parents
         )
         return NanobodyPreparation.from_prepared(body.parents, parents, issues)
 
@@ -127,7 +131,10 @@ def create_router(
         "/jobs",
         response_model=JobView,
         status_code=202,
-        responses={422: {"model": NanobodyInputErrors}},
+        responses={
+            422: {"model": NanobodyInputErrors},
+            503: {"model": CodedErrorResponse},
+        },
     )
     async def submit(
         body: NanobodySubmission,
@@ -155,8 +162,8 @@ def create_router(
                 "batch_too_large",
                 f"At most {max_parents} parents are allowed per job",
             )
-        parents, issues = await asyncio.get_running_loop().run_in_executor(
-            request.app.state.antibody_analysis.pool, prepare_batch, body.parents
+        parents, issues = await request.app.state.antibody_analysis.run(
+            prepare_batch, body.parents
         )
         if issues:
             return Response(
@@ -239,45 +246,6 @@ def create_router(
             preparation_version=retained.parents[0].preparation_version,
         )
 
-    async def read_selection[T](
-        job_id: UUID,
-        session: AuthenticatedSession,
-        reader: Callable[[IO[bytes], zipfile.ZipFile], T],
-    ) -> T:
-        job = owned_job(job_id, session)
-        if (
-            job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}
-            or job.result_size_bytes is None
-            or job.result_sha256 is None
-        ):
-            raise CodedAPIError(409, "result_not_ready", "Result is not ready")
-        lease = await cache.acquire_async(
-            str(job_id), size_bytes=job.result_size_bytes, sha256=job.result_sha256
-        )
-        if lease is None:
-            raise CodedAPIError(
-                409,
-                "result_not_cached",
-                "Prepare the result download before opening this table",
-            )
-        try:
-
-            def read_member() -> T:
-                with zipfile.ZipFile(lease) as archive:
-                    member = archive.getinfo("selection.csv")
-                    if member.file_size > 32 * 1024 * 1024:
-                        raise ValueError("Selection exceeds its byte limit")
-                    with archive.open(member) as source:
-                        return reader(source, archive)
-
-            return await cache.run_bounded(read_member)
-        except (KeyError, ValueError, zipfile.BadZipFile) as error:
-            raise CodedAPIError(
-                409, "result_invalid", "Selection table is unavailable or invalid"
-            ) from error
-        finally:
-            lease.close()
-
     @router.get("/jobs/{job_id}/selection", response_model=NanobodySelectionPage)
     async def selection(
         job_id: UUID,
@@ -344,7 +312,9 @@ def create_router(
                 )
             return page, assignments
 
-        page, assignments = await read_selection(job_id, session, read_page)
+        page, assignments = await read_cached_selection(
+            owned_job(job_id, session), cache, read_page
+        )
         (
             snapshot,
             page.reference,
@@ -370,8 +340,8 @@ def create_router(
         job_id: UUID, session: Annotated[AuthenticatedSession, Depends(require_session)]
     ) -> Response:
         return Response(
-            await read_selection(
-                job_id, session, lambda source, archive: source.read()
+            await read_cached_selection(
+                owned_job(job_id, session), cache, lambda source, archive: source.read()
             ),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="selection.csv"'},

@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import BoundedSemaphore
+from typing import Any
 
 from biomodals.helper.antibody import (
     ChainAnalysis,
@@ -31,6 +34,7 @@ from biomodals.service.antibody_sequence_analysis.reference import (
     TherapeuticReference,
     present_germlines,
 )
+from biomodals.service.http_contract import CodedAPIError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -147,15 +151,61 @@ def parse_fasta(group: FastaGroup) -> tuple[list[ParsedEntry], list[AnalysisIssu
 
 
 class AnalysisService:
-    """One bounded local CPU pool; inputs exist only for an active request."""
+    """Bounded local CPU work; inputs live only until admitted work finishes."""
 
-    def __init__(self, reference: TherapeuticReference) -> None:
+    def __init__(
+        self, reference: TherapeuticReference, *, max_requests: int = 8
+    ) -> None:
         """Keep reference I/O independent of the result-archive worker."""
+        if max_requests < 1:
+            raise ValueError("Local analysis request capacity must be positive")
         self.reference = reference
-        self.pool = ThreadPoolExecutor(
+        self._pool = ThreadPoolExecutor(
             max_workers=8, thread_name_prefix="antibody-analysis"
         )
+        self._capacity = BoundedSemaphore(max_requests)
+        self._requests: set[asyncio.Task] = set()
+        self._closed = False
         self._reference_task: asyncio.Task[ReferenceSnapshot] | None = None
+
+    async def _admit[T](
+        self, operation: Callable[..., Coroutine[Any, Any, T]], *args: object
+    ) -> T:
+        if self._closed or not self._capacity.acquire(blocking=False):
+            raise CodedAPIError(
+                503,
+                "local_analysis_busy",
+                "Local sequence analysis is busy. Your input is unchanged; try again shortly.",
+                headers={"Retry-After": "1"},
+            )
+        task = asyncio.create_task(operation(*args))
+        self._requests.add(task)
+        task.add_done_callback(self._finished)
+        # An HTTP disconnect must not release capacity while native work is
+        # still running. The bounded operation finishes without its waiter.
+        return await asyncio.shield(task)
+
+    def _finished(self, task: asyncio.Task) -> None:
+        self._requests.discard(task)
+        self._capacity.release()
+        if not task.cancelled():
+            task.exception()  # Observe failures even when the HTTP waiter left.
+
+    async def _work[T](self, operation: Callable[..., T], *args: object) -> T:
+        future = asyncio.get_running_loop().run_in_executor(
+            self._pool, operation, *args
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Loop shutdown can cancel the admitted Task too. Native threads
+            # cannot be interrupted; drain them before releasing its slot.
+            await asyncio.shield(future)
+            raise
+
+    async def run[T](self, operation: Callable[..., T], *args: object) -> T:
+        """Admit one inspection or preparation through the shared local limit."""
+        return await self._admit(self._work, operation, *args)
 
     async def reference_snapshot(
         self,
@@ -185,6 +235,9 @@ class AnalysisService:
 
     async def analyze(self, request: AnalysisRequest) -> AnalysisResponse:
         """Analyze valid entries once per exact chain, preserving group failures."""
+        return await self._admit(self._analyze, request)
+
+    async def _analyze(self, request: AnalysisRequest) -> AnalysisResponse:
         parsed = [parse_fasta(group) for group in request.groups]
         sequences = sorted({
             sequence
@@ -204,16 +257,26 @@ class AnalysisService:
                     detail="No valid sequences to analyze; reference data were not requested.",
                 ),
             )
-        loop = asyncio.get_running_loop()
-        computations = [
-            loop.run_in_executor(self.pool, analyze_chain, sequence)
-            for sequence in sequences
-        ]
         reference_future = asyncio.create_task(self.reference_snapshot())
-        results = dict(zip(sequences, await asyncio.gather(*computations), strict=True))
+        remaining = iter(sequences)
+        results = {}
+
+        async def consume() -> None:
+            for sequence in remaining:
+                results[sequence] = await self._work(analyze_chain, sequence)
+
+        # Four rolling calls per request preserve batch parallelism without
+        # placing thousands of chains ahead of interactive work in the FIFO.
+        outcomes = await asyncio.gather(
+            *(consume() for _ in range(min(4, len(sequences)))),
+            return_exceptions=True,
+        )
         snapshot, info = await reference_future
-        return await loop.run_in_executor(
-            self.pool, self._assemble, request, parsed, results, snapshot, info
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        return await self._work(
+            self._assemble, request, parsed, results, snapshot, info
         )
 
     @staticmethod
@@ -287,6 +350,8 @@ class AnalysisService:
 
     async def shutdown(self) -> None:
         """Finish active local work before closing the app."""
+        self._closed = True
+        await asyncio.gather(*self._requests, return_exceptions=True)
         if self._reference_task is not None:
             await asyncio.gather(self._reference_task, return_exceptions=True)
-        await asyncio.to_thread(self.pool.shutdown, wait=True, cancel_futures=True)
+        await asyncio.to_thread(self._pool.shutdown, wait=True, cancel_futures=True)

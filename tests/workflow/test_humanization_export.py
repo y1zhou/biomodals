@@ -14,7 +14,7 @@ from biomodals.service.humanization.results import (
     build_humanization_archive,
     query_selection,
 )
-from biomodals.service.humanization.router import MAX_SELECTION_BYTES
+from biomodals.service.table_archive import MAX_SELECTION_BYTES
 from biomodals.workflow.humanization.artifacts import generated_pairs, json_output
 from biomodals.workflow.humanization.contracts import AntibodyPair, CandidateOrigin
 from biomodals.workflow.humanization.export import (

@@ -37,6 +37,8 @@ sequence popup changes the annotation display, not this design policy.
   defaults initially; the last setting is not a global candidate-score floor.
 
 Both generators run independently within the Job's snapshotted provider limits.
+With a large batch and limited GPU slots, one method may start before the other;
+the shared scheduler does not guarantee simultaneous progress from both.
 Required model files are prepared and verified on CPU before GPU work starts.
 Initial preparation may take time; cancelling does not submit replacement jobs.
 
@@ -68,7 +70,8 @@ the ZIP does not duplicate its native output trees.
 
 If one generator or evaluation fails, usable results remain available with a
 Partial outcome. If every generator fails, the Job fails before scoring.
-An unchanged successful design is a valid no-op. Rerunning loads original
+An unchanged successful design is a valid no-op. When the whole result contains
+only prepared parents, the page says no new designs were produced. Rerunning loads original
 inputs into an editable form and requires a fresh preparation review and
 explicit submission. **Retry fetching results** rebuilds local result packaging
 only; it does not rerun models.

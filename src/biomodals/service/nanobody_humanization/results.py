@@ -43,6 +43,10 @@ class NanobodySelectionPage(BaseModel):
     columns: list[SelectionColumn]
     rows: list[dict[str, str | int | float | bool | None]]
     total_rows: int
+    nonparent_count: int = Field(
+        ge=0,
+        description="Number of unique nonparent candidates in the whole result, before filtering or paging. Zero means no new designs were produced.",
+    )
     offset: int
     limit: int
     parent_ids: list[str]
@@ -75,6 +79,7 @@ def query_selection(
     if table.columns != list(SELECTION_COLUMNS):
         raise ValueError("Selection columns do not match the nanobody publication")
     return NanobodySelectionPage(
+        nonparent_count=table.filter(~pl.col("is_parent")).height,
         **selection_page_values(
             table,
             offset=offset,
@@ -82,7 +87,7 @@ def query_selection(
             parent_id=parent_id,
             sort_by=sort_by,
             descending=descending,
-        )
+        ),
     )
 
 

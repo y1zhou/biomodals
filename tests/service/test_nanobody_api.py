@@ -3,8 +3,10 @@
 # ruff: noqa: D103
 
 import asyncio
+from io import BytesIO
 from uuid import UUID, uuid4
 
+import polars as pl
 from antibody_fixture import reference_csv
 from nanobody_fixture import VHH, result_directory
 from test_api_contract import ORIGIN, _app, _humanization_session, _request, _session
@@ -12,12 +14,29 @@ from test_api_contract import ORIGIN, _app, _humanization_session, _request, _se
 from biomodals.service.antibody_sequence_analysis.reference import TherapeuticReference
 from biomodals.service.http_contract import require_session
 from biomodals.service.nanobody_humanization import router
-from biomodals.service.nanobody_humanization.results import build_nanobody_archive
+from biomodals.service.nanobody_humanization.results import (
+    SELECTION_SCHEMA,
+    build_nanobody_archive,
+    query_selection,
+)
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobState
 from biomodals.workflow.nanobody_humanization.execution import NanobodyExecutionRequest
 
 ROOT = "/api/v1/nanobody-humanization"
+
+
+def test_parent_only_result_has_zero_new_designs_on_any_page():
+    table = pl.DataFrame(
+        [
+            {"parent_id": key, "candidate_id": key, "is_parent": True}
+            for key in ("a", "b")
+        ],
+        schema=SELECTION_SCHEMA,
+    )
+    for query in ({}, {"offset": 1, "limit": 1}, {"parent_id": "missing"}):
+        page = query_selection(BytesIO(table.write_csv().encode()), **query)
+        assert page.nonparent_count == 0
 
 
 def test_review_digest_exact_replay_and_frozen_parent(tmp_path, monkeypatch):
@@ -126,6 +145,7 @@ def test_result_page_frozen_germlines_download_and_cache_restore_boundary(tmp_pa
         page = response.json()
         assert page["parent_ids"] == ["001", "002"]
         assert page["total_rows"] == 3 and len(page["rows"]) == 1
+        assert page["nonparent_count"] == 4
         assert page["rows"][0]["parent_id"] == "002"
         assert page["rows"][0]["is_parent"] is True
         assert page["nativeness_ranges"]["abnativ2_vh_nativeness"] == {
@@ -145,6 +165,8 @@ def test_result_page_frozen_germlines_download_and_cache_restore_boundary(tmp_pa
         assert list(page["germlines"]) == [page["rows"][0]["candidate_id"]]
         assert page["germlines"][page["rows"][0]["candidate_id"]]["assignment"]["v"]
         assert page["reference"] is not None
+        empty = _request(app, "GET", path, params={"parent_id": "missing"}).json()
+        assert empty["total_rows"] == 0 and empty["nonparent_count"] == 4
         for descending in (True, False):
             sorted_page = _request(
                 app,

@@ -11,7 +11,8 @@ Antibody Sequence Analysis is an immediate authenticated operation, not a Servic
 Job. It computes sequence metrics, nearest germline references and display
 annotations for single variable domains or explicit VH/VL pairs. It neither
 humanizes sequences nor measures binding, immunogenicity or developability.
-Nanobody humanization is deferred. Recognition is H/K/L, not proof of VHH.
+[Nanobody humanization](nanobody-humanization.md) is a separate Tool that reuses
+these annotations. Recognition is H/K/L, not proof of VHH.
 
 - `helper/antibody.py` owns provider-neutral ordinary Python results. Optional
   native imports stay inside scientific functions, never `helper/__init__.py`.
@@ -63,6 +64,15 @@ lazy details. Both supplied sequences use the same canonical-residue/length
 validation. All routes use
 existing authentication; POST also uses Origin/CSRF protection. Responses are
 private/no-store. No endpoint logs or persists user sequences.
+
+Local analysis, sequence inspection and nanobody preparation share eight CPU
+workers and an admission limit of eight requests. A batch keeps at most four
+chain computations outstanding, not one queued future per input chain. Excess
+requests receive `503 local_analysis_busy` with `Retry-After: 1` and require an
+explicit retry; a disconnected waiter does not free capacity until its bounded
+operation finishes. Nanobody submission raises this code before Job admission;
+exact idempotent replay bypasses preparation. No scientific Job is created by
+the local operations. Shutdown drains admitted work before closing the pool.
 
 ## Physicochemical metrics
 

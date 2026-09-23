@@ -2,11 +2,57 @@
 
 import hashlib
 import zipfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import IO, BinaryIO
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.http_contract import CodedAPIError
+from biomodals.service.store import JobRecord, JobState
+
+MAX_SELECTION_BYTES = 32 * 1024 * 1024
+
+
+async def read_cached_selection[T](
+    job: JobRecord,
+    cache: ArtifactCache,
+    reader: Callable[[IO[bytes], zipfile.ZipFile], T],
+) -> T:
+    """Read a bounded member under a verified cache lease after owner authorization."""
+    if (
+        job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}
+        or job.result_size_bytes is None
+        or job.result_sha256 is None
+    ):
+        raise CodedAPIError(409, "result_not_ready", "Result is not ready")
+    lease = await cache.acquire_async(
+        str(job.job_id), size_bytes=job.result_size_bytes, sha256=job.result_sha256
+    )
+    if lease is None:
+        raise CodedAPIError(
+            409,
+            "result_not_cached",
+            "Prepare the result download before opening this table",
+        )
+    try:
+
+        def read_member() -> T:
+            with zipfile.ZipFile(lease) as archive:
+                member = archive.getinfo("selection.csv")
+                if member.file_size > MAX_SELECTION_BYTES:
+                    raise ValueError("Selection table exceeds the bounded read limit")
+                with archive.open(member) as source:
+                    return reader(source, archive)
+
+        return await cache.run_bounded(read_member)
+    except (KeyError, ValueError, zipfile.BadZipFile) as error:
+        raise CodedAPIError(
+            409, "result_invalid", "Selection table is unavailable or invalid"
+        ) from error
+    finally:
+        lease.close()
 
 
 class BuiltResultArchive(BaseModel):

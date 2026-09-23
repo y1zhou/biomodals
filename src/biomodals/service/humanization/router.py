@@ -50,18 +50,16 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobRecord,
-    JobState,
     ServiceStore,
     UserNotFoundError,
 )
+from biomodals.service.table_archive import read_cached_selection
 from biomodals.workflow.humanization.germlines import (
     ASSIGNMENT_COLUMNS,
     GENE_COLUMNS,
     GERMLINE_SCHEMA,
 )
 from biomodals.workflow.humanization.settings import HumanizationSettings
-
-MAX_SELECTION_BYTES = 32 * 1024 * 1024
 
 
 def create_router(
@@ -237,40 +235,7 @@ def create_router(
         job = store.get_job(session.principal.user_id, job_id)
         if job is None or job.tool != "humanization":
             raise HTTPException(404, "Job not found")
-        if (
-            job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}
-            or job.result_size_bytes is None
-            or job.result_sha256 is None
-        ):
-            raise CodedAPIError(409, "result_not_ready", "Result is not ready")
-        lease = await cache.acquire_async(
-            str(job_id), size_bytes=job.result_size_bytes, sha256=job.result_sha256
-        )
-        if lease is None:
-            raise CodedAPIError(
-                409,
-                "result_not_cached",
-                "Prepare the result download before opening this table",
-            )
-        try:
-
-            def read_member() -> T:
-                with zipfile.ZipFile(lease) as archive:
-                    member = archive.getinfo("selection.csv")
-                    if member.file_size > MAX_SELECTION_BYTES:
-                        raise ValueError(
-                            "Selection table exceeds the bounded read limit"
-                        )
-                    with archive.open(member) as source:
-                        return reader(source, archive)
-
-            return await cache.run_bounded(read_member)
-        except (KeyError, ValueError, zipfile.BadZipFile) as error:
-            raise CodedAPIError(
-                409, "result_invalid", "Selection table is unavailable or invalid"
-            ) from error
-        finally:
-            lease.close()
+        return await read_cached_selection(job, cache, reader)
 
     @router.get("/jobs/{job_id}/selection", response_model=SelectionPage)
     async def selection(

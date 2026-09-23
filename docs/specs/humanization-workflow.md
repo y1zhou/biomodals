@@ -266,8 +266,9 @@ retains the supporting observed-yield evidence.
 - Keep `selection.csv`, `imgt_mutations.parquet`, and all four consolidated
   `scores/*.parquet` files. They answer final candidate selection and detailed
   evaluation questions without rerunning models.
-- Schema 5 places three full-input pIs (VH, VL, VH+VL) and four V/J gene columns
-  immediately after `vh`, joined after ranking. Unique-chain/pair pI work runs
+- Schema 6 places `vh` and `vl` next to each other, followed by the three
+  full-input pIs (`vh_pI`, `vl_pI`, `vh_vl_pI`) and four V/J gene columns,
+  joined after ranking. Unique-chain/pair pI work runs
   locally in the coordinator with pinned Biopython. Keep the candidate/sequence-
   bound `germlines.parquet` from schema 4, produced alongside IMGT checks in the existing
   per-candidate CPU call, with independently reusable annotation Tasks.
@@ -293,7 +294,7 @@ retains the supporting observed-yield evidence.
 
 The download boundary deliberately omits some native evidence rather than
 claiming it is all present in the Parquets. Result schema/scientific
-identity is 4. The service continues to accept schemas 2/3 and serve immutable
+identity is 6. The service continues to accept schemas 2–5 and serve immutable
 old archives without gene backfill. The ZIP transport remains humanization/1.
 
 `generation.parquet` contains parent_id, method, source_id, root_seed, seed, iteration,

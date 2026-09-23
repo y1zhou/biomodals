@@ -266,6 +266,15 @@ retains the supporting observed-yield evidence.
 - Keep `selection.csv`, `imgt_mutations.parquet`, and all four consolidated
   `scores/*.parquet` files. They answer final candidate selection and detailed
   evaluation questions without rerunning models.
+- Schema 6 places `vh` and `vl` next to each other, followed by the three
+  full-input pIs (`vh_pI`, `vl_pI`, `vh_vl_pI`) and four V/J gene columns,
+  joined after ranking. Unique-chain/pair pI work runs
+  locally in the coordinator with pinned Biopython. Keep the candidate/sequence-
+  bound `germlines.parquet` from schema 4, produced alongside IMGT checks in the existing
+  per-candidate CPU call, with independently reusable annotation Tasks.
+  Germline matching and local therapeutic reference semantics are specified in
+  [antibody sequence analysis](antibody-sequence-analysis.md); they do not change
+  ranking or the stored IMGT-preservation contract.
 - Keep a compact manifest containing run/schema/status, settings, scientific
   identity once, ranking policy, generation failure count, and delivered-file
   sizes/hashes. Remove nested scoring manifests and native-copy bookkeeping from
@@ -285,8 +294,8 @@ retains the supporting observed-yield evidence.
 
 The download boundary deliberately omits some native evidence rather than
 claiming it is all present in the Parquets. Result schema/scientific
-identity is 3. The service continues to accept schema 2 and serve immutable
-old archives. The ZIP transport remains humanization/1.
+identity is 6. The service continues to accept schemas 2–5 and serve immutable
+old archives without gene backfill. The ZIP transport remains humanization/1.
 
 `generation.parquet` contains parent_id, method, source_id, root_seed, seed, iteration,
 attempt_index, outcome, reason, and candidate_id. Outcomes are generated, no_op,

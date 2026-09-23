@@ -12,28 +12,43 @@ from biomodals.workflow.humanization.contracts import (
     CandidateAnnotation,
     HumanizationCandidate,
 )
+from biomodals.workflow.humanization.germlines import candidate_germlines
 
 
 def annotate_humanization_candidate(
-    parent: dict[str, Any], candidate: dict[str, Any]
-) -> AppRunResult:
-    """Remote operation bound to a numbering-enabled image by the workflow root."""
-    annotation, mutations = annotate_candidate(
-        AntibodyPair.model_validate(parent),
-        HumanizationCandidate.model_validate(candidate),
-    )
-    if annotation.cdr_preservation == "unknown":
-        return AppRunResult(
-            status=AppRunStatus.FAILED,
-            warnings=[annotation.error or "IMGT annotation unavailable"],
+    parent: dict[str, Any],
+    candidate: dict[str, Any],
+    operations: tuple[str, ...] = ("annotation", "germline"),
+) -> dict[str, dict[str, Any]]:
+    """One CPU call with independently publishable IMGT and germline Tasks."""
+    candidate_model = HumanizationCandidate.model_validate(candidate)
+    results = {}
+    if "annotation" in operations:
+        annotation, mutations = annotate_candidate(
+            AntibodyPair.model_validate(parent), candidate_model
         )
-    return AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            json_output("annotation", annotation.model_dump()),
-            json_output("imgt_mutations", mutations),
-        ],
-    )
+        results["annotation"] = (
+            AppRunResult(
+                status=AppRunStatus.FAILED,
+                warnings=[annotation.error or "IMGT annotation unavailable"],
+            )
+            if annotation.cdr_preservation == "unknown"
+            else AppRunResult(
+                status=AppRunStatus.SUCCEEDED,
+                outputs=[
+                    json_output("annotation", annotation.model_dump()),
+                    json_output("imgt_mutations", mutations),
+                ],
+            )
+        )
+    if "germline" in operations:
+        results["germline"] = AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                json_output("germlines", candidate_germlines(candidate_model)),
+            ],
+        )
+    return {name: result.model_dump(mode="json") for name, result in results.items()}
 
 
 def annotate_candidate(

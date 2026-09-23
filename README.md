@@ -185,8 +185,13 @@ For the complete model, see
 
 The optional FastAPI service is a single-host control plane for the BioModals
 web interface. It exposes GROMACS MD simulation, AlphaFold3 structure
-prediction and [antibody humanization](docs/humanization.md) through shared
+prediction, [antibody humanization](docs/humanization.md), and
+[nanobody humanization](docs/nanobody-humanization.md) through shared
 account and Job routes.
+
+[Antibody sequence analysis](docs/antibody-sequence-analysis.md) provides local
+sequence metrics, germline usage and numbered CDR/liability displays through the
+same authenticated API. It creates no Job and submits no Modal compute.
 
 The service owns Users, Sessions, lean Job locators and projections, runtime
 settings, retained AlphaFold3 validation resources, and Result staging. Each
@@ -208,6 +213,7 @@ uv sync --extra api
 uv run biomodals app deploy gromacs --env production
 uv run biomodals app deploy alphafold3 --env production
 uv run biomodals workflow deploy humanization --env production
+uv run biomodals workflow deploy nanobody_humanization --env production
 ```
 
 Copy [`.env.example`](.env.example), replace both Modal token placeholders,
@@ -249,9 +255,9 @@ Session cookies.
 `false`; this cookie mode applies service-wide.
 
 The OpenAPI document includes the shared Job routes, typed GROMACS submission,
-retained AlphaFold3 JSON validation and submission, paired humanization
-submission and result tables, paginated Provider Call log
-targets, and Administrator billing reports. Completed AlphaFold3 Jobs also
+retained AlphaFold3 JSON validation and submission, paired and single-domain
+humanization submission and result tables, nanobody preparation, paginated
+Provider Call log targets, and Administrator billing reports. Completed AlphaFold3 Jobs also
 provide an owner-private highest-ranked structure and interactive PAE preview.
 Completed GROMACS Jobs show their production RMSD, radius-of-gyration and RMSF
 figures in a **Trajectory overview** panel above Execution stages, using the

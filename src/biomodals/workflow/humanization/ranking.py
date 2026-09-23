@@ -156,8 +156,8 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
 
 def _rank_parent(group: pl.DataFrame, patterns: pl.DataFrame) -> pl.DataFrame:
     objectives = [*OBJECTIVES, "_negative_edits"]
-    pairs = group.drop("parent_id").join(
-        group.drop("parent_id"), how="cross", suffix="_other"
+    pairs = group.select("candidate_id", *objectives).join(
+        group.select("candidate_id", *objectives), how="cross", suffix="_other"
     )
     edges = pairs.filter(
         pl.all_horizontal(
@@ -167,6 +167,9 @@ def _rank_parent(group: pl.DataFrame, patterns: pl.DataFrame) -> pl.DataFrame:
             pl.col(name) > pl.col(f"{name}_other") for name in objectives
         ),
     ).select("candidate_id", "candidate_id_other")
+    pairs = pairs.select(
+        "candidate_id", "candidate_id_other", "_negative_edits", "_negative_edits_other"
+    )
     remaining, fronts = group, []
     while remaining.height:
         front = remaining.join(
@@ -196,7 +199,7 @@ def _rank_parent(group: pl.DataFrame, patterns: pl.DataFrame) -> pl.DataFrame:
             .alias("_same"),
         )
     )
-    # Distinct replacements at a shared position count once; identical ones zero.
+    # Reuse the thin numeric pairs; distinct replacements at one site count once.
     distances = pairs.join(
         overlap, on=["candidate_id", "candidate_id_other"], how="left"
     ).select(
@@ -209,6 +212,7 @@ def _rank_parent(group: pl.DataFrame, patterns: pl.DataFrame) -> pl.DataFrame:
             - pl.col("_same").fill_null(0)
         ).alias("_distance"),
     )
+    del pairs
     remaining = pl.concat(fronts).with_columns(pl.lit(2**31 - 1).alias("_nearest"))
     picks = []
     while remaining.height:

@@ -7,14 +7,18 @@ import hashlib
 import time
 import zipfile
 from collections.abc import Callable
-from functools import partial
+from io import BytesIO
 from typing import IO, Annotated
 from uuid import UUID, uuid4
 
+import polars as pl
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response
+from pydantic import TypeAdapter
 
 from biomodals.execution import DeploymentIdentity
+from biomodals.helper.antibody import GermlineAssignment
+from biomodals.service.antibody_sequence_analysis.reference import present_germlines
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
@@ -31,7 +35,10 @@ from biomodals.service.humanization.contracts import (
 )
 from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.humanization.results import (
+    READ_SELECTION_SCHEMA,
     SELECTION_SCHEMA,
+    CandidateGermlines,
+    HumanizationManifest,
     SelectionPage,
     query_selection,
 )
@@ -43,13 +50,16 @@ from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
     JobRecord,
-    JobState,
     ServiceStore,
     UserNotFoundError,
 )
+from biomodals.service.table_archive import read_cached_selection
+from biomodals.workflow.humanization.germlines import (
+    ASSIGNMENT_COLUMNS,
+    GENE_COLUMNS,
+    GERMLINE_SCHEMA,
+)
 from biomodals.workflow.humanization.settings import HumanizationSettings
-
-MAX_SELECTION_BYTES = 32 * 1024 * 1024
 
 
 def create_router(
@@ -220,49 +230,17 @@ def create_router(
     async def read_selection[T](
         job_id: UUID,
         session: AuthenticatedSession,
-        reader: Callable[[IO[bytes]], T],
+        reader: Callable[[IO[bytes], zipfile.ZipFile], T],
     ) -> T:
         job = store.get_job(session.principal.user_id, job_id)
         if job is None or job.tool != "humanization":
             raise HTTPException(404, "Job not found")
-        if (
-            job.state not in {JobState.SUCCEEDED, JobState.PARTIAL}
-            or job.result_size_bytes is None
-            or job.result_sha256 is None
-        ):
-            raise CodedAPIError(409, "result_not_ready", "Result is not ready")
-        lease = await cache.acquire_async(
-            str(job_id), size_bytes=job.result_size_bytes, sha256=job.result_sha256
-        )
-        if lease is None:
-            raise CodedAPIError(
-                409,
-                "result_not_cached",
-                "Prepare the result download before opening this table",
-            )
-        try:
-
-            def read_member() -> T:
-                with zipfile.ZipFile(lease) as archive:
-                    member = archive.getinfo("selection.csv")
-                    if member.file_size > MAX_SELECTION_BYTES:
-                        raise ValueError(
-                            "Selection table exceeds the bounded read limit"
-                        )
-                    with archive.open(member) as source:
-                        return reader(source)
-
-            return await cache.run_bounded(read_member)
-        except (KeyError, ValueError, zipfile.BadZipFile) as error:
-            raise CodedAPIError(
-                409, "result_invalid", "Selection table is unavailable or invalid"
-            ) from error
-        finally:
-            lease.close()
+        return await read_cached_selection(job, cache, reader)
 
     @router.get("/jobs/{job_id}/selection", response_model=SelectionPage)
     async def selection(
         job_id: UUID,
+        request: Request,
         session: Annotated[AuthenticatedSession, Depends(require_session)],
         offset: Annotated[int, Query(ge=0)] = 0,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
@@ -270,20 +248,101 @@ def create_router(
         sort_by: str | None = None,
         descending: bool = False,
     ) -> SelectionPage:
-        if sort_by is not None and sort_by not in SELECTION_SCHEMA:
+        if sort_by is not None and sort_by not in READ_SELECTION_SCHEMA:
             raise CodedAPIError(422, "sort_invalid", "Unknown selection column")
-        return await read_selection(
-            job_id,
-            session,
-            partial(
-                query_selection,
+
+        def read_page(source: IO[bytes], archive: zipfile.ZipFile):
+            page = query_selection(
+                source,
                 offset=offset,
                 limit=limit,
                 parent_id=parent_id,
                 sort_by=sort_by,
                 descending=descending,
-            ),
-        )
+            )
+            if not set(GENE_COLUMNS) <= {column.name for column in page.columns}:
+                return page, None
+            manifest_member = archive.getinfo("manifest.json")
+            if manifest_member.file_size > 1024 * 1024:
+                raise ValueError("Humanization manifest exceeds preview limit")
+            manifest = HumanizationManifest.model_validate_json(
+                archive.read(manifest_member)
+            )
+            if manifest.schema_version < 4:
+                raise ValueError("Gene columns require an annotated publication")
+            names = {column.name for column in page.columns}
+            expected_pi = (
+                {"vh_pi", "vl_pi", "vh_vl_pi"}
+                if manifest.schema_version == 5
+                else {"vh_pI", "vl_pI", "vh_vl_pI"}
+                if manifest.schema_version >= 6
+                else set()
+            )
+            if {name for name in names if name.endswith(("_pi", "_pI"))} != expected_pi:
+                raise ValueError(
+                    "Sequence metrics do not match the publication version"
+                )
+            member = archive.getinfo("germlines.parquet")
+            if member.file_size > 64 * 1024 * 1024:
+                raise ValueError("Germline table exceeds preview limit")
+            selected = pl.DataFrame(page.rows, schema=SELECTION_SCHEMA).select(
+                "parent_id", "candidate_id", "vh", "vl"
+            )
+            evidence = (
+                pl
+                .scan_parquet(BytesIO(archive.read(member)))
+                .filter(
+                    pl.col("candidate_id").is_in(selected["candidate_id"].implode())
+                )
+                .collect()
+            )
+            if (
+                evidence.schema != pl.Schema(GERMLINE_SCHEMA)
+                or evidence.height != selected.height * 2
+            ):
+                raise ValueError("Germline evidence does not cover selected candidates")
+            assignments = {}
+            expected = {}
+            for row in page.rows:
+                for chain in ("vh", "vl"):
+                    sequence = row[chain]
+                    if not isinstance(sequence, str):
+                        raise ValueError("Selection chain sequence is missing")
+                    expected[row["candidate_id"], chain] = (
+                        row["parent_id"],
+                        hashlib.sha256(sequence.encode()).hexdigest(),
+                    )
+            adapter = TypeAdapter(GermlineAssignment)
+            for row in evidence.iter_rows(named=True):
+                key = row["candidate_id"], row["chain"]
+                if expected.pop(key, None) != (
+                    row["parent_id"],
+                    row["sequence_sha256"],
+                ):
+                    raise ValueError(
+                        "Germline evidence has the wrong candidate identity"
+                    )
+                assignments.setdefault(row["candidate_id"], {})[row["chain"]] = (
+                    adapter.validate_python({
+                        name: row[name] for name in ASSIGNMENT_COLUMNS
+                    })
+                )
+            return page, assignments
+
+        page, assignments = await read_selection(job_id, session, read_page)
+        if assignments is not None:
+            (
+                snapshot,
+                page.reference,
+            ) = await request.app.state.antibody_analysis.reference_snapshot()
+            page.germlines = {
+                candidate_id: CandidateGermlines(**{
+                    chain: present_germlines(assignment, chain, snapshot)
+                    for chain, assignment in chains.items()
+                })
+                for candidate_id, chains in assignments.items()
+            }
+        return page
 
     @router.get(
         "/jobs/{job_id}/selection.csv",
@@ -301,7 +360,9 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_session)],
     ) -> Response:
         return Response(
-            await read_selection(job_id, session, lambda source: source.read()),
+            await read_selection(
+                job_id, session, lambda source, archive: source.read()
+            ),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="selection.csv"'},
         )

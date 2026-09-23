@@ -214,7 +214,8 @@ function names remain available only as diagnostic log-target metadata.
 Each Tool's active Job limit also determines the per-Job Provider Call limits
 snapshotted during admission. For an active Job limit of `N`, every Tool gets
 `max(1, 8*N)` total Provider Calls per Job. Humanization gets `max(1, 5*N)`
-GPU Provider Calls per Job; GROMACS and AlphaFold3 retain `max(1, N)`.
+GPU Provider Calls per Job; nanobody humanization gets `max(1, 2*N)`;
+GROMACS and AlphaFold3 retain `max(1, N)`.
 GPU calls count toward the total. A zero active Job limit pauses admission;
 the positive provider-limit floors do not enable new Jobs.
 
@@ -537,7 +538,7 @@ short `Retry-After`; historical window reads do not consume these permits.
 
 Tool configuration controls whether logs are Administrator-only or also
 available to the owning User. GROMACS initially allows owner access;
-AlphaFold3 and humanization initially restrict logs to Administrators.
+AlphaFold3 and both humanization Tools initially restrict logs to Administrators.
 
 ## Modal billing
 
@@ -549,8 +550,8 @@ the selected report interval and displays zero when that Environment has no
 reported usage.
 
 Deployed Tool Apps and workflows carry a stable `biomodals_tool` tag (`gromacs`,
-`alphafold3`, or `humanization`). Humanization tags the containing workflow
-deployment, covering its included model functions and coordinator. Billing
+`alphafold3`, `humanization`, or `nanobody_humanization`). Humanization tags the
+containing workflow deployment, covering its included model functions and coordinator. Billing
 recognizes keys from the service's Tool registry rather than a separate allowlist.
 Billing reports request this tag and use it as the only reliable
 Tool attribution key. Untagged or unknown values remain **Other / untagged**;

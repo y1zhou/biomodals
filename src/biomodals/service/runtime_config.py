@@ -58,7 +58,7 @@ class ToolRuntimeConfiguration:
     @property
     def max_active_gpu_provider_calls(self) -> int:
         """Derive the per-Job GPU container ceiling from Tool capacity."""
-        multiplier = 5 if self.tool == "humanization" else 1
+        multiplier = {"humanization": 5, "nanobody_humanization": 2}.get(self.tool, 1)
         return max(1, self.active_job_limit.value * multiplier)
 
 

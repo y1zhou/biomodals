@@ -5,7 +5,7 @@ the sequence-distinct union. Research-use candidates require experimental testin
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -42,6 +42,12 @@ from biomodals.execution.modal import (
 )
 from biomodals.execution.model import NodeAggregationPolicy
 from biomodals.execution.nodes import ProviderCallSpec, TaskDefinition, TaskProviderNode
+from biomodals.helper import patch_image_for_helper
+from biomodals.helper.antibody import (
+    ARPEGGIA_VERSION,
+    BIOPYTHON_VERSION,
+    GERMLINE_REFERENCE,
+)
 from biomodals.helper.catalog import include_dependency_apps
 from biomodals.helper.constant import MAX_TIMEOUT
 from biomodals.helper.shell import sanitize_filename
@@ -76,6 +82,11 @@ from biomodals.workflow.humanization.execution import (
     stage_execution_request,
 )
 from biomodals.workflow.humanization.export import IMGT_MUTATION_SCHEMA, export_results
+from biomodals.workflow.humanization.germlines import (
+    GERMLINE_SCHEMA,
+    add_sequence_columns,
+    complete_germline_table,
+)
 from biomodals.workflow.humanization.ranking import RANKING_VERSION, rank_panel
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import (
@@ -88,7 +99,9 @@ from biomodals.workflow.humanization.tables import (
 
 METHODS = ("sapiens", "humatch", "pabnativ2", "hudiff_ab")
 SCIENTIFIC_VERSIONS = {
-    "result_schema": "3",
+    "result_schema": "6",
+    "sequence_metrics": f"biopython={BIOPYTHON_VERSION}|full-input-pi-v1",
+    "germline_annotation": f"arpeggia={ARPEGGIA_VERSION}|{GERMLINE_REFERENCE}|all-species-v1",
     "panel_ranking": RANKING_VERSION,
     "biomodals.workflow.humanization": "2",
     "sapiens": sapiens_app.RUNTIME_IDENTITY,
@@ -119,10 +132,26 @@ CONF = AppConfig(
 OUT_VOLUME = orchestrator.OUT_VOLUME
 OUT_VOLUME_NAME = orchestrator.OUT_VOLUME_NAME
 OUT_VOLUME_MOUNTPOINT = orchestrator.CONF.output_volume_mountpoint
-app = modal.App(CONF.name, image=orchestrator.runtime_image, tags=CONF.tags)
+# Install workflow dependencies before the helper's deferred source mounts.
+runtime_image = (
+    modal.Image
+    .debian_slim(python_version=CONF.python_version)
+    .env(CONF.default_env)
+    .uv_pip_install(f"biopython=={BIOPYTHON_VERSION}")
+    .pipe(patch_image_for_helper, include_workflow_modules=True)
+)
+app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 app = include_dependency_apps(app, CONF.depends_on_apps)
-annotation_image = hudiff_app.coordinator_image.add_local_python_source(
-    "biomodals.workflow.humanization"
+annotation_image = (
+    modal.Image
+    .micromamba(python_version="3.12")
+    .micromamba_install(
+        ["anarci==2020.04.23", "hmmer==3.3.2"],
+        channels=["bioconda", "conda-forge"],
+    )
+    .uv_pip_install(f"arpeggia=={ARPEGGIA_VERSION}")
+    .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.workflow.humanization")
 )
 annotate_humanization_candidate = app.function(
     image=annotation_image, cpu=1, memory=2048, timeout=600
@@ -357,7 +386,7 @@ class HumanizationEvaluateNode(TaskProviderNode):
             TaskDefinition("generation_complete", errors),
         ]
         for candidate in candidates:
-            for method in (*SCORE_COLUMNS, "annotation"):
+            for method in (*SCORE_COLUMNS, "annotation", "germline"):
                 tasks.append(
                     TaskDefinition(
                         f"{method}-{candidate['candidate_id']}",
@@ -400,12 +429,18 @@ class HumanizationEvaluateNode(TaskProviderNode):
             payload["parent"],
             payload["method"],
         )
-        if method == "annotation":
+        if method in {"annotation", "germline"}:
             return ProviderCallSpec(
                 function_name="annotate_humanization_candidate",
                 uses_gpu=False,
-                kwargs={"parent": parent, "candidate": candidate},
+                kwargs={
+                    "parent": parent,
+                    "candidate": candidate,
+                    "operations": (method,),
+                },
                 metadata=payload,
+                compatibility_key=f"annotation-{candidate['candidate_id']}",
+                max_tasks_per_call=2,
             )
         kwargs = {
             "csv_bytes": pl
@@ -433,15 +468,42 @@ class HumanizationEvaluateNode(TaskProviderNode):
             metadata=payload,
         )
 
+    def prepare_remote_task_batch(
+        self, context: NodeRunContext, tasks: tuple[TaskDefinition, ...]
+    ) -> ProviderCallSpec:
+        """Batch two independent annotations into the existing per-candidate call."""
+        call = self.prepare_remote_task(context, tasks[0])
+        if call.function_name != "annotate_humanization_candidate":
+            return call
+        return replace(
+            call,
+            kwargs={
+                **call.kwargs,
+                "operations": tuple(
+                    task.scientific_payload["method"] for task in tasks
+                ),
+            },
+        )
+
+    def process_remote_task_batch_result(
+        self, task_keys: tuple[str, ...], result: Any, metadata: Mapping[str, Any]
+    ) -> Mapping[str, AppRunResult]:
+        """Keep an IMGT failure from discarding a successful germline publication."""
+        if task_keys[0].split("-", 1)[0] not in {"annotation", "germline"}:
+            return super().process_remote_task_batch_result(task_keys, result, metadata)
+        if set(result) != {key.split("-", 1)[0] for key in task_keys}:
+            raise ValueError("Annotation response does not match the owned Tasks")
+        return {
+            key: AppRunResult.model_validate(result[key.split("-", 1)[0]])
+            for key in task_keys
+        }
+
     def process_remote_task_result(
         self, task_key: str, result: Any, metadata: Mapping[str, Any]
     ) -> AppRunResult:
         """Normalize scalar summaries while retaining the native detailed publication."""
         result = AppRunResult.model_validate(result)
-        if (
-            result.status != AppRunStatus.SUCCEEDED
-            or metadata["method"] == "annotation"
-        ):
+        if result.status != AppRunStatus.SUCCEEDED:
             return result
         method, candidate = metadata["method"], metadata["candidate"]
         if len(result.outputs) != 1 or not isinstance(
@@ -487,10 +549,15 @@ class HumanizationEvaluateNode(TaskProviderNode):
             HumanizationCandidate.model_validate(row)
             for row in orjson.loads(context.read_input_bytes("union"))
         ]
-        evaluations, annotations, mutation_frames = [], [], []
+        evaluations, annotations, mutation_frames, germline_frames = [], [], [], []
         for result in results.values():
             for output in result.outputs:
-                if output.name not in {"evaluation", "annotation", "imgt_mutations"}:
+                if output.name not in {
+                    "evaluation",
+                    "annotation",
+                    "imgt_mutations",
+                    "germlines",
+                }:
                     continue
                 if context.volume_root is None:
                     raise RuntimeError(
@@ -509,6 +576,9 @@ class HumanizationEvaluateNode(TaskProviderNode):
                     mutation_frames.append(
                         pl.read_json(path, schema=IMGT_MUTATION_SCHEMA)
                     )
+                    continue
+                if output.name == "germlines":
+                    germline_frames.append(pl.read_json(path, schema=GERMLINE_SCHEMA))
                     continue
                 value = orjson.loads(path.read_bytes())
                 if output.name == "evaluation":
@@ -546,6 +616,8 @@ class HumanizationEvaluateNode(TaskProviderNode):
         table = rank_panel(
             selection_table(candidates, evaluations, annotations), mutations
         )
+        germlines = complete_germline_table(candidates, germline_frames)
+        table = add_sequence_columns(table, germlines)
         bundle = export_results(
             context,
             candidates,
@@ -556,6 +628,7 @@ class HumanizationEvaluateNode(TaskProviderNode):
             self.settings,
             SCIENTIFIC_VERSIONS,
             self.parents,
+            germlines=germlines,
         )
         return AppRunResult(
             status=AppRunStatus.PARTIAL if errors else AppRunStatus.SUCCEEDED,

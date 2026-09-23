@@ -104,6 +104,8 @@ def export_results(
     settings: HumanizationSettings,
     scientific_versions: Mapping[str, str],
     parents: Sequence[AntibodyPair],
+    *,
+    germlines: pl.DataFrame,
 ) -> AppOutput:
     """Publish a terminal directory covering every retained scientific artifact."""
     if context.volume_root is None or context.artifact_volume_name is None:
@@ -114,6 +116,7 @@ def export_results(
     scores = root / "scores"
     scores.mkdir(exist_ok=True)
     table.write_csv(root / "selection.csv")
+    germlines.write_parquet(root / "germlines.parquet", compression="zstd")
     parent_by_candidate = {
         candidate.candidate_id: candidate.parent_id for candidate in candidates
     }
@@ -133,6 +136,7 @@ def export_results(
                     "imgt_mutations",
                     "evaluated_union",
                     "generation_complete",
+                    "germlines",
                 }:
                     continue
                 if (
@@ -182,7 +186,7 @@ def export_results(
             "content_sha256": digest,
         })
     manifest = {
-        "schema_version": 3,
+        "schema_version": 6,
         "execution_run_id": str(context.execution_run_id),
         "status": "partial" if errors else "succeeded",
         "parameters": settings.model_dump(),

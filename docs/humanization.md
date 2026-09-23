@@ -56,15 +56,25 @@ documented model-staging prerequisites are already met.
 
 ## Sampling and outcomes
 
-- Sapiens contributes the design after each iteration, before exact deduplication.
-- Humatch can successfully return an unchanged parent if its targets are met.
-- p-AbNatiV2 Sampling attempts means independent optimizer runs; different seeds
-  may converge to the same sequence.
-- HuDiff's candidate count is a sampling-attempt budget, not guaranteed yield.
-  Invalid and duplicate attempts reduce the number of distinct candidates.
+- Sapiens uses chain language models and contributes each successive greedy
+  refinement (1–5 iterations). Increasing iterations explores a refinement path,
+  not independent random replicas.
+- Humatch edits toward human V-family and pairing-classifier targets. It returns
+  one endpoint per parent, possibly unchanged if targets already hold. Increasing
+  its edit limit or thresholds does not request more candidates.
+- p-AbNatiV2 optimizes paired nativeness with accessibility/pairing constraints.
+  Increase **Sampling attempts per parent** (1–25) for more independent optimizer
+  runs; different seeds may still converge to the same sequence.
+- HuDiff samples paired frameworks around protected CDRs. Increase its attempts
+  (1–25) for more sampling, not guaranteed yield. Invalid and duplicate attempts
+  reduce the number of distinct candidates. HuDiff has no native evaluation score.
 
 Increasing these controls can increase generation and evaluation cost. There is
 no requirement that each method contribute the same number of candidates.
+Root seed affects p-AbNatiV2 and HuDiff, not all four methods. Position controls
+remain model-specific: Humatch uses IMGT, p-AbNatiV2 AHo and Sapiens its configured
+convention. Allowing CDR changes can alter binding determinants; none of these
+controls or sequence scores establishes experimental suitability.
 
 ## Choosing candidates
 
@@ -85,12 +95,27 @@ preservation and error columns before choosing a characterization panel.
 
 ## Downloaded results
 
-Current schema 3 archives contain the selection CSV, detailed score Parquets,
+New schema 6 archives contain the selection CSV with adjacent `vh` and `vl`,
+followed by `vh_pI`, `vl_pI`, `vh_vl_pI` and four V/J gene columns,
+one consolidated germline-evidence Parquet, detailed score Parquets,
 IMGT mutations, a compact generation ledger, and a digest manifest. The ledger
 links generation outcomes to retained candidates, including parental no-ops,
 duplicates and rejected attempts. Native model payloads and predicted structures
 are not copied into the standard archive. Historical archives keep their original
 layout and stored ranking.
+
+Hover genes for matched reference species and approved-therapeutic usage, with
+source/date information once above the table. Click sequences for numbering,
+CDR and potential-liability annotations, plus one Germline (humanized) /
+**Humanized** / Parental / Germline (parental) alignment with unlabeled comparison
+strips. Both before/after V/J genes and species are shown. The parent is read
+from this job's retained inputs; if unavailable, the candidate's germline display
+remains usable. pIs use the complete supplied
+chains; VH+VL treats their direct concatenation as one chain without a linker.
+Neither pIs nor genes change ranking. VH/VL checkboxes let you send selected
+chains to [Antibody sequence analysis](antibody-sequence-analysis.md), pairing
+only within each parental antibody. This immediate local analysis creates no Job
+and does not transfer source ranks or pairing scores to new recombinations.
 
 For exact scientific definitions and file fields, see the
 [workflow contract](specs/humanization-workflow.md). Deployment operators should

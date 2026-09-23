@@ -10,6 +10,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI, status
 
+from biomodals.service.antibody_sequence_analysis.analysis import AnalysisService
+from biomodals.service.antibody_sequence_analysis.contracts import MAX_REQUEST_BYTES
+from biomodals.service.antibody_sequence_analysis.reference import TherapeuticReference
+from biomodals.service.antibody_sequence_analysis.router import (
+    create_router as analysis_router,
+)
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthService, PasswordExecutor
 from biomodals.service.auth_api import create_auth_router
@@ -66,6 +72,13 @@ def create_app(
         raise ValueError("allowed_origins must contain exact origins without a slash")
     session_cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
     password_executor = PasswordExecutor()
+    analysis = AnalysisService(
+        TherapeuticReference(
+            cache.directory.parent
+            / "antibody-sequence-analysis"
+            / "therapeutic-gene-usage.json"
+        )
+    )
     reconcile_wakeup = asyncio.Event()
 
     @asynccontextmanager
@@ -103,6 +116,7 @@ def create_app(
             reconcile_wakeup.set()
             await task
             await password_executor.shutdown()
+            await analysis.shutdown()
             await cache.shutdown()
 
     app = FastAPI(
@@ -127,6 +141,7 @@ def create_app(
     app.state.lifecycle = lifecycle
     app.state.reconcile_wakeup = reconcile_wakeup
     app.state.cache = cache
+    app.state.antibody_analysis = analysis
     app.state.billing = BillingService()
     app.state.pending_requests = None
     app.state.validated_inputs = None
@@ -136,8 +151,15 @@ def create_app(
     install_http_contract(
         app,
         max_body_bytes=256 * 1024 * 1024,
-        path_limits={"/api/v1/humanization/jobs": 4 * 1024 * 1024},
+        path_limits={
+            "/api/v1/humanization/jobs": 4 * 1024 * 1024,
+            "/api/v1/nanobody-humanization/jobs": 1024 * 1024,
+            "/api/v1/nanobody-humanization/prepare": 1024 * 1024,
+            "/api/v1/antibody-sequence-analysis/analyze": MAX_REQUEST_BYTES,
+            "/api/v1/antibody-sequence-analysis/sequence": MAX_REQUEST_BYTES,
+        },
     )
+    app.include_router(analysis_router(analysis))
     app.include_router(create_operations_router(store=store, cache=cache))
     app.include_router(
         create_auth_router(
@@ -179,11 +201,16 @@ def create_deployed_app() -> FastAPI:
     from biomodals.service.humanization.router import (
         create_router as humanization_router,
     )
+    from biomodals.service.nanobody_humanization.modal import NanobodyToolAdapter
+    from biomodals.service.nanobody_humanization.router import (
+        create_router as nanobody_router,
+    )
     from biomodals.service.pending import PendingRequestStore
     from biomodals.service.tools import (
         ALPHAFOLD3_TOOL,
         GROMACS_TOOL,
         HUMANIZATION_TOOL,
+        NANOBODY_TOOL,
         TOOLS,
     )
 
@@ -222,7 +249,15 @@ def create_deployed_app() -> FastAPI:
         modal_download_concurrency=settings.modal_download_concurrency,
     )
     humanization = ToolRegistration(HUMANIZATION_TOOL, humanization_adapter)
-    registrations = (gromacs, alphafold3, humanization)
+    nanobody_adapter = NanobodyToolAdapter(
+        pending, modal_download_concurrency=settings.modal_download_concurrency
+    )
+    registrations = (
+        gromacs,
+        alphafold3,
+        humanization,
+        ToolRegistration(NANOBODY_TOOL, nanobody_adapter),
+    )
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     routers = (
         gromacs_router(
@@ -249,6 +284,15 @@ def create_deployed_app() -> FastAPI:
             cache=cache,
             adapter=humanization_adapter,
             max_pairs=settings.humanization_max_pairs,
+        ),
+        nanobody_router(
+            store=store,
+            configuration=configuration,
+            pending=pending,
+            remote=remote,
+            cache=cache,
+            adapter=nanobody_adapter,
+            max_parents=settings.nanobody_max_parents,
         ),
     )
     app = create_app(

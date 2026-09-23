@@ -1,7 +1,7 @@
 # Humanization publication and identifier boundaries
 
 Status: accepted. Consolidates the original mutation-format (0010) and
-identifier (0011) decisions with the schema 3 workflow download decision.
+identifier (0011) decisions with the lean workflow download decision.
 The [workflow spec](../specs/humanization-workflow.md#result-publication) owns
 current filenames, fields and compatibility behavior; this record owns why.
 
@@ -74,6 +74,24 @@ A null parental generation label is consequently not missing execution.
 Candidate provenance must survive exact deduplication, while method labels
 remain presentation rather than ranking inputs. More seed replicates do not
 guarantee novel candidates or balance method yields.
+
+## Germline assignments and therapeutic reference usage
+
+Decision accepted 21 September 2026. New workflow publications retain
+germline gene assignments and their species/tie evidence, so CLI and website
+users receive the same assignment record. Existing
+publications are not backfilled or rewritten. Gene labels belong in the normal
+selection CSV, with detailed assignments in one consolidated table rather than
+per-candidate payloads. These annotations do not change ranking eligibility.
+
+Therapeutic usage is a separate comparison against a local, approved-only
+Thera-SAbDab snapshot, not a property inferred by the humanization models.
+Keeping it outside the scientific workflow avoids a new public-data network
+dependency during generation. Build the reference only when absent, record its
+download date and digest, and do not schedule refreshes. Display its provenance
+once above results rather than repeating it per gene. Exact analysis and cohort
+semantics are maintained in the
+[sequence-analysis spec](../specs/antibody-sequence-analysis.md).
 
 ## Alternatives not retained
 

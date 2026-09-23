@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from modal._image import _Image
 
 from biomodals.app.bioinfo import rosetta_app
 from biomodals.app.bioinfo.gromacs import app as gromacs_app
@@ -20,8 +21,8 @@ from biomodals.app.fold import (
     protenix_app,
 )
 from biomodals.app.score import af3score_app, ensirna_app, oligoformer_app
-from biomodals.execution.modal import orchestrator
 from biomodals.workflow.humanization import workflow as humanization_workflow
+from biomodals.workflow.nanobody_humanization import workflow as nanobody_workflow
 from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
 
 
@@ -40,7 +41,7 @@ def _source_modules(image) -> set[str]:
 def test_humanization_coordinator_and_annotation_image_source_closures():
     """The shared coordinator can import app-composed graph classes remotely."""
     assert {"biomodals.workflow", "biomodals.app"} <= _source_modules(
-        orchestrator.runtime_image
+        humanization_workflow.app.image
     )
     assert "biomodals.workflow.humanization" in _source_modules(
         humanization_workflow.annotation_image
@@ -62,6 +63,53 @@ def test_humanization_coordinator_and_annotation_image_source_closures():
     ):
         path = Path(__file__).parents[2] / "src" / "biomodals" / relative
         ast.parse(path.read_text(), feature_version=(3, 12))
+
+
+def test_nanobody_coordinator_and_annotation_source_closures():
+    assert {"biomodals.workflow", "biomodals.app"} <= _source_modules(
+        nanobody_workflow.runtime_image
+    )
+    assert "biomodals.workflow.nanobody_humanization" in _source_modules(
+        nanobody_workflow.annotation_image
+    )
+    assert nanobody_workflow.CONF.python_version == "3.13"
+    assert nanobody_workflow.CONF.depends_on_apps == ("abnativ2_vhh", "hudiff_nb")
+    assert nanobody_workflow.CONF.tags["biomodals_tool"] == "nanobody_humanization"
+
+
+@pytest.mark.parametrize(
+    "image",
+    (
+        humanization_workflow.app.image,
+        humanization_workflow.annotation_image,
+        nanobody_workflow.runtime_image,
+        nanobody_workflow.annotation_image,
+    ),
+    ids=(
+        "paired-coordinator",
+        "paired-annotation",
+        "nanobody-coordinator",
+        "nanobody-annotation",
+    ),
+)
+def test_humanization_images_install_before_source_mounts(image):
+    """Check the real SDK build graph without resolving any remote images."""
+    original = next(
+        value
+        for key, value in image.__dict__.items()
+        if key.startswith("_sync_original")
+    )
+
+    def check_layers(layer):
+        for base in layer.deps():
+            if isinstance(base, _Image):
+                check_layers(base)
+                if layer._rep != "Image(local files)":
+                    assert base._rep != "Image(local files)", (
+                        f"Build step after deferred local files: {layer!r}"
+                    )
+
+    check_layers(original)
 
 
 @pytest.mark.parametrize(

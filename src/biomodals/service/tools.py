@@ -254,4 +254,25 @@ HUMANIZATION_TOOL = ToolDefinition(
     ),
 )
 
-TOOLS = (GROMACS_TOOL, ALPHAFOLD3_TOOL, HUMANIZATION_TOOL)
+NANOBODY_TOOL = ToolDefinition(
+    key="nanobody_humanization",
+    display_name="Nanobody humanization",
+    modal_app_name_environment="BIOMODALS_NANOBODY_HUMANIZATION_APP",
+    modal_app_version_environment="BIOMODALS_NANOBODY_HUMANIZATION_APP_VERSION",
+    active_job_limit_environment="BIOMODALS_NANOBODY_HUMANIZATION_ACTIVE_LIMIT",
+    default_modal_app_name="NanobodyHumanizationWorkflow",
+    default_modal_app_version=1,
+    default_active_job_limit=2,
+    stages=(
+        ToolStageDefinition(
+            "generate_abnativ2_vhh", "AbNatiV2-VHH", ("generate_abnativ2_vhh",)
+        ),
+        ToolStageDefinition("generate_hudiff_nb", "HuDiff-Nb", ("generate_hudiff_nb",)),
+        ToolStageDefinition("union", "Collect unique candidates", ("union",)),
+        ToolStageDefinition(
+            "evaluate", "Evaluate and rank candidates", ("evaluate", "publish")
+        ),
+    ),
+)
+
+TOOLS = (GROMACS_TOOL, ALPHAFOLD3_TOOL, HUMANIZATION_TOOL, NANOBODY_TOOL)

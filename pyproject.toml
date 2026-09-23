@@ -23,6 +23,8 @@ dependencies = [
 
 [project.optional-dependencies]
 api = [
+    "arpeggia==0.10.1",
+    "biopython==1.86",
     "fastapi>=0.140.0,<1",
     "pwdlib[argon2]>=0.3.0,<0.4",
     "python-multipart>=0.0.22,<1",
@@ -38,6 +40,8 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "arpeggia==0.10.1",
+    "biopython==1.86",
     "biotite==1.6.0",
     "fastapi>=0.140.0,<1",
     "httpx>=0.28.1,<1",

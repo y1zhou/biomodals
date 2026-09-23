@@ -125,6 +125,13 @@ runs require separate approval.
   successful or partial result. An evicted local result returns coded 409
   `result_not_cached`; the frontend calls the existing authenticated
   prepare-download mutation then retries once. It does not rerun science.
+- Schema 6 selection places `vh`, `vl`, then `vh_pI`, `vl_pI`, `vh_vl_pI`
+  and the four V/J genes together; numeric pI sorting uses the same full-table
+  path. Historical schema 2–5 CSVs retain their original columns and actual
+  sort keys. The sequence inspector lazily
+  reuses the retained-input GET for its exact parent's matching chain and sends
+  it to local sequence analysis; it does not fetch a full selection table or
+  create a scientific Job.
 - Full archives use the existing shared Job download endpoints. The adapter
   verifies workflow publication identity and file digests, then creates a
   deterministic ZIP suitable for exact cache restoration.

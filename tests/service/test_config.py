@@ -21,6 +21,7 @@ ENVIRONMENT_KEYS = (
     "BIOMODALS_GROMACS_APP_VERSION",
     "BIOMODALS_GROMACS_ACTIVE_LIMIT",
     "BIOMODALS_HUMANIZATION_MAX_PAIRS",
+    "BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS",
     "BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT",
     "BIOMODALS_DEFAULT_USER_ACTIVE_JOB_LIMIT",
     "BIOMODALS_RECONCILE_SECONDS",
@@ -43,6 +44,23 @@ def test_local_defaults_are_safe_and_cleanup_is_disabled(monkeypatch) -> None:
     assert settings.modal_environment == "production"
     assert settings.modal_download_concurrency == 4
     assert settings.humanization_max_pairs == 100
+    assert settings.nanobody_max_parents == 100
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "201", "bad"])
+def test_nanobody_parent_limit_rejects_invalid_configuration(value):
+    settings = ServiceSettings.from_environment({
+        "BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS": value
+    })
+    with pytest.raises(ValueError):
+        _ = settings.nanobody_max_parents
+
+
+def test_nanobody_parent_limit_permits_the_workflow_ceiling():
+    settings = ServiceSettings.from_environment({
+        "BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS": "200"
+    })
+    assert settings.nanobody_max_parents == 200
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "201", "1000", "bad"])

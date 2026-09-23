@@ -14,13 +14,17 @@ from biomodals.service.humanization.results import (
     build_humanization_archive,
     query_selection,
 )
-from biomodals.service.humanization.router import MAX_SELECTION_BYTES
+from biomodals.service.table_archive import MAX_SELECTION_BYTES
 from biomodals.workflow.humanization.artifacts import generated_pairs, json_output
 from biomodals.workflow.humanization.contracts import AntibodyPair, CandidateOrigin
 from biomodals.workflow.humanization.export import (
     IMGT_MUTATION_SCHEMA,
     export_results,
     generation_table,
+)
+from biomodals.workflow.humanization.germlines import (
+    add_gene_columns,
+    complete_germline_table,
 )
 from biomodals.workflow.humanization.settings import HumanizationSettings
 from biomodals.workflow.humanization.tables import candidate_union, selection_table
@@ -187,6 +191,8 @@ def test_maximum_candidate_envelope_has_bounded_verified_manifest(tmp_path):
         pl.lit(None, dtype=pl.Int64).alias("panel_order"),
     )
     context = export_context(tmp_path, outcomes)
+    germlines = complete_germline_table(candidates, [])
+    selection = add_gene_columns(selection, germlines)
     output = export_results(
         context,
         candidates,
@@ -197,6 +203,7 @@ def test_maximum_candidate_envelope_has_bounded_verified_manifest(tmp_path):
         settings,
         SCIENTIFIC_VERSIONS,
         parents,
+        germlines=germlines,
     )
     root = tmp_path / output.storage.path
     content = (root / "manifest.json").read_bytes()
@@ -211,6 +218,7 @@ def test_maximum_candidate_envelope_has_bounded_verified_manifest(tmp_path):
         "selection.csv",
         "generation.parquet",
         "imgt_mutations.parquet",
+        "germlines.parquet",
     }
     ledger = pl.read_parquet(root / "generation.parquet")
     assert ledger.height == 11200

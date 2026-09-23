@@ -75,6 +75,30 @@ def test_native_numbering_preserves_input_order_and_cdrs(scheme):
 
 
 @pytest.mark.parametrize("scheme", SCHEMES)
+def test_hallmark_indices_follow_imgt_across_display_schemes(scheme):
+    """Boxes follow native residues through tails and four-track gap columns."""
+    from arpeggia import number_antibody
+
+    sequence = "GGG" + VH + "HHHHHH"
+    native = number_antibody(sequence, scheme="imgt")
+    expected = [
+        residue.input_index
+        for residue in native.residues
+        if residue.position.number in (42, 49, 50, 52)
+        and not residue.position.insertion
+    ]
+    assert len(expected) == 4
+    detail = sequence_detail(sequence, scheme, "GG" + VH[:40] + "CC" + VH[40:])
+    assert detail["imgt_hallmark_indices"] == expected
+    alignment = detail["alignment"]
+    for index in expected:
+        column = alignment["input_indices"].index(index)
+        assert alignment["input"][column] == sequence[index]
+    assert sequence_detail(VL, scheme)["imgt_hallmark_indices"] == []
+    assert sequence_detail("ACDE", scheme)["imgt_hallmark_indices"] == []
+
+
+@pytest.mark.parametrize("scheme", SCHEMES)
 def test_native_germline_alignment_retains_operations_and_full_input_offsets(scheme):
     """Indels stay gapped, while query coordinates include unnumbered prefixes."""
     from arpeggia import number_antibody

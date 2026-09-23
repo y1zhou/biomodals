@@ -8,7 +8,7 @@ import pytest
 from antibody_fixture import VH, VL, reference_csv
 from test_api_contract import ORIGIN, _app, _humanization_session, _request
 
-from biomodals.helper.antibody import analyze_chain, assign_germlines
+from biomodals.helper.antibody import analyze_chain, assign_germlines, sequence_detail
 from biomodals.service.antibody_sequence_analysis.analysis import (
     AnalysisService,
     parse_fasta,
@@ -200,6 +200,10 @@ def test_private_api_options_details_limits_and_no_jobs(tmp_path):
         app, "POST", root + "/sequence", json={"sequence": VH, "scheme": "kabat"}
     )
     assert detail.status_code == 200 and detail.json()["residues"]
+    assert (
+        detail.json()["imgt_hallmark_indices"]
+        == sequence_detail(VH)["imgt_hallmark_indices"]
+    )
     assert [row["segment"] for row in detail.json()["germlines"]] == [
         "v",
         "j",

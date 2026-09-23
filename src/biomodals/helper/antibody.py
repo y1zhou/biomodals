@@ -131,6 +131,7 @@ class SequenceDetail(TypedDict):
     chain_type: str | None
     domain_span: tuple[int, int] | None
     residues: list[NumberedResidue]
+    imgt_hallmark_indices: list[int]
     germlines: list[GermlineReference]
     parental_germlines: list[GermlineReference]
     parental_germline_error: str | None
@@ -495,6 +496,7 @@ def sequence_detail(
         "chain_type": None,
         "domain_span": None,
         "residues": [],
+        "imgt_hallmark_indices": [],
         "germlines": [],
         "parental_germlines": [],
         "parental_germline_error": None,
@@ -505,6 +507,19 @@ def sequence_detail(
     }
     try:
         numbered = number_antibody(sequence, scheme=scheme)
+        if numbered.chain == "H":
+            imgt = (
+                numbered
+                if scheme == "imgt"
+                else number_antibody(sequence, scheme="imgt", match_germlines=False)
+            )
+            result["imgt_hallmark_indices"] = [
+                residue.input_index
+                for residue in imgt.residues
+                if residue.input_index is not None
+                and residue.position.number in (42, 49, 50, 52)
+                and not residue.position.insertion
+            ]
     except (ValueError, RuntimeError) as error:
         result["error"] = str(error)
         return result

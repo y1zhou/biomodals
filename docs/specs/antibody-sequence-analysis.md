@@ -221,6 +221,16 @@ insertions, - for deletions, : for positive-BLOSUM62 substitutions and x for
 other mismatches, following the pinned
 [arpeggia display contract](https://github.com/y1zhou/arpeggia/blob/v0.10.1/docs/antibody-numbering.md#display-and-antibody-alignments).
 
+The additive `imgt_hallmark_indices` annotation supplies full-input zero-based
+indices of exact heavy-chain IMGT positions 42, 49, 50 and 52, independent of
+the selected display scheme. Insertion-labelled positions are not included;
+light or unnumberable sequences return an empty list. Nanobody views map these
+indices through `alignment.input_indices` and outline each column across all
+biological rows and difference strips. This marks a position, not evidence of
+a mutation or autonomous VHH function. Representative V/J gene and species
+remain visible, without a representative-tie-count sentence in the alignment
+header; tie evidence remains available in the response and gene details.
+
 Liability intervals are zero-based, half-open and overlap-preserving across the
 entire supplied chain. Use the following selected
 [LAMBS v0.12.0 rules](https://github.com/dcroote/lambs/blob/61d6f28f3c666778fc06ed05a8a2d50faef4d715/index.html#L3052):

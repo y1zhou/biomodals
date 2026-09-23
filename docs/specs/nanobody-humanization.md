@@ -156,6 +156,9 @@ scores to zero to accommodate single-domain candidates.
   germline, bold Humanized sequence, Parental sequence and Germline (parental),
   with unlabeled difference strips and before/after V/J identities. Display
   CDR colors follow the chosen scheme, not the immutable generation mask.
+  Outline each of IMGT 42, 49, 50 and 52 with a gray box spanning the full
+  alignment stack, using native input coordinates even with another display
+  scheme. Show representative gene/species without a tie-count annotation.
 - Keep selection.csv as the primary download. The standard ZIP adds compact
   provenance and consolidated generation, mutation, germline and detailed
   score evidence. Do not duplicate selection as Parquet or copy native trees.
@@ -166,7 +169,9 @@ scores to zero to accommodate single-domain candidates.
   cross-product or transferred scientific ranks. Enforce its advertised
   1,000-entry group limit without truncation or automatic partitioning.
   The destination keeps its existing no-parent inspection; parental
-  comparison stays on the Job result page.
+  comparison stays on the Job result page. For this standalone-VH transfer,
+  hide VL columns by default (still selectable), and preserve the hallmark
+  column outlines in its two-sequence germline/input view.
 - Invalid rows must be corrected or removed before admission. Some failed
   parents/methods produce Partial usable results; if every generator fails
   for every parent, the Job is Failed. This deliberately differs from the

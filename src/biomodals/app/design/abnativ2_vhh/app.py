@@ -68,7 +68,6 @@ runtime_image = (
             "biopython==1.86",
             "numpy==2.2.6",
             "pandas==2.2.3",
-            "scipy==1.15.3",
         ],
         channels=["bioconda", "conda-forge"],
     )
@@ -76,6 +75,8 @@ runtime_image = (
         "torch==2.6.0+cu124", index_url="https://download.pytorch.org/whl/cu124"
     )
     .uv_pip_install(
+        # This release has Python 3.12 wheels on PyPI, but no conda-forge build.
+        "scipy==1.15.3",
         "lightning==2.5.6",
         "pytorch-lightning==2.5.6",
         "matplotlib==3.10.8",

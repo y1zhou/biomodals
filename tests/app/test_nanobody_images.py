@@ -3,6 +3,7 @@
 # ruff: noqa: D103
 
 import ast
+import inspect
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,28 @@ def test_image_source_closures_and_interpreter_versions():
         "hudiff_nb_humanize",
         "stage_hudiff_nb_models",
     }
+
+
+def test_scipy_pin_uses_the_available_python_wheel():
+    # The exact 1.15.3 release exists on PyPI, not in conda-forge. Inspect
+    # actual Modal-generated installation commands without building an image.
+    commands, seen = [], set()
+
+    def visit(layer):
+        if id(layer) in seen:
+            return
+        seen.add(id(layer))
+        if "uv_pip_install" in layer._rep or "micromamba_install" in layer._rep:
+            build = inspect.getclosurevars(layer._load).nonlocals["dockerfile_function"]
+            commands.extend(build("2025.06").commands)
+        for base in layer.deps():
+            if isinstance(base, _Image):
+                visit(base)
+
+    visit(_image(ab_app.runtime_image))
+    scipy_commands = [command for command in commands if "scipy==1.15.3" in command]
+    assert len(scipy_commands) == 1
+    assert "uv pip install" in scipy_commands[0]
 
 
 def test_colormap_patch_guards_exact_source_and_is_idempotent(tmp_path):

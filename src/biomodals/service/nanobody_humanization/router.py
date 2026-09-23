@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import polars as pl
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response
+from modal.exception import NotFoundError
 from pydantic import TypeAdapter
 
 from biomodals.execution import DeploymentIdentity
@@ -132,7 +133,8 @@ def create_router(
         response_model=JobView,
         status_code=202,
         responses={
-            422: {"model": NanobodyInputErrors},
+            422: {"model": NanobodyInputErrors | CodedErrorResponse},
+            409: {"model": CodedErrorResponse},
             503: {"model": CodedErrorResponse},
         },
     )
@@ -162,6 +164,12 @@ def create_router(
                 "batch_too_large",
                 f"At most {max_parents} parents are allowed per job",
             )
+        try:
+            body.settings.validate_budget(len(body.parents))
+        except ValueError as error:
+            raise CodedAPIError(
+                422, "exploration_budget_exceeded", str(error)
+            ) from error
         parents, issues = await request.app.state.antibody_analysis.run(
             prepare_batch, body.parents
         )
@@ -184,6 +192,14 @@ def create_router(
             effective.modal_app_version.value,
         )
         await remote.preflight(deployment)
+        try:
+            await adapter.preflight(deployment)
+        except NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin the updated nanobody workflow before submitting jobs.",
+            ) from error
         job_id = uuid4()
         execution_request = NanobodyExecutionRequest(
             run_name=f"nanobody-{job_id}",

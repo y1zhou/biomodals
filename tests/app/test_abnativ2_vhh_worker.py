@@ -5,7 +5,6 @@
 import sys
 import tarfile
 from io import BytesIO
-from pathlib import Path
 from types import SimpleNamespace
 
 import orjson
@@ -15,6 +14,7 @@ import pytest
 import zstandard
 
 from biomodals.app.design.abnativ2_vhh import worker
+from biomodals.app.design.abnativ2_vhh.contracts import SearchSummary
 from biomodals.app.design.vhh import VHHInput
 
 
@@ -66,24 +66,12 @@ def test_generation_retains_native_endpoint_and_rechecks_protection(
     monkeypatch.setattr(worker, "prepare_runtime", lambda: None)
     monkeypatch.setattr(worker, "native_grid", lambda value: value + "-" * 145)
     monkeypatch.setattr(worker, "allowed_positions", lambda *args: [1, 4])
-    monkeypatch.setattr(worker, "package_outputs", lambda *args, **kw: b"archive")
 
-    def generate(**kwargs):
-        calls.append(kwargs)
-        structures = Path(kwargs["output_dir"]) / "vhh/structures"
-        structures.mkdir(parents=True)
-        (structures / "prediction.pdb").write_text("native structure\n")
-        return pd.DataFrame({
-            "seq_id": ["vhh_abnativ_wt", "vhh_abnativ_hum_enhanced"],
-            "input_seq": ["ACDE", candidate],
-            "AbNatiV VH2 Score": [0.8, 0.9],
-        })
+    def generate(*args):
+        calls.append(args)
+        return [candidate], None
 
-    monkeypatch.setitem(
-        sys.modules,
-        "abnativ.humanisation.vhh_humanisation_functions",
-        SimpleNamespace(abnativ_vhh_humanisation=generate),
-    )
+    monkeypatch.setattr(worker, "generate", generate)
     result = worker.humanize_vhh(
         parent=VHHInput(sequence="ACDE", protected_indices=(1,)).model_dump(),
         settings={},
@@ -92,16 +80,8 @@ def test_generation_retains_native_endpoint_and_rechecks_protection(
     assert report["attempts"][0]["sequence"] == candidate
     assert (report["attempts"][0]["error"] is None) == (candidate != "AADE")
     assert result.metrics["valid_attempts"] == int(candidate != "AADE")
-    assert result.outputs[2].storage.data == b"archive"
-    call = calls[0]
-    assert (call["nat_vh"], call["nat_vhh"], call["is_brute"]) == ("VH2", "VHH2", False)
-    assert call["allowed_user_positions"] == [1, 4]
-    assert (call["a"], call["b"], call["forbidden_mut"]) == (2, 1, ["C", "M"])
-    assert (
-        call["threshold_abnativ_score"],
-        call["threshold_rasa_score"],
-        call["perc_allowed_decrease_vhh"],
-    ) == (0.98, 0.15, 0.05)
+    assert calls[0][:3] == ("ACDE", "ACDE" + "-" * 145, [1, 4])
+    assert report["settings"] == calls[0][3].model_dump()
 
 
 @pytest.mark.parametrize("model_type", ["VH2", "VHH2"])
@@ -179,3 +159,26 @@ def test_invalid_parameters_fail_before_model_access(monkeypatch):
         worker.score_vhh(
             sequences=[{"id": "same", "sequence": "ACDE"}] * 2, model_type="VH2"
         )
+
+
+def test_zero_passing_exploration_retains_successful_parent(monkeypatch):
+    monkeypatch.setattr(worker, "prepare_runtime", lambda: None)
+    monkeypatch.setattr(worker, "native_grid", lambda value: value + "-" * 145)
+    monkeypatch.setattr(worker, "allowed_positions", lambda *_: [1, 4])
+    summary = SearchSummary(
+        possible_candidates="1000000000000000000000",
+        evaluated_candidates=1000,
+        accepted_candidates=0,
+        coverage="sampled",
+    )
+    monkeypatch.setattr(worker, "generate", lambda *_: ([], summary))
+    result = worker.humanize_vhh(
+        parent={"sequence": "ACDE", "protected_indices": [1]},
+        settings={"explore": True},
+    )
+    report = orjson.loads(result.outputs[0].storage.data)
+    assert report["attempts"] == [
+        {"attempt_index": 1, "sequence": "ACDE", "error": None}
+    ]
+    assert report["search"] == summary.model_dump()
+    assert result.metrics == {"attempts": 1, "valid_attempts": 1}

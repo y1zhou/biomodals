@@ -9,6 +9,8 @@ import orjson
 import polars as pl
 import pytest
 
+from biomodals.app.design.abnativ2_vhh.models import RUNTIME_IDENTITY, SOURCE_COMMIT
+from biomodals.app.design.abnativ2_vhh.sampling import sample_combinations
 from biomodals.app.design.abnativ2_vhh.worker import _tables
 from biomodals.execution import DeploymentIdentity, GraphExecutionRunStore
 from biomodals.execution.definition_runtime import ExecutionGraphRuntime
@@ -33,16 +35,35 @@ SEQUENCE = (
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "abnativ2_vhh", "both", "score", "scalar", "annotation"]
+    "failure",
+    [None, "abnativ2_vhh", "both", "score", "score_chunk", "scalar", "annotation"],
 )
-def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure):
+@pytest.mark.parametrize("exploration_count", [0, 600])
+def test_native_union_scoring_publication_and_partial_outcomes(
+    tmp_path, failure, exploration_count
+):
     parent = prepare_vh(VHInput(id="a", vhh=SEQUENCE))
     index = next(
         i for i in range(len(parent.sequence)) if i not in parent.protected_indices
     )
     residue = "A" if parent.sequence[index] != "A" else "E"
     candidate = parent.sequence[:index] + residue + parent.sequence[index + 1 :]
-    settings = NanobodySettings(hudiff_nb_candidate_count=2)
+    mutable = [
+        i for i in range(len(parent.sequence)) if i not in parent.protected_indices
+    ][:10]
+    alternatives = sample_combinations(
+        parent.sequence,
+        [aa + "AE" if i in mutable else aa for i, aa in enumerate(parent.sequence)],
+        budget=600,
+        seed=0,
+    ).sequences
+    if exploration_count:
+        candidate = alternatives[0]
+    settings = NanobodySettings(
+        hudiff_nb_candidate_count=2,
+        abnativ2_explore=bool(exploration_count),
+        abnativ2_candidate_budget=exploration_count or 1000,
+    )
     graph = build_nanobody_graph((parent,), settings)
 
     class Driver:
@@ -62,10 +83,19 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
             ]
             if (
                 (
-                    operation.endswith("_humanize")
+                    operation.endswith(("_humanize", "_generate"))
                     and (failure == "both" or operation.startswith(str(failure)))
                 )
                 or (failure == "score" and operation == "abnativ2_vhh_score")
+                or (
+                    failure == "score_chunk"
+                    and operation == "abnativ2_vhh_score"
+                    and kwargs["model_type"] == "VH2"
+                    and any(
+                        row["sequence"] == parent.sequence
+                        for row in kwargs["sequences"]
+                    )
+                )
                 or (
                     failure == "annotation"
                     and operation == "annotate_nanobody_candidates"
@@ -75,16 +105,27 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
                     ProviderCallObservationKind.FAILED,
                     message="Unavailable native operation",
                 )
-            if operation.endswith("_humanize"):
-                method = operation.removesuffix("_humanize")
-                count = kwargs.get("candidate_count", 1)
+            if operation.endswith(("_humanize", "_generate")):
+                method = operation.removesuffix("_humanize").removesuffix("_generate")
+                count = kwargs.get("candidate_count", exploration_count or 1)
                 result = AppRunResult(
                     status=AppRunStatus.SUCCEEDED,
                     outputs=[
                         json_output(
                             "generation",
                             {
-                                "schema_version": 1,
+                                "schema_version": 2 if method == "abnativ2_vhh" else 1,
+                                "settings": kwargs.get("settings"),
+                                "source_commit": SOURCE_COMMIT,
+                                "runtime_identity": RUNTIME_IDENTITY,
+                                "search": {
+                                    "possible_candidates": str(exploration_count),
+                                    "evaluated_candidates": exploration_count,
+                                    "accepted_candidates": exploration_count,
+                                    "coverage": "complete",
+                                }
+                                if method == "abnativ2_vhh" and exploration_count
+                                else None,
                                 "method": method,
                                 "input_sequence": parent.sequence,
                                 "seed": kwargs.get("seed"),
@@ -93,6 +134,8 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
                                         "attempt_index": attempt,
                                         "sequence": candidate
                                         if method == "hudiff_nb"
+                                        else alternatives[attempt - 1]
+                                        if exploration_count
                                         else parent.sequence,
                                         "error": None,
                                     }
@@ -169,7 +212,7 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
         if failure == "both":
             assert result.status == AppRunStatus.FAILED
             assert {call[0] for call in driver.calls} == {
-                "abnativ2_vhh_humanize",
+                "abnativ2_vhh_generate",
                 "hudiff_nb_humanize",
             }
             return
@@ -181,16 +224,33 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
         )
         root = tmp_path / bundle.storage.path
         table = pl.read_csv(root / "selection.csv")
-        assert table.height == 2
-        assert table["is_parent"].to_list() == [True, False]
-        assert table["generating_methods"].to_list() == [None, "hudiff_nb"]
-        assert table["vh_mutations"].to_list() == [0, 1]
-        assert table["panel_order"].to_list() == [
-            None,
-            None if failure in {"score", "scalar"} else 1,
-        ]
+        designs = (
+            exploration_count if exploration_count and failure != "abnativ2_vhh" else 1
+        )
+        assert table.height == 1 + designs
+        assert table["is_parent"].to_list() == [True, *([False] * designs)]
+        shared = table.filter(pl.col("vh") == candidate)
+        assert shared["generating_methods"].item() == (
+            "abnativ2_vhh;hudiff_nb"
+            if exploration_count and failure != "abnativ2_vhh"
+            else "hudiff_nb"
+        )
+        assert table["panel_order"].count() == (
+            0
+            if failure == "score"
+            else designs - min(designs, 127)
+            if failure == "score_chunk"
+            else designs - int(failure == "scalar")
+        )
+        if failure == "score_chunk":
+            assert table["abnativ2_vh_nativeness_error"].is_not_null().sum() == min(
+                128, table.height
+            )
+            assert table["abnativ2_vhh_nativeness"].count() == table.height
         generation = pl.read_parquet(root / "generation.parquet")
-        assert generation.height == 3
+        assert generation.height == 2 + (
+            exploration_count if exploration_count and failure != "abnativ2_vhh" else 1
+        )
         assert (
             generation.filter(pl.col("method") == "hudiff_nb")[
                 "candidate_id"
@@ -200,7 +260,18 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
         manifest = orjson.loads((root / "manifest.json").read_bytes())
         assert manifest["status"] == result.status.value
         assert manifest["parameters"] == settings.model_dump()
-        assert manifest["candidate_count"] == 2
+        assert manifest["candidate_count"] == table.height
+        if exploration_count and failure != "abnativ2_vhh":
+            assert (
+                manifest["abnativ2_searches"][0]["accepted_candidates"]
+                == exploration_count
+            )
+            assert (
+                manifest["abnativ2_searches"][0]["sampling_seed"]
+                == settings.abnativ_parameters(
+                    parent.id, parent.sequence, parent.protected_indices
+                ).sampling_seed
+            )
         for file in manifest["files"]:
             content = (root / file["path"]).read_bytes()
             assert len(content) == file["size_bytes"]
@@ -209,10 +280,15 @@ def test_native_union_scoring_publication_and_partial_outcomes(tmp_path, failure
             kwargs for name, kwargs in driver.calls if name == "abnativ2_vhh_score"
         ]
         assert {call["model_type"] for call in score_calls} == {"VH2", "VHH2"}
-        assert all(
-            {row["sequence"] for row in call["sequences"]}
-            == {parent.sequence, candidate}
-            for call in score_calls
-        )
+        assert all(len(call["sequences"]) <= 128 for call in score_calls)
+        for model in ("VH2", "VHH2"):
+            records = [
+                row
+                for call in score_calls
+                if call["model_type"] == model
+                for row in call["sequences"]
+            ]
+            assert len(records) == table.height
+            assert {row["sequence"] for row in records} == set(table["vh"])
     finally:
         store.close()

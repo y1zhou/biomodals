@@ -12,6 +12,7 @@ import orjson
 import pytest
 from nanobody_fixture import VHH, result_directory
 
+from biomodals.execution import DeploymentIdentity
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.nanobody_humanization import modal as service_modal
 from biomodals.service.pending import PendingRequestStore
@@ -43,6 +44,51 @@ def setup(tmp_path, monkeypatch):
         service_modal, "load_execution_request_from_volume", lambda *_: request
     )
     return adapter, job, request
+
+
+@pytest.mark.anyio
+async def test_preflight_hydrates_actual_new_entrypoint_without_invoking_it(
+    tmp_path, monkeypatch
+):
+    adapter, job, _ = setup(tmp_path, monkeypatch)
+    calls = []
+
+    def resolve(app, name, **kwargs):
+        async def hydrate():
+            calls.append((app, name, kwargs))
+
+        return SimpleNamespace(hydrate=SimpleNamespace(aio=hydrate))
+
+    monkeypatch.setattr(service_modal.modal.Function, "from_name", resolve)
+    await adapter.preflight(
+        DeploymentIdentity(
+            job.modal_environment, job.modal_app_name, job.modal_app_version
+        )
+    )
+    assert calls == [
+        (
+            job.modal_app_name,
+            "abnativ2_vhh_generate",
+            {"environment_name": "fixture", "version": 3},
+        )
+    ]
+
+
+def test_historical_manifest_remains_byte_identical_in_download(tmp_path, monkeypatch):
+    adapter, job, request = setup(tmp_path, monkeypatch)
+    root = result_directory(tmp_path / "volume", job.job_id, request)
+    manifest = orjson.loads((root / "manifest.json").read_bytes())
+    manifest["schema_version"] = 1
+    manifest.pop("abnativ2_searches")
+    manifest["parameters"].pop("abnativ2_explore")
+    manifest["parameters"].pop("abnativ2_candidate_budget")
+    original = orjson.dumps(manifest)
+    (root / "manifest.json").write_bytes(original)
+    output = io.BytesIO()
+    service_modal.build_nanobody_archive(root, output)
+    with zipfile.ZipFile(io.BytesIO(output.getvalue())) as archive:
+        assert archive.read("manifest.json") == original
+        assert archive.read("selection.csv") == (root / "selection.csv").read_bytes()
 
 
 @pytest.mark.anyio

@@ -1,4 +1,4 @@
-"""Enhanced single-domain humanization with AbNatiV2 VH2/VHH2 and NbForge.
+"""Bounded single-domain humanization with AbNatiV2 VH2/VHH2 and optional NbForge.
 
 Upstream: https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ
 
@@ -14,6 +14,7 @@ from pathlib import Path
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.design.abnativ2_vhh.contracts import HumanizationSettings
 from biomodals.app.design.abnativ2_vhh.models import (
     MODEL_ROOT,
     NBFORGE_COMMIT,
@@ -25,7 +26,6 @@ from biomodals.app.design.abnativ2_vhh.patches import (
     verify_runtime,
 )
 from biomodals.app.design.abnativ2_vhh.worker import (
-    EnhancedSettings,
     humanize_vhh,
     score_vhh,
 )
@@ -109,8 +109,8 @@ runtime_image = (
     )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
-abnativ2_vhh_humanize = app.function(
-    name="abnativ2_vhh_humanize",
+abnativ2_vhh_generate = app.function(
+    name="abnativ2_vhh_generate",
     gpu=CONF.gpu,
     cpu=4,
     memory=16384,
@@ -152,27 +152,36 @@ def submit_abnativ2_vhh_task(
     residue_score_threshold: float = 0.98,
     rasa_threshold: float = 0.15,
     max_relative_vhh_score_decrease: float = 0.05,
+    explore: bool = False,
+    candidate_budget: int = 1000,
+    sampling_seed: int = 0,
 ) -> None:
     """Run one already prepared domain in explicit development mode.
 
     Args:
         input_json: JSON containing sequence and protected_indices; maximum 8 KiB.
-        output_dir: New local directory for the generation report and native evidence.
+        output_dir: New local directory for the compact generation report.
         residue_score_threshold: Native VH2 residue-liability threshold.
         rasa_threshold: Minimum solvent exposure for allowed substitutions.
-        max_relative_vhh_score_decrease: Native per-step VHH2 loss tolerance.
+        max_relative_vhh_score_decrease: Relative VHH2 loss, per-step enhanced or parent-relative exploration.
+        explore: Evaluate a bounded sample of native substitution combinations.
+        candidate_budget: Distinct nonparent combinations evaluated, at most 5000.
+        sampling_seed: Private seed for balanced exploration, independent of model RNG.
     """
     source, destination = Path(input_json), Path(output_dir)
     if not source.is_file() or source.stat().st_size > 8192:
         raise ValueError("Prepared input must be a regular JSON file at most 8 KiB")
     parent = VHHInput.model_validate_json(source.read_bytes())
-    settings = EnhancedSettings(
+    settings = HumanizationSettings(
         residue_score_threshold=residue_score_threshold,
         rasa_threshold=rasa_threshold,
         max_relative_vhh_score_decrease=max_relative_vhh_score_decrease,
+        explore=explore,
+        candidate_budget=candidate_budget,
+        sampling_seed=sampling_seed,
     )
     destination.mkdir(parents=True, exist_ok=False)
-    result = abnativ2_vhh_humanize.remote(
+    result = abnativ2_vhh_generate.remote(
         parent=parent.model_dump(), settings=settings.model_dump()
     )
     for output in result.outputs:

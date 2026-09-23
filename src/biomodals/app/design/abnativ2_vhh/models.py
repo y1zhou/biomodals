@@ -39,7 +39,7 @@ RUNTIME_IDENTITY = "|".join((
     "biopython=1.86|lightning=2.5.6|pytorch-lightning=2.5.6",
     "anarci=2020.04.23|hmmer=3.4|freesasa=2.2.1|pdbfixer=1.12.0|openmm=8.3.1",
     "matplotlib=3.10.8|seaborn=0.13.2|protein-topmodel=1.0.1",
-    "VH2+VHH2|enhanced|weights=2,1|forbidden=C,M|colormap-patch=1|wrapper=1",
+    "VH2+VHH2|enhanced+balanced-edit-count-v1|weights=2,1|forbidden=C,M|colormap-patch=1|wrapper=2",
 ))
 
 

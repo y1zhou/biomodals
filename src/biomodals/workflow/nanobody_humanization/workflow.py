@@ -11,6 +11,7 @@ import modal
 import orjson
 import polars as pl
 
+from biomodals.app.design.abnativ2_vhh.contracts import SCORE_BATCH_SIZE
 from biomodals.app.design.abnativ2_vhh.models import (
     MODELS,
     NBFORGE_SHA256,
@@ -72,6 +73,9 @@ from biomodals.schema import (
 )
 from biomodals.workflow.display import print_workflow_dag
 from biomodals.workflow.nanobody_humanization.annotation import (
+    ANNOTATION_BATCH_SIZE,
+)
+from biomodals.workflow.nanobody_humanization.annotation import (
     annotate_nanobody_candidates as _annotate_candidates,
 )
 from biomodals.workflow.nanobody_humanization.artifacts import (
@@ -106,8 +110,8 @@ from biomodals.workflow.nanobody_humanization.tables import (
 
 METHODS = ("abnativ2_vhh", "hudiff_nb")
 SCIENTIFIC_VERSIONS = {
-    "result_schema": "1",
-    "workflow": "1",
+    "result_schema": "2",
+    "workflow": "2",
     "preparation": PREPARATION_VERSION,
     "panel_ranking": "1",
     "abnativ2_vhh": ABNATIV_IDENTITY,
@@ -203,13 +207,13 @@ class NanobodyGenerateNode(TaskProviderNode):
                 candidate_count=self.settings.hudiff_nb_candidate_count,
             )
         else:
-            kwargs["settings"] = {
-                key.removeprefix("abnativ2_"): value
-                for key, value in self.settings.model_dump().items()
-                if key.startswith("abnativ2_")
-            }
+            kwargs["settings"] = self.settings.abnativ_parameters(
+                parent["id"], parent["sequence"], tuple(parent["protected_indices"])
+            ).model_dump()
         return ProviderCallSpec(
-            function_name=f"{self.method}_humanize",
+            function_name="abnativ2_vhh_generate"
+            if self.method == "abnativ2_vhh"
+            else "hudiff_nb_humanize",
             uses_gpu=True,
             kwargs=kwargs,
             metadata={"parent": parent},
@@ -241,7 +245,7 @@ class NanobodyGenerateNode(TaskProviderNode):
         errors: Mapping[str, str],
     ) -> AppRunResult:
         """Consolidate attempts and failures without copying native structures."""
-        frames = []
+        frames, searches = [], []
         for index, parent in enumerate(self.parents):
             key = f"parent-{index:04d}"
             if key in errors:
@@ -266,17 +270,27 @@ class NanobodyGenerateNode(TaskProviderNode):
                     for output in results[key].outputs
                     if output.name == "generation"
                 )
+                report = orjson.loads(output_bytes(context, output))
+                if report.get("search") is not None:
+                    searches.append({
+                        "parent_id": parent.id,
+                        "sampling_seed": report["settings"]["sampling_seed"],
+                        **report["search"],
+                    })
                 frames.append(
                     generation_frame(
                         parent,
                         self.method,
                         self.settings,
-                        orjson.loads(output_bytes(context, output)),
+                        report,
                     )
                 )
+        outputs = [table_output(context, "generation", pl.concat(frames))]
+        if self.method == "abnativ2_vhh":
+            outputs.append(json_output("searches", searches))
         return AppRunResult(
             status=AppRunStatus.PARTIAL if errors else AppRunStatus.SUCCEEDED,
-            outputs=[table_output(context, "generation", pl.concat(frames))],
+            outputs=outputs,
         )
 
 
@@ -324,26 +338,27 @@ class NanobodyEvaluateNode(TaskProviderNode):
         candidates = pl.read_parquet(
             context.resolve_artifact(context.single_input("candidates"))
         )
-        tasks = [
-            TaskDefinition("baseline", candidates["candidate_id"].to_list()),
-            TaskDefinition("annotation", candidates.select(*KEY, "vh").write_csv()),
-        ]
-        for index, parent in enumerate(self.parents):
-            sequences = (
-                candidates
-                .filter(pl.col("parent_id") == parent.id)
-                .select(
-                    pl.col("candidate_id").alias("id"), pl.col("vh").alias("sequence")
-                )
-                .to_dicts()
+        tasks = [TaskDefinition("baseline", candidates["candidate_id"].to_list())]
+        tasks.extend(
+            TaskDefinition(
+                f"annotation-{index:04d}", chunk.select(*KEY, "vh").write_csv()
             )
-            for model in ("VH2", "VHH2"):
-                tasks.append(
-                    TaskDefinition(
-                        f"{model}-{index:04d}",
-                        {"sequences": sequences, "model_type": model},
+            for index, chunk in enumerate(candidates.iter_slices(ANNOTATION_BATCH_SIZE))
+        )
+        for index, parent in enumerate(self.parents):
+            sequences = candidates.filter(pl.col("parent_id") == parent.id).select(
+                pl.col("candidate_id").alias("id"), pl.col("vh").alias("sequence")
+            )
+            for chunk_index, chunk in enumerate(
+                sequences.iter_slices(SCORE_BATCH_SIZE)
+            ):
+                for model in ("VH2", "VHH2"):
+                    tasks.append(
+                        TaskDefinition(
+                            f"{model}-{index:04d}-{chunk_index:04d}",
+                            {"sequences": chunk.to_dicts(), "model_type": model},
+                        )
                     )
-                )
         return tuple(tasks)
 
     def recover_remote_task_result(
@@ -361,7 +376,7 @@ class NanobodyEvaluateNode(TaskProviderNode):
         self, context: NodeRunContext, task: TaskDefinition
     ) -> ProviderCallSpec:
         """One included model operation per bounded parent/model batch."""
-        if task.task_key == "annotation":
+        if task.task_key.startswith("annotation-"):
             return ProviderCallSpec(
                 function_name="annotate_nanobody_candidates",
                 uses_gpu=False,
@@ -392,7 +407,7 @@ class NanobodyEvaluateNode(TaskProviderNode):
                 result.outputs[0].storage.data
             ).items()
         }
-        if task_key == "annotation":
+        if task_key.startswith("annotation-"):
             expected = pl.read_csv(
                 BytesIO(metadata["csv"].encode()), infer_schema=False
             )
@@ -453,7 +468,7 @@ class NanobodyEvaluateNode(TaskProviderNode):
         )
         scores, details = {}, {}
         for key, result in results.items():
-            if key in {"baseline", "annotation"}:
+            if key == "baseline" or key.startswith("annotation-"):
                 continue
             model = key.split("-", 1)[0]
             for name, frame in score_tables(context, result).items():
@@ -468,13 +483,14 @@ class NanobodyEvaluateNode(TaskProviderNode):
                     )
                     details.setdefault(f"{model}_{name}", []).append(frame)
         for key, error in errors.items():
-            if key == "annotation":
+            if key.startswith("annotation-"):
                 continue
-            model, index = key.split("-", 1)
+            model, index, chunk_index = key.split("-")
             scores.setdefault(model, []).append(
-                candidates.filter(
-                    pl.col("parent_id") == self.parents[int(index)].id
-                ).select(
+                candidates
+                .filter(pl.col("parent_id") == self.parents[int(index)].id)
+                .slice(int(chunk_index) * SCORE_BATCH_SIZE, SCORE_BATCH_SIZE)
+                .select(
                     "candidate_id",
                     pl.lit(None, dtype=pl.Float64).alias("score"),
                     pl.lit(error).alias("error"),
@@ -494,18 +510,29 @@ class NanobodyEvaluateNode(TaskProviderNode):
             ),
             mutations,
         )
-        if "annotation" in results:
-            annotated = score_tables(context, results["annotation"])
-            annotations, germlines = annotated["annotations"], annotated["germlines"]
-        else:
-            annotations = candidates.select(
-                *KEY,
-                pl.lit(None, dtype=pl.Float64).alias("vh_pI"),
-                pl.lit(None, dtype=pl.String).alias("vh_v_gene"),
-                pl.lit(None, dtype=pl.String).alias("vh_j_gene"),
-                pl.lit(errors["annotation"]).alias("annotation_error"),
-            )
-            germlines = pl.DataFrame(schema=GERMLINE_TABLE_SCHEMA)
+        annotation_frames, germline_frames = [], []
+        for index, chunk in enumerate(candidates.iter_slices(ANNOTATION_BATCH_SIZE)):
+            key = f"annotation-{index:04d}"
+            if key in results:
+                annotated = score_tables(context, results[key])
+                annotation_frames.append(annotated["annotations"])
+                germline_frames.append(annotated["germlines"])
+            else:
+                annotation_frames.append(
+                    chunk.select(
+                        *KEY,
+                        pl.lit(None, dtype=pl.Float64).alias("vh_pI"),
+                        pl.lit(None, dtype=pl.String).alias("vh_v_gene"),
+                        pl.lit(None, dtype=pl.String).alias("vh_j_gene"),
+                        pl.lit(errors[key]).alias("annotation_error"),
+                    )
+                )
+        annotations = pl.concat(annotation_frames)
+        germlines = (
+            pl.concat(germline_frames)
+            if germline_frames
+            else pl.DataFrame(schema=GERMLINE_TABLE_SCHEMA)
+        )
         selection = selection.join(
             annotations, on=KEY, how="left", validate="1:1", maintain_order="left"
         )
@@ -529,6 +556,7 @@ class NanobodyEvaluateNode(TaskProviderNode):
             self.settings,
             SCIENTIFIC_VERSIONS,
             incomplete=incomplete,
+            searches=orjson.loads(context.read_input_bytes("searches")),
         )
         return AppRunResult(
             status=AppRunStatus.PARTIAL if errors else AppRunStatus.SUCCEEDED,
@@ -602,6 +630,7 @@ def build_nanobody_graph(
         raise ValueError("Expected 1–200 unique prepared parents")
     if any(parent.preparation_version != PREPARATION_VERSION for parent in parents):
         raise ValueError("Prepared parents use an unsupported preparation version")
+    settings.validate_budget(len(parents))
     graph = ExecutionGraph(
         "nanobody_humanization", scientific_versions=SCIENTIFIC_VERSIONS
     )
@@ -629,11 +658,18 @@ def build_nanobody_graph(
         NanobodyEvaluateNode(parents, settings),
         id="evaluate",
         inputs={
-            name: ArtifactSelector(
-                producing_node_id=union.node_id, pattern=f"{name}.parquet"
-            )
-            for name in ("candidates", "generation", "mutations")
+            "searches": ArtifactSelector(
+                producing_node_id=generators["abnativ2_vhh"].node_id,
+                pattern="searches.json",
+            ),
+            **{
+                name: ArtifactSelector(
+                    producing_node_id=union.node_id, pattern=f"{name}.parquet"
+                )
+                for name in ("candidates", "generation", "mutations")
+            },
         },
+        accept_partial_from=[generators["abnativ2_vhh"]],
         aggregation_policy=NodeAggregationPolicy.ALLOW_PARTIAL,
     )
     graph.add_node(
@@ -789,7 +825,7 @@ class ExecutionCoordinator:
                 output_volume_name=OUT_VOLUME_NAME,
                 provider_driver=development_modal_call_driver(
                     {
-                        "abnativ2_vhh_humanize": abnativ_app.abnativ2_vhh_humanize,
+                        "abnativ2_vhh_generate": abnativ_app.abnativ2_vhh_generate,
                         "abnativ2_vhh_score": abnativ_app.abnativ2_vhh_score,
                         "hudiff_nb_humanize": hudiff_app.hudiff_nb_humanize,
                         "annotate_nanobody_candidates": annotate_nanobody_candidates,
@@ -811,6 +847,8 @@ def submit_nanobody_humanization_workflow(
     abnativ2_residue_score_threshold: float = 0.98,
     abnativ2_rasa_threshold: float = 0.15,
     abnativ2_max_relative_vhh_score_decrease: float = 0.05,
+    abnativ2_explore: bool = False,
+    abnativ2_candidate_budget: int = 1000,
     wait: bool = True,
     max_containers: int | None = None,
     max_gpu_containers: int | None = None,
@@ -826,11 +864,13 @@ def submit_nanobody_humanization_workflow(
     Args:
         input_csv: CSV containing exactly id,vhh; 1–200 original constructs.
         run_id: Logical run label; defaults to the input filename stem.
-        root_seed: Explicit HuDiff-Nb root seed, unsigned 32-bit integer.
+        root_seed: HuDiff seed and independent per-parent exploration streams.
         hudiff_nb_candidate_count: Native attempts per parent, 1–25; no refill.
         abnativ2_residue_score_threshold: Enhanced humanization residue threshold.
         abnativ2_rasa_threshold: Native relative solvent-accessibility threshold.
-        abnativ2_max_relative_vhh_score_decrease: Allowed per-step VHH nativeness loss.
+        abnativ2_max_relative_vhh_score_decrease: Relative VHH loss; per-step enhanced, prepared-parent-relative exploration.
+        abnativ2_explore: Explore bounded combinations instead of one enhanced endpoint.
+        abnativ2_candidate_budget: Nonparent evaluations per parent, 1–5000; whole-job maximum 10000.
         wait: Wait for completion and print final Volume paths.
         max_containers: Global active provider-call ceiling.
         max_gpu_containers: Global GPU subset of the provider-call ceiling.
@@ -852,6 +892,7 @@ def submit_nanobody_humanization_workflow(
     frame = pl.read_csv(BytesIO(content), infer_schema=False)
     if frame.columns != ["id", "vhh"] or not 1 <= frame.height <= 200:
         raise ValueError("Expected id,vhh CSV with 1–200 rows")
+    settings.validate_budget(frame.height)
     parents, issues = prepare_batch([
         VHInput.model_validate(row) for row in frame.iter_rows(named=True)
     ])

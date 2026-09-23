@@ -82,6 +82,16 @@ class NanobodyToolAdapter:
         await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
         await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
 
+    async def preflight(self, deployment: DeploymentIdentity) -> None:
+        """Resolve the versioned generation entrypoint without invoking compute."""
+        function = modal.Function.from_name(
+            deployment.deployment_name,
+            "abnativ2_vhh_generate",
+            environment_name=deployment.environment,
+            version=deployment.deployment_version,
+        )
+        await function.hydrate.aio()
+
     def _prepare_environment(self, job: JobRecord) -> SubmissionWait | None:
         """Share preparation without holding a Job lock during model downloads."""
         deployment = DeploymentIdentity(

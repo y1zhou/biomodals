@@ -28,13 +28,25 @@ sequence popup changes the annotation display, not this design policy.
 - **HuDiff-Nb sampling attempts per parent** defaults to 10 and accepts 1–25.
   More attempts explore more designs but increase compute. Duplicates, no-ops
   and rejected samples are not replaced, so this is not a guaranteed yield.
-- **Root seed** controls HuDiff-Nb's random sampling. Keeping the seed and
-  scientific version fixed makes the request reproducible; a changed seed
-  explores a different sample.
-- **AbNatiV2-VHH** proposes one enhanced-humanization endpoint per parent.
-  Its residue-score threshold, solvent-accessibility threshold and allowed
-  per-step VHH-score decrease expose the native search controls. Keep their
-  defaults initially; the last setting is not a global candidate-score floor.
+- **Root seed** controls HuDiff-Nb's unchanged sampling and an independent,
+  deterministic AbNatiV exploration stream per parent.
+- **AbNatiV2-VHH** defaults to enhanced search: one best-effort endpoint per
+  parent, possibly unchanged. Turn on **Explore more candidates** to evaluate
+  combinations of native-allowed substitutions. Small spaces are evaluated
+  completely; larger ones are sampled across mutation counts. All passing
+  designs enter the common ranked table, not a separate top-N shortlist.
+- **Exploration budget per parent** defaults to 1,000 distinct nonparent
+  evaluations, with a range of 1–5,000. Parents × budget must not exceed
+  10,000 per Job. For example, 100 parents can use a budget of at most 100
+  each. This allowance is not a predicted yield, runtime or cost: rejected
+  designs are not replaced, and HuDiff plus final evaluation add work.
+- **Solvent-exposure screening** is on by default at threshold 0.15. Turning
+  it off permits consideration of buried positions and bypasses structure
+  prediction; the protected CDR/cysteine/hallmark policy still applies.
+  The workflow does not calculate unused endpoint structural reports.
+- **Allowed VHH-score decrease** is relative to the current sequence at each
+  enhanced-search step, but relative to the prepared parent during exploration.
+  It is not an absolute VHH score floor and is not imposed on HuDiff outputs.
 
 Both generators run independently within the Job's snapshotted provider limits.
 With a large batch and limited GPU slots, one method may start before the other;
@@ -65,8 +77,9 @@ truncating selections.
 
 The ZIP contains the selection CSV, consolidated generation, germline and
 IMGT mutation tables, detailed scores under `scores/`, and a content-bound
-manifest. Native structural work used by AbNatiV remains operational evidence;
-the ZIP does not duplicate its native output trees.
+manifest. Exploration adds compact per-parent search counts, coverage and seed
+identity to that manifest, not extra columns or rejected-design tables. Parent
+structure is used only when screening needs it; the ZIP contains no native trees.
 
 If one generator or evaluation fails, usable results remain available with a
 Partial outcome. If every generator fails, the Job fails before scoring.
@@ -100,6 +113,11 @@ paired workflow. `BIOMODALS_NANOBODY_HUMANIZATION_MAX_PARENTS` controls the
 website batch limit; the active Job limit is managed through the shared
 Administrator settings. Per-Job provider limits are documented in the
 [service contract](specs/api-tool-service.md#provider-call-limits).
+The exploration release changes scientific identity and requires a new containing
+workflow deployment even for enhanced mode. Admission checks for its new
+`abnativ2_vhh_generate` entrypoint without starting compute; an older pin is
+rejected with deployment guidance. Historical outputs remain unchanged and
+downloadable; do not resume old scientific plans against the changed implementation.
 
 Offline tests do not validate native GPU inference or image installation. A
 separately authorized deployment and smallest native smoke run are required

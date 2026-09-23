@@ -24,6 +24,8 @@ from biomodals.schema import (
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
+ANNOTATION_BATCH_SIZE = 512
+
 
 def annotation_tables(candidates: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Compute each distinct supplied sequence once and bind evidence to every row."""
@@ -76,7 +78,7 @@ def annotate_nanobody_candidates(csv_bytes: bytes) -> AppRunResult:
     candidates = pl.read_csv(BytesIO(csv_bytes), infer_schema=False)
     if (
         candidates.columns != ["parent_id", "candidate_id", "vh"]
-        or not 1 <= candidates.height <= 5400
+        or not 1 <= candidates.height <= ANNOTATION_BATCH_SIZE
     ):
         raise ValueError("Unexpected candidate annotation input")
     summary, germlines = annotation_tables(candidates)

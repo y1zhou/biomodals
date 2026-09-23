@@ -303,7 +303,7 @@ class _FakeRemote:
                 "generate_humatch": "humatch_humanize",
                 "generate_pabnativ2": "pabnativ2_humanize_pair",
                 "generate_hudiff_ab": "hudiff_ab_humanize_pair",
-                "generate_abnativ2_vhh": "abnativ2_vhh_humanize",
+                "generate_abnativ2_vhh": "abnativ2_vhh_generate",
                 "generate_hudiff_nb": "hudiff_nb_humanize",
             }.get(node_key, self._functions.get(node_key, node_key))
             status = self._node_status(run_id, node_key)

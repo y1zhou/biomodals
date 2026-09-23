@@ -59,7 +59,7 @@ def test_image_source_closures_and_interpreter_versions():
         "biomodals.app.design.hudiff_ab.models",
     } <= set(_image(hu_app.staging_image)._added_python_source_set)
     assert set(ab_app.app.registered_functions) == {
-        "abnativ2_vhh_humanize",
+        "abnativ2_vhh_generate",
         "abnativ2_vhh_score",
         "stage_abnativ2_vhh_models",
     }

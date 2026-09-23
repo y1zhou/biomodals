@@ -1,6 +1,7 @@
 """Compact content-bound single-domain results; native trees stay operational."""
 
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import orjson
 import polars as pl
@@ -50,6 +51,7 @@ def export_results(
     scientific_versions: Mapping[str, str],
     *,
     incomplete: bool,
+    searches: Sequence[dict[str, Any]] = (),
 ) -> AppOutput:
     """Write one ordered CSV and consolidated evidence with a sorted inventory."""
     if context.volume_root is None or context.artifact_volume_name is None:
@@ -80,7 +82,7 @@ def export_results(
                 "content_sha256": digest,
             })
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "execution_run_id": str(context.execution_run_id),
         "status": "partial" if incomplete else "succeeded",
         "parameters": settings.model_dump(),
@@ -88,6 +90,7 @@ def export_results(
         "preparation_digest": preparation_digest(parents),
         "candidate_count": selection.height,
         "ranking_policy": RANKING_POLICY,
+        "abnativ2_searches": list(searches),
         "files": files,
     }
     path = root / "manifest.json"

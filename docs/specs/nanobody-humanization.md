@@ -1,7 +1,8 @@
 # Nanobody humanization
 
-Status: implemented and verified offline on 22 September 2026; ready for user
-review. Deployment remains separately authorized and unverified.
+Status: implementation includes budgeted exploration (23 September 2026).
+Verification evidence is below; deployment and GPU validation remain separately
+authorized and unverified.
 Branch `feat/nanobody-humanization` was
 rebased onto paired display/publication fix `297c579` before implementation.
 The supplied research report is design input, not an accepted specification.
@@ -77,9 +78,11 @@ scores to zero to accommodate single-domain candidates.
   restrictions during generation and independently check them afterward.
   Other framework positions, including imputed termini, remain mutable.
   Do not expose a shared Allow CDR mutations control in this release.
-- AbNatiV2 uses enhanced search and contributes its final endpoint per parent.
-  Retaining internal intermediate states and exhaustive search are deferred.
-  Preserve the native generator-required structure calculations.
+- AbNatiV2 defaults to enhanced search and contributes one best-effort endpoint
+  per parent, possibly unchanged. Optional bounded exploration retains all
+  native-score-passing designs. The [exploration contract](#exhaustive-diversity-follow-up-23-september-2026)
+  specifies its sampling, limits and structural-work scope. Enhanced intermediates
+  are excluded.
 - HuDiff-Nb defaults to 10 attempts per parent, with an accepted range of
   1–25 and root seed 0. Apply the seed explicitly; preserve native batch size
   10 and cross-batch token carry-over. A single parent budget is not split
@@ -112,8 +115,9 @@ scores to zero to accommodate single-domain candidates.
   greedily maximize minimum position-wise mutation distance to already selected
   candidates. Seed/ties prefer higher VH2, then higher VHH2, fewer mutations,
   then ascending candidate ID. Distinct replacements at one position differ
-  once. This reuses the paired workflow's Pareto/distance primitives, not its
-  paired guardrails or two-tier selection window.
+  once. The nanobody implementation uses linear-memory arrays rather than the
+  paired workflow's all-pairs tables, with identical objective/tie semantics.
+  It does not adopt paired guardrails or a two-tier selection window.
 - Publish each prepared parent first as an unranked reference, followed by
   ranked candidates, then candidates with incomplete evaluations and no
   numeric rank. Do not turn missing scores into zero or imply ranking by a
@@ -133,10 +137,10 @@ scores to zero to accommodate single-domain candidates.
   admission. These are immutable admission snapshots, not one shared provider
   pool across all Jobs; existing Jobs retain their limits. CLI runs reuse
   global `--max-containers` and `--max-gpu-containers` arguments.
-- Advanced controls expose AbNatiV's native humanness threshold, solvent-
-  exposure threshold and allowed per-step VHH-score decrease, with concise
-  explanations and explicit defaults, plus the accepted HuDiff attempt/seed
-  controls. A per-step tolerance is not a maximum total loss from the parent.
+- Advanced controls expose AbNatiV's residue threshold, conditional solvent-
+  exposure threshold, mode-sensitive VHH-loss tolerance, exploration toggle
+  and evaluation budget, plus the HuDiff attempt/seed controls. See the
+  exploration contract for precise defaults and bounds.
   Keep the accepted residue policy fixed and defer arbitrary protected-site
   editing from the first release.
 
@@ -155,8 +159,8 @@ scores to zero to accommodate single-domain candidates.
 - Keep selection.csv as the primary download. The standard ZIP adds compact
   provenance and consolidated generation, mutation, germline and detailed
   score evidence. Do not duplicate selection as Parquet or copy native trees.
-  Native-generated structures remain operational artifacts outside this ZIP;
-  no new structure viewer or extra structure inference is in scope.
+  No structure viewer, extra structure inference or unused endpoint structural
+  reports are in scope.
 - Selected sequences survive pagination and transfer to Group 1 of the
   existing analysis tool as standalone VH FASTA records, with no pairing
   cross-product or transferred scientific ranks. Enforce its advertised
@@ -288,9 +292,8 @@ changes the version and package-data paths, not the audited VHH search logic.
 It is the pin for the new VHH app, not authorization to upgrade the
 existing paired runtime. Native exhaustive search has no effective combination
 cap: it materializes combinations, scores them and predicts frontier-member
-structures. Enhanced endpoint generation is the accepted first scope;
-publishing its internal intermediate states would need explicit instrumentation
-and equivalence tests because no native trace/callback is exposed.
+structures. Enhanced endpoint generation remains the implemented scope;
+the proposed bounded exhaustive integration below is not an implemented mode.
 
 The [mutation-acceptance code](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/eb517f1f0b947084cb7e44a54ef34103e9692f5e/abnativ/humanisation/humanisation_utils.py)
 applies VHH-loss tolerance relative to the current sequence at each accepted
@@ -308,14 +311,145 @@ A sequence-input interface is therefore not a promise of structure-free compute.
 The new app pins this implementation and NbForge 0.1.1 separately from the
 existing paired app. Its explicit defaults are VH2/VHH2, enhanced search,
 thresholds 0.98/0.15, per-step loss tolerance 0.05, weights 2/1 and forbidden
-substitution targets C/M. Native structure generation is retained; its output
-is an operational artifact, not copied into the final selection ZIP.
+substitution targets C/M. The integration now composes lower-level native
+helpers: it preserves conditional parent structure for exposure screening and
+omits the outer wrapper's unused structural reporting.
 
 The inspected [NbForge 0.1.1 dependency declarations](https://gitlab.doc.ic.ac.uk/sormanni-lab/nbforge/-/blob/f5c90aa6a81968759890ae269d4ba137d0a6a61b/setup.cfg)
 require NumPy >=2.2.6 and Lightning >=2.5.6, conflicting with the existing paired
 image's validated NumPy 1.26.4 and Lightning 2.5.5. A VHH runtime therefore needs
 separate compatibility verification. Its native AbNatiV invocation also does
 not request NbForge GPU mode; GPU allocation is not evidence every step uses it.
+
+### Exhaustive diversity follow-up (23 September 2026)
+
+The user approved the following implementation, deliberately not a replacement
+for the native exhaustive algorithm. [ADR 0013](../adr/0013-budgeted-abnativ-candidate-exploration.md)
+records the bounded-coverage tradeoff.
+
+#### Controls and scientific policy
+
+- `abnativ2_explore=false` retains the native enhanced endpoint search (no
+  intermediates). True explores substitution combinations from the original
+  prepared parent, retaining every passing design for the common union/ranker.
+- `abnativ2_candidate_budget=1000`, range 1–5000, bounds **distinct nonparent
+  combinations evaluated per parent**. The product of parents × budget must
+  not exceed 10,000 in exploration mode. Reject excess before preparation,
+  pending-request writes or admission with `422 exploration_budget_exceeded`;
+  never silently scale the request. Replay of an admitted exact intent comes
+  first. These bounds cover possible downstream all-pass output, not just
+  generation. Parent profiles, HuDiff and common evaluation are additional work.
+- For native space N including the parent, evaluate all N−1 alternatives when
+  they fit; otherwise sample B unique alternatives directly. No Cartesian
+  materialization, duplicate retries, acceptance-driven refill or output cap.
+  Zero accepted changes is a successful parental no-op.
+- Canonical residue choices and suffix polynomial coefficients count exact-k
+  substitutions. Distribute near-equal quotas across feasible edit counts,
+  redistribute from exhausted groups, use a seeded group order for remainders,
+  then uniformly sample distinct integer ranks within each group. This avoids
+  bias toward large combinatorial groups while not promising pairwise diversity,
+  nested samples as B changes, or a native exhaustive optimum.
+- Sampling identity is `balanced-edit-count-v1`. A private per-parent seed
+  hashes that identity, Root seed, parent ID, prepared sequence and frozen mask.
+  Parent reorder/run IDs do not change the stream. HuDiff receives its existing
+  exact Root seed unchanged.
+- Native replacement options intersect VH2 and VHH2 PSSMs (frequency >0.01 and
+  positive log score), parental liability and allowed/exposed positions.
+  Preserve the parental residue and native forbidden substitution targets
+  C/M/gap. The existing CDR/cysteine/hallmark policy applies during generation
+  and is checked afterward.
+- Exploration requires nonnegative VH2 improvement and a VHH2 delta at least
+  `-tolerance * parental VHH2`, with native five-decimal delta rounding.
+  The same tolerance remains **per step** in enhanced mode, not relative to its
+  original parent. Do not impose these Ab-only gates on HuDiff candidates or
+  add a separate two-objective native Pareto shortlist.
+- Solvent-exposure screening is on at existing RASA 0.15 by default in both
+  modes. Off sends existing `abnativ2_rasa_threshold=0`, not a new wire boolean;
+  retain the positive edit locally across toggle cycles. Historical zero
+  initializes off; its dormant positive value comes from service defaults.
+  Parent structure is predicted only when screening needs it. Neither mode
+  performs unused post-search parent/candidate structural reporting. With
+  screening off neither needs structure inference.
+- Settings edits invalidate the frozen submission intent, not an unchanged
+  reviewed preparation. Admission errors preserve the preview/draft for explicit
+  user retry. Counting actual native space belongs to scientific execution,
+  never the preparation page. Display parents × B as an upper allowance, not a
+  prediction of candidate yield, runtime or price.
+
+#### Pinned native evidence and integration
+
+The exact source is AbNatiV 2.0.9 at
+`413ebd3995f9383bcb225638810d7fa0b5a3dbe4`:
+
+- [Option helper](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/413ebd3995f9383bcb225638810d7fa0b5a3dbe4/abnativ/humanisation/humanisation_utils.py#L1421-1533):
+  returns per-position options before enumeration; its printed 100,000 warning
+  is not an enforced bound.
+- [Acceptance/output selection](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/413ebd3995f9383bcb225638810d7fa0b5a3dbe4/abnativ/humanisation/humanisation_utils.py#L1585-1649):
+  applies the original-parent score gates, then a VH-improvement/fewer-edits
+  frontier and structural reports. The integration uses the gates, intentionally
+  not that output frontier/reporting.
+- [Enhanced helper](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/413ebd3995f9383bcb225638810d7fa0b5a3dbe4/abnativ/humanisation/humanisation_utils.py#L620-643):
+  performs DMS, optional parental RASA and the native endpoint search. Calling
+  it directly omits the public wrapper's unconditional structural reports.
+- [Scorer](https://gitlab.doc.ic.ac.uk/sormanni-lab/abnativ/-/blob/413ebd3995f9383bcb225638810d7fa0b5a3dbe4/abnativ/model/scoring_functions.py#L218-508):
+  loads a model per invocation and internally minibatches. Exploration makes
+  one capped mean-only pool call per model with native exhaustive batch size
+  128, rather than reloading weights for each external minibatch. Common
+  evaluation separately retains detailed evidence in bounded Tasks.
+
+Report schema 2 binds controls, source/runtime identity, parent, attempt count
+and search counts before union admission. Manifest `abnativ2_searches` carries
+successful per-parent possible/evaluated/accepted counts, complete/sampled
+coverage, sampling version and seed; an enormous possible count is decimal
+text. Parameters and checkpoint identities remain in the same manifest.
+Rejected designs and unconsumed native trees are not copied to the user ZIP.
+
+Workflow/scientific publication identities advance to 2; ranking policy remains
+1 because its full Pareto layers, rounded objectives and farthest-first order
+are unchanged. The real `abnativ2_vhh_generate` entrypoint replaces the old
+one-endpoint operation. API admission hydrates that exact pinned function
+without invoking it and returns `409 deployment_incompatible` for an old pin.
+Deploy/pin the updated containing workflow with the matching API/frontend.
+Historical results remain readable; old plans must not resume against new
+science. No rollout, restart or paid model run is authorized by this spec.
+
+#### Offline bounds and verification
+
+Single-machine measurements on 23 September 2026, not GPU/runtime guarantees:
+
+| Check | Result |
+| --- | --- |
+| 5,000 sampled alternatives | 0.029 s, without Cartesian allocation |
+| 5,000-candidate dense exact ranking | 0.662 s; 312 MiB process peak |
+| 512 distinct native CPU annotations | 5.807 s |
+| Maximum admitted 15,200-row union (200 × [50 Ab + 25 Hu + parent]) | 1.626 s for union/ranking/annotation with 76 shared sequence strings |
+| Full native-width synthetic random float32 residue evidence for both models | 364,001,358-byte publication; 1,536 MiB peak process RSS |
+| Content-bound publication / archive verification | 0.485 s / 0.418 s |
+| Selection CSV / bounded 50-row response | 5,355,084 bytes / 39,490 bytes, 0.015 s query (before page germline presentation) |
+
+The last stress check uses synthetic scores, not model predictions; it measures
+full profile width/compression and publication size. The annotation timing is
+the separate 512-unique-sequence measurement, not a claim about 15,200 unique
+annotations. The CSV remains below the shared 32 MiB read cap, and per-Task
+score archives are bounded separately. Harnesses/data live only in `/tmp`.
+
+Regression coverage includes exhaustive small-space enumeration, enormous
+integer spaces, quota redistribution, deterministic sampling, native scalar
+rounding for float32/64, successful no-ops, exact ranking against a brute-force
+oracle, real scheduler chunking/partial outcomes, coded pre-admission bounds
+and pinned-entrypoint hydration. Enhanced control delegation is tested against
+the native interface, not a claimed model-output equivalence experiment.
+GPU inference, image installation and live enhanced endpoint equivalence still
+require a separately authorized smallest smoke run.
+
+Final verification: 2,039 backend tests passed in 67.31 s, plus repository
+hooks, targeted type checks, app/workflow discovery and an exploration-enabled
+local-only CLI dry run. The frontend passed 117 unit tests and all 90 offline
+browser tests in one full run, with lint/build and exact exported-schema
+checks. Its native local fixture rejected 100 × 1,000 before admission, then
+accepted an explicit 100 × 100 request with exposure off and verified retained
+settings, paging, downloads, prepared-parent inspection and analysis transfer.
+No deployment, restart or model execution was performed for this release.
 
 ### HuDiff-Nb
 
@@ -428,15 +562,17 @@ The authoritative schemas are in
 The scientific graph has independent `generate_abnativ2_vhh` and
 `generate_hudiff_nb` Nodes, followed by `union`, `evaluate` and `publish`.
 The service combines the last two into one Evaluate and rank stage. Evaluation
-uses at most 27 sequences per parent/model call and one CPU annotation call
-deduplicated by sequence. `publish` is local: it preserves the complete bundle
+uses at most 128 sequences per parent/model Task, with native scoring minibatches
+of 32, and CPU annotation chunks of at most 512 rows (deduplicated by sequence
+within each chunk). Failed chunks mark only their submitted candidate IDs. `publish` is local: it preserves the complete bundle
 while reflecting row-level incompleteness as Partial using existing kernel
 Task outcomes. It never submits another scientific operation.
 
 Immutable requests retain original/prepared correspondence, masks, references,
-parameters and scientific identities. Publication schema 1 contains the
+parameters and scientific identities. Publication schema 2 retains the
 19-column ordered CSV defined by `export.SELECTION_COLUMNS`, consolidated
-evidence and a sorted content inventory. Service packaging checks request,
+evidence and a sorted content inventory, adding compact `abnativ2_searches`
+metadata to the manifest. The service also reads historical schema 1 unchanged. Service packaging checks request,
 preparation and file identities before publishing a deterministic ZIP. Native
 model output trees stay in execution storage rather than the user archive.
 
@@ -448,7 +584,7 @@ account and real local result production with fake scientific scores. Neither
 this fixture nor the native sampling-boundary oracle establishes successful
 GPU inference; image installation and an authorized deployed smoke remain open.
 
-The completed implementation passed 1,995 backend tests, repository hooks,
+The initial release passed 1,995 backend tests, repository hooks,
 targeted type checks, CLI discovery/help and the local-only example. Frontend
 commit `d88f111` passed 117 unit tests, all 78 offline browser tests in one run,
 lint, build and exact exported-schema checks. The native local browser fixture

@@ -1,4 +1,4 @@
-"""Native enhanced VHH generation and independent VH2/VHH2 evaluation."""
+"""Bounded VHH generation and independent VH2/VHH2 evaluation."""
 
 # ruff: noqa: PLC0415 - scientific dependencies live only in the task image.
 
@@ -14,12 +14,17 @@ import orjson
 import polars as pl
 from pydantic import BaseModel, ConfigDict, Field
 
+from biomodals.app.design.abnativ2_vhh.contracts import (
+    SCORE_BATCH_SIZE,
+    HumanizationSettings,
+)
 from biomodals.app.design.abnativ2_vhh.models import (
     MODEL_ROOT,
     RUNTIME_IDENTITY,
     SOURCE_COMMIT,
     assert_assets,
 )
+from biomodals.app.design.abnativ2_vhh.search import generate
 from biomodals.app.design.vhh import VHHInput
 from biomodals.helper.shell import package_outputs
 from biomodals.schema import (
@@ -30,18 +35,6 @@ from biomodals.schema import (
     InlineBytes,
 )
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
-
-MAX_NATIVE_BYTES = 64 * 1024 * 1024
-
-
-class EnhancedSettings(BaseModel):
-    """Explicit native CLI defaults, not the differing Python API defaults."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    residue_score_threshold: float = Field(default=0.98, ge=0, le=1)
-    rasa_threshold: float = Field(default=0.15, ge=0, le=1)
-    max_relative_vhh_score_decrease: float = Field(default=0.05, ge=0, le=1)
 
 
 class ScoreInput(BaseModel):
@@ -117,70 +110,37 @@ def _tables(name: str, frames: dict[str, pl.DataFrame]) -> AppOutput:
 
 
 def humanize_vhh(*, parent: dict[str, Any], settings: dict[str, Any]) -> AppRunResult:
-    """Retain the native enhanced endpoint, native structure work and raw evidence."""
+    """Keep all accepted alternatives, or a successful unchanged parental endpoint."""
     prepared = VHHInput.model_validate(parent)
-    parameters = EnhancedSettings.model_validate(settings)
+    parameters = HumanizationSettings.model_validate(settings)
     prepare_runtime()
     aligned = native_grid(prepared.sequence)
     mutable = allowed_positions(prepared, aligned)
 
     import matplotlib.pyplot as plt
-    from abnativ.humanisation.vhh_humanisation_functions import (  # type: ignore[ty:unresolved-import]
-        abnativ_vhh_humanisation,
-    )
 
     with (
         TemporaryDirectory(prefix="abnativ2-vhh-") as directory,
         ExitStack() as cleanup,
     ):
         cleanup.callback(plt.close, "all")
-        root = Path(directory) / "native"
-        native = abnativ_vhh_humanisation(
-            wt_seq=prepared.sequence,
-            name_seq="vhh",
-            nat_vh="VH2",
-            nat_vhh="VHH2",
-            output_dir=str(root),
-            allowed_user_positions=mutable,
-            is_brute=False,
-            threshold_abnativ_score=parameters.residue_score_threshold,
-            threshold_rasa_score=parameters.rasa_threshold,
-            perc_allowed_decrease_vhh=parameters.max_relative_vhh_score_decrease,
-            forbidden_mut=["C", "M"],
-            a=2,
-            b=1,
-            verbose=True,
+        candidates, search = generate(
+            prepared.sequence, aligned, mutable, parameters, Path(directory)
         )
-        # Pandas is upstream's API; convert once, then retain typed native evidence.
-        scores = pl.from_pandas(native)
-        expected = ["vhh_abnativ_wt", "vhh_abnativ_hum_enhanced"]
-        if scores["seq_id"].to_list() != expected:
-            raise ValueError("AbNatiV2 returned unexpected endpoint identities")
-        if scores["input_seq"][0] != prepared.sequence:
-            raise ValueError("AbNatiV2 changed its parental reference")
-        candidate = scores["input_seq"][1]
+    attempts = []
+    occupied = [i for i, aa in enumerate(aligned) if aa != "-"]
+    for index, candidate in enumerate(candidates or [prepared.sequence], start=1):
         error = None
         try:
             prepared.validate_candidate(candidate)
             candidate_grid = native_grid(candidate)
-            if [i for i, aa in enumerate(candidate_grid) if aa != "-"] != [
-                i for i, aa in enumerate(aligned) if aa != "-"
-            ]:
+            if [i for i, aa in enumerate(candidate_grid) if aa != "-"] != occupied:
                 raise ValueError("AbNatiV2 endpoint changed native alignment occupancy")
         except ValueError as exc:
             error = str(exc)
-        structures = root / "vhh" / "structures"
-        paths = list(structures.rglob("*"))
-        if any(path.is_symlink() for path in paths):
-            raise ValueError("Native structure output contains a symlink")
-        if (
-            sum(path.stat().st_size for path in paths if path.is_file())
-            > MAX_NATIVE_BYTES
-        ):
-            raise ValueError("Native structure output exceeds its publication limit")
-        archive = package_outputs(structures, num_threads=2)
+        attempts.append({"attempt_index": index, "sequence": candidate, "error": error})
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "method": "abnativ2_vhh",
         "input_sequence": prepared.sequence,
         "input_aligned_sequence": aligned,
@@ -188,7 +148,8 @@ def humanize_vhh(*, parent: dict[str, Any], settings: dict[str, Any]) -> AppRunR
         "settings": parameters.model_dump(),
         "source_commit": SOURCE_COMMIT,
         "runtime_identity": RUNTIME_IDENTITY,
-        "attempts": [{"attempt_index": 1, "sequence": candidate, "error": error}],
+        "search": search.model_dump() if search else None,
+        "attempts": attempts,
     }
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
@@ -202,27 +163,20 @@ def humanize_vhh(*, parent: dict[str, Any], settings: dict[str, Any]) -> AppRunR
                     data=orjson.dumps(report),
                 ),
             ),
-            _tables("native_endpoints", {"native_endpoints": scores}),
-            AppOutput(
-                name="native_structures",
-                kind=ArtifactKind.ARCHIVE,
-                storage=InlineBytes(
-                    filename="structures.tar.zst",
-                    media_type=ZSTD_MEDIA_TYPE,
-                    data=archive,
-                ),
-            ),
         ],
-        metrics={"attempts": 1, "valid_attempts": int(error is None)},
+        metrics={
+            "attempts": len(attempts),
+            "valid_attempts": sum(row["error"] is None for row in attempts),
+        },
     )
 
 
 def score_vhh(
     *, sequences: list[dict[str, str]], model_type: Literal["VH2", "VHH2"]
 ) -> AppRunResult:
-    """Score a single parent's complete union with one independent native model."""
-    if model_type not in {"VH2", "VHH2"} or not 1 <= len(sequences) <= 27:
-        raise ValueError("Expected VH2 or VHH2 and between 1 and 27 candidates")
+    """Score a bounded union chunk with one independent native model."""
+    if model_type not in {"VH2", "VHH2"} or not 1 <= len(sequences) <= SCORE_BATCH_SIZE:
+        raise ValueError(f"Expected VH2 or VHH2 and 1–{SCORE_BATCH_SIZE} candidates")
     inputs = [ScoreInput.model_validate(value) for value in sequences]
     if len({value.id for value in inputs}) != len(inputs):
         raise ValueError("Candidate identities must be unique")

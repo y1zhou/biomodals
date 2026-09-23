@@ -8,8 +8,16 @@ from uuid import UUID, uuid4
 
 import polars as pl
 from antibody_fixture import reference_csv
+from modal.exception import NotFoundError
 from nanobody_fixture import VHH, result_directory
-from test_api_contract import ORIGIN, _app, _humanization_session, _request, _session
+from test_api_contract import (
+    ORIGIN,
+    NanobodyAdapter,
+    _app,
+    _humanization_session,
+    _request,
+    _session,
+)
 
 from biomodals.service.antibody_sequence_analysis.reference import TherapeuticReference
 from biomodals.service.http_contract import require_session
@@ -226,6 +234,75 @@ def test_invalid_rows_and_oversized_body_never_admit_jobs(tmp_path):
                 ).status_code
                 == 413
             )
+        assert _request(app, "GET", "/api/v1/jobs").json()["jobs"] == []
+    finally:
+        asyncio.run(app.state.antibody_analysis.shutdown())
+
+
+def test_exploration_options_and_over_budget_rejection_precede_preparation(
+    tmp_path, monkeypatch
+):
+    app = _app(tmp_path)
+    _humanization_session(app)
+    monkeypatch.setattr(
+        router,
+        "prepare_batch",
+        lambda *_: (_ for _ in ()).throw(
+            AssertionError("Preparation should not start")
+        ),
+    )
+    try:
+        options = _request(app, "GET", ROOT + "/options").json()
+        assert options["defaults"]["abnativ2_explore"] is False
+        assert options["defaults"]["abnativ2_candidate_budget"] == 1000
+        assert options["max_exploration_candidates_per_parent"] == 5000
+        assert options["max_exploration_candidates_per_job"] == 10000
+        response = _request(
+            app,
+            "POST",
+            ROOT + "/jobs",
+            json={
+                "parents": [{"id": f"p{i}", "vhh": VHH} for i in range(11)],
+                "preparation_digest": "0" * 64,
+                "settings": {
+                    "abnativ2_explore": True,
+                    "abnativ2_candidate_budget": 1000,
+                },
+            },
+            headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+        )
+        assert response.status_code == 422
+        assert response.json()["code"] == "exploration_budget_exceeded"
+        assert app.state.remote_execution.preflights == 0
+        assert _request(app, "GET", "/api/v1/jobs").json()["jobs"] == []
+    finally:
+        asyncio.run(app.state.antibody_analysis.shutdown())
+
+
+def test_unsupported_pinned_workflow_rejects_before_admission(tmp_path, monkeypatch):
+    async def incompatible(self, deployment):
+        raise NotFoundError("old generation entrypoint")
+
+    monkeypatch.setattr(NanobodyAdapter, "preflight", incompatible)
+    app = _app(tmp_path)
+    _humanization_session(app)
+    try:
+        parents = [{"id": "one", "vhh": VHH}]
+        preview = _request(
+            app, "POST", ROOT + "/prepare", json={"parents": parents}
+        ).json()
+        response = _request(
+            app,
+            "POST",
+            ROOT + "/jobs",
+            json={
+                "parents": parents,
+                "preparation_digest": preview["preparation_digest"],
+            },
+            headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+        )
+        assert response.status_code == 409
+        assert response.json()["code"] == "deployment_incompatible"
         assert _request(app, "GET", "/api/v1/jobs").json()["jobs"] == []
     finally:
         asyncio.run(app.state.antibody_analysis.shutdown())

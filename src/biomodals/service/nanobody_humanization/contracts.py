@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from biomodals.app.design.abnativ2_vhh.sampling import MAX_EXPLORATION_CANDIDATES
 from biomodals.helper.antibody import MAX_CHAIN_LENGTH
 from biomodals.workflow.nanobody_humanization.preparation import (
     PREPARATION_VERSION,
@@ -14,7 +15,10 @@ from biomodals.workflow.nanobody_humanization.preparation import (
     VHInput,
     preparation_digest,
 )
-from biomodals.workflow.nanobody_humanization.settings import NanobodySettings
+from biomodals.workflow.nanobody_humanization.settings import (
+    MAX_JOB_EXPLORATION_CANDIDATES,
+    NanobodySettings,
+)
 
 MAX_CSV_BYTES = 10 * 1024 * 1024
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -27,6 +31,8 @@ class NanobodyOptions(BaseModel):
     max_input_length: int = MAX_CHAIN_LENGTH
     max_csv_bytes: int = MAX_CSV_BYTES
     preparation_version: str = PREPARATION_VERSION
+    max_exploration_candidates_per_parent: int = MAX_EXPLORATION_CANDIDATES
+    max_exploration_candidates_per_job: int = MAX_JOB_EXPLORATION_CANDIDATES
     defaults: NanobodySettings = Field(default_factory=NanobodySettings)
     settings_schema: dict[str, Any] = Field(
         default_factory=NanobodySettings.model_json_schema

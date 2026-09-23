@@ -53,6 +53,7 @@ class NanobodyExecutionRequest:
             )
         if len({parent.id for parent in self.parents}) != len(self.parents):
             raise ValueError("Duplicate prepared parent IDs")
+        self.settings.validate_budget(len(self.parents))
         resolve_provider_call_limits(
             max_containers=self.max_active_provider_calls,
             max_gpu_containers=self.max_active_gpu_provider_calls,

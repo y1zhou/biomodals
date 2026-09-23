@@ -295,6 +295,11 @@ class GromacsAdapter(GromacsToolAdapter):
         return None
 
 
+class NanobodyAdapter(NanobodyToolAdapter):
+    async def preflight(self, _deployment):
+        return None
+
+
 def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
@@ -360,7 +365,7 @@ def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
                 pending=pending,
                 remote=remote,
                 cache=cache,
-                adapter=NanobodyToolAdapter(pending),
+                adapter=NanobodyAdapter(pending),
                 max_parents=settings.nanobody_max_parents,
             ),
         ),

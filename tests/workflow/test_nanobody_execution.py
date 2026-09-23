@@ -5,6 +5,7 @@
 from dataclasses import replace
 from uuid import UUID
 
+import orjson
 import pytest
 
 from biomodals.execution import DeploymentIdentity, RunStatus
@@ -20,8 +21,29 @@ from biomodals.workflow.nanobody_humanization.execution import (
     persist_execution_request,
 )
 from biomodals.workflow.nanobody_humanization.preparation import VHInput, prepare_vh
+from biomodals.workflow.nanobody_humanization.settings import NanobodySettings
 
 VHH = "EVQLVESGGGLVQPGGSLRLSCAASGFTFSDYWMYWVRQAPGKGLEWVSEINTNGLITKYPDSVKGRFTISRDNAKNTLYLQMNSLRPEDTAVYYCARSPSGFNRGQGTLVTVSS"
+
+
+def test_historical_inputs_preserve_settings_without_repreparing_or_running_new_science():
+    request = NanobodyExecutionRequest(
+        run_name="historical",
+        parents=(prepare_vh(VHInput(id="one", vhh=VHH)),),
+        settings=NanobodySettings(root_seed=123, abnativ2_rasa_threshold=0),
+    )
+    native = orjson.loads(request.to_bytes())
+    native["scientific_versions"]["workflow"] = "1"
+    native["settings"].pop("abnativ2_explore")
+    native["settings"].pop("abnativ2_candidate_budget")
+    restored = NanobodyExecutionRequest.from_bytes(orjson.dumps(native))
+    assert restored.parents == request.parents
+    assert restored.settings.root_seed == 123
+    assert restored.settings.abnativ2_rasa_threshold == 0
+    assert restored.settings.abnativ2_explore is False
+    assert restored.settings.abnativ2_candidate_budget == 1000
+    with pytest.raises(ValueError, match="scientific versions"):
+        _ = restored.execution_plan
 
 
 def test_saved_preparation_and_cli_graph_identity_are_immutable(tmp_path, monkeypatch):

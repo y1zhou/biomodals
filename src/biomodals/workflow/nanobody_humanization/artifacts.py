@@ -7,6 +7,8 @@ from typing import Any
 import orjson
 import polars as pl
 
+from biomodals.app.design.abnativ2_vhh.contracts import SearchSummary
+from biomodals.app.design.abnativ2_vhh.models import RUNTIME_IDENTITY, SOURCE_COMMIT
 from biomodals.app.design.vhh import VHHInput
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.helper.archives import MAX_ARCHIVE_BYTES, flat_archive_members
@@ -79,13 +81,40 @@ def generation_frame(
 ) -> pl.DataFrame:
     """Bind native attempts to their exact parent, method, budget and fixed policy."""
     if (
-        report.get("schema_version") != 1
+        report.get("schema_version") != (2 if method == "abnativ2_vhh" else 1)
         or report.get("method") != method
         or report.get("input_sequence") != parent.sequence
     ):
         raise ValueError("Generation report changed its request identity")
     expected = settings.hudiff_nb_candidate_count if method == "hudiff_nb" else 1
     attempts = report["attempts"]
+    if method == "abnativ2_vhh":
+        parameters = settings.abnativ_parameters(
+            parent.id, parent.sequence, parent.protected_indices
+        )
+        if (
+            report.get("settings") != parameters.model_dump()
+            or report.get("source_commit") != SOURCE_COMMIT
+            or report.get("runtime_identity") != RUNTIME_IDENTITY
+        ):
+            raise ValueError(
+                "AbNatiV generation changed its settings or scientific identity"
+            )
+        if parameters.explore:
+            search = SearchSummary.model_validate(report.get("search"))
+            if search.evaluated_candidates != min(
+                parameters.candidate_budget, int(search.possible_candidates)
+            ):
+                raise ValueError("Exploration report changed its evaluation budget")
+            expected = max(1, search.accepted_candidates)
+            if search.accepted_candidates == 0 and attempts != [
+                {"attempt_index": 1, "sequence": parent.sequence, "error": None}
+            ]:
+                raise ValueError(
+                    "Empty exploration must retain the successful parental no-op"
+                )
+        elif report.get("search") is not None:
+            raise ValueError("Enhanced report contains exploration evidence")
     if [row["attempt_index"] for row in attempts] != list(range(1, expected + 1)):
         raise ValueError("Generation report changed its attempt budget")
     if method == "hudiff_nb" and report.get("seed") != settings.root_seed:

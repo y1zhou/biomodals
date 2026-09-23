@@ -830,7 +830,19 @@ _Avoid_: original input, experimentally verified parental sequence
 The sequence-distinct VH candidates collected from independent generators for
 one Prepared VH Domain, retaining every generating method's provenance and
 the unchanged prepared parent as a baseline. It is not a VH-VL pairing set.
-_Avoid_: consensus sequence, experimentally validated panel, Humanization Candidate Union
+_Avoid_: consensus sequence, experimentally validated panel, first Pareto front, Humanization Candidate Union
+
+**AbNatiV Mutational Space**:
+The combinations of parental residues and allowed substitutions at eligible
+positions for one prepared parent. This is the full allowed space, not
+necessarily the set evaluated, passing scoring safeguards or retained as output.
+_Avoid_: candidate count, enhanced-search trajectory
+
+**AbNatiV Exploration Budget**:
+The maximum number of distinct nonparent combinations evaluated during candidate
+exploration for one Prepared VH Domain. It is not a promised number of passing
+designs, a limit on total model invocations or a monetary budget.
+_Avoid_: retained-candidate limit, successful designs, GPU-call allowance
 
 **Recombined VH-VL Pair**:
 A VH-VL Pair formed by independently selecting its heavy and light variable

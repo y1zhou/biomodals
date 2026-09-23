@@ -94,7 +94,7 @@ def query_selection(
 class NanobodyManifest(BaseModel):
     """Bind safe result members to the exact request and reviewed preparation."""
 
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     execution_run_id: UUID
     parameters: NanobodySettings
     scientific_versions: dict[str, str]

@@ -1,6 +1,6 @@
 [project]
 name = "biomodals"
-version = "0.1.4"
+version = "0.1.5"
 description = "Run biomodelling tasks with Modal"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -1,8 +1,7 @@
 """Three-objective, per-parent experimental panels for single-domain candidates."""
 
+import numpy as np
 import polars as pl
-
-from biomodals.helper.panel import mutation_distances, pareto_layers
 
 RANKING_VERSION = "1"
 SCORES = ("abnativ2_vh_nativeness", "abnativ2_vhh_nativeness")
@@ -21,7 +20,7 @@ RANKING_POLICY = {
 
 
 def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
-    """Keep wide sequence/evidence columns out of all pairwise calculations."""
+    """Exact ranking with linear working memory, never an N-by-N distance table."""
     if table.select(KEY).is_duplicated().any():
         raise ValueError("Duplicate candidate identities")
     if mutations.join(table.select(KEY), on=KEY, how="anti").height:
@@ -55,49 +54,62 @@ def rank_panel(table: pl.DataFrame, mutations: pl.DataFrame) -> pl.DataFrame:
     pattern_groups = patterns.partition_by("parent_id", as_dict=True)
     results = []
     for group in eligible.partition_by("parent_id"):
-        objectives = [*SCORES, "_negative_edits"]
-        distances = mutation_distances(
-            group.rename({"vh_mutations": "mutation_count"}),
-            pattern_groups[(group["parent_id"][0],)].drop("parent_id"),
-            ["sequence_index"],
+        group = group.sort(
+            *SCORES,
+            "vh_mutations",
+            "candidate_id",
+            descending=[True, True, False, False],
         )
-        remaining = pareto_layers(
-            group.with_columns((-pl.col("vh_mutations")).alias("_negative_edits")),
-            objectives,
-        ).with_columns(pl.lit(2**31 - 1).alias("_nearest"))
-        order = 0
-        while remaining.height:
-            chosen = (
-                remaining
-                .filter(pl.col("quality_tier") == pl.col("quality_tier").min())
-                .sort(
-                    "_nearest",
-                    *objectives,
-                    "candidate_id",
-                    descending=[True, True, True, True, False],
-                )
-                .head(1)
+        objectives = group.select(*SCORES, -pl.col("vh_mutations")).to_numpy()
+        layers = np.ones(group.height, dtype=np.int64)
+        # Sorted objectives put every strict dominator before its descendants.
+        # Identical objective tuples belong to the same layer, not a chain.
+        first = 0
+        for index in range(group.height):
+            if index and np.array_equal(objectives[index], objectives[index - 1]):
+                layers[index] = layers[first]
+                continue
+            first = index
+            dominates = (objectives[:index, 1] >= objectives[index, 1]) & (
+                objectives[:index, 2] >= objectives[index, 2]
             )
-            order += 1
-            results.append(
-                chosen.select(*KEY, "quality_tier").with_columns(
-                    pl.lit(order, dtype=pl.Int64).alias("panel_order")
-                )
+            layers[index] = 1 + layers[:index][dominates].max(initial=0)
+        patterns_for_parent = pattern_groups[(group["parent_id"][0],)]
+        encoded = patterns_for_parent.with_columns(
+            pl.col("candidate_residue").replace_strict(
+                {
+                    residue: index
+                    for index, residue in enumerate("ACDEFGHIKLMNPQRSTVWY", start=1)
+                },
+                return_dtype=pl.UInt8,
             )
-            remaining = (
-                remaining
-                .join(chosen.select("candidate_id"), on="candidate_id", how="anti")
-                .join(
-                    distances.filter(
-                        pl.col("candidate_id_other") == chosen["candidate_id"][0]
-                    ).select("candidate_id", "_distance"),
-                    on="candidate_id",
-                )
-                .with_columns(
-                    pl.min_horizontal("_nearest", "_distance").alias("_nearest")
-                )
-                .drop("_distance")
+        ).pivot(on="sequence_index", index="candidate_id", values="candidate_residue")
+        states = (
+            group
+            .select("candidate_id")
+            .join(encoded, on="candidate_id", maintain_order="left")
+            .drop("candidate_id")
+            .fill_null(0)
+            .to_numpy()
+        )
+        # Zero represents the prepared-parent residue at a site. Different
+        # substitutions at that same site contribute one difference, not two.
+        nearest = np.full(group.height, states.shape[1] + 1, dtype=np.int64)
+        orders = np.zeros(group.height, dtype=np.int64)
+        for order in range(1, group.height + 1):
+            available = np.flatnonzero(
+                (orders == 0) & (layers == layers[orders == 0].min())
             )
+            chosen = available[np.argmax(nearest[available])]
+            orders[chosen] = order
+            nearest = np.minimum(
+                nearest, np.count_nonzero(states != states[chosen], axis=1)
+            )
+        results.append(
+            group.select(KEY).with_columns(
+                pl.Series("quality_tier", layers), pl.Series("panel_order", orders)
+            )
+        )
     ranks = (
         pl.concat(results)
         if results

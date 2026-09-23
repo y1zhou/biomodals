@@ -42,6 +42,8 @@ entries are analyzed. Numbering failures do not discard valid physical metrics.
 
 Inputs and results stay in memory. Reloading loses them; download a group's CSV
 if you want to retain its table. Sort or change pages without recomputing results.
+CSV text that could be interpreted as a spreadsheet formula receives a leading
+apostrophe; original IDs and FASTA downloads are unchanged.
 The two tables sort independently and share column visibility controls.
 Use **Columns (shown/all)** to choose visible metrics. Select rows and choose
 **Download selected pairs** to save FASTA for that group; pairs use VH:VL and

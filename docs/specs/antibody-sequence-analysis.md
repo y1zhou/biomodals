@@ -322,6 +322,11 @@ Gene popovers show evidence without repeating generic V/J match descriptions.
 The Issues column contains input/annotation diagnostics, not liability flags or
 quality assessments.
 
+Analysis presentation CSV escapes formula-leading string cells (`=`, `+`, `-`,
+`@`, including after leading whitespace/control characters) with an apostrophe
+before ordinary CSV quoting. Numeric values, including negatives, are unchanged.
+Do not mutate internal IDs, FASTA exports or canonical workflow CSVs.
+
 Each analysis group has independent row selection, retained through sorting and
 paging and reset with new results. Download selected pairs exports FASTA in
 original input order: VH:VL for pairs, one sequence for standalone entries.

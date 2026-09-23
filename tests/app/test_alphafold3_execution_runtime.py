@@ -19,6 +19,7 @@ from biomodals.app.fold.alphafold3.environment import (
     acquire_asset_claim,
 )
 from biomodals.app.fold.alphafold3.execution_planning import (
+    MSA_ASSEMBLIES,
     PREPARE_ENVIRONMENT,
     SEED_PREDICTIONS,
     STAGE_INFERENCE,
@@ -35,7 +36,12 @@ from biomodals.app.fold.alphafold3.generation_claims import (
     GenerationClaim,
     generation_status,
 )
-from biomodals.app.fold.alphafold3.msa_search import SearchRuntime
+from biomodals.app.fold.alphafold3.msa_search import (
+    MsaArtifactReference,
+    SearchRuntime,
+    sequence_cache_relpath,
+    sequence_hash,
+)
 from biomodals.app.fold.alphafold3.profiles import DATABASE_PROFILE_SPECS, profile_root
 from biomodals.app.fold.alphafold3.seed_predictions import (
     ClaimedSeed,
@@ -47,7 +53,9 @@ from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
     GraphExecutionRunStore,
+    NodeStatus,
     PreparedTaskBatch,
+    ProviderBinding,
     ProviderCallStatus,
     ProviderDeploymentUnavailableError,
     RunStatus,
@@ -429,6 +437,94 @@ def test_task_result_refresh_reloads_the_template_cache(tmp_path: Path) -> None:
     node.refresh_result_storage()
 
     assert inputs["template_runtime"].cache_volume.reloads == 1
+
+
+@pytest.mark.parametrize("publication", ["fresh", "cached", "missing"])
+def test_msa_completion_observes_committed_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, publication: str
+) -> None:
+    """Worker success requires a validated publication in the coordinator mount."""
+    committed = publication == "cached"
+    visible = False
+
+    class AssemblyDriver(RecordingDriver):
+        def observe(self, provider_call_handle_id: str):
+            nonlocal committed
+            spawn = next(
+                call
+                for call in self.spawns
+                if call["handle"] == provider_call_handle_id
+            )
+            binding = cast(ProviderBinding, spawn["function"])
+            if binding.function_name == "assemble_sequence_msas":
+                committed = publication == "fresh"
+                return ProviderCallObservation(
+                    ProviderCallObservationKind.SUCCEEDED,
+                    result={"status": "published"},
+                )
+            return super().observe(provider_call_handle_id)
+
+    runtime, inputs = _runtime(
+        tmp_path, request=_request(search_msa=True), driver=AssemblyDriver()
+    )
+
+    def reload_cache() -> None:
+        nonlocal visible
+        visible = committed
+
+    def inspect(sharded_root, cache_root, raw_tasks, assembly_tasks):
+        statuses = []
+        for task in assembly_tasks:
+            msa = f">query\n{task.sequence}\n"
+            statuses.append(
+                {
+                    "status": "reused",
+                    "polymer": task.polymer,
+                    "sequence_sha256": sequence_hash(task.sequence),
+                    "combined_identity": "a" * 64,
+                    "fields": {"unpairedMsa": msa, "pairedMsa": msa},
+                    "unpaired_msa_reference": MsaArtifactReference.from_content(
+                        sequence_cache_relpath(task.polymer, task.sequence)
+                        / "unpaired.a3m",
+                        msa.encode(),
+                    ).to_record(),
+                }
+                if visible
+                else {"status": "missing"}
+            )
+        return (
+            [{"status": "reused", "search_identity": "a" * 64} for _ in raw_tasks],
+            statuses,
+        )
+
+    search = cast(SearchRuntime, inputs["search_runtime"])
+    monkeypatch.setattr(search.cache_volume, "reload", reload_cache)
+    monkeypatch.setattr(planning_module, "inspect_msa_cache", inspect)
+    try:
+        runtime.attach()
+        for _ in range(16):
+            runtime.advance_once()
+            node = runtime.store.execution.get_node(RUN_ID, MSA_ASSEMBLIES)
+            if node.status.is_terminal:
+                break
+        calls = [
+            call
+            for call in runtime.store.execution.list_provider_calls(RUN_ID)
+            if call.node_key == MSA_ASSEMBLIES
+        ]
+        assert [call.status for call in calls] == (
+            [] if publication == "cached" else [ProviderCallStatus.SUCCEEDED]
+        )
+        assert node.status == (
+            NodeStatus.FAILED if publication == "missing" else NodeStatus.SUCCEEDED
+        )
+        if publication == "missing":
+            (task,) = runtime.store.execution.list_tasks(RUN_ID, MSA_ASSEMBLIES)
+            assert task.status == TaskStatus.FAILED
+            assert task.error_message is not None
+            assert "returned without a publication" in task.error_message
+    finally:
+        runtime.close()
 
 
 def test_staged_inference_preserves_unknown_observations(

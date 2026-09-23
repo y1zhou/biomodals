@@ -173,7 +173,9 @@ class AlphaFold3ExecutionPlanning:
     def refresh_result_storage(self, node_key: str) -> None:
         """Refresh the workload store that publishes one Task stage."""
         self.invalidate({node_key})
-        if node_key == TEMPLATE_SEARCHES:
+        if node_key == MSA_ASSEMBLIES:
+            self.search_runtime.cache_volume.reload()
+        elif node_key == TEMPLATE_SEARCHES:
             self.template_runtime.cache_volume.reload()
 
     def planned_tasks(self, node_key: str) -> tuple[PlannedTask, ...]:

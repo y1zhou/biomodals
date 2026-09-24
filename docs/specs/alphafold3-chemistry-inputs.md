@@ -114,7 +114,22 @@ components and atoms, not merely repeat JSON parsing. Reuse the deployed
 model environment's component definitions rather than installing a separate
 potentially different chemical dictionary in the API runtime.
 
-### Proposed preflight implementation
+### Preflight implementation
+
+The API advertises protocol 1 at authenticated `GET /alphafold3/capabilities`.
+Successful validation responses expose typed `chemistry` confirmation data and
+`chemistry_checked`; an ordinary input without modifications, ligands, explicit
+bonds or custom CCD does not need the native check. Historical validations
+without native evidence cannot submit chemistry. Deployment changes require
+revalidation, while exact replay of an already admitted Job remains valid.
+
+The checker uses one CPU, an 8 GiB memory ceiling, at most two Modal containers,
+a 120-second child-process timeout and a 180-second service deadline including
+queue/startup time. Two existing validation upload slots bound API concurrency.
+Timeout/disconnection cancels a known checker call; failures do not retain a
+submission-ready validation. Native response size is limited to 8 KiB. The
+receipt records normalized-input SHA-256, installed CCD SHA-256, and upstream
+commit; retained metadata also binds the exact deployment.
 
 Reuse the existing Continue/retained-validation flow: bounded local
 parse/normalization, CPU preflight, then publish the successful validation ID.

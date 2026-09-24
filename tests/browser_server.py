@@ -27,6 +27,8 @@ from service.nanobody_fixture import result_directory as nanobody_result_directo
 
 from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
+from biomodals.app.fold.alphafold3.chemistry import ChemistryReceipt
+from biomodals.app.fold.alphafold3.profiles import ALPHAFOLD3_COMMIT
 from biomodals.execution import (
     ActiveProviderCallCounts,
     DeploymentIdentity,
@@ -625,6 +627,13 @@ class _FakeNanobodyAdapter(_FakeAdapter):
 
 
 class _FakeAlphaFold3Adapter(_FakeAdapter):
+    async def check_chemistry(self, content, deployment):
+        return ChemistryReceipt(
+            input_sha256=hashlib.sha256(content).hexdigest(),
+            ccd_sha256="a" * 64,
+            upstream_commit=ALPHAFOLD3_COMMIT,
+        )
+
     async def stage(self, job: JobRecord) -> None:
         raise AssertionError("AlphaFold3 is not submitted by this browser fixture")
 

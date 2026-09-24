@@ -14,6 +14,11 @@ from uuid import UUID, uuid4
 import orjson
 from uniaf3.schema.alphafold3 import AF3Config
 
+from biomodals.app.fold.alphafold3.chemistry import (
+    ChemistryReceipt,
+    chemistry_summary,
+    require_inline_inputs,
+)
 from biomodals.app.fold.alphafold3.execution_request import (
     AlphaFold3ExecutionRequest,
 )
@@ -24,6 +29,7 @@ from biomodals.app.fold.alphafold3.inference_inputs import (
     normalize_model_seeds,
     serialize_af3_input,
 )
+from biomodals.execution import DeploymentIdentity
 from biomodals.helper.artifacts import replace_bytes_atomic
 
 MAX_VALIDATION_BYTES = MAX_INPUT_JSON_BYTES
@@ -70,8 +76,10 @@ class ValidatedInput:
     created_at: int
     expires_at: int
     settings: ValidationSettings
-    preview: dict[str, object]
+    preview: dict[str, Any]
     directory: Path
+    chemistry_receipt: ChemistryReceipt | None = None
+    chemistry_deployment: DeploymentIdentity | None = None
 
     @property
     def document_path(self) -> Path:
@@ -119,6 +127,18 @@ class ValidatedInput:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedValidation:
+    """Locally checked bytes awaiting native chemistry and atomic publication."""
+
+    content: bytes
+    digest: str
+    settings: ValidationSettings
+    preview: dict[str, Any]
+    chemistry_receipt: ChemistryReceipt | None = None
+    chemistry_deployment: DeploymentIdentity | None = None
+
+
 class ValidatedInputStore:
     """Atomically retain successful validations in the configured state dir."""
 
@@ -137,17 +157,15 @@ class ValidatedInputStore:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory.chmod(0o700)
 
-    def validate_and_publish(
+    def prepare(
         self,
         source: Path,
         *,
         owner_user_id: UUID,
         digest: str,
         settings: ValidationSettings,
-        now: int | None = None,
-        validation_id: UUID | None = None,
-    ) -> ValidatedInput:
-        """Apply the existing app validator, then atomically publish a resource."""
+    ) -> PreparedValidation:
+        """Normalize locally without making an input available for submission."""
         if settings.search_protein_templates and not settings.search_msa:
             raise ValueError("Protein template search requires MSA search")
         size = source.stat().st_size
@@ -158,7 +176,7 @@ class ValidatedInputStore:
         if sha256(content).hexdigest() != digest:
             raise ValueError("AlphaFold3 document digest changed during validation")
         document = orjson.loads(content)
-        _reject_path_fields(document)
+        require_inline_inputs(document)
         config = AF3Config.model_validate(document)
         if len(config.name) > MAX_JOB_NAME_LENGTH:
             raise ValueError(
@@ -177,19 +195,44 @@ class ValidatedInputStore:
             sample=settings.sample,
         )
         del request
+        return PreparedValidation(
+            content=orjson.dumps(normalized),
+            digest=digest,
+            settings=settings,
+            preview=_preview(normalized, settings, prediction_count),
+        )
+
+    def publish(
+        self,
+        prepared: PreparedValidation,
+        *,
+        owner_user_id: UUID,
+        now: int | None = None,
+        validation_id: UUID | None = None,
+    ) -> ValidatedInput:
+        """Atomically publish checked bytes after capacity is rechecked."""
+        settings = prepared.settings
+        if any(prepared.preview["chemistry"].values()):
+            if (
+                prepared.chemistry_receipt is None
+                or prepared.chemistry_deployment is None
+                or prepared.chemistry_receipt.input_sha256
+                != sha256(prepared.content).hexdigest()
+            ):
+                raise ValueError("Native chemistry check does not match this input")
         created_at = int(time.time()) if now is None else now
         selected_id = validation_id or uuid4()
         target = self.directory / str(selected_id)
         staging = self.directory / f".{selected_id}.tmp"
         if target.exists() or staging.exists():
             raise FileExistsError(f"Validation already exists: {selected_id}")
-        document_content = orjson.dumps(normalized)
-        preview = _preview(normalized, settings, prediction_count)
+        document_content = prepared.content
+        preview = prepared.preview
         metadata_content = orjson.dumps(
             {
                 "validation_id": str(selected_id),
                 "owner_user_id": str(owner_user_id),
-                "digest": digest,
+                "digest": prepared.digest,
                 "created_at": created_at,
                 "expires_at": created_at + VALIDATION_TTL_SECONDS,
                 "settings": {
@@ -199,6 +242,20 @@ class ValidatedInputStore:
                     "sample": settings.sample,
                 },
                 "preview": preview,
+                "chemistry_receipt": (
+                    prepared.chemistry_receipt.model_dump(mode="json")
+                    if prepared.chemistry_receipt
+                    else None
+                ),
+                "chemistry_deployment": (
+                    {
+                        "environment": prepared.chemistry_deployment.environment,
+                        "deployment_name": prepared.chemistry_deployment.deployment_name,
+                        "deployment_version": prepared.chemistry_deployment.deployment_version,
+                    }
+                    if prepared.chemistry_deployment
+                    else None
+                ),
             },
             option=orjson.OPT_SORT_KEYS,
         )
@@ -352,20 +409,17 @@ class ValidatedInputStore:
             settings=ValidationSettings(**settings),
             preview=dict(metadata["preview"]),
             directory=directory,
+            chemistry_receipt=(
+                ChemistryReceipt.model_validate(metadata["chemistry_receipt"])
+                if metadata.get("chemistry_receipt")
+                else None
+            ),
+            chemistry_deployment=(
+                DeploymentIdentity(**metadata["chemistry_deployment"])
+                if metadata.get("chemistry_deployment")
+                else None
+            ),
         )
-
-
-def _reject_path_fields(value: object) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if isinstance(key, str) and key.lower().endswith("path"):
-                raise ValueError(
-                    f"Path-valued field is not supported by the API: {key}"
-                )
-            _reject_path_fields(item)
-    elif isinstance(value, list):
-        for item in value:
-            _reject_path_fields(item)
 
 
 def _preview(
@@ -407,6 +461,7 @@ def _preview(
         "search_msa": settings.search_msa,
         "search_protein_templates": settings.search_protein_templates,
         "recycle": settings.recycle,
+        "chemistry": chemistry_summary(document),
         "advanced_counts": {
             "modifications": modifications,
             "bonds": len(document.get("bondedAtomPairs", [])),

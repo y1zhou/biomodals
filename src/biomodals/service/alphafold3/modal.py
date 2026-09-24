@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import tempfile
 
 import modal
 
+from biomodals.app.fold.alphafold3.chemistry import ChemistryReceipt
 from biomodals.app.fold.alphafold3.execution_request import (
     load_execution_request_from_volume,
     load_input_document_from_volume,
@@ -17,11 +19,13 @@ from biomodals.app.fold.alphafold3.invocation_cache import (
     load_invocation_manifest,
 )
 from biomodals.app.fold.alphafold3.request_results import create_request_archive
+from biomodals.execution import DeploymentIdentity
 from biomodals.execution.modal import stage_execution_launch
 from biomodals.helper.artifacts import file_size_sha256
 from biomodals.helper.modal_volume import download_modal_volume_files
 from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.artifacts import ArtifactCache
+from biomodals.service.http_contract import CodedAPIError
 from biomodals.service.store import JobRecord, JobState, ServiceStore
 from biomodals.service.tool_runtime import PreparedResult, SubmissionWait
 
@@ -49,6 +53,61 @@ class AlphaFold3ToolAdapter:
         self.store = store
         self.output_volume_name = output_volume_name
         self.modal_download_concurrency = modal_download_concurrency
+
+    async def check_chemistry(
+        self, content: bytes, deployment: DeploymentIdentity
+    ) -> ChemistryReceipt:
+        """Use the exact prediction deployment's isolated native CPU checker."""
+        call = None
+        try:
+            async with asyncio.timeout(180):
+                function = modal.Function.from_name(
+                    deployment.deployment_name,
+                    "check_input_chemistry",
+                    environment_name=deployment.environment,
+                    version=deployment.deployment_version,
+                )
+                await function.hydrate.aio()
+                call = await function.spawn.aio(content)
+                response = await call.get.aio()
+        except modal.exception.NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin an AlphaFold3 version supporting chemistry checks",
+            ) from error
+        except TimeoutError as error:
+            if call is not None:
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(5):
+                        await call.cancel.aio()
+            raise CodedAPIError(
+                504,
+                "chemistry_timeout",
+                "Chemistry check timed out; retry Continue",
+            ) from error
+        except asyncio.CancelledError:
+            if call is not None:
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(5):
+                        await call.cancel.aio()
+            raise
+        except Exception as error:
+            raise CodedAPIError(
+                503,
+                "chemistry_unavailable",
+                "Chemistry check is unavailable; retry Continue",
+            ) from error
+        if response.get("error"):
+            raise CodedAPIError(400, "chemistry_invalid", str(response["error"])[:1000])
+        try:
+            return ChemistryReceipt.model_validate(response["receipt"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CodedAPIError(
+                503,
+                "chemistry_unavailable",
+                "Native chemistry evidence is invalid; retry Continue",
+            ) from error
 
     async def stage(self, job: JobRecord) -> SubmissionWait | None:
         """Stage one retained validation with its admitted provider limits."""

@@ -3,6 +3,7 @@
 # ruff: noqa: D103
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -11,7 +12,10 @@ import orjson
 import pytest
 from uniaf3.schema.alphafold3 import AF3Config, AF3Protein, AF3SequenceEntry
 
+from biomodals.app.fold.alphafold3.chemistry import ChemistryReceipt
 from biomodals.app.fold.alphafold3.inference_inputs import serialize_af3_input
+from biomodals.app.fold.alphafold3.profiles import ALPHAFOLD3_COMMIT
+from biomodals.execution import DeploymentIdentity
 from biomodals.service.alphafold3.validation import (
     MAX_VALIDATION_BYTES,
     ValidatedInputStore,
@@ -34,6 +38,23 @@ def _document() -> bytes:
     )
 
 
+def _publish(store, source, *, owner_user_id, digest, settings, now=None):
+    prepared = store.prepare(
+        source, owner_user_id=owner_user_id, digest=digest, settings=settings
+    )
+    if any(prepared.preview["chemistry"].values()):
+        prepared = replace(
+            prepared,
+            chemistry_receipt=ChemistryReceipt(
+                input_sha256=hashlib.sha256(prepared.content).hexdigest(),
+                ccd_sha256="a" * 64,
+                upstream_commit=ALPHAFOLD3_COMMIT,
+            ),
+            chemistry_deployment=DeploymentIdentity("test", "af3", 1),
+        )
+    return store.publish(prepared, owner_user_id=owner_user_id, now=now)
+
+
 def test_api_and_standalone_upload_limits_are_256_mib() -> None:
     from biomodals.app.fold.alphafold3.inference_inputs import MAX_INPUT_JSON_BYTES
     from biomodals.app.fold.alphafold3.template_search import (
@@ -52,7 +73,8 @@ def test_validation_retains_native_document_and_bounded_preview(tmp_path: Path) 
     content = _document()
     source.write_bytes(content)
 
-    validated = store.validate_and_publish(
+    validated = _publish(
+        store,
         source,
         owner_user_id=OWNER,
         digest=hashlib.sha256(content).hexdigest(),
@@ -76,7 +98,8 @@ def test_publication_scope_ignores_name_and_seed_selection(tmp_path: Path) -> No
     def validate(value: dict[str, object]):
         content = orjson.dumps(value)
         source.write_bytes(content)
-        return store.validate_and_publish(
+        return _publish(
+            store,
             source,
             owner_user_id=OWNER,
             digest=hashlib.sha256(content).hexdigest(),
@@ -101,7 +124,8 @@ def test_validation_allows_zero_recycles_and_bounds_job_name(tmp_path: Path) -> 
     content = _document()
     source.write_bytes(content)
 
-    validated = store.validate_and_publish(
+    validated = _publish(
+        store,
         source,
         owner_user_id=OWNER,
         digest=hashlib.sha256(content).hexdigest(),
@@ -114,7 +138,8 @@ def test_validation_allows_zero_recycles_and_bounds_job_name(tmp_path: Path) -> 
     oversized = orjson.dumps(document)
     source.write_bytes(oversized)
     with pytest.raises(ValueError, match="name exceeds 120"):
-        store.validate_and_publish(
+        _publish(
+            store,
             source,
             owner_user_id=OWNER,
             digest=hashlib.sha256(oversized).hexdigest(),
@@ -130,7 +155,8 @@ def test_template_search_requires_msa_search(tmp_path: Path) -> None:
     source.write_bytes(content)
 
     with pytest.raises(ValueError, match="template search requires MSA search"):
-        store.validate_and_publish(
+        _publish(
+            store,
             source,
             owner_user_id=OWNER,
             digest=hashlib.sha256(content).hexdigest(),
@@ -152,7 +178,8 @@ def test_validation_preview_separates_custom_inputs(tmp_path: Path) -> None:
     content = orjson.dumps(document)
     source.write_bytes(content)
 
-    validated = store.validate_and_publish(
+    validated = _publish(
+        store,
         source,
         owner_user_id=OWNER,
         digest=hashlib.sha256(content).hexdigest(),
@@ -178,7 +205,8 @@ def test_expert_documents_reject_browser_local_paths(tmp_path: Path) -> None:
     source.write_bytes(content)
 
     with pytest.raises(ValueError, match="Path-valued"):
-        store.validate_and_publish(
+        _publish(
+            store,
             source,
             owner_user_id=OWNER,
             digest=hashlib.sha256(content).hexdigest(),
@@ -192,7 +220,8 @@ def test_claimed_validation_survives_ordinary_expiry(tmp_path: Path) -> None:
     source = tmp_path / "input.json"
     content = _document()
     source.write_bytes(content)
-    validated = store.validate_and_publish(
+    validated = _publish(
+        store,
         source,
         owner_user_id=OWNER,
         digest=hashlib.sha256(content).hexdigest(),
@@ -220,14 +249,16 @@ def test_validation_enforces_per_user_retention_limit(tmp_path: Path) -> None:
     content = _document()
     source.write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
-    store.validate_and_publish(
+    _publish(
+        store,
         source,
         owner_user_id=OWNER,
         digest=digest,
         settings=ValidationSettings(),
     )
     with pytest.raises(ValidationLimitExceededError):
-        store.validate_and_publish(
+        _publish(
+            store,
             source,
             owner_user_id=OWNER,
             digest=digest,
@@ -252,14 +283,16 @@ def test_validation_enforces_global_retention_limit(tmp_path: Path) -> None:
     source.write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
 
-    store.validate_and_publish(
+    _publish(
+        store,
         source,
         owner_user_id=OWNER,
         digest=digest,
         settings=ValidationSettings(),
     )
     with pytest.raises(ValidationLimitExceededError):
-        store.validate_and_publish(
+        _publish(
+            store,
             source,
             owner_user_id=UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
             digest=digest,
@@ -284,7 +317,8 @@ def test_validation_enforces_retained_byte_limit(tmp_path: Path) -> None:
     source.write_bytes(content)
 
     with pytest.raises(ValidationLimitExceededError):
-        store.validate_and_publish(
+        _publish(
+            store,
             source,
             owner_user_id=OWNER,
             digest=hashlib.sha256(content).hexdigest(),
@@ -305,3 +339,35 @@ def test_validation_reserves_minimum_free_space(
 
     with pytest.raises(ValidationStorageLowError):
         store.require_free_space()
+
+
+def test_chemistry_publication_requires_evidence_for_exact_normalized_bytes(tmp_path):
+    store = ValidatedInputStore(tmp_path)
+    store.initialize()
+    document = orjson.loads(_document())
+    document["sequences"][0]["protein"]["modifications"] = [
+        {"ptmType": "ALY", "ptmPosition": 1}
+    ]
+    content = orjson.dumps(document)
+    source = tmp_path / "input.json"
+    source.write_bytes(content)
+    prepared = store.prepare(
+        source,
+        owner_user_id=OWNER,
+        digest=hashlib.sha256(content).hexdigest(),
+        settings=ValidationSettings(),
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        store.publish(prepared, owner_user_id=OWNER)
+    wrong = replace(
+        prepared,
+        chemistry_deployment=DeploymentIdentity("main", "AF3", 1),
+        chemistry_receipt=ChemistryReceipt(
+            input_sha256="f" * 64,
+            ccd_sha256="a" * 64,
+            upstream_commit=ALPHAFOLD3_COMMIT,
+        ),
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        store.publish(wrong, owner_user_id=OWNER)
+    assert store.usage() == (0, 0)

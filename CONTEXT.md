@@ -781,6 +781,23 @@ _Avoid_: RFdiffusion design, trajectory
 
 ### GROMACS molecular dynamics
 
+**Trajectory Cluster**:
+A group of production-trajectory frames with similar protein conformations,
+defined using C-alpha RMSD and a chosen structural-distance cutoff. It is
+distinct from grouping molecules across periodic boundaries within one frame.
+_Avoid_: PBC cluster, simulation replica
+
+**Trajectory Medoid**:
+An actual frame within a Trajectory Cluster whose mean C-alpha RMSD to the
+other frames in that cluster is minimal.
+_Avoid_: average structure, cluster-building seed, sampled representative
+
+**Trajectory Clustering Job**:
+A linked analysis of an existing simulation's production trajectory that
+assigns frames to Trajectory Clusters without running additional molecular
+dynamics. Its source simulation and original Result remain unchanged.
+_Avoid_: zero-nanosecond continuation, new simulation, Result preparation retry
+
 **Production Continuation**:
 An additional interval of molecular dynamics begun from a completed
 simulation's full dynamical state, with its physical settings retained. It

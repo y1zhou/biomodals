@@ -352,7 +352,7 @@ def _authorized(
         if session.principal.is_admin
         else store.get_job(session.principal.user_id, job_id)
     )
-    if job is None:
+    if job is None or job.deleted_at is not None:
         raise HTTPException(404, "Job not found")
     registration = request.app.state.registrations[job.tool]
     visible = request.app.state.configuration.tool(

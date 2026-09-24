@@ -71,6 +71,7 @@ def create_app(
     ):
         raise ValueError("allowed_origins must contain exact origins without a slash")
     session_cookie_name = SECURE_SESSION_COOKIE if secure_cookies else SESSION_COOKIE
+    cache.check_job_access = store.require_job_access
     password_executor = PasswordExecutor()
     analysis = AnalysisService(
         TherapeuticReference(

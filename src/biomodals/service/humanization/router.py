@@ -23,6 +23,7 @@ from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
     CodedAPIError,
+    CodedErrorResponse,
     require_session,
     require_unsafe_session,
 )
@@ -132,7 +133,7 @@ def create_router(
         "/jobs",
         response_model=JobView,
         status_code=202,
-        responses={422: {"model": InputErrors}},
+        responses={422: {"model": InputErrors}, 409: {"model": CodedErrorResponse}},
     )
     async def submit(
         body: HumanizationSubmission,
@@ -222,6 +223,9 @@ def create_router(
         except UserNotFoundError as error:
             pending.delete(job_id)
             raise CodedAPIError(403, "account_disabled", str(error)) from error
+        except BaseException:
+            pending.delete(job_id)
+            raise
         if not admission.created:
             pending.delete(job_id)
         request.app.state.reconcile_wakeup.set()

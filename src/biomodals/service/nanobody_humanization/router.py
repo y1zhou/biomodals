@@ -232,6 +232,9 @@ def create_router(
         except UserNotFoundError as error:
             pending.delete(job_id)
             raise CodedAPIError(403, "account_disabled", str(error)) from error
+        except BaseException:
+            pending.delete(job_id)
+            raise
         if not admission.created:
             pending.delete(job_id)
         request.app.state.reconcile_wakeup.set()

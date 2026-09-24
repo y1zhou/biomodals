@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Annotated
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     JobCursorError,
     JobNotCancellableError,
+    JobNotDeletableError,
     JobNotRetryableError,
     JobRecord,
     JobState,
@@ -94,6 +96,25 @@ def create_jobs_router(
         }:
             job = await lifecycle.advance(job_id)
         return view(job, session)
+
+    @router.delete(
+        "/{job_id}",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_class=Response,
+        responses={404: {"model": ErrorResponse}, 409: {"model": CodedErrorResponse}},
+    )
+    async def delete_job(
+        job_id: UUID,
+        request: Request,
+        session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
+    ) -> Response:
+        """Hide a terminal owner Job; durable local cleanup follows asynchronously."""
+        try:
+            store.delete_job(session.principal.user_id, job_id, now=int(time.time()))
+        except JobNotDeletableError as error:
+            raise CodedAPIError(409, "job_not_deletable", str(error)) from error
+        request.app.state.reconcile_wakeup.set()
+        return Response(status_code=status.HTTP_202_ACCEPTED)
 
     @router.post("/{job_id}/refresh")
     async def refresh_job(
@@ -168,6 +189,7 @@ def create_jobs_router(
                 ) from error
         else:
             lease.close()
+        _owned(store, session, job_id)
         cache.protect_prepared(str(job.job_id))
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 

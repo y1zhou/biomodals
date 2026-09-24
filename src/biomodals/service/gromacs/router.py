@@ -128,9 +128,20 @@ def create_router(
     )
     source_checks: dict[tuple[UUID, DeploymentIdentity, object], asyncio.Task[Any]] = {}
 
-    def owner_job(job_id: UUID, session: AuthenticatedSession) -> JobRecord:
-        job = store.get_job(session.principal.user_id, job_id)
-        if job is None or job.tool != "gromacs":
+    def owner_job(
+        job_id: UUID, session: AuthenticatedSession, *, replay: bool = False
+    ) -> JobRecord:
+        # Source tombstones supply the original default name only for exact replay.
+        job = (
+            store.get_job_by_id(job_id)
+            if replay
+            else store.get_job(session.principal.user_id, job_id)
+        )
+        if (
+            job is None
+            or job.tool != "gromacs"
+            or job.owner_user_id != session.principal.user_id
+        ):
             raise HTTPException(404, "Job not found")
         return job
 
@@ -171,7 +182,11 @@ def create_router(
                 source_job_id=(
                     execution_request.source.execution_run_id
                     if isinstance(execution_request, ClusteringExecutionRequest)
-                    else None
+                    else (
+                        execution_request.continuation.execution_run_id
+                        if execution_request.continuation is not None
+                        else None
+                    )
                 ),
             )
         except (IdempotencyConflictError, JobLimitExceededError) as error:
@@ -180,6 +195,9 @@ def create_router(
         except UserNotFoundError as error:
             pending.delete(job_id)
             raise CodedAPIError(403, "account_disabled", str(error)) from error
+        except BaseException:
+            pending.delete(job_id)
+            raise
         if not admission.created:
             pending.delete(job_id)
         request.app.state.reconcile_wakeup.set()
@@ -306,7 +324,7 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
         idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     ) -> JobView:
-        job = owner_job(job_id, session)
+        job = owner_job(job_id, session, replay=True)
         normalized_name = (
             submission.display_name.strip() if submission.display_name else ""
         )
@@ -335,6 +353,8 @@ def create_router(
                     "Idempotency key was already used for another request",
                 )
             return _view(replay, session, configuration)
+        if job.deleted_at is not None:
+            raise HTTPException(404, "Job not found")
         if job.state != JobState.SUCCEEDED or job.operation != JobOperation.RUN:
             raise CodedAPIError(
                 409, "source_not_completed", "Source job must be completed"
@@ -475,7 +495,7 @@ def create_router(
         session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
         idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     ) -> JobView:
-        job = owner_job(job_id, session)
+        job = owner_job(job_id, session, replay=True)
         name = (
             body.display_name or ""
         ).strip() or f"{job.display_name[:100]} (clusters)"
@@ -503,6 +523,8 @@ def create_router(
                     "Idempotency key was already used for another request",
                 )
             return _view(replay, session, configuration)
+        if job.deleted_at is not None:
+            raise HTTPException(404, "Job not found")
         deployment = clustering_deployment(job)
         await remote.preflight(deployment)
         try:
@@ -603,6 +625,7 @@ def create_router(
         response_model=JobView,
         response_description="Job durably admitted for asynchronous staging and launch",
         status_code=202,
+        responses={409: {"model": CodedErrorResponse}},
     )
     async def submit_job(
         request: Request,

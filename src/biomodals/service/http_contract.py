@@ -14,6 +14,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from biomodals.service.auth import AuthenticatedSession, AuthService
+from biomodals.service.store import DeletedSubmissionError, JobNotFoundError
 
 LOGGER = logging.getLogger(__name__)
 SESSION_COOKIE = "biomodals-session"
@@ -254,6 +255,22 @@ def install_http_contract(
         )
         response.headers.update(exc.headers)
         return response
+
+    @app.exception_handler(DeletedSubmissionError)
+    async def deleted_submission(
+        _request: Request, _exc: DeletedSubmissionError
+    ) -> Response:
+        return model_response(
+            CodedErrorResponse(
+                code="job_deleted",
+                detail="This submission's Job was deleted. It cannot be recovered.",
+            ),
+            status_code=409,
+        )
+
+    @app.exception_handler(JobNotFoundError)
+    async def missing_job(_request: Request, _exc: JobNotFoundError) -> Response:
+        return model_response(ErrorResponse(detail="Job not found"), status_code=404)
 
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, exc: Exception) -> Response:

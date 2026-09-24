@@ -34,6 +34,7 @@ from biomodals.app.bioinfo.gromacs.clustering import (
 )
 from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
+from biomodals.app.bioinfo.gromacs.protein import NonProteinTemplateError
 from biomodals.execution import DeploymentIdentity
 from biomodals.helper.pdb import validate_pdb_content
 from biomodals.service.artifacts import ArtifactCache
@@ -407,6 +408,8 @@ def create_router(
             if source.execution_run_id != job.job_id:
                 raise ValueError("Clustering source identity does not match the Job")
             return source
+        except NonProteinTemplateError as error:
+            raise CodedAPIError(409, "source_unavailable", str(error)) from error
         except (FileNotFoundError, ValueError, TypeError, KeyError) as error:
             raise CodedAPIError(
                 409,

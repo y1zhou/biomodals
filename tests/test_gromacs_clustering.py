@@ -52,11 +52,12 @@ def publish(root, request):
     ).write(tuple(records))
 
 
-@pytest.fixture
-def source(tmp_path):
+@pytest.fixture(params=["ALA", "CYX", "HIE"])
+def source(tmp_path, request):
     import biotite.structure as struc
     import biotite.structure.io as strucio
 
+    residue = request.param
     request = GromacsExecutionRequest(
         run_name="source",
         pdb_content=b"ATOM\n",
@@ -80,7 +81,7 @@ def source(tmp_path):
     atoms = struc.AtomArray(3)
     atoms.atom_name[:] = "CA"
     atoms.element[:] = "C"
-    atoms.res_name[:] = "ALA"
+    atoms.res_name[:] = residue
     atoms.chain_id[:] = "A"
     atoms.res_id = np.arange(1, 4)
     atoms.coord = np.array([[0, 0, 0], [4, 0, 0], [4, 4, 0]], dtype=np.float32)
@@ -107,9 +108,36 @@ def test_inspection_checks_metadata_without_reading_trajectory(
     assert inspected.ca_atoms == inspected.protein_atoms == 3
     assert read == [source.template.path, "rmsd_production_source.csv"]
     template = tmp_path / source.run_name / source.template.path
-    template.write_bytes(template.read_bytes().replace(b"ALA", b"VAL"))
+    template.write_bytes(template.read_bytes().replace(b" CA ", b" CB "))
     with pytest.raises(ValueError, match="metadata changed"):
         inspect_clustering_source(tmp_path, source.execution_run_id)
+
+
+@pytest.mark.parametrize("residue", ["HOH", "SOL", "CA", "LIG"])
+def test_clustering_rejects_published_nonprotein_templates(tmp_path, source, residue):
+    import biotite.structure.io as strucio
+
+    from biomodals.app.bioinfo.gromacs.execution_runtime import load_execution_request
+    from biomodals.app.bioinfo.gromacs.protein import NonProteinTemplateError
+
+    path = tmp_path / source.run_name / source.template.path
+    atoms = strucio.load_structure(path)
+    atoms.res_name[-1] = residue
+    strucio.save_structure(path, atoms)
+    publish(tmp_path, load_execution_request(tmp_path, source.execution_run_id))
+    with pytest.raises(NonProteinTemplateError, match="GROMACS Protein group"):
+        inspect_clustering_source(tmp_path, source.execution_run_id)
+    # Validation precedes any trajectory read or native command.
+    with pytest.raises(NonProteinTemplateError, match="GROMACS Protein group"):
+        cluster_trajectory(
+            tmp_path / source.run_name / source.trajectory.path,
+            path,
+            tmp_path / "clusters.zip",
+            run_name="child",
+            cutoff_angstrom=2,
+            provenance={},
+            expected_frames=2,
+        )
 
 
 def test_worker_reloads_checks_source_then_publishes(tmp_path, source, monkeypatch):
@@ -269,7 +297,10 @@ def test_memberships_are_total_unique_and_one_based(tmp_path):
             read_memberships(path, 3)
 
 
-def test_native_cluster_archive_matches_pairwise_medoid_oracle(tmp_path):
+@pytest.mark.parametrize("forcefield_names", [False, True])
+def test_native_cluster_archive_matches_pairwise_medoid_oracle(
+    tmp_path, forcefield_names
+):
     import biotite.structure as struc
     import biotite.structure.io as strucio
     from biotite.structure.io.xtc import XTCFile
@@ -283,6 +314,8 @@ def test_native_cluster_archive_matches_pairwise_medoid_oracle(tmp_path):
     template.element = np.tile(["N", "C", "C", "O"], 8)
     template.res_id = np.repeat(np.arange(1, 9), 4)
     template.res_name[:] = "ALA"
+    if forcefield_names:
+        template.res_name[:16] = np.repeat(["CYX", "HIE", "HID", "LYN"], 4)
     template.chain_id[:] = "A"
     reference = rng.normal(0, 10, (32, 3))
     deformation = rng.normal(0, 4, (32, 3))
@@ -344,6 +377,7 @@ def test_native_cluster_archive_matches_pairwise_medoid_oracle(tmp_path):
                 io.StringIO(archive.read(f"medoids/child-frame_{medoid}.pdb").decode())
             ).get_structure(model=1)
             assert len(pdb) == len(template)
+            assert pdb.res_name.tolist() == template.res_name.tolist()
             assert pdb.coord == pytest.approx(actual[medoid], abs=0.0011)
         provenance = orjson.loads(archive.read("provenance.json"))
         assert provenance["cluster_count"] == 3

@@ -13,6 +13,7 @@ from biomodals.app.bioinfo.gromacs.execution import (
     ANALYSIS_PACKAGES,
     ANALYSIS_POLICY_VERSION,
 )
+from biomodals.app.bioinfo.gromacs.protein import protein_mask
 from biomodals.execution import ContentBoundFileSet
 from biomodals.helper.artifacts import sha256_file
 from biomodals.schema import ArtifactFile
@@ -99,7 +100,6 @@ def analyze_trajectory(
     Chunk size is an internal test seam, not a scientific sampling parameter.
     """
     import biotite
-    import biotite.structure as struc
     import biotite.structure.io as strucio
     from biotite.structure.io.xtc import XTCFile
 
@@ -127,8 +127,8 @@ def analyze_trajectory(
     # Invalidate before overwriting any members; no mixed-generation cache hit.
     publication.marker_path.unlink(missing_ok=True)
     template = strucio.load_structure(template_path)
-    protein_mask = struc.filter_amino_acids(template)
-    template = template[protein_mask]
+    mask = protein_mask(template)
+    template = template[mask]
     if not template.array_length():
         raise ValueError("Trajectory has no protein atoms to analyze")
     statistics = TrajectoryStatistics(template)
@@ -145,7 +145,7 @@ def analyze_trajectory(
             closing(
                 XTCFile.read_iter(
                     trajectory_path,
-                    atom_i=np.flatnonzero(protein_mask),
+                    atom_i=np.flatnonzero(mask),
                     stack_size=chunk_frames,
                 )
             )

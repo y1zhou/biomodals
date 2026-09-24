@@ -166,6 +166,16 @@ template/statistics plus trajectory existence/size, not trajectory contents.
 It shares overlapping same-source/deployment requests, with a 45-second service
 deadline and a two-container inspector cap.
 
+Inspection and clustering use the pinned GROMACS 2026.1 `residuetypes.dat`
+Protein names, shared with trajectory statistics. Valid force-field aliases
+(including disulfide `CYX` and protonated histidine variants) are retained
+unchanged, not judged against the PDB chemical-component dictionary. Templates
+containing non-protein residues fail with a specific protein-selection message.
+The native GROMOS/Cα metric and clustering policy remain unchanged; this fixes
+acceptance of existing protein-only trajectories, without rewriting their
+source statistics or requiring a new MD simulation. Deploy and pin the corrected
+GROMACS app and restart the matching API before retrying source inspection.
+
 The worker builds `clusters.zip` with `clusters.csv`, `medoids/*.pdb`, and
 `provenance.json`. Provenance contains source identity, cutoff, indexing/coordinate
 conventions, policy version, and the exact CSV/PDB size/digest inventory. The

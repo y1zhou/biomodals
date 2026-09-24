@@ -122,7 +122,7 @@ class GromacsExecutionRequest:
             self.continuation.simulation_time_ns if self.continuation else 0
         )
         if (
-            self.execution_plan_version in {"3", "4"}
+            self.execution_plan_version in {"3", "4", "5"}
             and not 1 <= interval <= MAX_SIMULATION_TIME_NS
         ):
             raise ValueError("Production interval must be 1–250 whole nanoseconds")
@@ -284,7 +284,7 @@ def gromacs_node_paths(
             f"production_{name}.edr",
         ) + (
             (f"production_{name}.cpt", f"production_{name}.log")
-            if request.execution_plan_version in {"3", "4"}
+            if request.execution_plan_version in {"3", "4", "5"}
             else ()
         )
     if node_key == PRODUCTION_ANALYSIS:
@@ -306,7 +306,7 @@ def gromacs_node_paths(
             )
             + (
                 ("continuation.json",)
-                if request.continuation and request.execution_plan_version == "4"
+                if request.continuation and request.execution_plan_version in {"4", "5"}
                 else ()
             )
         )
@@ -785,7 +785,7 @@ def _operation_kwargs(
             "num_threads": request.num_threads,
             "use_openmp_threads": request.use_openmp_threads,
         })
-        if request.execution_plan_version in {"3", "4"}:
+        if request.execution_plan_version in {"3", "4", "5"}:
             invocation.kwargs["fixed_target"] = True
     return invocation.kwargs
 

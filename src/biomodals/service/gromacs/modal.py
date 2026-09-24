@@ -180,7 +180,7 @@ class GromacsToolAdapter:
                 archive_schema="gromacs-clustering/1",
             )
         evidence = None
-        if request.continuation and request.execution_plan_version == "4":
+        if request.continuation and request.execution_plan_version in {"4", "5"}:
             record = next(
                 file for file in published_files if file.path == "continuation.json"
             )

@@ -23,6 +23,7 @@ from biomodals.app.bioinfo.gromacs.execution import (
     GROMACS_SCIENTIFIC_VERSION,
     PREPARE_RESULT,
 )
+from biomodals.app.bioinfo.gromacs.protein import require_protein
 from biomodals.execution import ExecutionPlan, NodeDependency, NodePlan
 from biomodals.helper.artifacts import file_size_sha256, read_bounded_file_bytes
 from biomodals.helper.io import require_safe_filename_component
@@ -168,7 +169,6 @@ def inspect_clustering_source(
     volume_root: Path, execution_run_id: UUID
 ) -> ClusteringSource:
     """Inspect published MD metadata remotely, without downloading the trajectory."""
-    import biotite.structure as struc
     import biotite.structure.io as strucio
     import numpy as np
     import polars as pl
@@ -208,8 +208,7 @@ def inspect_clustering_source(
         if record != trajectory and file_size_sha256(path)[1] != record.content_sha256:
             raise ValueError("Retained clustering metadata changed")
     atoms = strucio.load_structure(root / template.path)
-    if not np.all(struc.filter_amino_acids(atoms)):
-        raise ValueError("Processed trajectory template must contain protein only")
+    require_protein(atoms)
     frames = (
         pl
         .scan_csv(root / statistics.path)
@@ -272,7 +271,6 @@ def cluster_trajectory(
     timeout: float = CLUSTER_TIMEOUT_SECONDS - 30,
 ) -> None:
     """Publish an exact CSV/medoid inventory, leaving native scratch off the volume."""
-    import biotite.structure as struc
     import biotite.structure.io as strucio
     import numpy as np
     import polars as pl
@@ -284,8 +282,9 @@ def cluster_trajectory(
         raise ValueError("RMSD cutoff must be finite and positive")
     deadline = time.monotonic() + timeout
     template = strucio.load_structure(template_path)
+    require_protein(template)
     ca = np.flatnonzero(template.atom_name == "CA")
-    if len(ca) < 3 or not np.all(struc.filter_amino_acids(template)):
+    if len(ca) < 3:
         raise ValueError(
             "Clustering requires a protein template with at least three C-alpha atoms"
         )

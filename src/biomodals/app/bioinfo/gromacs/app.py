@@ -264,6 +264,7 @@ runtime_image = gromacs_base_image.pipe(patch_image_for_helper).add_local_python
     "biomodals.app.bioinfo.gromacs.continuation",
     "biomodals.app.bioinfo.gromacs.continue_run",
     "biomodals.app.bioinfo.gromacs.clustering",
+    "biomodals.app.bioinfo.gromacs.protein",
 )
 
 biotite_image = (
@@ -278,6 +279,7 @@ biotite_image = (
         "biomodals.app.bioinfo.gromacs.continuation",
         "biomodals.app.bioinfo.gromacs.analysis",
         "biomodals.app.bioinfo.gromacs.clustering",
+        "biomodals.app.bioinfo.gromacs.protein",
     )
 )
 
@@ -290,6 +292,7 @@ inspection_image = (
         "biomodals.app.bioinfo.gromacs.execution_runtime",
         "biomodals.app.bioinfo.gromacs.continuation",
         "biomodals.app.bioinfo.gromacs.clustering",
+        "biomodals.app.bioinfo.gromacs.protein",
     )
 )
 

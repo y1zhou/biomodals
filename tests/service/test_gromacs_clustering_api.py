@@ -19,6 +19,7 @@ from biomodals.app.bioinfo.gromacs.clustering import (
     ClusteringExecutionRequest,
     ClusteringSource,
 )
+from biomodals.app.bioinfo.gromacs.protein import NonProteinTemplateError
 from biomodals.schema import ArtifactFile
 from biomodals.service.http_contract import require_session, require_unsafe_session
 from biomodals.service.pending import PendingRequestStore
@@ -128,6 +129,33 @@ def test_owner_scope_missing_source_and_mismatched_identity(setup, monkeypatch):
     assert _request(app, "GET", path).status_code == 404
     assert submit(app, parent.job_id).status_code == 404
     assert reads == []
+
+
+def test_nonprotein_source_explains_selection_without_exposing_internal_errors(
+    setup, monkeypatch
+):
+    app, _, parent, _, _ = setup
+    path = f"/api/v1/gromacs/jobs/{parent.job_id}/clustering"
+    detail = "Clustering requires the matching protein-only processed trajectory and template."
+
+    async def nonprotein(*args):
+        raise NonProteinTemplateError(detail)
+
+    monkeypatch.setattr(GromacsAdapter, "clustering_source", nonprotein)
+    response = _request(app, "GET", path)
+    assert response.json()["eligible"] is False
+    assert response.json()["detail"] == detail
+    rejected = submit(app, parent.job_id)
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == detail
+
+    async def unexpected(*args):
+        raise ValueError("private filesystem details")
+
+    monkeypatch.setattr(GromacsAdapter, "clustering_source", unexpected)
+    assert _request(app, "GET", path).json()["detail"] == (
+        "Retained processed trajectory or matching protein template is unavailable or invalid"
+    )
 
 
 @pytest.mark.parametrize("cutoff", [0, -1, "nan", "inf"])

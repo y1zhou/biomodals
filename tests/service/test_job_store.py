@@ -9,8 +9,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from biomodals.service.store import (
+    DeletedSubmissionError,
     IdempotencyConflictError,
     JobNotCancellableError,
+    JobNotDeletableError,
+    JobNotFoundError,
     JobState,
     JobStateResolutionError,
     ServiceStore,
@@ -80,20 +83,27 @@ def test_schema_contains_only_six_service_tables(tmp_path: Path) -> None:
     }
 
 
-def test_v8_migration_preserves_jobs_and_authentication(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [8, 9])
+def test_migration_preserves_jobs_and_authentication(
+    tmp_path: Path, version: int
+) -> None:
     store, owner = _store(tmp_path)
     original = _admit(store, owner).job
     with sqlite3.connect(store.path) as connection:
-        connection.execute("ALTER TABLE jobs DROP COLUMN operation")
-        connection.execute("ALTER TABLE jobs DROP COLUMN source_job_id")
-        connection.execute("PRAGMA user_version = 8")
+        if version == 8:
+            connection.execute("ALTER TABLE jobs DROP COLUMN operation")
+            connection.execute("ALTER TABLE jobs DROP COLUMN source_job_id")
+        connection.execute("ALTER TABLE jobs DROP COLUMN deleted_at")
+        connection.execute("ALTER TABLE jobs DROP COLUMN cleanup_completed_at")
+        connection.execute("ALTER TABLE jobs DROP COLUMN cleanup_retry_at")
+        connection.execute(f"PRAGMA user_version = {version}")
         before = connection.execute("SELECT * FROM sessions").fetchall()
     store.initialize()
     assert store.get_job_by_id(original.job_id) == original
     assert _admit(store, owner).created is False
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("SELECT * FROM sessions").fetchall() == before
-        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (10,)
 
 
 def test_admission_replays_identity_without_execution_tables(tmp_path: Path) -> None:
@@ -111,7 +121,35 @@ def test_admission_replays_identity_without_execution_tables(tmp_path: Path) -> 
         _admit(store, owner, digest="b" * 64)
 
 
-def test_unstaged_jobs_select_only_queued_gromacs_requests(tmp_path: Path) -> None:
+def test_deleted_predecessor_remains_available_for_publication_repair(
+    tmp_path: Path,
+) -> None:
+    store, owner = _store(tmp_path)
+    previous = _admit(store, owner).job
+    store.fail_job(previous.job_id, error_code="test", error_message="test", now=11)
+    store.delete_job(owner, previous.job_id, now=12)
+    current = store.admit_job(
+        owner_user_id=owner,
+        tool="alphafold3",
+        display_name="New explicit intent",
+        idempotency_key="another-intent",
+        request_digest=previous.request_digest,
+        modal_environment="main",
+        modal_app_name="AlphaFold3",
+        modal_app_version=7,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=1,
+        now=13,
+    ).job
+    predecessors = store.list_preceding_jobs_for_request(current.job_id)
+    assert [job.job_id for job in predecessors] == [previous.job_id]
+    assert predecessors[0].deleted_at == 12
+    assert [job.job_id for job in store.list_jobs(owner)] == [current.job_id]
+
+
+def test_unstaged_jobs_retain_queued_requests_across_tools(tmp_path: Path) -> None:
     store, owner = _store(tmp_path)
     gromacs_id = uuid4()
     store.admit_job(
@@ -132,10 +170,58 @@ def test_unstaged_jobs_select_only_queued_gromacs_requests(tmp_path: Path) -> No
     )
     _admit(store, owner)
 
-    assert store.unstaged_job_ids() == {gromacs_id}
+    assert store.unstaged_job_ids() == {gromacs_id, JOB_ID}
 
     store.record_launch(gromacs_id, function_call_id="fc-test", now=11)
-    assert store.unstaged_job_ids() == set()
+    assert store.unstaged_job_ids() == {JOB_ID}
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_owner_deletion_eligibility_and_replay(tmp_path: Path, state: JobState) -> None:
+    store, owner = _store(tmp_path)
+    _admit(store, owner)
+    store.replace_projection(JOB_ID, state=state, projection={}, observed_at=11)
+    with pytest.raises(JobNotFoundError):
+        store.delete_job(uuid4(), JOB_ID, now=12)
+    if state not in {
+        JobState.SUCCEEDED,
+        JobState.PARTIAL,
+        JobState.FAILED,
+        JobState.CANCELLED,
+    }:
+        with pytest.raises(JobNotDeletableError):
+            store.delete_job(owner, JOB_ID, now=12)
+        assert store.get_job(owner, JOB_ID) is not None
+        return
+    store.delete_job(owner, JOB_ID, now=12)
+    store.delete_job(owner, JOB_ID, now=13)
+    assert store.get_job(owner, JOB_ID) is None
+    assert store.list_jobs(owner) == []
+    assert store.list_jobs_page(owner, limit=10).jobs == []
+    assert store.list_jobs_page(owner, limit=10, cursor=JOB_ID).jobs == []
+    tombstone = store.get_job_by_id(JOB_ID)
+    assert tombstone is not None and tombstone.deleted_at == 12
+    assert tombstone.state == state
+    with pytest.raises(DeletedSubmissionError):
+        _admit(store, owner)
+    with pytest.raises(DeletedSubmissionError):
+        store.find_idempotent_job(
+            owner, tool="alphafold3", idempotency_key="idempotency"
+        )
+    with pytest.raises(JobNotFoundError):
+        store.replace_projection(
+            JOB_ID, state=JobState.RUNNING, projection={}, observed_at=14
+        )
+    with pytest.raises(JobNotFoundError):
+        store.restore_result_cached(JOB_ID, now=14)
+    assert [j.job_id for j in store.list_pending_deletions(now=14)] == [JOB_ID]
+    store.record_deletion_cleanup(JOB_ID, completed=False, now=14)
+    store.initialize()
+    assert store.list_pending_deletions(now=73) == []
+    assert len(store.list_pending_deletions(now=74)) == 1
+    store.record_deletion_cleanup(JOB_ID, completed=True, now=75)
+    assert store.list_pending_deletions(now=100) == []
+    assert store.get_job_by_id(JOB_ID).cleanup_completed_at == 75
 
 
 def test_projection_and_result_metadata_replace_atomically(tmp_path: Path) -> None:

@@ -152,7 +152,7 @@ class GromacsToolAdapter:
             path = cache.staging_path(str(job.job_id))
             try:
                 with TemporaryDirectory(
-                    dir=cache.directory, prefix="clustering-download-"
+                    dir=cache.directory, prefix=f".{job.job_id}.archive-"
                 ) as directory:
                     downloaded = Path(directory) / CLUSTER_ARCHIVE
                     await asyncio.to_thread(

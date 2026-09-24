@@ -1,7 +1,7 @@
 # Scientifically faithful AlphaFold 3 MSA database sharding
 
 Status: historical research supporting
-[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
+[ADR 0005](../../adr/0005-alphafold3-msa-sharding.md).
 Research dates: 2026-07-22 through 2026-07-23
 Scope: database partition semantics, profile preparation, and search equivalence
 Historical implementation target: `src/biomodals/app/fold/alphafold3_msa_app.py`

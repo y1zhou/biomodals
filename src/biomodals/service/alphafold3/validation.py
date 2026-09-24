@@ -321,7 +321,10 @@ class ValidatedInputStore:
 
     def delete_claimed(self, validation_id: UUID) -> None:
         """Delete one resource after the service verified remote staging."""
-        shutil.rmtree(self.directory / str(validation_id), ignore_errors=True)
+        try:
+            shutil.rmtree(self.directory / str(validation_id))
+        except FileNotFoundError:
+            pass
 
     def cleanup_expired(self, *, claimed: set[UUID], now: int) -> int:
         """Remove expired unclaimed resources and abandoned staging dirs."""

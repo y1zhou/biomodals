@@ -26,6 +26,7 @@ from biomodals.service.remote_execution import (
     RemoteSubmissionOutcomeUnknownError,
 )
 from biomodals.service.store import (
+    JobNotFoundError,
     JobNotRetryableError,
     JobRecord,
     JobState,
@@ -517,9 +518,31 @@ class JobLifecycle:
 
     def _required_job(self, job_id: UUID) -> JobRecord:
         job = self.store.get_job_by_id(job_id)
-        if job is None:
-            raise LookupError(f"Job not found: {job_id}")
+        if job is None or job.deleted_at is not None:
+            raise JobNotFoundError("Job not found")
         return job
+
+    async def cleanup_deleted_job(self, job: JobRecord) -> None:
+        """Retry local-only removal without waiting behind a long restore."""
+        lock = self._locks.setdefault(job.job_id, asyncio.Lock())
+        completed = False
+        try:
+            if lock.locked():
+                return
+            async with lock:
+                current = self.store.get_job_by_id(job.job_id)
+                if current is None or current.deleted_at is None:
+                    return
+                await self.registrations[current.tool].adapter.discard_pending(current)
+                completed = await self.cache.run_bounded(
+                    self.cache.remove_job_files, str(job.job_id)
+                )
+        except Exception:
+            LOGGER.exception("Local deletion cleanup failed for Job %s", job.job_id)
+        finally:
+            self.store.record_deletion_cleanup(
+                job.job_id, completed=completed, now=int(time.time())
+            )
 
     async def restore_result(self, job: JobRecord) -> PreparedResult:
         """Join one cancellation-safe exact Result restoration per Job."""
@@ -538,6 +561,11 @@ class JobLifecycle:
         return await asyncio.shield(task)
 
     async def _restore_result(self, job_id: UUID) -> PreparedResult:
+        lock = self._locks.setdefault(job_id, asyncio.Lock())
+        async with lock:
+            return await self._restore_result_locked(job_id)
+
+    async def _restore_result_locked(self, job_id: UUID) -> PreparedResult:
         job = self._required_job(job_id)
         recorded = _recorded_result(job)
         lease = await self.cache.acquire_async(
@@ -612,7 +640,12 @@ async def reconciliation_loop(
 
     async def reconcile(job: JobRecord) -> None:
         try:
-            await lifecycle.advance(job.job_id, finalize=True, background=True)
+            if job.deleted_at is not None:
+                await lifecycle.cleanup_deleted_job(job)
+            else:
+                await lifecycle.advance(job.job_id, finalize=True, background=True)
+        except JobNotFoundError:
+            pass  # A deletion may supersede this queued reconciliation pass.
         except Exception:
             LOGGER.exception("Could not reconcile Job %s", job.job_id)
 
@@ -624,9 +657,10 @@ async def reconciliation_loop(
                     wake_task = asyncio.create_task(wake.wait())
                 pending = deque(
                     job
-                    for job in lifecycle.store.list_reconcilable_jobs(
+                    for job in lifecycle.store.list_pending_deletions(
                         now=int(time.time())
                     )
+                    + lifecycle.store.list_reconcilable_jobs(now=int(time.time()))
                     if job.job_id not in active
                 )
                 next_scan = loop.time() + interval_seconds

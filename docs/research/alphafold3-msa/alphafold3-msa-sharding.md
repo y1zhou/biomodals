@@ -1,7 +1,7 @@
 # AlphaFold 3 MSA database sharding for Biomodals
 
 Status: historical research superseded by
-[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
+[ADR 0005](../../adr/0005-alphafold3-msa-sharding.md).
 Research date: 2026-07-14
 Target: `src/biomodals/app/fold/alphafold3_app.py`
 
@@ -235,7 +235,7 @@ The current data function has these relevant behaviors:
    reader can observe an incomplete protein entry or mixed writers.
 
 The relevant code is in
-[`alphafold3_app.py`](../../src/biomodals/app/fold/alphafold3_app.py), especially
+[`alphafold3_app.py`](../../../src/biomodals/app/fold/alphafold3_app.py), especially
 `_load_msa_cache`, `_save_msa_cache`, `run_data_pipeline`, and
 `search_msa_and_templates`.
 

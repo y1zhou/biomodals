@@ -46,6 +46,14 @@ class JobNotFoundError(LookupError):
     """Raised when an owner-scoped job lookup fails."""
 
 
+class DeletedSubmissionError(RuntimeError):
+    """An admitted submission remains consumed after its Job was deleted."""
+
+
+class JobNotDeletableError(RuntimeError):
+    """Only terminal Jobs can be deleted without leaving hidden execution."""
+
+
 class JobCursorError(ValueError):
     """Raised when a history cursor does not name one owner's Job."""
 
@@ -85,7 +93,7 @@ class JobOperation(StrEnum):
 
 
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 9
+_SERVICE_SCHEMA_VERSION = 10
 _ACTIVE_JOB_STATES = (
     JobState.QUEUED.value,
     JobState.RUNNING.value,
@@ -145,6 +153,9 @@ CREATE TABLE jobs (
     blocked_at INTEGER,
     blocking_category TEXT,
     next_retry_at INTEGER,
+    deleted_at INTEGER,
+    cleanup_completed_at INTEGER,
+    cleanup_retry_at INTEGER,
     UNIQUE (owner_user_id, tool, idempotency_key)
 );
 CREATE INDEX jobs_owner_created ON jobs(owner_user_id, created_at DESC);
@@ -252,12 +263,15 @@ class JobRecord:
     cache_cleared_at: int | None
     operation: JobOperation = JobOperation.RUN
     source_job_id: UUID | None = None
+    deleted_at: int | None = None
+    cleanup_completed_at: int | None = None
 
     @property
     def can_retry_result_preparation(self) -> bool:
         """Only first publication may retry after a recorded scientific outcome."""
         return (
-            self.state == JobState.FAILED
+            self.deleted_at is None
+            and self.state == JobState.FAILED
             and self.error_code == "result_preparation_failed"
             and self.result_state in {JobState.SUCCEEDED.value, JobState.PARTIAL.value}
             and self.finalization_started_at is not None
@@ -419,13 +433,22 @@ class ServiceStore:
                     raise
                 else:
                     conn.commit()
-            elif version == 8:
+            elif version in {8, 9}:
+                if version == 8:
+                    conn.executescript("""
+                        BEGIN IMMEDIATE;
+                        ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'run'
+                            CHECK (operation IN ('run', 'trajectory_clustering'));
+                        ALTER TABLE jobs ADD COLUMN source_job_id TEXT REFERENCES jobs(job_id);
+                        PRAGMA user_version = 9;
+                        COMMIT;
+                    """)
                 conn.executescript("""
                     BEGIN IMMEDIATE;
-                    ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'run'
-                        CHECK (operation IN ('run', 'trajectory_clustering'));
-                    ALTER TABLE jobs ADD COLUMN source_job_id TEXT REFERENCES jobs(job_id);
-                    PRAGMA user_version = 9;
+                    ALTER TABLE jobs ADD COLUMN deleted_at INTEGER;
+                    ALTER TABLE jobs ADD COLUMN cleanup_completed_at INTEGER;
+                    ALTER TABLE jobs ADD COLUMN cleanup_retry_at INTEGER;
+                    PRAGMA user_version = 10;
                     COMMIT;
                 """)
             elif version != _SERVICE_SCHEMA_VERSION:
@@ -490,6 +513,7 @@ class ServiceStore:
                 SELECT COUNT(*), COALESCE(SUM(result_size_bytes), 0)
                 FROM jobs
                 WHERE result_size_bytes IS NOT NULL AND cache_cleared_at IS NULL
+                  AND deleted_at IS NULL
                 """
             ).fetchone()
         return PublishedResultUsage(entries=int(row[0]), bytes=int(row[1]))
@@ -503,6 +527,7 @@ class ServiceStore:
                        MIN(blocked_at) AS oldest_blocked_at
                 FROM jobs
                 WHERE blocking_category IS NOT NULL AND blocked_at IS NOT NULL
+                  AND deleted_at IS NULL
                 GROUP BY blocking_category
                 ORDER BY blocking_category
                 """
@@ -529,7 +554,7 @@ class ServiceStore:
 
     def set_result_cached(self, job_id: UUID, *, cached: bool) -> None:
         """Persist whether the rebuildable local archive is currently present."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -541,7 +566,7 @@ class ServiceStore:
 
     def restore_result_cached(self, job_id: UUID, *, now: int) -> JobRecord:
         """Restore exact cached bytes and any prior completed Job state."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -1291,6 +1316,8 @@ class ServiceStore:
                 (str(owner_user_id), tool, idempotency_key),
             ).fetchone()
             if existing is not None:
+                if existing["deleted_at"] is not None:
+                    raise DeletedSubmissionError("This submission's Job was deleted")
                 if existing["request_digest"] != request_digest:
                     raise IdempotencyConflictError(
                         "Idempotency key was already used for another request"
@@ -1306,7 +1333,7 @@ class ServiceStore:
             if (
                 source_job_id is not None
                 and conn.execute(
-                    "SELECT 1 FROM jobs WHERE job_id = ? AND owner_user_id = ? AND tool = ?",
+                    "SELECT 1 FROM jobs WHERE job_id = ? AND owner_user_id = ? AND tool = ? AND deleted_at IS NULL",
                     (str(source_job_id), str(owner_user_id), tool),
                 ).fetchone()
                 is None
@@ -1417,6 +1444,8 @@ class ServiceStore:
                 """,
                 (str(owner_user_id), tool, idempotency_key),
             ).fetchone()
+        if row is not None and row["deleted_at"] is not None:
+            raise DeletedSubmissionError("This submission's Job was deleted")
         return _job_from_row(row) if row is not None else None
 
     def list_preceding_jobs_for_request(
@@ -1474,7 +1503,7 @@ class ServiceStore:
             rows = conn.execute(
                 """
                 SELECT job_id FROM jobs
-                WHERE tool = 'gromacs' AND state = 'queued'
+                WHERE state = 'queued' AND deleted_at IS NULL
                     AND root_function_call_id IS NULL
                 """
             ).fetchall()
@@ -1484,7 +1513,7 @@ class ServiceStore:
         """Load a Job only when it belongs to the requesting owner."""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ? AND owner_user_id = ?",
+                "SELECT * FROM jobs WHERE job_id = ? AND owner_user_id = ? AND deleted_at IS NULL",
                 (str(job_id), str(owner_user_id)),
             ).fetchone()
         return _job_from_row(row) if row is not None else None
@@ -1497,12 +1526,73 @@ class ServiceStore:
             ).fetchone()
         return _job_from_row(row) if row is not None else None
 
+    def require_job_access(self, job_id: str) -> None:
+        """Fence late local archive readers/writers after durable deletion."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT deleted_at FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is not None and row["deleted_at"] is not None:
+            raise JobNotFoundError("Job not found")
+
+    def delete_job(self, owner_user_id: UUID, job_id: UUID, *, now: int) -> None:
+        """Hide a terminal Job atomically; repeated owner deletion is harmless."""
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT state, deleted_at FROM jobs WHERE job_id = ? AND owner_user_id = ?",
+                (str(job_id), str(owner_user_id)),
+            ).fetchone()
+            if row is None:
+                raise JobNotFoundError("Job not found")
+            if row["deleted_at"] is not None:
+                return
+            if row["state"] in _ACTIVE_JOB_STATES:
+                raise JobNotDeletableError(
+                    "Only completed, partial, failed or cancelled Jobs can be deleted"
+                )
+            conn.execute(
+                "UPDATE jobs SET deleted_at = ?, updated_at = ? WHERE job_id = ?",
+                (now, now, str(job_id)),
+            )
+
+    def list_pending_deletions(self, *, now: int, limit: int = 100) -> list[JobRecord]:
+        """Bound cleanup work and revisit busy/failed entries after a delay."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM jobs WHERE deleted_at IS NOT NULL
+                   AND cleanup_completed_at IS NULL
+                   AND (cleanup_retry_at IS NULL OR cleanup_retry_at <= ?)
+                   ORDER BY cleanup_retry_at, deleted_at, job_id LIMIT ?""",
+                (now, limit),
+            ).fetchall()
+        return [_job_from_row(row) for row in rows]
+
+    def record_deletion_cleanup(
+        self, job_id: UUID, *, completed: bool, now: int
+    ) -> None:
+        """Keep cleanup recoverable without changing a deleted Job's outcome."""
+        with self._transaction() as conn:
+            conn.execute(
+                """UPDATE jobs SET cleanup_completed_at = ?, cleanup_retry_at = ?,
+                   pending_validation_id = CASE WHEN ? THEN NULL ELSE pending_validation_id END,
+                   cache_cleared_at = CASE WHEN ? THEN ? ELSE cache_cleared_at END
+                   WHERE job_id = ? AND deleted_at IS NOT NULL""",
+                (
+                    now if completed else None,
+                    None if completed else now + 60,
+                    completed,
+                    completed,
+                    now,
+                    str(job_id),
+                ),
+            )
+
     def list_jobs(self, owner_user_id: UUID) -> list[JobRecord]:
         """List one owner's Jobs in reverse creation order."""
         with self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT * FROM jobs WHERE owner_user_id = ?
+                SELECT * FROM jobs WHERE owner_user_id = ? AND deleted_at IS NULL
                 ORDER BY created_at DESC, job_id DESC
                 """,
                 (str(owner_user_id),),
@@ -1542,7 +1632,7 @@ class ServiceStore:
             rows = conn.execute(
                 f"""
                 SELECT * FROM jobs
-                WHERE owner_user_id = ? {clause}
+                WHERE owner_user_id = ? AND deleted_at IS NULL {clause}
                 ORDER BY created_at DESC, job_id DESC LIMIT ?
                 """,  # noqa: S608 - closed cursor clause
                 parameters,
@@ -1594,7 +1684,7 @@ class ServiceStore:
             rows = conn.execute(
                 f"""
                 SELECT * FROM jobs
-                WHERE state IN ({placeholders})
+                WHERE deleted_at IS NULL AND state IN ({placeholders})
                   AND (state != ? OR root_function_call_id IS NOT NULL)
                   AND NOT (state = ? AND blocking_category = 'result_integrity'
                            AND next_retry_at IS NULL)
@@ -1613,7 +1703,7 @@ class ServiceStore:
 
     def touch_job(self, job_id: UUID, *, now: int) -> JobRecord:
         """Move one unchanged Job behind older reconciliation candidates."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs SET updated_at = CASE
@@ -1639,7 +1729,7 @@ class ServiceStore:
         """Attach root launch evidence exactly once."""
         if not function_call_id:
             raise ValueError("Function Call ID must not be empty")
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             row = conn.execute(
                 "SELECT root_function_call_id FROM jobs WHERE job_id = ?",
                 (str(job_id),),
@@ -1679,7 +1769,7 @@ class ServiceStore:
         """Replace one completed root call with explicit resume evidence."""
         if not previous_function_call_id or not function_call_id:
             raise ValueError("Function Call IDs must not be empty")
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             cursor = conn.execute(
                 """
                 UPDATE jobs
@@ -1720,7 +1810,7 @@ class ServiceStore:
 
     def mark_request_staged(self, job_id: UUID, *, now: int) -> JobRecord:
         """Release a retained validation after verified immutable staging."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -1748,7 +1838,7 @@ class ServiceStore:
         now: int,
     ) -> JobRecord:
         """Keep an unlaunched Job queued behind matching active work."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -1798,7 +1888,7 @@ class ServiceStore:
             }
             else None
         )
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -1838,7 +1928,7 @@ class ServiceStore:
         encoded = orjson.dumps(projection, option=orjson.OPT_SORT_KEYS).decode()
         if len(encoded) > 1024 * 1024:
             raise ValueError("Job projection exceeds one MiB")
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -1867,7 +1957,7 @@ class ServiceStore:
 
     def retry_result_preparation(self, job_id: UUID, *, now: int) -> JobRecord:
         """Queue local preparation without changing remote evidence or identity."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
             ).fetchone()
@@ -1897,7 +1987,7 @@ class ServiceStore:
 
     def request_cancel(self, job_id: UUID, *, now: int) -> JobRecord:
         """Persist sticky cancellation intent before contacting Modal."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
             ).fetchone()
@@ -1948,7 +2038,7 @@ class ServiceStore:
         now: int,
     ) -> JobRecord:
         """Preserve ownership after an ambiguous provider outcome."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -1979,7 +2069,7 @@ class ServiceStore:
         now: int,
     ) -> JobRecord:
         """Apply one explicit Administrator decision to an ambiguous launch."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)
             ).fetchone()
@@ -2040,7 +2130,7 @@ class ServiceStore:
         now: int,
     ) -> JobRecord:
         """Record a recoverable service-owned delivery failure."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -2080,7 +2170,7 @@ class ServiceStore:
         """Publish verified browser Result metadata."""
         if result_state not in {JobState.SUCCEEDED, JobState.PARTIAL}:
             raise ValueError("Result state must be succeeded or partial")
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -2121,7 +2211,7 @@ class ServiceStore:
         now: int,
     ) -> JobRecord:
         """Record one owner-safe terminal failure."""
-        with self._transaction() as conn:
+        with self._transaction(job_id=job_id) as conn:
             conn.execute(
                 """
                 UPDATE jobs
@@ -2168,10 +2258,18 @@ class ServiceStore:
                 conn.rollback()
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(
+        self, *, job_id: UUID | None = None
+    ) -> Iterator[sqlite3.Connection]:
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if job_id is not None:
+                    row = conn.execute(
+                        "SELECT deleted_at FROM jobs WHERE job_id = ?", (str(job_id),)
+                    ).fetchone()
+                    if row is None or row["deleted_at"] is not None:
+                        raise JobNotFoundError("Job not found")
                 yield conn
             except BaseException:
                 conn.rollback()
@@ -2238,4 +2336,6 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         next_retry_at=row["next_retry_at"],
         blocking_category=row["blocking_category"],
         cache_cleared_at=row["cache_cleared_at"],
+        deleted_at=row["deleted_at"],
+        cleanup_completed_at=row["cleanup_completed_at"],
     )

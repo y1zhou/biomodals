@@ -70,6 +70,21 @@ def submit(app, source_id, *, key=None, **body):
     )
 
 
+def test_deleted_source_allows_only_exact_existing_analysis_replay(setup):
+    app, session, parent, _, reads = setup
+    key = uuid4()
+    admitted = submit(app, parent.job_id, key=key, cutoff_angstrom=3.5)
+    assert admitted.status_code == 202
+    app.state.store.delete_job(session.principal.user_id, parent.job_id, now=30)
+    count = len(reads)
+    replay = submit(app, parent.job_id, key=key, cutoff_angstrom=3.5)
+    assert replay.status_code == 202
+    assert replay.json()["job_id"] == admitted.json()["job_id"]
+    assert submit(app, parent.job_id, key=key, cutoff_angstrom=4).status_code == 409
+    assert submit(app, parent.job_id, cutoff_angstrom=3.5).status_code == 404
+    assert len(reads) == count
+
+
 def test_large_source_warns_and_admits_exact_analysis_with_immutable_lineage(
     setup, tmp_path, monkeypatch
 ):

@@ -131,6 +131,41 @@ def test_source_metadata_owner_scope_and_read_only_validation(setup):
     assert _submit(app, parent.job_id).status_code == 404
 
 
+def test_deleted_source_preserves_admitted_child_replay(setup):
+    app, session, parent, pending, _ = setup
+    key = uuid4()
+    admitted = _submit(app, parent.job_id, key=key)
+    assert admitted.status_code == 202
+    child = UUID(admitted.json()["job_id"])
+    assert admitted.json()["source_job_id"] == str(parent.job_id)
+    original = pending.get(child)
+    app.state.store.delete_job(session.principal.user_id, parent.job_id, now=30)
+    pending.delete(parent.job_id)
+    replay = _submit(app, parent.job_id, key=key)
+    assert replay.status_code == 202 and replay.json()["job_id"] == str(child)
+    assert pending.get(child) == original
+    assert _submit(app, parent.job_id).status_code == 404
+    app.state.store.request_cancel(child, now=31)
+    app.state.store.delete_job(session.principal.user_id, child, now=32)
+    replay = _submit(app, parent.job_id, key=key)
+    assert replay.status_code == 409 and replay.json()["code"] == "job_deleted"
+
+
+def test_source_deleted_during_inspection_blocks_new_admission(setup, monkeypatch):
+    app, session, parent, pending, _ = setup
+    original = GromacsAdapter.continuation_source
+
+    async def inspect_then_delete(self, job, deployment):
+        result = await original(self, job, deployment)
+        app.state.store.delete_job(session.principal.user_id, parent.job_id, now=30)
+        return result
+
+    monkeypatch.setattr(GromacsAdapter, "continuation_source", inspect_then_delete)
+    assert _submit(app, parent.job_id).status_code == 404
+    assert app.state.store.list_jobs(session.principal.user_id) == []
+    assert {p.name for p in pending.directory.iterdir()} == {str(parent.job_id)}
+
+
 @pytest.mark.parametrize("unavailable", [False, True])
 def test_overlapping_checks_share_work_survive_disconnect_and_expire(
     setup, monkeypatch, unavailable

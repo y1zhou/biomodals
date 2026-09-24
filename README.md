@@ -320,8 +320,10 @@ disabled or demoted.
 
 ### Pre-release database schemas
 
-The service intentionally has no migration path for pre-release database
-schemas. If startup reports an unsupported version, stop the service, verify
+Startup upgrades service database schemas 8 and 9 to schema 10, preserving
+Users, Sessions, Jobs and settings. Stop the API and back up SQLite before
+upgrading; rollback to an older API requires restoring that backup.
+For other unsupported pre-release versions, stop the service, verify
 the configured database path, and select a new empty state directory for the
 new build. Retain the old database separately if its Users or settings still
 need to be inspected or copied manually.
@@ -342,6 +344,13 @@ cross-repository checks, manual smoke tests, and rollback guidance.
 Run the API as a dedicated Linux and Modal service user. Keep SQLite state
 separate from the rebuildable local Result cache. Modal Volume storage remains
 authoritative for Results and scientific intermediates.
+
+Owners can delete terminal Jobs using the red **Delete** button beside Refresh
+on Job details. Confirmation removes website access permanently; local cached
+results and retained inputs are cleaned up in the background, after existing
+downloads finish. There is no undo. Modal data, past charges, and existing
+extension/clustering Jobs remain unchanged. This feature needs the matching
+API/frontend update and schema migration, not a Modal redeployment.
 
 ## Repository map
 

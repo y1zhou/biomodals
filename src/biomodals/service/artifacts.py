@@ -14,7 +14,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from shutil import disk_usage
+from shutil import disk_usage, rmtree
 from threading import Lock
 from uuid import UUID, uuid4
 
@@ -145,6 +145,8 @@ class ArtifactCache:
     def __init__(self, directory: Path) -> None:
         """Configure a cache directory without automatic size eviction."""
         self.directory = directory
+        # The service binds its durable tombstone check; standalone caches need none.
+        self.check_job_access: Callable[[str], None] = lambda _job_id: None
         self._active: dict[str, int] = {}
         self._prepared_until: dict[str, float] = {}
         self._verified: dict[str, tuple[int, str, int, int, int, int]] = {}
@@ -250,6 +252,7 @@ class ArtifactCache:
             return True, None
         try:
             with self._state_lock:
+                self.check_job_access(job_id)
                 fingerprint = self._fingerprint(
                     os.fstat(descriptor),
                     size_bytes,
@@ -314,6 +317,7 @@ class ArtifactCache:
             os.utime(descriptor)
             os.lseek(descriptor, 0, os.SEEK_SET)
             with self._state_lock:
+                self.check_job_access(job_id)
                 self._verified[job_id] = self._fingerprint(
                     os.fstat(descriptor), size_bytes, sha256
                 )
@@ -394,6 +398,7 @@ class ArtifactCache:
         os.fchmod(descriptor, 0o600)
         destination = self._path(job_id)
         with self._state_lock:
+            self.check_job_access(job_id)
             os.replace(source, destination)
             os.utime(descriptor)
             self._verified[job_id] = self._fingerprint(
@@ -401,6 +406,29 @@ class ArtifactCache:
                 size_bytes,
                 sha256,
             )
+
+    def remove_job_files(self, job_id: str) -> bool:
+        """Remove exact Job-owned files after producers have quiesced.
+
+        Active descriptors finish first. Temporary directory names must carry
+        the canonical Job UUID; unidentifiable historical scratch is untouched.
+        """
+        path = self._path(job_id)
+        with self._state_lock:
+            if self._active.get(job_id, 0):
+                return False
+            self._verified.pop(job_id, None)
+            self._prepared_until.pop(job_id, None)
+            path.unlink(missing_ok=True)
+        for scratch in self.directory.glob(f".{job_id}.*"):
+            if scratch.name.endswith(".part") or scratch.name.startswith(
+                f".{job_id}.archive-"
+            ):
+                if scratch.is_symlink() or not scratch.is_dir():
+                    scratch.unlink(missing_ok=True)
+                else:
+                    rmtree(scratch)
+        return True
 
     def _open_staging(self, path: Path) -> int:
         if path.parent != self.directory or not path.name.endswith(".part"):

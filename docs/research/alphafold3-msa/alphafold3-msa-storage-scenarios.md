@@ -1,11 +1,11 @@
 # AlphaFold 3 MSA database storage and staging scenarios
 
 Status: historical benchmark design; production storage is governed by
-[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
+[ADR 0005](../../adr/0005-alphafold3-msa-sharding.md).
 
 Scope: storage, compression, sharding, staging, and reuse options for the
 AlphaFold 3 data pipeline in
-[`alphafold3_app.py`](../../src/biomodals/app/fold/alphafold3_app.py). This note
+[`alphafold3_app.py`](../../../src/biomodals/app/fold/alphafold3_app.py). This note
 does not change production code or recommend a production default before
 measurement.
 
@@ -217,7 +217,7 @@ to a unique local directory, requests only 0.125 CPU with a 32.125-core soft
 limit, and has no active `ephemeral_disk` request. Its chain-parallel path reads
 directly from the Volume. These are implementation facts, not measurements of
 either backend's speed
-([`run_data_pipeline`](../../src/biomodals/app/fold/alphafold3_app.py)).
+([`run_data_pipeline`](../../../src/biomodals/app/fold/alphafold3_app.py)).
 
 ## Scenario dimensions
 

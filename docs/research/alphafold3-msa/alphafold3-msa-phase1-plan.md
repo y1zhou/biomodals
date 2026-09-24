@@ -1,7 +1,7 @@
 # AlphaFold 3 small-BFD sharding benchmark plan
 
 Status: historical benchmark; production integration is governed by
-[ADR 0005](../adr/0005-alphafold3-msa-sharding.md).
+[ADR 0005](../../adr/0005-alphafold3-msa-sharding.md).
 Plan date: 2026-07-22
 Results date: 2026-07-23
 Original campaign: `small-bfd-phase1-v1`

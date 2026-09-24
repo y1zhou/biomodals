@@ -522,9 +522,12 @@ async def test_reconciliation_processes_at_most_four_jobs_concurrently() -> None
     active = 0
     maximum = 0
     completed = 0
-    jobs = [SimpleNamespace(job_id=uuid4()) for _ in range(8)]
+    jobs = [SimpleNamespace(job_id=uuid4(), deleted_at=None) for _ in range(8)]
 
     class Store:
+        def list_pending_deletions(self, *, now):
+            return []
+
         def list_reconcilable_jobs(self, *, now):
             del now
             return jobs
@@ -560,12 +563,15 @@ async def test_slow_reconciliation_does_not_block_new_jobs_or_duplicate_delivery
     stop, wake = asyncio.Event(), asyncio.Event()
     entered, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
     old_id, new_id = uuid4(), uuid4()
-    jobs = [SimpleNamespace(job_id=old_id)]
+    jobs = [SimpleNamespace(job_id=old_id, deleted_at=None)]
     old_calls = 0
 
     class Store:
+        def list_pending_deletions(self, *, now):
+            return []
+
         def list_reconcilable_jobs(self, *, now):
-            return tuple(jobs)
+            return list(jobs)
 
     class Lifecycle:
         store = Store()
@@ -590,7 +596,7 @@ async def test_slow_reconciliation_does_not_block_new_jobs_or_duplicate_delivery
     )
     try:
         await asyncio.wait_for(entered.wait(), timeout=1)
-        jobs.append(SimpleNamespace(job_id=new_id))
+        jobs.append(SimpleNamespace(job_id=new_id, deleted_at=None))
         wake.set()
         await asyncio.wait_for(processed.wait(), timeout=0.1)
         wake.set()
@@ -607,11 +613,14 @@ async def test_slow_reconciliation_does_not_block_new_jobs_or_duplicate_delivery
 async def test_reconciliation_does_not_hot_poll_after_snapshot_is_exhausted() -> None:
     stop, wake, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = 0
-    job = SimpleNamespace(job_id=uuid4())
+    job = SimpleNamespace(job_id=uuid4(), deleted_at=None)
 
     class Store:
+        def list_pending_deletions(self, *, now):
+            return []
+
         def list_reconcilable_jobs(self, *, now):
-            return (job,)
+            return [job]
 
     class Lifecycle:
         store = Store()
@@ -648,10 +657,13 @@ async def test_reconciliation_wakes_for_a_newly_admitted_job() -> None:
     jobs: list[SimpleNamespace] = []
 
     class Store:
+        def list_pending_deletions(self, *, now):
+            return []
+
         def list_reconcilable_jobs(self, *, now):
             del now
             first_scan.set()
-            return tuple(jobs)
+            return list(jobs)
 
     class Lifecycle:
         store = Store()
@@ -670,7 +682,7 @@ async def test_reconciliation_wakes_for_a_newly_admitted_job() -> None:
         )
     )
     await asyncio.wait_for(first_scan.wait(), timeout=1)
-    jobs.append(SimpleNamespace(job_id=uuid4()))
+    jobs.append(SimpleNamespace(job_id=uuid4(), deleted_at=None))
     wake.set()
     await asyncio.wait_for(processed.wait(), timeout=1)
     await task

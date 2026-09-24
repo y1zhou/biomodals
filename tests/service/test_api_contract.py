@@ -851,6 +851,75 @@ def test_chemistry_continue_publishes_only_matching_success(
         assert replay.json()["job_id"] == admitted.json()["job_id"]
 
 
+@pytest.mark.parametrize("kind", ["protein", "ccd", "smiles", "ptm"])
+@pytest.mark.parametrize("already_admitted", [False, True])
+def test_historical_chemistry_requires_revalidation_but_keeps_job_replay(
+    tmp_path, monkeypatch, kind, already_admitted
+):
+    app = _app(tmp_path)
+    _humanization_session(app)
+
+    async def check(_self, content, deployment):
+        return ChemistryReceipt(
+            input_sha256=hashlib.sha256(content).hexdigest(),
+            ccd_sha256="a" * 64,
+            upstream_commit=ALPHAFOLD3_COMMIT,
+        )
+
+    monkeypatch.setattr(AlphaFold3ToolAdapter, "check_chemistry", check)
+    protein = {"id": "A", "sequence": "AST"}
+    sequences = [{"protein": protein}]
+    if kind == "ptm":
+        protein["modifications"] = [{"ptmType": "SEP", "ptmPosition": 2}]
+    elif kind in {"ccd", "smiles"}:
+        ligand = {"ccdCodes": ["NAG"]} if kind == "ccd" else {"smiles": "CCO"}
+        sequences.append({"ligand": {"id": "B", **ligand}})
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/validations",
+        headers={"Origin": ORIGIN},
+        json={
+            "name": "legacy",
+            "modelSeeds": [1],
+            "dialect": "alphafold3",
+            "version": 3,
+            "sequences": sequences,
+        },
+    )
+    assert response.status_code == 201, response.text
+    validation_id = response.json()["validation_id"]
+    headers = {"Origin": ORIGIN, "Idempotency-Key": str(uuid4())}
+    body = {"validation_id": validation_id}
+    if already_admitted:
+        original = _request(
+            app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=body
+        )
+        assert original.status_code == 202, original.text
+
+    # Recreate pre-upgrade retained metadata, including its native entity list.
+    path = (
+        ValidatedInputStore(tmp_path / "validations").directory
+        / validation_id
+        / "metadata.json"
+    )
+    metadata = orjson.loads(path.read_bytes())
+    metadata["preview"].pop("chemistry")
+    metadata.pop("chemistry_receipt")
+    metadata.pop("chemistry_deployment")
+    path.write_bytes(orjson.dumps(metadata))
+    result = _request(
+        app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=body
+    )
+    if already_admitted or kind == "protein":
+        assert result.status_code == 202, result.text
+        if already_admitted:
+            assert result.json()["job_id"] == original.json()["job_id"]
+    else:
+        assert result.status_code == 409, result.text
+        assert result.json()["code"] == "chemistry_revalidation_required"
+
+
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)

@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
-from biomodals.app.fold.alphafold3.chemistry import ChemistryPreview
+from biomodals.app.fold.alphafold3.chemistry import ChemistryPreview, ChemistryReceipt
 from biomodals.execution import DeploymentIdentity
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.results import (
@@ -113,6 +113,32 @@ def create_router(
         _session: Annotated[AuthenticatedSession, Depends(require_session)],
     ) -> AlphaFold3Capabilities:
         return AlphaFold3Capabilities()
+
+    async def check_chemistry(
+        request: Request, content: bytes, deployment: DeploymentIdentity
+    ) -> ChemistryReceipt:
+        # The upload is fully consumed before this sole receive-channel reader.
+        async def disconnected() -> None:
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        checker = asyncio.create_task(adapter.check_chemistry(content, deployment))
+        disconnect = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait(
+                {checker, disconnect}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnect in done:
+                await disconnect
+                raise HTTPException(499, "Client disconnected during chemistry check")
+            return await checker
+        finally:
+            # Await cancellation so the adapter can cancel its known Modal call
+            # before this request releases its upload slot.
+            for task in (checker, disconnect):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(checker, disconnect, return_exceptions=True)
 
     async def read_result[T](
         job_id: UUID,
@@ -345,8 +371,8 @@ def create_router(
                             effective.modal_app_name,
                             effective.modal_app_version.value,
                         )
-                        receipt = await adapter.check_chemistry(
-                            prepared.content, deployment
+                        receipt = await check_chemistry(
+                            request, prepared.content, deployment
                         )
                         prepared = replace(
                             prepared,
@@ -354,11 +380,24 @@ def create_router(
                             chemistry_deployment=deployment,
                         )
                     async with validation_lock:
+                        if await request.is_disconnected():
+                            raise HTTPException(
+                                499, "Client disconnected before validation publication"
+                            )
                         validated = await asyncio.to_thread(
                             validations.publish,
                             prepared,
                             owner_user_id=session.principal.user_id,
                         )
+                        if await request.is_disconnected():
+                            await asyncio.to_thread(
+                                validations.delete,
+                                validated.validation_id,
+                                owner_user_id=session.principal.user_id,
+                            )
+                            raise HTTPException(
+                                499, "Client disconnected during validation publication"
+                            )
                 except ValidationLimitExceededError as error:
                     raise CodedAPIError(429, "validation_limit", str(error)) from error
                 except ValidationStorageLowError as error:
@@ -488,6 +527,9 @@ def create_router(
             any(chemistry.values())
             if isinstance(chemistry, dict)
             else any(counts[key] for key in ("modifications", "bonds", "custom_ccd"))
+            or any(
+                entity["type"] == "ligand" for entity in validated.preview["entities"]
+            )
         )
         if needs_chemistry and validated.chemistry_deployment != deployment:
             raise CodedAPIError(

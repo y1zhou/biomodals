@@ -131,6 +131,13 @@ submission-ready validation. Native response size is limited to 8 KiB. The
 receipt records normalized-input SHA-256, installed CCD SHA-256, and upstream
 commit; retained metadata also binds the exact deployment.
 
+After consuming the upload, the route watches the ASGI receive channel while
+waiting for native chemistry. A reported disconnect cancels and awaits the
+checker before releasing its upload slot. It also checks for disconnects before
+publication and removes a newly written validation if the client disconnects
+during that write. This responds to disconnects delivered by the HTTP server;
+it cannot detect a browser departure hidden by an intermediary proxy.
+
 Reuse the existing Continue/retained-validation flow: bounded local
 parse/normalization, CPU preflight, then publish the successful validation ID.
 Perform the remote wait outside the global validation lock, rechecking local

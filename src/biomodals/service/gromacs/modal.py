@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from hashlib import sha256
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import BinaryIO, cast
 
 import modal
 import orjson
 
+from biomodals.app.bioinfo.gromacs.clustering import (
+    CLUSTER_ARCHIVE,
+    ClusteringExecutionRequest,
+    ClusteringSource,
+)
 from biomodals.app.bioinfo.gromacs.continuation import (
     ContinuationEvidence,
     ContinuationInspection,
@@ -17,15 +24,19 @@ from biomodals.app.bioinfo.gromacs.continuation import (
 )
 from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
 from biomodals.app.bioinfo.gromacs.execution_runtime import (
-    GromacsExecutionRequest,
     gromacs_publication_path,
     load_execution_request_from_volume,
+    parse_execution_request,
     parse_gromacs_publication,
     stage_execution_request,
 )
 from biomodals.execution import DeploymentIdentity
 from biomodals.execution.modal import stage_execution_launch
-from biomodals.helper.modal_volume import read_modal_volume_file
+from biomodals.helper.artifacts import file_size_sha256
+from biomodals.helper.modal_volume import (
+    download_modal_volume_files,
+    read_modal_volume_file,
+)
 from biomodals.service.artifacts import ArtifactCache, ArtifactIntegrityError
 from biomodals.service.gromacs.archive import (
     GROMACS_ARCHIVE_SCHEMA_VERSION,
@@ -61,7 +72,7 @@ class GromacsToolAdapter:
                 job.job_id,
             )
             return
-        request = GromacsExecutionRequest.from_bytes(content)
+        request = parse_execution_request(content)
         await asyncio.to_thread(stage_execution_request, volume, job.job_id, request)
         await asyncio.to_thread(stage_execution_launch, volume, job.job_id, None)
 
@@ -74,6 +85,30 @@ class GromacsToolAdapter:
     ) -> ContinuationInspection:
         """Inspect in Modal without transferring native files to the API host."""
         return await read_continuation_source(deployment, job.job_id)
+
+    async def clustering_source(
+        self, job: JobRecord, deployment: DeploymentIdentity
+    ) -> ClusteringSource:
+        """Read bounded metadata in the selected deployment's read-only worker."""
+        function = modal.Function.from_name(
+            deployment.deployment_name,
+            "inspect_clustering_source",
+            environment_name=deployment.environment,
+            version=deployment.deployment_version,
+        )
+        return ClusteringSource.model_validate_json(
+            await function.remote.aio(str(job.job_id))
+        )
+
+    async def clustering_preflight(self, deployment: DeploymentIdentity) -> None:
+        """Resolve the new worker without starting scientific computation."""
+        function = modal.Function.from_name(
+            deployment.deployment_name,
+            "cluster_trajectory",
+            environment_name=deployment.environment,
+            version=deployment.deployment_version,
+        )
+        await function.hydrate.aio()
 
     async def preflight(self, deployment: DeploymentIdentity) -> None:
         """Require the continuation entrypoint before admitting a scientific plan."""
@@ -112,6 +147,38 @@ class GromacsToolAdapter:
         )
         if published_files is None:
             raise ArtifactIntegrityError("GROMACS final publication marker is invalid")
+        if isinstance(request, ClusteringExecutionRequest):
+            (record,) = published_files
+            path = cache.staging_path(str(job.job_id))
+            try:
+                with TemporaryDirectory(
+                    dir=cache.directory, prefix="clustering-download-"
+                ) as directory:
+                    downloaded = Path(directory) / CLUSTER_ARCHIVE
+                    await asyncio.to_thread(
+                        download_modal_volume_files,
+                        volume,
+                        [(f"{request.run_name}/{record.path}", downloaded)],
+                        concurrency=1,
+                    )
+                    size, digest = await cache.run_bounded(file_size_sha256, downloaded)
+                    if (size, digest) != (record.size_bytes, record.content_sha256):
+                        raise ArtifactIntegrityError(
+                            "Clustering archive changed after publication"
+                        )
+                    os.replace(downloaded, path)
+                await cache.publish_staged(
+                    str(job.job_id), path, size_bytes=size, sha256=digest
+                )
+            finally:
+                path.unlink(missing_ok=True)
+            return PreparedResult(
+                filename=f"{request.run_name}.zip",
+                media_type="application/zip",
+                size_bytes=size,
+                sha256=digest,
+                archive_schema="gromacs-clustering/1",
+            )
         evidence = None
         if request.continuation and request.execution_plan_version == "4":
             record = next(

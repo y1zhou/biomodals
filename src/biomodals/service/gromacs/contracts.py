@@ -51,6 +51,32 @@ class GromacsContinuationInfo(BaseModel):
     max_additional_time_ns: int = MAX_SIMULATION_TIME_NS
 
 
+class GromacsClusteringSubmission(BaseModel):
+    """Native all-frame GROMOS settings; no simulation parameters."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    display_name: str | None = Field(default=None, max_length=120)
+    cutoff_angstrom: float = Field(default=2.0, gt=0, allow_inf_nan=False)
+
+
+class GromacsClusteringInfo(BaseModel):
+    """Source eligibility and advisory resource demand, never a size admission cap."""
+
+    source_job_id: UUID
+    source_display_name: str
+    eligible: bool
+    code: str | None = None
+    detail: str
+    frame_count: int | None = None
+    protein_atoms: int | None = None
+    ca_atoms: int | None = None
+    estimated_memory_bytes: int | None = None
+    warnings: list[str] = Field(default_factory=list)
+    default_cutoff_angstrom: float = 2.0
+    deadline_seconds: int = 43200
+
+
 def gromacs_run_name(display_name: str, job_id: UUID) -> str:
     """Build a readable, path-safe name with collision-proof job identity."""
     ascii_name = (

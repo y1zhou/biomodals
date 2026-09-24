@@ -1,6 +1,6 @@
 # GROMACS trajectory clustering
 
-Status: implementation approved 2026-09-24; verification pending.
+Status: implemented with offline native/API/browser verification; deployment verification pending.
 
 Researched 2026-09-23 against backend `aa7d853` and GROMACS 2026.1.
 For existing cumulative-run semantics, see
@@ -154,6 +154,59 @@ is not selected for this release.
 No clustering result viewer, new Tool catalog entry, new MD-submission
 controls, or mutation of historical archives is included. Deployments and paid
 smoke runs require separate authorization.
+
+## Implemented contracts and rollout
+
+The app request discriminates `trajectory_clustering` from MD without artificial
+duration or velocity settings. Its graph is `cluster_trajectory` →
+`prepare_result`; the ordinary MD graph is unchanged. The worker reloads the
+Volume before reading, rechecks the source publication identity and hashes the
+trajectory before native analysis. Source inspection reads the published
+template/statistics plus trajectory existence/size, not trajectory contents.
+It shares overlapping same-source/deployment requests, with a 45-second service
+deadline and a two-container inspector cap.
+
+The worker builds `clusters.zip` with `clusters.csv`, `medoids/*.pdb`, and
+`provenance.json`. Provenance contains source identity, cutoff, indexing/coordinate
+conventions, policy version, and the exact CSV/PDB size/digest inventory. The
+kernel content-binds the complete ZIP as one publication; the API downloads it
+with the shared transfer helper and verifies that digest before caching. Native
+matrices and binary medoid scratch stay outside the published directory. The
+source frame count must match its published statistics; ambiguous binary times
+fail explicitly instead of being mapped through rounded native logs.
+
+The CPU worker has a 12-hour deadline and 64 GiB memory ceiling. Metadata estimates
+`8 * frames² + 12 * frames * CA_atoms` bytes; estimated memory ≥8 GiB or
+pairwise atom work ≥10¹¹ triggers a warning, not rejection. These conservative
+estimates omit some native/scratch overhead and are not guarantees of completion.
+
+Authenticated GET/POST `/api/v1/gromacs/jobs/{job_id}/clustering` share ownership,
+CSRF and normal admission. POST accepts optional `display_name` and a finite
+positive `cutoff_angstrom` (default 2; no arbitrary upper bound). Exact idempotent
+replay precedes source/deployment I/O. Shared Job views persist `operation` and
+`source_job_id` in every state; analysis Jobs are neither MD continuation sources
+nor MD-plot providers. The SQLite 8 → 9 upgrade preserves existing records; see
+the [service database contract](api-tool-service.md#database-upgrades-and-historical-cutover).
+
+CLI (one existing entrypoint, so fresh/continuation command resolution is unchanged):
+
+```bash
+uv run biomodals app run gromacs::submit_gromacs_task --environment production --version <version> -- --cluster-from <execution-run-id> --clustering-cutoff-angstrom 2 --run-name trajectory-clusters
+```
+
+MD settings cannot be combined with `--cluster-from`. Use `biomodals run restart`
+for compatible recovery of the same analysis plan. Deploy the updated GROMACS
+app, pin its exact version, then restart the matching API and deploy the frontend.
+Back up SQLite before the API upgrade; do not delete deployments existing Jobs
+still reference. The AF3 chemistry feature separately requires its updated app
+deployment. Neither humanization workflow needs redeployment for this release.
+
+Offline tests cover native medoid/RMSD agreement, rounded-time collisions, full
+protein PDBs, exact sparse assignments/inventory, source-only metadata inspection,
+warm-worker reload ordering, changed-input rejection, CPU graph/recovery, archive
+transfer integrity, CLI dispatch, owner/replay/admission and database preservation.
+Browser verification uses deterministic fake science; it does not verify Modal
+image installation, cold starts, or production-scale 12-hour execution.
 
 ## Offline native feasibility (2026-09-23)
 

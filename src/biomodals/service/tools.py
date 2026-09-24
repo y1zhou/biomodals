@@ -49,6 +49,9 @@ GROMACS_TOOL = ToolDefinition(
     default_active_job_limit=2,
     stages=(
         ToolStageDefinition(
+            "cluster_trajectory", "Cluster trajectory", ("cluster_trajectory",)
+        ),
+        ToolStageDefinition(
             "prepare_continuation",
             "Verify continuation source",
             ("prepare_continuation",),

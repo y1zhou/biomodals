@@ -7,9 +7,10 @@ import hashlib
 import re
 import time
 import zipfile
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 import orjson
@@ -27,7 +28,10 @@ from fastapi.responses import Response
 from modal.exception import NotFoundError
 from modal.exception import TimeoutError as ModalTimeoutError
 
-from biomodals.app.bioinfo.gromacs.continuation import ContinuationInspection
+from biomodals.app.bioinfo.gromacs.clustering import (
+    ClusteringExecutionRequest,
+    ClusteringSource,
+)
 from biomodals.app.bioinfo.gromacs.execution import concrete_gromacs_seed
 from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
 from biomodals.execution import DeploymentIdentity
@@ -41,6 +45,8 @@ from biomodals.service.gromacs.archive import (
 )
 from biomodals.service.gromacs.contracts import (
     MAX_SIMULATION_TIME_NS,
+    GromacsClusteringInfo,
+    GromacsClusteringSubmission,
     GromacsContinuationInfo,
     GromacsContinuationSubmission,
     GromacsJobOptions,
@@ -61,6 +67,7 @@ from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import (
     IdempotencyConflictError,
     JobLimitExceededError,
+    JobOperation,
     JobRecord,
     JobState,
     ServiceStore,
@@ -118,9 +125,7 @@ def create_router(
     previews = APIRouter(
         prefix="/jobs/{job_id}/trajectory", route_class=PrivateResultRoute
     )
-    source_checks: dict[
-        tuple[UUID, DeploymentIdentity], asyncio.Task[ContinuationInspection]
-    ] = {}
+    source_checks: dict[tuple[UUID, DeploymentIdentity, object], asyncio.Task[Any]] = {}
 
     def owner_job(job_id: UUID, session: AuthenticatedSession) -> JobRecord:
         job = store.get_job(session.principal.user_id, job_id)
@@ -129,7 +134,7 @@ def create_router(
         return job
 
     def admit(
-        execution_request: GromacsExecutionRequest,
+        execution_request: GromacsExecutionRequest | ClusteringExecutionRequest,
         *,
         job_id: UUID,
         normalized_name: str,
@@ -157,6 +162,16 @@ def create_router(
                 max_active_gpu_provider_calls=execution_request.max_active_gpu_provider_calls,
                 now=int(time.time()),
                 new_job_id=job_id,
+                operation=(
+                    JobOperation.TRAJECTORY_CLUSTERING
+                    if isinstance(execution_request, ClusteringExecutionRequest)
+                    else JobOperation.RUN
+                ),
+                source_job_id=(
+                    execution_request.source.execution_run_id
+                    if isinstance(execution_request, ClusteringExecutionRequest)
+                    else None
+                ),
             )
         except (IdempotencyConflictError, JobLimitExceededError) as error:
             pending.delete(job_id)
@@ -180,18 +195,21 @@ def create_router(
                 "Deploy and pin the updated GROMACS app before submitting jobs",
             ) from error
 
-    async def inspect_source(
-        job: JobRecord, deployment: DeploymentIdentity
-    ) -> ContinuationInspection:
+    async def inspect_source[T](
+        job: JobRecord,
+        deployment: DeploymentIdentity,
+        *,
+        read: Callable[[JobRecord, DeploymentIdentity], Awaitable[T]],
+    ) -> T:
         """Share only in-flight checks, with one deadline independent of callers."""
-        key = (job.job_id, deployment)
+        key = (job.job_id, deployment, read)
         task = source_checks.get(key)
         if task is None:
 
-            async def inspect() -> ContinuationInspection:
+            async def inspect() -> T:
                 try:
                     async with asyncio.timeout(SOURCE_CHECK_TIMEOUT_SECONDS):
-                        return await adapter.continuation_source(job, deployment)
+                        return await read(job, deployment)
                 finally:
                     source_checks.pop(key, None)
 
@@ -207,7 +225,7 @@ def create_router(
             raise CodedAPIError(
                 409,
                 "deployment_incompatible",
-                "Deploy and pin the updated GROMACS app before extending simulations",
+                "Deploy and pin the updated GROMACS app before reusing completed simulations",
             ) from error
         except ModalTimeoutError as error:
             raise CodedAPIError(
@@ -243,7 +261,7 @@ def create_router(
             code="source_not_completed",
             detail="Only completed GROMACS jobs can be continued",
         )
-        if job.state != JobState.SUCCEEDED:
+        if job.state != JobState.SUCCEEDED or job.operation != JobOperation.RUN:
             return info
         if job.modal_environment != configuration.modal_environment().value:
             info.code = "source_environment_mismatch"
@@ -256,7 +274,9 @@ def create_router(
             effective.modal_app_version.value,
         )
         try:
-            saved = await inspect_source(job, deployment)
+            saved = await inspect_source(
+                job, deployment, read=adapter.continuation_source
+            )
         except (FileNotFoundError, ValueError, TypeError) as error:
             info.code = "source_unavailable"
             info.detail = _source_error_detail(error)
@@ -314,7 +334,7 @@ def create_router(
                     "Idempotency key was already used for another request",
                 )
             return _view(replay, session, configuration)
-        if job.state != JobState.SUCCEEDED:
+        if job.state != JobState.SUCCEEDED or job.operation != JobOperation.RUN:
             raise CodedAPIError(
                 409, "source_not_completed", "Source job must be completed"
             )
@@ -331,7 +351,9 @@ def create_router(
             effective.modal_app_version.value,
         )
         try:
-            inspection = await inspect_source(job, deployment)
+            inspection = await inspect_source(
+                job, deployment, read=adapter.continuation_source
+            )
         except (FileNotFoundError, ValueError, TypeError) as error:
             raise CodedAPIError(
                 409,
@@ -351,6 +373,157 @@ def create_router(
             child,
             job_id=child_id,
             normalized_name=normalized_name,
+            digest=digest,
+            session=session,
+            idempotency_key=idempotency_key,
+            deployment=deployment,
+            request=request,
+        )
+
+    def clustering_deployment(job: JobRecord) -> DeploymentIdentity:
+        if job.state != JobState.SUCCEEDED or job.operation != JobOperation.RUN:
+            raise CodedAPIError(
+                409, "source_not_completed", "Select a completed GROMACS simulation"
+            )
+        environment = configuration.modal_environment().value
+        if job.modal_environment != environment:
+            raise CodedAPIError(
+                409,
+                "source_environment_mismatch",
+                "Source simulation belongs to a different environment",
+            )
+        effective = configuration.tool("gromacs")
+        return DeploymentIdentity(
+            environment, effective.modal_app_name, effective.modal_app_version.value
+        )
+
+    async def cluster_source(
+        job: JobRecord, deployment: DeploymentIdentity
+    ) -> ClusteringSource:
+        try:
+            source = await inspect_source(
+                job, deployment, read=adapter.clustering_source
+            )
+            if source.execution_run_id != job.job_id:
+                raise ValueError("Clustering source identity does not match the Job")
+            return source
+        except (FileNotFoundError, ValueError, TypeError, KeyError) as error:
+            raise CodedAPIError(
+                409,
+                "source_unavailable",
+                "Retained processed trajectory or matching protein template is unavailable or invalid",
+            ) from error
+
+    @router.get(
+        "/jobs/{job_id}/clustering",
+        response_model=GromacsClusteringInfo,
+        responses={
+            409: {"model": CodedErrorResponse},
+            504: {"model": CodedErrorResponse},
+        },
+    )
+    async def clustering_info(
+        job_id: UUID,
+        session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> GromacsClusteringInfo:
+        job = owner_job(job_id, session)
+        try:
+            deployment = clustering_deployment(job)
+            source = await cluster_source(job, deployment)
+        except CodedAPIError as error:
+            if error.code not in {
+                "source_not_completed",
+                "source_unavailable",
+                "source_environment_mismatch",
+            }:
+                raise
+            return GromacsClusteringInfo(
+                source_job_id=job_id,
+                source_display_name=job.display_name,
+                eligible=False,
+                code=error.code,
+                detail=error.detail,
+            )
+        return GromacsClusteringInfo(
+            source_job_id=job_id,
+            source_display_name=job.display_name,
+            eligible=True,
+            detail="Clusters the complete processed production trajectory without additional simulation.",
+            frame_count=source.frame_count,
+            protein_atoms=source.protein_atoms,
+            ca_atoms=source.ca_atoms,
+            estimated_memory_bytes=source.estimated_memory_bytes,
+            warnings=source.warnings,
+        )
+
+    @router.post(
+        "/jobs/{job_id}/clustering",
+        response_model=JobView,
+        status_code=202,
+        responses={
+            409: {"model": CodedErrorResponse},
+            504: {"model": CodedErrorResponse},
+        },
+    )
+    async def submit_clustering(
+        job_id: UUID,
+        body: GromacsClusteringSubmission,
+        request: Request,
+        session: Annotated[AuthenticatedSession, Depends(require_unsafe_session)],
+        idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
+    ) -> JobView:
+        job = owner_job(job_id, session)
+        name = (
+            body.display_name or ""
+        ).strip() or f"{job.display_name[:100]} (clusters)"
+        digest = hashlib.sha256(
+            orjson.dumps(
+                {
+                    "operation": "trajectory_clustering",
+                    "source_job_id": str(job_id),
+                    "display_name": name,
+                    "cutoff_angstrom": body.cutoff_angstrom,
+                },
+                option=orjson.OPT_SORT_KEYS,
+            )
+        ).hexdigest()
+        replay = store.find_idempotent_job(
+            session.principal.user_id,
+            tool="gromacs",
+            idempotency_key=str(idempotency_key),
+        )
+        if replay is not None:
+            if replay.request_digest != digest:
+                raise CodedAPIError(
+                    409,
+                    "idempotency_conflict",
+                    "Idempotency key was already used for another request",
+                )
+            return _view(replay, session, configuration)
+        deployment = clustering_deployment(job)
+        await remote.preflight(deployment)
+        try:
+            await adapter.clustering_preflight(deployment)
+        except NotFoundError as error:
+            raise CodedAPIError(
+                409,
+                "deployment_incompatible",
+                "Deploy and pin a GROMACS version supporting trajectory clustering",
+            ) from error
+        source = await cluster_source(job, deployment)
+        child_id = uuid4()
+        effective = configuration.tool("gromacs")
+        child = ClusteringExecutionRequest(
+            run_name=gromacs_run_name(name, child_id),
+            source=source,
+            cutoff_angstrom=body.cutoff_angstrom,
+            max_active_provider_calls=effective.max_active_provider_calls,
+            max_active_gpu_provider_calls=effective.max_active_gpu_provider_calls,
+        )
+        return admit(
+            child,
+            job_id=child_id,
+            normalized_name=name,
             digest=digest,
             session=session,
             idempotency_key=idempotency_key,
@@ -381,6 +554,7 @@ def create_router(
             raise HTTPException(404, "Job not found")
         if (
             job.state != JobState.SUCCEEDED
+            or job.operation != JobOperation.RUN
             or job.result_size_bytes is None
             or job.result_sha256 is None
         ):

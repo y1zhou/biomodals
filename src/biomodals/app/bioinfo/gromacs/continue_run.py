@@ -143,6 +143,8 @@ def prepare_continuation_files(
     if prepared.load() is not None:
         return root
     parent = load_execution_request(volume_root, source.execution_run_id)
+    if not isinstance(parent, GromacsExecutionRequest):
+        raise ValueError("Only a simulation can be extended")
     if sha256(parent.to_bytes()).hexdigest() != source.request_sha256:
         raise ValueError("Continuation source request changed")
     marker = (

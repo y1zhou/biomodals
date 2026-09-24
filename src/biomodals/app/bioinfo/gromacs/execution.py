@@ -231,7 +231,7 @@ def operation_provider_binding(
 def operation_target(operation: str) -> OperationTarget:
     """Return provider-neutral dispatch metadata for one operation."""
     function_name = operation.partition(":")[0]
-    if function_name not in REQUIRED_FUNCTIONS:
+    if function_name not in (*REQUIRED_FUNCTIONS, "cluster_trajectory"):
         raise ValueError(f"Unsupported GROMACS operation: {operation}")
     uses_gpu = function_name.endswith("_gpu")
     return OperationTarget(

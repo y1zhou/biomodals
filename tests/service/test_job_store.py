@@ -80,6 +80,22 @@ def test_schema_contains_only_six_service_tables(tmp_path: Path) -> None:
     }
 
 
+def test_v8_migration_preserves_jobs_and_authentication(tmp_path: Path) -> None:
+    store, owner = _store(tmp_path)
+    original = _admit(store, owner).job
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("ALTER TABLE jobs DROP COLUMN operation")
+        connection.execute("ALTER TABLE jobs DROP COLUMN source_job_id")
+        connection.execute("PRAGMA user_version = 8")
+        before = connection.execute("SELECT * FROM sessions").fetchall()
+    store.initialize()
+    assert store.get_job_by_id(original.job_id) == original
+    assert _admit(store, owner).created is False
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT * FROM sessions").fetchall() == before
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
+
+
 def test_admission_replays_identity_without_execution_tables(tmp_path: Path) -> None:
     store, owner = _store(tmp_path)
     created = _admit(store, owner)

@@ -1,6 +1,6 @@
 # AlphaFold3 chemistry inputs
 
-Status: implementation approved 2026-09-24; verification pending.
+Status: implemented with offline native/API/browser verification; deployment verification pending.
 
 Researched 2026-09-23 against backend `aa7d853` and the pinned AF3 source below.
 This extends the input scope of [AlphaFold3 UX](alphafold3-ux.md), not its

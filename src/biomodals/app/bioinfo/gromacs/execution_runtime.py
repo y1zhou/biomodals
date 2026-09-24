@@ -12,6 +12,12 @@ from uuid import UUID
 
 import orjson
 
+from biomodals.app.bioinfo.gromacs.clustering import (
+    CLUSTER_ARCHIVE,
+    CLUSTER_NODE,
+    CLUSTER_POLICY_VERSION,
+    ClusteringExecutionRequest,
+)
 from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
 from biomodals.app.bioinfo.gromacs.execution import (
     EXECUTION_PLAN_SCHEMA_VERSION,
@@ -227,7 +233,7 @@ class GromacsExecutionRequest:
 
 
 def gromacs_publication_path(
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
     node_key: str,
 ) -> PurePosixPath:
     """Return one operation's marker path relative to the output Volume."""
@@ -236,10 +242,14 @@ def gromacs_publication_path(
 
 
 def gromacs_node_paths(
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
     node_key: str,
 ) -> tuple[str, ...]:
     """Return the exact run-relative scientific files for one operation."""
+    if isinstance(request, ClusteringExecutionRequest):
+        if node_key not in {CLUSTER_NODE, PREPARE_RESULT}:
+            raise ValueError("Unknown clustering Node")
+        return (CLUSTER_ARCHIVE,)
     name = request.file_stem
     prepare = preparation_execution_paths(name)
 
@@ -304,7 +314,7 @@ def gromacs_node_paths(
 
 
 def parse_gromacs_publication(
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
     node_key: str,
     content: bytes,
 ) -> tuple[ArtifactFile, ...] | None:
@@ -324,7 +334,7 @@ def parse_gromacs_publication(
 def stage_execution_request(
     output_volume: Any,
     execution_run_id: UUID,
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
 ) -> PurePosixPath:
     """Idempotently stage a request before coordinator launch."""
     return _REQUEST_FILE.stage(output_volume, execution_run_id, request.to_bytes())
@@ -333,7 +343,7 @@ def stage_execution_request(
 def persist_execution_request(
     volume_root: str | Path,
     execution_run_id: UUID,
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
 ) -> PurePosixPath:
     """Persist a coordinator-generated successor request."""
     return _REQUEST_FILE.persist(volume_root, execution_run_id, request.to_bytes())
@@ -342,21 +352,28 @@ def persist_execution_request(
 def load_execution_request(
     volume_root: str | Path,
     execution_run_id: UUID,
-) -> GromacsExecutionRequest:
+) -> GromacsExecutionRequest | ClusteringExecutionRequest:
     """Load one request inside the mounted coordinator."""
-    return GromacsExecutionRequest.from_bytes(
-        _REQUEST_FILE.load(volume_root, execution_run_id)
-    )
+    return parse_execution_request(_REQUEST_FILE.load(volume_root, execution_run_id))
 
 
 def load_execution_request_from_volume(
     output_volume: Any,
     execution_run_id: UUID,
-) -> GromacsExecutionRequest:
+) -> GromacsExecutionRequest | ClusteringExecutionRequest:
     """Load a staged request through the client-side Volume API."""
-    return GromacsExecutionRequest.from_bytes(
+    return parse_execution_request(
         _REQUEST_FILE.load_from_volume(output_volume, execution_run_id)
     )
+
+
+def parse_execution_request(
+    content: bytes,
+) -> GromacsExecutionRequest | ClusteringExecutionRequest:
+    """Dispatch saved immutable requests without conflating MD and analysis."""
+    if orjson.loads(content).get("operation") == "trajectory_clustering":
+        return ClusteringExecutionRequest.from_bytes(content)
+    return GromacsExecutionRequest.from_bytes(content)
 
 
 class GromacsPublicationBoundary(Protocol):
@@ -394,7 +411,7 @@ class GromacsPublications:
     def __init__(
         self,
         *,
-        request: GromacsExecutionRequest,
+        request: GromacsExecutionRequest | ClusteringExecutionRequest,
         execution_run_id: UUID,
         predecessor_execution_run_id: UUID | None,
         output_root: str | Path,
@@ -577,13 +594,19 @@ class GromacsPublications:
 
     def invalidate(self, node_key: str) -> None:
         """Remove digest-invalid outputs and their checkpoint-bound siblings."""
-        if self.request.continuation and node_key.startswith("production_run_"):
+        if (
+            isinstance(self.request, GromacsExecutionRequest)
+            and self.request.continuation
+            and node_key.startswith("production_run_")
+        ):
             # Preserve child checkpoint progress. Native append validation, not
             # resetting the child from its source, decides whether it is usable.
             self.publication_path(node_key).unlink(missing_ok=True)
             return
         paths = list(self.node_paths(node_key))
-        if node_key.startswith("production_run_"):
+        if isinstance(self.request, GromacsExecutionRequest) and node_key.startswith(
+            "production_run_"
+        ):
             root = self.request.run_root(self.output_root)
             prefix = root / f"production_{self.request.file_stem}"
             paths.extend(
@@ -657,7 +680,7 @@ class GromacsProviderNode(_GromacsPublicationHooks, ProviderNode):
     """Describe one established remote GROMACS operation."""
 
     operation: str
-    request: GromacsExecutionRequest
+    request: GromacsExecutionRequest | ClusteringExecutionRequest
     publications: GromacsPublicationBoundary
 
     def prepare_remote(self, context: NodeRunContext) -> ProviderCallSpec:
@@ -698,7 +721,7 @@ class GromacsResultNode(_GromacsPublicationHooks, CoordinatorNode):
 
 
 def gromacs_execution_graph(
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
     publications: GromacsPublicationBoundary,
 ) -> ExecutionGraph:
     """Build the direct-app graph without reproducing kernel orchestration."""
@@ -727,9 +750,11 @@ def gromacs_execution_graph(
 
 
 def _operation_kwargs(
-    request: GromacsExecutionRequest,
+    request: GromacsExecutionRequest | ClusteringExecutionRequest,
     operation: str,
 ) -> dict[str, object]:
+    if isinstance(request, ClusteringExecutionRequest):
+        return {"request_content": request.to_bytes()}
     if operation == PREPARE_CONTINUATION:
         return {"request_content": request.to_bytes()}
     if operation.startswith("prepare_tpr_"):
@@ -804,13 +829,14 @@ class GromacsExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
             target_scientific_versions={
                 "gromacs": GROMACS_SCIENTIFIC_VERSION,
                 "biomodals.gromacs.execution_plan": EXECUTION_PLAN_SCHEMA_VERSION,
+                "biomodals.gromacs.clustering": CLUSTER_POLICY_VERSION,
             },
             poll_interval_seconds=poll_interval_seconds,
         )
 
     def _build_graph(
         self,
-        request: GromacsExecutionRequest,
+        request: GromacsExecutionRequest | ClusteringExecutionRequest,
         predecessor_execution_run_id: UUID | None,
     ) -> ExecutionGraph:
         publications = GromacsPublications(

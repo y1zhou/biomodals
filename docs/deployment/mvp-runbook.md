@@ -80,8 +80,14 @@ record.
 
 ### Pre-release service schema
 
-The service has no migration command or compatibility reader for pre-release
-database schemas. If startup rejects a version, stop the API process and first
+Startup automatically migrates service schema 8 to 9 by adding Job operation
+and source lineage columns. Existing Users, Sessions, Jobs and settings remain
+intact; existing Jobs receive operation `run`. Stop the API and back up SQLite
+before upgrading. Older executables cannot open schema 9; rollback requires
+restoring the backup, not dropping columns from production state.
+
+There is no general migration command or compatibility reader for older
+pre-release schemas. If startup rejects a version, stop the API process and first
 confirm the selected configuration and exact database path. Point the new build
 at a new empty, pre-release-only state directory; retain the old database
 separately if an Administrator needs to inspect or copy Users and settings.

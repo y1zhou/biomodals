@@ -19,6 +19,11 @@ from uuid import UUID, uuid4
 
 import modal
 
+from biomodals.app.bioinfo.gromacs.clustering import (
+    CLUSTER_ARCHIVE,
+    CLUSTER_TIMEOUT_SECONDS,
+    ClusteringExecutionRequest,
+)
 from biomodals.app.bioinfo.gromacs.execution import (
     ANALYSIS_PACKAGES,
     MAX_SIMULATION_TIME_NS,
@@ -134,7 +139,7 @@ def _invalidate_incomplete_preparation(work_path: Path, run_name: str) -> None:
         (work_path / f"production_{run_name}.tpr").unlink(missing_ok=True)
 
 
-runtime_image = (
+gromacs_base_image = (
     modal.Image
     .from_registry(
         "nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python=CONF.python_version
@@ -251,13 +256,14 @@ runtime_image = (
         "echo 'source /usr/local/gromacs/bin/GMXRC' >> /etc/profile",
     )
     .add_local_dir(Path(__file__).parent / "assets", APP_INFO.gmx_scripts, copy=True)
-    .pipe(patch_image_for_helper)
-    .add_local_python_source(
-        "biomodals.app.bioinfo.gromacs.execution",
-        "biomodals.app.bioinfo.gromacs.execution_runtime",
-        "biomodals.app.bioinfo.gromacs.continuation",
-        "biomodals.app.bioinfo.gromacs.continue_run",
-    )
+)
+
+runtime_image = gromacs_base_image.pipe(patch_image_for_helper).add_local_python_source(
+    "biomodals.app.bioinfo.gromacs.execution",
+    "biomodals.app.bioinfo.gromacs.execution_runtime",
+    "biomodals.app.bioinfo.gromacs.continuation",
+    "biomodals.app.bioinfo.gromacs.continue_run",
+    "biomodals.app.bioinfo.gromacs.clustering",
 )
 
 biotite_image = (
@@ -271,6 +277,7 @@ biotite_image = (
         "biomodals.app.bioinfo.gromacs.execution_runtime",
         "biomodals.app.bioinfo.gromacs.continuation",
         "biomodals.app.bioinfo.gromacs.analysis",
+        "biomodals.app.bioinfo.gromacs.clustering",
     )
 )
 
@@ -282,7 +289,15 @@ inspection_image = (
         "biomodals.app.bioinfo.gromacs.execution",
         "biomodals.app.bioinfo.gromacs.execution_runtime",
         "biomodals.app.bioinfo.gromacs.continuation",
+        "biomodals.app.bioinfo.gromacs.clustering",
     )
+)
+
+clustering_image = (
+    gromacs_base_image
+    .uv_pip_install(*ANALYSIS_PACKAGES[:3])
+    .pipe(patch_image_for_helper)
+    .add_local_python_source("biomodals.app.bioinfo.gromacs")
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
@@ -679,6 +694,74 @@ def inspect_continuation_source(execution_run_id: str) -> str:
 
 
 @app.function(
+    image=biotite_image,
+    cpu=1,
+    memory=2048,
+    timeout=40,
+    max_containers=2,
+    volumes={
+        CONF.output_volume_mountpoint: CONF.output_volume.with_mount_options(
+            read_only=True, sub_path="/"
+        )
+    },
+)
+def inspect_clustering_source(execution_run_id: str) -> str:
+    """Read published source metadata; never copy trajectory data to the API."""
+    from biomodals.app.bioinfo.gromacs.clustering import (
+        inspect_clustering_source as inspect,
+    )
+
+    CONF.output_volume.reload()
+    return inspect(
+        Path(CONF.output_volume_mountpoint), UUID(execution_run_id)
+    ).model_dump_json()
+
+
+@app.function(
+    image=clustering_image,
+    cpu=1,
+    memory=(2048, 65536),
+    timeout=CLUSTER_TIMEOUT_SECONDS,
+    volumes=CONF.mounts(output_volume=True),
+)
+def cluster_trajectory(request_content: bytes) -> str:
+    """Run exact all-frame CPU clustering in a new analysis-owned directory."""
+    from biomodals.app.bioinfo.gromacs.clustering import (
+        cluster_trajectory as run,
+    )
+    from biomodals.app.bioinfo.gromacs.clustering import (
+        inspect_clustering_source as inspect,
+    )
+    from biomodals.helper.artifacts import file_size_sha256
+
+    CONF.output_volume.reload()
+    request = ClusteringExecutionRequest.from_bytes(request_content)
+    volume_root = Path(CONF.output_volume_mountpoint)
+    source = inspect(volume_root, request.source.execution_run_id)
+    if source != request.source:
+        raise ValueError("Clustering source changed after admission")
+    root = volume_root / source.run_name
+    trajectory = root / source.trajectory.path
+    if file_size_sha256(trajectory) != (
+        source.trajectory.size_bytes,
+        source.trajectory.content_sha256,
+    ):
+        raise ValueError("Clustering trajectory changed after publication")
+    output = request.run_root(volume_root)
+    run(
+        trajectory,
+        root / source.template.path,
+        output / CLUSTER_ARCHIVE,
+        run_name=request.run_name,
+        cutoff_angstrom=request.cutoff_angstrom,
+        provenance=source.model_dump(mode="json"),
+        expected_frames=source.frame_count,
+    )
+    CONF.output_volume.commit()
+    return str(output)
+
+
+@app.function(
     image=runtime_image,
     cpu=1,
     memory=(1024, 4096),
@@ -960,6 +1043,7 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
             "production_run_cpu": production_run_cpu,
             "production_run_gpu": production_run_gpu,
             "prepare_continuation": prepare_continuation,
+            "cluster_trajectory": cluster_trajectory,
         },
         workload_name="GROMACS",
     )
@@ -968,6 +1052,83 @@ def _coordinator_modal_driver(*, development: bool) -> ModalCallDriver:
 ##########################################
 # Local entrypoint client
 ##########################################
+def _submit_clustering(
+    source_run_id: str,
+    cutoff_angstrom: float = 2.0,
+    run_name: str | None = None,
+    max_containers: int | None = None,
+    max_gpu_containers: int | None = None,
+    use_deployed_coordinator: bool = False,
+    deployment_environment: str = "main",
+    deployment_name: str = CONF.name,
+    deployment_version: int = 1,
+) -> None:
+    """Cluster every processed production frame of a completed Execution Run.
+
+    Args:
+        source_run_id: Completed MD Execution Run UUID in the target environment.
+        cutoff_angstrom: Positive C-alpha RMSD cutoff in Angstroms (default 2).
+        run_name: Unique analysis output name; omission generates a new name.
+        max_containers: Maximum active workload calls for this analysis.
+        max_gpu_containers: Shared scheduler GPU ceiling; this analysis uses none.
+        use_deployed_coordinator: Use the exact pinned deployment (normal CLI).
+        deployment_environment: Modal Environment containing the source and app.
+        deployment_name: Exact deployed Modal app name.
+        deployment_version: Exact numeric deployment version.
+    """
+    from biomodals.app.bioinfo.gromacs.clustering import ClusteringSource
+
+    source_id = UUID(source_run_id)
+    deployment = DeploymentIdentity(
+        deployment_environment, deployment_name, deployment_version
+    )
+    inspector = (
+        modal.Function.from_name(
+            deployment_name,
+            "inspect_clustering_source",
+            environment_name=deployment_environment,
+            version=deployment_version,
+        )
+        if use_deployed_coordinator
+        else inspect_clustering_source
+    )
+    source = ClusteringSource.model_validate_json(inspector.remote(str(source_id)))
+    if source.execution_run_id != source_id:
+        raise ValueError("Source inspection returned a different Execution Run")
+    for warning in source.warnings:
+        print(f"Warning: {warning}")
+    total_limit, gpu_limit = resolve_provider_call_limits(
+        default_max_containers=1,
+        default_max_gpu_containers=0,
+        max_containers=max_containers,
+        max_gpu_containers=max_gpu_containers,
+    )
+    execution_run_id = uuid4()
+    request = ClusteringExecutionRequest(
+        run_name=run_name or f"clusters-{execution_run_id.hex}",
+        source=source,
+        cutoff_angstrom=cutoff_angstrom,
+        max_active_provider_calls=total_limit,
+        max_active_gpu_provider_calls=gpu_limit,
+    )
+    stage_execution_request(CONF.output_volume, execution_run_id, request)
+    submit_staged_execution_run(
+        CONF.output_volume,
+        execution_run_id=execution_run_id,
+        deployment=deployment,
+        predecessor_execution_run_id=None,
+        use_deployed_coordinator=use_deployed_coordinator,
+        local_coordinator=ExecutionCoordinator,
+        workload_name=CONF.name,
+        restart_kwargs={
+            "workload_plan_fingerprint": request.execution_plan.workload_plan_fingerprint,
+            "max_active_provider_calls": total_limit,
+            "max_active_gpu_provider_calls": gpu_limit,
+        },
+    )
+    print(f"Clustering archive: {request.run_name}/{CLUSTER_ARCHIVE}")
+
+
 @app.local_entrypoint()
 def submit_gromacs_task(
     input_pdb: str | None = None,
@@ -989,6 +1150,8 @@ def submit_gromacs_task(
     restart_from: str | None = None,
     continue_from: str | None = None,
     additional_time_ns: int | None = None,
+    cluster_from: str | None = None,
+    clustering_cutoff_angstrom: float | None = None,
 ) -> None:
     """Run GROMACS MD simulations on Modal and save results to a volume.
 
@@ -1021,7 +1184,46 @@ def submit_gromacs_task(
         restart_from: Optional predecessor Execution Run ID for a Successor Run.
         continue_from: Completed Execution Run to extend in a new output directory.
         additional_time_ns: Additional whole nanoseconds (1–250), only with continue_from.
+        cluster_from: Completed MD Execution Run to analyze without running MD.
+        clustering_cutoff_angstrom: C-alpha RMSD cutoff for cluster_from (default 2 Å).
     """
+    if cluster_from is not None:
+        if any(
+            value is not None
+            for value in (
+                input_pdb,
+                simulation_time_ns,
+                run_pdbfixer,
+                cpu_only,
+                num_threads,
+                use_openmp_threads,
+                ld_seed,
+                gen_seed,
+                genion_seed,
+                restart_from,
+                continue_from,
+                additional_time_ns,
+            )
+        ):
+            raise ValueError(
+                "--cluster-from cannot be combined with simulation or restart options; use 'biomodals run restart' for analysis recovery"
+            )
+        _submit_clustering(
+            source_run_id=cluster_from,
+            cutoff_angstrom=2.0
+            if clustering_cutoff_angstrom is None
+            else clustering_cutoff_angstrom,
+            run_name=run_name,
+            max_containers=max_containers,
+            max_gpu_containers=max_gpu_containers,
+            use_deployed_coordinator=use_deployed_coordinator,
+            deployment_environment=deployment_environment,
+            deployment_name=deployment_name,
+            deployment_version=deployment_version,
+        )
+        return
+    if clustering_cutoff_angstrom is not None:
+        raise ValueError("--clustering-cutoff-angstrom requires --cluster-from")
     inspection = None
     if continue_from:
         import asyncio

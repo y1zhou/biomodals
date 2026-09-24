@@ -273,6 +273,22 @@ An active check shows progress and times out after 45 seconds with a manual
 retry option. See the
 [continuation specification](docs/specs/gromacs-continuation.md) for CLI usage
 and the required GROMACS deployment/API update.
+**Cluster trajectory** creates a separate analysis Job from a completed
+simulation, including its full cumulative production history. It uses native
+GROMOS clustering on protein C-alpha atoms with an editable RMSD cutoff
+(default 2 Å). The download contains `clusters.csv`, whole-protein medoid PDBs
+and provenance, not another copy of the trajectory. Large-input warnings are
+advisory; exact all-frame clustering has a 12-hour deadline and finite memory.
+The analysis links back to its unchanged source Job. See the
+[clustering specification](docs/specs/gromacs-trajectory-clustering.md).
+
+AlphaFold3 Regular mode supports PTMs, N-linked glycan presets and explicit
+ligand–polymer bonds. Continue checks chemistry against the pinned native CCD
+before showing confirmation; this CPU check performs no prediction or MSA
+search. Polymer–polymer bonds, including explicit disulfides, remain unsupported
+by the pinned upstream implementation. See the
+[chemistry specification](docs/specs/alphafold3-chemistry-inputs.md).
+
 Large or unavailable previews do not prevent native archive downloads; see
 the [AlphaFold3 viewer specification](docs/specs/alphafold3-ux.md) for preview
 limits. AlphaFold3 input documents are

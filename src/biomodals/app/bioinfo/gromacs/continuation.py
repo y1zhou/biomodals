@@ -206,11 +206,14 @@ def inspect_continuation_source(
     submitted child's preparation Task, not a side effect of opening its form.
     """
     from biomodals.app.bioinfo.gromacs.execution_runtime import (
+        GromacsExecutionRequest,
         gromacs_publication_path,
         load_execution_request,
     )
 
     request = load_execution_request(volume_root, execution_run_id)
+    if not isinstance(request, GromacsExecutionRequest):
+        raise ValueError("Only a simulation can be extended")
     if request.gromacs_version != GROMACS_SCIENTIFIC_VERSION:
         raise ValueError("Source uses an incompatible GROMACS version")
     root = request.run_root(volume_root)

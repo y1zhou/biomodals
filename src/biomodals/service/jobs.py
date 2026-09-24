@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from biomodals.service.store import JobRecord, JobState
+from biomodals.service.store import JobOperation, JobRecord, JobState
 
 
 class StageTaskCounts(BaseModel):
@@ -46,6 +46,8 @@ class JobView(BaseModel):
     job_id: UUID
     tool: str
     display_name: str
+    operation: JobOperation = JobOperation.RUN
+    source_job_id: UUID | None = None
     state: JobState
     can_view_logs: bool
     can_retry_result_preparation: bool
@@ -82,6 +84,8 @@ class JobView(BaseModel):
             job_id=record.job_id,
             tool=record.tool,
             display_name=record.display_name,
+            operation=record.operation,
+            source_job_id=record.source_job_id,
             state=record.state,
             can_view_logs=can_view_logs,
             can_retry_result_preparation=record.can_retry_result_preparation,

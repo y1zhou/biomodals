@@ -77,8 +77,15 @@ class JobState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class JobOperation(StrEnum):
+    """Immutable purpose of a Job, independent of its lifecycle state."""
+
+    RUN = "run"
+    TRAJECTORY_CLUSTERING = "trajectory_clustering"
+
+
 _SESSION_TOUCH_INTERVAL_SECONDS = 5 * 60
-_SERVICE_SCHEMA_VERSION = 8
+_SERVICE_SCHEMA_VERSION = 9
 _ACTIVE_JOB_STATES = (
     JobState.QUEUED.value,
     JobState.RUNNING.value,
@@ -93,6 +100,8 @@ CREATE TABLE jobs (
     owner_user_id TEXT NOT NULL REFERENCES users(user_id),
     tool TEXT NOT NULL,
     display_name TEXT NOT NULL,
+    operation TEXT NOT NULL DEFAULT 'run' CHECK (operation IN ('run', 'trajectory_clustering')),
+    source_job_id TEXT REFERENCES jobs(job_id),
     idempotency_key TEXT NOT NULL,
     request_digest TEXT NOT NULL,
     publication_scope_digest TEXT NOT NULL,
@@ -241,6 +250,8 @@ class JobRecord:
     next_retry_at: int | None
     blocking_category: str | None
     cache_cleared_at: int | None
+    operation: JobOperation = JobOperation.RUN
+    source_job_id: UUID | None = None
 
     @property
     def can_retry_result_preparation(self) -> bool:
@@ -408,6 +419,15 @@ class ServiceStore:
                     raise
                 else:
                     conn.commit()
+            elif version == 8:
+                conn.executescript("""
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE jobs ADD COLUMN operation TEXT NOT NULL DEFAULT 'run'
+                        CHECK (operation IN ('run', 'trajectory_clustering'));
+                    ALTER TABLE jobs ADD COLUMN source_job_id TEXT REFERENCES jobs(job_id);
+                    PRAGMA user_version = 9;
+                    COMMIT;
+                """)
             elif version != _SERVICE_SCHEMA_VERSION:
                 raise RuntimeError(
                     "Unsupported service database version "
@@ -1233,8 +1253,15 @@ class ServiceStore:
         now: int,
         new_job_id: UUID | None = None,
         pending_validation_id: UUID | None = None,
+        operation: JobOperation = JobOperation.RUN,
+        source_job_id: UUID | None = None,
     ) -> JobAdmission:
         """Atomically admit one Job before any provider side effect."""
+        if operation not in {"run", "trajectory_clustering"} or (
+            operation == "trajectory_clustering"
+            and (tool != "gromacs" or source_job_id is None)
+        ):
+            raise ValueError("Invalid Job operation")
         if not tool or not display_name or not idempotency_key:
             raise ValueError("Job identity fields must not be empty")
         if len(request_digest) != 64 or any(
@@ -1276,6 +1303,15 @@ class ServiceStore:
             ).fetchone()
             if user is None or user["status"] != UserStatus.ENABLED.value:
                 raise UserNotFoundError(f"Enabled User not found: {owner_user_id}")
+            if (
+                source_job_id is not None
+                and conn.execute(
+                    "SELECT 1 FROM jobs WHERE job_id = ? AND owner_user_id = ? AND tool = ?",
+                    (str(source_job_id), str(owner_user_id), tool),
+                ).fetchone()
+                is None
+            ):
+                raise JobNotFoundError("Source Job not found")
             limits = (
                 int(user["active_job_limit"]),
                 tool_active_job_limit,
@@ -1332,8 +1368,8 @@ class ServiceStore:
                     modal_environment, modal_app_name,
                     modal_app_version, state, max_active_provider_calls,
                     max_active_gpu_provider_calls, pending_validation_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, operation, source_job_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(job_id),
@@ -1356,6 +1392,8 @@ class ServiceStore:
                     ),
                     now,
                     now,
+                    operation,
+                    str(source_job_id) if source_job_id is not None else None,
                 ),
             )
             row = conn.execute(
@@ -2162,6 +2200,8 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         owner_user_id=UUID(row["owner_user_id"]),
         tool=str(row["tool"]),
         display_name=str(row["display_name"]),
+        operation=JobOperation(row["operation"]),
+        source_job_id=UUID(row["source_job_id"]) if row["source_job_id"] else None,
         idempotency_key=str(row["idempotency_key"]),
         request_digest=str(row["request_digest"]),
         publication_scope_digest=str(row["publication_scope_digest"]),

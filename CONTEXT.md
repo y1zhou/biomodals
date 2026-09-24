@@ -411,6 +411,13 @@ result delivery, and presentation that refers to an Execution Run without
 persisting a duplicate compute state.
 _Avoid_: Execution Run, Task, provider call
 
+**Job Deletion**:
+Permanent withdrawal of an owner's terminal Service Job from normal access,
+with eventual removal of its local files while retaining its internal identity.
+It is not execution cancellation, remote scientific data erasure, or deletion
+of existing child Jobs.
+_Avoid_: cache clearing, cancellation, remote purge
+
 **Tool**:
 A user-facing scientific capability, such as GROMACS MD simulation or Antibody
 Sequence Analysis. Job-producing Tools have durable execution and Results;

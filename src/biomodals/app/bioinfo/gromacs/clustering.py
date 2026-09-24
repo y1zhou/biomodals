@@ -329,12 +329,6 @@ def cluster_trajectory(
                 "medoids.trr",
                 "-clndx",
                 "members.ndx",
-                "-g",
-                "cluster.log",
-                "-o",
-                "clusters.xpm",
-                "-om",
-                "matrix.xpm",
                 "-xvg",
                 "none",
             ]

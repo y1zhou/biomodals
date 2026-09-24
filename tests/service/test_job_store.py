@@ -121,6 +121,34 @@ def test_admission_replays_identity_without_execution_tables(tmp_path: Path) -> 
         _admit(store, owner, digest="b" * 64)
 
 
+def test_deleted_predecessor_remains_available_for_publication_repair(
+    tmp_path: Path,
+) -> None:
+    store, owner = _store(tmp_path)
+    previous = _admit(store, owner).job
+    store.fail_job(previous.job_id, error_code="test", error_message="test", now=11)
+    store.delete_job(owner, previous.job_id, now=12)
+    current = store.admit_job(
+        owner_user_id=owner,
+        tool="alphafold3",
+        display_name="New explicit intent",
+        idempotency_key="another-intent",
+        request_digest=previous.request_digest,
+        modal_environment="main",
+        modal_app_name="AlphaFold3",
+        modal_app_version=7,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=1,
+        now=13,
+    ).job
+    predecessors = store.list_preceding_jobs_for_request(current.job_id)
+    assert [job.job_id for job in predecessors] == [previous.job_id]
+    assert predecessors[0].deleted_at == 12
+    assert [job.job_id for job in store.list_jobs(owner)] == [current.job_id]
+
+
 def test_unstaged_jobs_retain_queued_requests_across_tools(tmp_path: Path) -> None:
     store, owner = _store(tmp_path)
     gromacs_id = uuid4()

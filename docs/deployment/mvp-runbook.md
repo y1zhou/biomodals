@@ -80,11 +80,19 @@ record.
 
 ### Pre-release service schema
 
-Startup automatically migrates service schema 8 to 9 by adding Job operation
-and source lineage columns. Existing Users, Sessions, Jobs and settings remain
-intact; existing Jobs receive operation `run`. Stop the API and back up SQLite
-before upgrading. Older executables cannot open schema 9; rollback requires
+Startup automatically migrates service schemas 8 and 9 to 10, chaining the
+operation/source-lineage migration where needed and adding durable Job deletion
+and cleanup progress. Existing Users, Sessions, Jobs and settings remain intact.
+Stop the API and back up SQLite before upgrading. Older executables cannot open
+schema 10; rollback requires
 restoring the backup, not dropping columns from production state.
+
+Job deletion requires the matching frontend, but no Modal redeployment. It hides
+terminal Jobs immediately and removes their local files after active downloads
+or result restoration finish. Cleanup retries after errors and restarts; inspect
+the API journal for `Local deletion cleanup failed` and correct filesystem
+permissions or storage errors. Do not delete the whole cache/state directory to
+resolve one Job's cleanup. Modal outputs and existing child Jobs are retained.
 
 There is no general migration command or compatibility reader for older
 pre-release schemas. If startup rejects a version, stop the API process and first

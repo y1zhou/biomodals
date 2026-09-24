@@ -11,15 +11,70 @@ from test_api_contract import ORIGIN, _app, _humanization_session, _request, _se
 from test_artifact_cache import publish
 from test_tool_runtime import JOB_ID, Adapter, _lifecycle
 
+from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
+from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.http_contract import require_unsafe_session
 from biomodals.service.pending import PendingRequestStore
 from biomodals.service.store import JobNotFoundError, JobState
 from biomodals.service.tool_runtime import (
+    JobLifecycle,
     PreparedResult,
+    ToolRegistration,
     reconciliation_loop,
 )
 from biomodals.service.tools import TOOLS
+
+
+@pytest.mark.anyio
+async def test_cleanup_removes_only_jobs_claimed_validation(tmp_path):
+    store, original, _ = _lifecycle(tmp_path, object())
+    owner = store.get_job_by_id(JOB_ID).owner_user_id
+    validations = ValidatedInputStore(tmp_path)
+    validations.initialize()
+    validation_id, other_id = uuid4(), uuid4()
+    for key in (validation_id, other_id):
+        directory = validations.directory / str(key)
+        directory.mkdir()
+        (directory / "document.json").write_bytes(b"retained input")
+    job = store.admit_job(
+        owner_user_id=owner,
+        tool="alphafold3",
+        display_name="Pending validation",
+        idempotency_key="claimed-validation",
+        request_digest="b" * 64,
+        modal_environment="main",
+        modal_app_name="AlphaFold3",
+        modal_app_version=1,
+        tool_active_job_limit=10,
+        global_active_job_limit=10,
+        max_active_provider_calls=4,
+        max_active_gpu_provider_calls=1,
+        now=11,
+        pending_validation_id=validation_id,
+    ).job
+    store.request_cancel(job.job_id, now=12)
+    store.delete_job(owner, job.job_id, now=13)
+    registration = next(iter(original.registrations.values()))
+    lifecycle = JobLifecycle(
+        store,
+        object(),
+        (
+            ToolRegistration(
+                registration.definition, AlphaFold3ToolAdapter(validations, store)
+            ),
+        ),
+        original.cache,
+    )
+    await lifecycle.cleanup_deleted_job(store.get_job_by_id(job.job_id))
+    assert list(validations.directory.iterdir()) == [
+        validations.directory / str(other_id)
+    ]
+    assert (
+        validations.directory / str(other_id) / "document.json"
+    ).read_bytes() == b"retained input"
+    assert store.get_job_by_id(job.job_id).pending_validation_id is None
+    await original.cache.shutdown()
 
 
 def test_delete_api_owner_visibility_and_replay(tmp_path):

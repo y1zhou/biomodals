@@ -250,6 +250,18 @@ sharding_image = (
 )
 
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
+
+
+@app.function(cpu=1, memory=8192, timeout=150, max_containers=2)
+def check_input_chemistry(content: bytes) -> dict:
+    """Check native components and covalent atoms without starting prediction."""
+    from biomodals.app.fold.alphafold3.chemistry import (  # noqa: PLC0415
+        check_chemistry_isolated,
+    )
+
+    return check_chemistry_isolated(content)
+
+
 _CONTAINER_INSTANCE_ID = uuid.uuid4().hex
 _PROFILE_BUILDER_RUNTIME = ProfileBuilderRuntime(
     output_root=Path(CONF.output_volume_mountpoint),

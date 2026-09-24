@@ -158,13 +158,24 @@ say they are overviews and point to the full-resolution CSV. Sampling may omit
 brief extrema; it never changes CSV statistics. The aligned final-frame PDB
 and all public output filenames remain unchanged.
 
-Analysis publications bind processed-XTC/template SHA-256, `streaming-v1`,
+Protein selection follows GROMACS 2026.1 `residuetypes.dat`, including force-field
+protonation, disulfide and terminal names such as `HIE` and `CYX`. Names,
+coordinates and atom order are preserved; water, ions and ligands are excluded.
+This avoids the PDB chemical-component classifier silently omitting valid MD
+residues from alignment, RMSD, Rg and Cα RMSF.
+
+Analysis publications bind processed-XTC/template SHA-256, `streaming-v2`,
 pinned numerical/plotting packages and the child title to exact output digests.
 Temporary CSV names are stable and overwritten after interruption; incomplete
-or old-policy outputs cannot become a cache hit. Plan version 4 covers this
-analysis and validated continuation provenance. ShortMD also declares the
+or old-policy outputs cannot become a cache hit. Plan version 5 covers corrected
+native protein selection; version 4 introduced streaming analysis and validated
+continuation provenance. ShortMD also declares the
 analysis policy in its scientific identity. Historical plans retain their
 fingerprints; a new deployment does not silently upgrade an old Run.
+Historical published statistics remain unchanged and may omit force-field
+aliases under the old classifier. Continuing a source recomputes cumulative
+production statistics under the new policy; inherited NVT/NPT outputs remain
+the source's original publications.
 
 Offline tests compare streamed statistics to pinned Biotite 1.6.0 batch
 calculations across chunk sizes 1, 2, 7 and 128, with rigid displacement,

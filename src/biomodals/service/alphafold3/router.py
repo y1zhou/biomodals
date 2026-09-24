@@ -9,9 +9,10 @@ import sqlite3
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import orjson
@@ -19,6 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 
+from biomodals.app.fold.alphafold3.chemistry import ChemistryPreview, ChemistryReceipt
 from biomodals.execution import DeploymentIdentity
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.results import (
@@ -70,6 +72,14 @@ class ValidationView(BaseModel):
     created_at: datetime
     expires_at: datetime
     preview: dict[str, object]
+    chemistry: ChemistryPreview | None
+    chemistry_checked: bool
+
+
+class AlphaFold3Capabilities(BaseModel):
+    """API support; Continue also verifies the pinned native deployment."""
+
+    chemistry_preflight: Literal[1] = 1
 
 
 class AlphaFold3JobRequest(BaseModel):
@@ -97,6 +107,38 @@ def create_router(
     upload_slots = asyncio.Semaphore(2)
     validation_lock = asyncio.Lock()
     predictions = PredictionReader()
+
+    @router.get("/capabilities", response_model=AlphaFold3Capabilities)
+    async def capabilities(
+        _session: Annotated[AuthenticatedSession, Depends(require_session)],
+    ) -> AlphaFold3Capabilities:
+        return AlphaFold3Capabilities()
+
+    async def check_chemistry(
+        request: Request, content: bytes, deployment: DeploymentIdentity
+    ) -> ChemistryReceipt:
+        # The upload is fully consumed before this sole receive-channel reader.
+        async def disconnected() -> None:
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        checker = asyncio.create_task(adapter.check_chemistry(content, deployment))
+        disconnect = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait(
+                {checker, disconnect}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnect in done:
+                await disconnect
+                raise HTTPException(499, "Client disconnected during chemistry check")
+            return await checker
+        finally:
+            # Await cancellation so the adapter can cancel its known Modal call
+            # before this request releases its upload slot.
+            for task in (checker, disconnect):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(checker, disconnect, return_exceptions=True)
 
     async def read_result[T](
         job_id: UUID,
@@ -238,7 +280,11 @@ def create_router(
         response_model=ValidationView,
         status_code=201,
         responses={
+            400: {"model": CodedErrorResponse},
+            409: {"model": CodedErrorResponse},
             429: {"model": CodedErrorResponse},
+            503: {"model": CodedErrorResponse},
+            504: {"model": CodedErrorResponse},
             507: {"model": CodedErrorResponse},
         },
     )
@@ -311,14 +357,47 @@ def create_router(
                     sample=sample,
                 )
                 try:
-                    async with validation_lock:
-                        validated = await asyncio.to_thread(
-                            validations.validate_and_publish,
-                            path,
-                            owner_user_id=session.principal.user_id,
-                            digest=digest.hexdigest(),
-                            settings=settings,
+                    prepared = await asyncio.to_thread(
+                        validations.prepare,
+                        path,
+                        owner_user_id=session.principal.user_id,
+                        digest=digest.hexdigest(),
+                        settings=settings,
+                    )
+                    if any(prepared.preview["chemistry"].values()):
+                        effective = configuration.tool("alphafold3")
+                        deployment = DeploymentIdentity(
+                            configuration.modal_environment().value,
+                            effective.modal_app_name,
+                            effective.modal_app_version.value,
                         )
+                        receipt = await check_chemistry(
+                            request, prepared.content, deployment
+                        )
+                        prepared = replace(
+                            prepared,
+                            chemistry_receipt=receipt,
+                            chemistry_deployment=deployment,
+                        )
+                    async with validation_lock:
+                        if await request.is_disconnected():
+                            raise HTTPException(
+                                499, "Client disconnected before validation publication"
+                            )
+                        validated = await asyncio.to_thread(
+                            validations.publish,
+                            prepared,
+                            owner_user_id=session.principal.user_id,
+                        )
+                        if await request.is_disconnected():
+                            await asyncio.to_thread(
+                                validations.delete,
+                                validated.validation_id,
+                                owner_user_id=session.principal.user_id,
+                            )
+                            raise HTTPException(
+                                499, "Client disconnected during validation publication"
+                            )
                 except ValidationLimitExceededError as error:
                     raise CodedAPIError(429, "validation_limit", str(error)) from error
                 except ValidationStorageLowError as error:
@@ -411,6 +490,7 @@ def create_router(
         response_model=JobView,
         response_description="Job durably admitted for asynchronous staging and launch",
         status_code=202,
+        responses={409: {"model": CodedErrorResponse}},
     )
     async def submit_job(
         request: Request,
@@ -441,6 +521,22 @@ def create_router(
             effective.modal_app_name,
             effective.modal_app_version.value,
         )
+        chemistry = validated.preview.get("chemistry")
+        counts = validated.preview["advanced_counts"]
+        needs_chemistry = (
+            any(chemistry.values())
+            if isinstance(chemistry, dict)
+            else any(counts[key] for key in ("modifications", "bonds", "custom_ccd"))
+            or any(
+                entity["type"] == "ligand" for entity in validated.preview["entities"]
+            )
+        )
+        if needs_chemistry and validated.chemistry_deployment != deployment:
+            raise CodedAPIError(
+                409,
+                "chemistry_revalidation_required",
+                "The prediction deployment changed; repeat Continue to check chemistry",
+            )
         await remote.preflight(deployment)
         async with validation_lock:
             replay = _idempotent_replay(
@@ -542,7 +638,15 @@ def _validation_view(validated: ValidatedInput) -> ValidationView:
         request_digest=validated.digest,
         created_at=datetime.fromtimestamp(validated.created_at, UTC),
         expires_at=datetime.fromtimestamp(validated.expires_at, UTC),
-        preview=validated.preview,
+        preview={
+            key: value for key, value in validated.preview.items() if key != "chemistry"
+        },
+        chemistry=(
+            ChemistryPreview.model_validate(validated.preview["chemistry"])
+            if "chemistry" in validated.preview
+            else None
+        ),
+        chemistry_checked=validated.chemistry_receipt is not None,
     )
 
 

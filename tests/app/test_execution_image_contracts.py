@@ -122,16 +122,22 @@ def test_humanization_images_install_before_source_mounts(image):
                 "biomodals.app.bioinfo.gromacs.execution_runtime",
                 "biomodals.app.bioinfo.gromacs.continuation",
                 "biomodals.app.bioinfo.gromacs.continue_run",
+                "biomodals.app.bioinfo.gromacs.protein",
             },
         ),
         (
             gromacs_app.biotite_image,
             {
                 "biomodals.app.bioinfo.gromacs.analysis",
+                "biomodals.app.bioinfo.gromacs.protein",
                 "biomodals.app.bioinfo.gromacs.execution",
                 "biomodals.app.bioinfo.gromacs.execution_runtime",
                 "biomodals.app.bioinfo.gromacs.continuation",
             },
+        ),
+        (
+            gromacs_app.inspection_image,
+            {"biomodals.app.bioinfo.gromacs.protein"},
         ),
         (
             rosetta_app.runtime_image,

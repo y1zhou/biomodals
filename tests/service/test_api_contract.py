@@ -12,9 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
 import httpx
+import orjson
 import polars as pl
 import pytest
 
+from biomodals.app.fold.alphafold3.chemistry import ChemistryReceipt
+from biomodals.app.fold.alphafold3.profiles import ALPHAFOLD3_COMMIT
 from biomodals.service.alphafold3.modal import AlphaFold3ToolAdapter
 from biomodals.service.alphafold3.router import create_router as af3_router
 from biomodals.service.alphafold3.validation import ValidatedInputStore
@@ -29,7 +32,11 @@ from biomodals.service.config import ServiceSettings
 from biomodals.service.gromacs import router as gromacs_routes
 from biomodals.service.gromacs.modal import GromacsToolAdapter
 from biomodals.service.gromacs.router import create_router as gromacs_router
-from biomodals.service.http_contract import require_session, require_unsafe_session
+from biomodals.service.http_contract import (
+    CodedAPIError,
+    require_session,
+    require_unsafe_session,
+)
 from biomodals.service.humanization.modal import HumanizationToolAdapter
 from biomodals.service.humanization.results import SELECTION_SCHEMA
 from biomodals.service.humanization.router import create_router as humanization_router
@@ -754,6 +761,165 @@ def test_alphafold3_rerun_document_is_private_and_does_not_submit(
         assert missing.json()["code"] == "job_input_unavailable"
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        (400, "chemistry_invalid"),
+        (503, "chemistry_unavailable"),
+        (504, "chemistry_timeout"),
+    ],
+)
+def test_chemistry_continue_publishes_only_matching_success(
+    tmp_path, monkeypatch, failure
+):
+    app = _app(tmp_path)
+    _humanization_session(app)
+    observed = []
+
+    async def check(_self, content, deployment):
+        observed.append((orjson.loads(content), deployment))
+        if failure:
+            raise CodedAPIError(*failure, "Try again")
+        return ChemistryReceipt(
+            input_sha256=hashlib.sha256(content).hexdigest(),
+            ccd_sha256="a" * 64,
+            upstream_commit=ALPHAFOLD3_COMMIT,
+        )
+
+    monkeypatch.setattr(AlphaFold3ToolAdapter, "check_chemistry", check)
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/validations",
+        headers={"Origin": ORIGIN},
+        json={
+            "name": "ptm",
+            "modelSeeds": [1],
+            "dialect": "alphafold3",
+            "version": 3,
+            "sequences": [
+                {
+                    "protein": {
+                        "id": "A",
+                        "sequence": "AST",
+                        "modifications": [{"ptmType": "SEP", "ptmPosition": 2}],
+                    }
+                }
+            ],
+        },
+    )
+    assert len(observed) == 1
+    assert response.status_code == (failure[0] if failure else 201), response.text
+    retained = ValidatedInputStore(tmp_path / "validations")
+    assert retained.usage()[0] == (0 if failure else 1)
+    if failure:
+        assert response.json()["code"] == failure[1]
+    else:
+        assert response.json()["chemistry_checked"] is True
+        assert response.json()["chemistry"]["modifications"][0]["ccd_code"] == "SEP"
+        resource = retained.get(
+            UUID(response.json()["validation_id"]),
+            owner_user_id=app.dependency_overrides[require_session]().principal.user_id,
+        )
+        assert resource.chemistry_deployment == observed[0][1]
+        assert resource.chemistry_receipt.ccd_sha256 == "a" * 64
+        current_version = observed[0][1].deployment_version
+        app.state.configuration.set_tool(
+            "alphafold3", modal_app_version=current_version + 1
+        )
+        headers = {"Origin": ORIGIN, "Idempotency-Key": str(uuid4())}
+        submit = {"validation_id": response.json()["validation_id"]}
+        stale = _request(
+            app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=submit
+        )
+        assert stale.status_code == 409
+        assert stale.json()["code"] == "chemistry_revalidation_required"
+        app.state.configuration.set_tool(
+            "alphafold3", modal_app_version=current_version
+        )
+        admitted = _request(
+            app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=submit
+        )
+        assert admitted.status_code == 202, admitted.text
+        app.state.configuration.set_tool(
+            "alphafold3", modal_app_version=current_version + 1
+        )
+        replay = _request(
+            app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=submit
+        )
+        assert replay.json()["job_id"] == admitted.json()["job_id"]
+
+
+@pytest.mark.parametrize("kind", ["protein", "ccd", "smiles", "ptm"])
+@pytest.mark.parametrize("already_admitted", [False, True])
+def test_historical_chemistry_requires_revalidation_but_keeps_job_replay(
+    tmp_path, monkeypatch, kind, already_admitted
+):
+    app = _app(tmp_path)
+    _humanization_session(app)
+
+    async def check(_self, content, deployment):
+        return ChemistryReceipt(
+            input_sha256=hashlib.sha256(content).hexdigest(),
+            ccd_sha256="a" * 64,
+            upstream_commit=ALPHAFOLD3_COMMIT,
+        )
+
+    monkeypatch.setattr(AlphaFold3ToolAdapter, "check_chemistry", check)
+    protein = {"id": "A", "sequence": "AST"}
+    sequences = [{"protein": protein}]
+    if kind == "ptm":
+        protein["modifications"] = [{"ptmType": "SEP", "ptmPosition": 2}]
+    elif kind in {"ccd", "smiles"}:
+        ligand = {"ccdCodes": ["NAG"]} if kind == "ccd" else {"smiles": "CCO"}
+        sequences.append({"ligand": {"id": "B", **ligand}})
+    response = _request(
+        app,
+        "POST",
+        "/api/v1/alphafold3/validations",
+        headers={"Origin": ORIGIN},
+        json={
+            "name": "legacy",
+            "modelSeeds": [1],
+            "dialect": "alphafold3",
+            "version": 3,
+            "sequences": sequences,
+        },
+    )
+    assert response.status_code == 201, response.text
+    validation_id = response.json()["validation_id"]
+    headers = {"Origin": ORIGIN, "Idempotency-Key": str(uuid4())}
+    body = {"validation_id": validation_id}
+    if already_admitted:
+        original = _request(
+            app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=body
+        )
+        assert original.status_code == 202, original.text
+
+    # Recreate pre-upgrade retained metadata, including its native entity list.
+    path = (
+        ValidatedInputStore(tmp_path / "validations").directory
+        / validation_id
+        / "metadata.json"
+    )
+    metadata = orjson.loads(path.read_bytes())
+    metadata["preview"].pop("chemistry")
+    metadata.pop("chemistry_receipt")
+    metadata.pop("chemistry_deployment")
+    path.write_bytes(orjson.dumps(metadata))
+    result = _request(
+        app, "POST", "/api/v1/alphafold3/jobs", headers=headers, json=body
+    )
+    if already_admitted or kind == "protein":
+        assert result.status_code == 202, result.text
+        if already_admitted:
+            assert result.json()["job_id"] == original.json()["job_id"]
+    else:
+        assert result.status_code == 409, result.text
+        assert result.json()["code"] == "chemistry_revalidation_required"
+
+
 def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     async def send() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
@@ -769,6 +935,7 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
 def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> None:
     document = _app(tmp_path).openapi()
     paths = document["paths"]
+    assert "/api/v1/alphafold3/capabilities" in paths
 
     assert "/api/v1/gromacs/jobs" in paths
     assert "/api/v1/alphafold3/validations" in paths

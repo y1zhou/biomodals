@@ -597,9 +597,17 @@ must expose launch, bounded status, cancellation, and cursor-paginated Provider
 Call diagnostics. Failure names the missing or incompatible capability in the
 existing validation popup and does not update the setting.
 
-## Pre-release database cutover
+## Database upgrades and historical cutover
 
-The new service schema has no compatibility reader or shipped migration from
+The clustering release adds an automatic additive schema 8 → 9 migration for
+`jobs.operation` and `jobs.source_job_id`. It preserves Jobs, Users, Sessions
+and settings. Existing Jobs default to operation `run`; clustering Jobs use
+`trajectory_clustering` and an owner-scoped source Job reference. These are
+service metadata, not a second execution state machine. Back up the stopped
+service's database before upgrading; an older binary requires restoring its
+compatible backup.
+
+The service has no compatibility reader or shipped migration from
 the service-local execution schema. Pre-release deployments initialize fresh
 state. If development users and settings need to survive the local cutover, an
 operator may copy only those rows once into a fresh database; this is not

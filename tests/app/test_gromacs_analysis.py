@@ -41,8 +41,10 @@ def _trajectory(frames=37):
     return template, coordinates
 
 
-def _files(tmp_path, frames=37):
+def _files(tmp_path, frames=37, *, forcefield_names=False):
     template, coordinates = _trajectory(frames)
+    if forcefield_names:
+        template.res_name[:16] = np.repeat(["CYX", "HIE", "HID", "LYN"], 4)
     path = tmp_path / "production_parent_nopbc.xtc"
     pdb = tmp_path / "production_parent_nopbc_centered.pdb"
     strucio.save_structure(pdb, template)
@@ -56,7 +58,9 @@ def _files(tmp_path, frames=37):
     # External oracle: the original pinned Biotite full-stack calculation,
     # including XTC quantization, PDB annotations, alignment and atomic masses.
     loaded = strucio.load_structure(pdb)
-    mask = struc.filter_amino_acids(loaded)
+    # The fixture has four protein residues and one water. Do not use the
+    # implementation's residue classifier to construct its own oracle.
+    mask = loaded.res_id <= 4
     native = XTCFile.read(path, atom_i=np.flatnonzero(mask))
     stack = native.get_structure(loaded[mask])
     aligned, _ = struc.superimpose(stack[0], stack)
@@ -98,12 +102,13 @@ def test_statistics_match_batch_across_uneven_chunks(chunk_size):
 
 
 @pytest.mark.parametrize("chunk_size", [1, 7, 128])
+@pytest.mark.parametrize("forcefield_names", [False, True])
 def test_real_xtc_streaming_preserves_all_rows_units_titles_and_last_frame(
-    tmp_path, monkeypatch, chunk_size
+    tmp_path, monkeypatch, chunk_size, forcefield_names
 ):
     from matplotlib.axes import Axes
 
-    path, pdb, expected, aligned = _files(tmp_path)
+    path, pdb, expected, aligned = _files(tmp_path, forcefield_names=forcefield_names)
     titles = []
     original_title = Axes.set_title
 
@@ -145,6 +150,7 @@ def test_real_xtc_streaming_preserves_all_rows_units_titles_and_last_frame(
         if metric != "rmsf":
             assert_allclose(table["time_ns"].to_numpy(), np.arange(37) / 100, atol=1e-6)
     final = strucio.load_structure(tmp_path / "production_parent_last_frame.pdb")
+    assert final.res_name.tolist() == aligned.res_name.tolist()
     assert_allclose(final.coord, aligned[-1].coord, atol=0.001)
 
 
@@ -189,7 +195,7 @@ def test_cache_repair_and_interruption_do_not_reuse_partial_csvs(tmp_path, monke
     assert pl.read_csv(csv).height == len(expected["rmsd"])
     assert not list(tmp_path.glob("*.part"))
     evidence = orjson.loads(marker.read_bytes())
-    assert evidence["identity"]["analysis_policy"] == "streaming-v1"
+    assert evidence["identity"]["analysis_policy"] == "streaming-v2"
     # Input identity changes must invalidate otherwise valid outputs.
     original = path.read_bytes()
     path.write_bytes(original + b" ")
@@ -200,6 +206,29 @@ def test_cache_repair_and_interruption_do_not_reuse_partial_csvs(tmp_path, monke
     )
     with pytest.raises(ValueError, match="changed input"):
         analysis.analyze_trajectory(path, pdb, **kwargs)
+
+
+def test_new_policy_replaces_a_valid_old_policy_cache(tmp_path, monkeypatch):
+    path, pdb, _, _ = _files(tmp_path, forcefield_names=True)
+    kwargs = dict(prefix="production_parent", run_name="child", make_figures=False)
+    with monkeypatch.context() as old:
+        old.setattr(analysis, "ANALYSIS_POLICY_VERSION", "streaming-v1")
+        analysis.analyze_trajectory(path, pdb, **kwargs)
+    reads = []
+    read_iter = XTCFile.read_iter
+
+    def track(*args, **kwargs):
+        reads.append(args[0])
+        return read_iter(*args, **kwargs)
+
+    monkeypatch.setattr(XTCFile, "read_iter", track)
+    analysis.analyze_trajectory(path, pdb, **kwargs)
+    assert reads == [path]
+    marker = tmp_path / ".biomodals/gromacs/analysis-production_parent.json"
+    assert (
+        orjson.loads(marker.read_bytes())["identity"]["analysis_policy"]
+        == "streaming-v2"
+    )
 
 
 @pytest.mark.parametrize("count", [1, 5000, 5001, 9999, 20001])

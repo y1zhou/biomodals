@@ -12,12 +12,17 @@ from uuid import UUID
 import orjson
 import pytest
 
+from biomodals.app.bioinfo.gromacs.clustering import (
+    ClusteringExecutionRequest,
+    ClusteringSource,
+)
 from biomodals.app.bioinfo.gromacs.execution import PREPARE_RESULT
 from biomodals.app.bioinfo.gromacs.execution_runtime import (
     GromacsExecutionCoordinator,
     GromacsExecutionRequest,
     GromacsPublications,
     gromacs_execution_graph,
+    parse_execution_request,
     parse_gromacs_publication,
     persist_execution_request,
 )
@@ -27,6 +32,7 @@ from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
 )
+from biomodals.schema import ArtifactFile
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SECOND_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -94,6 +100,9 @@ class CompletingDriver:
 
     def _publish(self, function_name: str, kwargs: dict[str, object]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        if function_name == "cluster_trajectory":
+            (self.root / "clusters.zip").write_bytes(b"published analysis archive")
+            return
         if function_name.startswith("prepare_tpr_"):
             (self.root / f"{self.run_name}.pdb").write_bytes(b"pdb")
             (self.root / f"nvt_{self.run_name}.tpr").write_bytes(b"tpr")
@@ -227,6 +236,48 @@ def test_gromacs_definition_preserves_exact_execution_plan(tmp_path: Path) -> No
             workload_run_key=request.run_name,
         )
         == request.execution_plan
+    )
+
+
+def test_clustering_uses_cpu_graph_publication_and_recovery(tmp_path: Path) -> None:
+    source = ClusteringSource(
+        execution_run_id=THIRD_RUN_ID,
+        run_name="source",
+        publication_sha256="a" * 64,
+        trajectory=ArtifactFile(
+            path="source.xtc", size_bytes=5, content_sha256="b" * 64
+        ),
+        template=ArtifactFile(
+            path="source.pdb", size_bytes=10, content_sha256="c" * 64
+        ),
+        frame_count=30,
+        protein_atoms=32,
+        ca_atoms=8,
+    )
+    request = ClusteringExecutionRequest(
+        run_name="clusters", source=source, max_active_gpu_provider_calls=0
+    )
+    assert parse_execution_request(request.to_bytes()) == request
+    claims = FakeClaims()
+    graph = gromacs_execution_graph(
+        request, _publications(tmp_path, request, claims, RUN_ID)
+    )
+    assert (
+        execution_plan(graph.validate(), workload_run_key=request.run_name)
+        == request.execution_plan
+    )
+    driver = CompletingDriver(tmp_path, request.run_name)
+    coordinator = _coordinator(tmp_path, request, claims, RUN_ID, driver=driver)
+    result = coordinator.run()
+    assert result.run.status == RunStatus.SUCCEEDED
+    assert driver.spawns == [
+        ("cluster_trajectory", {"request_content": request.to_bytes()})
+    ]
+    assert coordinator.run().run.status == RunStatus.SUCCEEDED
+    assert len(driver.spawns) == 1
+    assert (
+        replace(request, cutoff_angstrom=3).execution_plan.workload_plan_fingerprint
+        != request.execution_plan.workload_plan_fingerprint
     )
 
 

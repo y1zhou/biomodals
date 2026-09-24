@@ -9,6 +9,7 @@ import hashlib
 import os
 import secrets
 import time
+import zipfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -25,8 +26,17 @@ from service.antibody_fixture import annotated_archive, reference_csv
 from service.gromacs_preview_fixture import trajectory_archive
 from service.nanobody_fixture import result_directory as nanobody_result_directory
 
+from biomodals.app.bioinfo.gromacs.clustering import (
+    ClusteringExecutionRequest,
+    ClusteringSource,
+)
 from biomodals.app.bioinfo.gromacs.continuation import ContinuationSource
-from biomodals.app.bioinfo.gromacs.execution_runtime import GromacsExecutionRequest
+from biomodals.app.bioinfo.gromacs.execution_runtime import (
+    GromacsExecutionRequest,
+    parse_execution_request,
+)
+from biomodals.app.fold.alphafold3.chemistry import ChemistryReceipt
+from biomodals.app.fold.alphafold3.profiles import ALPHAFOLD3_COMMIT
 from biomodals.execution import (
     ActiveProviderCallCounts,
     DeploymentIdentity,
@@ -42,6 +52,7 @@ from biomodals.execution import (
     RunStatus,
 )
 from biomodals.execution.model import ProviderCallOverview
+from biomodals.schema import ArtifactFile
 from biomodals.service.alphafold3.router import create_router as af3_router
 from biomodals.service.alphafold3.validation import ValidatedInputStore
 from biomodals.service.antibody_sequence_analysis.reference import TherapeuticReference
@@ -432,8 +443,28 @@ class _FakeAdapter:
     async def input_request(self, job: JobRecord) -> GromacsExecutionRequest:
         content = self.pending.get(job.job_id)
         if content is not None:
-            return GromacsExecutionRequest.from_bytes(content)
+            return parse_execution_request(content)
         return self.requests[job.job_id]
+
+    async def clustering_preflight(self, _deployment) -> None:
+        pass
+
+    async def clustering_source(self, job: JobRecord, _deployment):
+        request = await self.input_request(job)
+        return ClusteringSource(
+            execution_run_id=job.job_id,
+            run_name=request.run_name,
+            publication_sha256="c" * 64,
+            trajectory=ArtifactFile(
+                path="production_nopbc.xtc", size_bytes=100, content_sha256="a" * 64
+            ),
+            template=ArtifactFile(
+                path="production_centered.pdb", size_bytes=100, content_sha256="b" * 64
+            ),
+            frame_count=3,
+            protein_atoms=12,
+            ca_atoms=3,
+        )
 
     async def continuation_source(self, job: JobRecord, _deployment):
         from biomodals.app.bioinfo.gromacs.continuation import ContinuationInspection
@@ -454,7 +485,7 @@ class _FakeAdapter:
         content = self.pending.get(job.job_id)
         if content is None:
             raise FileNotFoundError("Browser test request is unavailable")
-        request = GromacsExecutionRequest.from_bytes(content)
+        request = parse_execution_request(content)
         self.requests[job.job_id] = request
         self.remote.bind_plan(job.job_id, request.execution_plan)
 
@@ -465,14 +496,37 @@ class _FakeAdapter:
         self, job: JobRecord, cache: ArtifactCache, *, completed_at: int
     ) -> PreparedResult:
         del completed_at
-        digest = hashlib.sha256(self.archive).hexdigest()
+        archive = self.archive
+        schema = "gromacs-result/1"
+        request = self.requests.get(job.job_id)
+        if isinstance(request, ClusteringExecutionRequest):
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w") as zipped:
+                zipped.writestr(
+                    "clusters.csv",
+                    "frame,time_ns,cluster_id,is_medoid\n0,0.0,1,yes\n1,0.1,1,\n2,0.2,2,yes\n",
+                )
+                for frame in (0, 2):
+                    zipped.writestr(
+                        f"medoids/{request.run_name}-frame_{frame}.pdb", "END\n"
+                    )
+                zipped.writestr(
+                    "provenance.json",
+                    orjson.dumps({
+                        "source": request.source.model_dump(mode="json"),
+                        "cutoff_angstrom": request.cutoff_angstrom,
+                    }),
+                )
+            archive = output.getvalue()
+            schema = "gromacs-clustering/1"
+        digest = hashlib.sha256(archive).hexdigest()
         staging = cache.staging_path(str(job.job_id))
-        staging.write_bytes(self.archive)
+        staging.write_bytes(archive)
         try:
             await cache.publish_staged(
                 str(job.job_id),
                 staging,
-                size_bytes=len(self.archive),
+                size_bytes=len(archive),
                 sha256=digest,
             )
         finally:
@@ -480,9 +534,9 @@ class _FakeAdapter:
         return PreparedResult(
             "result.zip",
             "application/zip",
-            len(self.archive),
+            len(archive),
             digest,
-            "gromacs-result/1",
+            schema,
         )
 
 
@@ -625,6 +679,13 @@ class _FakeNanobodyAdapter(_FakeAdapter):
 
 
 class _FakeAlphaFold3Adapter(_FakeAdapter):
+    async def check_chemistry(self, content, deployment):
+        return ChemistryReceipt(
+            input_sha256=hashlib.sha256(content).hexdigest(),
+            ccd_sha256="a" * 64,
+            upstream_commit=ALPHAFOLD3_COMMIT,
+        )
+
     async def stage(self, job: JobRecord) -> None:
         raise AssertionError("AlphaFold3 is not submitted by this browser fixture")
 

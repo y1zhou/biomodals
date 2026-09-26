@@ -145,6 +145,8 @@ Resolve the latest stable TabPFN release/model and ESM release compatible with E
 
 Offline boundary tests cover schema reorder/mismatch, categorical handling, nonfinite values and output identity. Native package/image checks, checkpoint access, deterministic settings, and batched-versus-whole prediction tolerance remain separately reported gates, not claims made by mocked tests.
 
+The standalone implementation pins TabPFN 9.0.0 with the immutable V3.5 checkpoint recorded in the model API audit, Torch 2.11.0/CUDA 13.0 and scikit-learn 1.9.1. It stages content-bound CSV inputs in its own Volume, verifies them again before native consumption, and returns a content-bound prediction CSV. Workflow callers may use equivalently validated Parquet features. The default native ensemble has eight estimators and inference batches of 256 rows. The pinned native validator requires at least two training observations. Preparation is a tracked CPU stage with writable foundation storage; inference mounts it read-only and disables implicit network downloads. No fitted estimator is persisted. These are implemented offline boundaries, not evidence that the image or GPU inference has been exercised.
+
 ### 4. Exploration and protein-optimization workflow
 
 Implement `workflow/protein_optimization/workflow.py`, composing both apps but executing only the selected mode. Keep ESMC600M extraction workflow-owned initially. The workflow owns one existing execution-kernel Run; included app calls do not spawn nested coordinators. Reuse global total/GPU admission controls and pinned containing-deployment operation names.

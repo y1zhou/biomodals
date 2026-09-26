@@ -30,6 +30,9 @@ from biomodals.service.http_contract import (
 )
 from biomodals.service.jobs_api import create_jobs_router
 from biomodals.service.operations_api import create_operations_router
+from biomodals.service.protein_optimization.router import (
+    create_review_router as protein_optimization_review_router,
+)
 from biomodals.service.remote_execution import RemoteExecutionClient
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import ServiceStore
@@ -161,6 +164,7 @@ def create_app(
         },
     )
     app.include_router(analysis_router(analysis))
+    app.include_router(protein_optimization_review_router())
     app.include_router(create_operations_router(store=store, cache=cache))
     app.include_router(
         create_auth_router(

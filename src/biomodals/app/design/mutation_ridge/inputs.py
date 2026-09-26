@@ -18,6 +18,7 @@ import polars as pl
 AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 MAX_INPUT_BYTES = 10 * 1024 * 1024
 MAX_MEASUREMENT_ROWS = 10_000
+MAX_MUTATION_TOKENS = 100_000
 _TOKEN = re.compile(
     r"([^\s:,]+):([ACDEFGHIKLMNPQRSTVWY])([1-9][0-9]*)([ACDEFGHIKLMNPQRSTVWY])"
 )
@@ -147,6 +148,17 @@ def review_measurements(
         raise ValueError(f"Provide between 1 and {max_rows} measurement rows")
     if "id" not in frame.columns:
         frame = frame.with_columns(pl.lit("").alias("id"))
+    token_count = frame.select(
+        pl
+        .when(pl.col("mutations").str.strip_chars().str.len_chars() > 0)
+        .then(pl.col("mutations").str.count_matches(",") + 1)
+        .otherwise(0)
+        .sum()
+    ).item()
+    if token_count > MAX_MUTATION_TOKENS:
+        raise ValueError(
+            f"Measurement table exceeds {MAX_MUTATION_TOKENS} mutation tokens"
+        )
     frame = frame.with_row_index("row_index").with_columns(
         pl.col("label").str.strip_chars().cast(pl.Float64, strict=False).alias("value")
     )
@@ -266,6 +278,13 @@ def build_dataset(content: bytes, parental_fasta: str) -> MutationDataset:
     """Validate all rows and aggregate identical variants using the supplied scale."""
     review = review_measurements(content)
     parents = parse_parents(parental_fasta)
+    return validated_dataset(review, parents)
+
+
+def validated_dataset(
+    review: MeasurementReview, parents: dict[str, str]
+) -> MutationDataset:
+    """Reuse a local review without reparsing the user's table or retaining a cache."""
     issues = review.issues + parent_issues(review, parents)
     if issues:
         first = issues[0]

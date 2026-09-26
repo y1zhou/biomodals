@@ -131,7 +131,7 @@ Tests cover quoted mutation lists, arbitrary multichain parents, ordering-equiva
 
 ### 2. Standalone mutation-ridge app and Combination path
 
-Expose `app/design/mutation_ridge/app.py` through existing app discovery/CLI and a workflow-compatible operation. Fit an intercept-bearing ridge regressor on unscaled binary columns for measured exact substitutions. Start with explicit app-level `alpha=1.0` rather than add automatic hyperparameter search; record the parameter and use the same policy in validation. A later tuning option must remain training-fold-local, never use evaluation labels. This is an implementation default proposed for plan approval, not a claim of optimal regularization.
+Expose `app/design/mutation_ridge/app.py` through existing app discovery/CLI and a workflow-compatible operation. Fit an intercept-bearing ridge regressor on unscaled binary columns for measured exact substitutions. Use the approved app-level `alpha=1.0` rather than add automatic hyperparameter search; record the parameter and use the same policy in validation. A later tuning option must remain training-fold-local, never use evaluation labels. This default is not a claim of optimal regularization. The native implementation uses scikit-learn 1.9.1, sparse CSR features and its intercept-aware `lsqr` solver with tolerance `1e-10`.
 
 Count compatible novel combinations before admission, enumerate in bounded batches, exclude measured/parental variants, and score using the fitted intercept and active substitution coefficients rather than constructing a dense candidate-by-feature matrix. Stream complete candidate rows to CSV. Perform support-aware held-out-combination validation when feasible, then refit on the complete aggregated measurements for production scoring.
 

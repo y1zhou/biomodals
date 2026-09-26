@@ -220,9 +220,7 @@ def write_combinations(
     }
     variants = iter_combinations(dataset, max_mutations=max_mutations, budget=budget)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with TemporaryDirectory(
-        prefix="ridge-candidates-", dir=output_path.parent
-    ) as staging:
+    with TemporaryDirectory(prefix="ridge-candidates-") as staging:
         spool = Path(staging) / "candidates.csv"
         offset = 0
         with spool.open("wb") as handle:

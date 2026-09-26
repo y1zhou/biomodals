@@ -157,3 +157,27 @@ def test_rejected_large_space_uses_exact_string_not_unsafe_json_integer(tmp_path
         assert result["review_digest"] is None
     finally:
         asyncio.run(app.state.antibody_analysis.shutdown())
+
+
+def test_exploration_requires_two_unique_native_training_rows(tmp_path):
+    """Replicate rows cannot satisfy the estimator's minimum sample count."""
+    app = _app(tmp_path)
+    try:
+        _humanization_session(app)
+        result = _request(
+            app,
+            "POST",
+            ROOT + "/review",
+            json={
+                "measurements_csv": "mutations,label\nA:A1V,1\nA:A1V,3\n",
+                "parental_fasta": ">A\nAA\n",
+                "settings": {"mode": "exploration", "candidate_budget": 5},
+            },
+        ).json()
+        assert result["unique_variant_count"] == 1
+        assert result["replicate_rows"] == 1
+        assert result["errors"][0]["code"] == "invalid_design_space"
+        assert "two unique" in result["errors"][0]["message"]
+        assert result["review_digest"] is None
+    finally:
+        asyncio.run(app.state.antibody_analysis.shutdown())

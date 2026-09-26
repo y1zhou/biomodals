@@ -10,10 +10,14 @@ import orjson
 from pydantic import BaseModel, ConfigDict
 
 from biomodals.app.misc.tabpfn.execution import TabPFNRequest
-from biomodals.app.misc.tabpfn.models import RUNTIME_IDENTITY, native_regressor
+from biomodals.app.misc.tabpfn.models import (
+    RUNTIME_IDENTITY,
+    checkpoint,
+    native_regressor,
+)
 from biomodals.app.misc.tabpfn.tables import (
     RegressionTables,
-    fit_predict_tables,
+    fit_evaluate_tables,
     read_table_file,
 )
 from biomodals.helper.app_run import AppRunLayout, volume_app_output
@@ -32,8 +36,7 @@ class PredictionPublication(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_sha256: str
     runtime_identity: str
-    csv_sha256: str
-    csv_bytes: int
+    files: tuple[ArtifactFile, ...]
     result: AppRunResult
 
 
@@ -61,12 +64,24 @@ def run_tabpfn(
     if marker.exists():
         saved = PredictionPublication.model_validate_json(
             read_bounded_file_bytes(
-                marker, field_name="prediction publication", max_bytes=1024 * 1024
+                marker, field_name="prediction publication", max_bytes=32 * 1024 * 1024
             )
         )
         if saved.request_sha256 != digest or saved.runtime_identity != runtime_identity:
             raise ValueError("Prediction namespace belongs to a different request")
-        if not file_matches_sha256(destination, saved.csv_bytes, saved.csv_sha256):
+        expected = (
+            {"predictions.csv", "validation.csv"}
+            if request.validation_folds
+            else {"predictions.csv"}
+        )
+        if {record.path for record in saved.files} != expected or any(
+            not file_matches_sha256(
+                layout.outputs_dir / record.path,
+                record.size_bytes,
+                record.content_sha256,
+            )
+            for record in saved.files
+        ):
             raise ValueError("Published predictions failed integrity validation")
         return saved.result
     tables = RegressionTables(
@@ -78,19 +93,29 @@ def run_tabpfn(
             request.inference.resolve(volume_root), request.table_schema, training=False
         ),
     )
-    estimator = native_regressor(
-        model_root,
+    model_path = checkpoint(model_root)
+    predicted, validation, widths = fit_evaluate_tables(
+        tables,
+        lambda: native_regressor(
+            model_path,
+            seed=request.seed,
+            n_estimators=request.n_estimators,
+            categorical_indices=tables.categorical_indices,
+        ),
+        batch_size=request.batch_size,
+        validation_folds=request.validation_folds,
+        pca_components=request.pca_components,
         seed=request.seed,
-        n_estimators=request.n_estimators,
-        categorical_indices=tables.categorical_indices,
     )
-    predicted = fit_predict_tables(tables, estimator, batch_size=request.batch_size)
     layout.prep_dir.mkdir(parents=True, exist_ok=True)
     layout.outputs_dir.mkdir(parents=True, exist_ok=True)
     temporary = layout.prep_dir / "predictions.csv"
     predicted.write_csv(temporary)
     temporary.replace(destination)
     csv_digest, size = sha256_file(destination), destination.stat().st_size
+    files = [
+        ArtifactFile(path=destination.name, size_bytes=size, content_sha256=csv_digest)
+    ]
     result = AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[
@@ -114,15 +139,37 @@ def run_tabpfn(
                     "feature_schema": request.table_schema.model_dump(mode="json"),
                     "training_rows": tables.training.height,
                     "prediction_rows": predicted.height,
+                    "fitted_feature_widths": list(widths),
                 },
             )
         ],
     )
+    if request.validation_folds:
+        temporary = layout.prep_dir / "validation.csv"
+        validation.write_csv(temporary)
+        validation_path = layout.outputs_dir / "validation.csv"
+        temporary.replace(validation_path)
+        record = ArtifactFile(
+            path=validation_path.name,
+            size_bytes=validation_path.stat().st_size,
+            content_sha256=sha256_file(validation_path),
+        )
+        files.append(record)
+        result.outputs.append(
+            volume_app_output(
+                name="validation",
+                kind=ArtifactKind.TABLE,
+                remote_path=str(validation_path),
+                mount_root=str(volume_root),
+                volume_name=volume_name,
+                media_type="text/csv",
+                files=[record],
+            )
+        )
     publication = PredictionPublication(
         request_sha256=digest,
         runtime_identity=runtime_identity,
-        csv_sha256=csv_digest,
-        csv_bytes=size,
+        files=tuple(files),
         result=result,
     )
     write_bytes_atomic(marker, publication.model_dump_json().encode())

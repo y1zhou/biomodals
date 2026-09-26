@@ -173,23 +173,28 @@ def read_regression_tables(
 
 
 def fit_predict_tables(
-    tables: RegressionTables, estimator, *, batch_size: int = 256
+    tables: RegressionTables,
+    estimator,
+    *,
+    batch_size: int = 256,
+    feature_transform=None,
 ) -> pl.DataFrame:
     """Fit once on all rows, convert only at native boundaries, and preserve IDs."""
     import numpy as np
 
     if not 1 <= batch_size <= 4096:
         raise ValueError("Prediction batch size must be between 1 and 4096")
-    estimator.fit(
-        tables.training.select(tables.feature_names).to_numpy(),
-        tables.training[tables.schema.target].to_numpy(),
-    )
+    training = tables.training.select(tables.feature_names).to_numpy()
+    if feature_transform is not None:
+        training = feature_transform.fit_transform(training)
+    estimator.fit(training, tables.training[tables.schema.target].to_numpy())
     predictions = []
     for batch in tables.inference.iter_slices(batch_size):
+        features = batch.select(tables.feature_names).to_numpy()
+        if feature_transform is not None:
+            features = feature_transform.transform(features)
         predicted = np.asarray(
-            estimator.predict(
-                batch.select(tables.feature_names).to_numpy(), output_type="mean"
-            ),
+            estimator.predict(features, output_type="mean"),
             dtype=np.float64,
         )
         if predicted.shape != (len(batch),) or not np.isfinite(predicted).all():
@@ -202,3 +207,91 @@ def fit_predict_tables(
         else pl.DataFrame({"row_index": range(tables.inference.height)})
     )
     return identifiers.with_columns(labels)
+
+
+def fit_evaluate_tables(
+    tables: RegressionTables,
+    estimator_factory,
+    *,
+    batch_size: int = 256,
+    validation_folds: tuple[tuple[int, ...], ...] = (),
+    pca_components: int | None = None,
+    seed: int = 0,
+) -> tuple[pl.DataFrame, pl.DataFrame, tuple[int, ...]]:
+    """Fresh fold-local preprocessing/models, then an unconditional all-data refit.
+
+    This generic boundary receives explicit holdout indices. The caller owns the
+    scientific split policy; this app never invents random validation rows.
+    """
+    if pca_components is not None and (
+        pca_components < 1 or tables.categorical_indices
+    ):
+        raise ValueError(
+            "PCA requires numeric-only features and a positive component bound"
+        )
+    if len(validation_folds) > 5:
+        raise ValueError("At most five validation folds are supported")
+    for indices in validation_folds:
+        if (
+            not indices
+            or len(set(indices)) != len(indices)
+            or min(indices) < 0
+            or max(indices) >= tables.training.height
+        ):
+            raise ValueError("Invalid held-out row indices")
+        if tables.training.height - len(indices) < 2:
+            raise ValueError(
+                "Every validation fold must retain at least two training rows"
+            )
+    widths = []
+
+    def predict(subset):
+        transform = None
+        width = len(subset.feature_names)
+        if pca_components is not None and width > pca_components:
+            from sklearn.decomposition import PCA
+
+            width = min(pca_components, subset.training.height - 1)
+            transform = PCA(
+                n_components=width, svd_solver="randomized", random_state=seed
+            )
+        widths.append(width)
+        return fit_predict_tables(
+            subset,
+            estimator_factory(),
+            batch_size=batch_size,
+            feature_transform=transform,
+        )
+
+    records = []
+    for fold_index, indices in enumerate(validation_folds):
+        held = set(indices)
+        training_indices = [i for i in range(tables.training.height) if i not in held]
+        inference_columns = tables.feature_names + (
+            [] if tables.schema.identifier is None else [tables.schema.identifier]
+        )
+        subset = RegressionTables(
+            tables.schema,
+            tables.training[training_indices],
+            tables.training[list(indices)].select(inference_columns),
+        )
+        values = predict(subset)
+        records.append(
+            pl.DataFrame({
+                "fold_index": pl.Series([fold_index] * len(indices), dtype=pl.UInt32),
+                "row_index": pl.Series(indices, dtype=pl.UInt32),
+                "predicted_label": values["predicted_label"],
+            })
+        )
+    validation = (
+        pl.concat(records)
+        if records
+        else pl.DataFrame(
+            schema={
+                "fold_index": pl.UInt32,
+                "row_index": pl.UInt32,
+                "predicted_label": pl.Float64,
+            }
+        )
+    )
+    return predict(tables), validation, tuple(widths)

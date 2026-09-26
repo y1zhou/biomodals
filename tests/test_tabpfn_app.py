@@ -54,6 +54,10 @@ def test_fit_predict_publication_redelivery_and_tampering(tmp_path, monkeypatch)
     """Same completed task never refits, and result bytes are content-bound."""
     request = _request(tmp_path)
     events = []
+    monkeypatch.setattr(
+        "biomodals.app.misc.tabpfn.runtime.checkpoint",
+        lambda root: root / "verified.safetensors",
+    )
 
     class Estimator:
         def fit(self, x, y):

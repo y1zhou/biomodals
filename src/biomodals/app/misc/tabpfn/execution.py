@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.app.misc.tabpfn.models import RUNTIME_IDENTITY
-from biomodals.app.misc.tabpfn.tables import MAX_PARQUET_BYTES, TableSchema
+from biomodals.app.misc.tabpfn.tables import (
+    MAX_PARQUET_BYTES,
+    MAX_TRAIN_ROWS,
+    TableSchema,
+)
 from biomodals.execution import ExecutionGraph, ExecutionPlanMetadata
 from biomodals.execution.nodes import NodeRunContext, ProviderCallSpec, ProviderNode
 from biomodals.helper.artifacts import file_matches_sha256
@@ -47,6 +52,10 @@ class TabPFNRequest(BaseModel):
     seed: int = Field(default=0, ge=0, le=2**32 - 1)
     n_estimators: int = Field(default=8, ge=1, le=32)
     batch_size: int = Field(default=256, ge=1, le=4096)
+    pca_components: int | None = Field(default=None, ge=1, le=6000)
+    validation_folds: tuple[
+        Annotated[tuple[int, ...], Field(max_length=MAX_TRAIN_ROWS)], ...
+    ] = Field(default=(), max_length=5)
 
     def scientific_identity(self) -> dict:
         """Staging location is transport, not model or data identity."""

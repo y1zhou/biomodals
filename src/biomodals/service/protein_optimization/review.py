@@ -101,6 +101,10 @@ def review_inputs(body: OptimizationReviewRequest) -> OptimizationReview:
                 candidate_budget=body.settings.candidate_budget,
             )
         else:
+            if len(dataset.variants) < 2:
+                raise ValueError(
+                    "Exploration requires at least two unique measured variants for native TabPFN fitting"
+                )
             if any(
                 len(sequence) > options.max_exploration_chain_length
                 for sequence in parents.values()

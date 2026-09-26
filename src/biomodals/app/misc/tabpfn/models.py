@@ -11,7 +11,7 @@ MODEL_FILENAME = "tabpfn-v3.5-20260909.safetensors"
 MODEL_SHA256 = "ece4d67eadfea42eb0e610df5189bea60cb7f31073d81e9c7a019b76eacf0be3"
 MODEL_BYTES = 876_027_932
 TORCH_VERSION = "2.11.0"
-RUNTIME_IDENTITY = f"tabpfn={TABPFN_VERSION}|model={MODEL_REVISION}|sha256={MODEL_SHA256}|torch={TORCH_VERSION}|sklearn=1.9.1|schema=1"
+RUNTIME_IDENTITY = f"tabpfn={TABPFN_VERSION}|model={MODEL_REVISION}|sha256={MODEL_SHA256}|torch={TORCH_VERSION}|sklearn=1.9.1|schema=2"
 
 
 def checkpoint(root: Path) -> Path:
@@ -43,21 +43,20 @@ def provision_checkpoint(root: Path) -> Path:
 
 
 def native_regressor(
-    root: Path,
+    checkpoint_path: Path,
     *,
     categorical_indices: list[int] | None = None,
     seed: int = 0,
     n_estimators: int = 8,
     device: str = "cuda",
 ):
-    """Load local frozen weights; no user-fitted state survives this invocation."""
-    path = checkpoint(root)
+    """Load the caller-verified local checkpoint without repeating its large hash."""
     import torch  # type: ignore[ty:unresolved-import]
 
     from tabpfn import TabPFNRegressor  # type: ignore[ty:unresolved-import]
 
     return TabPFNRegressor(
-        model_path=path,
+        model_path=checkpoint_path,
         n_estimators=n_estimators,
         random_state=seed,
         device=device,

@@ -6,6 +6,7 @@ import pytest
 from biomodals.app.misc.tabpfn.tables import (
     TableFeature,
     TableSchema,
+    fit_evaluate_tables,
     fit_predict_tables,
     read_regression_tables,
 )
@@ -77,3 +78,58 @@ def test_extra_features_identifier_leakage_and_infinite_features_are_rejected():
             read_regression_tables(
                 b"id,group,response,dose\na,a,1,1\n", inference, _schema()
             )
+
+
+def test_fold_local_pca_and_final_refit_use_exact_training_rows(monkeypatch):
+    """Held-out extremes cannot affect fold projections; final fit restores all rows."""
+    from sklearn.decomposition import PCA
+
+    from biomodals.app.misc.tabpfn.tables import RegressionTables
+
+    schema = TableSchema(
+        target="y", features=tuple(TableFeature(name=name) for name in ("a", "b", "c"))
+    )
+    tables = read_regression_tables(
+        b"a,b,c,y\n1,2,3,10\n2,4,5,20\n3,5,7,30\n1000,2000,3000,40\n",
+        b"a,b,c\n4,6,8\n5,7,9\n",
+        schema,
+    )
+    fitted_pca, fitted_labels = [], []
+
+    class RecordedPCA(PCA):
+        def fit_transform(self, x, y=None):
+            fitted_pca.append(x.copy())
+            return super().fit_transform(x, y)
+
+    class Estimator:
+        def fit(self, x, y):
+            fitted_labels.append(y.copy())
+            self.mean = y.mean()
+
+        def predict(self, x, **kwargs):
+            return np.repeat(self.mean, len(x))
+
+    monkeypatch.setattr("sklearn.decomposition.PCA", RecordedPCA)
+    predictions, validation, widths = fit_evaluate_tables(
+        tables,
+        Estimator,
+        validation_folds=((3,), (0,)),
+        pca_components=2,
+        batch_size=1,
+    )
+    assert [len(rows) for rows in fitted_pca] == [3, 3, 4]
+    assert fitted_pca[0][:, 0].tolist() == [1, 2, 3]
+    assert fitted_pca[-1][:, 0].tolist() == [1, 2, 3, 1000]
+    assert fitted_labels[-1].tolist() == [10, 20, 30, 40]
+    assert predictions["predicted_label"].to_list() == [25, 25]
+    assert validation["row_index"].to_list() == [3, 0]
+    assert widths == (2, 2, 2)
+    for bad in (((0, 1, 2),), ((-1,),), ((4,),), ((0, 0),)):
+        with pytest.raises(ValueError):
+            fit_evaluate_tables(tables, Estimator, validation_folds=bad)
+    with pytest.raises(ValueError, match="numeric-only"):
+        fit_evaluate_tables(
+            RegressionTables(_schema(), tables.training, tables.inference),
+            Estimator,
+            pca_components=2,
+        )

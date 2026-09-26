@@ -28,6 +28,7 @@ from biomodals.workflow.protein_optimization.settings import (
 )
 
 REVIEW_VERSION = "1"
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
 
 class ProteinOptimizationOptions(BaseModel):

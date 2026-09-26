@@ -88,11 +88,11 @@ def review_inputs(body: OptimizationReviewRequest) -> OptimizationReview:
         if body.settings.mode == "combination":
             count = sum(combination_space(dataset, body.settings.max_mutations)[1])
             response.candidate_space_size = str(count)
-            response.evaluation_count = count
             if count > body.settings.candidate_budget:
                 raise ValueError(
                     f"All {count} novel combinations require a budget of at least {count}; reduce maximum mutations or raise the budget"
                 )
+            response.evaluation_count = count
             # Enforce the standalone app's identical scientific/resource boundary.
             RidgeRequest(
                 measurements_csv=body.measurements_csv,

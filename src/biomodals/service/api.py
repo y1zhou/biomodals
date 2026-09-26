@@ -30,6 +30,9 @@ from biomodals.service.http_contract import (
 )
 from biomodals.service.jobs_api import create_jobs_router
 from biomodals.service.operations_api import create_operations_router
+from biomodals.service.protein_optimization.contracts import (
+    MAX_REQUEST_BYTES as PROTEIN_OPTIMIZATION_MAX_REQUEST_BYTES,
+)
 from biomodals.service.protein_optimization.router import (
     create_review_router as protein_optimization_review_router,
 )
@@ -159,6 +162,7 @@ def create_app(
             "/api/v1/humanization/jobs": 4 * 1024 * 1024,
             "/api/v1/nanobody-humanization/jobs": 1024 * 1024,
             "/api/v1/nanobody-humanization/prepare": 1024 * 1024,
+            "/api/v1/protein-optimization/review": PROTEIN_OPTIMIZATION_MAX_REQUEST_BYTES,
             "/api/v1/antibody-sequence-analysis/analyze": MAX_REQUEST_BYTES,
             "/api/v1/antibody-sequence-analysis/sequence": MAX_REQUEST_BYTES,
         },

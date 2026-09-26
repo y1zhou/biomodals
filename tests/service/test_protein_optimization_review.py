@@ -28,6 +28,12 @@ def test_authenticated_discovery_preserves_bad_rows_then_validates_parent(tmp_pa
         assert options["defaults"]["combination"]["candidate_budget"] == 1_000_000
         assert options["defaults"]["exploration"]["candidate_budget"] == 5000
         assert options["max_exploration_chain_length"] == 2046
+        assert (
+            options["settings_schema"]["$defs"]["PositionChoices"]["properties"][
+                "amino_acids"
+            ]["default"]
+            == "ADEFGHIKLNPQRSTVWY"
+        )
         response = _request(
             app,
             "POST",
@@ -122,5 +128,32 @@ def test_invalid_csv_is_known_rejection_and_parentless_only_rows_need_fasta(tmp_
         assert result["required_chain_ids"] == []
         assert result["review_digest"] is None
         assert result["rows"][0]["canonical_mutations"] == ""
+    finally:
+        asyncio.run(app.state.antibody_analysis.shutdown())
+
+
+def test_rejected_large_space_uses_exact_string_not_unsafe_json_integer(tmp_path):
+    """A valid input can describe more combinations than a browser can count."""
+    app = _app(tmp_path)
+    try:
+        _humanization_session(app)
+        positions = 60
+        measurements = "mutations,label\n" + "".join(
+            f"A:A{position}V,{position}\n" for position in range(1, positions + 1)
+        )
+        result = _request(
+            app,
+            "POST",
+            ROOT + "/review",
+            json={
+                "measurements_csv": measurements,
+                "parental_fasta": ">A\n" + "A" * positions,
+                "settings": {"max_mutations": positions},
+            },
+        ).json()
+        assert result["candidate_space_size"] == str(2**positions - positions - 1)
+        assert result["evaluation_count"] is None
+        assert result["errors"][0]["code"] == "invalid_design_space"
+        assert result["review_digest"] is None
     finally:
         asyncio.run(app.state.antibody_analysis.shutdown())

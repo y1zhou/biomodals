@@ -117,17 +117,14 @@ def test_worker_reload_then_commit_and_reject_wrong_runtime(tmp_path, monkeypatc
 
 def test_cli_dry_run_requires_no_modal_calls(tmp_path, monkeypatch, capsys):
     """Input and graph validation precede any coordinator lookup."""
-    csv, fasta = tmp_path / "measurements.csv", tmp_path / "parent.fasta"
+    csv = tmp_path / "measurements.csv"
     csv.write_text(_request().measurements_csv)
-    fasta.write_text(_request().parental_fasta)
     monkeypatch.setattr(
         ridge_app.orchestrator,
         "execution_coordinator_handle",
         lambda **kwargs: pytest.fail("Unexpected Modal access"),
     )
-    ridge_app.submit_mutation_ridge_task(
-        input_csv=str(csv), parental_fasta=str(fasta), dry_run=True
-    )
+    ridge_app.submit_mutation_ridge_task(input_csv=str(csv), dry_run=True)
     assert "fit_score_combinations" in capsys.readouterr().out
 
 

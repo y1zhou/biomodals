@@ -354,7 +354,7 @@ class ExecutionCoordinator:
 @app.local_entrypoint()
 def submit_protein_optimization_workflow(
     input_csv: str,
-    parental_fasta: str,
+    parental_fasta: str | None = None,
     mode: str = "combination",
     settings_json: str | None = None,
     run_id: str | None = None,
@@ -372,7 +372,7 @@ def submit_protein_optimization_workflow(
 
     Args:
         input_csv: mutations,label CSV with optional id and quoted mutation lists.
-        parental_fasta: Full parental chains keyed by case-sensitive FASTA IDs.
+        parental_fasta: Full chain-ID FASTA, required only for Exploration.
         mode: combination or exploration, using that mode's complete defaults.
         settings_json: Optional complete settings JSON; its mode must match --mode.
         run_id: Display label, defaulting to the input CSV stem.
@@ -407,11 +407,15 @@ def submit_protein_optimization_workflow(
             field_name="measurements",
             max_bytes=MAX_INPUT_BYTES,
         ).decode(),
-        parental_fasta=read_bounded_file_bytes(
-            Path(parental_fasta).expanduser(),
-            field_name="parental FASTA",
-            max_bytes=MAX_INPUT_BYTES,
-        ).decode(),
+        parental_fasta=(
+            read_bounded_file_bytes(
+                Path(parental_fasta).expanduser(),
+                field_name="parental FASTA",
+                max_bytes=MAX_INPUT_BYTES,
+            ).decode()
+            if parental_fasta is not None
+            else None
+        ),
         settings=settings,
     )
     if dry_run:

@@ -150,3 +150,12 @@ def test_chain_ids_are_case_sensitive_and_never_path_sanitized():
     )
     assert dataset.parents == {"../A": "A", "a": "C"}
     assert dataset.observations["id"].item() == "../../sample"
+
+
+def test_table_only_dataset_validates_original_claims_without_sequence_padding():
+    """Unobserved positions require neither invented residues nor dense arrays."""
+    dataset = build_dataset(b"mutations,label\nA:Y900000F,-1\nB:A4V,-2\n")
+    assert [m.token for m in dataset.vocabulary] == ["A:Y900000F", "B:A4V"]
+    assert combination_space(dataset, 2)[1] == (0, 0, 1)
+    with pytest.raises(ValueError, match="Rows disagree"):
+        build_dataset(b"mutations,label\nA:Y5F,1\nA:A5V,2\n")

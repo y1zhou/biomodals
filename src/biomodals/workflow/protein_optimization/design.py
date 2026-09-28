@@ -32,11 +32,11 @@ from biomodals.workflow.protein_optimization.settings import OptimizationSetting
 
 PCA_COMPONENTS = 1024
 SCIENTIFIC_VERSIONS = {
-    "workflow": "1",
+    "workflow": "2",
     "result_schema": "1",
     "ridge": RIDGE_IDENTITY,
     "sampling": "1",
-    "validation": "1",
+    "validation": "2",
     "esmc": EMBEDDING_IDENTITY,
     "tabpfn": TABPFN_IDENTITY,
     "projection": f"numeric_randomized_pca_max{PCA_COMPONENTS}_train_only_v1",
@@ -48,11 +48,15 @@ class OptimizationDesign(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
     measurements_csv: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
-    parental_fasta: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
+    parental_fasta: str | None = Field(
+        default=None, min_length=1, max_length=MAX_INPUT_BYTES
+    )
     settings: OptimizationSettings = Field(default_factory=OptimizationSettings)
 
     def dataset(self) -> MutationDataset:
         """Restore all validated observations, independent of proposal distance."""
+        if self.settings.mode == "exploration" and self.parental_fasta is None:
+            raise ValueError("Exploration requires parental chain sequences")
         return build_dataset(self.measurements_csv.encode(), self.parental_fasta)
 
     def candidate_count(self, dataset: MutationDataset) -> int:
@@ -98,7 +102,7 @@ class OptimizationDesign(BaseModel):
         self.settings.validate_mode_budget()
         dataset = self.dataset()
         if (
-            len(dataset.parents) > 16
+            len(set(dataset.parents) | {m.chain for m in dataset.vocabulary}) > 16
             or sum(map(len, dataset.parents.values())) > MAX_TOTAL_RESIDUES
         ):
             raise ValueError(

@@ -1,6 +1,7 @@
 """Measurement parsing shared by standalone ridge and protein optimization.
 
-Positions refer to one-based, untrimmed parental sequences. Display IDs never
+Positions refer to one-based, untrimmed parental sequences; Combination needs
+only the original residue claims at observed sites. Display IDs never
 participate in variant identity or become paths. Invalid rows remain addressable;
 only an error-free review may become a scientific dataset.
 """
@@ -69,7 +70,7 @@ class MeasurementReview:
 
 @dataclass(frozen=True)
 class MutationDataset:
-    """Validated parents, canonical mean labels, and replicate evidence."""
+    """Optional full parents, canonical mean labels, and replicate evidence."""
 
     parents: dict[str, str]
     measurements: pl.DataFrame
@@ -274,18 +275,18 @@ def parent_issues(
     return tuple(issues)
 
 
-def build_dataset(content: bytes, parental_fasta: str) -> MutationDataset:
+def build_dataset(content: bytes, parental_fasta: str | None = None) -> MutationDataset:
     """Validate all rows and aggregate identical variants using the supplied scale."""
     review = review_measurements(content)
-    parents = parse_parents(parental_fasta)
+    parents = None if parental_fasta is None else parse_parents(parental_fasta)
     return validated_dataset(review, parents)
 
 
 def validated_dataset(
-    review: MeasurementReview, parents: dict[str, str]
+    review: MeasurementReview, parents: dict[str, str] | None = None
 ) -> MutationDataset:
     """Reuse a local review without reparsing the user's table or retaining a cache."""
-    issues = review.issues + parent_issues(review, parents)
+    issues = review.issues + (() if parents is None else parent_issues(review, parents))
     if issues:
         first = issues[0]
         raise ValueError(f"Measurement row {first.row_index}: {first.message}")
@@ -304,7 +305,7 @@ def validated_dataset(
     if not measurements["label"].is_finite().all():
         raise ValueError("Replicate aggregation produced a nonfinite label")
     return MutationDataset(
-        parents,
+        parents or {},
         measurements,
         review.observations,
         tuple(parse_mutations(value) for value in measurements["mutations"]),

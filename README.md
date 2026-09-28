@@ -100,12 +100,17 @@ Deploy them separately only when they must also run as standalone apps.
 For experimental protein optimization, `protein_optimization` offers two modes:
 Combination uses additive ridge regression to recombine measured substitutions;
 Exploration uses frozen ESMC600M features and TabPFN to score sampled novel
-substitutions. Upload a `mutations,label` CSV first, then full parental FASTA
-chains matching the chain IDs in expressions such as `A:Y52F`. Multiple
-substitutions belong in a quoted, comma-separated CSV cell. Labels stay on your
-supplied scale; choose whether higher or lower is better. The final model fits
+substitutions. Upload a `mutations,label` CSV with expressions such as `A:Y52F`.
+Combination needs only this table; Exploration additionally requires full
+parental FASTA chains matching its chain IDs. Multiple substitutions belong in
+a quoted, comma-separated CSV cell. Normalize labels and correct batch/plate
+effects before uploading: for example, use `log10(mutant KD) - log10(parent KD)`
+with each plate's own parent control, then choose lower-is-better. A parent row
+is not required. Labels stay on your supplied scale. The final model fits
 all measurements, while the result summary reports separate support-aware
 held-out validation when available. Predictions are not experimental confirmation.
+Table-only Combination results contain mutation combinations and scores;
+Exploration also returns reconstructed full-chain sequences.
 
 The website displays only novel candidates, with server-side paging, sorting,
 filtering and selection. Download all candidates through the normal Job download

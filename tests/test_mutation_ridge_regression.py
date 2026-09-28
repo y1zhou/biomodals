@@ -90,7 +90,6 @@ def test_singles_only_and_confounded_inputs_show_truthful_warnings():
     assert summary.evaluated_variants == 0
     assert summary.mae is None
     assert any("No supported multi-mutant" in warning for warning in summary.warnings)
-    assert any("No parental measurement" in warning for warning in summary.warnings)
     confounded = build_dataset(b'mutations,label\n,1\n"A:A1C,A:A2C",2\n', ">A\nAA\n")
     assert any(
         "confounded" in warning for warning in validate_ridge(confounded).warnings
@@ -146,3 +145,24 @@ def test_zero_novel_candidates_still_write_typed_csv_header(tmp_path):
         "sequence_A",
     ]
     assert summary.training_variants == 2
+
+
+def test_table_only_fit_preserves_normalized_labels_and_predictions(tmp_path):
+    """Sequences are irrelevant to ridge; mutation identities fully specify features."""
+    content = b"mutations,label\nA:A1C,-0.2\nA:A2V,-0.4\nB:C1A,0.1\n"
+    sparse = build_dataset(content)
+    complete = build_dataset(content, ">A\nAA\n>B\nC\n")
+    write_combinations(sparse, tmp_path / "sparse.csv")
+    write_combinations(complete, tmp_path / "complete.csv")
+    output = pl.read_csv(tmp_path / "sparse.csv")
+    assert output.height == 3
+    assert output.columns == [
+        "id",
+        "mutations",
+        "predicted_label",
+        "n_mutations",
+        "n_new_mutations",
+        "warnings",
+    ]
+    assert output.equals(pl.read_csv(tmp_path / "complete.csv").select(output.columns))
+    assert sparse.measurements["label"].to_list() == [-0.2, -0.4, 0.1]

@@ -2,7 +2,8 @@
 
 Fit a sparse additive regressor to measurements and score every compatible,
 unmeasured combination through a mutation-count bound. Inputs are mutations,label
-CSV and chain-ID parental FASTA; positions are one-based raw coordinates. Results
+CSV with already-normalized labels. Chain-ID parental FASTA is optional for
+sequence validation/output; positions are one-based raw coordinates. Results
 are candidates.csv, not a serialized fitted model. Ridge does not model epistasis.
 No pretrained weights or GPU are required. Deploy for recoverable CLI execution.
 """
@@ -103,7 +104,7 @@ def check_mutation_ridge_artifact(artifact: ExecutionArtifact) -> ArtifactAvaila
 @app.local_entrypoint()
 def submit_mutation_ridge_task(
     input_csv: str,
-    parental_fasta: str,
+    parental_fasta: str | None = None,
     output_csv: str = "candidates.csv",
     max_mutations: int = 2,
     candidate_budget: int = 1_000_000,
@@ -123,7 +124,7 @@ def submit_mutation_ridge_task(
 
     Args:
         input_csv: Measurement table with mutations,label and optional id columns.
-        parental_fasta: Multi-record FASTA with mutation-table chain IDs.
+        parental_fasta: Optional FASTA for validation and full-chain output only.
         output_csv: New local candidate CSV; existing files are never overwritten.
         max_mutations: Maximum total parent-relative substitutions in candidates.
         candidate_budget: Exhaustive admission ceiling; never silently sampled.
@@ -144,14 +145,18 @@ def submit_mutation_ridge_task(
         field_name="measurements",
         max_bytes=MAX_INPUT_BYTES,
     )
-    fasta = read_bounded_file_bytes(
-        Path(parental_fasta).expanduser(),
-        field_name="parental FASTA",
-        max_bytes=MAX_INPUT_BYTES,
+    fasta = (
+        read_bounded_file_bytes(
+            Path(parental_fasta).expanduser(),
+            field_name="parental FASTA",
+            max_bytes=MAX_INPUT_BYTES,
+        ).decode("utf-8")
+        if parental_fasta is not None
+        else None
     )
     request = RidgeRequest(
         measurements_csv=content.decode("utf-8"),
-        parental_fasta=fasta.decode("utf-8"),
+        parental_fasta=fasta,
         max_mutations=max_mutations,
         candidate_budget=candidate_budget,
         alpha=alpha,

@@ -101,10 +101,6 @@ def exploration_summary(
         warnings.append(
             "Predictions for variants evaluated in multiple substitution holdouts are averaged before computing metrics."
         )
-    if () not in variants:
-        warnings.append(
-            "No parental measurement was supplied; scores are predictions, not measured improvement over the parent."
-        )
     return ValidationSummary(
         regime="same_position_alternatives",
         training_variants=len(variants),

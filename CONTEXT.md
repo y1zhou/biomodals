@@ -1336,8 +1336,9 @@ _Avoid_: temporary scratch, local cache
 ### Protein sequence optimization
 
 **Optimization Parent**:
-The fixed mapping of chain identifiers to original protein sequences against
-which every measured and proposed variant in one optimization round is defined.
+The fixed original protein reference against which every measured and proposed
+variant in one optimization round is defined. Combination identifies it only at
+measured chain positions; Exploration requires full original chain sequences.
 It can represent a single protein chain or multiple chains of a molecule.
 _Avoid_: current best variant, imputed parent, antibody-only parent
 
@@ -1356,6 +1357,7 @@ _Avoid_: unrestricted mutation search, experimentally verified combination
 **Optimization Measurement**:
 An experimental numeric observation for a variant of the fixed Optimization
 Parent, interpreted on the chosen endpoint's scale and improvement direction.
+Its supplied label is already normalized, including any batch/plate correction.
 Repeated observations of the same variant are replicates, not distinct variants.
 _Avoid_: predicted score, pseudo-label, automatically normalized affinity
 

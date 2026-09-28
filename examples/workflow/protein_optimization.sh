@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Parental FASTA headers must match the chain IDs in mutations,label CSV.
+# Combination requires only mutations,label CSV with already-normalized labels.
+# Exploration additionally requires --parental-fasta with matching chain IDs.
 # Optional --settings-json carries explicit position masks/budgets for Exploration.
 set -euo pipefail
 
 uv run biomodals workflow run --environment main --version 1 protein_optimization -- \
     --input-csv measurements.csv \
-    --parental-fasta parents.fasta \
     --mode combination

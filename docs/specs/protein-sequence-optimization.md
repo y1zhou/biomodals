@@ -5,18 +5,18 @@ Status: implemented and under review; native model/GPU validation remains a roll
 ## Requested outcomes
 
 1. A reusable Biomodals TabPFN app that fits a labeled table and predicts another table with the same features.
-2. A reusable Biomodals ridge app that accepts a parent and a `mutations,label` table, constructs mutation one-hot features, and scores all compatible combinations through a user-selected mutation count.
+2. A reusable Biomodals ridge app that accepts a `mutations,label` table, constructs mutation one-hot features, and scores all compatible combinations through a user-selected mutation count. Full parental sequences are not required for this model.
 3. A protein-optimization service and website that turn experimental measurements into suggested combinations or new variants, including but not limited to antibodies.
 
 The current branch is `feat/protein-optimization`. Research and this interview do not authorize model downloads, paid inference, deployment, or server changes.
 
-## Accepted product decisions — September 26, 2026
+## Accepted product decisions — updated September 28, 2026
 
 - Include both Combination and Exploration in the first release, delivering the combination path as the first implementation milestone. Each website submission selects exactly one of the two modes; there is no Both mode. Preselect Combination, retain uploaded data when switching modes, and never start computation automatically. Explain their differences in gray descriptive website text: Combination recombines experimentally supported substitutions using additive ridge; Exploration proposes previously unmeasured substitutions and scores complete variants using sequence features and TabPFN. Neither prediction is experimental confirmation.
-- Support arbitrary proteins and mutations across user-identified chains of a multimer, not only VH/VL or VHH. Each run uses one fixed parental chain mapping. The input sequence is authoritative; do not infer chain roles or apply antibody-specific trimming, imputation, or numbering rules.
-- Start by uploading the measurement table. Mutation tokens use `{chain_id}:{original_aa}{position}{mutated_aa}`, with commas separating multiple mutations in a row. Discover the required chain IDs from the table, then request their parental sequences. Validate every original residue and position against its chain; conflicting original-residue claims, missing chains, or out-of-range positions must not reach model fitting. Positions are one-based raw sequence coordinates.
+- Support arbitrary proteins and mutations across user-identified chains of a multimer, not only VH/VL or VHH. Each run uses fixed original-residue identities at measured sites; Exploration additionally uses full parental chains. Do not infer chain roles or apply antibody-specific trimming, imputation, or numbering rules.
+- Start by uploading the measurement table. Mutation tokens use `{chain_id}:{original_aa}{position}{mutated_aa}`, with commas separating multiple mutations in a row. Both modes reject conflicting original-residue claims at a site. Only Exploration requests parental FASTA and validates every original residue and position against its chain; missing chains or out-of-range positions must not reach Exploration fitting. Combination uses observed sites only, without fabricating residues for unobserved positions. Positions are one-based raw sequence coordinates.
 - Combination features cover only exact substitutions present in usable measured input, never invariant positions or unobserved alternatives at a tested position. Encode a variant as a binary vector over those substitutions; distinct alternative residues at one position remain distinct features and cannot coexist in one candidate.
-- Accept an arbitrary numeric experimental label with explicit higher/lower-is-better direction. Do not presume KD, require affinity units, or automatically transform labels. Use the supplied numerical scale.
+- Accept an arbitrary numeric experimental label with explicit higher/lower-is-better direction. All uploaded labels are treated as already normalized; users must correct batch/plate effects before upload. For example, use `log10(mutant KD) - log10(parent KD)` with the parent control on each plate and select lower-is-better. Do not presume KD, require affinity units, or automatically transform labels. Use the supplied numerical scale.
 - Return all compatible novel combinations through the requested mutation count and reject oversized exhaustive requests before compute rather than silently sampling or truncating. Exclude the unchanged parent and variants already represented in the uploaded measurement snapshot from the candidate CSV/table. The input measurements remain training/validation data, not candidate-result rows.
 - The generic TabPFN app is regression-only initially, with one numeric target and numerical/categorical features selected explicitly; identifiers are not automatically features.
 - Fit and infer in the same invocation. No saved fitted-model reuse, prediction-only follow-up using an earlier fit, model registry, or reusable fitted-context cache in this release. Standard Job inputs/results and pinned foundation-weight provisioning remain distinct from fitted-model storage. Runtime speed still needs measurement, especially embedding extraction and large candidate pools.
@@ -32,16 +32,15 @@ The input is CSV with required `mutations,label` columns and optional `id`. A ce
 
 ```csv
 id,mutations,label
-parent,,1.2
-variant_1,A:Y52F,1.8
-variant_2,"A:Y52F,B:S30A",2.4
+variant_1,A:Y52F,-0.2
+variant_2,"A:Y52F,B:S30A",-0.4
 ```
 
-An empty mutation cell denotes the unchanged parent. A parental measurement is optional; without one, parental predictions must be labeled as predictions, not experimental evidence of improvement.
+No parent row is needed for normalization: it is the user's responsibility before upload. An explicitly supplied empty mutation cell still denotes a measured unchanged parent and is accepted on the same supplied scale. Its absence is not a missing-input warning.
 
 Repeated rows describing the same canonical variant are experimental replicates. Aggregate their finite labels by arithmetic mean on the supplied scale, retain raw observations, counts and spread, and keep their shared variant identity together in validation splits. Flag malformed, missing, nonfinite, and censored labels such as `>1000` for explicit correction or removal; do not silently discard rows or convert bounds to exact values.
 
-After discovering chain IDs, accept a multi-record parental FASTA with matching chain-ID headers and per-chain previews. Require every referenced chain and permit additional explicitly named chains for exploration of previously unmutated chains. Unchanged partners are optional; do not invent missing chains or claim multimer structure/stoichiometry modeling.
+Only in Exploration, show the Parental chains box beneath Design settings and accept a multi-record parental FASTA with matching chain-ID headers and per-chain previews. Require every referenced chain and permit additional explicitly named chains for exploration of previously unmutated chains. Unchanged partners are optional; do not invent missing chains or claim multimer structure/stoichiometry modeling. Mode switches retain drafts locally, but the website omits FASTA from Combination requests. The standalone ridge/API optional FASTA can still validate sites and supply full-chain outputs when explicitly provided; it never changes ridge features or scores. Table-only Combination CSVs have no sequence columns and expose an empty `chain_columns` mapping.
 
 ### Design space and exploration representation
 
@@ -185,7 +184,7 @@ A local synthetic million-row delivery check produced a 241,036,828-byte CSV and
 
 ### 6. Frontend and end-to-end verification
 
-Add one Protein sequence optimization catalog entry and a dedicated input/result flow. Upload measurements first, display discovered chains, accept parental FASTA and corrections, choose one mode, show mode-specific gray guidance, and require explicit submission after review. Exploration has an editable per-position residue table initialized to the accepted 18-residue set. Use authoritative API bounds/defaults rather than duplicate independent frontend ceilings.
+Add one Protein sequence optimization catalog entry and a dedicated input/result flow. Upload measurements first, choose one mode, show mode-specific gray guidance, and require explicit submission after review. Combination can review and submit the table alone. Exploration displays discovered chains, requests parental FASTA beneath Design settings, and has an editable per-position residue table initialized to the accepted 18-residue set. Use authoritative API bounds/defaults rather than duplicate independent frontend ceilings. Review contract version 2 advertises these mode-specific requirements; deploy the updated containing workflow and restart the matching API before using the updated frontend.
 
 Display the compact validation summary and bounded novel-candidate table on shared Job detail. Support filtering, numeric sorting, full-sequence inspection appropriate for arbitrary proteins, persistent-across-pages manual selection, and full/selected CSV downloads. Do not force non-antibody proteins through antibody numbering/germline services. Reuse generic UI controls and shared Job actions rather than extending the humanization result component with another scientific mode.
 

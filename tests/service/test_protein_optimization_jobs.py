@@ -23,8 +23,7 @@ ROOT = "/api/v1/protein-optimization"
 
 def _body(app):
     inputs = {
-        "measurements_csv": "mutations,label\n,0\nA:A1V,1\nB:G1A,2\n",
-        "parental_fasta": ">A\nAG\n>B\nGA\n",
+        "measurements_csv": "mutations,label\nA:A1V,-0.3\nB:G1A,-0.2\n",
     }
     review = _request(app, "POST", ROOT + "/review", json=inputs)
     assert review.status_code == 200, review.text

@@ -30,7 +30,7 @@ from biomodals.workflow.protein_optimization.settings import (
     mode_defaults,
 )
 
-REVIEW_VERSION = "1"
+REVIEW_VERSION = "2"
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
 
@@ -69,7 +69,7 @@ class ProteinOptimizationOptions(BaseModel):
 
 
 class OptimizationReviewRequest(BaseModel):
-    """Original editable inputs; FASTA may be absent during chain discovery."""
+    """Original inputs; only Exploration needs FASTA after chain discovery."""
 
     model_config = ConfigDict(extra="forbid")
     measurements_csv: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
@@ -114,7 +114,6 @@ class OptimizationReview(BaseModel):
 class OptimizationSubmission(OptimizationReviewRequest):
     """An explicit reviewed intent; replay binds the complete body and key."""
 
-    parental_fasta: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
     review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     display_name: str = Field(default="Protein optimization", max_length=200)
 
@@ -128,7 +127,6 @@ class OptimizationSubmission(OptimizationReviewRequest):
 class RetainedOptimizationInputs(OptimizationReviewRequest):
     """Editable original inputs; rerun requires fresh review and explicit submit."""
 
-    parental_fasta: str
     display_name: str
 
 

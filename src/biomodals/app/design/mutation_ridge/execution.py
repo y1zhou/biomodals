@@ -33,7 +33,9 @@ class RidgeRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     measurements_csv: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
-    parental_fasta: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
+    parental_fasta: str | None = Field(
+        default=None, min_length=1, max_length=MAX_INPUT_BYTES
+    )
     max_mutations: int = Field(default=2, ge=1)
     candidate_budget: int = Field(default=1_000_000, ge=1)
     alpha: float = Field(default=1.0, gt=0)
@@ -52,7 +54,7 @@ class RidgeRequest(BaseModel):
         ):
             raise ValueError("Input exceeds the measured substitution/site limit")
         if (
-            len(dataset.parents) > 16
+            len(set(dataset.parents) | {m.chain for m in dataset.vocabulary}) > 16
             or sum(map(len, dataset.parents.values())) > MAX_TOTAL_RESIDUES
         ):
             raise ValueError(

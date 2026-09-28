@@ -106,8 +106,8 @@ def test_exploration_review_counts_novelty_masks_and_reports_mode_limit(tmp_path
         asyncio.run(app.state.antibody_analysis.shutdown())
 
 
-def test_invalid_csv_is_known_rejection_and_parentless_only_rows_need_fasta(tmp_path):
-    """Bad framing uses a coded error; discovery does not invent parental chains."""
+def test_invalid_csv_and_no_substitutions_are_known_rejections(tmp_path):
+    """Bad framing and an empty design vocabulary cannot produce scientific work."""
     app = _app(tmp_path)
     try:
         _humanization_session(app)
@@ -128,6 +128,25 @@ def test_invalid_csv_is_known_rejection_and_parentless_only_rows_need_fasta(tmp_
         assert result["required_chain_ids"] == []
         assert result["review_digest"] is None
         assert result["rows"][0]["canonical_mutations"] == ""
+        assert result["errors"][0]["code"] == "invalid_design_space"
+    finally:
+        asyncio.run(app.state.antibody_analysis.shutdown())
+
+
+def test_combination_review_needs_only_table_but_exploration_requires_parents(tmp_path):
+    """Table-only review binds a valid Combination intent without inventing chains."""
+    app = _app(tmp_path)
+    try:
+        _humanization_session(app)
+        body = {"measurements_csv": "mutations,label\nA:Y52F,-0.3\nB:C10V,-0.2\n"}
+        result = _request(app, "POST", ROOT + "/review", json=body).json()
+        assert result["evaluation_count"] == 1
+        assert result["unique_variant_count"] == 2
+        assert len(result["review_digest"]) == 64
+        body["settings"] = {"mode": "exploration", "candidate_budget": 5}
+        discovery = _request(app, "POST", ROOT + "/review", json=body).json()
+        assert discovery["required_chain_ids"] == ["A", "B"]
+        assert discovery["review_digest"] is None
     finally:
         asyncio.run(app.state.antibody_analysis.shutdown())
 

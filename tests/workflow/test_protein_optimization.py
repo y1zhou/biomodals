@@ -45,7 +45,7 @@ CSV = 'mutations,label\n,0\nA:A1V,1\nA:A1V,3\nA:A1L,4\nB:C1V,3\n"A:A1V,B:C1V",5\
 def _design(mode):
     return OptimizationDesign(
         measurements_csv=CSV,
-        parental_fasta=">A\nAA\n>B\nCC\n",
+        parental_fasta=">A\nAA\n>B\nCC\n" if mode == "exploration" else None,
         settings=OptimizationSettings(mode=mode, candidate_budget=10, seed=17),
     )
 
@@ -205,7 +205,8 @@ def test_native_graph_outputs_and_reopen_without_repeat_work(
         assert manifest.validation.training_variants == 5
         if mode == "combination":
             assert [op for op, _ in calls] == ["mutation_ridge_score"]
-            assert candidates["sequence_A"].to_list() == ["LA"]
+            assert candidates["mutations"].to_list() == ["A:A1L,B:C1V"]
+            assert manifest.chain_columns == {}
         else:
             assert [op for op, _ in calls] == [
                 "prepare_protein_optimization_models",
@@ -272,6 +273,15 @@ def test_empty_exploration_and_combination_graphs_have_no_model_preparation():
     assert list(combination.nodes) == ["fit_score_combinations", "publish"]
 
 
+def test_exploration_rejects_missing_parents_at_the_scientific_boundary():
+    """Skipping provisional review cannot admit sequence-free neural inference."""
+    with pytest.raises(ValueError, match="Exploration requires parental"):
+        OptimizationDesign(
+            measurements_csv="mutations,label\nA:A1V,0.3\nA:A2V,0.2\n",
+            settings=OptimizationSettings(mode="exploration", candidate_budget=5),
+        )
+
+
 def test_workflow_cli_dry_run_stages_no_files_or_models(tmp_path, monkeypatch, capsys):
     """Both modes can be validated and inspected without paid calls."""
     csv, fasta = tmp_path / "measurements.csv", tmp_path / "parent.fasta"
@@ -284,7 +294,10 @@ def test_workflow_cli_dry_run_stages_no_files_or_models(tmp_path, monkeypatch, c
     )
     for mode in ("combination", "exploration"):
         workflow.submit_protein_optimization_workflow(
-            input_csv=str(csv), parental_fasta=str(fasta), mode=mode, dry_run=True
+            input_csv=str(csv),
+            parental_fasta=str(fasta) if mode == "exploration" else None,
+            mode=mode,
+            dry_run=True,
         )
         assert "publish" in capsys.readouterr().out
     assert workflow.CONF.depends_on_apps == ("mutation_ridge", "tabpfn")

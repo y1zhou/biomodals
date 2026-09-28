@@ -36,28 +36,32 @@ def review_inputs(body: OptimizationReviewRequest) -> OptimizationReview:
         chains=[],
         errors=list(review.issues),
     )
+    parents = None
     if body.parental_fasta is None:
-        return response
-    try:
-        parents = parse_parents(body.parental_fasta)
-    except ValueError as exc:
-        response.errors.append(
-            InputIssue(None, "parental_fasta", "invalid_parents", str(exc))
-        )
-        return response
+        if body.settings.mode == "exploration":
+            return response
+    else:
+        try:
+            parents = parse_parents(body.parental_fasta)
+        except ValueError as exc:
+            response.errors.append(
+                InputIssue(None, "parental_fasta", "invalid_parents", str(exc))
+            )
+            return response
+        response.errors.extend(parent_issues(review, parents))
     response.chains = [
         ParentalChain(chain_id=chain, sequence=sequence)
-        for chain, sequence in parents.items()
+        for chain, sequence in (parents or {}).items()
     ]
-    response.errors.extend(parent_issues(review, parents))
     if response.errors:
         return response
     dataset = validated_dataset(review, parents)
+    parents = dataset.parents
     response.unique_variant_count = len(dataset.variants)
     response.replicate_rows = review.observations.height - len(dataset.variants)
     options = ProteinOptimizationOptions()
     if (
-        len(parents) > options.max_chains
+        len(set(parents) | set(review.required_chains)) > options.max_chains
         or sum(map(len, parents.values())) > options.max_total_residues
     ):
         response.errors.append(
@@ -84,7 +88,6 @@ def review_inputs(body: OptimizationReviewRequest) -> OptimizationReview:
         return response
     try:
         body.settings.validate_mode_budget()
-        response.positions = list(resolved_positions(dataset, body.settings))
         if body.settings.mode == "combination":
             count = sum(combination_space(dataset, body.settings.max_mutations)[1])
             response.candidate_space_size = str(count)
@@ -101,6 +104,7 @@ def review_inputs(body: OptimizationReviewRequest) -> OptimizationReview:
                 candidate_budget=body.settings.candidate_budget,
             )
         else:
+            response.positions = list(resolved_positions(dataset, body.settings))
             if len(dataset.variants) < 2:
                 raise ValueError(
                     "Exploration requires at least two unique measured variants for native TabPFN fitting"
@@ -133,9 +137,5 @@ def review_inputs(body: OptimizationReviewRequest) -> OptimizationReview:
         return response
     if response.evaluation_count == 0:
         response.warnings.append("No novel candidates satisfy this design space.")
-    if () not in dataset.variants:
-        response.warnings.append(
-            "No parental measurement was supplied; model predictions are not measured improvement over the parent."
-        )
     response.review_digest = sha256(body.model_dump_json().encode()).hexdigest()
     return response

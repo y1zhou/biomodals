@@ -24,7 +24,7 @@ from biomodals.app.design.mutation_ridge.inputs import (
 )
 
 SCIKIT_LEARN_VERSION = "1.9.1"
-RIDGE_VERSION = "1"
+RIDGE_VERSION = "2"
 
 
 class ValidationSummary(BaseModel):
@@ -150,10 +150,6 @@ def validate_ridge(
         warnings.append(
             "No supported multi-mutant holdout is available; predictions have no empirical combination validation."
         )
-    if () not in variants:
-        warnings.append(
-            "No parental measurement was supplied; the intercept is predicted, not measured improvement."
-        )
     occurrences: dict[Substitution, list[int]] = {m: [] for m in vocabulary}
     for index, variant in enumerate(variants):
         for mutation in variant:
@@ -244,8 +240,10 @@ def write_combinations(
                         "warnings": None,
                         **{
                             f"sequence_{chain}": seq
-                            for chain, seq in variant_sequences(
-                                dataset.parents, variant
+                            for chain, seq in (
+                                variant_sequences(dataset.parents, variant)
+                                if dataset.parents
+                                else {}
                             ).items()
                         },
                     })

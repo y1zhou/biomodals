@@ -392,6 +392,9 @@ def create_router(
                 "selection_expired",
                 "Selected download expired or was replaced. Prepare it again.",
             ) from error
+        except BaseException:
+            lease.close()
+            raise
         stream = selected_csv(
             cache.derived_path(str(job_id)), cast(str, job.result_sha256), ids
         )

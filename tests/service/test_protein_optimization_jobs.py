@@ -2,8 +2,10 @@
 
 import asyncio
 from io import BytesIO
+from threading import Event
 from uuid import UUID, uuid4
 
+import httpx
 import polars as pl
 import pytest
 from test_api_contract import ORIGIN, _app, _humanization_session, _request, _session
@@ -177,3 +179,71 @@ def test_candidate_routes_export_scientific_order_and_deleted_intent(tmp_path):
     assert _request(app, "GET", replaced.json()["download_url"]).status_code == 404
     asyncio.run(cache.shutdown())
     asyncio.run(app.state.antibody_analysis.shutdown())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_selected_ticket_failure_releases_result_lease(tmp_path, monkeypatch, cancel):
+    """Pre-stream I/O failures and task cancellation must not prevent deletion."""
+    app = _app(tmp_path)
+    _humanization_session(app)
+    submitted = _request(
+        app,
+        "POST",
+        ROOT + "/jobs",
+        json=_body(app),
+        headers={"Origin": ORIGIN, "Idempotency-Key": str(uuid4())},
+    )
+    job_id = UUID(submitted.json()["job_id"])
+    cache = app.state.cache
+    _, source, manifest = _result(tmp_path)
+    csv, database = cache.staging_path(str(job_id)), cache.staging_path(str(job_id))
+    size, digest = build_projection(source, csv, database, manifest)
+    cache.publish_derived(str(job_id), database)
+    asyncio.run(cache.publish_staged(str(job_id), csv, size_bytes=size, sha256=digest))
+    app.state.store.complete_job(
+        job_id,
+        result_state=JobState.SUCCEEDED,
+        result_filename="candidates.csv",
+        result_media_type="text/csv",
+        result_size_bytes=size,
+        result_sha256=digest,
+        result_archive_schema="protein_optimization/1",
+        now=10,
+    )
+    entered, release = Event(), Event()
+
+    def failing_ticket(*args, **kwargs):
+        entered.set()
+        if cancel:
+            assert release.wait(5)
+            return ["candidate_000000001"]
+        raise OSError("Ticket read failed")
+
+    monkeypatch.setattr(
+        "biomodals.service.protein_optimization.router.load_selection", failing_ticket
+    )
+
+    async def download():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=ORIGIN
+        ) as client:
+            return await client.get(
+                ROOT + f"/jobs/{job_id}/candidates.csv", params={"ticket": str(uuid4())}
+            )
+
+    async def scenario():
+        task = asyncio.create_task(download())
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            if cancel:
+                task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError if cancel else OSError):
+                await task
+            assert cache.remove_job_files(str(job_id))
+        finally:
+            release.set()
+            await cache.shutdown()
+            await app.state.antibody_analysis.shutdown()
+
+    asyncio.run(scenario())

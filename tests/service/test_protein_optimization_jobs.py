@@ -5,6 +5,7 @@ from io import BytesIO
 from uuid import UUID, uuid4
 
 import polars as pl
+import pytest
 from test_api_contract import ORIGIN, _app, _humanization_session, _request, _session
 from test_protein_optimization_results import _result
 
@@ -26,6 +27,37 @@ def _body(app):
     review = _request(app, "POST", ROOT + "/review", json=inputs)
     assert review.status_code == 200, review.text
     return {**inputs, "review_digest": review.json()["review_digest"]}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("", "Protein optimization"),
+        (" \t\n", "Protein optimization"),
+        ("  Round  two  ", "Round two"),
+    ],
+)
+def test_optional_name_normalization_survives_admission_and_replay(
+    tmp_path, name, expected
+):
+    """Explicit blank names use the default in saved Jobs and retained inputs."""
+    app = _app(tmp_path)
+    _humanization_session(app)
+    body = {**_body(app), "display_name": name}
+    headers = {"Origin": ORIGIN, "Idempotency-Key": str(uuid4())}
+    try:
+        response = _request(app, "POST", ROOT + "/jobs", json=body, headers=headers)
+        assert response.status_code == 202, response.text
+        job = response.json()
+        assert job["display_name"] == expected
+        retained = _request(app, "GET", ROOT + f"/jobs/{job['job_id']}/inputs")
+        assert retained.json()["display_name"] == expected
+        replay = _request(app, "POST", ROOT + "/jobs", json=body, headers=headers)
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["job_id"] == job["job_id"]
+    finally:
+        asyncio.run(app.state.cache.shutdown())
+        asyncio.run(app.state.antibody_analysis.shutdown())
 
 
 def test_review_binding_replay_retained_input_and_known_rejections(tmp_path):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from biomodals.app.design.mutation_ridge.execution import (
     MAX_RESULT_BYTES,
@@ -117,6 +117,12 @@ class OptimizationSubmission(OptimizationReviewRequest):
     parental_fasta: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
     review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     display_name: str = Field(default="Protein optimization", max_length=200)
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        """Normalize optional names before admission and idempotency binding."""
+        return " ".join(value.split()) or "Protein optimization"
 
 
 class RetainedOptimizationInputs(OptimizationReviewRequest):

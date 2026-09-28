@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +19,8 @@ from biomodals.app.design.mutation_ridge.inputs import (
     MAX_MUTATION_TOKENS,
     InputIssue,
 )
+from biomodals.app.design.mutation_ridge.regression import ValidationSummary
+from biomodals.service.selection import SelectionColumn
 from biomodals.workflow.protein_optimization.settings import (
     MAX_COMBINATION_CANDIDATES,
     MAX_EXPLORATION_CANDIDATES,
@@ -48,6 +51,17 @@ class ProteinOptimizationOptions(BaseModel):
     max_exploration_candidates: int = MAX_EXPLORATION_CANDIDATES
     max_exploration_mutations: int = MAX_EXPLORATION_MUTATIONS
     max_result_bytes: int = MAX_RESULT_BYTES
+    max_page_size: int = 200
+    max_selected_candidates: int = MAX_COMBINATION_CANDIDATES
+    sortable_columns: list[str] = Field(
+        default_factory=lambda: [
+            "id",
+            "mutations",
+            "predicted_label",
+            "n_mutations",
+            "n_new_mutations",
+        ]
+    )
     defaults: dict[str, OptimizationSettings] = Field(default_factory=mode_defaults)
     settings_schema: dict[str, Any] = Field(
         default_factory=OptimizationSettings.model_json_schema
@@ -95,3 +109,55 @@ class OptimizationReview(BaseModel):
     evaluation_count: int | None = None
     warnings: list[str] = Field(default_factory=list)
     review_digest: str | None = None
+
+
+class OptimizationSubmission(OptimizationReviewRequest):
+    """An explicit reviewed intent; replay binds the complete body and key."""
+
+    parental_fasta: str = Field(min_length=1, max_length=MAX_INPUT_BYTES)
+    review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    display_name: str = Field(default="Protein optimization", max_length=200)
+
+
+class RetainedOptimizationInputs(OptimizationReviewRequest):
+    """Editable original inputs; rerun requires fresh review and explicit submit."""
+
+    parental_fasta: str
+    display_name: str
+
+
+class OptimizationResultSummary(BaseModel):
+    """Whole-result scientific context, independent of filters and pagination."""
+
+    mode: Literal["combination", "exploration"]
+    direction: Literal["maximize", "minimize"]
+    candidate_count: int
+    chain_columns: dict[str, str]
+    validation: ValidationSummary
+
+
+class OptimizationCandidatePage(BaseModel):
+    """Bounded raw scalar rows in original scientific or explicit stable sort order."""
+
+    summary: OptimizationResultSummary
+    columns: list[SelectionColumn]
+    rows: list[dict[str, str | int | float | None]]
+    total_rows: int
+    offset: int
+    limit: int
+
+
+class OptimizationSelectedCandidates(BaseModel):
+    """Exact IDs from this Job, not row offsets or client-supplied sequences."""
+
+    model_config = ConfigDict(extra="forbid")
+    ids: list[Annotated[str, Field(pattern=r"^candidate_[0-9]{9}$", max_length=19)]] = (
+        Field(min_length=1, max_length=MAX_COMBINATION_CANDIDATES)
+    )
+
+
+class OptimizationDownloadTicket(BaseModel):
+    """Same-origin native download URL; authentication still required on GET."""
+
+    download_url: str
+    expires_at: datetime

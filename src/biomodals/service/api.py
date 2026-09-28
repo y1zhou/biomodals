@@ -163,6 +163,7 @@ def create_app(
             "/api/v1/nanobody-humanization/jobs": 1024 * 1024,
             "/api/v1/nanobody-humanization/prepare": 1024 * 1024,
             "/api/v1/protein-optimization/review": PROTEIN_OPTIMIZATION_MAX_REQUEST_BYTES,
+            "/api/v1/protein-optimization/jobs": PROTEIN_OPTIMIZATION_MAX_REQUEST_BYTES,
             "/api/v1/antibody-sequence-analysis/analyze": MAX_REQUEST_BYTES,
             "/api/v1/antibody-sequence-analysis/sequence": MAX_REQUEST_BYTES,
         },
@@ -215,11 +216,16 @@ def create_deployed_app() -> FastAPI:
         create_router as nanobody_router,
     )
     from biomodals.service.pending import PendingRequestStore
+    from biomodals.service.protein_optimization.modal import ProteinOptimizationAdapter
+    from biomodals.service.protein_optimization.router import (
+        create_router as optimization_router,
+    )
     from biomodals.service.tools import (
         ALPHAFOLD3_TOOL,
         GROMACS_TOOL,
         HUMANIZATION_TOOL,
         NANOBODY_TOOL,
+        PROTEIN_OPTIMIZATION_TOOL,
         TOOLS,
     )
 
@@ -261,14 +267,24 @@ def create_deployed_app() -> FastAPI:
     nanobody_adapter = NanobodyToolAdapter(
         pending, modal_download_concurrency=settings.modal_download_concurrency
     )
+    optimization_adapter = ProteinOptimizationAdapter(pending)
     registrations = (
         gromacs,
         alphafold3,
         humanization,
         ToolRegistration(NANOBODY_TOOL, nanobody_adapter),
+        ToolRegistration(PROTEIN_OPTIMIZATION_TOOL, optimization_adapter),
     )
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     routers = (
+        optimization_router(
+            store=store,
+            configuration=configuration,
+            pending=pending,
+            remote=remote,
+            cache=cache,
+            adapter=optimization_adapter,
+        ),
         gromacs_router(
             store=store,
             configuration=configuration,

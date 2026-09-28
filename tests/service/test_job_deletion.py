@@ -163,6 +163,7 @@ def test_delete_authentication_and_all_tool_inputs(tmp_path, monkeypatch, tool):
         "gromacs": ["continuation", "clustering"],
         "humanization": ["inputs", "selection"],
         "nanobody_humanization": ["inputs", "selection"],
+        "protein_optimization": ["inputs", "candidates"],
     }
     for suffix in tool_routes[tool.key]:
         response = _request(app, "GET", f"/api/v1/{slug}/jobs/{job.job_id}/{suffix}")

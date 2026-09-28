@@ -97,6 +97,25 @@ A workflow deployment includes the callable functions declared by its
 dependency apps. Those apps do not need separate deployments for that workflow.
 Deploy them separately only when they must also run as standalone apps.
 
+For experimental protein optimization, `protein_optimization` offers two modes:
+Combination uses additive ridge regression to recombine measured substitutions;
+Exploration uses frozen ESMC600M features and TabPFN to score sampled novel
+substitutions. Upload a `mutations,label` CSV first, then full parental FASTA
+chains matching the chain IDs in expressions such as `A:Y52F`. Multiple
+substitutions belong in a quoted, comma-separated CSV cell. Labels stay on your
+supplied scale; choose whether higher or lower is better. The final model fits
+all measurements, while the result summary reports separate support-aware
+held-out validation when available. Predictions are not experimental confirmation.
+
+The website displays only novel candidates, with server-side paging, sorting,
+filtering and selection. Download all candidates through the normal Job download
+or a selected CSV through a five-minute authenticated download link. Preparing a
+new selection replaces the previous unused link. CSV text is spreadsheet-escaped;
+numeric predictions and the raw table values are unchanged. The independent
+`mutation_ridge` and `tabpfn` apps have examples under `examples/app/`, and the
+workflow example is `examples/workflow/protein_optimization.sh`. Native model
+installation and GPU rollout verification are still required before production.
+
 Use `--dry-run` to build and print a workflow DAG without resolving a Modal
 deployment or starting remote work:
 

@@ -30,8 +30,11 @@ def test_registered_tool_defaults_are_explicit(tmp_path: Path) -> None:
         "alphafold3",
         "humanization",
         "nanobody_humanization",
+        "protein_optimization",
     )
     assert configuration.tool("gromacs").max_active_provider_calls == 16
+    assert configuration.tool("protein_optimization").max_active_provider_calls == 16
+    assert configuration.tool("protein_optimization").max_active_gpu_provider_calls == 2
     assert configuration.tool("gromacs").max_active_gpu_provider_calls == 2
     assert configuration.tool("alphafold3").max_active_provider_calls == 16
     assert configuration.tool("alphafold3").max_active_gpu_provider_calls == 2

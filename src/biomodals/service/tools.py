@@ -278,4 +278,38 @@ NANOBODY_TOOL = ToolDefinition(
     ),
 )
 
-TOOLS = (GROMACS_TOOL, ALPHAFOLD3_TOOL, HUMANIZATION_TOOL, NANOBODY_TOOL)
+PROTEIN_OPTIMIZATION_TOOL = ToolDefinition(
+    key="protein_optimization",
+    display_name="Protein sequence optimization",
+    modal_app_name_environment="BIOMODALS_PROTEIN_OPTIMIZATION_APP",
+    modal_app_version_environment="BIOMODALS_PROTEIN_OPTIMIZATION_APP_VERSION",
+    active_job_limit_environment="BIOMODALS_PROTEIN_OPTIMIZATION_ACTIVE_LIMIT",
+    default_modal_app_name="ProteinOptimizationWorkflow",
+    default_modal_app_version=1,
+    default_active_job_limit=2,
+    stages=(
+        ToolStageDefinition("prepare_models", "Prepare models", ("prepare_models",)),
+        ToolStageDefinition(
+            "extract_features", "Encode protein sequences", ("extract_features",)
+        ),
+        ToolStageDefinition(
+            "fit_score_combinations",
+            "Fit ridge and score combinations",
+            ("fit_score_combinations",),
+        ),
+        ToolStageDefinition(
+            "fit_score_exploration",
+            "Fit TabPFN and score exploration",
+            ("fit_score_exploration",),
+        ),
+        ToolStageDefinition("publish", "Publish candidate scores", ("publish",)),
+    ),
+)
+
+TOOLS = (
+    GROMACS_TOOL,
+    ALPHAFOLD3_TOOL,
+    HUMANIZATION_TOOL,
+    NANOBODY_TOOL,
+    PROTEIN_OPTIMIZATION_TOOL,
+)

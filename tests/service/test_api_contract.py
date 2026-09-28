@@ -45,6 +45,10 @@ from biomodals.service.nanobody_humanization.router import (
     create_router as nanobody_router,
 )
 from biomodals.service.pending import PendingRequestStore
+from biomodals.service.protein_optimization.modal import ProteinOptimizationAdapter
+from biomodals.service.protein_optimization.router import (
+    create_router as optimization_router,
+)
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import JobState, ServiceStore
 from biomodals.service.tool_runtime import JobLifecycle, ToolRegistration
@@ -53,6 +57,7 @@ from biomodals.service.tools import (
     GROMACS_TOOL,
     HUMANIZATION_TOOL,
     NANOBODY_TOOL,
+    PROTEIN_OPTIMIZATION_TOOL,
     TOOLS,
 )
 
@@ -307,6 +312,11 @@ class NanobodyAdapter(NanobodyToolAdapter):
         return None
 
 
+class OptimizationAdapter(ProteinOptimizationAdapter):
+    async def preflight(self, _deployment):
+        return None
+
+
 def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
     store = ServiceStore(tmp_path / "service.sqlite3")
     store.initialize()
@@ -334,6 +344,7 @@ def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
         ToolRegistration(ALPHAFOLD3_TOOL, Adapter()),
         ToolRegistration(HUMANIZATION_TOOL, Adapter()),
         ToolRegistration(NANOBODY_TOOL, Adapter()),
+        ToolRegistration(PROTEIN_OPTIMIZATION_TOOL, Adapter()),
     )
     lifecycle = JobLifecycle(store, remote, registrations, cache)
     app = create_app(
@@ -342,6 +353,14 @@ def _app(tmp_path: Path, *, environment: dict[str, str] | None = None):
         configuration=configuration,
         registrations=registrations,
         tool_routers=(
+            optimization_router(
+                store=store,
+                configuration=configuration,
+                pending=pending,
+                remote=remote,
+                cache=cache,
+                adapter=OptimizationAdapter(pending),
+            ),
             gromacs_router(
                 store=store,
                 configuration=configuration,

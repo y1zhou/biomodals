@@ -1,6 +1,6 @@
 # Protein sequence optimization
 
-Status: implementation authorized on September 26, 2026; milestone work in progress. This document adapts the user-supplied [research proposal](../research/protein-sequence-optimization.md) to Biomodals. Numerical defaults and proposed components in that proposal are not automatically accepted product requirements.
+Status: implemented and under review; native model/GPU validation remains a rollout gate. This document records the accepted product decisions and their implementation. The user-supplied research proposal is local background, not a repository dependency or an additional source of product requirements.
 
 ## Requested outcomes
 

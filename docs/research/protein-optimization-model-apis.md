@@ -1,6 +1,6 @@
 # Protein optimization: model API evidence
 
-Checked September 24, 2026. Research only; no model installation, weight download, GPU inference, deployment, or product decision was performed. The user-supplied [optimization proposal](protein-sequence-optimization.md) remains unchanged. This note checks the model integration boundary, not the paper's reported predictive performance.
+Initial research checked September 24, 2026; subsequent implementation checks are dated or described below. No weight download, GPU inference, or deployment was performed. The user-supplied optimization proposal remains local background; the accepted specification owns product decisions. This note checks the model integration boundary, not the paper's reported predictive performance.
 
 ## Version choice must be explicit
 

@@ -1,6 +1,8 @@
 """Offline staged table, native call boundary, and durable CSV publication checks."""
 
+import sys
 from hashlib import sha256
+from types import SimpleNamespace
 from uuid import uuid4
 
 import numpy as np
@@ -16,9 +18,18 @@ from biomodals.app.misc.tabpfn.execution import (
     TabPFNRequest,
     tabpfn_graph,
 )
-from biomodals.app.misc.tabpfn.models import RUNTIME_IDENTITY, checkpoint
+from biomodals.app.misc.tabpfn.models import (
+    RUNTIME_IDENTITY,
+    checkpoint,
+    native_regressor,
+)
 from biomodals.app.misc.tabpfn.runtime import run_tabpfn
-from biomodals.app.misc.tabpfn.tables import TableFeature, TableSchema, read_table_file
+from biomodals.app.misc.tabpfn.tables import (
+    MAX_TRAIN_ROWS,
+    TableFeature,
+    TableSchema,
+    read_table_file,
+)
 from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.nodes import NodeRunContext
 
@@ -63,6 +74,9 @@ def test_fit_predict_publication_redelivery_and_tampering(tmp_path, monkeypatch)
         def fit(self, x, y):
             events.append(("fit", len(x)))
             np.testing.assert_array_equal(y, [2, 4])
+            self.inferred_feature_schema_ = SimpleNamespace(
+                features=[SimpleNamespace(modality=SimpleNamespace(value="numerical"))]
+            )
 
         def predict(self, x, *, output_type):
             assert output_type == "mean"
@@ -91,6 +105,7 @@ def test_fit_predict_publication_redelivery_and_tampering(tmp_path, monkeypatch)
     assert output.metadata["feature_schema"] == request.table_schema.model_dump(
         mode="json"
     )
+    assert output.metadata["fitted_feature_modalities"] == [["numerical"]]
     assert run_tabpfn(request.model_dump_json(), **kwargs) == first
     assert len(events) == 3
     with pytest.raises(ValueError, match="different request"):
@@ -220,3 +235,21 @@ def test_worker_refreshes_both_volumes_before_native_read_and_commits(
     result = tabpfn_app.prepare_tabpfn_models.get_raw_f()(RUNTIME_IDENTITY)
     assert result.outputs[0].storage.data.decode() == RUNTIME_IDENTITY
     assert events == ["model:reload", "provision", "model:commit"]
+
+
+def test_native_categorical_override_covers_every_admitted_training_row(
+    monkeypatch, tmp_path
+):
+    """Numeric-looking categories above the native default remain categorical."""
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(float32="float32"))
+    monkeypatch.setitem(
+        sys.modules, "tabpfn", SimpleNamespace(TabPFNRegressor=lambda **kwargs: kwargs)
+    )
+    estimator = native_regressor(
+        tmp_path / "verified.safetensors", categorical_indices=[1]
+    )
+    assert estimator["categorical_features_indices"] == [1]
+    assert (
+        estimator["inference_config"]["MAX_UNIQUE_FOR_CATEGORICAL_FEATURES"]
+        == MAX_TRAIN_ROWS
+    )

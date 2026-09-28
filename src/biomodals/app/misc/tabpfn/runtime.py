@@ -94,7 +94,7 @@ def run_tabpfn(
         ),
     )
     model_path = checkpoint(model_root)
-    predicted, validation, widths = fit_evaluate_tables(
+    predicted, validation, modalities = fit_evaluate_tables(
         tables,
         lambda: native_regressor(
             model_path,
@@ -139,7 +139,10 @@ def run_tabpfn(
                     "feature_schema": request.table_schema.model_dump(mode="json"),
                     "training_rows": tables.training.height,
                     "prediction_rows": predicted.height,
-                    "fitted_feature_widths": list(widths),
+                    "fitted_feature_widths": [len(values) for values in modalities],
+                    "fitted_feature_modalities": [
+                        list(values) for values in modalities
+                    ],
                 },
             )
         ],

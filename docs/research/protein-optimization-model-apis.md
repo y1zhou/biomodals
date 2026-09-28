@@ -151,6 +151,13 @@ categorical strings. Pass zero-based `categorical_features_indices`. A
 declared **string** column remains categorical at any cardinality; a declared
 numeric column can still be inferred numerical. Numeric-looking category
 labels therefore need a representation that preserves category intent.
+The adapter now sets `MAX_UNIQUE_FOR_CATEGORICAL_FEATURES` to its 10,000-row
+training ceiling, so declared numeric-looking categories stay categorical
+without rewriting their values. A pinned-source detector check covers 31 and
+10,000 distinct numeric spellings. After each fit, the adapter verifies declared
+categorical modalities and records the inferred modalities in feature order,
+for each validation fold followed by the final fit. This preprocessing check
+does not substitute for the outstanding native model/GPU checks.
 Disable `TRANSFORM_TEXT` and `TRANSFORM_DATES` for this app's selected
 numerical/categorical contract. No external one-hot/scaling step is required
 for TabPFN. Record the resolved inferred feature schema alongside requested

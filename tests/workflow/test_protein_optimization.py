@@ -87,6 +87,12 @@ def test_native_graph_outputs_and_reopen_without_repeat_work(
         def fit(self, x, y):
             fit_sizes.append(len(y))
             self.score = float(np.mean(y))
+            self.inferred_feature_schema_ = SimpleNamespace(
+                features=[
+                    SimpleNamespace(modality=SimpleNamespace(value="numerical"))
+                    for _ in range(x.shape[1])
+                ]
+            )
 
         def predict(self, x, **kwargs):
             return np.repeat(self.score, len(x))

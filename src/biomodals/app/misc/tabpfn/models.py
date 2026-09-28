@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from biomodals.app.misc.tabpfn.tables import MAX_TRAIN_ROWS
 from biomodals.helper.artifacts import file_matches_sha256
 
 TABPFN_VERSION = "9.0.0"
@@ -11,7 +12,7 @@ MODEL_FILENAME = "tabpfn-v3.5-20260909.safetensors"
 MODEL_SHA256 = "ece4d67eadfea42eb0e610df5189bea60cb7f31073d81e9c7a019b76eacf0be3"
 MODEL_BYTES = 876_027_932
 TORCH_VERSION = "2.11.0"
-RUNTIME_IDENTITY = f"tabpfn={TABPFN_VERSION}|model={MODEL_REVISION}|sha256={MODEL_SHA256}|torch={TORCH_VERSION}|sklearn=1.9.1|schema=2"
+RUNTIME_IDENTITY = f"tabpfn={TABPFN_VERSION}|model={MODEL_REVISION}|sha256={MODEL_SHA256}|torch={TORCH_VERSION}|sklearn=1.9.1|categorical_max={MAX_TRAIN_ROWS}|schema=3"
 
 
 def checkpoint(root: Path) -> Path:
@@ -63,5 +64,10 @@ def native_regressor(
         inference_precision=torch.float32,
         categorical_features_indices=categorical_indices,
         fit_mode="fit_preprocessors",
-        inference_config={"TRANSFORM_TEXT": False, "TRANSFORM_DATES": False},
+        inference_config={
+            "TRANSFORM_TEXT": False,
+            "TRANSFORM_DATES": False,
+            # Native numeric-looking categories otherwise become numerical above 30.
+            "MAX_UNIQUE_FOR_CATEGORICAL_FEATURES": MAX_TRAIN_ROWS,
+        },
     )

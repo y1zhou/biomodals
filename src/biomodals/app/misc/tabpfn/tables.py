@@ -178,7 +178,7 @@ def fit_predict_tables(
     *,
     batch_size: int = 256,
     feature_transform=None,
-) -> pl.DataFrame:
+) -> tuple[pl.DataFrame, tuple[str, ...]]:
     """Fit once on all rows, convert only at native boundaries, and preserve IDs."""
     import numpy as np
 
@@ -188,6 +188,16 @@ def fit_predict_tables(
     if feature_transform is not None:
         training = feature_transform.fit_transform(training)
     estimator.fit(training, tables.training[tables.schema.target].to_numpy())
+    modalities = tuple(
+        feature.modality.value
+        for feature in estimator.inferred_feature_schema_.features
+    )
+    if len(modalities) != training.shape[1] or any(
+        modalities[index] != "categorical" for index in tables.categorical_indices
+    ):
+        raise ValueError(
+            "Native feature modalities changed a declared categorical feature or width"
+        )
     predictions = []
     for batch in tables.inference.iter_slices(batch_size):
         features = batch.select(tables.feature_names).to_numpy()
@@ -206,7 +216,7 @@ def fit_predict_tables(
         if tables.schema.identifier is not None
         else pl.DataFrame({"row_index": range(tables.inference.height)})
     )
-    return identifiers.with_columns(labels)
+    return identifiers.with_columns(labels), modalities
 
 
 def fit_evaluate_tables(
@@ -217,7 +227,7 @@ def fit_evaluate_tables(
     validation_folds: tuple[tuple[int, ...], ...] = (),
     pca_components: int | None = None,
     seed: int = 0,
-) -> tuple[pl.DataFrame, pl.DataFrame, tuple[int, ...]]:
+) -> tuple[pl.DataFrame, pl.DataFrame, tuple[tuple[str, ...], ...]]:
     """Fresh fold-local preprocessing/models, then an unconditional all-data refit.
 
     This generic boundary receives explicit holdout indices. The caller owns the
@@ -243,7 +253,7 @@ def fit_evaluate_tables(
             raise ValueError(
                 "Every validation fold must retain at least two training rows"
             )
-    widths = []
+    modalities = []
 
     def predict(subset):
         transform = None
@@ -255,13 +265,14 @@ def fit_evaluate_tables(
             transform = PCA(
                 n_components=width, svd_solver="randomized", random_state=seed
             )
-        widths.append(width)
-        return fit_predict_tables(
+        predictions, inferred = fit_predict_tables(
             subset,
             estimator_factory(),
             batch_size=batch_size,
             feature_transform=transform,
         )
+        modalities.append(inferred)
+        return predictions
 
     records = []
     for fold_index, indices in enumerate(validation_folds):
@@ -294,4 +305,5 @@ def fit_evaluate_tables(
             }
         )
     )
-    return predict(tables), validation, tuple(widths)
+    predicted = predict(tables)
+    return predicted, validation, tuple(modalities)

@@ -1,5 +1,7 @@
 """No weights required: scientific table contracts and native boundary semantics."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -39,18 +41,62 @@ def test_ordered_numeric_categorical_missing_features_fit_once_and_preserve_ids(
             assert x[0].tolist() == [1.0, "001"]
             assert np.isnan(x[1, 0])
             assert y.tolist() == [2, 3, 4]
+            self.inferred_feature_schema_ = SimpleNamespace(
+                features=[
+                    SimpleNamespace(modality=SimpleNamespace(value=kind))
+                    for kind in ("numerical", "categorical")
+                ]
+            )
 
         def predict(self, x, *, output_type):
             assert output_type == "mean"
             calls.append(("predict", len(x)))
             return np.asarray(x[:, 0], dtype=float) * 2
 
-    result = fit_predict_tables(tables, Estimator(), batch_size=2)
+    result, modalities = fit_predict_tables(tables, Estimator(), batch_size=2)
+    assert modalities == ("numerical", "categorical")
     assert result.to_dict(as_series=False) == {
         "id": ["x", "y", "z"],
         "predicted_label": [6, 10, 14],
     }
     assert calls == [("fit", 3), ("predict", 2), ("predict", 1)]
+
+
+@pytest.mark.parametrize("inferred", ["categorical", "numerical"])
+def test_high_cardinality_categories_preserve_values_and_verify_native_type(inferred):
+    """Never merge numeric spellings or treat a declared category as a quantity."""
+    categories = [f"{i:03d}" for i in range(31)] + ["0", "00", ""]
+    tables = read_regression_tables(
+        (
+            "id,group,y\n"
+            + "".join(f"m{i},{value},{i}\n" for i, value in enumerate(categories))
+        ).encode(),
+        b'id,group\na,000\nb,0\nc,031\nd,\ne,""\n',
+        TableSchema(
+            target="y",
+            identifier="id",
+            features=(TableFeature(name="group", kind="categorical"),),
+        ),
+    )
+
+    class Estimator:
+        def fit(self, x, y):
+            assert x[:, 0].tolist() == categories[:-1] + [None]
+            self.inferred_feature_schema_ = SimpleNamespace(
+                features=[SimpleNamespace(modality=SimpleNamespace(value=inferred))]
+            )
+
+        def predict(self, x, **kwargs):
+            assert x[:, 0].tolist() == ["000", "0", "031", None, ""]
+            return np.arange(len(x), dtype=float)
+
+    if inferred == "numerical":
+        with pytest.raises(ValueError, match="declared categorical"):
+            fit_predict_tables(tables, Estimator())
+    else:
+        result, modalities = fit_predict_tables(tables, Estimator())
+        assert modalities == ("categorical",)
+        assert result["predicted_label"].to_list() == [0, 1, 2, 3, 4]
 
 
 @pytest.mark.parametrize("bad", ["", "nan", "inf", ">1000", "label"])
@@ -105,12 +151,18 @@ def test_fold_local_pca_and_final_refit_use_exact_training_rows(monkeypatch):
         def fit(self, x, y):
             fitted_labels.append(y.copy())
             self.mean = y.mean()
+            self.inferred_feature_schema_ = SimpleNamespace(
+                features=[
+                    SimpleNamespace(modality=SimpleNamespace(value="numerical"))
+                    for _ in range(x.shape[1])
+                ]
+            )
 
         def predict(self, x, **kwargs):
             return np.repeat(self.mean, len(x))
 
     monkeypatch.setattr("sklearn.decomposition.PCA", RecordedPCA)
-    predictions, validation, widths = fit_evaluate_tables(
+    predictions, validation, modalities = fit_evaluate_tables(
         tables,
         Estimator,
         validation_folds=((3,), (0,)),
@@ -123,7 +175,7 @@ def test_fold_local_pca_and_final_refit_use_exact_training_rows(monkeypatch):
     assert fitted_labels[-1].tolist() == [10, 20, 30, 40]
     assert predictions["predicted_label"].to_list() == [25, 25]
     assert validation["row_index"].to_list() == [3, 0]
-    assert widths == (2, 2, 2)
+    assert modalities == (("numerical", "numerical"),) * 3
     for bad in (((0, 1, 2),), ((-1,),), ((4,),), ((0, 0),)):
         with pytest.raises(ValueError):
             fit_evaluate_tables(tables, Estimator, validation_folds=bad)

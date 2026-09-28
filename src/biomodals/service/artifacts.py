@@ -180,10 +180,17 @@ class ArtifactCache:
                 os.close(descriptor)
         with os.scandir(self.directory) as entries:
             for entry in entries:
-                if not entry.name.endswith(".part"):
+                orphan_projection = (
+                    entry.name.endswith(".derived")
+                    and not Path(entry.path).with_suffix(".result").is_file()
+                )
+                if (
+                    not entry.name.endswith((".part", ".download"))
+                    and not orphan_projection
+                ):
                     continue
                 file_stat = entry.stat(follow_symlinks=False)
-                if stat.S_ISREG(file_stat.st_mode):
+                if stat.S_ISREG(file_stat.st_mode) or stat.S_ISLNK(file_stat.st_mode):
                     os.unlink(entry.path)
 
     def check_ready(self) -> None:
@@ -286,6 +293,25 @@ class ArtifactCache:
             raise ValueError("job_id must be a canonical UUID")
         return self.directory / f"{job_id}.result"
 
+    def derived_path(self, job_id: str) -> Path:
+        """One disposable local projection, protected by the owning Result lease."""
+        return self._path(job_id).with_suffix(".derived")
+
+    def download_request_path(self, job_id: str) -> Path:
+        """One replaceable download intent; never a second scientific Result."""
+        return self._path(job_id).with_suffix(".download")
+
+    def publish_derived(self, job_id: str, source: Path) -> None:
+        """Adopt a projection built on the artifact worker before publishing its CSV."""
+        descriptor = self._open_staging(source)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with self._state_lock:
+                self.check_job_access(job_id)
+                os.replace(source, self.derived_path(job_id))
+        finally:
+            os.close(descriptor)
+
     def acquire(
         self,
         job_id: str,
@@ -377,6 +403,8 @@ class ArtifactCache:
                 raise RuntimeError("Cannot discard an active Result archive")
             self._verified.pop(job_id, None)
         self._unlink_if_same(path, file_stat)
+        self.derived_path(job_id).unlink(missing_ok=True)
+        self.download_request_path(job_id).unlink(missing_ok=True)
 
     def _publish_descriptor(
         self,
@@ -420,6 +448,8 @@ class ArtifactCache:
             self._verified.pop(job_id, None)
             self._prepared_until.pop(job_id, None)
             path.unlink(missing_ok=True)
+            self.derived_path(job_id).unlink(missing_ok=True)
+            self.download_request_path(job_id).unlink(missing_ok=True)
         for scratch in self.directory.glob(f".{job_id}.*"):
             if scratch.name.endswith(".part") or scratch.name.startswith(
                 f".{job_id}.archive-"
@@ -526,14 +556,27 @@ class ArtifactCache:
         reclaimable = [
             file_stat for path, file_stat in archives if path.stem not in protected
         ]
+
+        def derived_bytes(path: Path) -> int:
+            size = 0
+            for suffix in (".derived", ".download"):
+                try:
+                    size += path.with_suffix(suffix).stat(follow_symlinks=False).st_size
+                except FileNotFoundError:
+                    pass
+            return size
+
+        extra = {path.stem: derived_bytes(path) for path, _ in archives}
         return CacheUsage(
             cached_entries=len(archives),
-            cached_bytes=sum(item.st_size for _path, item in archives),
+            cached_bytes=sum(item.st_size for _path, item in archives)
+            + sum(extra.values()),
             staging_entries=len(staging),
             staging_bytes=sum(item.st_size for item in staging),
             free_bytes=disk_usage(self.directory).free,
             reclaimable_entries=len(reclaimable),
-            reclaimable_bytes=sum(item.st_size for item in reclaimable),
+            reclaimable_bytes=sum(item.st_size for item in reclaimable)
+            + sum(size for job_id, size in extra.items() if job_id not in protected),
         )
 
     async def usage_async(self) -> CacheUsage:
@@ -554,6 +597,15 @@ class ArtifactCache:
                     self._verified.pop(job_id, None)
                     entries += 1
                     reclaimed += file_stat.st_size
+                    for auxiliary in (
+                        self.derived_path(job_id),
+                        self.download_request_path(job_id),
+                    ):
+                        try:
+                            reclaimed += auxiliary.stat(follow_symlinks=False).st_size
+                            auxiliary.unlink()
+                        except FileNotFoundError:
+                            pass
                     job_ids.append(job_id)
         return CacheCleanup(
             entries=entries,

@@ -25,6 +25,9 @@ from service.alphafold3_preview_fixture import preview_archive
 from service.antibody_fixture import annotated_archive, reference_csv
 from service.gromacs_preview_fixture import trajectory_archive
 from service.nanobody_fixture import result_directory as nanobody_result_directory
+from service.protein_optimization_fixture import (
+    result_publication as optimization_publication,
+)
 
 from biomodals.app.bioinfo.gromacs.clustering import (
     ClusteringExecutionRequest,
@@ -69,6 +72,10 @@ from biomodals.service.nanobody_humanization.router import (
     create_router as nanobody_router,
 )
 from biomodals.service.pending import PendingRequestStore
+from biomodals.service.protein_optimization.results import build_projection
+from biomodals.service.protein_optimization.router import (
+    create_router as optimization_router,
+)
 from biomodals.service.remote_execution import ExecutionLocator
 from biomodals.service.runtime_config import RuntimeConfiguration
 from biomodals.service.store import JobRecord, JobState, ServiceStore
@@ -82,10 +89,14 @@ from biomodals.service.tools import (
     GROMACS_TOOL,
     HUMANIZATION_TOOL,
     NANOBODY_TOOL,
+    PROTEIN_OPTIMIZATION_TOOL,
     TOOLS,
 )
 from biomodals.workflow.humanization.execution import HumanizationExecutionRequest
 from biomodals.workflow.nanobody_humanization.execution import NanobodyExecutionRequest
+from biomodals.workflow.protein_optimization.execution import (
+    OptimizationExecutionRequest,
+)
 
 ORIGIN = os.environ["BIOMODALS_BROWSER_ORIGIN"]
 _CALL_NAMESPACE = UUID("156d600f-2a56-4ce7-8d0c-886bfa35698a")
@@ -111,6 +122,7 @@ class _FakeRemote:
         self.nanobody_password_link = ""
         self.alphafold3_password_link = ""
         self.antibody_analysis_password_link = ""
+        self.protein_optimization_password_link = ""
         self.alphafold3_job_id = ""
         self.alphafold3_retry_job_id = ""
         self.preflight_versions: list[int] = []
@@ -137,6 +149,7 @@ class _FakeRemote:
                     "nanobody_password_link": self.nanobody_password_link,
                     "alphafold3_password_link": self.alphafold3_password_link,
                     "antibody_analysis_password_link": self.antibody_analysis_password_link,
+                    "protein_optimization_password_link": self.protein_optimization_password_link,
                     "alphafold3_job_id": self.alphafold3_job_id,
                     "alphafold3_retry_job_id": self.alphafold3_retry_job_id,
                     "preflight_versions": self.preflight_versions,
@@ -678,6 +691,55 @@ class _FakeNanobodyAdapter(_FakeAdapter):
         )
 
 
+class _FakeOptimizationAdapter(_FakeAdapter):
+    """Real reviewed inputs, graph and CSV/query preparation, with no cloud calls."""
+
+    def __init__(self, remote, pending):
+        super().__init__(remote, pending, b"")
+        self.requests: dict[UUID, OptimizationExecutionRequest] = {}
+
+    async def stage(self, job):
+        request = OptimizationExecutionRequest.from_bytes(self.pending.get(job.job_id))
+        self.requests[job.job_id] = request
+        self.remote.bind_plan(job.job_id, request.execution_plan)
+
+    async def input_request(self, job):
+        content = self.pending.get(job.job_id)
+        if content is not None:
+            return OptimizationExecutionRequest.from_bytes(content)
+        return self.requests[job.job_id]
+
+    async def prepare_result(self, job, cache, *, completed_at):
+        del completed_at
+        request = self.requests[job.job_id]
+        csv, database = (
+            cache.staging_path(str(job.job_id)),
+            cache.staging_path(str(job.job_id)),
+        )
+        try:
+            with TemporaryDirectory(prefix="offline-optimization-") as temporary:
+                source, manifest = await asyncio.to_thread(
+                    optimization_publication, Path(temporary), job.job_id, request
+                )
+                size, digest = await cache.run_bounded(
+                    build_projection, source, csv, database, manifest
+                )
+            await cache.run_bounded(cache.publish_derived, str(job.job_id), database)
+            await cache.publish_staged(
+                str(job.job_id), csv, size_bytes=size, sha256=digest
+            )
+        finally:
+            csv.unlink(missing_ok=True)
+            database.unlink(missing_ok=True)
+        return PreparedResult(
+            filename=f"protein-optimization-{job.job_id}.csv",
+            media_type="text/csv",
+            size_bytes=size,
+            sha256=digest,
+            archive_schema="protein_optimization/1",
+        )
+
+
 class _FakeAlphaFold3Adapter(_FakeAdapter):
     async def check_chemistry(self, content, deployment):
         return ChemistryReceipt(
@@ -771,6 +833,10 @@ def _create_browser_app():
         display_name="Antibody Analysis Browser User",
     )
     remote.antibody_analysis_password_link = analysis_link.urls[0]
+    remote.protein_optimization_password_link = auth.create_user(
+        "protein-optimization-user@example.com",
+        display_name="Protein Optimization Browser User",
+    ).urls[0]
     cache = ArtifactCache(settings.cache_dir / "results")
     af3_link = auth.create_user(
         "alphafold3-user@example.com", display_name="AlphaFold3 Browser User"
@@ -848,6 +914,9 @@ def _create_browser_app():
         ),
         ToolRegistration(HUMANIZATION_TOOL, _FakeHumanizationAdapter(remote, pending)),
         ToolRegistration(NANOBODY_TOOL, _FakeNanobodyAdapter(remote, pending)),
+        ToolRegistration(
+            PROTEIN_OPTIMIZATION_TOOL, _FakeOptimizationAdapter(remote, pending)
+        ),
     )
     configuration = RuntimeConfiguration(store, settings, tool_definitions=TOOLS)
     lifecycle = JobLifecycle(store, remote, registrations, cache)
@@ -857,6 +926,14 @@ def _create_browser_app():
         configuration=configuration,
         registrations=registrations,
         tool_routers=(
+            optimization_router(
+                store=store,
+                configuration=configuration,
+                pending=pending,
+                remote=remote,
+                cache=cache,
+                adapter=registrations[4].adapter,
+            ),
             gromacs_router(
                 store=store,
                 configuration=configuration,

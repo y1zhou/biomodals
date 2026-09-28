@@ -97,6 +97,34 @@ A workflow deployment includes the callable functions declared by its
 dependency apps. Those apps do not need separate deployments for that workflow.
 Deploy them separately only when they must also run as standalone apps.
 
+For experimental protein optimization, `protein_optimization` offers two modes:
+Combination uses additive ridge regression to recombine measured substitutions;
+Exploration uses frozen ESMC600M features and TabPFN to score sampled novel
+substitutions. Upload a `mutations,label` CSV with expressions such as `A:Y52F`.
+Combination needs only this table; Exploration additionally requires full
+parental FASTA chains matching its chain IDs. Multiple substitutions belong in
+a quoted, comma-separated CSV cell. Normalize labels and correct batch/plate
+effects before uploading: for example, use `log10(mutant KD) - log10(parent KD)`
+with each plate's own parent control, then choose lower-is-better. A parent row
+is not required. Labels stay on your supplied scale. The final model fits
+all measurements, while the result summary reports separate support-aware
+held-out validation when available. Predictions are not experimental confirmation.
+When held-out predictions were retained, an interactive measured-versus-predicted
+plot shows the evaluated variants, separately from the novel candidate table.
+Older results without these points remain readable without a plot.
+Table-only Combination results contain mutation combinations and scores;
+Exploration also returns reconstructed full-chain sequences.
+
+The candidate table displays only novel designs, sorted by predicted label in
+your chosen improvement direction, with server-side paging, sorting,
+filtering and selection. Download all candidates through the normal Job download
+or a selected CSV through a five-minute authenticated download link. Preparing a
+new selection replaces the previous unused link. CSV text is spreadsheet-escaped;
+numeric predictions and the raw table values are unchanged. The independent
+`mutation_ridge` and `tabpfn` apps have examples under `examples/app/`, and the
+workflow example is `examples/workflow/protein_optimization.sh`. Native model
+installation and GPU rollout verification are still required before production.
+
 Use `--dry-run` to build and print a workflow DAG without resolving a Modal
 deployment or starting remote work:
 

@@ -50,6 +50,7 @@ dev = [
     "pwdlib[argon2]>=0.3.0,<0.4",
     "python-multipart>=0.0.22,<1",
     "pytest>=9.0.3",
+    "scikit-learn==1.9.1",
     "uvicorn>=0.51.0,<1",
 ]
 

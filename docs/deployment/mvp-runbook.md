@@ -39,11 +39,21 @@ BIOMODALS_GROMACS_ACTIVE_LIMIT=1
 BIOMODALS_ALPHAFOLD3_ACTIVE_LIMIT=1
 BIOMODALS_HUMANIZATION_ACTIVE_LIMIT=1
 BIOMODALS_NANOBODY_HUMANIZATION_ACTIVE_LIMIT=1
+BIOMODALS_PROTEIN_OPTIMIZATION_ACTIVE_LIMIT=1
 BIOMODALS_GLOBAL_ACTIVE_JOB_LIMIT=1
 ```
 
 These values constrain only the selected service database. They do not
 coordinate with another BioModals deployment that targets the same Modal App.
+
+Protein optimization adds the `ProteinOptimizationWorkflow` containing deployment.
+Set `BIOMODALS_PROTEIN_OPTIMIZATION_APP_VERSION` to its exact deployed version before
+restarting an API that registers this Tool. Ridge and TabPFN are included in this
+workflow; separate app deployments are needed only for standalone CLI use. The
+Combination path is CPU-only. Exploration provisions pinned foundation weights
+in a tracked CPU stage before ESMC600M/TabPFN GPU stages. Checkpoint access,
+license suitability, image installation and the smallest approved native GPU
+smoke remain release gates; offline fixture success is not evidence for them.
 
 ## API service example
 

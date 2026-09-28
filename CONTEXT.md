@@ -1333,6 +1333,46 @@ Modal redelivers the same provider input or a Successor Execution Run schedules
 still-missing work.
 _Avoid_: temporary scratch, local cache
 
+### Protein sequence optimization
+
+**Optimization Parent**:
+The fixed original protein reference against which every measured and proposed
+variant in one optimization round is defined. Combination identifies it only at
+measured chain positions; Exploration requires full original chain sequences.
+It can represent a single protein chain or multiple chains of a molecule.
+_Avoid_: current best variant, imputed parent, antibody-only parent
+
+**Optimization Substitution**:
+A change from one checked parental amino acid to another at a one-based raw
+sequence position in a named chain. Several substitutions describe one variant
+relative to the same Optimization Parent, not a sequential editing history.
+_Avoid_: antibody-numbered mutation, chain-free position
+
+**Combination Mode**:
+Protein optimization that recombines exact substitutions supported by usable
+experimental measurements, including only compatible alternatives at distinct
+chain positions.
+_Avoid_: unrestricted mutation search, experimentally verified combination
+
+**Optimization Measurement**:
+An experimental numeric observation for a variant of the fixed Optimization
+Parent, interpreted on the chosen endpoint's scale and improvement direction.
+Its supplied label is already normalized, including any batch/plate correction.
+Repeated observations of the same variant are replicates, not distinct variants.
+_Avoid_: predicted score, pseudo-label, automatically normalized affinity
+
+**Optimization Candidate**:
+A proposed non-parental protein variant absent from the supplied round's
+measurement snapshot. Novelty is relative to that snapshot, not evidence that
+the variant has never been tested elsewhere.
+_Avoid_: measured reference, globally novel sequence, experimentally improved variant
+
+**Exploration Mode**:
+Protein optimization that proposes variants containing previously unmeasured
+substitutions within an explicitly permitted design space. Predictions do not
+constitute experimental support for those substitutions.
+_Avoid_: measured improvement, validated new mutation
+
 ## Flagged ambiguities
 
 - "artifact" can mean either inline app bytes or durable files. Resolved: an

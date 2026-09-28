@@ -36,7 +36,7 @@ SCIENTIFIC_VERSIONS = {
     "result_schema": "1",
     "ridge": RIDGE_IDENTITY,
     "sampling": "1",
-    "validation": "2",
+    "validation": "3",
     "esmc": EMBEDDING_IDENTITY,
     "tabpfn": TABPFN_IDENTITY,
     "projection": f"numeric_randomized_pca_max{PCA_COMPONENTS}_train_only_v1",

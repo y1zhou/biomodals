@@ -29,6 +29,7 @@ from biomodals.workflow.protein_optimization.execution import (
 )
 from biomodals.workflow.protein_optimization.nodes import FEATURE_OPERATION
 from biomodals.workflow.protein_optimization.publication import (
+    MAX_MANIFEST_BYTES,
     RESULT_SCHEMA,
     OptimizationManifest,
 )
@@ -95,7 +96,7 @@ class ProteinOptimizationAdapter:
         )
         manifest = OptimizationManifest.model_validate_json(
             await read_modal_volume_file(
-                volume, str(root / "manifest.json"), max_bytes=1024 * 1024
+                volume, str(root / "manifest.json"), max_bytes=MAX_MANIFEST_BYTES
             )
         )
         if (

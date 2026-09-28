@@ -10,11 +10,18 @@ from uuid import UUID
 import polars as pl
 from pydantic import BaseModel, ConfigDict
 
-from biomodals.app.design.mutation_ridge.regression import ValidationSummary
+from biomodals.app.design.mutation_ridge.regression import (
+    MAX_VALIDATION_BYTES,
+    ValidationSummary,
+)
 from biomodals.execution.artifacts import execution_artifact_availability_errors
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.helper.app_run import volume_app_output
-from biomodals.helper.artifacts import sha256_file, write_bytes_atomic
+from biomodals.helper.artifacts import (
+    read_bounded_file_bytes,
+    sha256_file,
+    write_bytes_atomic,
+)
 from biomodals.schema import (
     AppRunResult,
     AppRunStatus,
@@ -29,6 +36,7 @@ from biomodals.workflow.protein_optimization.validation import (
 )
 
 RESULT_SCHEMA = "protein_optimization/1"
+MAX_MANIFEST_BYTES = MAX_VALIDATION_BYTES + 1024 * 1024
 
 
 class OptimizationManifest(BaseModel):
@@ -83,10 +91,16 @@ def publish_candidates(
     widths: tuple[int, ...] = ()
     count = design.candidate_count(dataset)
     if design.settings.mode == "combination":
-        if scored is None:
-            raise ValueError("Ridge result is required")
+        if scored is None or validation is None:
+            raise ValueError("Ridge result and validation evidence are required")
         source = checked_artifact_path(scored, roots)
-        summary = ValidationSummary.model_validate(scored.metadata["validation"])
+        summary = ValidationSummary.model_validate_json(
+            read_bounded_file_bytes(
+                checked_artifact_path(validation, roots),
+                field_name="ridge validation",
+                max_bytes=MAX_VALIDATION_BYTES,
+            )
+        )
         if scored.metadata["candidate_count"] != count:
             raise ValueError("Ridge result does not cover the admitted candidate space")
         shutil.copyfile(source, destination)

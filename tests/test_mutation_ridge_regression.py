@@ -60,9 +60,21 @@ def test_interaction_failure_is_reported_but_all_labels_return_to_final_fit(tmp_
     summary = write_combinations(dataset, tmp_path / "result.csv", max_mutations=3)
     assert summary.evaluated_variants == 1
     assert summary.mae > 90
+    assert len(summary.points) == 1
+    point = summary.points[0]
+    assert point.mutations == "A:A1C,A:A2C"
+    assert point.measured_label == 100
+    assert point.prediction_count == 1
+    assert abs(point.measured_label - point.predicted_label) == pytest.approx(
+        summary.mae
+    )
     result = pl.read_csv(tmp_path / "result.csv")
     matrix = mutation_matrix(dataset.variants, dataset.vocabulary)
     final = fit_ridge(matrix, dataset.measurements["label"].to_numpy())
+    measured_variant = mutation_matrix(
+        [parse_mutations(point.mutations)], dataset.vocabulary
+    )
+    assert final.predict(measured_variant)[0] != pytest.approx(point.predicted_label)
     candidates = [parse_mutations(value) for value in result["mutations"]]
     expected = final.predict(mutation_matrix(candidates, dataset.vocabulary))
     np.testing.assert_allclose(result["predicted_label"].to_numpy(), expected)

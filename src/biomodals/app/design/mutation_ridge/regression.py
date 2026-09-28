@@ -11,9 +11,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from biomodals.app.design.mutation_ridge.inputs import (
+    MAX_INPUT_BYTES,
+    MAX_MEASUREMENT_ROWS,
     MutationDataset,
     Substitution,
     Variant,
@@ -24,7 +26,20 @@ from biomodals.app.design.mutation_ridge.inputs import (
 )
 
 SCIKIT_LEARN_VERSION = "1.9.1"
-RIDGE_VERSION = "2"
+RIDGE_VERSION = "3"
+# Worst-case JSON escaping of input text plus 10,000 numeric point records.
+MAX_VALIDATION_BYTES = 6 * MAX_INPUT_BYTES + 2 * 1024 * 1024
+
+
+class ValidationPoint(BaseModel):
+    """One unique variant, using only predictions made while it was held out."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+    mutations: str
+    measured_label: float
+    predicted_label: float
+    prediction_count: int = Field(ge=1)
 
 
 class ValidationSummary(BaseModel):
@@ -41,6 +56,9 @@ class ValidationSummary(BaseModel):
     spearman: float | None = None
     evaluated_mutation_counts: tuple[int, ...] = ()
     warnings: tuple[str, ...] = ()
+    points: tuple[ValidationPoint, ...] = Field(
+        default=(), max_length=MAX_MEASUREMENT_ROWS
+    )
 
 
 def combination_folds(
@@ -166,6 +184,17 @@ def validate_ridge(
         folds=len(folds),
         evaluated_mutation_counts=tuple(sorted({len(variants[i]) for i in tested})),
         warnings=tuple(warnings),
+        points=tuple(
+            ValidationPoint(
+                mutations=variant_key(variants[index]),
+                measured_label=measured,
+                predicted_label=predicted,
+                prediction_count=1,
+            )
+            for index, measured, predicted in zip(
+                tested, actual, predictions, strict=True
+            )
+        ),
         **validation_metrics(actual, predictions),
     )
 

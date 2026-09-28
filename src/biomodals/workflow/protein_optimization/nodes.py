@@ -127,7 +127,10 @@ def optimization_graph(design: OptimizationDesign) -> ExecutionGraph:
         inputs = {
             "scored": ArtifactSelector(
                 producing_node_id=score.node_id, pattern="candidates.csv"
-            )
+            ),
+            "validation": ArtifactSelector(
+                producing_node_id=score.node_id, pattern="validation.json"
+            ),
         }
     elif design.candidate_count(design.dataset()) == 0:
         inputs = {}

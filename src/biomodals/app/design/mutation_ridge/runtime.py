@@ -29,6 +29,8 @@ class RidgePublication(BaseModel):
     runtime_identity: str
     csv_sha256: str
     csv_bytes: int
+    validation_sha256: str
+    validation_bytes: int
     result: AppRunResult
 
 
@@ -50,6 +52,7 @@ def run_ridge(
     layout = AppRunLayout.from_run_root(volume_root / "runs" / output_key)
     marker = layout.markers_dir / "result.json"
     csv_path = layout.outputs_dir / "candidates.csv"
+    validation_path = layout.outputs_dir / "validation.json"
     if marker.exists():
         published = RidgePublication.model_validate_json(
             read_bounded_file_bytes(
@@ -69,6 +72,12 @@ def run_ridge(
             expected_digest=published.csv_sha256,
         ):
             raise ValueError("Published ridge candidates failed integrity validation")
+        if not file_matches_sha256(
+            validation_path,
+            expected_size=published.validation_bytes,
+            expected_digest=published.validation_sha256,
+        ):
+            raise ValueError("Published ridge validation failed integrity validation")
         return published.result
     dataset = build_dataset(request.measurements_csv.encode(), request.parental_fasta)
     layout.outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +94,9 @@ def run_ridge(
         seed=request.seed,
     )
     temporary_csv.replace(csv_path)
+    write_bytes_atomic(validation_path, summary.model_dump_json().encode())
+    validation_digest = sha256_file(validation_path)
+    validation_size = validation_path.stat().st_size
     csv_digest, size = sha256_file(csv_path), csv_path.stat().st_size
     count = sum(combination_space(dataset, request.max_mutations)[1])
     result = AppRunResult(
@@ -103,7 +115,7 @@ def run_ridge(
                     )
                 ],
                 metadata={
-                    "validation": summary.model_dump(mode="json"),
+                    "validation": summary.model_dump(mode="json", exclude={"points"}),
                     "candidate_count": count,
                     "chain_columns": {
                         chain: f"sequence_{chain}" for chain in dataset.parents
@@ -111,7 +123,22 @@ def run_ridge(
                     "request_sha256": digest,
                     "runtime_identity": runtime_identity,
                 },
-            )
+            ),
+            volume_app_output(
+                name="validation",
+                kind=ArtifactKind.REPORT,
+                remote_path=str(validation_path),
+                mount_root=str(volume_root),
+                volume_name=volume_name,
+                media_type="application/json",
+                files=[
+                    ArtifactFile(
+                        path=validation_path.name,
+                        size_bytes=validation_size,
+                        content_sha256=validation_digest,
+                    )
+                ],
+            ),
         ],
         metrics={"candidate_count": count, "training_variants": len(dataset.variants)},
     )
@@ -120,6 +147,8 @@ def run_ridge(
         runtime_identity=runtime_identity,
         csv_sha256=csv_digest,
         csv_bytes=size,
+        validation_sha256=validation_digest,
+        validation_bytes=validation_size,
         result=result,
     )
     write_bytes_atomic(marker, publication.model_dump_json().encode())

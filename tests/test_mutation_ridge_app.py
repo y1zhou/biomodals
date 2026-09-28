@@ -13,6 +13,10 @@ from biomodals.app.design.mutation_ridge.execution import (
     RidgeRequest,
     ridge_graph,
 )
+from biomodals.app.design.mutation_ridge.regression import (
+    ValidationPoint,
+    ValidationSummary,
+)
 from biomodals.app.design.mutation_ridge.runtime import run_ridge
 from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import AppRunStatus
@@ -64,6 +68,52 @@ def test_unpublished_partial_csv_can_be_replaced_but_foreign_plan_cannot(tmp_pat
     with pytest.raises(ValueError, match="different scientific request"):
         run_ridge(changed.model_dump_json(), **arguments)
     assert pl.read_csv(path).height == 1
+
+
+def test_large_validation_is_file_backed_and_verified_on_redelivery(
+    tmp_path, monkeypatch
+):
+    """Held-out data must not exceed the kernel's 1 MiB result-envelope limit."""
+    summary = ValidationSummary(
+        regime="supported_combinations",
+        training_variants=10000,
+        evaluated_variants=10000,
+        folds=5,
+        points=tuple(
+            ValidationPoint(
+                mutations=f"chain_{'x' * 100}:A{i + 1}V",
+                measured_label=float(i),
+                predicted_label=float(i) + 0.5,
+                prediction_count=1,
+            )
+            for i in range(10000)
+        ),
+    )
+
+    def write(dataset, path, **kwargs):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"id": ["candidate_000000001"]}).write_csv(path)
+        return summary
+
+    monkeypatch.setattr(
+        "biomodals.app.design.mutation_ridge.runtime.write_combinations", write
+    )
+    arguments = dict(
+        output_key="c" * 64,
+        runtime_identity=RUNTIME_IDENTITY,
+        volume_root=tmp_path,
+        volume_name="test",
+    )
+    result = run_ridge(_request().model_dump_json(), **arguments)
+    evidence = next(output for output in result.outputs if output.name == "validation")
+    path = tmp_path / evidence.storage.path
+    assert path.stat().st_size > 1024 * 1024
+    assert len(result.model_dump_json().encode()) < 1024 * 1024
+    assert ValidationSummary.model_validate_json(path.read_bytes()) == summary
+    assert run_ridge(_request().model_dump_json(), **arguments) == result
+    path.write_bytes(b"{}")
+    with pytest.raises(ValueError, match="integrity"):
+        run_ridge(_request().model_dump_json(), **arguments)
 
 
 def test_node_is_a_single_cpu_call_in_its_owning_run(tmp_path):

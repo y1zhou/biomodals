@@ -109,10 +109,14 @@ with each plate's own parent control, then choose lower-is-better. A parent row
 is not required. Labels stay on your supplied scale. The final model fits
 all measurements, while the result summary reports separate support-aware
 held-out validation when available. Predictions are not experimental confirmation.
+When held-out predictions were retained, an interactive measured-versus-predicted
+plot shows the evaluated variants, separately from the novel candidate table.
+Older results without these points remain readable without a plot.
 Table-only Combination results contain mutation combinations and scores;
 Exploration also returns reconstructed full-chain sequences.
 
-The website displays only novel candidates, with server-side paging, sorting,
+The candidate table displays only novel designs, sorted by predicted label in
+your chosen improvement direction, with server-side paging, sorting,
 filtering and selection. Download all candidates through the normal Job download
 or a selected CSV through a five-minute authenticated download link. Preparing a
 new selection replaces the previous unused link. CSV text is spreadsheet-escaped;

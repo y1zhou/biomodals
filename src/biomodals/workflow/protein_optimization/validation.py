@@ -7,8 +7,13 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from biomodals.app.design.mutation_ridge.inputs import Substitution, Variant
+from biomodals.app.design.mutation_ridge.inputs import (
+    Substitution,
+    Variant,
+    variant_key,
+)
 from biomodals.app.design.mutation_ridge.regression import (
+    ValidationPoint,
     ValidationSummary,
     validation_metrics,
 )
@@ -108,6 +113,15 @@ def exploration_summary(
         folds=len(folds),
         evaluated_mutation_counts=tuple(sorted({len(variants[i]) for i in tested})),
         warnings=tuple(warnings),
+        points=tuple(
+            ValidationPoint(
+                mutations=variant_key(variants[i]),
+                measured_label=labels[i],
+                predicted_label=totals[i] / counts[i],
+                prediction_count=int(counts[i]),
+            )
+            for i in tested
+        ),
         **validation_metrics(
             np.asarray(labels)[tested], totals[tested] / counts[tested]
         ),

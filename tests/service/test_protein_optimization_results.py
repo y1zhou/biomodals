@@ -7,7 +7,10 @@ from uuid import uuid4
 import polars as pl
 import pytest
 
-from biomodals.app.design.mutation_ridge.regression import ValidationSummary
+from biomodals.app.design.mutation_ridge.regression import (
+    ValidationPoint,
+    ValidationSummary,
+)
 from biomodals.helper.artifacts import sha256_file
 from biomodals.service.artifacts import ArtifactCache
 from biomodals.service.protein_optimization.downloads import (
@@ -107,6 +110,40 @@ def test_projection_paging_raw_values_and_selected_order(tmp_path):
         next(selected_csv(database, digest, ["candidate_000000999"]))
     with pytest.raises(ValueError, match="sort"):
         query_candidates(database, digest, sort_by="c0; DROP TABLE candidates")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_heldout_evidence_survives_projection_and_candidate_filters(tmp_path, legacy):
+    """The plot describes held-out measurements, never the visible candidate page."""
+    _, source, manifest = _result(tmp_path)
+    summary = ValidationSummary(
+        regime="supported_combinations",
+        training_variants=4,
+        evaluated_variants=1,
+        folds=1,
+        mae=0.5,
+        rmse=0.5,
+        points=(
+            ValidationPoint(
+                mutations="A:A1G,A:A2G",
+                measured_label=-1.25,
+                predicted_label=-0.75,
+                prediction_count=1,
+            ),
+        ),
+    )
+    if legacy:
+        summary = ValidationSummary.model_validate_json(
+            summary.model_dump_json(exclude={"points"})
+        )
+    manifest = manifest.model_copy(update={"validation": summary})
+    database = tmp_path / "index.sqlite"
+    _, digest = build_projection(source, tmp_path / "download.csv", database, manifest)
+    for kwargs in ({}, {"offset": 200}, {"mutations": "unmatched"}):
+        page = query_candidates(database, digest, **kwargs)
+        assert page.summary.validation == summary
+        assert page.summary.validation.evaluated_variants == 1
+        assert len(page.summary.validation.points) == (0 if legacy else 1)
 
 
 def test_projection_verifies_source_and_empty_result(tmp_path):

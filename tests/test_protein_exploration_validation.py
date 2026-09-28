@@ -3,7 +3,8 @@
 import numpy as np
 import pytest
 
-from biomodals.app.design.mutation_ridge.inputs import build_dataset
+from biomodals.app.design.mutation_ridge.inputs import build_dataset, variant_key
+from biomodals.app.design.mutation_ridge.regression import validation_metrics
 from biomodals.workflow.protein_optimization.validation import (
     exploration_folds,
     exploration_summary,
@@ -73,3 +74,31 @@ def test_unavailable_validation_is_explicit_and_not_a_random_split():
     assert summary.evaluated_variants == 0
     assert summary.mae is None
     assert any("unavailable" in warning for warning in summary.warnings)
+
+
+def test_plot_points_share_replicate_and_holdout_means_with_metrics():
+    """One point per variant, even when different folds predict it differently."""
+    dataset = _dataset()
+    folds = exploration_folds(dataset.variants)
+    labels = dataset.measurements["label"].to_numpy()
+    predictions = [labels[list(f.test_indices)] + i for i, f in enumerate(folds)]
+    summary = exploration_summary(dataset.variants, labels, folds, predictions)
+    points = {point.mutations: point for point in summary.points}
+    assert len(points) == summary.evaluated_variants
+    assert points["A:A1V"].measured_label == 2
+    for index, variant in enumerate(dataset.variants):
+        estimates = [
+            values[fold.test_indices.index(index)]
+            for fold, values in zip(folds, predictions, strict=True)
+            if index in fold.test_indices
+        ]
+        if estimates:
+            point = points[variant_key(variant)]
+            assert point.prediction_count == len(estimates)
+            assert point.predicted_label == pytest.approx(np.mean(estimates))
+    metrics = validation_metrics(
+        [p.measured_label for p in summary.points],
+        [p.predicted_label for p in summary.points],
+    )
+    for name, value in metrics.items():
+        assert getattr(summary, name) == pytest.approx(value)

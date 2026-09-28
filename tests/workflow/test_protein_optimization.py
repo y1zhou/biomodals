@@ -203,6 +203,13 @@ def test_native_graph_outputs_and_reopen_without_repeat_work(
             design.dataset().measurements["mutations"].to_list()
         )
         assert manifest.validation.training_variants == 5
+        assert len(manifest.validation.points) == manifest.validation.evaluated_variants
+        assert manifest.validation.points
+        measured = dict(
+            design.dataset().measurements.select("mutations", "label").iter_rows()
+        )
+        for point in manifest.validation.points:
+            assert point.measured_label == measured[point.mutations]
         if mode == "combination":
             assert [op for op, _ in calls] == ["mutation_ridge_score"]
             assert candidates["mutations"].to_list() == ["A:A1L,B:C1V"]

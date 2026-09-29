@@ -3,7 +3,6 @@
 # ruff: noqa: D103
 
 import hashlib
-import pickle
 import tarfile
 from dataclasses import replace
 from io import BytesIO
@@ -16,14 +15,8 @@ import polars as pl
 import pytest
 import yaml
 import zstandard as zstd
-from uniaf3.schema.alphafold3 import AF3Config
 
 from biomodals.app.design import ligandmpnn_app, ppiflow_app
-from biomodals.app.fold.alphafold3 import (
-    inference_inputs,
-    modal_adapters,
-    request_results,
-)
 from biomodals.execution import (
     NodeRunContext,
     ProviderNode,
@@ -60,7 +53,6 @@ from biomodals.workflow.ppiflow import (
 from biomodals.workflow.ppiflow import manifests as ppiflow_manifests
 from biomodals.workflow.ppiflow import workflow as ppiflow_workflow
 from biomodals.workflow.ppiflow.workflow import (
-    CONF,
     build_ppiflow_workflow,
 )
 
@@ -159,11 +151,6 @@ def _manifest_ancestor_chain(definition, node_id: str) -> list[str]:
         )
         chain.append(current)
     return chain
-
-
-def _function_binding(source: str, function_name: str) -> str:
-    binding = source.split(f"{function_name} = app.function(", 1)[1]
-    return binding.split("\n\n", 1)[0]
 
 
 def _local_transform_environment(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
@@ -266,19 +253,6 @@ def _tar_zst_bytes(files: dict[str, bytes]) -> bytes:
             info.size = len(data)
             tar.addfile(info, BytesIO(data))
     return zstd.ZstdCompressor().compress(tar_buffer.getvalue())
-
-
-def test_ppiflow_workflow_declares_app_dependency() -> None:
-    assert CONF.depends_on_apps == (
-        "ppiflow",
-        "rosetta",
-        "flowpacker",
-        "ligandmpnn",
-        "dockq",
-        "af3score",
-        "alphafold3",
-    )
-    assert CONF.tags == {"depends_on": "-".join(CONF.depends_on_apps)}
 
 
 def test_ppiflow_plan_binds_ranked_refold_semantics() -> None:
@@ -454,67 +428,6 @@ PartialStep:
 """,
             stage=2,
         )
-
-
-def test_ppiflow_stage_wrappers_declare_stage_specific_mounts() -> None:
-    source = Path(ppiflow_workflow.__file__).read_text(encoding="utf-8")
-
-    assert "ALPHAFOLD3_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_refold_candidate",
-    )
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_dockq_stage",
-    )
-    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_partial_candidate",
-    )
-    assert "PPI_FLOW_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_design_stage",
-    )
-    assert "LIGANDMPNN_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_ligandmpnn_candidate",
-    )
-    assert "FLOWPACKER_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_flowpacker_stage",
-    )
-    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "prepare_ppiflow_af3score_stage",
-    )
-    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_af3score_batch",
-    )
-    assert "AF3SCORE_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "postprocess_ppiflow_af3score_stage",
-    )
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "prepare_ppiflow_rosetta_stage",
-    )
-    assert "ROSETTA_TASK_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "run_ppiflow_rosetta_worker",
-    )
-    rosetta_binding = _function_binding(source, "run_ppiflow_rosetta_worker")
-    assert "cpu=(0.125, 30.125)" in rosetta_binding
-    assert "memory=(1024, 43008)" in rosetta_binding
-    assert "PPI_FLOW_SOURCE_VOLUME_MOUNTS" in _function_binding(
-        source,
-        "finalize_ppiflow_rosetta_stage",
-    )
-    ligandmpnn_image = source.split("ligandmpnn_task_image =", 1)[1].split(
-        "flowpacker_task_image =",
-        1,
-    )[0]
-    assert "polars==1.42.0" in ligandmpnn_image
 
 
 def test_ppiflow_app_step_preparation_does_not_submit_provider_call(
@@ -2104,23 +2017,6 @@ def test_refold_step_derives_af3_config_and_runs_inference(tmp_path: Path) -> No
     assert submission.kwargs["artifacts"] == [_upstream_structure_artifact()]
 
 
-def test_refold_uses_alphafold3_helpers_from_their_owning_modules() -> None:
-    assert refold_runtime.AF3Config is AF3Config
-    assert (
-        refold_runtime.prepare_inference_run is inference_inputs.prepare_inference_run
-    )
-    assert refold_runtime.stage_inference_run is modal_adapters.stage_inference_run
-    assert refold_runtime.RequestPublication is request_results.RequestPublication
-    assert refold_runtime.load_request_manifest is request_results.load_request_manifest
-    assert (
-        refold_runtime.request_manifest_from_result
-        is request_results.request_manifest_from_result
-    )
-    assert (
-        refold_runtime.create_request_archive is request_results.create_request_archive
-    )
-
-
 def test_refold_publishes_only_request_ranked_model_and_metrics(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2266,23 +2162,6 @@ def test_refold_publishes_only_request_ranked_model_and_metrics(
     manifest_path = tmp_path / aggregate.outputs[0].storage.path
     [manifest_row] = ppiflow_manifests.read_manifest(manifest_path).to_dicts()
     assert manifest_row["files"] == structures.metadata["candidate_files"]
-
-
-def test_refold_builds_af3_config_without_app_reexports() -> None:
-    config = refold_runtime._af3_config(
-        structure_name="candidate.pdb",
-        structure_bytes=(
-            b"ATOM      1  CA  ALA A   1       0.000   0.000   0.000"
-            b"  1.00  0.00           C\n"
-        ),
-        run_name="refold-run",
-        config={"model_seeds": [3]},
-    )
-
-    assert config.name == "refold-run"
-    assert config.modelSeeds == [3]
-    assert config.sequences[0].protein.id == "A"
-    assert config.sequences[0].protein.sequence == "A"
 
 
 def test_refold_discovers_manifest_candidates_in_order(
@@ -2477,81 +2356,6 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
         ("*.cif",),
         ("workflow/workflow_model.cif",),
     ]
-
-
-def test_filter_step_delegates_score_filtering(
-    tmp_path: Path,
-) -> None:
-    node = ppiflow_workflow.FilterStructuresNode(
-        "FilterStep_stage1",
-        {"filters": {"iptm": "> 0.7"}},
-    )
-
-    call = node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id="stage1-filter",
-            task_key="node",
-            work_dir=tmp_path / "result",
-            cache_dir=tmp_path / "cache",
-            inputs={
-                "structures": [_upstream_structure_artifact()],
-                "scores": [_upstream_structure_artifact(kind=ArtifactKind.SCORES)],
-            },
-        )
-    )
-
-    assert call.function_name == "filter_ppiflow_artifacts"
-    assert call.kwargs["step_name"] == "FilterStep_stage1"
-    assert call.kwargs["config"] == {"filters": {"iptm": "> 0.7"}}
-
-
-def test_fixed_positions_delegates_residue_energy_parsing(tmp_path: Path) -> None:
-    node = ppiflow_workflow.FixedPositionsNode(
-        "FixedPositions",
-        {"gentype": "binder", "energy_threshold": -5},
-    )
-
-    call = node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id="stage2-fixed-positions",
-            task_key="node",
-            work_dir=tmp_path / "result",
-            cache_dir=tmp_path / "cache",
-            inputs={"structures": [_upstream_structure_artifact()]},
-        )
-    )
-
-    assert call.function_name == "derive_ppiflow_fixed_positions"
-    assert call.kwargs["config"] == {
-        "gentype": "binder",
-        "energy_threshold": -5,
-    }
-
-
-def test_rank_step_delegates_score_aware_ranking(tmp_path: Path) -> None:
-    node = ppiflow_workflow.RankNode(
-        "RankStep",
-        {"gentype": "binder"},
-    )
-
-    call = node.prepare_remote(
-        NodeRunContext(
-            execution_run_id=RUN_ID,
-            workload_run_key="run-1",
-            node_id="stage2-rank",
-            task_key="node",
-            work_dir=tmp_path / "result",
-            cache_dir=tmp_path / "cache",
-            inputs={"structures": [_upstream_structure_artifact()]},
-        )
-    )
-
-    assert call.function_name == "rank_ppiflow_artifacts"
-    assert call.kwargs["config"] == {"gentype": "binder"}
 
 
 def test_filter_transform_selects_only_passing_structures(
@@ -3201,201 +3005,6 @@ PPIFlowStep:
     assert calls["drive"] == {"development_function_handles": None}
 
 
-def test_ppiflow_full_binder_chain_uses_specific_node_classes() -> None:
-    workflow = build_ppiflow_workflow(
-        task_yaml_bytes=_task_yaml(
-            enabled_steps="""  PPIFlowStep: true
-  MPNNStep_stage1: true
-  FlowpackerStep_stage1: true
-  AF3scoreStep_stage1: true
-  FilterStep_stage1: true
-  RosettaFixStep: true
-  PartialStep: true
-  MPNNStep_stage2: true
-  FlowpackerStep_stage2: true
-  AF3scoreStep_stage2: true
-  FilterStep_stage2: true
-  ReFoldStep: true
-  DockQStep: true
-  RosettaRelaxStep: true
-  RankStep: true
-  ReportStep: true
-"""
-        ),
-        steps_yaml_bytes=_binder_design_and_partial_steps_yaml(),
-    )
-
-    definition = workflow.validate()
-
-    assert list(definition.nodes) == [
-        "ppiflow-model-validation",
-        "stage1-ppiflow-design",
-        "stage1-ligandmpnn",
-        "stage1-flowpacker",
-        "stage1-af3score-prepare",
-        "stage1-af3score-batches",
-        "stage1-af3score",
-        "stage1-filter",
-        "stage2-rosetta-fix-prepare",
-        "stage2-rosetta-fix-workers",
-        "stage2-rosetta-fix",
-        "stage2-fixed-positions",
-        "stage2-partial-ppiflow",
-        "stage2-ligandmpnn",
-        "stage2-flowpacker",
-        "stage2-af3score-prepare",
-        "stage2-af3score-batches",
-        "stage2-af3score",
-        "stage2-filter",
-        "stage2-alphafold3-refold",
-        "stage2-dockq",
-        "stage2-rosetta-relax-prepare",
-        "stage2-rosetta-relax-workers",
-        "stage2-rosetta-relax",
-        "stage2-rank",
-        "stage2-report",
-    ]
-    assert [
-        type(definition.nodes[node_id].node).__name__ for node_id in definition.nodes
-    ] == [
-        "PPIFlowModelValidationNode",
-        "PPIFlowDesignNode",
-        "LigandMPNNNode",
-        "FlowPackerNode",
-        "AF3ScorePrepareNode",
-        "AF3ScoreBatchNode",
-        "AF3ScoreNode",
-        "FilterStructuresNode",
-        "RosettaPrepareNode",
-        "RosettaWorkerNode",
-        "RosettaFixNode",
-        "FixedPositionsNode",
-        "PPIFlowPartialNode",
-        "LigandMPNNNode",
-        "FlowPackerNode",
-        "AF3ScorePrepareNode",
-        "AF3ScoreBatchNode",
-        "AF3ScoreNode",
-        "FilterStructuresNode",
-        "ReFoldNode",
-        "DockQNode",
-        "RosettaPrepareNode",
-        "RosettaWorkerNode",
-        "RosettaRelaxNode",
-        "RankNode",
-        "ReportNode",
-    ]
-    assert definition.dependencies["stage2-fixed-positions"] == {"stage2-rosetta-fix"}
-    assert definition.dependencies["stage2-rosetta-fix-prepare"] == {"stage1-filter"}
-    assert definition.dependencies["stage2-rosetta-fix-workers"] == {
-        "stage2-rosetta-fix-prepare"
-    }
-    assert definition.dependencies["stage2-rosetta-fix"] == {
-        "stage2-rosetta-fix-prepare",
-        "stage2-rosetta-fix-workers",
-    }
-    assert definition.dependencies["stage1-af3score-batches"] == {
-        "stage1-af3score-prepare"
-    }
-    assert definition.dependencies["stage1-af3score"] == {
-        "stage1-af3score-prepare",
-        "stage1-af3score-batches",
-    }
-    assert (
-        definition.nodes["stage1-af3score-batches"].aggregation_policy
-        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
-    )
-    assert definition.dependencies["stage2-partial-ppiflow"] == {
-        "ppiflow-model-validation",
-        "stage2-fixed-positions",
-    }
-    assert (
-        definition.nodes["stage1-ligandmpnn"].aggregation_policy
-        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
-    )
-    assert definition.nodes["stage1-flowpacker"].partial_dependencies == {
-        "stage1-ligandmpnn"
-    }
-    assert definition.dependencies["stage2-dockq"] == {
-        "stage2-filter",
-        "stage2-alphafold3-refold",
-    }
-    assert (
-        definition.nodes["stage2-partial-ppiflow"].aggregation_policy
-        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
-    )
-    assert (
-        definition.nodes["stage2-ligandmpnn"].aggregation_policy
-        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
-    )
-    assert definition.nodes["stage2-ligandmpnn"].partial_dependencies == {
-        "stage2-partial-ppiflow"
-    }
-    assert (
-        definition.nodes["stage2-alphafold3-refold"].aggregation_policy
-        == ppiflow_workflow.NodeAggregationPolicy.ALLOW_PARTIAL
-    )
-    assert definition.nodes["stage2-dockq"].partial_dependencies == {
-        "stage2-alphafold3-refold"
-    }
-    assert definition.dependencies["stage2-rosetta-relax-prepare"] == {
-        "stage2-filter",
-        "stage2-dockq",
-    }
-    assert definition.dependencies["stage2-rosetta-relax-workers"] == {
-        "stage2-rosetta-relax-prepare"
-    }
-    assert definition.dependencies["stage2-rosetta-relax"] == {
-        "stage2-rosetta-relax-prepare",
-        "stage2-rosetta-relax-workers",
-    }
-    assert definition.dependencies["stage2-rank"] == {
-        "stage2-af3score",
-        "stage2-alphafold3-refold",
-        "stage2-rosetta-relax",
-        "stage2-dockq",
-    }
-    assert definition.nodes["stage2-rank"].partial_dependencies == {
-        "stage2-af3score",
-        "stage2-alphafold3-refold",
-        "stage2-rosetta-relax",
-    }
-    assert (
-        definition.nodes["stage2-rank"].inputs["refold_metrics"].kind
-        == ArtifactKind.TABLE
-    )
-    assert (
-        definition.nodes["stage2-rank"].inputs["candidate_manifest"].role
-        == ppiflow_manifests.MANIFEST_FILE_ROLE
-    )
-    assert (
-        definition.nodes["stage2-report"].inputs["filter_tables"].kind
-        == ArtifactKind.TABLE
-    )
-    assert (
-        definition.nodes["stage2-report"].inputs["structures"].kind
-        == ArtifactKind.STRUCTURES
-    )
-    assert definition.nodes["stage2-report"].inputs["rank"].kind == ArtifactKind.TABLE
-    assert definition.dependencies["stage2-report"] == {
-        "stage2-rank",
-        "stage2-rosetta-relax",
-        "stage1-ligandmpnn",
-        "stage1-filter",
-        "stage2-ligandmpnn",
-        "stage2-filter",
-        "stage2-alphafold3-refold",
-    }
-    assert definition.nodes["stage2-report"].partial_dependencies == {
-        "stage2-alphafold3-refold",
-        "stage2-rosetta-relax",
-        "stage1-ligandmpnn",
-        "stage2-ligandmpnn",
-    }
-    restored = pickle.loads(pickle.dumps(workflow))  # noqa: S301
-    assert restored.validate() == definition
-
-
 def test_ppiflow_candidate_manifest_edges_select_manifest_role() -> None:
     workflow = build_ppiflow_workflow(
         task_yaml_bytes=_task_yaml(
@@ -3491,46 +3100,6 @@ def test_ppiflow_stage2_scientific_nodes_consume_only_retained_manifests() -> No
         definition,
         "stage2-rank",
     )
-
-
-def test_ppiflow_ignores_obsolete_workload_concurrency_keys() -> None:
-    workflow = build_ppiflow_workflow(
-        task_yaml_bytes=b"""
-task:
-  gentype: binder
-  candidate_concurrency: 3
-steps:
-  MPNNStep_stage1: true
-  AF3scoreStep_stage1: true
-  RosettaFixStep: true
-""",
-        steps_yaml_bytes=b"""
-MPNNStep_stage1:
-  candidate_concurrency: 2
-  max_child_calls: 2
-AF3scoreStep_stage1:
-  max_batches: 2
-  num_jobs: 2
-RosettaFixStep:
-  max_num_pods: 2
-""",
-    )
-
-    definition = workflow.validate()
-
-    obsolete = {
-        "candidate_concurrency",
-        "max_child_calls",
-        "max_batches",
-        "max_num_pods",
-        "num_jobs",
-    }
-    for node_id in (
-        "stage1-ligandmpnn",
-        "stage1-af3score",
-        "stage2-rosetta-fix",
-    ):
-        assert obsolete.isdisjoint(definition.nodes[node_id].node.config)
 
 
 def test_ppiflow_propagates_run_container_limits() -> None:

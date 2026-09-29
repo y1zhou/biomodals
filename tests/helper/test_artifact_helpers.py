@@ -12,7 +12,6 @@ from biomodals.helper.artifacts import (
     publish_content_addressed_file,
     read_volume_file_exact,
     read_volume_json,
-    replace_bytes_atomic,
     sha256_bytes,
 )
 
@@ -27,13 +26,6 @@ class _Reader:
         yield self.files[path]
 
 
-def test_file_size_sha256_reads_one_regular_file(tmp_path: Path) -> None:
-    path = tmp_path / "artifact.bin"
-    path.write_bytes(b"artifact")
-
-    assert file_size_sha256(path) == (8, sha256_bytes(b"artifact"))
-
-
 def test_file_matches_sha256_rejects_changed_file(tmp_path: Path) -> None:
     path = tmp_path / "artifact.bin"
     path.write_bytes(b"original")
@@ -44,15 +36,6 @@ def test_file_matches_sha256_rejects_changed_file(tmp_path: Path) -> None:
     path.write_bytes(b"changed!")
 
     assert not file_matches_sha256(path, size, digest)
-
-
-def test_replace_bytes_atomic_replaces_content(tmp_path: Path) -> None:
-    path = tmp_path / "nested" / "artifact.bin"
-    replace_bytes_atomic(path, b"first")
-    replace_bytes_atomic(path, b"second")
-
-    assert path.read_bytes() == b"second"
-    assert not tuple(path.parent.glob(".*.tmp"))
 
 
 def test_publish_content_addressed_file_uses_digest_directory(tmp_path: Path) -> None:

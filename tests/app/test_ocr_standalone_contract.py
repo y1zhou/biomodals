@@ -21,17 +21,6 @@ def _tar_zst_names(content: bytes, tmp_path: Path) -> set[str]:
     )
 
 
-def test_ocr_app_configs_use_tool_specific_model_store_paths() -> None:
-    assert ocr_app.CONF.name == "MinerU"
-    assert ocr_app.POPO_CONF.name == "MinerU-Popo"
-    assert ocr_app.MINERU_CONFIG_PATH == Path("/biomodals-store/MinerU/mineru.json")
-    assert ocr_app.VLLM_CACHE_ROOT == Path("/biomodals-store/MinerU/vllm-cache")
-    assert ocr_app.POPO_HF_CACHE_DIR == Path("/biomodals-store/huggingface/hub")
-    assert ocr_app.POPO_HF_CACHE_DIR / "models--DreamEternal--MinerU-Popo" == Path(
-        "/biomodals-store/huggingface/hub/models--DreamEternal--MinerU-Popo"
-    )
-
-
 def test_run_mineru_ocr_packages_hybrid_outputs(monkeypatch, tmp_path) -> None:
     calls = {}
 

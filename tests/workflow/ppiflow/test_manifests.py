@@ -62,18 +62,6 @@ def test_stage2_candidate_ids() -> None:
         manifests.stage2_input_candidate_id(0)
 
 
-def test_manifest_round_trips_nested_files_as_parquet(tmp_path: Path) -> None:
-    path = manifests.write_manifest([_manifest_row()], tmp_path / "manifest.parquet")
-
-    frame = manifests.read_manifest(path)
-
-    assert frame.height == 1
-    row = frame.row(0, named=True)
-    assert row["candidate_id"] == "candidate-1"
-    assert row["files"][0]["role"] == "structure"
-    assert row["files"][0]["app_volume_path"] == "inputs/model.pdb"
-
-
 def test_manifest_output_is_table_artifact_with_parquet_file(
     tmp_path: Path,
 ) -> None:

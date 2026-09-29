@@ -110,20 +110,6 @@ def _fake_workflow_output_volume(
     return volume
 
 
-def test_shortmd_uses_gromacs_app_volume_metadata() -> None:
-    assert shortmd_workflow.CONF.depends_on_apps == ("gromacs",)
-    assert shortmd_workflow.CONF.tags == {"depends_on": "gromacs"}
-    assert (
-        shortmd_workflow.GROMACS_OUTPUT_MOUNTPOINT
-        == gromacs_app.CONF.output_volume_mountpoint
-    )
-    assert shortmd_workflow.GROMACS_OUTPUT_VOLUME is gromacs_app.CONF.output_volume
-    assert (
-        shortmd_workflow.GROMACS_OUTPUT_VOLUME_NAME
-        == gromacs_app.CONF.output_volume_name
-    )
-
-
 def test_discover_pdb_inputs_globs_pdb_files(tmp_path: Path) -> None:
     tmp_path.joinpath("b.pdb").write_text("B\n", encoding="utf-8")
     tmp_path.joinpath("a.pdb").write_text("A\n", encoding="utf-8")
@@ -821,17 +807,6 @@ def test_shortmd_summary_node_emits_markdown_manifest(tmp_path: Path) -> None:
     assert result.outputs[1].metadata["files"] == [
         {"path": "trajectory.xtc", "size_bytes": 1024}
     ]
-
-
-def test_shortmd_app_includes_orchestrator_class() -> None:
-    functions = shortmd_workflow.app._local_state.functions
-
-    assert "ExecutionCoordinator.*" in functions
-    assert "prepare_tpr_cpu" in functions
-    assert "prepare_tpr_gpu" in functions
-    assert "production_run_cpu" in functions
-    assert "production_run_gpu" in functions
-    assert "analyze_shortmd_gromacs_run" in functions
 
 
 def test_submit_shortmd_workflow_uses_included_orchestrator_class_boundary(

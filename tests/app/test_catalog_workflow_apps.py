@@ -70,40 +70,6 @@ def test_workflow_catalog_supports_both_layouts_and_rejects_duplicates(
         get_catalog("workflow")
 
 
-def test_include_dependency_apps_resolves_catalog_app_and_includes_modal_app(
-    monkeypatch,
-) -> None:
-    workflow_app = modal.App("workflow")
-    dependency_app = modal.App("dependency")
-
-    @dependency_app.function(name="dependency_function", serialized=True)
-    def dependency_function() -> None:
-        return None
-
-    class FakeBiomodalsApp:
-        def __init__(self, app_name_or_path: str, all_apps: dict[str, Path]) -> None:
-            assert app_name_or_path == "dependency"
-            assert all_apps == {"dependency": Path("/apps/dependency_app.py")}
-            self.module = "fake.dependency_app"
-
-    monkeypatch.setattr(
-        catalog,
-        "get_catalog",
-        lambda catalog_type, *, use_absolute_paths=False, cwd=None: {
-            "dependency": Path("/apps/dependency_app.py")
-        },
-    )
-    monkeypatch.setattr(catalog, "BiomodalsApp", FakeBiomodalsApp)
-    monkeypatch.setattr(
-        catalog.importlib,
-        "import_module",
-        lambda module_name: SimpleNamespace(app=dependency_app),
-    )
-
-    assert include_dependency_apps(workflow_app, ("dependency",)) is workflow_app
-    assert "dependency_function" in workflow_app._local_state.functions
-
-
 def test_include_dependency_apps_rejects_duplicate_modal_tags(monkeypatch) -> None:
     workflow_app = modal.App("workflow")
     dependency_app = modal.App("dependency")

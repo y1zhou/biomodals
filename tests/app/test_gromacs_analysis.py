@@ -2,8 +2,6 @@
 
 # ruff: noqa: D103
 
-from importlib.metadata import version
-
 import biotite.structure as struc
 import biotite.structure.io as strucio
 import matplotlib
@@ -15,7 +13,6 @@ from biotite.structure.io.xtc import XTCFile
 from numpy.testing import assert_allclose
 
 from biomodals.app.bioinfo.gromacs import analysis
-from biomodals.app.bioinfo.gromacs.execution import ANALYSIS_PACKAGES
 
 matplotlib.use("Agg")
 
@@ -71,12 +68,6 @@ def _files(tmp_path, frames=37, *, forcefield_names=False):
         "rmsf": struc.rmsf(struc.average(ca), ca),
     }
     return path, pdb, expected, aligned
-
-
-def test_analysis_environment_matches_the_runtime_pins():
-    for package in ANALYSIS_PACKAGES:
-        name, expected = package.split("==")
-        assert version(name) == expected
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 7, 128])

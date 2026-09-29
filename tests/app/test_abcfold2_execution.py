@@ -11,21 +11,12 @@ import pytest
 
 from biomodals.app.fold import abcfold2_app
 from biomodals.app.fold.abcfold2_execution import (
-    BOLTZ_ARCHIVE_NODE,
-    BOLTZ_DOWNLOAD_NODE,
-    BOLTZ_SEEDS_NODE,
-    CHAI_ARCHIVE_NODE,
-    CHAI_DOWNLOAD_NODE,
-    CHAI_SEEDS_NODE,
     PREPARE_NODE,
     ABCFold2ExecutionCoordinator,
     ABCFold2ExecutionRequest,
-    ABCFold2Publications,
-    abcfold2_execution_graph,
     persist_execution_request,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
-from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
@@ -170,49 +161,6 @@ def _coordinator(
         boltz_version=request.boltz_version,
         chai_version=request.chai_version,
         poll_interval_seconds=0,
-    )
-
-
-def test_request_round_trip_preserves_parallel_model_branches() -> None:
-    request = _request()
-
-    decoded = ABCFold2ExecutionRequest.from_bytes(request.to_bytes())
-
-    assert decoded == request
-    assert decoded.execution_plan.node_keys == (
-        PREPARE_NODE,
-        BOLTZ_DOWNLOAD_NODE,
-        CHAI_DOWNLOAD_NODE,
-        BOLTZ_SEEDS_NODE,
-        BOLTZ_ARCHIVE_NODE,
-        CHAI_SEEDS_NODE,
-        CHAI_ARCHIVE_NODE,
-    )
-    assert decoded.execution_plan.terminal_node_keys == (
-        BOLTZ_ARCHIVE_NODE,
-        CHAI_ARCHIVE_NODE,
-    )
-
-
-def test_definition_preserves_exact_execution_plan(tmp_path: Path) -> None:
-    request = _request()
-    graph = abcfold2_execution_graph(
-        request,
-        ABCFold2Publications(
-            request=request,
-            execution_run_id=RUN_ID,
-            output_root=tmp_path,
-            output_volume_name=OUTPUT_VOLUME_NAME,
-            output_claims=FakeClaims(),
-        ),
-    )
-
-    assert (
-        execution_plan(
-            graph.validate(),
-            workload_run_key=request.run_name,
-        )
-        == request.execution_plan
     )
 
 

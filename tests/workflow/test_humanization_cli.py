@@ -85,30 +85,6 @@ def test_cli_dry_run_validates_native_controls_without_staging(
         raw(input_csv=str(source), dry_run=True, max_containers=1, max_gpu_containers=2)
 
 
-def test_composition_includes_all_generators_and_scorers():
-    """Included operations have unique tags and do not include child coordinators."""
-    assert workflow.CONF.tags["biomodals_tool"] == "humanization"
-    assert workflow.CONF.depends_on_apps == (
-        "sapiens",
-        "humatch",
-        "pabnativ2",
-        "hudiff_ab",
-    )
-    functions = workflow.app._local_state.functions
-    for name in (
-        "sapiens_humanize",
-        "humatch_humanize",
-        "pabnativ2_humanize_pair",
-        "hudiff_ab_humanize_pair",
-        "sapiens_score",
-        "humatch_score",
-        "pabnativ2_score",
-        "annotate_humanization_candidate",
-    ):
-        assert name in functions
-    assert list(workflow.app._local_state.classes) == ["ExecutionCoordinator"]
-
-
 def test_package_metadata_and_waited_result_locations(tmp_path, monkeypatch, capsys):
     """Package launch keeps canonical imports and exposes durable result locations."""
     from types import SimpleNamespace

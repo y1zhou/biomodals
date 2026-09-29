@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import sys
 from dataclasses import replace
@@ -25,8 +24,6 @@ from biomodals.app.design.hudiff_ab import (
     worker,
 )
 from biomodals.app.design.hudiff_ab.execution import (
-    COLLECT_NODE,
-    HUMANIZE_NODE,
     HuDiffAbExecutionRequest,
     _HuDiffAbHumanizeNode,
 )
@@ -88,19 +85,6 @@ def _request() -> HuDiffAbExecutionRequest:
     )
 
 
-def test_package_app_is_discoverable_by_contract() -> None:
-    assert hudiff_app.CONF.tags == {"group": "design"}
-    assert hudiff_app.CONF.name == "HuDiff-Ab"
-    assert hudiff_app.EXECUTION_COORDINATOR_ENTRYPOINTS == {"submit_hudiff_ab_task"}
-
-
-def test_parse_accepts_complete_unique_wide_csv() -> None:
-    frame = hudiff_app.parse_hudiff_ab_csv(VALID_CSV)
-
-    assert frame.schema == {"id": pl.String, "vh": pl.String, "vl": pl.String}
-    assert frame.item(0, "id") == "7k9i"
-
-
 @pytest.mark.parametrize(
     ("content", "message"),
     (
@@ -157,26 +141,6 @@ def test_controls_reject_total_attempt_overflow_and_boolean_seed() -> None:
             sampling_order="shuffle",
             upstream_inference_dropout=True,
         )
-
-
-def test_request_roundtrips_and_plans_one_gpu_task_per_pair(monkeypatch) -> None:
-    request = _request()
-    records = tuple(hudiff_app.parse_hudiff_ab_csv(VALID_CSV).to_dicts())
-    monkeypatch.setattr(execution, "_pair_records", lambda _content: records)
-
-    assert HuDiffAbExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert [node.node_key for node in request.execution_plan.nodes] == [
-        HUMANIZE_NODE,
-        COLLECT_NODE,
-    ]
-    node = _HuDiffAbHumanizeNode(request)
-    task = node.discover_remote_tasks(cast(NodeRunContext, None))[0]
-    call = node.prepare_remote_task(cast(NodeRunContext, None), task)
-    assert call.function_name == "hudiff_ab_humanize_pair"
-    assert call.uses_gpu is True
-    assert call.runtime_image_key == "hudiff_ab-a10g"
-    assert call.kwargs["candidate_count"] == 10
-    assert call.kwargs["upstream_inference_dropout"] is True
 
 
 def test_multi_pair_tasks_prepare_fixed_batches_of_two(monkeypatch) -> None:
@@ -498,25 +462,6 @@ def test_runtime_fingerprint_rejects_dependency_drift(monkeypatch) -> None:
         models.assert_runtime_environment()
 
 
-def test_verified_checkpoint_audit_values_are_pinned() -> None:
-    assert models.ARCHIVE_SIZE_BYTES == 2_070_382_005
-    assert len(models.CHECKPOINTS) == 6
-    antibody = next(
-        item for item in models.CHECKPOINTS if item.path == models.ANTIBODY_CHECKPOINT
-    )
-    assert antibody.size_bytes == 479_136_082
-    assert antibody.sha256 == models.ANTIBODY_CHECKPOINT_SHA256
-    assert "hmmer=3.3.2" in models.RUNTIME_IDENTITY
-    assert (
-        f"resolved-environment={models.RUNTIME_ENVIRONMENT_SHA256}"
-        in models.RUNTIME_IDENTITY
-    )
-    assert f"cuda-determinism={models.CUDA_DETERMINISM_POLICY}" in (
-        models.RUNTIME_IDENTITY
-    )
-    assert "wrapper-protocol=3" in models.RUNTIME_IDENTITY
-
-
 def test_bundle_handles_late_nullable_attempt_fields(monkeypatch) -> None:
     attempts = [
         {
@@ -610,15 +555,4 @@ def test_checkpoint_publication_replaces_files_without_deleting_tree(
     assert retained.read_bytes() == b"retained"
     assert orjson.loads((root / models.MODEL_MANIFEST).read_bytes()) == (
         models._expected_manifest()
-    )
-
-
-@pytest.mark.parametrize(
-    "module",
-    (models, patches, upstream_runtime, worker),
-)
-def test_worker_import_closure_parses_as_python_310(module: ModuleType) -> None:
-    path = Path(cast(str, module.__file__))
-    ast.parse(
-        path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10)
     )

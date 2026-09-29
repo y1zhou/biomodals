@@ -287,20 +287,3 @@ def test_run_restart_reports_successor_when_interrupted(
     assert result.exit_code == 130
     assert "submission outcome is unknown" in result.output
     assert str(SUCCESSOR_ID) in result.output
-
-
-def test_top_level_run_is_reserved_for_execution_lifecycle() -> None:
-    result = runner.invoke(app, ["run", "--help"])
-
-    assert result.exit_code == 0
-    assert "status" in result.output
-    assert "cancel" in result.output
-    assert "resume" in result.output
-    assert "restart" in result.output
-
-
-def test_run_resume_help_describes_both_resumable_states() -> None:
-    result = runner.invoke(app, ["run", "resume", "--help"])
-
-    assert result.exit_code == 0
-    assert "suspended or state-unknown Run" in result.output

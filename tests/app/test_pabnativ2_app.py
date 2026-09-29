@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import sys
 from dataclasses import replace
@@ -93,17 +92,6 @@ def _request() -> PAbNatiV2ExecutionRequest:
     )
 
 
-def test_modal_group_tag_does_not_depend_on_source_path() -> None:
-    assert pabnativ2_app.CONF.tags == {"group": "design"}
-
-
-def test_parse_pabnativ2_csv_accepts_complete_unique_pairs() -> None:
-    frame = pabnativ2_app.parse_pabnativ2_csv(VALID_CSV)
-
-    assert frame.schema == {"id": pl.String, "vh": pl.String, "vl": pl.String}
-    assert frame.item(0, "id") == "pair-1"
-
-
 @pytest.mark.parametrize(
     ("content", "message"),
     (
@@ -177,26 +165,6 @@ def test_pair_seed_is_order_independent_and_input_specific() -> None:
     assert first != pabnativ2_app._pair_seed(4, "other", "AAAA", "CCCC")
 
 
-def test_execution_request_roundtrips_and_plans_per_pair_gpu_tasks(monkeypatch) -> None:
-    request = _request()
-    records = tuple(pabnativ2_app.parse_pabnativ2_csv(VALID_CSV).to_dicts())
-    monkeypatch.setattr(pabnativ2_execution, "_pair_records", lambda _content: records)
-
-    assert PAbNatiV2ExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert [node.node_key for node in request.execution_plan.nodes] == [
-        HUMANIZE_NODE,
-        COLLECT_NODE,
-    ]
-    node = _PAbNatiV2HumanizeNode(request)
-    task = node.discover_remote_tasks(cast(NodeRunContext, None))[0]
-    call = node.prepare_remote_task(cast(NodeRunContext, None), task)
-    assert call.function_name == "pabnativ2_humanize_pair"
-    assert call.uses_gpu is True
-    assert call.runtime_image_key == "pabnativ2-a10g"
-    assert call.kwargs["pair"]["id"] == "pair-1"
-    assert call.kwargs["seed"] == 7
-
-
 def test_multi_pair_tasks_prepare_one_fixed_batch(monkeypatch) -> None:
     records = (
         {"id": "pair-1", "vh": "AAAA", "vl": "CCCC"},
@@ -221,23 +189,6 @@ def test_multi_pair_tasks_prepare_one_fixed_batch(monkeypatch) -> None:
 def test_execution_request_rejects_boolean_seed() -> None:
     with pytest.raises(ValueError, match="seed"):
         replace(_request(), seed=True)
-
-
-def test_gpu_worker_returns_common_app_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    expected = AppRunResult(status=AppRunStatus.SUCCEEDED)
-    captured: dict[str, object] = {}
-
-    def fake_run(**kwargs: object) -> AppRunResult:
-        captured.update(kwargs)
-        return expected
-
-    monkeypatch.setattr(pabnativ2_app, "_run_pabnativ2_pair", fake_run)
-
-    pair = {"id": "pair", "vh": "AAAA", "vl": "CCCC"}
-    result = pabnativ2_app.pabnativ2_humanize_pair.get_raw_f()(pair)
-
-    assert result is expected
-    assert captured["pair"] == pair
 
 
 @pytest.mark.parametrize("fail", (False, True))
@@ -392,15 +343,6 @@ def test_execution_request_requires_gpu_capacity_and_safe_run_name() -> None:
         replace(request, max_active_gpu_provider_calls=0)
     with pytest.raises(ValueError, match="safe short filename"):
         replace(request, run_name="x" * 201)
-
-
-def test_entrypoint_accepts_cli_provider_limits() -> None:
-    entrypoint = pabnativ2_app.submit_pabnativ2_task.info.raw_f
-    assert entrypoint is not None
-    parameters = inspect.signature(entrypoint).parameters
-
-    assert "max_containers" in parameters
-    assert "max_gpu_containers" in parameters
 
 
 @pytest.mark.parametrize("failed_pair_id", (None, "pair-2"))

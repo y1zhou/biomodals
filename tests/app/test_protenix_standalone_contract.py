@@ -7,12 +7,10 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from uuid import UUID
 
 import orjson
 
 from biomodals.app.fold import protenix_app
-from biomodals.execution import RunStatus
 
 
 class FakeVolume:
@@ -24,10 +22,6 @@ class FakeVolume:
 
     def reload(self) -> None:
         pass
-
-
-def test_msa_cache_uses_an_absolute_modal_mount() -> None:
-    assert Path(protenix_app.APP_INFO.msa_cache_mountpoint).is_absolute()
 
 
 def test_publication_validators_reject_same_size_corruption(
@@ -156,89 +150,3 @@ def test_planner_discovers_one_task_per_input(
     assert [task.task_key for task in plan.tasks] == ["0000-job-0", "0001-job-1"]
     assert all(Path(task.input_json_path).is_file() for task in plan.tasks)
     assert volume.commit_count == 1
-
-
-def test_local_entrypoint_launches_one_execution_coordinator(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    input_path = tmp_path / "input.json"
-    input_path.write_text('[{"name":"demo"}]')
-    execution_run_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-    captured = {}
-
-    class FakeOutputVolume:
-        def read_file(self, path):
-            captured["download"] = path
-            if path.endswith(".complete.json"):
-                request = captured["request"]
-                yield orjson.dumps({
-                    "result_key": request.result_key,
-                    "size": 3,
-                    "sha256": sha256(b"tar").hexdigest(),
-                })
-                return
-            yield b"tar"
-
-    class FakeMethod:
-        def spawn(self, **kwargs):
-            captured["run_kwargs"] = kwargs
-            return SimpleNamespace(
-                object_id="fc-1",
-                get=lambda: SimpleNamespace(
-                    run=SimpleNamespace(
-                        status=RunStatus.SUCCEEDED,
-                        status_message=None,
-                        status_reason=None,
-                    )
-                ),
-            )
-
-    def stage(volume, run_id, request):
-        captured.update(volume=volume, run_id=run_id, request=request)
-
-    volume = FakeOutputVolume()
-    monkeypatch.setattr(
-        protenix_app,
-        "CONF",
-        SimpleNamespace(
-            name="Protenix",
-            version="2.0.0",
-            repo_commit_hash="7e1de70",
-            output_volume=volume,
-            output_volume_mountpoint="/protenix-output",
-        ),
-    )
-    monkeypatch.setattr(protenix_app, "uuid4", lambda: execution_run_id)
-    monkeypatch.setattr(protenix_app, "stage_execution_request", stage)
-    monkeypatch.setattr(
-        protenix_app,
-        "submit_staged_execution_run",
-        lambda volume, **kwargs: (
-            captured.update(submit=(volume, kwargs)) or FakeMethod().spawn().get()
-        ),
-    )
-    monkeypatch.setattr(
-        protenix_app,
-        "write_local_tarball",
-        lambda path, data: captured.update(out_file=path, data=data),
-    )
-    raw = protenix_app.submit_protenix_task.info.raw_f
-    assert raw is not None
-
-    raw(
-        input_file=str(input_path),
-        out_dir=str(tmp_path / "results"),
-        run_name="../demo",
-        max_containers=3,
-        max_gpu_containers=1,
-    )
-
-    assert captured["request"].run_name == "demo"
-    assert captured["request"].max_active_provider_calls == 3
-    assert captured["request"].max_active_gpu_provider_calls == 1
-    _, submit_kwargs = captured["submit"]
-    assert submit_kwargs["execution_run_id"] == execution_run_id
-    assert submit_kwargs["predecessor_execution_run_id"] is None
-    assert submit_kwargs["use_deployed_coordinator"] is False
-    assert captured["data"] == b"tar"

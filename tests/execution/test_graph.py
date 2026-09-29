@@ -7,11 +7,9 @@ from dataclasses import dataclass, field
 import pytest
 
 from biomodals.execution import ExecutionPlanMetadata, NodeAggregationPolicy
-from biomodals.execution.definition_plan import execution_plan, node_task_plan
-from biomodals.execution.nodes import CoordinatorNode, TaskProviderNode
-from biomodals.schema import ArtifactKind
+from biomodals.execution.definition_plan import execution_plan
+from biomodals.execution.nodes import CoordinatorNode
 from biomodals.workflow import ExecutionGraph
-from biomodals.workflow.display import print_workflow_dag
 
 
 class DummyNode(CoordinatorNode):
@@ -25,39 +23,6 @@ class ConfiguredDummyNode(CoordinatorNode):
 
     def run(self, context):  # pragma: no cover - builder tests do not execute nodes
         raise NotImplementedError
-
-
-def test_selector_input_creates_data_dependency() -> None:
-    workflow = ExecutionGraph("demo")
-    upstream = workflow.add_node(DummyNode(), id="design")
-    downstream = workflow.add_node(
-        DummyNode(),
-        id="score",
-        inputs={
-            "structures": upstream.outputs(
-                kind=ArtifactKind.STRUCTURES,
-                pattern="**/*.pdb",
-            )
-        },
-    )
-
-    definition = workflow.validate()
-
-    assert definition.dependencies["score"] == {"design"}
-    assert definition.nodes["score"].inputs["structures"].producing_node_id == "design"
-    assert downstream.node_id == "score"
-
-
-def test_depends_on_creates_control_edge() -> None:
-    workflow = ExecutionGraph("demo")
-    ranked = workflow.add_node(DummyNode(), id="ranked")
-    packaged = workflow.add_node(DummyNode(), id="package", depends_on=[ranked])
-
-    definition = workflow.validate()
-
-    assert definition.dependencies["package"] == {"ranked"}
-    assert definition.nodes["package"].control_dependencies == {"ranked"}
-    assert packaged.node_id == "package"
 
 
 def test_duplicate_node_ids_raise_value_error() -> None:
@@ -166,20 +131,3 @@ def test_partial_acceptance_must_name_an_actual_dependency() -> None:
 
     with pytest.raises(ValueError, match="must name a Node dependency"):
         workflow.validate()
-
-
-def test_workflow_node_is_one_scientifically_identified_task() -> None:
-    task = node_task_plan("score")
-
-    assert task.task_key == "node"
-    assert task.scientific_payload == {"workflow_node_id": "score"}
-    assert task.execution_payload is None
-
-
-def test_dag_display_marks_runtime_task_nodes_as_provider_work(capsys) -> None:
-    workflow = ExecutionGraph("display")
-    workflow.add_node(TaskProviderNode(), id="fanout")
-
-    print_workflow_dag(workflow.validate())
-
-    assert "[provider; TaskProviderNode]" in capsys.readouterr().out

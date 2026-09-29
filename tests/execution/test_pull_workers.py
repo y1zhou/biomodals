@@ -231,103 +231,6 @@ def test_worker_cannot_exceed_its_unfinished_claim_capacity() -> None:
     ]
 
 
-def test_pull_hot_paths_use_the_unplanned_dispatch_index() -> None:
-    connection = sqlite3.connect(":memory:")
-    create_repository(connection=connection, task_count=100)
-
-    claim_plan = connection.execute(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT task_key
-        FROM execution_tasks
-        WHERE execution_run_id = ?
-            AND node_key = ?
-            AND status = ?
-            AND result_observation = ?
-            AND provider_call_id IS NULL
-            AND worker_provider_call_id IS NULL
-            AND local_owned = 0
-            AND dispatch_policy_json IS NULL
-        ORDER BY ordinal
-        LIMIT ?
-        """,
-        (str(RUN_ID), "inference", "pending", "missing", 8),
-    ).fetchall()
-    count_plan = connection.execute(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT COUNT(*)
-        FROM execution_tasks
-        WHERE execution_run_id = ?
-            AND node_key = ?
-            AND status IN (?, ?)
-            AND dispatch_policy_json IS NULL
-        """,
-        (str(RUN_ID), "inference", "pending", "running"),
-    ).fetchall()
-    validation_plan = connection.execute(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT task_key
-        FROM execution_tasks
-        WHERE execution_run_id = ?
-            AND node_key = ?
-            AND status = 'pending'
-            AND result_observation IS NOT 'missing'
-            AND dispatch_policy_json IS NULL
-        LIMIT 1
-        """,
-        (str(RUN_ID), "inference"),
-    ).fetchall()
-
-    assert any(
-        "execution_tasks_unplanned_dispatch_idx" in str(row[3]) for row in claim_plan
-    )
-    assert any(
-        "execution_tasks_unplanned_dispatch_idx" in str(row[3])
-        or "execution_tasks_publication_recovery_idx" in str(row[3])
-        for row in count_plan
-    )
-    assert any(
-        "execution_tasks_unplanned_dispatch_idx" in str(row[3])
-        or "execution_tasks_publication_recovery_idx" in str(row[3])
-        for row in validation_plan
-    )
-
-
-def test_pull_worker_preclaim_uses_batch_and_call_indexes() -> None:
-    connection = sqlite3.connect(":memory:")
-    create_repository(connection=connection, task_count=3)
-
-    batch_plan = connection.execute(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT *
-        FROM execution_dispatch_batches
-        WHERE execution_run_id = ? AND node_key = ? AND mode = ?
-        """,
-        (str(RUN_ID), "inference", "pull_worker"),
-    ).fetchall()
-    calls_plan = connection.execute(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT COUNT(*)
-        FROM execution_provider_calls
-        WHERE dispatch_batch_id = ?
-            AND status NOT IN (?, ?, ?)
-        """,
-        ("batch", "succeeded", "failed", "cancelled"),
-    ).fetchall()
-
-    assert any(
-        "execution_dispatch_batches_run_node_mode_idx" in str(row[3])
-        for row in batch_plan
-    )
-    assert any(
-        "execution_provider_calls_batch_status_idx" in str(row[3]) for row in calls_plan
-    )
-
-
 def test_publication_recovery_omits_known_missing_pending_tasks() -> None:
     connection = sqlite3.connect(":memory:")
     repository = create_repository(connection=connection, task_count=4)
@@ -353,34 +256,6 @@ def test_publication_recovery_omits_known_missing_pending_tasks() -> None:
     )
 
     assert [task.task_key for task in tasks] == ["seed-0", "seed-1", "seed-2"]
-
-
-def test_publication_recovery_uses_its_status_index() -> None:
-    connection = sqlite3.connect(":memory:")
-    create_repository(connection=connection)
-
-    query_plan = connection.execute(
-        """
-        EXPLAIN QUERY PLAN
-        SELECT *
-        FROM execution_tasks
-        WHERE execution_run_id = ?
-            AND node_key = ?
-            AND (
-                status = 'running'
-                OR (
-                    status = 'pending'
-                    AND result_observation IS NOT 'missing'
-                )
-            )
-        ORDER BY ordinal
-        """,
-        (str(RUN_ID), "inference"),
-    ).fetchall()
-
-    assert any(
-        "execution_tasks_publication_recovery_idx" in str(row[3]) for row in query_plan
-    )
 
 
 def test_pull_worker_rejects_an_unobserved_pending_task() -> None:

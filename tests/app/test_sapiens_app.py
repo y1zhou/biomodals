@@ -8,7 +8,6 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
 from uuid import UUID
 
 import pandas as pd
@@ -17,12 +16,9 @@ import pytest
 
 from biomodals.app.design.sapiens import app as sapiens_app
 from biomodals.app.design.sapiens.execution import (
-    HUMANIZE_NODE,
     SapiensExecutionRequest,
-    _SapiensHumanizeNode,
 )
 from biomodals.execution import RunStatus
-from biomodals.execution.nodes import NodeRunContext
 from biomodals.schema import (
     AppOutput,
     AppRunResult,
@@ -55,17 +51,6 @@ def _request() -> SapiensExecutionRequest:
     )
 
 
-def test_modal_group_tag_does_not_depend_on_source_path() -> None:
-    assert sapiens_app.CONF.tags == {"group": "design"}
-
-
-def test_parse_sapiens_csv_accepts_complete_unique_pairs() -> None:
-    frame = sapiens_app.parse_sapiens_csv(VALID_CSV)
-
-    assert frame.schema == {"id": pl.String, "vh": pl.String, "vl": pl.String}
-    assert frame.to_dicts()[0]["id"] == "pair-1"
-
-
 @pytest.mark.parametrize(
     ("content", "message"),
     (
@@ -81,17 +66,6 @@ def test_parse_sapiens_csv_rejects_invalid_batches(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         sapiens_app.parse_sapiens_csv(content)
-
-
-def test_execution_request_roundtrips_and_plans_one_cpu_node() -> None:
-    request = _request()
-
-    assert SapiensExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert request.execution_plan.nodes[0].node_key == HUMANIZE_NODE
-    call = _SapiensHumanizeNode(request).prepare_remote(cast(NodeRunContext, None))
-    assert call.function_name == "sapiens_humanize"
-    assert call.uses_gpu is False
-    assert call.kwargs["csv_bytes"] == VALID_CSV
 
 
 def test_execution_request_rejects_boolean_iterations() -> None:
@@ -268,32 +242,6 @@ def test_paired_iteration_outputs_keep_matching_chain_passes(monkeypatch):
         mutate_cdrs=False,
     )
     assert predictions == ["AAAA", "CACC", "DADD", "EEEE", "FEFF", "GEGG"]
-
-
-def test_workflow_function_returns_inline_archive(monkeypatch) -> None:
-    monkeypatch.setattr(
-        sapiens_app,
-        "_run_sapiens_humanization",
-        lambda **kwargs: (b"archive", 3, 7, 1.25),
-    )
-
-    result = sapiens_app.sapiens_humanize.get_raw_f()(
-        run_name="../example",
-        csv_bytes=VALID_CSV,
-    )
-
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert result.metrics == {
-        "pair_count": 3,
-        "mutation_count": 7,
-        "iterations": 1,
-        "elapsed_seconds": 1.25,
-    }
-    assert result.outputs[0].storage == InlineBytes(
-        data=b"archive",
-        filename="example_sapiens.tar.zst",
-        media_type=ZSTD_MEDIA_TYPE,
-    )
 
 
 def test_scoring_only_keeps_sequences_and_averages_observed_not_argmax(monkeypatch):

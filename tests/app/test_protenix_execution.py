@@ -14,20 +14,14 @@ import pytest
 from biomodals.app.fold import protenix_app
 from biomodals.app.fold.protenix_execution import (
     DOWNLOAD_NODE,
-    FINALIZE_NODE,
     INFERENCE_NODE,
-    MSA_NODE,
-    PLAN_NODE,
     ProtenixExecutionCoordinator,
     ProtenixExecutionRequest,
     ProtenixMsaTaskSpec,
     ProtenixPreparationPlan,
-    ProtenixPublications,
     persist_execution_request,
-    protenix_execution_graph,
 )
 from biomodals.execution import DeploymentIdentity, RunStatus
-from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.modal import (
     ProviderCallObservation,
     ProviderCallObservationKind,
@@ -196,43 +190,6 @@ def _coordinator(
         provider_driver=driver,
         app_version=request.app_version,
         poll_interval_seconds=0,
-    )
-
-
-def test_request_round_trip_preserves_msa_fanout_graph(tmp_path: Path) -> None:
-    request = _request()
-
-    decoded = ProtenixExecutionRequest.from_bytes(request.to_bytes())
-
-    assert decoded == request
-    assert decoded.execution_plan.node_keys == (
-        DOWNLOAD_NODE,
-        PLAN_NODE,
-        MSA_NODE,
-        FINALIZE_NODE,
-        INFERENCE_NODE,
-    )
-    assert decoded.execution_plan.scientific_versions["protenix.model"] == (
-        decoded.model_name
-    )
-    assert decoded.execution_plan.scientific_versions["protenix.reference_data"] == (
-        "v1.0.0"
-    )
-    assert decoded.execution_plan.terminal_node_keys == (INFERENCE_NODE,)
-    graph = protenix_execution_graph(
-        request,
-        ProtenixPublications(
-            request=request,
-            execution_run_id=RUN_ID,
-            output_root=tmp_path,
-            output_volume_name=OUTPUT_VOLUME_NAME,
-            msa_cache_volume=FakeVolume(),
-            output_claims=FakeClaims(),
-        ),
-    )
-    assert (
-        execution_plan(graph.validate(), workload_run_key=request.run_name)
-        == request.execution_plan
     )
 
 

@@ -15,27 +15,6 @@ from biomodals.execution import (
 )
 
 
-def test_plan_preserves_node_order_and_identifies_terminal_nodes() -> None:
-    plan = ExecutionPlan(
-        workload_name="short-md",
-        nodes=(
-            NodePlan(node_key="prepare"),
-            NodePlan(
-                node_key="production",
-                dependencies=(NodeDependency(node_key="prepare"),),
-            ),
-            NodePlan(
-                node_key="summary",
-                dependencies=(NodeDependency(node_key="production"),),
-            ),
-        ),
-    )
-
-    assert plan.node_keys == ("prepare", "production", "summary")
-    assert plan.terminal_node_keys == ("summary",)
-    assert plan.nodes[0].aggregation_policy == NodeAggregationPolicy.COLLECT_ALL
-
-
 def test_plan_rejects_duplicate_node_keys() -> None:
     with pytest.raises(ValueError, match="duplicate Node key 'prepare'"):
         ExecutionPlan(

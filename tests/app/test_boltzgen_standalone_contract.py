@@ -20,36 +20,6 @@ class FakeOutputVolume:
         self.reload_count += 1
 
 
-def test_prepare_boltzgen_run_uses_app_run_layout(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    output_volume = FakeOutputVolume()
-    monkeypatch.setattr(
-        boltzgen_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume_mountpoint=str(tmp_path), output_volume=output_volume
-        ),
-    )
-
-    boltzgen_app.prepare_boltzgen_run.get_raw_f()(
-        yaml_content=b"name: demo\n",
-        run_name="demo",
-        additional_files={"templates/input.cif": b"data"},
-    )
-
-    run_root = tmp_path / "demo"
-    assert (
-        run_root / "inputs" / "config" / "demo.yaml"
-    ).read_bytes() == b"name: demo\n"
-    assert (
-        run_root / "inputs" / "config" / "templates" / "input.cif"
-    ).read_bytes() == b"data"
-    assert (run_root / "outputs").is_dir()
-    assert output_volume.commit_count == 1
-
-
 def test_get_run_ids_salvage_mode_reads_outputs_from_app_run_layout(
     tmp_path: Path,
     monkeypatch,

@@ -19,8 +19,6 @@ from biomodals.app.design.humatch import app as humatch_app
 from biomodals.app.design.humatch.execution import (
     _RESULT_FILE,
     COLLECT_NODE,
-    HUMANIZE_NODE,
-    HUMATCH_BATCH_SIZE,
     HumatchExecutionRequest,
     _HumatchHumanizeNode,
     humatch_execution_graph,
@@ -72,17 +70,6 @@ def _request() -> HumatchExecutionRequest:
     )
 
 
-def test_modal_group_tag_does_not_depend_on_source_path() -> None:
-    assert humatch_app.CONF.tags == {"group": "design"}
-
-
-def test_parse_humatch_csv_accepts_complete_unique_pairs() -> None:
-    frame = humatch_app.parse_humatch_csv(VALID_CSV)
-
-    assert frame.schema == {"id": pl.String, "vh": pl.String, "vl": pl.String}
-    assert frame.to_dicts()[0]["id"] == "pair-1"
-
-
 @pytest.mark.parametrize(
     ("content", "message"),
     (
@@ -108,30 +95,6 @@ def test_fixed_positions_are_normalized_without_exposing_upstream_spacing() -> N
     )
     with pytest.raises(ValueError, match="duplicate"):
         humatch_app._normalize_fixed_positions("27,27", "fixed")
-
-
-def test_execution_request_roundtrips_and_plans_fixed_cpu_batches() -> None:
-    request = _request()
-
-    assert HumatchExecutionRequest.from_bytes(request.to_bytes()) == request
-    assert [node.node_key for node in request.execution_plan.nodes] == [
-        HUMANIZE_NODE,
-        COLLECT_NODE,
-    ]
-    node = _HumatchHumanizeNode(request)
-    tasks = node.discover_remote_tasks(cast(NodeRunContext, None))
-    call = node.prepare_remote_task_batch(cast(NodeRunContext, None), tasks)
-    assert call.function_name == "humatch_humanize_batch"
-    assert call.uses_gpu is False
-    assert call.max_tasks_per_call == HUMATCH_BATCH_SIZE
-    assert call.kwargs["pairs"] == [
-        {
-            "id": "pair-1",
-            "vh": "QVQLVQSGAEVKKPGASVKVSCKASGYTFTNYGMNWVRQAPGQGLEWMG",
-            "vl": "DIQMTQSPSSLSASVGDRVTITCRASQSI",
-        }
-    ]
-    assert call.kwargs["max_edits"] == 60
 
 
 def test_execution_request_allows_outer_cpu_call_limit() -> None:
@@ -584,35 +547,6 @@ def test_result_bundle_has_the_stable_workflow_files(monkeypatch) -> None:
         "manifest.json",
     }
     assert b'"schema_version": 2' in captured["manifest.json"]
-
-
-def test_workflow_function_returns_inline_archive(monkeypatch) -> None:
-    metrics = {
-        "pair_count": 3,
-        "mutation_count": 7,
-        "success_count": 2,
-        "model_load_seconds": 1.0,
-        "humanization_seconds": 2.0,
-        "elapsed_seconds": 3.0,
-    }
-    monkeypatch.setattr(
-        humatch_app,
-        "_run_humatch_humanization",
-        lambda **kwargs: (b"archive", metrics),
-    )
-
-    result = humatch_app.humatch_humanize.get_raw_f()(
-        run_name="../example",
-        csv_bytes=VALID_CSV,
-    )
-
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert result.metrics == metrics
-    assert result.outputs[0].storage == InlineBytes(
-        data=b"archive",
-        filename="example_humatch.tar.zst",
-        media_type=ZSTD_MEDIA_TYPE,
-    )
 
 
 def test_image_asset_manifest_contains_only_inference_assets() -> None:

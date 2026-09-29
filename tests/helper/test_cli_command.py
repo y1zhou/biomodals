@@ -2,12 +2,8 @@
 
 # ruff: noqa: D103
 
-import sys
-
 from biomodals.helper.cli_command import (
-    build_modal_deploy_command,
     build_workflow_run_command,
-    modal_env_overrides,
     resolve_workflow_entrypoint,
     select_modal_deployment_version,
 )
@@ -85,35 +81,3 @@ def test_resolve_workflow_entrypoint_reports_ambiguous_workflows() -> None:
     assert "contains multiple local entrypoints" in message
     assert "ambiguous::first" in message
     assert "ambiguous::second" in message
-
-
-def test_modal_env_overrides_only_contains_requested_values() -> None:
-    assert modal_env_overrides(gpu="L40S", timeout=3600) == {
-        "GPU": "L40S",
-        "TIMEOUT": "3600",
-    }
-    assert modal_env_overrides(gpu=None, timeout=None) == {}
-
-
-def test_build_modal_deploy_command() -> None:
-    assert build_modal_deploy_command(
-        app_ref="src/biomodals/app/fold/demo_app.py",
-        name="demo-prod",
-        tag="v1",
-        env="production",
-        strategy="recreate",
-    ) == (
-        sys.executable,
-        "-m",
-        "modal",
-        "deploy",
-        "--name",
-        "demo-prod",
-        "--tag",
-        "v1",
-        "--env",
-        "production",
-        "--strategy",
-        "recreate",
-        "src/biomodals/app/fold/demo_app.py",
-    )

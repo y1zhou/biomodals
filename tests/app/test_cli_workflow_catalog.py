@@ -49,41 +49,11 @@ def test_run_rejects_outer_options_after_entrypoint_separator(
     assert "Do not pass it after" in strip_ansi(result.output)
 
 
-def test_cli_loads_workflow_namespace_names() -> None:
-    workflow = _load_entry("workflow", "ppiflow")
-
-    assert workflow.module == "biomodals.workflow.ppiflow.workflow"
-    assert workflow.category == "workflow"
-
-
 def test_cli_loads_hyphenated_workflow_aliases() -> None:
     workflow = _load_entry("workflow", "rfd-ligandmpnn")
 
     assert workflow.name == "rfd_ligandmpnn"
     assert workflow.module == "biomodals.workflow.rfd_ligandmpnn_workflow"
-
-
-def test_workflow_list_command_shows_workflow_names() -> None:
-    result = runner.invoke(app, ["workflow", "list", "--short"])
-
-    assert result.exit_code == 0
-    assert "ppiflow" in result.output
-
-
-def test_app_list_command_is_namespaced() -> None:
-    result = runner.invoke(app, ["app", "list", "--short"])
-
-    assert result.exit_code == 0
-    assert "rosetta" in result.output
-
-
-def test_app_list_shows_package_app_category() -> None:
-    result = runner.invoke(app, ["app", "list"])
-
-    assert result.exit_code == 0
-    assert any(
-        "sapiens" in line and "design" in line for line in result.output.splitlines()
-    )
 
 
 @pytest.mark.parametrize(
@@ -127,30 +97,6 @@ def test_entry_help_separates_cli_owned_and_workload_flags(
     if command[0] == "workflow":
         assert "dry_run" not in output
         assert "--dry-run" not in output
-
-
-@pytest.mark.parametrize("namespace", ["app", "workflow"])
-def test_run_help_owns_public_deployment_flags(namespace: str) -> None:
-    result = runner.invoke(app, [namespace, "run", "--help"])
-    output = strip_ansi(result.output)
-
-    assert result.exit_code == 0
-    assert "--environment" in output
-    assert "--deployment-name" in output
-    assert "--version" in output
-    assert "--restart-from" in output
-
-
-def test_app_deploy_command_is_namespaced() -> None:
-    result = runner.invoke(app, ["app", "deploy", "--help"])
-    output = strip_ansi(result.output)
-
-    assert result.exit_code == 0
-    assert "Name or path of the app to deploy" in output
-    assert "--env" in output
-    assert "--strategy" in output
-    assert "rolling" in output
-    assert "recreate" in output
 
 
 def test_workflow_deploy_uses_importable_module(

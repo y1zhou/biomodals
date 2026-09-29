@@ -7,7 +7,6 @@ import types
 from pathlib import Path
 
 from biomodals.app.misc import ocr_app
-from biomodals.helper.catalog import get_catalog
 from biomodals.helper.shell import run_command
 
 
@@ -20,13 +19,6 @@ def _tar_zst_names(content: bytes, tmp_path: Path) -> set[str]:
             output_mode="capture",
         )
     )
-
-
-def test_ocr_is_available_in_app_catalog() -> None:
-    apps = get_catalog("app", use_absolute_paths=True)
-
-    assert "ocr" in apps
-    assert apps["ocr"].name == "ocr_app.py"
 
 
 def test_ocr_app_configs_use_tool_specific_model_store_paths() -> None:

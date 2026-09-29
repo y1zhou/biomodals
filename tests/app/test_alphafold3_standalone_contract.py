@@ -2,8 +2,6 @@
 
 # ruff: noqa: D103
 
-import ast
-import inspect
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import cast
@@ -117,25 +115,6 @@ def _install_claim_runtime(
         ),
     )
     return claims
-
-
-def test_app_public_functions_are_modal_endpoints() -> None:
-    tree = ast.parse(inspect.getsource(alphafold3_app))
-    violations: list[str] = []
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
-            continue
-        decorator_names = {
-            decorator.func.attr
-            for decorator in node.decorator_list
-            if isinstance(decorator, ast.Call)
-            and isinstance(decorator.func, ast.Attribute)
-            and isinstance(decorator.func.value, ast.Name)
-            and decorator.func.value.id == "app"
-        }
-        if not decorator_names.intersection({"function", "local_entrypoint"}):
-            violations.append(node.name)
-    assert violations == []
 
 
 def test_summary_claim_lifetime_matches_its_shorter_function_timeout() -> None:

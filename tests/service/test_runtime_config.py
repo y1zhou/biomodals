@@ -76,10 +76,3 @@ def test_disabled_tool_keeps_positive_provider_limit_floors(tmp_path, tool):
     assert effective.active_job_limit.value == 0
     assert effective.max_active_provider_calls == 1
     assert effective.max_active_gpu_provider_calls == 1
-
-
-def test_modal_app_name_comes_from_startup_configuration(tmp_path: Path) -> None:
-    configuration = _configuration(tmp_path)
-
-    effective = configuration.tool("gromacs")
-    assert effective.modal_app_name == "Gromacs"

@@ -28,7 +28,6 @@ from biomodals.execution import (
     RunStatus,
     TaskPlan,
 )
-from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ExecutionVolumeSync,
@@ -198,16 +197,6 @@ def _publish_collection(
             "filtered": False,
             "artifacts": artifacts,
         },
-    )
-
-
-def test_graph_preserves_the_declared_execution_plan(tmp_path: Path) -> None:
-    request = _request()
-    graph = boltzgen_execution_graph(request, output_root=tmp_path)
-
-    assert (
-        execution_plan(graph.validate(), workload_run_key=request.run_name)
-        == request.execution_plan
     )
 
 

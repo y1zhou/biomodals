@@ -1633,11 +1633,3 @@ def test_submit_workflow_run_reports_identity_when_interrupted(
         "print:Coordinator submission outcome is unknown; inspect this Execution "
         "Run before retrying.",
     ]
-
-
-def test_orchestrator_modal_app_exposes_standard_coordinator_surface() -> None:
-    functions = orchestrator.app._local_state.functions
-
-    assert orchestrator.CONF.python_version == "3.13"
-    assert orchestrator.OUT_VOLUME_NAME == WORKFLOW_ORCHESTRATOR_VOLUME_NAME
-    assert "ExecutionCoordinator.*" in functions

@@ -118,11 +118,6 @@ def test_execution_envelope_has_independent_metadata_headroom(
     assert request.to_bytes() == envelope
 
 
-def test_execution_envelope_retains_one_gib_ceiling() -> None:
-    """The internal coordinator envelope retains its independent headroom."""
-    assert execution_request.MAX_EXECUTION_REQUEST_BYTES == 1024 * 1024 * 1024
-
-
 def test_operational_limits_do_not_change_the_scientific_plan() -> None:
     """CPU and GPU call ceilings remain outside result compatibility."""
     first = _request(max_containers=4, max_gpu_containers=2)

@@ -7,7 +7,6 @@ import types
 from pathlib import Path
 
 from biomodals.app.misc import ocr_app
-from biomodals.helper.catalog import get_catalog
 from biomodals.helper.shell import run_command
 
 
@@ -19,24 +18,6 @@ def _tar_zst_names(content: bytes, tmp_path: Path) -> set[str]:
             ["tar", "-I", "zstd", "-tf", str(archive_path)],
             output_mode="capture",
         )
-    )
-
-
-def test_ocr_is_available_in_app_catalog() -> None:
-    apps = get_catalog("app", use_absolute_paths=True)
-
-    assert "ocr" in apps
-    assert apps["ocr"].name == "ocr_app.py"
-
-
-def test_ocr_app_configs_use_tool_specific_model_store_paths() -> None:
-    assert ocr_app.CONF.name == "MinerU"
-    assert ocr_app.POPO_CONF.name == "MinerU-Popo"
-    assert ocr_app.MINERU_CONFIG_PATH == Path("/biomodals-store/MinerU/mineru.json")
-    assert ocr_app.VLLM_CACHE_ROOT == Path("/biomodals-store/MinerU/vllm-cache")
-    assert ocr_app.POPO_HF_CACHE_DIR == Path("/biomodals-store/huggingface/hub")
-    assert ocr_app.POPO_HF_CACHE_DIR / "models--DreamEternal--MinerU-Popo" == Path(
-        "/biomodals-store/huggingface/hub/models--DreamEternal--MinerU-Popo"
     )
 
 

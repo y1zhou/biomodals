@@ -223,16 +223,6 @@ def _coordinator(
     )
 
 
-def test_request_round_trips_without_pickle() -> None:
-    request = _request(
-        off_target=True,
-        utr_bytes=b">utr\nAUGC\n",
-        orf_bytes=b">orf\nAUGC\n",
-    )
-
-    assert OligoformerExecutionRequest.from_bytes(request.to_bytes()) == request
-
-
 def test_operational_provider_limits_round_trip_without_changing_science() -> None:
     base = _request()
     changed = _request(
@@ -454,12 +444,6 @@ def test_process_budget_only_controls_in_container_workers() -> None:
     assert oligoformer_app._off_target_branch_slots(execution) == (6, 6)
     assert oligoformer_app._pita_local_workers(execution) == (1, 2)
     assert oligoformer_app._targetscan_local_workers(execution) == 3
-
-
-def test_pita_reference_provider_mounts_all_human_references() -> None:
-    volumes = oligoformer_app.prepare_oligoformer_pita_reference.spec.volumes
-
-    assert oligoformer_app.CONF.model_volume_mountpoint in volumes
 
 
 def test_runtime_drives_efficacy_only_run_through_deployed_functions(

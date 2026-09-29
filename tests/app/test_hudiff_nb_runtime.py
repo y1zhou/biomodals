@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -196,9 +195,3 @@ def test_worker_validates_controls_and_preserves_duplicate_attempts(
     with pytest.raises(ValueError, match="protected"):
         parent.validate_candidate("ACAE")
     parent.validate_candidate("ACDF")
-
-
-def test_remote_modules_parse_with_python310():
-    """The reused HuDiff image runs 3.10, independently of its coordinator."""
-    for module in (runtime, worker, patches):
-        ast.parse(Path(module.__file__).read_text(), feature_version=(3, 10))

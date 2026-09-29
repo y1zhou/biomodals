@@ -95,26 +95,6 @@ def _selected_rfd_artifact(tmp_path: Path) -> ExecutionArtifact:
     )
 
 
-def test_rfd_ligandmpnn_uses_dependency_app_metadata() -> None:
-    assert rfd_ligandmpnn_workflow.CONF.depends_on_apps == (
-        "rfdiffusion",
-        "ligandmpnn",
-    )
-    assert rfd_ligandmpnn_workflow.CONF.tags == {"depends_on": "rfdiffusion-ligandmpnn"}
-    assert (
-        rfd_ligandmpnn_workflow.RFDIFFUSION_OUTPUT_MOUNTPOINT
-        == rfdiffusion_app.CONF.output_volume_mountpoint
-    )
-    assert (
-        rfd_ligandmpnn_workflow.RFDIFFUSION_OUTPUT_VOLUME
-        is rfdiffusion_app.CONF.output_volume
-    )
-    assert (
-        rfd_ligandmpnn_workflow.RFDIFFUSION_OUTPUT_VOLUME_NAME
-        == rfdiffusion_app.CONF.output_volume_name
-    )
-
-
 def test_build_rfd_ligandmpnn_workflow_models_trajectory_design_fanout() -> None:
     workflow = build_rfd_ligandmpnn_workflow(
         input_pdb=("input.pdb", b"ATOM\n"),

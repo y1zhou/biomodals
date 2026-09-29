@@ -99,19 +99,6 @@ def _create_run(repository: SqliteExecutionRepository) -> UUID:
     return execution_run_id
 
 
-def test_run_reason_vocabulary_is_closed() -> None:
-    assert tuple(RunStatusReason) == (
-        RunStatusReason.COORDINATOR_ERROR,
-        RunStatusReason.RESULT_VALIDATION_UNKNOWN,
-        RunStatusReason.RESOURCE_CAPACITY_UNAVAILABLE,
-        RunStatusReason.SUBMISSION_OUTCOME_UNKNOWN,
-        RunStatusReason.PROVIDER_OUTCOME_UNKNOWN,
-        RunStatusReason.CANCELLATION_OUTCOME_UNKNOWN,
-        RunStatusReason.REQUIRED_WORK_FAILED,
-        RunStatusReason.DEPLOYMENT_UNAVAILABLE,
-    )
-
-
 def test_repository_enforces_run_transitions_and_reason_compatibility() -> None:
     repository = _repository()
     execution_run_id = _create_run(repository)

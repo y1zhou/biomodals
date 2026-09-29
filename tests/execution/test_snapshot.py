@@ -8,7 +8,6 @@ from biomodals.execution import (
     ActiveProviderCallCounts,
     NodeTaskStatusCounts,
     ProviderCallStatus,
-    RunStatus,
 )
 
 from .provider_call_helpers import (
@@ -17,18 +16,6 @@ from .provider_call_helpers import (
     create_repository,
     persist_fixed_policy,
 )
-
-
-def test_snapshot_projects_one_consistent_execution_view() -> None:
-    repository = create_repository(task_count=2)
-
-    snapshot = repository.snapshot(RUN_ID)
-
-    assert snapshot.run.status == RunStatus.RUNNING
-    assert [node.node_key for node in snapshot.nodes] == ["inference"]
-    assert [task.task_key for task in snapshot.tasks] == ["seed-0", "seed-1"]
-    assert snapshot.provider_calls == ()
-    assert snapshot.active_provider_calls == ActiveProviderCallCounts(total=0, gpu=0)
 
 
 def test_overview_preserves_lifecycle_state_without_reading_tasks() -> None:

@@ -10,8 +10,7 @@ from uuid import UUID
 import pytest
 
 from biomodals.app.bioinfo import rosetta_app
-from biomodals.execution import PullTaskClaim, RunStatus, WorkerAssignmentRecord
-from biomodals.helper import shell as shell_helper
+from biomodals.execution import RunStatus
 
 WORKLOAD_UUID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 EXECUTION_RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -140,133 +139,6 @@ def test_rosetta_staging_hashes_exact_script_and_flag_bytes(
 
     assert row["script_hash"] == sha256(script.read_bytes()).hexdigest()
     assert row["flags_hash"] == sha256(flags.read_bytes()).hexdigest()
-
-
-def test_rosetta_worker_uses_app_run_layout(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    captured = {}
-
-    class FakeVolume:
-        def __init__(self) -> None:
-            self.commit_count = 0
-
-        def commit(self) -> None:
-            self.commit_count += 1
-
-    run_root = tmp_path / "demo-abc123"
-    staged_inputs = {
-        "inputs/1/demo.pdb": b"ATOM\n",
-        "inputs/_script/script.xml": b"<ROSETTASCRIPTS />",
-        "inputs/_flags/options.flags": b"-nstruct 1",
-    }
-    for relative_path, content in staged_inputs.items():
-        path = run_root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-    task = rosetta_app.RosettaTaskSpec(
-        task_key="1",
-        index=1,
-        binary="/usr/bin/relax",
-        pdb="inputs/1/demo.pdb",
-        rosetta_script="inputs/_script/script.xml",
-        flags_file="inputs/_flags/options.flags",
-        output_dir="outputs/1",
-        worker_log="logs/1.log",
-        expected_files=(),
-        input_sha256=sha256(staged_inputs["inputs/1/demo.pdb"]).hexdigest(),
-        script_sha256=sha256(staged_inputs["inputs/_script/script.xml"]).hexdigest(),
-        flags_sha256=sha256(staged_inputs["inputs/_flags/options.flags"]).hexdigest(),
-    )
-    assignment = WorkerAssignmentRecord(
-        execution_run_id=EXECUTION_RUN_ID,
-        node_key="rosetta-tasks",
-        task_key=task.task_key,
-        task_fingerprint="fingerprint",
-        execution_payload=task.to_dict(),
-        provider_call_id=PROVIDER_CALL_ID,
-        request_id="claim",
-        ordinal=0,
-        created_at=1,
-    )
-    claim_count = 0
-    completions = []
-
-    def claim(provider_call_id, request_id, capacity):
-        nonlocal claim_count
-        captured.setdefault("claims", []).append((
-            provider_call_id,
-            request_id,
-            capacity,
-        ))
-        assignments = (assignment,) if claim_count == 0 else ()
-        claim_count += 1
-        return PullTaskClaim(
-            request_id=request_id,
-            provider_call_id=PROVIDER_CALL_ID,
-            assignments=assignments,
-        )
-
-    def complete_and_claim(provider_call_id, batch, request_id, capacity):
-        completions.extend(
-            (provider_call_id, task_key, completion_request_id, result)
-            for task_key, completion_request_id, result in batch
-        )
-        return claim(provider_call_id, request_id, capacity)
-
-    output_volume = FakeVolume()
-    monkeypatch.setattr(
-        rosetta_app,
-        "CONF",
-        SimpleNamespace(
-            output_volume=output_volume,
-            output_volume_mountpoint=str(tmp_path),
-        ),
-    )
-    coordinator = SimpleNamespace(
-        claim_tasks=SimpleNamespace(remote=claim),
-        complete_tasks_and_claim=SimpleNamespace(remote=complete_and_claim),
-    )
-
-    def fake_run_command(cmd, *, output_mode, log_file):
-        captured["cmd"] = cmd
-        captured["output_mode"] = output_mode
-        captured["log_file"] = log_file
-        Path(log_file).write_text("log\n", encoding="utf-8")
-        Path(cmd[-1], "result.pdb").write_text("ATOM\n", encoding="utf-8")
-
-    monkeypatch.setattr(shell_helper, "run_command", fake_run_command)
-
-    summary = rosetta_app.run_rosetta_worker.get_raw_f()(
-        coordinator=coordinator,
-        provider_call_id=str(PROVIDER_CALL_ID),
-        run_name="demo",
-        run_id="abc123",
-        claim_capacity=1,
-        max_parallel=1,
-    )
-
-    assert captured["cmd"] == [
-        "/usr/bin/relax",
-        "-parser:protocol",
-        str(run_root / "inputs" / "_script" / "script.xml"),
-        f"@{run_root / 'inputs' / '_flags' / 'options.flags'}",
-        "-s",
-        str(run_root / "inputs" / "1" / "demo.pdb"),
-        "-out:path:all",
-        str(run_root / "outputs" / "1"),
-    ]
-    assert captured["output_mode"] == "log"
-    assert captured["log_file"] == run_root / "logs" / "1.log"
-    assert completions[0][0:3] == (
-        str(PROVIDER_CALL_ID),
-        "1",
-        f"{PROVIDER_CALL_ID}:complete:fingerprint",
-    )
-    assert completions[0][3].status == rosetta_app.AppRunStatus.SUCCEEDED
-    assert summary == {"claimed_tasks": 1, "claim_requests": 2}
-    assert output_volume.commit_count == 1
 
 
 def test_rosetta_worker_rejects_path_escaping_run_identity(

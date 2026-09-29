@@ -61,7 +61,6 @@ from biomodals.execution import (
     RunStatus,
     TaskStatus,
 )
-from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ExecutionVolumeSync,
@@ -316,23 +315,6 @@ def _advance_until_calls(runtime: ExecutionGraphRuntime, count: int) -> None:
         if len(runtime.store.execution.list_provider_calls(RUN_ID)) == count:
             return
     raise AssertionError(f"Expected {count} AlphaFold3 Provider Calls")
-
-
-def test_graph_preserves_the_staged_execution_plan(tmp_path: Path) -> None:
-    request = _request()
-    assert request.execution_plan.workload_run_key is not None
-    graph = alphafold3_execution_graph(
-        request,
-        execution_run_id=RUN_ID,
-        **_graph_inputs(tmp_path),
-    )
-
-    plan = execution_plan(
-        graph.validate(),
-        workload_run_key=request.execution_plan.workload_run_key,
-    )
-
-    assert plan == request.execution_plan
 
 
 def test_environment_task_waits_without_a_call_then_reuses_publication(

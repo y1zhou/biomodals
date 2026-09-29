@@ -198,16 +198,3 @@ def test_ranked_design_rows_uses_manifest_candidate_identity() -> None:
     )
 
     assert rows[0]["design"] == "cand_0123"
-
-
-def test_render_report_markdown_includes_attrition_and_ranked_rows() -> None:
-    markdown = tables.render_report_markdown(
-        step_name="ReportStep",
-        artifact_count=3,
-        ranked_rows=[{"design": "design-a", "rank_score": 1.0}],
-        attrition_rows=[{"stage_name": "FilterStep", "retained": 1, "rejected": 2}],
-    )
-
-    assert "## Candidate Attrition" in markdown
-    assert "| FilterStep | 1 | 2 |" in markdown
-    assert "## Ranked Designs" in markdown

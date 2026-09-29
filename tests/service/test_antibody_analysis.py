@@ -19,7 +19,6 @@ from biomodals.service.antibody_sequence_analysis.contracts import (
 )
 from biomodals.service.antibody_sequence_analysis.reference import (
     TherapeuticReference,
-    build_reference,
     present_germlines,
 )
 
@@ -256,13 +255,6 @@ def test_missing_reference_leaves_metrics_available_and_corrupt_file_intact(tmp_
     chain = response.groups[0].entries[0].vh
     assert chain.metrics["pi"] > 0 and chain.germlines.v_usage[0].frequency is None
     assert path.read_text() == "corrupt"
-
-
-def test_real_fixture_reference_can_be_built_without_modal():
-    """Small deterministic public reference uses the installed native package."""
-    snapshot = build_reference(reference_csv())
-    assert snapshot.info.heavy_sequences == snapshot.info.light_sequences == 2
-    assert snapshot.usage
 
 
 def test_all_invalid_inputs_do_not_trigger_reference_download(tmp_path):

@@ -207,38 +207,6 @@ def _restart(
     return coordinator.drive_prepared()
 
 
-def test_gromacs_execution_request_round_trips_scientific_and_operational_data(
-    tmp_path: Path,
-) -> None:
-    request = _request()
-
-    decoded = GromacsExecutionRequest.from_bytes(request.to_bytes())
-
-    assert decoded == request
-    assert decoded.execution_plan.workload_run_key == "example"
-    assert decoded.run_root(tmp_path) == tmp_path / "example"
-    assert decoded.execution_plan.scientific_versions == {
-        "gromacs": request.gromacs_version,
-        "biomodals.gromacs.execution_plan": request.execution_plan_version,
-    }
-
-
-def test_gromacs_definition_preserves_exact_execution_plan(tmp_path: Path) -> None:
-    request = _request()
-    graph = gromacs_execution_graph(
-        request,
-        _publications(tmp_path, request, FakeClaims(), RUN_ID),
-    )
-
-    assert (
-        execution_plan(
-            graph.validate(),
-            workload_run_key=request.run_name,
-        )
-        == request.execution_plan
-    )
-
-
 def test_clustering_uses_cpu_graph_publication_and_recovery(tmp_path: Path) -> None:
     source = ClusteringSource(
         execution_run_id=THIRD_RUN_ID,

@@ -17,7 +17,6 @@ from biomodals.app.fold.alphafold3.inference_inputs import serialize_af3_input
 from biomodals.app.fold.alphafold3.profiles import ALPHAFOLD3_COMMIT
 from biomodals.execution import DeploymentIdentity
 from biomodals.service.alphafold3.validation import (
-    MAX_VALIDATION_BYTES,
     ValidatedInputStore,
     ValidationLimitExceededError,
     ValidationLimits,
@@ -53,17 +52,6 @@ def _publish(store, source, *, owner_user_id, digest, settings, now=None):
             chemistry_deployment=DeploymentIdentity("test", "af3", 1),
         )
     return store.publish(prepared, owner_user_id=owner_user_id, now=now)
-
-
-def test_api_and_standalone_upload_limits_are_256_mib() -> None:
-    from biomodals.app.fold.alphafold3.inference_inputs import MAX_INPUT_JSON_BYTES
-    from biomodals.app.fold.alphafold3.template_search import (
-        MAX_TEMPLATE_INSPECTION_BYTES,
-    )
-
-    assert MAX_VALIDATION_BYTES == 256 * 1024 * 1024
-    assert MAX_INPUT_JSON_BYTES == 256 * 1024 * 1024
-    assert MAX_TEMPLATE_INSPECTION_BYTES == 1024 * 1024 * 1024
 
 
 def test_validation_retains_native_document_and_bounded_preview(tmp_path: Path) -> None:

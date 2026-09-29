@@ -393,19 +393,6 @@ def test_all_human_evidence_key_uses_converted_reference_content_identity(
     assert first.cache_key != second.cache_key
 
 
-def test_targetscan_rnaplfold_cache_uses_output_volume_v2(tmp_path: Path, monkeypatch):
-    volume = FakeVolume()
-    monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
-    info = oligoformer_app.AppInfo(
-        model_ref_dir=tmp_path / "models" / "off-target" / "ref"
-    )
-
-    cache_root = Path(tmp_path / "outputs-volume" / "reference-cache")
-    assert info.targetscan_rnaplfold_cache_dir.is_relative_to(cache_root)
-    assert info.targetscan_rnaplfold_shard_dir.is_relative_to(cache_root)
-    assert info.targetscan_rnaplfold_marker_path.is_relative_to(cache_root)
-
-
 def test_targetscan_rnaplfold_cache_identity_includes_converted_utr_digest(
     tmp_path: Path, monkeypatch
 ):
@@ -1704,25 +1691,6 @@ def test_merge_pita_shards_sorts_like_upstream_score_table(tmp_path: Path):
     ]
 
 
-def test_oligoformer_execution_defaults_validate_cpu_workers():
-    execution = oligoformer_app.OligoformerExecutionConfig()
-
-    assert execution == oligoformer_app.DEFAULT_EXECUTION_CONFIG
-    assert (
-        oligoformer_app._targetscan_ref_shard_size(
-            100,
-            prepare_nodes=execution.targetscan_prepare_nodes,
-        )
-        == 4
-    )
-    assert (
-        oligoformer_app._targetscan_rnaplfold_worker_count(
-            execution.targetscan_rnaplfold_workers
-        )
-        == 8
-    )
-
-
 def test_targetscan_batch_specs_split_transcript_aligned_refs(
     tmp_path: Path,
     monkeypatch,
@@ -2498,7 +2466,6 @@ def test_package_output_tables_requires_all_final_tables(tmp_path: Path):
 def test_download_oligoformer_models_writes_to_model_volume(
     tmp_path: Path, monkeypatch
 ) -> None:
-    source = Path(oligoformer_app.__file__).read_text(encoding="utf-8")
     commit_events = []
 
     class TrackingVolume(FakeVolume):
@@ -2601,8 +2568,6 @@ def test_download_oligoformer_models_writes_to_model_volume(
     assert output_volume.commit_count == 1
     assert commit_events == ["model", "output"]
     assert lock_calls == [("targetscan-reference-state", "global", True)]
-    assert "min(Args.top_n, RESULT_ranked.shape[0])" in source
-    assert "--biomodals_stage" in source
 
 
 def test_download_models_refreshes_stale_output_reference_identity(

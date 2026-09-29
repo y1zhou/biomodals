@@ -21,7 +21,6 @@ from biomodals.execution import (
     RunStatus,
     TaskStatus,
 )
-from biomodals.execution.definition_plan import execution_plan
 from biomodals.execution.definition_runtime import ExecutionGraphRuntime
 from biomodals.execution.modal import (
     ExecutionVolumeSync,
@@ -169,17 +168,6 @@ def _publish_assignment(
         run_command=run_command,
     )
     return AppRunResult(status=AppRunStatus.SUCCEEDED)
-
-
-def test_graph_preserves_the_staged_execution_plan(tmp_path: Path) -> None:
-    request = _request()
-
-    plan = execution_plan(
-        rosetta_execution_graph(request, output_root=tmp_path).validate(),
-        workload_run_key=request.workload_run_key,
-    )
-
-    assert plan == request.execution_plan
 
 
 def test_workers_claim_disjoint_microbatches_and_complete_each_task(

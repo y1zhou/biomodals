@@ -10,7 +10,7 @@ import pytest
 import zstandard as zstd
 
 from biomodals.app.score import dockq_app
-from biomodals.schema import AppRunResult, AppRunStatus, ArtifactKind, InlineBytes
+from biomodals.schema import AppRunStatus, ArtifactKind, InlineBytes
 from biomodals.schema.storage import ZSTD_MEDIA_TYPE
 
 
@@ -25,16 +25,6 @@ class _FakeDockQBatch:
             return self.archive_bytes
 
         return run_dockq_batch
-
-
-class _FakeDockQWorkflow:
-    def __init__(self, result: AppRunResult) -> None:
-        self.result = result
-        self.calls: list[dict[str, object]] = []
-
-    def remote(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.result
 
 
 def _dockq_archive(csv_text: str) -> bytes:
@@ -161,45 +151,3 @@ def test_dockq_batch_shortens_long_structure_filenames(
     assert len(reference_path.name) <= dockq_app.MAX_STRUCTURE_FILENAME_LENGTH
     assert reference_path.exists()
     assert row["reference"] == reference_path.name
-
-
-def test_dockq_local_entrypoint_writes_tarball_from_workflow_result(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    model = tmp_path / "model.pdb"
-    reference = tmp_path / "reference.pdb"
-    model.write_text("MODEL\n", encoding="utf-8")
-    reference.write_text("REF\n", encoding="utf-8")
-    input_csv = tmp_path / "pairs.csv"
-    input_csv.write_text(
-        f"id,model,reference\npair-1,{model.name},{reference.name}\n",
-        encoding="utf-8",
-    )
-    result = AppRunResult(
-        status=AppRunStatus.SUCCEEDED,
-        outputs=[
-            {
-                "name": "dockq_scores",
-                "kind": ArtifactKind.SCORES,
-                "storage": InlineBytes(
-                    data=b"archive-bytes",
-                    filename="demo_dockq.tar.zst",
-                    media_type=ZSTD_MEDIA_TYPE,
-                ),
-            }
-        ],
-    )
-    fake_workflow = _FakeDockQWorkflow(result)
-    monkeypatch.setattr(dockq_app, "run_dockq_workflow", fake_workflow)
-
-    dockq_app.submit_dockq_task(
-        input_csv=str(input_csv),
-        out_dir=str(tmp_path / "out"),
-        run_name="demo",
-        dockq_args="--short",
-    )
-
-    assert fake_workflow.calls[0]["run_name"] == "demo"
-    assert fake_workflow.calls[0]["dockq_args"] == ["--short"]
-    assert (tmp_path / "out" / "demo.tar.zst").read_bytes() == b"archive-bytes"

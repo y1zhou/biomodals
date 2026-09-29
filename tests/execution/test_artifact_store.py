@@ -16,7 +16,6 @@ from biomodals.execution import (
     TaskPlan,
 )
 from biomodals.execution.artifact_store import (
-    EXECUTION_ARTIFACT_TABLES,
     ExecutionArtifactStore,
 )
 from biomodals.schema import (
@@ -33,18 +32,6 @@ from biomodals.schema import (
 
 RUN_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OTHER_RUN_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
-EXPECTED_EXECUTION_TABLES = {
-    "execution_dispatch_batches",
-    "execution_node_dependencies",
-    "execution_nodes",
-    "execution_provider_calls",
-    "execution_runs",
-    "execution_schema",
-    "execution_task_claim_requests",
-    "execution_task_completion_requests",
-    "execution_tasks",
-    "execution_worker_assignments",
-}
 
 
 def _stores() -> tuple[
@@ -177,20 +164,6 @@ def test_artifact_publication_and_task_completion_share_caller_transaction() -> 
         )
     ) == (artifact,)
     assert execution.get_task(RUN_ID, "design", "node").status.value == "succeeded"
-
-
-def test_schema_contains_execution_and_artifact_tables() -> None:
-    connection, _, _ = _stores()
-
-    tables = {
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-
-    assert EXPECTED_EXECUTION_TABLES.issubset(tables)
-    assert set(EXECUTION_ARTIFACT_TABLES).issubset(tables)
 
 
 def test_artifact_publications_are_scoped_to_one_execution_run() -> None:

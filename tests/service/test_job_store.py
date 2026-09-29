@@ -64,25 +64,6 @@ def _admit(store: ServiceStore, owner: UUID, *, digest: str = "a" * 64):
     )
 
 
-def test_schema_contains_only_six_service_tables(tmp_path: Path) -> None:
-    store, _owner = _store(tmp_path)
-    with sqlite3.connect(store.path) as connection:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-    assert tables == {
-        "users",
-        "password_tokens",
-        "sessions",
-        "service_settings",
-        "tool_settings",
-        "jobs",
-    }
-
-
 @pytest.mark.parametrize("version", [8, 9])
 def test_migration_preserves_jobs_and_authentication(
     tmp_path: Path, version: int

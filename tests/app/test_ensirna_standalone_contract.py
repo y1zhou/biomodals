@@ -117,60 +117,6 @@ def test_cache_layout_rejects_non_content_addressed_keys() -> None:
         ensirna_app._layout_for_cache_key("not-a-digest")
 
 
-def test_runtime_image_uses_rosetta_base_build() -> None:
-    source = Path(ensirna_app.__file__).read_text(encoding="utf-8")
-
-    assert 'from_registry("rosettacommons/rosetta:serial-420"' in source
-    assert '"MAMBA_ROOT_PREFIX": APP_INFO.mamba_root' in source
-    assert '"PATH": APP_INFO.mamba_bin_path' in source
-    assert ensirna_app.APP_INFO.mamba_lib_path == "/root/micromamba/lib"
-    assert '"LD_LIBRARY_PATH": APP_INFO.mamba_lib_path' in source
-    assert "python -c 'import RNA'" in source
-    assert "def rosetta_extract_shim" in source
-    assert "rna_denovo.static.linuxgccrelease" in source
-    assert "def get_pdb_runtime_patch" in source
-    assert "get_pdb_source_sha256" in source
-    assert "dataset_source_sha256" in source
-    assert ".run_commands(APP_INFO.patched_sources_compile_command)" in source
-    assert "expected_len = 61 + len(seq2) + len(seq1) + 1 + 1" in source
-    assert "def _fit_secstruct(secstruct, size):" in source
-    assert "-out:file:silent" in source
-    assert ensirna_app.APP_INFO.rnafm_revision in source
-    assert "RNA-FM_pretrained.pth" in source
-    assert "find . -path '*/pkl/*.ckpt' -delete" in source
-    assert "download_ensirna_models" in source
-    assert "ensirna_prepare_inputs" in source
-    assert "ensirna_prepare_pdb_chunk" in source
-    assert "ensirna_finalize_prepared_inputs" in source
-    assert "ensirna_preprocess_dataset" in source
-    assert "run_ensirna_inference" in source
-    assert "MODEL_VOLUME.commit()" in source
-    assert "download_files(" in source
-    assert ".micromamba_install(" in source
-    assert "viennarna=2.6.4-0" in source
-    assert ".uv_pip_install(*APP_INFO.pip_packages)" in source
-    assert ".uv_pip_install(*APP_INFO.torch_packages" in source
-    assert "https://download.pytorch.org/whl/cu118" in source
-    assert "rna-fm" in source
-    assert "ENSIRNA_RNAFM_DEVICE" in source
-    assert '"--num-cores"' in source
-    assert "cpu=(0.125, 32.125)" in source
-    assert '"data.dataset"' in source
-    assert '"data.get_pdb"' in source
-    assert '"run.py"' in source
-    assert "ignore_dep_versions=True" in source
-    assert 'skip_deps=["uniaf3"]' in source
-    preprocess_block = source[
-        source.index("def ensirna_preprocess_dataset") - 180 : source.index(
-            "def run_ensirna_inference"
-        )
-    ]
-    assert "gpu=CONF.gpu" in preprocess_block
-    assert (
-        "volumes=CONF.mounts(output_volume=True, model_volume=True)" in preprocess_block
-    )
-
-
 def test_runtime_patch_contract_pins_sources_and_compiles_both_modules(
     tmp_path: Path,
 ) -> None:
@@ -181,15 +127,6 @@ def test_runtime_patch_contract_pins_sources_and_compiles_both_modules(
     data_dir.joinpath("dataset.py").write_text("unexpected", encoding="utf-8")
     app_info = replace(ensirna_app.APP_INFO, ensirna_dir=ensirna_dir)
 
-    assert app_info.get_pdb_source_sha256 == (
-        "8e509f253b552c6312f4bd655bc75a47f9f017b57925d7928ae63459fefe1fb8"
-    )
-    assert app_info.dataset_source_sha256 == (
-        "dc3dae6f9f2b950c6a6c2a31f85b37e95f302f2402324aa8969e1fe7de2bc1c8"
-    )
-    assert app_info.patched_sources_compile_command == (
-        f"python -m py_compile {data_dir / 'get_pdb.py'} {data_dir / 'dataset.py'}"
-    )
     with pytest.raises(SystemExit, match="get_pdb.py source hash mismatch"):
         exec(app_info.get_pdb_runtime_patch, {})  # noqa: S102
     with pytest.raises(SystemExit, match="dataset.py source hash mismatch"):
@@ -1362,96 +1299,6 @@ def test_inference_repairs_wholly_missing_completed_publication(
     )
 
     assert result == b"xlsx"
-
-
-def test_submit_ensirna_writes_local_xlsx(tmp_path: Path, monkeypatch) -> None:
-    input_fasta = tmp_path / "target.fa"
-    input_fasta.write_text(">m\nAUGCUAGCUAGCUAGCUAGC\n", encoding="utf-8")
-    captured = {}
-    execution_run_id = ensirna_app.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-
-    class FakeVolume:
-        def read_file(self, path):
-            captured["download"] = path
-            if path.endswith(ensirna_app.APP_INFO.result_marker_name):
-                request = captured["request"]
-                cache_key = ensirna_app._cache_key_for_fasta(
-                    request.fasta_content,
-                    force_generation=request.force_generation,
-                )
-                yield orjson.dumps({
-                    "schema_version": ensirna_app.APP_INFO.cache_schema_version,
-                    "cache_key": cache_key,
-                    "size": 4,
-                    "sha256": sha256_bytes(b"xlsx"),
-                })
-                return
-            yield b"xlsx"
-
-    class FakeMethod:
-        def spawn(self, **kwargs):
-            captured["run_kwargs"] = kwargs
-            return SimpleNamespace(
-                object_id="fc-1",
-                get=lambda: SimpleNamespace(
-                    run=SimpleNamespace(
-                        status=RunStatus.SUCCEEDED,
-                        status_message=None,
-                        status_reason=None,
-                    )
-                ),
-            )
-
-    def stage(volume, run_id, request):
-        captured.update(volume=volume, run_id=run_id, request=request)
-
-    volume = FakeVolume()
-    monkeypatch.setattr(
-        ensirna_app,
-        "CONF",
-        SimpleNamespace(
-            name="ENsiRNA",
-            version=None,
-            repo_commit_hash="0288243",
-            output_volume=volume,
-            output_volume_mountpoint="/ensirna-output",
-        ),
-    )
-    monkeypatch.setattr(ensirna_app, "uuid4", lambda: execution_run_id)
-    monkeypatch.setattr(ensirna_app, "stage_execution_request", stage)
-    monkeypatch.setattr(
-        ensirna_app,
-        "submit_staged_execution_run",
-        lambda volume, **kwargs: (
-            captured.update(submit=(volume, kwargs)) or FakeMethod().spawn().get()
-        ),
-    )
-    raw_f = ensirna_app.submit_ensirna_task.info.raw_f
-    assert raw_f is not None
-
-    raw_f(
-        mrna_fasta=str(input_fasta),
-        out_dir=str(tmp_path),
-        run_name="demo",
-        max_containers=2,
-        max_gpu_containers=1,
-        pdb_cores=3,
-        preprocess_shard_size=17,
-    )
-
-    request = captured["request"]
-    assert captured["run_id"] == execution_run_id
-    _, submit_kwargs = captured["submit"]
-    assert submit_kwargs["execution_run_id"] == execution_run_id
-    assert submit_kwargs["predecessor_execution_run_id"] is None
-    assert request.fasta_content == b">m\nAUGCUAGCUAGCUAGCUAGC\n"
-    assert request.prepare_workers == 2
-    assert request.max_active_provider_calls == 2
-    assert request.max_active_gpu_provider_calls == 1
-    assert request.pdb_cores == 3
-    assert request.preprocess_shard_size == 17
-    assert submit_kwargs["use_deployed_coordinator"] is False
-    assert (tmp_path / "demo.xlsx").read_bytes() == b"xlsx"
 
 
 def test_submit_ensirna_restart_stages_the_supplied_scientific_input(

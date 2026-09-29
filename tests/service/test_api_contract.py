@@ -951,57 +951,6 @@ def _request(app, method: str, path: str, **kwargs) -> httpx.Response:
     return asyncio.run(send())
 
 
-def test_openapi_exposes_typed_tool_and_shared_job_routes(tmp_path: Path) -> None:
-    document = _app(tmp_path).openapi()
-    paths = document["paths"]
-    assert "/api/v1/alphafold3/capabilities" in paths
-
-    assert "/api/v1/gromacs/jobs" in paths
-    assert "/api/v1/alphafold3/validations" in paths
-    assert "/api/v1/alphafold3/validations/{validation_id}/document" in paths
-    assert "/api/v1/alphafold3/jobs" in paths
-    assert "/api/v1/alphafold3/jobs/{job_id}/document" in paths
-    assert "/api/v1/jobs/{job_id}/refresh" in paths
-    assert "/api/v1/jobs/{job_id}/download" in paths
-    alpha_request = document["components"]["schemas"]["AlphaFold3JobRequest"]
-    assert alpha_request["required"] == ["validation_id"]
-    assert alpha_request["additionalProperties"] is False
-    job_view = document["components"]["schemas"]["JobView"]
-    assert {"result_size_bytes", "state_reason", "state_message"} <= set(
-        job_view["properties"]
-    )
-    unknown_job = document["components"]["schemas"]["AdminStateUnknownJobView"]
-    assert {
-        "diagnostic_message",
-        "modal_environment",
-        "modal_app_name",
-        "modal_app_version",
-        "root_function_call_id",
-    } <= set(unknown_job["required"])
-    recycle = next(
-        parameter
-        for parameter in paths["/api/v1/alphafold3/validations"]["post"]["parameters"]
-        if parameter["name"] == "recycle"
-    )
-    assert recycle["name"] == "recycle"
-    assert recycle["schema"]["minimum"] == 0
-    logs = paths["/api/v1/jobs/{job_id}/logs"]["get"]["responses"]["200"]
-    assert set(logs["content"]) == {"application/x-ndjson"}
-    download = paths["/api/v1/jobs/{job_id}/download"]["get"]["responses"]
-    assert {"200", "206", "416"} <= set(download)
-    assert set(download["200"]["content"]) == {
-        "application/zip",
-        "application/zstd",
-    }
-    assert "Content-Range" in download["206"]["headers"]
-    prepared = paths["/api/v1/jobs/{job_id}/prepare-download"]["post"]
-    assert "204" in prepared["responses"]
-    for path in ("/api/v1/gromacs/jobs", "/api/v1/alphafold3/jobs"):
-        assert paths[path]["post"]["responses"]["202"]["description"] == (
-            "Job durably admitted for asynchronous staging and launch"
-        )
-
-
 def test_submission_returns_after_durable_admission(tmp_path: Path) -> None:
     app = _app(tmp_path)
     session = _enabled_session(app)

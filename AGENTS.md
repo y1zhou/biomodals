@@ -19,6 +19,12 @@
   - For CLI or app-discovery changes, smoke test with `uv run biomodals app list`, `uv run biomodals app help <app-name>`, and `uv run biomodals workflow list` before making commits.
   - Keep generated archives, large run outputs, Modal result directories, and local test data out of commits unless the user explicitly asks for them.
 
+## Tests
+
+- Never write unit tests after you write code.
+- Highly prefer E2E tests as the sole testing mechanism. Use them to verify complex features work. At the end of E2E tests, produce a verifiable and repeatable artifact.
+- If you must test a system in isolation, first write down all the ways it could fail, then write the code.
+
 ## Instruction maintenance
 
 - Keep root `AGENTS.md` focused on repo-wide expectations. Put long-form context in linked docs under `docs/agents/` or narrower instruction files when that context only applies to a subtree.

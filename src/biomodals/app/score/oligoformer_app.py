@@ -98,7 +98,7 @@ import shlex
 import shutil
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import count, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -5316,7 +5316,9 @@ def run_oligoformer_postprocess(
         targetscan_threshold=targetscan_threshold,
         toxicity_threshold=toxicity_threshold,
     )
-    if requested_config != plan.config:
+    # Modal can load this entrypoint under a different module name from the
+    # coordinator's plan decoder; compare settings rather than class identity.
+    if asdict(requested_config) != asdict(plan.config):
         raise ValueError(
             "OligoFormer post-processing settings do not match the prepared run plan"
         )

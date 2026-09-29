@@ -34,6 +34,7 @@ def patch_image_for_helper(
         ignore_dep_versions: Whether to install `biomodals` dependencies without
             their version specifiers. This is useful for older app images where
             the pinned/latest dependency versions require newer Python versions.
+            The Modal SDK requirement is always retained from package metadata.
     """
     # This is a bit hacky, but because Modal's .add_local_python_source()
     # does not install the package, the metadata.requires call would not work
@@ -66,7 +67,11 @@ def patch_image_for_helper(
         for dep in helper_deps:
             requirement, separator, marker = dep.partition(";")
             match = requirement_name_pattern.match(requirement)
-            if match is None or " @ " in requirement:
+            if (
+                match is None
+                or " @ " in requirement
+                or match.group(1).split("[", 1)[0].lower() == "modal"
+            ):
                 stripped_deps.append(dep)
                 continue
             stripped = match.group(1)

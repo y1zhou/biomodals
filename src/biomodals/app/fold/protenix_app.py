@@ -170,7 +170,11 @@ runtime_image = (
         env={"LAYERNORM_TYPE": "fast_layernorm"},  # default, but just in case
     )
     .pipe(patch_image_for_helper)
-    .add_local_python_source("biomodals.app.fold.protenix_execution")
+    # The execution adapter imports the package-qualified app in file-mode runs.
+    .add_local_python_source(
+        "biomodals.app.fold.protenix_app",
+        "biomodals.app.fold.protenix_execution",
+    )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 PROTENIX_OUTPUT_CLAIMS = modal.Dict.from_name(

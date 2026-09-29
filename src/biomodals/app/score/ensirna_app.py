@@ -1229,7 +1229,11 @@ runtime_image = (
     .uv_pip_install(*APP_INFO.extra_pip_packages)
     # ENsiRNA requires Python 3.10; install only the shared modules it imports.
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
-    .add_local_python_source("biomodals.app.score.ensirna_execution")
+    # The execution adapter imports the package-qualified app in file-mode runs.
+    .add_local_python_source(
+        "biomodals.app.score.ensirna_app",
+        "biomodals.app.score.ensirna_execution",
+    )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ENSIRNA_OUTPUT_CLAIMS = modal.Dict.from_name(

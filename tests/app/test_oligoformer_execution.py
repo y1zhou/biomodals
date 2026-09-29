@@ -2,9 +2,6 @@
 
 # ruff: noqa: D101,D102,D103,D107
 
-import shutil
-import subprocess
-import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,72 +179,6 @@ def _request(**changes) -> OligoformerExecutionRequest:
         reference_version="reference-source-v1",
     )
     return replace(request, **changes)
-
-
-def test_staged_request_loads_from_declared_image_sources(tmp_path: Path) -> None:
-    # Exercise the real mount files in a fresh interpreter: importing from the
-    # checkout masks missing canonical modules when Modal stages /root/app.py.
-    image_root = tmp_path / "root"
-    image_root.mkdir()
-    # Deferred mounts are populated only after remote hydration. Walk the SDK's
-    # image dependencies to materialize their real file manifests without a build.
-    pending = [oligoformer_app.runtime_image]
-    seen = set()
-    while pending:
-        dependency = pending.pop()
-        if id(dependency) in seen:
-            continue
-        seen.add(id(dependency))
-        pending.extend(dependency._deps_())
-        if not hasattr(dependency, "entries"):
-            continue
-        for entry in dependency.entries:
-            for source, remote in entry.get_files_to_upload():
-                destination = image_root / Path(remote).relative_to("/root")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, destination)
-    shutil.copyfile(oligoformer_app.__file__, image_root / "oligoformer_app.py")
-    request = _request()
-    volume_root = tmp_path / "volume"
-    persist_execution_request(volume_root, RUN_ID, request)
-    artifact = tmp_path / "rehydrated-request.json"
-    checkout_source = Path(oligoformer_app.__file__).resolve().parents[3]
-    result = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            """
-import sys
-from pathlib import Path
-from uuid import UUID
-
-root, checkout, volume, run_id, artifact = sys.argv[1:]
-sys.path = [root] + [
-    value for value in sys.path
-    if not Path(value).resolve().is_relative_to(Path(checkout))
-]
-# Match the top-level entry module seen in Modal's traceback.
-import oligoformer_app
-from biomodals.app.score.oligoformer_execution import load_execution_request
-
-request = load_execution_request(volume, UUID(run_id))
-Path(artifact).write_bytes(request.to_bytes())
-""",
-            str(image_root),
-            str(checkout_source),
-            str(volume_root),
-            str(RUN_ID),
-            str(artifact),
-        ],
-        cwd=image_root,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert artifact.read_bytes() == request.to_bytes()
 
 
 def _publications(

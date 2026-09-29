@@ -171,7 +171,7 @@ def test_worker_reloads_checks_source_then_publishes(tmp_path, source, monkeypat
 
     monkeypatch.setattr(clustering, "inspect_clustering_source", inspect)
     monkeypatch.setattr(clustering, "cluster_trajectory", compute)
-    assert app.cluster_trajectory.get_raw_f()(request.to_bytes()) == str(
+    assert app.cluster_trajectory.local(request.to_bytes()) == str(
         tmp_path / "analysis"
     )
     assert events == ["reload", "inspect", "compute", "commit"]
@@ -181,7 +181,7 @@ def test_worker_reloads_checks_source_then_publishes(tmp_path, source, monkeypat
         b"corrupted"
     )  # Same size: inspection is cheap; worker verifies the digest.
     with pytest.raises(ValueError, match="trajectory changed"):
-        app.cluster_trajectory.get_raw_f()(request.to_bytes())
+        app.cluster_trajectory.local(request.to_bytes())
     assert events == ["reload", "inspect"]
 
 

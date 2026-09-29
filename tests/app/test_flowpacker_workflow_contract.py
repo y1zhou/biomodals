@@ -18,12 +18,9 @@ def test_flowpacker_workflow_result_stores_archive_in_volume(
     seen_kwargs = {}
 
     class FakeRunFlowPacker:
-        def get_raw_f(self):
-            def fake_run_flowpacker(**kwargs):
-                seen_kwargs.update(kwargs)
-                return b"tarball"
-
-            return fake_run_flowpacker
+        def local(self, **kwargs):
+            seen_kwargs.update(kwargs)
+            return b"tarball"
 
     class FakeOutputVolume:
         def __init__(self):
@@ -45,7 +42,7 @@ def test_flowpacker_workflow_result_stores_archive_in_volume(
         ),
     )
 
-    result = flowpacker_app.run_flowpacker_workflow.get_raw_f()(
+    result = flowpacker_app.run_flowpacker_workflow.local(
         input_files=[("input.pdb", b"ATOM\n")],
         run_name="../packed",
     )
@@ -131,7 +128,7 @@ def test_flowpacker_checkpoint_download_copies_git_lfs_files_to_volume(
     monkeypatch.setattr(flowpacker_app, "MODEL_VOLUME", fake_model_volume)
     monkeypatch.setattr("biomodals.helper.shell.run_command", fake_run_command)
 
-    flowpacker_app.download_flowpacker_checkpoints.get_raw_f()(force=False)
+    flowpacker_app.download_flowpacker_checkpoints.local(force=False)
 
     for checkpoint_name in flowpacker_app.APP_INFO.checkpoint_names:
         assert (cache_dir / f"{checkpoint_name}.pth").read_bytes() == (

@@ -313,7 +313,7 @@ def run_dockq_workflow(
 ) -> AppRunResult:
     """Run DockQ and return a workflow-compatible score archive."""
     safe_run_name = sanitize_filename(run_name)
-    tarball_bytes = run_dockq_batch.get_raw_f()(
+    tarball_bytes = run_dockq_batch.local(
         pairs=pairs,
         run_name=safe_run_name,
         dockq_args=dockq_args,

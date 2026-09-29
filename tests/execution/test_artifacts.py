@@ -65,8 +65,14 @@ def test_content_bound_file_set_rejects_incomplete_manifest(tmp_path: Path) -> N
         publication.write((ArtifactFile(path="other.txt"),))
 
 
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"ok\n", b"0123456789\n" * 100_000],
+    ids=["empty", "small", "large"],
+)
 def test_materialize_inline_bytes_writes_one_result_artifact_copy(
     tmp_path: Path,
+    content: bytes,
 ) -> None:
     result = AppRunResult(
         status=AppRunStatus.SUCCEEDED,
@@ -74,7 +80,7 @@ def test_materialize_inline_bytes_writes_one_result_artifact_copy(
             AppOutput(
                 name="summary",
                 kind=ArtifactKind.REPORT,
-                storage=InlineBytes(data=b"ok\n", filename="summary.txt"),
+                storage=InlineBytes(data=content, filename="summary.txt"),
             )
         ],
     )
@@ -96,14 +102,23 @@ def test_materialize_inline_bytes_writes_one_result_artifact_copy(
     assert not (
         tmp_path / "nodes" / "summary" / "result" / "materialized_outputs"
     ).exists()
-    assert output_path.read_bytes() == b"ok\n"
+    assert output_path.read_bytes() == content
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
         path="nodes/summary/result/summary-summary/summary.txt",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage
     assert artifacts[0].files[0].path == "summary.txt"
-    assert (tmp_path / "artifacts" / "summary-summary.json").exists()
+    manifest = ExecutionArtifact.model_validate_json(
+        (tmp_path / "artifacts" / "summary-summary.json").read_bytes()
+    )
+    assert manifest.files == [
+        ArtifactFile(
+            path="summary.txt",
+            size_bytes=len(content),
+            content_sha256=sha256(content).hexdigest(),
+        )
+    ]
 
 
 def test_task_scope_keeps_repeated_output_names_distinct(

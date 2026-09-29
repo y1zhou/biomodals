@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -213,7 +214,12 @@ def _artifact_files(root: Path) -> list[ArtifactFile]:
 
 def _file_sha256(path: Path) -> str:
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        if sys.version_info >= (3, 11):  # noqa: UP036 - mounted in Python 3.10 apps
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+        digest = hashlib.sha256()
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _declared_artifact_files(metadata: Mapping[str, Any]) -> list[ArtifactFile]:

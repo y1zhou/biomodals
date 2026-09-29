@@ -342,7 +342,7 @@ def run_flowpacker_workflow(
 ) -> AppRunResult:
     """Run FlowPacker and return a workflow-compatible app result."""
     safe_run_name = sanitize_filename(run_name)
-    tarball_bytes = run_flowpacker.get_raw_f()(
+    tarball_bytes = run_flowpacker.local(
         input_files=input_files,
         run_name=safe_run_name,
         model_name=model_name,

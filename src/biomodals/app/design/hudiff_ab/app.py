@@ -28,7 +28,6 @@ from biomodals.app.design.hudiff_ab.models import (
     MODEL_REVISION,
     RUNTIME_IDENTITY,
     SOURCE_COMMIT,
-    assert_runtime_environment,
     stage_hudiff_assets,
 )
 from biomodals.app.design.hudiff_ab.patches import (
@@ -108,29 +107,13 @@ runtime_image = (
     .uv_pip_install(
         "easydict==1.13",
         "einops==0.6.1",
-        "orjson==3.12.0",
-        "pyyaml==6.0.3",
         "sequence-models==1.8.0",
-        "tqdm==4.70.0",
     )
     .run_commands(
         f"git clone {CONF.repo_url} /opt/HuDiff",
         f"git -C /opt/HuDiff checkout --detach {CONF.repo_commit_hash}",
     )
-    .add_local_python_source(
-        "biomodals.app.design.hudiff_ab.patches",
-        "biomodals.app.design.hudiff_ab.upstream_runtime",
-        copy=True,
-    )
-    .run_function(apply_hudiff_inference_patches)
-    # Constrain helper dependencies to the validated scientific environment.
-    # Keep the full inventory assertion below: constraints do not pin Conda builds.
-    .add_local_file(
-        Path(__file__).with_name("runtime-constraints.txt"),
-        "/opt/hudiff-runtime-constraints.txt",
-        copy=True,
-    )
-    .env({"UV_CONSTRAINT": "/opt/hudiff-runtime-constraints.txt"})
+    # Inherit shared dependencies, including Modal, from Biomodals metadata.
     # UniAF3 requires Python 3.11 and is outside this worker's import closure.
     .pipe(
         patch_image_for_helper,
@@ -138,11 +121,13 @@ runtime_image = (
         skip_deps={"uniaf3"},
     )
     .add_local_python_source(
-        "biomodals.app.design.hudiff_ab.models",
+        "biomodals.app.design.hudiff_ab.patches",
+        "biomodals.app.design.hudiff_ab.upstream_runtime",
         copy=True,
     )
-    .run_function(assert_runtime_environment)
+    .run_function(apply_hudiff_inference_patches)
     .add_local_python_source(
+        "biomodals.app.design.hudiff_ab.models",
         "biomodals.app.design.hudiff_ab.worker",
     )
 )

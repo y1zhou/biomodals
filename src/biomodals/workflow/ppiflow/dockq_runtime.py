@@ -95,7 +95,7 @@ def run_ppiflow_dockq_stage(
     if isinstance(dockq_args, str):
         dockq_args = shlex.split(dockq_args)
     return AppRunResult.model_validate(
-        dockq_app.run_dockq_workflow.get_raw_f()(
+        dockq_app.run_dockq_workflow.local(
             pairs=pairs,
             run_name=run_name,
             dockq_args=dockq_args,

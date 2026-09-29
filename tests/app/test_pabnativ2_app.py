@@ -264,7 +264,7 @@ def test_gpu_batch_worker_returns_pair_result_mapping(
     monkeypatch.setattr(pabnativ2_app, "_run_pabnativ2_batch", fake_run)
     pairs = [{"id": "pair", "vh": "AAAA", "vl": "CCCC"}]
 
-    result = pabnativ2_app.pabnativ2_humanize_batch.get_raw_f()(pairs)
+    result = pabnativ2_app.pabnativ2_humanize_batch.local(pairs)
 
     assert result == {
         pair_id: pair_result.model_dump(mode="json")

@@ -142,7 +142,7 @@ def test_planner_discovers_one_task_per_input(
         SimpleNamespace(repo_commit_hash="7e1de70", version="2.0.0"),
     )
 
-    plan = protenix_app.plan_protenix_inputs.get_raw_f()(
+    plan = protenix_app.plan_protenix_inputs.local(
         b'[{"name":"demo"}]',
         msa_server_mode="protenix",
     )

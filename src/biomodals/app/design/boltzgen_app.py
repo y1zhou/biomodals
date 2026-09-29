@@ -379,12 +379,12 @@ def collect_boltzgen_data(
     }
     if filter_results:
         print(f"💊 Collecting BoltzGen outputs in {vol_path}...")
-        combine_multiple_runs.get_raw_f()(run_name, run_ids)
+        combine_multiple_runs.local(run_name, run_ids)
         print("💊 Filtering combined BoltzGen designs...")
-        refilter_designs.get_raw_f()(run_name, budget, filter_rmsd_threshold)
+        refilter_designs.local(run_name, budget, filter_rmsd_threshold)
 
         print("💊 Packaging filtered BoltzGen outputs...")
-        tarball_bytes = package_outputs_helper.get_raw_f()(
+        tarball_bytes = package_outputs_helper.local(
             layout.run_root / "pass-filter-designs",
             [
                 "all-designs.parquet",

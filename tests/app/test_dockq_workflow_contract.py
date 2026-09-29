@@ -19,12 +19,9 @@ class _FakeDockQBatch:
         self.archive_bytes = archive_bytes
         self.calls: list[dict[str, object]] = []
 
-    def get_raw_f(self):
-        def run_dockq_batch(**kwargs):
-            self.calls.append(kwargs)
-            return self.archive_bytes
-
-        return run_dockq_batch
+    def local(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.archive_bytes
 
 
 def _dockq_archive(csv_text: str) -> bytes:
@@ -44,7 +41,7 @@ def test_dockq_workflow_result_returns_inline_score_archive(monkeypatch) -> None
     fake_batch = _FakeDockQBatch(archive)
     monkeypatch.setattr(dockq_app, "run_dockq_batch", fake_batch)
 
-    result = dockq_app.run_dockq_workflow.get_raw_f()(
+    result = dockq_app.run_dockq_workflow.local(
         pairs=[{"id": "pair-1", "model_bytes": b"m", "reference_bytes": b"r"}],
         run_name="dockq-demo",
         dockq_args=["--short"],
@@ -108,7 +105,7 @@ def test_dockq_workflow_reports_partial_or_failed_pairs(
     fake_batch = _FakeDockQBatch(_dockq_archive(csv_text))
     monkeypatch.setattr(dockq_app, "run_dockq_batch", fake_batch)
 
-    result = dockq_app.run_dockq_workflow.get_raw_f()(
+    result = dockq_app.run_dockq_workflow.local(
         pairs=[
             {"id": "pair-1", "model_bytes": b"m", "reference_bytes": b"r"},
             {"id": "pair-2", "model_bytes": b"m", "reference_bytes": b"r"},

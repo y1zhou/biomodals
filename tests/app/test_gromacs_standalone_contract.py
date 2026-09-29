@@ -46,7 +46,7 @@ def test_gromacs_preparation_rebuilds_an_incomplete_publication(
     monkeypatch.setattr(gromacs_app.APP_INFO, "gmx_scripts", str(scripts))
     monkeypatch.setattr(gromacs_app, "run_command", run_command)
 
-    gromacs_app.prepare_tpr_gpu.get_raw_f()(
+    gromacs_app.prepare_tpr_gpu.local(
         pdb_content=b"ATOM\n",
         run_name=run_name,
     )
@@ -86,7 +86,7 @@ def test_fresh_production_run_uses_mdp_nsteps(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr(gromacs_app, "run_command", fake_run_command)
 
-    result = gromacs_app.production_run_cpu.get_raw_f()(
+    result = gromacs_app.production_run_cpu.local(
         run_name="fresh",
         simulation_time_ns=2,
     )
@@ -148,7 +148,7 @@ def test_analysis_volume_handoff_refreshes_inputs_and_stale_deletion(
         events.append("postprocess")
 
     monkeypatch.setattr(gromacs_app, "run_command", native_command)
-    postprocess = gromacs_app.postprocess_traj.get_raw_f()
+    postprocess = gromacs_app.postprocess_traj.local
 
     def remote(*args, **kwargs):
         assert events[-1] == "analysis commit"
@@ -168,7 +168,7 @@ def test_analysis_volume_handoff_refreshes_inputs_and_stale_deletion(
         active_root = tmp_path / name
         events.clear()
         with pytest.raises(StopAfterHandoff):
-            gromacs_app.collect_traj_stats.get_raw_f()(
+            gromacs_app.collect_traj_stats.local(
                 "production_", name, file_stem="parent"
             )
         assert events == [

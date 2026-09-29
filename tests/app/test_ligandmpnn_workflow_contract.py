@@ -86,7 +86,7 @@ def test_ligandmpnn_workflow_result_returns_inline_zstd_archive(
 
     monkeypatch.setattr(ligandmpnn_app, "_ligandmpnn_run", fake_ligandmpnn_run)
 
-    result = ligandmpnn_app.ligandmpnn_run.get_raw_f()(
+    result = ligandmpnn_app.ligandmpnn_run.local(
         run_name="../mpnn-run",
         script_mode="run",
         struct_bytes=b"ATOM\n",

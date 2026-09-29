@@ -71,7 +71,7 @@ def run_ppiflow_ligandmpnn_candidate(
         )
     structure = matches[0]
     result = AppRunResult.model_validate(
-        ligandmpnn_app.ligandmpnn_run.get_raw_f()(
+        ligandmpnn_app.ligandmpnn_run.local(
             run_name=sanitize_filename(f"{run_name}-{candidate_id}"),
             script_mode=script_mode,
             struct_bytes=bytes_payload(structure["data"], "structure data"),

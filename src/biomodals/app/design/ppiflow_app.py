@@ -367,7 +367,7 @@ def ppiflow_run(args: PPIFlowArgs, run_name: str) -> str:
 def ppiflow_run_workflow(args: PPIFlowArgs, run_name: str) -> AppRunResult:
     """Run PPIFlow and return a workflow-compatible app result."""
     safe_run_name = sanitize_filename(run_name)
-    remote_workdir = ppiflow_run.get_raw_f()(args=args, run_name=safe_run_name)
+    remote_workdir = ppiflow_run.local(args=args, run_name=safe_run_name)
     return AppRunResult(
         status=AppRunStatus.SUCCEEDED,
         outputs=[

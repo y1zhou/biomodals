@@ -505,10 +505,10 @@ def test_production_uses_fixed_tpr_and_requires_checkpoint(
         "use_openmp_threads": use_openmp_threads,
     }
     with pytest.raises(FileNotFoundError, match="checkpoint"):
-        function.get_raw_f()(**kwargs)
+        function.local(**kwargs)
     (root / "production_parent.cpt").write_bytes(b"state")
     (root / "production_parent.xtc").write_bytes(b"trajectory behind checkpoint")
-    function.get_raw_f()(**kwargs)
+    function.local(**kwargs)
     command = commands[0]
     assert "-append" in command
     assert "-nsteps" not in command  # actual endpoint comes from the fixed TPR
@@ -611,7 +611,7 @@ def test_remote_inspection_transfers_metadata_only(tmp_path, monkeypatch):
     lookups = []
 
     async def remote(run_id):
-        return app.inspect_continuation_source.get_raw_f()(run_id)
+        return app.inspect_continuation_source.local(run_id)
 
     def lookup(*args, **kwargs):
         lookups.append((args, kwargs))

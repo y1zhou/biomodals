@@ -5384,7 +5384,7 @@ def build_oligoformer_final_tables(
     plan: OligoformerRunPlan,
 ) -> OligoformerRunPlan:
     """Build final tables and return only their refreshed publication plan."""
-    run_oligoformer_postprocess.get_raw_f()(
+    run_oligoformer_postprocess.local(
         plan=plan,
         off_target=plan.config.off_target,
         toxicity=plan.config.toxicity,

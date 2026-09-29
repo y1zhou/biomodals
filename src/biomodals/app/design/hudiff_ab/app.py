@@ -24,15 +24,12 @@ from biomodals.app.design.hudiff_ab.execution import (
 )
 from biomodals.app.design.hudiff_ab.models import (
     ANTIBODY_CHECKPOINT_SHA256,
-    CUBLAS_WORKSPACE_CONFIG,
     MODEL_REVISION,
     RUNTIME_IDENTITY,
     SOURCE_COMMIT,
-    assert_runtime_environment,
     stage_hudiff_assets,
 )
 from biomodals.app.design.hudiff_ab.patches import (
-    apply_hudiff_inference_patches,
     patch_identity,
 )
 from biomodals.app.design.hudiff_ab.validation import (
@@ -84,67 +81,18 @@ CONF = AppConfig(
     timeout=_TIMEOUT_SECONDS,
 )
 
-runtime_image = (
-    modal.Image
-    .micromamba(python_version=CONF.python_version)
-    .env({"CUBLAS_WORKSPACE_CONFIG": CUBLAS_WORKSPACE_CONFIG})
-    .apt_install("git")
-    .micromamba_install(
-        [
-            "abnumber==0.3.2",
-            "anarci==2020.04.23",
-            "hmmer==3.3.2",
-            "biopython==1.79",
-            "numpy==1.23.5",
-            "pandas==1.5.3",
-            "scipy==1.9.3",
-        ],
-        channels=["bioconda", "conda-forge"],
-    )
-    .uv_pip_install(
-        "torch==1.13.0+cu116",
-        index_url="https://download.pytorch.org/whl/cu116",
-    )
-    .uv_pip_install(
-        "easydict==1.13",
-        "einops==0.6.1",
-        "orjson==3.12.0",
-        "pyyaml==6.0.3",
-        "sequence-models==1.8.0",
-        "tqdm==4.70.0",
-    )
-    .run_commands(
-        f"git clone {CONF.repo_url} /opt/HuDiff",
-        f"git -C /opt/HuDiff checkout --detach {CONF.repo_commit_hash}",
-    )
-    .add_local_python_source(
-        "biomodals.app.design.hudiff_ab.patches",
-        "biomodals.app.design.hudiff_ab.upstream_runtime",
-        copy=True,
-    )
-    .run_function(apply_hudiff_inference_patches)
-    # Constrain helper dependencies to the validated scientific environment.
-    # Keep the full inventory assertion below: constraints do not pin Conda builds.
-    .add_local_file(
-        Path(__file__).with_name("runtime-constraints.txt"),
-        "/opt/hudiff-runtime-constraints.txt",
-        copy=True,
-    )
-    .env({"UV_CONSTRAINT": "/opt/hudiff-runtime-constraints.txt"})
-    # UniAF3 requires Python 3.11 and is outside this worker's import closure.
-    .pipe(
-        patch_image_for_helper,
-        copy_patch_files=True,
-        skip_deps={"uniaf3"},
-    )
-    .add_local_python_source(
-        "biomodals.app.design.hudiff_ab.models",
-        copy=True,
-    )
-    .run_function(assert_runtime_environment)
-    .add_local_python_source(
-        "biomodals.app.design.hudiff_ab.worker",
-    )
+# Reuse the scientifically validated environment without re-resolving its
+# constrained dependencies. Modal injects the deployment SDK separately; current
+# Biomodals source is mounted over the source captured in this immutable image.
+# See docs/agents/modal-sdk.md before replacing this image.
+runtime_image = modal.Image.from_id(
+    "im-08MH3kBTTZNGSTjyazY6EW"
+).add_local_python_source(
+    "biomodals.helper",
+    "biomodals.app.config",
+    "biomodals.schema",
+    "biomodals.execution",
+    "biomodals.app.design.hudiff_ab",
 )
 
 coordinator_image = (

@@ -239,7 +239,7 @@ def test_download_ensirna_models_writes_to_model_volume(monkeypatch) -> None:
     monkeypatch.setattr(ensirna_app, "download_files", fake_download_files)
     monkeypatch.setattr(ensirna_app, "MODEL_VOLUME", volume)
 
-    ensirna_app.download_ensirna_models.get_raw_f()(force=True)
+    ensirna_app.download_ensirna_models.local(force=True)
 
     assert len(captured["urls"]) == 6
     assert ensirna_app.APP_INFO.rnafm_pretrained_url in captured["urls"]
@@ -290,7 +290,7 @@ def test_prepare_inputs_reuses_completed_volume_cache(
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
-    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+    result = ensirna_app.ensirna_prepare_inputs.local(
         mrna_fasta_bytes=fasta,
         max_prepare_jobs=8,
     )
@@ -387,7 +387,7 @@ def test_prepare_inputs_creates_cpu_chunk_plan(
         ),
     )
 
-    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+    result = ensirna_app.ensirna_prepare_inputs.local(
         mrna_fasta_bytes=b">m\nAUGCUAGCUAGCUAGCUAGC\n",
         max_prepare_jobs=2,
     )
@@ -444,7 +444,7 @@ def test_prepare_inputs_rejects_unsafe_upstream_candidate_ids(
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
     with pytest.raises(ValueError, match="candidate ID"):
-        ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+        ensirna_app.ensirna_prepare_inputs.local(
             mrna_fasta_bytes=b">target\nAUGCUAGCUAGCUAGCUAGC\n",
         )
 
@@ -505,7 +505,7 @@ def test_prepare_inputs_regenerates_unmarked_truncated_csv_and_preserves_pdb_cac
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
-    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+    result = ensirna_app.ensirna_prepare_inputs.local(
         mrna_fasta_bytes=fasta,
         max_prepare_jobs=4,
     )
@@ -585,7 +585,7 @@ def test_prepare_inputs_force_generation_isolated_from_normal_cache(
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
-    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+    result = ensirna_app.ensirna_prepare_inputs.local(
         mrna_fasta_bytes=fasta,
         max_prepare_jobs=4,
         force_generation=force_generation,
@@ -646,7 +646,7 @@ def test_prepare_inputs_repairs_zero_byte_pdb_with_stale_json(
         ),
     )
 
-    result = ensirna_app.ensirna_prepare_inputs.get_raw_f()(
+    result = ensirna_app.ensirna_prepare_inputs.local(
         mrna_fasta_bytes=fasta,
         max_prepare_jobs=1,
     )
@@ -692,7 +692,7 @@ def test_prepare_pdb_chunk_runs_rosetta_on_cpu(
         )
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    result = ensirna_app.ensirna_prepare_pdb_chunk.get_raw_f()(
+    result = ensirna_app.ensirna_prepare_pdb_chunk.local(
         chunk=ensirna_app.EnsirnaPdbChunkSpec(
             chunk_name="chunk_0000",
             csv_path=str(chunk_csv),
@@ -747,7 +747,7 @@ def test_prepare_pdb_chunk_does_not_publish_interrupted_json(
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
     with pytest.raises(RuntimeError, match="interrupted"):
-        ensirna_app.ensirna_prepare_pdb_chunk.get_raw_f()(
+        ensirna_app.ensirna_prepare_pdb_chunk.local(
             chunk=ensirna_app.EnsirnaPdbChunkSpec(
                 "chunk_0000", str(chunk_csv), str(chunk_json), str(pdb_dir)
             )
@@ -808,7 +808,7 @@ def test_finalize_prepared_inputs_merges_json_only_on_cpu(
         raise AssertionError("CPU finalize should not run dataset preprocessing")
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    result = ensirna_app.ensirna_finalize_prepared_inputs.get_raw_f()(plan)
+    result = ensirna_app.ensirna_finalize_prepared_inputs.local(plan)
 
     assert [
         record["siRNA"] for record in ensirna_app._json_records(Path(plan.json_path))
@@ -861,7 +861,7 @@ def test_finalize_rejects_json_without_complete_pdbs(
     )
 
     with pytest.raises(FileNotFoundError, match="PDB artifacts"):
-        ensirna_app.ensirna_finalize_prepared_inputs.get_raw_f()(plan)
+        ensirna_app.ensirna_finalize_prepared_inputs.local(plan)
 
 
 def test_finalize_prepared_inputs_merges_cached_and_new_json_in_csv_order(
@@ -926,7 +926,7 @@ def test_finalize_prepared_inputs_merges_cached_and_new_json_in_csv_order(
         raise AssertionError("CPU finalize should not run dataset preprocessing")
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    ensirna_app.ensirna_finalize_prepared_inputs.get_raw_f()(plan)
+    ensirna_app.ensirna_finalize_prepared_inputs.local(plan)
 
     assert [
         record["siRNA"] for record in ensirna_app._json_records(Path(plan.json_path))
@@ -994,7 +994,7 @@ def test_preprocess_dataset_runs_rnafm_on_gpu_and_marks_cache(
         )
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    result = ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan)
+    result = ensirna_app.ensirna_preprocess_dataset.local(plan)
 
     assert result.chunks == []
     assert result.cached is False
@@ -1072,7 +1072,7 @@ def test_preprocess_dataset_checkpoints_independent_rnafm_shards(
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
-    ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan, preprocess_shard_size=1)
+    ensirna_app.ensirna_preprocess_dataset.local(plan, preprocess_shard_size=1)
 
     assert len(calls) == 2
     assert ensirna_app._processed_manifest_valid(Path(plan.processed_dir), 2)
@@ -1133,9 +1133,7 @@ def test_preprocess_dataset_recomputes_same_size_corrupted_partial_shard(
 
     monkeypatch.setattr(ensirna_app, "run_command", interrupted_run)
     with pytest.raises(RuntimeError, match="simulated interruption"):
-        ensirna_app.ensirna_preprocess_dataset.get_raw_f()(
-            plan, preprocess_shard_size=1
-        )
+        ensirna_app.ensirna_preprocess_dataset.local(plan, preprocess_shard_size=1)
 
     first_part = (
         Path(plan.processed_dir) / "shards" / "shard_0000" / "processed" / "part_0.pkl"
@@ -1162,7 +1160,7 @@ def test_preprocess_dataset_recomputes_same_size_corrupted_partial_shard(
         )
 
     monkeypatch.setattr(ensirna_app, "run_command", retry_run)
-    ensirna_app.ensirna_preprocess_dataset.get_raw_f()(plan, preprocess_shard_size=1)
+    ensirna_app.ensirna_preprocess_dataset.local(plan, preprocess_shard_size=1)
 
     assert len(retry_inputs) == 2
     assert "target_0" in retry_inputs[0]
@@ -1219,9 +1217,7 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
         Path(cmd[cmd.index("--save_dir") + 1], "mrna_result.xlsx").write_bytes(b"xlsx")
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
-    result = ensirna_app.run_ensirna_inference.get_raw_f()(
-        prepared_dir=str(layout.run_root)
-    )
+    result = ensirna_app.run_ensirna_inference.local(prepared_dir=str(layout.run_root))
 
     assert result == b"xlsx"
     assert captured["cmd"][:6] == [
@@ -1247,7 +1243,7 @@ def test_run_ensirna_inference_returns_result_xlsx_bytes(
     assert output_volume.commit_count == 1
 
     (layout.outputs_dir / "mrna_result.xlsx").write_bytes(b"oops")
-    repaired = ensirna_app.run_ensirna_inference.get_raw_f()(
+    repaired = ensirna_app.run_ensirna_inference.local(
         prepared_dir=str(layout.run_root)
     )
 
@@ -1294,9 +1290,7 @@ def test_inference_repairs_wholly_missing_completed_publication(
 
     monkeypatch.setattr(ensirna_app, "run_command", fake_run_command)
 
-    result = ensirna_app.run_ensirna_inference.get_raw_f()(
-        prepared_dir=str(layout.run_root)
-    )
+    result = ensirna_app.run_ensirna_inference.local(prepared_dir=str(layout.run_root))
 
     assert result == b"xlsx"
 

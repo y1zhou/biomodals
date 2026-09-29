@@ -65,7 +65,7 @@ def test_rfdiffusion_workflow_result_references_cached_output_directory(
         ),
     )
 
-    result = rfdiffusion_app.rfdiffusion_infer.get_raw_f()(
+    result = rfdiffusion_app.rfdiffusion_infer.local(
         input_pdb_bytes=b"ATOM\n",
         input_pdb_name="input.pdb",
         run_name="../rfd-run",

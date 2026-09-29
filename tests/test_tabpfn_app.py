@@ -224,7 +224,7 @@ def test_worker_refreshes_both_volumes_before_native_read_and_commits(
     monkeypatch.setattr(tabpfn_app, "MODEL_VOLUME", Volume("model"))
     monkeypatch.setattr(tabpfn_app, "run_tabpfn", run)
     assert (
-        tabpfn_app.tabpfn_fit_predict.get_raw_f()("{}", "a" * 64, RUNTIME_IDENTITY)
+        tabpfn_app.tabpfn_fit_predict.local("{}", "a" * 64, RUNTIME_IDENTITY)
         == "result"
     )
     assert events == ["output:reload", "model:reload", "native", "output:commit"]
@@ -232,7 +232,7 @@ def test_worker_refreshes_both_volumes_before_native_read_and_commits(
     monkeypatch.setattr(
         tabpfn_app, "provision_checkpoint", lambda root: events.append("provision")
     )
-    result = tabpfn_app.prepare_tabpfn_models.get_raw_f()(RUNTIME_IDENTITY)
+    result = tabpfn_app.prepare_tabpfn_models.local(RUNTIME_IDENTITY)
     assert result.outputs[0].storage.data.decode() == RUNTIME_IDENTITY
     assert events == ["model:reload", "provision", "model:commit"]
 

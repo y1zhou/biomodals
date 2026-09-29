@@ -37,7 +37,7 @@ jobs:
       - name: Verify Python 3.11 task-image imports
         run: >-
           PYTHONPATH=src uv run --no-project --python 3.11
-          --with 'modal>=1.5.1'
+          --with 'modal==1.6.0'
           --with 'orjson>=3.11.8'
           --with 'pydantic>=2.12.5'
           --with 'polars==1.42.0'

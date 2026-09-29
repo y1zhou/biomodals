@@ -61,7 +61,7 @@ def run_ppiflow_design_stage(
     reload_source_volumes()
     reload_ppiflow_model_volume()
     result = AppRunResult.model_validate(
-        ppiflow_app.ppiflow_run_workflow.get_raw_f()(
+        ppiflow_app.ppiflow_run_workflow.local(
             args=args,
             run_name=run_name,
         )
@@ -150,7 +150,7 @@ def run_ppiflow_partial_candidate(
         fixed_positions=fixed_positions.get(candidate_id),
     )
     result = AppRunResult.model_validate(
-        ppiflow_app.ppiflow_run_workflow.get_raw_f()(
+        ppiflow_app.ppiflow_run_workflow.local(
             args=app_args,
             run_name=sanitize_filename(f"{run_name}-{candidate_id}"),
         )

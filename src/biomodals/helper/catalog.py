@@ -306,7 +306,9 @@ class BiomodalsApp:
         for obj in dir(module):
             f = getattr(module, obj)
             if isinstance(f, modal.Function):
-                raw_f = f.get_raw_f()
+                # Modal exposes no public source-signature API. Keep this SDK
+                # introspection confined to help metadata; invoke through .local().
+                raw_f = f._raw_f_
                 func_type = "modal"
             elif isinstance(f, modal.app.LocalEntrypoint):
                 raw_f = f.info.raw_f

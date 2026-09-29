@@ -143,11 +143,11 @@ def _run_candidate(
     if manifest is None:
         stage_inference_run(output_volume, prepared)
         executor = InProcessInferenceExecutor(
-            claim_function=alphafold3_app.claim_seed_prediction_work.get_raw_f(),
-            inspect_function=alphafold3_app.inspect_seed_prediction_cache.get_raw_f(),
-            worker_function=alphafold3_app.run_inference_pipeline.get_raw_f(),
-            summary_function=alphafold3_app.finalize_inference_summary.get_raw_f(),
-            request_function=alphafold3_app.finalize_inference_request.get_raw_f(),
+            claim_function=alphafold3_app.claim_seed_prediction_work.local,
+            inspect_function=alphafold3_app.inspect_seed_prediction_cache.local,
+            worker_function=alphafold3_app.run_inference_pipeline.local,
+            summary_function=alphafold3_app.finalize_inference_summary.local,
+            request_function=alphafold3_app.finalize_inference_request.local,
         )
         result = coordinate_seed_predictions(
             prepared,

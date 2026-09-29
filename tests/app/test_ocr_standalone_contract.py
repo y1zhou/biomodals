@@ -45,7 +45,7 @@ def test_run_mineru_ocr_packages_hybrid_outputs(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(ocr_app, "VLLM_CACHE_ROOT", tmp_path / "vllm-cache")
     monkeypatch.setattr(ocr_app, "MODEL_VOLUME", FakeModelVolume())
 
-    archive = ocr_app.run_mineru_ocr.get_raw_f()(b"%PDF-1.7\n", "demo.pdf", "high")
+    archive = ocr_app.run_mineru_ocr.local(b"%PDF-1.7\n", "demo.pdf", "high")
 
     assert calls["cmd"][:5] == ["mineru", "-b", "hybrid-engine", "--effort", "high"]
     assert calls["output_mode"] == "tee"
@@ -77,7 +77,7 @@ def test_download_popo_model_weights_passes_hf_token(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(ocr_app, "POPO_HF_CACHE_DIR", tmp_path / "hub")
     monkeypatch.setattr(ocr_app, "MODEL_VOLUME", FakeModelVolume())
 
-    ocr_app.download_popo_model_weights.get_raw_f()(force=True)
+    ocr_app.download_popo_model_weights.local(force=True)
 
     assert calls["snapshot_download"] == {
         "repo_id": "DreamEternal/MinerU-Popo",
@@ -112,7 +112,7 @@ def test_download_popo_model_weights_allows_missing_hf_token(
     monkeypatch.setattr(ocr_app, "POPO_HF_CACHE_DIR", tmp_path / "hub")
     monkeypatch.setattr(ocr_app, "MODEL_VOLUME", FakeModelVolume())
 
-    ocr_app.download_popo_model_weights.get_raw_f()(force=False)
+    ocr_app.download_popo_model_weights.local(force=False)
 
     assert calls["snapshot_download"]["token"] is None
     assert calls["snapshot_download"]["cache_dir"] == tmp_path / "hub"
@@ -170,7 +170,7 @@ def test_run_mineru_popo_stages_mineru_hybrid_as_vlm(monkeypatch, tmp_path) -> N
     monkeypatch.setitem(sys.modules, "huggingface_hub", FakeHub("huggingface_hub"))
     monkeypatch.setattr(ocr_app, "POPO_HF_CACHE_DIR", tmp_path / "hub")
 
-    archive = ocr_app.run_mineru_popo.get_raw_f()(
+    archive = ocr_app.run_mineru_popo.local(
         mineru_archive,
         b"%PDF-1.7\n",
         "demo.pdf",

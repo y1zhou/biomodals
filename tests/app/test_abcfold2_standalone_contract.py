@@ -98,7 +98,7 @@ def test_prepare_abcfold2_uses_hash_partitioned_app_run_root(
         },
     )
 
-    result = abcfold2_app.prepare_abcfold2.get_raw_f()(
+    result = abcfold2_app.prepare_abcfold2.local(
         yaml_str=b"name: demo\n",
         search_templates=False,
         msa_chains="A",
@@ -143,11 +143,11 @@ def test_collectors_only_package_completed_seed_directories(
     )
     run_conf = {"workdir": str(workdir), "run_id": "run"}
 
-    boltz = abcfold2_app.collect_abcfold2_boltz_data.get_raw_f()(
+    boltz = abcfold2_app.collect_abcfold2_boltz_data.local(
         run_conf,
         publication_key="boltz-key",
     )
-    chai = abcfold2_app.collect_abcfold2_chai_data.get_raw_f()(
+    chai = abcfold2_app.collect_abcfold2_chai_data.local(
         run_conf,
         publication_key="chai-key",
     )

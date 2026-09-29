@@ -393,7 +393,7 @@ def test_clone_prepared_shortmd_run_copies_prepared_inputs_into_replicate(
     monkeypatch.setattr(shortmd_workflow, "GROMACS_OUTPUT_MOUNTPOINT", str(tmp_path))
     monkeypatch.setattr(shortmd_workflow, "GROMACS_OUTPUT_VOLUME", output_volume)
 
-    result = clone_prepared_shortmd_run.get_raw_f()(
+    result = clone_prepared_shortmd_run.local(
         source_storage_path="prepared/source",
         source_run_name="source",
         replicate_run_name="source-r001",
@@ -722,11 +722,11 @@ def test_analyze_shortmd_gromacs_run_binds_final_file_contents(
         gromacs_app,
         "collect_traj_stats",
         SimpleNamespace(
-            get_raw_f=lambda: lambda **_kwargs: str(run_root),
+            local=lambda **_kwargs: str(run_root),
         ),
     )
 
-    result = shortmd_workflow.analyze_shortmd_gromacs_run.get_raw_f()(
+    result = shortmd_workflow.analyze_shortmd_gromacs_run.local(
         traj_prefix="production_",
         run_name=run_name,
         source_run_name="source",

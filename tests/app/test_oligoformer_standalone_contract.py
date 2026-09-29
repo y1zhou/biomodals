@@ -127,7 +127,7 @@ def test_prepare_oligoformer_run_writes_volume_inputs(tmp_path: Path, monkeypatc
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
 
-    result = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    result = oligoformer_app.prepare_oligoformer_run.local(
         mrna_fasta_bytes=b">target one\nAUGCUAGCUAGCUAGCUAGCUAGC\n",
         sirna_fasta_bytes=b">s\nAUGCUAGCUAGCUAGCUAG\n",
         off_target=True,
@@ -156,7 +156,7 @@ def test_prepare_oligoformer_run_sanitizes_fasta_names_and_rewrites_input(
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
 
-    result = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    result = oligoformer_app.prepare_oligoformer_run.local(
         mrna_fasta_bytes=b">../../target; touch unsafe\nAUGCUAGCUAGCUAGCUAGC\n",
     )
 
@@ -177,7 +177,7 @@ def test_prepare_oligoformer_run_bounds_long_fasta_names(
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
     raw_name = "record-" + "x" * 300
 
-    result = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    result = oligoformer_app.prepare_oligoformer_run.local(
         mrna_fasta_bytes=f">{raw_name}\nAUGCUAGCUAGCUAGCUAGC\n".encode(),
     )
 
@@ -204,7 +204,7 @@ def test_prepare_oligoformer_run_rejects_duplicate_or_colliding_fasta_names(
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
 
     with pytest.raises(ValueError, match="unique after sanitization"):
-        oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        oligoformer_app.prepare_oligoformer_run.local(
             mrna_fasta_bytes=fasta_bytes,
         )
 
@@ -215,7 +215,7 @@ def test_prepare_oligoformer_run_sanitizes_paired_custom_reference_names(
     volume = FakeVolume()
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
 
-    result = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    result = oligoformer_app.prepare_oligoformer_run.local(
         mrna_fasta_bytes=b">target\nAUGCUAGCUAGCUAGCUAGC\n",
         off_target=True,
         utr_bytes=b">../../tx; one\naugtn\n",
@@ -250,7 +250,7 @@ def test_prepare_oligoformer_run_rejects_unsafe_custom_references(
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
 
     with pytest.raises(ValueError, match=message):
-        oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+        oligoformer_app.prepare_oligoformer_run.local(
             mrna_fasta_bytes=b">target\nAUGCUAGCUAGCUAGCUAGC\n",
             off_target=True,
             utr_bytes=utr_bytes,
@@ -270,12 +270,12 @@ def test_prepare_oligoformer_run_reuses_compute_cache_across_final_thresholds(
         "orf_bytes": b">orf\nAUGC\n",
     }
 
-    first = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    first = oligoformer_app.prepare_oligoformer_run.local(
         **shared,
         pita_threshold=-10.0,
         toxicity=False,
     )
-    second = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    second = oligoformer_app.prepare_oligoformer_run.local(
         **shared,
         pita_threshold=-5.0,
         toxicity=True,
@@ -299,12 +299,12 @@ def test_prepare_oligoformer_run_reuses_efficacy_across_evidence_inputs(
         "orf_bytes": b">orf\nAUGC\n",
     }
 
-    first = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    first = oligoformer_app.prepare_oligoformer_run.local(
         **shared,
         utr_bytes=b">utr\nAUGC\n",
         top_n=20,
     )
-    second = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    second = oligoformer_app.prepare_oligoformer_run.local(
         **shared,
         utr_bytes=b">utr\nAUGCAUGC\n",
         top_n=40,
@@ -323,13 +323,13 @@ def test_force_uses_isolated_cache_generation_without_deleting_shared_cache(
     monkeypatch.setattr(oligoformer_app, "CONF", _fake_conf(tmp_path, volume))
     kwargs = {"mrna_fasta_bytes": b">target\nAUGCUAGCUAGCUAGCUAGCUAGC\n"}
 
-    shared = oligoformer_app.prepare_oligoformer_run.get_raw_f()(**kwargs)
-    forced = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    shared = oligoformer_app.prepare_oligoformer_run.local(**kwargs)
+    forced = oligoformer_app.prepare_oligoformer_run.local(
         **kwargs,
         force=True,
         force_generation="force-run",
     )
-    repeated_plan = oligoformer_app.prepare_oligoformer_run.get_raw_f()(
+    repeated_plan = oligoformer_app.prepare_oligoformer_run.local(
         **kwargs,
         force=True,
         force_generation="force-run",
@@ -374,7 +374,7 @@ def test_all_human_evidence_key_uses_converted_reference_content_identity(
             }
         )
     )
-    first = oligoformer_app.prepare_oligoformer_run.get_raw_f()(**shared)
+    first = oligoformer_app.prepare_oligoformer_run.local(**shared)
     identity_path.write_bytes(
         orjson.dumps(
             shared_identity
@@ -386,7 +386,7 @@ def test_all_human_evidence_key_uses_converted_reference_content_identity(
             }
         )
     )
-    second = oligoformer_app.prepare_oligoformer_run.get_raw_f()(**shared)
+    second = oligoformer_app.prepare_oligoformer_run.local(**shared)
 
     assert first.efficacy_key == second.efficacy_key
     assert first.reference_identity != second.reference_identity
@@ -798,7 +798,7 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
     )
     monkeypatch.setattr(oligoformer_app.modal, "Dict", FakeDict)
 
-    result = oligoformer_app.run_oligoformer_efficacy.get_raw_f()(
+    result = oligoformer_app.run_oligoformer_efficacy.local(
         plan=plan,
         functionality_filter=False,
     )
@@ -863,7 +863,7 @@ def test_run_oligoformer_efficacy_rejects_mismatched_plan_settings():
     )
 
     with pytest.raises(ValueError, match="efficacy settings"):
-        oligoformer_app.run_oligoformer_efficacy.get_raw_f()(plan)
+        oligoformer_app.run_oligoformer_efficacy.local(plan)
 
 
 def test_run_oligoformer_efficacy_rechecks_cache_after_lock(
@@ -910,7 +910,7 @@ def test_run_oligoformer_efficacy_rechecks_cache_after_lock(
     monkeypatch.setattr(oligoformer_app, "_cache_build_lock", fake_cache_build_lock)
     monkeypatch.setattr(oligoformer_app, "run_command", exploding_run_command)
 
-    result = oligoformer_app.run_oligoformer_efficacy.get_raw_f()(plan)
+    result = oligoformer_app.run_oligoformer_efficacy.local(plan)
 
     assert result.efficacy_ready
     assert volume.reload_count == 2
@@ -933,7 +933,7 @@ def test_run_oligoformer_postprocess_rejects_mismatched_plan_settings():
     )
 
     with pytest.raises(ValueError, match="post-processing settings"):
-        oligoformer_app.run_oligoformer_postprocess.get_raw_f()(
+        oligoformer_app.run_oligoformer_postprocess.local(
             plan,
             off_target=True,
         )
@@ -990,7 +990,7 @@ def test_run_postprocess_rechecks_final_cache_after_lock(tmp_path: Path, monkeyp
         lambda *_args, **_kwargs: b"archive",
     )
 
-    result = oligoformer_app.run_oligoformer_postprocess.get_raw_f()(plan)
+    result = oligoformer_app.run_oligoformer_postprocess.local(plan)
 
     assert result == b"archive"
     assert volume.reload_count == 2
@@ -1109,7 +1109,7 @@ def test_run_postprocess_rejects_changed_all_human_reference_identity(
     )
 
     with pytest.raises(FileNotFoundError, match="changed after run preparation"):
-        oligoformer_app.run_oligoformer_postprocess.get_raw_f()(
+        oligoformer_app.run_oligoformer_postprocess.local(
             plan,
             off_target=True,
             all_human=True,
@@ -2538,7 +2538,7 @@ def test_download_oligoformer_models_writes_to_model_volume(
         fake_cache_build_lock,
     )
 
-    oligoformer_app.download_oligoformer_models.get_raw_f()(force=True)
+    oligoformer_app.download_oligoformer_models.local(force=True)
 
     assert list(calls[0]["urls"]) == [info.rnafm_archive_url]
     assert calls[0]["force"] is True
@@ -2627,7 +2627,7 @@ def test_download_models_refreshes_stale_output_reference_identity(
         lambda *_args, **_kwargs: nullcontext(True),
     )
 
-    oligoformer_app.download_oligoformer_models.get_raw_f()(force=False)
+    oligoformer_app.download_oligoformer_models.local(force=False)
 
     assert (
         orjson.loads(info.targetscan_ref_identity_path.read_bytes()) == model_identity
@@ -2640,7 +2640,7 @@ def test_download_models_refreshes_stale_output_reference_identity(
         raise AssertionError("ready assets must bypass the coordination ledger")
 
     monkeypatch.setattr(oligoformer_app, "_cache_build_lock", exploding_lock)
-    oligoformer_app.download_oligoformer_models.get_raw_f()(force=False)
+    oligoformer_app.download_oligoformer_models.local(force=False)
 
     assert output_volume.reload_count == 3
     assert output_volume.commit_count == 1

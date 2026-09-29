@@ -1004,7 +1004,7 @@ def test_search_pipeline_bounds_derived_tasks_before_remote_work(
 
 def test_remote_search_repeats_query_length_bound() -> None:
     with pytest.raises(ValueError, match="between 1 and 5,120"):
-        alphafold3_app.search_database_msa.get_raw_f()(
+        alphafold3_app.search_database_msa.local(
             "small_bfd",
             "A" * 5_121,
         )

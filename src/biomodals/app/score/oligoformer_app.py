@@ -1650,7 +1650,12 @@ runtime_image = (
     .uv_pip_install(*APP_INFO.requirements)
     # OligoFormer requires Python 3.10; avoid incompatible project dependencies.
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
-    .add_local_python_source("biomodals.app.score.oligoformer_execution")
+    # Requests lazily import the app by package name, even when Modal stages
+    # this entry module as /root/oligoformer_app.py.
+    .add_local_python_source(
+        "biomodals.app.score.oligoformer_app",
+        "biomodals.app.score.oligoformer_execution",
+    )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 OLIGOFORMER_OUTPUT_CLAIMS = modal.Dict.from_name(

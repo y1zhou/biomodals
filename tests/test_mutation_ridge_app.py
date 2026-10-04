@@ -154,13 +154,13 @@ def test_worker_reload_then_commit_and_reject_wrong_runtime(tmp_path, monkeypatc
         output_volume_name = "test"
 
     monkeypatch.setattr(ridge_app, "CONF", FakeConfig())
-    result = ridge_app.mutation_ridge_score.get_raw_f()(
+    result = ridge_app.mutation_ridge_score.local(
         _request().model_dump_json(), "b" * 64, RUNTIME_IDENTITY
     )
     assert result.metrics["candidate_count"] == 1
     assert events == ["reload", "commit"]
     with pytest.raises(ValueError, match="scientific versions"):
-        ridge_app.mutation_ridge_score.get_raw_f()(
+        ridge_app.mutation_ridge_score.local(
             _request().model_dump_json(), "b" * 64, "older"
         )
 

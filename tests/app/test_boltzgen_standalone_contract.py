@@ -42,12 +42,12 @@ def test_get_run_ids_salvage_mode_reads_outputs_from_app_run_layout(
         ),
     )
 
-    assert boltzgen_app.get_run_ids.get_raw_f()(
+    assert boltzgen_app.get_run_ids.local(
         run_name="demo",
         num_runs=2,
         salvage_mode=True,
     ) == ["complete", "incomplete"]
-    assert boltzgen_app.get_run_ids.get_raw_f()(
+    assert boltzgen_app.get_run_ids.local(
         run_name="demo",
         num_runs=2,
         salvage_mode=True,

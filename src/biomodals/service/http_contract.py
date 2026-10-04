@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Literal
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
+from anyio import CancelScope
 from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.datastructures import MutableHeaders
@@ -87,6 +89,33 @@ class PrivateResultRoute(APIRoute):
             await send(message)
 
         await super().handle(scope, receive, send_private)
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """Release response-owned resources even when the body never starts."""
+
+    def __init__(
+        self,
+        content: AsyncGenerator[bytes, None],
+        *,
+        close: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
+        """Transfer an iterator and its acquired resources to the response."""
+        super().__init__(content, **kwargs)
+        self._content = content
+        self._close = close
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Close the body before releasing resources on every ASGI exit path."""
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with CancelScope(shield=True):
+                try:
+                    await self._content.aclose()
+                finally:
+                    await self._close()
 
 
 def model_response(model: BaseModel, *, status_code: int) -> Response:

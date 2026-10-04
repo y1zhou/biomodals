@@ -64,7 +64,10 @@ class ProviderDriver(Protocol):
         ...
 
     def observe(self, provider_call_handle_id: str) -> ProviderCallObservation:
-        """Observe one retained Provider Call."""
+        """Observe retained work; implementations must allow concurrent observations.
+
+        This operation performs provider I/O only, never coordinator ledger writes.
+        """
         ...
 
     def cancel(self, provider_call_handle_id: str) -> ProviderCallObservation | None:

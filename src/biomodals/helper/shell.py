@@ -28,7 +28,9 @@ def _build_env(env: dict[str, str] | None) -> dict[str, str]:
 def run_command(
     cmd: list[str] | str,
     *,
-    output_mode: Literal["tee", "capture", "log", "inherit", "discard"] = "tee",
+    output_mode: Literal[
+        "tee", "capture", "stream", "log", "inherit", "discard"
+    ] = "tee",
     log_file: str | Path | None = None,
     show_command: bool = True,
     warn_on_error: bool = True,
@@ -39,11 +41,12 @@ def run_command(
     Args:
         cmd: Command to run, either as a string or a list of arguments.
         output_mode: ``tee`` captures and streams raw output, ``capture`` captures
-            without streaming, ``log`` writes raw output only to ``log_file``,
+            without streaming, ``stream`` streams without retaining output,
+            ``log`` writes raw output only to ``log_file``,
             ``inherit`` attaches the child to parent streams, and ``discard``
             drops child output while waiting for completion.
         log_file: Optional file that receives command timing metadata and raw
-            child output. Only valid with ``tee``, ``capture``, or ``log`` modes.
+            child output. Valid with ``tee``, ``capture``, ``stream``, or ``log``.
         show_command: Whether to print the command banner to stdout before
             running. Command metadata is still written to ``log_file``.
         warn_on_error: Whether to emit a warning with the log path before
@@ -74,12 +77,14 @@ def run_command(
     if show_command:
         sys.stdout.write(f"Running command: {cmd_str}\n")
         sys.stdout.flush()
-    if output_mode not in {"tee", "capture", "log", "inherit", "discard"}:
+    if output_mode not in {"tee", "capture", "stream", "log", "inherit", "discard"}:
         raise ValueError(f"Unsupported command output mode: {output_mode}")
     if output_mode == "log" and log_file is None:
         raise ValueError("output_mode='log' requires log_file")
     if log_file is not None and output_mode in {"inherit", "discard"}:
-        raise ValueError("log_file requires output_mode='tee', 'capture', or 'log'")
+        raise ValueError(
+            "log_file requires output_mode='tee', 'capture', 'stream', or 'log'"
+        )
     kwargs["env"] = _build_env(kwargs.get("env", None))
     if output_mode == "inherit":
         kwargs.setdefault("stdout", None)
@@ -132,19 +137,19 @@ def run_command(
                     text = chunk.decode("utf-8", errors="replace")
                 if log_handle is not None:
                     log_handle.write(raw)
-                if output_mode == "tee":
+                if output_mode in {"tee", "stream"}:
                     try:
                         sys.stdout.buffer.write(raw)
                     except AttributeError:
                         sys.stdout.write(text)
                     sys.stdout.flush()
-                if output_mode != "log":
+                if output_mode in {"tee", "capture"}:
                     output_buffer += text
                     while "\n" in output_buffer:
                         line, output_buffer = output_buffer.split("\n", 1)
                         all_outputs.append(line.removesuffix("\r"))
 
-            if output_mode != "log" and output_buffer:
+            if output_mode in {"tee", "capture"} and output_buffer:
                 all_outputs.append(output_buffer.removesuffix("\r"))
 
             p.wait()

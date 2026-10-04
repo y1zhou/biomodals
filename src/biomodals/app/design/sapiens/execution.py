@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from base64 import b64decode, b64encode
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -129,19 +129,8 @@ class SapiensExecutionRequest:
         content = orjson.dumps(
             {
                 "schema_version": REQUEST_SCHEMA_VERSION,
-                "run_name": self.run_name,
+                **asdict(self),
                 "csv_bytes": b64encode(self.csv_bytes).decode("ascii"),
-                "iterations": self.iterations,
-                "numbering_scheme": self.numbering_scheme,
-                "cdr_definition": self.cdr_definition,
-                "mutate_cdrs": self.mutate_cdrs,
-                "app_version": self.app_version,
-                "model_vh_revision": self.model_vh_revision,
-                "model_vl_revision": self.model_vl_revision,
-                "tokenizer_revision": self.tokenizer_revision,
-                "runtime_identity": self.runtime_identity,
-                "max_active_provider_calls": self.max_active_provider_calls,
-                "max_active_gpu_provider_calls": self.max_active_gpu_provider_calls,
             },
             option=orjson.OPT_SORT_KEYS,
         )

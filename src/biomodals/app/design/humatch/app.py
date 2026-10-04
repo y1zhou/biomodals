@@ -14,7 +14,7 @@ import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -404,6 +404,32 @@ def _classifier_row(
     return row
 
 
+@lru_cache(maxsize=128)
+def _reference_targets(
+    reference_vh: str,
+    reference_vl: str,
+    vh_target_family: str,
+    vl_target_family: str,
+) -> tuple[str, str]:
+    """Reuse immutable parental labels within one container's fixed model runtime."""
+    parent_frame = parse_humatch_csv(
+        pl
+        .DataFrame({"id": ["parent"], "vh": [reference_vh], "vl": [reference_vl]})
+        .write_csv()
+        .encode()
+    )
+    upstream = _load_upstream()
+    models, _ = _load_models(upstream)
+    parent = _align_pair_record(parent_frame.row(0, named=True), upstream=upstream)
+    parental = _predict_distributions(
+        parent.vh, parent.vl, models, upstream, num_cpus=ENCODING_WORKERS_PER_PAIR
+    )
+    return (
+        _select_target(parental[0], "heavy", vh_target_family, upstream),
+        _select_target(parental[1], "light", vl_target_family, upstream),
+    )
+
+
 def _score_humatch_pairs(
     csv_bytes: bytes,
     *,
@@ -421,22 +447,11 @@ def _score_humatch_pairs(
     inputs = parse_humatch_csv(csv_bytes)
     if inputs.height > HUMATCH_BATCH_SIZE:
         raise ValueError(f"Score calls support at most {HUMATCH_BATCH_SIZE} pairs")
-    parent_frame = parse_humatch_csv(
-        pl
-        .DataFrame({"id": ["parent"], "vh": [reference_vh], "vl": [reference_vl]})
-        .write_csv()
-        .encode()
+    targets = _reference_targets(
+        reference_vh, reference_vl, vh_target_family, vl_target_family
     )
     upstream = _load_upstream()
     models, _ = _load_models(upstream)
-    parent = _align_pair_record(parent_frame.row(0, named=True), upstream=upstream)
-    parental = _predict_distributions(
-        parent.vh, parent.vl, models, upstream, num_cpus=ENCODING_WORKERS_PER_PAIR
-    )
-    targets = (
-        _select_target(parental[0], "heavy", vh_target_family, upstream),
-        _select_target(parental[1], "light", vl_target_family, upstream),
-    )
     summaries, distributions = [], []
     for row in inputs.iter_rows(named=True):
         pair = _align_pair_record(row, upstream=upstream)

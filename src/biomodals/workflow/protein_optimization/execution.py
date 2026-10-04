@@ -165,17 +165,7 @@ class OptimizationExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
 
     def result(self) -> AppRunResult:
         """Return terminal references, including validated successor reuse."""
-        with self._volume_io_lock, self._writer_lock:
-            store = (
-                self._runtime.store if self._runtime is not None else self._run_store()
-            )
-            try:
-                overview = store.execution.overview(self.execution_run_id)
-                self._verify_overview(overview)
-                result = store.artifacts.load_node_result("publish")
-                if not overview.run.status.is_terminal or result is None:
-                    raise LookupError("Protein optimization result is not available")
-                return result
-            finally:
-                if self._runtime is None:
-                    store.close()
+        return self._terminal_node_result(
+            "publish",
+            unavailable_message="Protein optimization result is not available",
+        )

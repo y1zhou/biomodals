@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -182,23 +182,8 @@ class HumatchExecutionRequest:
         content = orjson.dumps(
             {
                 "schema_version": REQUEST_SCHEMA_VERSION,
-                "run_name": self.run_name,
+                **asdict(self),
                 "csv_bytes": b64encode(self.csv_bytes).decode("ascii"),
-                "vh_target_family": self.vh_target_family,
-                "vl_target_family": self.vl_target_family,
-                "germline_likeness_target": self.germline_likeness_target,
-                "vh_classifier_target": self.vh_classifier_target,
-                "vl_classifier_target": self.vl_classifier_target,
-                "pair_classifier_target": self.pair_classifier_target,
-                "max_edits": self.max_edits,
-                "mutate_cdrs": self.mutate_cdrs,
-                "fixed_vh_positions": self.fixed_vh_positions,
-                "fixed_vl_positions": self.fixed_vl_positions,
-                "app_version": self.app_version,
-                "asset_record": self.asset_record,
-                "runtime_identity": self.runtime_identity,
-                "max_active_provider_calls": self.max_active_provider_calls,
-                "max_active_gpu_provider_calls": self.max_active_gpu_provider_calls,
             },
             option=orjson.OPT_SORT_KEYS,
         )

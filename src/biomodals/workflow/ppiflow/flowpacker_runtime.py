@@ -43,7 +43,7 @@ def run_ppiflow_flowpacker_stage(
         if key in config
     }
     return AppRunResult.model_validate(
-        flowpacker_app.run_flowpacker_workflow.get_raw_f()(
+        flowpacker_app.run_flowpacker_workflow.local(
             input_files=selected,
             run_name=run_name,
             **kwargs,

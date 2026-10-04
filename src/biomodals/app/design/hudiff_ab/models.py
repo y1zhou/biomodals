@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import os
-import re
 import shutil
 import tarfile
 from dataclasses import dataclass
@@ -71,9 +69,6 @@ CHECKPOINTS = (
 ANTIBODY_CHECKPOINT_SHA256 = next(
     item.sha256 for item in CHECKPOINTS if item.path == ANTIBODY_CHECKPOINT
 )
-RUNTIME_ENVIRONMENT_SHA256 = (
-    "10e6779b054f02a18c3c876b467bd80ea96d216e850861c82952bcacc78f2e45"
-)
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 CUDA_DETERMINISM_POLICY = "torch-strict+cudnn-deterministic+cublas-4096x8"
 RUNTIME_IDENTITY = "|".join((
@@ -92,52 +87,10 @@ RUNTIME_IDENTITY = "|".join((
     "scipy=1.9.3",
     "easydict=1.13",
     "einops=0.6.1",
-    "pyyaml=6.0.3",
-    "tqdm=4.70.0",
-    f"resolved-environment={RUNTIME_ENVIRONMENT_SHA256}",
     f"cuda-determinism={CUDA_DETERMINISM_POLICY}",
-    "wrapper-protocol=3",
+    "wrapper-protocol=4",
     "patch-protocol=1",
 ))
-
-
-def runtime_environment_sha256() -> str:
-    """Fingerprint every resolved Conda build and Python distribution."""
-    conda = sorted(
-        (
-            item["name"],
-            item["version"],
-            item["build"],
-            item["channel"],
-        )
-        for path in Path("/opt/conda/conda-meta").glob("*.json")
-        if isinstance((item := orjson.loads(path.read_bytes())), dict)
-    )
-    if not conda:
-        raise RuntimeError("Conda returned an empty package inventory")
-    python = sorted(
-        (
-            re.sub(r"[-_.]+", "-", name).lower(),
-            distribution.version,
-        )
-        for distribution in importlib.metadata.distributions()
-        if (name := distribution.metadata["Name"])
-    )
-    payload = {"conda": conda, "python": python}
-    return hashlib.sha256(
-        orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
-    ).hexdigest()
-
-
-def assert_runtime_environment() -> str:
-    """Fail the image build if dependency resolution drifts from its identity."""
-    observed = runtime_environment_sha256()
-    if observed != RUNTIME_ENVIRONMENT_SHA256:
-        raise RuntimeError(
-            "HuDiff-Ab resolved runtime changed: "
-            f"expected {RUNTIME_ENVIRONMENT_SHA256}, observed {observed}"
-        )
-    return observed
 
 
 def _digest(path: Path) -> str:

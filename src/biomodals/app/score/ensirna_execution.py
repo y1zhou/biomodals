@@ -12,6 +12,12 @@ from uuid import UUID
 
 import orjson
 
+from biomodals.app.score.ensirna_contracts import (
+    EnsirnaPdbChunkSpec as EnsirnaPdbChunkSpec,
+)
+from biomodals.app.score.ensirna_contracts import (
+    EnsirnaPreparationPlan as EnsirnaPreparationPlan,
+)
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -59,30 +65,6 @@ _REQUEST_FILE = ExecutionRequestFile(
     MAX_REQUEST_BYTES,
     "ENsiRNA execution request",
 )
-
-
-@dataclass(frozen=True, slots=True)
-class EnsirnaPdbChunkSpec:
-    """One CPU Rosetta PDB preparation chunk."""
-
-    chunk_name: str
-    csv_path: str
-    json_path: str
-    pdb_dir: str
-
-
-@dataclass(frozen=True, slots=True)
-class EnsirnaPreparationPlan:
-    """Volume-backed prepared-input contract for ENsiRNA inference."""
-
-    cache_key: str
-    prepared_dir: str
-    json_path: str
-    processed_dir: str
-    candidate_count: int
-    chunk_count: int
-    chunks: list[EnsirnaPdbChunkSpec]
-    cached: bool
 
 
 @dataclass(frozen=True)

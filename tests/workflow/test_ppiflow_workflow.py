@@ -90,8 +90,8 @@ class _FakeModalFunction:
         self.kwargs = kwargs
         return _FakeFunctionCall(self.object_id, self.result)
 
-    def get_raw_f(self):
-        return self.remote
+    def local(self, *args, **kwargs):
+        return self.remote(*args, **kwargs)
 
 
 def _task_yaml(*, enabled_steps: str) -> bytes:
@@ -611,7 +611,7 @@ def test_flowpacker_stage_executes_batch_in_tracked_provider_call(
         flowpacker,
     )
 
-    ppiflow_workflow.run_ppiflow_flowpacker_stage.get_raw_f()(
+    ppiflow_workflow.run_ppiflow_flowpacker_stage.local(
         artifacts=[_upstream_structure_artifact()],
         config={"seed": 7},
         run_name="flowpacker-run",
@@ -725,9 +725,9 @@ def test_design_stage_publishes_digest_bearing_candidate_manifest(
     monkeypatch.setattr(
         ppiflow_app,
         "ppiflow_run_workflow",
-        SimpleNamespace(get_raw_f=lambda: run_raw),
+        SimpleNamespace(local=run_raw),
     )
-    result = ppiflow_workflow.run_ppiflow_design_stage.get_raw_f()(
+    result = ppiflow_workflow.run_ppiflow_design_stage.local(
         args=ppiflow_app.PPIFlowArgs.model_validate({
             "args": {
                 "name": "design",
@@ -816,9 +816,9 @@ def test_ligandmpnn_candidate_runs_science_in_kernel_owned_call(
     monkeypatch.setattr(
         ligandmpnn_app,
         "ligandmpnn_run",
-        SimpleNamespace(get_raw_f=lambda: run_raw),
+        SimpleNamespace(local=run_raw),
     )
-    result = ppiflow_workflow.run_ppiflow_ligandmpnn_candidate.get_raw_f()(
+    result = ppiflow_workflow.run_ppiflow_ligandmpnn_candidate.local(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[
             ExecutionArtifact(
@@ -937,9 +937,9 @@ def test_partial_candidate_runs_science_in_kernel_owned_call(
     monkeypatch.setattr(
         ppiflow_app,
         "ppiflow_run_workflow",
-        SimpleNamespace(get_raw_f=lambda: run_raw),
+        SimpleNamespace(local=run_raw),
     )
-    result = ppiflow_workflow.run_ppiflow_partial_candidate.get_raw_f()(
+    result = ppiflow_workflow.run_ppiflow_partial_candidate.local(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[
             ExecutionArtifact(
@@ -1299,7 +1299,7 @@ def test_af3score_prepare_publishes_candidate_to_batch_mapping(
         ),
     )
 
-    result = ppiflow_workflow.prepare_ppiflow_af3score_stage.get_raw_f()(
+    result = ppiflow_workflow.prepare_ppiflow_af3score_stage.local(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[],
         config={"_max_gpu_containers": 2},
@@ -1412,7 +1412,7 @@ def test_af3score_postprocess_returns_per_candidate_outcomes(
         lambda _root, input_id, **_kwargs: input_id == "a",
     )
 
-    result = ppiflow_workflow.postprocess_ppiflow_af3score_stage.get_raw_f()(
+    result = ppiflow_workflow.postprocess_ppiflow_af3score_stage.local(
         plan_artifacts=[plan_artifact],
         task_keys=["a", "b"],
         step_name="AF3scoreStep_stage1",
@@ -1686,7 +1686,7 @@ def test_rosetta_prepare_publishes_deterministic_task_plan(
     preserved_marker.parent.mkdir(parents=True)
     preserved_marker.write_text("{}\n", encoding="utf-8")
 
-    result = ppiflow_workflow.prepare_ppiflow_rosetta_stage.get_raw_f()(
+    result = ppiflow_workflow.prepare_ppiflow_rosetta_stage.local(
         artifacts=[_upstream_structure_artifact()],
         candidate_manifests=[],
         config={"rosetta_binary": "relax"},
@@ -1789,7 +1789,7 @@ def test_rosetta_worker_claims_executes_and_checkpoints_microbatch(
     input_pdb.parent.mkdir(parents=True)
     input_pdb.write_text("ATOM\n", encoding="utf-8")
 
-    summary = ppiflow_workflow.run_ppiflow_rosetta_worker.get_raw_f()(
+    summary = ppiflow_workflow.run_ppiflow_rosetta_worker.local(
         coordinator=coordinator,
         provider_call_id=str(provider_call_id),
         run_name="rosetta-run",
@@ -1916,7 +1916,7 @@ def test_rosetta_finalizer_preserves_usable_partial_candidate_manifest(
         SimpleNamespace(reload=lambda: None),
     )
 
-    result = ppiflow_workflow.finalize_ppiflow_rosetta_stage.get_raw_f()(
+    result = ppiflow_workflow.finalize_ppiflow_rosetta_stage.local(
         plan_artifacts=[plan_artifact],
         outcome_artifacts=[outcomes_artifact],
         config={"rosetta_binary": "relax"},
@@ -2288,7 +2288,7 @@ def test_dockq_stage_rejects_unpaired_structure_counts(
         lambda *args, **kwargs: next(selected),
     )
     with pytest.raises(ValueError, match="pairing mismatch"):
-        ppiflow_workflow.run_ppiflow_dockq_stage.get_raw_f()(
+        ppiflow_workflow.run_ppiflow_dockq_stage.local(
             reference_artifacts=[_upstream_structure_artifact()],
             model_artifacts=[
                 _upstream_structure_artifact(metadata={"candidate_id": "model-a"})
@@ -2332,7 +2332,7 @@ def test_dockq_stage_executes_batch_in_tracked_provider_call(
         dockq,
     )
 
-    ppiflow_workflow.run_ppiflow_dockq_stage.get_raw_f()(
+    ppiflow_workflow.run_ppiflow_dockq_stage.local(
         reference_artifacts=[_upstream_structure_artifact()],
         model_artifacts=[
             _upstream_structure_artifact(
@@ -2373,7 +2373,7 @@ def test_filter_transform_selects_only_passing_structures(
     structure_artifact = _upstream_structure_artifact()
     structure_artifact.storage.path = "structures"
 
-    result = ppiflow_workflow.filter_ppiflow_artifacts.get_raw_f()(
+    result = ppiflow_workflow.filter_ppiflow_artifacts.local(
         structures=[structure_artifact],
         scores=[
             ExecutionArtifact(
@@ -2430,7 +2430,7 @@ def test_fixed_position_transform_parses_rosetta_residue_energies(
     )
     artifact.storage.path = "rosetta"
 
-    result = ppiflow_workflow.derive_ppiflow_fixed_positions.get_raw_f()(
+    result = ppiflow_workflow.derive_ppiflow_fixed_positions.local(
         artifacts=[artifact],
         config={"gentype": "binder", "energy_threshold": -5},
         run_id="run-1",
@@ -2465,7 +2465,7 @@ def test_rank_transform_uses_dockq_scores(tmp_path: Path, monkeypatch) -> None:
     structure_artifact = _upstream_structure_artifact()
     structure_artifact.storage.path = "structures"
 
-    result = ppiflow_workflow.rank_ppiflow_artifacts.get_raw_f()(
+    result = ppiflow_workflow.rank_ppiflow_artifacts.local(
         structures=[structure_artifact],
         candidate_manifests=[],
         score_artifacts=[score_artifact],
@@ -2511,7 +2511,7 @@ def test_rank_transform_allows_empty_ranked_outputs(
     structure_artifact = _upstream_structure_artifact()
     structure_artifact.storage.path = "structures"
 
-    result = ppiflow_workflow.rank_ppiflow_artifacts.get_raw_f()(
+    result = ppiflow_workflow.rank_ppiflow_artifacts.local(
         structures=[structure_artifact],
         candidate_manifests=[],
         score_artifacts=[score_artifact],
@@ -3551,7 +3551,7 @@ def test_stage2_input_rejects_bytes_changed_after_submission(
     structure.write_bytes(b"ATOM MUTATED!\n")
 
     with pytest.raises(ValueError, match="changed after submission"):
-        ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
+        ppiflow_workflow.normalize_ppiflow_stage2_input.local(
             storage=storage,
             config={ppiflow_workflow._STAGE2_INPUT_SNAPSHOT_KEY: snapshot},
             run_id="run-1",
@@ -3631,7 +3631,7 @@ def test_stage2_input_normalization_scans_path_and_writes_manifest(
     (existing_dir / "design-a.pdb").write_text("ATOM A\n", encoding="utf-8")
     (existing_dir / "design-b.pdb").write_text("ATOM B\n", encoding="utf-8")
 
-    result = ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
+    result = ppiflow_workflow.normalize_ppiflow_stage2_input.local(
         storage=VolumePath(volume_name="source-volume", path="existing"),
         config={
             "run_name": "stage2-run",
@@ -3697,7 +3697,7 @@ def test_stage2_input_normalization_accepts_explicit_manifest(
         explicit_manifest,
     )
 
-    result = ppiflow_workflow.normalize_ppiflow_stage2_input.get_raw_f()(
+    result = ppiflow_workflow.normalize_ppiflow_stage2_input.local(
         storage=VolumePath(volume_name="source-volume", path="existing"),
         config={
             "manifest_volume_name": "workflow-volume",

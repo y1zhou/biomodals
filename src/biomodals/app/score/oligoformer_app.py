@@ -98,7 +98,7 @@ import shlex
 import shutil
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import count, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -110,6 +110,75 @@ import orjson
 import polars as pl
 
 from biomodals.app.config import AppConfig
+from biomodals.app.score.oligoformer_contracts import (
+    DEFAULT_EXECUTION_CONFIG as DEFAULT_EXECUTION_CONFIG,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    EFFICACY_POLICY_VERSION as EFFICACY_POLICY_VERSION,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    TARGETSCAN_RNAPLFOLD_MAX_NODES as TARGETSCAN_RNAPLFOLD_MAX_NODES,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    TARGETSCAN_RNAPLFOLD_MAX_WORKERS as TARGETSCAN_RNAPLFOLD_MAX_WORKERS,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OffTargetShardResult as OffTargetShardResult,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OffTargetShardSpec as OffTargetShardSpec,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OffTargetSirnaRecord as OffTargetSirnaRecord,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OligoformerEvidencePlan as OligoformerEvidencePlan,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OligoformerEvidenceStemPlan as OligoformerEvidenceStemPlan,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OligoformerExecutionConfig as OligoformerExecutionConfig,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OligoformerReferencePlan as OligoformerReferencePlan,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OligoformerRunConfig as OligoformerRunConfig,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    OligoformerRunPlan as OligoformerRunPlan,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    PitaPreparePlan as PitaPreparePlan,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    PitaPrepareUtrShardSpec as PitaPrepareUtrShardSpec,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    PitaReferencePlan as PitaReferencePlan,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    PitaRowShardSpec as PitaRowShardSpec,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    PreparedOffTargetShard as PreparedOffTargetShard,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    PreparedTargetscanBatch as PreparedTargetscanBatch,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    TargetscanBatchSpec as TargetscanBatchSpec,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    TargetscanContextShardSpec as TargetscanContextShardSpec,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    TargetscanReferenceShard as TargetscanReferenceShard,
+)
+from biomodals.app.score.oligoformer_contracts import (
+    TargetscanRnaPlfoldShardSpec as TargetscanRnaPlfoldShardSpec,
+)
 from biomodals.app.score.oligoformer_execution import (
     OligoformerExecutionCoordinator,
     OligoformerExecutionRequest,
@@ -149,8 +218,6 @@ from biomodals.helper.shell import (
 from biomodals.helper.task_budget import bounded_map
 from biomodals.helper.web import download_files
 
-TARGETSCAN_RNAPLFOLD_MAX_NODES = 32
-TARGETSCAN_RNAPLFOLD_MAX_WORKERS = 32
 TARGETSCAN_RNAPLFOLD_MANIFEST_VERSION = 1
 TARGETSCAN_RNAPLFOLD_CACHE_MARKER_VERSION = 2
 
@@ -215,6 +282,7 @@ class AppInfo:
         "targetscan-8.0-viennarna-2.7.2-semantic-topn-targetscan-polars-"
         "pita-ref-mount-v2"
     )
+    efficacy_cache_salt: str = EFFICACY_POLICY_VERSION
     postprocess_cache_salt: str = "final-tables-v3"
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
     model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
@@ -223,26 +291,6 @@ class AppInfo:
     human_ref_filenames: tuple[str, ...] = ("human_UTR.txt", "human_ORF.txt")
     default_top_n: int = 20
     prepared_marker_name: str = "oligoformer.json"
-    default_off_target_nodes: int = 32
-    default_off_target_workers_per_node: int = 32
-    default_off_target_process_slots: int = 64
-    max_off_target_process_slots: int = 64
-    default_off_target_prep_workers: int = 16
-    default_pita_prepare_nodes: int = 32
-    default_pita_prepare_workers: int = 32
-    default_pita_prepare_utr_shard_size: int = 1000
-    default_pita_row_shard_size: int = 1000
-    default_pita_row_attempts: int = 3
-    default_targetscan_rnaplfold_nodes: int = 32
-    default_targetscan_rnaplfold_workers: int = 8
-    default_targetscan_rnaplfold_shard_size: int = 500
-    default_targetscan_prepare_nodes: int = 32
-    default_targetscan_candidate_shard_size: int = 20
-    default_targetscan_context_nodes: int = 100
-    default_targetscan_context_workers: int = 32
-    default_targetscan_context_shard_size: int = 500
-    default_targetscan_context_attempts: int = 3
-    default_targetscan_merge_nodes: int = 16
     cache_lock_dict_name: str = f"{CONF.package_name}-cache-locks"
     cache_lock_poll_seconds: float = 5.0
     cache_lock_stale_seconds: float = MAX_TIMEOUT + 600
@@ -400,279 +448,6 @@ infer_path.write_text(infer_text)
 
 
 APP_INFO = AppInfo()
-
-
-@dataclass(frozen=True, slots=True)
-class OligoformerRunConfig:
-    """Semantic configuration shared by OligoFormer compute and final stages."""
-
-    off_target: bool = False
-    toxicity: bool = False
-    all_human: bool = False
-    top_n: int = 20
-    functionality_filter: bool = True
-    pita_threshold: float = -10.0
-    targetscan_threshold: float = 1.0
-    toxicity_threshold: float = 50.0
-
-
-@dataclass(frozen=True, slots=True)
-class OligoformerExecutionConfig:
-    """Result-neutral per-run OligoFormer fanout, sharding, and retry controls."""
-
-    off_target_nodes: int = APP_INFO.default_off_target_nodes
-    off_target_workers: int = APP_INFO.default_off_target_workers_per_node
-    off_target_process_slots: int = APP_INFO.default_off_target_process_slots
-    off_target_prep_workers: int = APP_INFO.default_off_target_prep_workers
-    pita_prepare_nodes: int = APP_INFO.default_pita_prepare_nodes
-    pita_prepare_workers: int = APP_INFO.default_pita_prepare_workers
-    pita_prepare_utr_shard_size: int = APP_INFO.default_pita_prepare_utr_shard_size
-    pita_row_shard_size: int = APP_INFO.default_pita_row_shard_size
-    pita_row_attempts: int = APP_INFO.default_pita_row_attempts
-    targetscan_rnaplfold_nodes: int = APP_INFO.default_targetscan_rnaplfold_nodes
-    targetscan_rnaplfold_workers: int = APP_INFO.default_targetscan_rnaplfold_workers
-    targetscan_rnaplfold_shard_size: int = (
-        APP_INFO.default_targetscan_rnaplfold_shard_size
-    )
-    targetscan_prepare_nodes: int = APP_INFO.default_targetscan_prepare_nodes
-    targetscan_candidate_shard_size: int = (
-        APP_INFO.default_targetscan_candidate_shard_size
-    )
-    targetscan_context_nodes: int = APP_INFO.default_targetscan_context_nodes
-    targetscan_context_workers: int = APP_INFO.default_targetscan_context_workers
-    targetscan_context_shard_size: int = APP_INFO.default_targetscan_context_shard_size
-    targetscan_context_attempts: int = APP_INFO.default_targetscan_context_attempts
-    targetscan_merge_nodes: int = APP_INFO.default_targetscan_merge_nodes
-
-    def __post_init__(self) -> None:
-        """Reject misleading or unsafe per-run resource settings."""
-        for name in self.__slots__:
-            value = getattr(self, name)
-            if value < 1:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.off_target_process_slots < 2:
-            raise ValueError(
-                "off_target_process_slots must be at least 2 so TargetScan and "
-                "PITA each receive one process slot"
-            )
-        if self.off_target_process_slots > APP_INFO.max_off_target_process_slots:
-            raise ValueError(
-                "off_target_process_slots must not exceed "
-                f"{APP_INFO.max_off_target_process_slots}"
-            )
-        worker_limits = {
-            "off_target_workers": 32,
-            "off_target_prep_workers": 32,
-            "pita_prepare_workers": 32,
-            "targetscan_rnaplfold_workers": TARGETSCAN_RNAPLFOLD_MAX_WORKERS,
-            "targetscan_context_workers": 32,
-        }
-        for name, limit in worker_limits.items():
-            if getattr(self, name) > limit:
-                raise ValueError(f"{name} must not exceed {limit}")
-        if self.targetscan_rnaplfold_nodes > TARGETSCAN_RNAPLFOLD_MAX_NODES:
-            raise ValueError(
-                "targetscan_rnaplfold_nodes must not exceed "
-                f"{TARGETSCAN_RNAPLFOLD_MAX_NODES}"
-            )
-
-
-DEFAULT_EXECUTION_CONFIG = OligoformerExecutionConfig()
-
-
-@dataclass(frozen=True, slots=True)
-class OligoformerRunPlan:
-    """Volume-backed OligoFormer run plan."""
-
-    cache_key: str
-    efficacy_key: str
-    run_root: str
-    efficacy_dir: str
-    output_dir: str
-    output_stems: tuple[str, ...]
-    config: OligoformerRunConfig
-    postprocess_key: str
-    efficacy_ready: bool
-    evidence_ready: bool
-    final_ready: bool
-    reference_identity: str | None = None
-    model_identity: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class OffTargetSirnaRecord:
-    """One siRNA FASTA record for OligoFormer off-target tools."""
-
-    name: str
-    sequence: str
-
-
-@dataclass(frozen=True, slots=True)
-class OffTargetShardResult:
-    """Per-siRNA off-target output paths inside a temporary shard workdir."""
-
-    index: int
-    pita_path: str
-
-
-@dataclass(frozen=True, slots=True)
-class OffTargetShardSpec:
-    """One siRNA off-target task backed by the shared output-volume cache."""
-
-    run_root: str
-    output_dir: str
-    stem: str
-    index: int
-    record_name: str
-    record_sequence: str
-    utr_path: str
-    orf_path: str
-    row_shard_size: int
-
-
-@dataclass(frozen=True, slots=True)
-class TargetscanBatchSpec:
-    """One TargetScan batch for a stem's selected siRNAs."""
-
-    run_root: str
-    output_dir: str
-    stem: str
-    ref_shard_size: int
-    shard_index: int
-    sirna_path: str
-    sirna_count: int
-    utr_path: str
-    orf_path: str
-    rnaplfold_cache_dir: str
-    candidate_shard_size: int = APP_INFO.default_targetscan_candidate_shard_size
-    candidate_shard_index: int = 0
-    context_shard_size: int = APP_INFO.default_targetscan_context_shard_size
-
-
-@dataclass(frozen=True, slots=True)
-class TargetscanReferenceShard:
-    """One transcript-aligned TargetScan reference shard."""
-
-    ref_shard_size: int
-    shard_index: int
-    utr_path: str
-    orf_path: str
-    rnaplfold_cache_dir: str
-
-
-@dataclass(frozen=True, slots=True)
-class PitaRowShardSpec:
-    """One cached PITA potential-target row shard."""
-
-    run_root: str
-    stem: str
-    sirna_index: int
-    record_name: str
-    shard_index: int
-    start_row: int
-    end_row: int
-    potential_targets_path: str
-    input_path: str
-    ext_utr_path: str
-    output_path: str
-    log_path: str
-
-
-@dataclass(frozen=True, slots=True)
-class PitaPrepareUtrShardSpec:
-    """One cached PITA UTR shard for potential-target discovery."""
-
-    shard_index: int
-    input_path: str
-    mir_stab_path: str
-    output_path: str
-    log_path: str
-
-
-@dataclass(frozen=True, slots=True)
-class TargetscanRnaPlfoldShardSpec:
-    """One shard of TargetScan UTRs for RNAplfold cache preparation."""
-
-    shard_index: int
-    shard_path: str
-    output_dir: str
-    log_path: str
-
-
-@dataclass(frozen=True, slots=True)
-class TargetscanContextShardSpec:
-    """One TargetScan context-score target-table shard."""
-
-    shard_index: int
-    common_dir: str
-    targets_path: str
-    output_path: str
-    log_path: str
-    rnaplfold_cache_dir: str
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedTargetscanBatch:
-    """Prepared TargetScan context shards for a siRNA batch."""
-
-    targetscan_path: str
-    logs_dir: str
-    context_shards: tuple[TargetscanContextShardSpec, ...]
-    needs_merge: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PitaPreparePlan:
-    """Prepared PITA target-discovery inputs for one siRNA."""
-
-    spec: OffTargetShardSpec
-    utr_shards: tuple[PitaPrepareUtrShardSpec, ...]
-    row_count: int | None
-    ext_utr_path: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class PitaReferencePlan:
-    """Reusable PITA reference-only stabilization data for one run stem."""
-
-    utr_shard_paths: tuple[str, ...]
-    ext_utr_path: str
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedOffTargetShard:
-    """Cached per-siRNA off-target inputs ready for row-shard scoring."""
-
-    index: int
-    record_name: str
-    cache_dir: str
-    logs_dir: str
-    pita_path: str
-    row_shards: tuple[PitaRowShardSpec, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class OligoformerReferencePlan:
-    """Finite RNAplfold reference-shard publication plan."""
-
-    record_count: int
-    shard_specs: tuple[TargetscanRnaPlfoldShardSpec, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class OligoformerEvidenceStemPlan:
-    """Deterministic PITA and TargetScan Tasks for one efficacy output."""
-
-    stem: str
-    pita_specs: tuple[OffTargetShardSpec, ...]
-    targetscan_specs: tuple[TargetscanBatchSpec, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class OligoformerEvidencePlan:
-    """Finite off-target Task plan discovered after efficacy prediction."""
-
-    stems: tuple[OligoformerEvidenceStemPlan, ...]
 
 
 def _hash_bytes(data: bytes | None) -> str:
@@ -865,8 +640,10 @@ def _output_bundle_paths(output_stems: tuple[str, ...]) -> tuple[Path, ...]:
     )
 
 
-def _package_output_tables(output_dir: Path, output_stems: tuple[str, ...]) -> bytes:
-    """Package only final OligoFormer result tables, excluding diagnostic logs."""
+def _package_output_tables(
+    output_dir: Path, output_stems: tuple[str, ...], *, provenance: dict | None = None
+) -> bytes:
+    """Package final tables and optional scientific provenance, excluding logs."""
     bundle_paths = _output_bundle_paths(output_stems)
     missing = [
         str(output_dir / path)
@@ -877,6 +654,16 @@ def _package_output_tables(output_dir: Path, output_stems: tuple[str, ...]) -> b
         raise FileNotFoundError(
             "OligoFormer final output tables are incomplete: " + ", ".join(missing)
         )
+    if provenance is not None:
+        provenance = provenance | {
+            "tables": {
+                str(path): _hash_path(output_dir / path) for path in bundle_paths
+            }
+        }
+        (output_dir / "provenance.json").write_bytes(
+            orjson.dumps(provenance, option=orjson.OPT_INDENT_2)
+        )
+        bundle_paths = (*bundle_paths, Path("provenance.json"))
     return package_outputs(output_dir, paths_to_bundle=bundle_paths)
 
 
@@ -1614,6 +1401,11 @@ runtime_image = (
         "zstd",
     )
     .env(CONF.default_env)
+    .add_local_file(
+        Path(__file__).with_name("oligoformer_inference.patch"),
+        "/opt/oligoformer-inference.patch",
+        copy=True,
+    )
     .run_commands(
         " && ".join((
             "tmpdir=$(mktemp -d)",
@@ -1633,6 +1425,8 @@ runtime_image = (
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
             f"cd {CONF.git_clone_dir}",
             f"git checkout {CONF.repo_commit_hash}",
+            "git apply --check /opt/oligoformer-inference.patch",
+            "git apply /opt/oligoformer-inference.patch",
             "grep -q \"Args.orf = './off-target/ref/human_UTR.txt'\" scripts/infer.py",
             "sed -i \"s|Args.orf = './off-target/ref/human_UTR.txt'|Args.orf = './off-target/ref/human_ORF.txt'|\" scripts/infer.py",
             'grep -q "for i in range(Args.top_n):" scripts/infer.py',
@@ -1649,10 +1443,14 @@ runtime_image = (
     .workdir(str(CONF.git_clone_dir))
     .uv_pip_install(*APP_INFO.requirements)
     # OligoFormer requires Python 3.10; avoid incompatible project dependencies.
-    .pipe(
-        patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3", "modal"]
+    .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
+    # Requests lazily import the app by package name, even when Modal stages
+    # this entry module as /root/oligoformer_app.py.
+    .add_local_python_source(
+        "biomodals.app.score.oligoformer_app",
+        "biomodals.app.score.oligoformer_execution",
+        "biomodals.app.score.oligoformer_contracts",
     )
-    .add_local_python_source("biomodals.app.score.oligoformer_execution")
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 OLIGOFORMER_OUTPUT_CLAIMS = modal.Dict.from_name(
@@ -1891,7 +1689,7 @@ def _run_rnaplfold_for_record(
 )
 def run_oligoformer_targetscan_rnaplfold_shard(
     spec: TargetscanRnaPlfoldShardSpec,
-    local_workers: int = APP_INFO.default_targetscan_rnaplfold_workers,
+    local_workers: int = DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_workers,
 ) -> int:
     """Populate one shard of cached TargetScan RNAplfold outputs."""
     CONF.output_volume.reload()
@@ -2089,6 +1887,7 @@ def _efficacy_key_for_run(
             CONF.name,
             CONF.version or "",
             CONF.repo_commit_hash or "",
+            APP_INFO.efficacy_cache_salt,
             f"mrna:{_hash_bytes(mrna_fasta_bytes)}",
             f"sirna:{_hash_bytes(sirna_fasta_bytes)}",
             f"functionality_filter:{int(functionality_filter)}",
@@ -2236,7 +2035,7 @@ def _targetscan_ref_shard_size(
     utr_count: int,
     configured_size: int | None = None,
     *,
-    prepare_nodes: int = APP_INFO.default_targetscan_prepare_nodes,
+    prepare_nodes: int = DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes,
 ) -> int:
     """Choose a TargetScan reference shard size from explicit tuning or fanout."""
     if utr_count < 1:
@@ -2421,7 +2220,7 @@ def _targetscan_reference_shards(
     utr_path: str,
     orf_path: str,
     ref_shard_size: int | None = None,
-    prepare_nodes: int = APP_INFO.default_targetscan_prepare_nodes,
+    prepare_nodes: int = DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes,
 ) -> list[TargetscanReferenceShard]:
     """Persist transcript-aligned TargetScan reference shards once per run."""
     layout = AppRunLayout.from_run_root(run_root)
@@ -2763,7 +2562,7 @@ def _cached_pita_prepare_utr_shard_specs(
 
 def _run_pita_prepare_utr_shard(
     spec: PitaPrepareUtrShardSpec,
-    attempts: int = APP_INFO.default_pita_row_attempts,
+    attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts,
 ) -> str:
     """Run one local UTR STAB shard through PITA potential-target discovery."""
     import subprocess as sp
@@ -3402,7 +3201,7 @@ def _targetscan_context_shard_specs(
 
 def _run_targetscan_context_shard(
     spec: TargetscanContextShardSpec,
-    attempts: int = APP_INFO.default_targetscan_context_attempts,
+    attempts: int = DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts,
 ) -> str:
     """Run one TargetScan context-score shard on a CPU node."""
     import shutil
@@ -4258,7 +4057,7 @@ def _cleanup_off_target_transients(raw_off_target_dir: Path) -> None:
 
 def _run_pita_row_shard(
     spec: PitaRowShardSpec,
-    attempts: int = APP_INFO.default_pita_row_attempts,
+    attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts,
 ) -> str:
     """Run or reuse one cached PITA row-shard score table."""
     import subprocess as sp
@@ -5173,7 +4972,7 @@ def run_oligoformer_efficacy(
         if not functionality_filter:
             cmd.append("--no_func")
 
-        run_command(cmd, cwd=CONF.git_clone_dir)
+        run_command(cmd, cwd=CONF.git_clone_dir, output_mode="stream")
         _publish_output_bundle_marker(
             _marker_path(efficacy_layout, "efficacy.done"),
             output_dir=efficacy_dir,
@@ -5384,7 +5183,7 @@ def build_oligoformer_final_tables(
     plan: OligoformerRunPlan,
 ) -> OligoformerRunPlan:
     """Build final tables and return only their refreshed publication plan."""
-    run_oligoformer_postprocess.get_raw_f()(
+    run_oligoformer_postprocess.local(
         plan=plan,
         off_target=plan.config.off_target,
         toxicity=plan.config.toxicity,
@@ -5441,7 +5240,8 @@ def _parse_oligoformer_result_publication(
         return None
     if not (
         isinstance(value, dict)
-        and value.get("version") == 2
+        # Version 3 archives include custom-reference input digests.
+        and value.get("version") == 3
         and value.get("publication_key") == publication_key
         and isinstance(value.get("result_path"), str)
         and isinstance(value.get("size_bytes"), int)
@@ -5485,7 +5285,7 @@ def _publish_oligoformer_result_record(
     try:
         tmp_path.write_bytes(
             orjson.dumps({
-                "version": 2,
+                "version": 3,
                 "publication_key": publication_key,
                 "model_identity": model_identity,
                 "reference_identity": reference_identity,
@@ -5569,7 +5369,7 @@ def publish_oligoformer_outputs(
     plan: OligoformerRunPlan,
     publication_key: str,
 ) -> dict[str, object]:
-    """Publish the final standalone archive for Volume API download."""
+    """Publish final tables and scientific provenance for Volume API download."""
     CONF.output_volume.reload()
     refreshed = _build_plan(
         plan.cache_key,
@@ -5585,10 +5385,27 @@ def publish_oligoformer_outputs(
         raise FileNotFoundError("OligoFormer final outputs are incomplete")
     if refreshed.model_identity is None:
         raise FileNotFoundError("OligoFormer model identity is unavailable")
+    inputs_dir = AppRunLayout.from_run_root(refreshed.run_root).inputs_dir
+    input_paths = list(inputs_dir.glob("*.fa"))
+    if refreshed.config.off_target and not refreshed.config.all_human:
+        input_paths.extend((inputs_dir / "utr.txt", inputs_dir / "orf.txt"))
     archive_path = _oligoformer_result_archive_path(refreshed)
     archive_bytes = _package_output_tables(
         Path(refreshed.output_dir),
         refreshed.output_stems,
+        provenance={
+            "upstream_commit": CONF.repo_commit_hash,
+            "efficacy_policy": EFFICACY_POLICY_VERSION,
+            "efficacy_key": refreshed.efficacy_key,
+            "model_identity": refreshed.model_identity,
+            "efficacy_checkpoint_sha256": _hash_path(
+                CONF.git_clone_dir / "model/best_model.pth"
+            ),
+            "reference_identity": refreshed.reference_identity,
+            "config": asdict(refreshed.config),
+            "seed": 42,
+            "inputs": {path.name: _hash_path(path) for path in input_paths},
+        },
     )
     tmp_path = _unique_tmp_path(archive_path)
     try:
@@ -5808,26 +5625,26 @@ def submit_oligoformer_task(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    off_target_workers: int = APP_INFO.default_off_target_workers_per_node,
-    off_target_process_slots: int = APP_INFO.default_off_target_process_slots,
-    off_target_prep_workers: int = APP_INFO.default_off_target_prep_workers,
-    pita_prepare_workers: int = APP_INFO.default_pita_prepare_workers,
-    pita_prepare_utr_shard_size: int = APP_INFO.default_pita_prepare_utr_shard_size,
-    pita_row_shard_size: int = APP_INFO.default_pita_row_shard_size,
-    pita_row_attempts: int = APP_INFO.default_pita_row_attempts,
-    targetscan_rnaplfold_workers: int = APP_INFO.default_targetscan_rnaplfold_workers,
+    off_target_workers: int = DEFAULT_EXECUTION_CONFIG.off_target_workers,
+    off_target_process_slots: int = DEFAULT_EXECUTION_CONFIG.off_target_process_slots,
+    off_target_prep_workers: int = DEFAULT_EXECUTION_CONFIG.off_target_prep_workers,
+    pita_prepare_workers: int = DEFAULT_EXECUTION_CONFIG.pita_prepare_workers,
+    pita_prepare_utr_shard_size: int = DEFAULT_EXECUTION_CONFIG.pita_prepare_utr_shard_size,
+    pita_row_shard_size: int = DEFAULT_EXECUTION_CONFIG.pita_row_shard_size,
+    pita_row_attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts,
+    targetscan_rnaplfold_workers: int = DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_workers,
     targetscan_rnaplfold_shard_size: int = (
-        APP_INFO.default_targetscan_rnaplfold_shard_size
+        DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_shard_size
     ),
     targetscan_ref_shard_size: int | None = None,
     targetscan_candidate_shard_size: int = (
-        APP_INFO.default_targetscan_candidate_shard_size
+        DEFAULT_EXECUTION_CONFIG.targetscan_candidate_shard_size
     ),
-    targetscan_context_workers: int = APP_INFO.default_targetscan_context_workers,
+    targetscan_context_workers: int = DEFAULT_EXECUTION_CONFIG.targetscan_context_workers,
     targetscan_context_shard_size: int = (
-        APP_INFO.default_targetscan_context_shard_size
+        DEFAULT_EXECUTION_CONFIG.targetscan_context_shard_size
     ),
-    targetscan_context_attempts: int = APP_INFO.default_targetscan_context_attempts,
+    targetscan_context_attempts: int = DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts,
     max_containers: int | None = None,
     max_gpu_containers: int | None = None,
     force: bool = False,
@@ -5896,7 +5713,7 @@ def submit_oligoformer_task(
         default_max_containers=max(
             2,
             off_target_process_slots,
-            APP_INFO.default_targetscan_rnaplfold_nodes,
+            DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_nodes,
         ),
         default_max_gpu_containers=1,
         max_containers=max_containers,
@@ -5916,26 +5733,26 @@ def submit_oligoformer_task(
         pita_threshold=pita_threshold,
         targetscan_threshold=targetscan_threshold,
         toxicity_threshold=toxicity_threshold,
-        off_target_nodes=APP_INFO.default_off_target_nodes,
+        off_target_nodes=DEFAULT_EXECUTION_CONFIG.off_target_nodes,
         off_target_workers=off_target_workers,
         off_target_process_slots=off_target_process_slots,
         off_target_prep_workers=off_target_prep_workers,
-        pita_prepare_nodes=APP_INFO.default_pita_prepare_nodes,
+        pita_prepare_nodes=DEFAULT_EXECUTION_CONFIG.pita_prepare_nodes,
         pita_prepare_workers=pita_prepare_workers,
         pita_prepare_utr_shard_size=pita_prepare_utr_shard_size,
         pita_row_shard_size=pita_row_shard_size,
         pita_row_attempts=pita_row_attempts,
-        targetscan_rnaplfold_nodes=APP_INFO.default_targetscan_rnaplfold_nodes,
+        targetscan_rnaplfold_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_nodes,
         targetscan_rnaplfold_workers=targetscan_rnaplfold_workers,
         targetscan_rnaplfold_shard_size=targetscan_rnaplfold_shard_size,
-        targetscan_prepare_nodes=APP_INFO.default_targetscan_prepare_nodes,
+        targetscan_prepare_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes,
         targetscan_ref_shard_size=targetscan_ref_shard_size,
         targetscan_candidate_shard_size=targetscan_candidate_shard_size,
-        targetscan_context_nodes=APP_INFO.default_targetscan_context_nodes,
+        targetscan_context_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_context_nodes,
         targetscan_context_workers=targetscan_context_workers,
         targetscan_context_shard_size=targetscan_context_shard_size,
         targetscan_context_attempts=targetscan_context_attempts,
-        targetscan_merge_nodes=APP_INFO.default_targetscan_merge_nodes,
+        targetscan_merge_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_merge_nodes,
         force=force,
         force_generation=uuid4().hex if force else None,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",

@@ -115,7 +115,7 @@ def test_worker_preserves_claim_on_failure_and_redelivery_finishes_it(
         raise RuntimeError("preempted")
 
     monkeypatch.setattr(boltzgen_app, "run_command", fail)
-    worker = boltzgen_app.run_boltzgen_task.get_raw_f()
+    worker = boltzgen_app.run_boltzgen_task.local
     task_fingerprint = "a" * 64
     with pytest.raises(RuntimeError, match="preempted"):
         worker(
@@ -183,7 +183,7 @@ def test_collection_commits_artifacts_before_its_publication_marker(
         task_fingerprint=task_fingerprint,
     )
 
-    result = boltzgen_app.collect_boltzgen_data.get_raw_f()(
+    result = boltzgen_app.collect_boltzgen_data.local(
         run_name="example",
         run_ids=["run-a"],
         task_fingerprints={"run-a": task_fingerprint},
@@ -209,7 +209,7 @@ def test_worker_rejects_output_outside_the_mounted_volume(
             output_volume_name="outputs",
         ),
     )
-    worker = boltzgen_app.run_boltzgen_task.get_raw_f()
+    worker = boltzgen_app.run_boltzgen_task.local
 
     with pytest.raises(ValueError, match="inside the output Volume"):
         worker(

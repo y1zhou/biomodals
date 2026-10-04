@@ -64,6 +64,45 @@ def test_run_command_tee_streams_raw_child_output(capfd) -> None:
     assert lines == ["\x1b[32mok\x1b[0m", "[ranked_designs]", "err"]
 
 
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_stream_mode_preserves_large_newline_free_output_without_retention(
+    tmp_path, capfd, exit_code
+):
+    """The child emits real stdout/stderr; stream mode must not buffer lines."""
+    import tracemalloc
+
+    log = tmp_path / "stream.log"
+    command = [
+        sys.executable,
+        "-c",
+        f"import sys; sys.stdout.write('x' * (4 * 1024 * 1024)); sys.stdout.flush(); sys.stderr.write('tail'); sys.exit({exit_code})",
+    ]
+    tracemalloc.start()
+    try:
+        if exit_code:
+            with pytest.raises(sp.CalledProcessError):
+                run_command(
+                    command,
+                    output_mode="stream",
+                    log_file=log,
+                    show_command=False,
+                    warn_on_error=False,
+                )
+        else:
+            assert (
+                run_command(
+                    command, output_mode="stream", log_file=log, show_command=False
+                )
+                == []
+            )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1024 * 1024
+    assert capfd.readouterr().out == "x" * (4 * 1024 * 1024) + "tail"
+    assert b"x" * (4 * 1024 * 1024) + b"tail" in log.read_bytes()
+
+
 def test_run_command_capture_returns_output_without_streaming(capfd) -> None:
     lines = run_command(
         [

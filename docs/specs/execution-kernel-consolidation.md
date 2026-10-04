@@ -54,8 +54,9 @@ not import a provider SDK. Provider wrappers own decorators, resource and image
 declarations, mounts, Secrets, call handles, and durability synchronization.
 
 The API service owns users, Jobs, authorization, configuration, presentation,
-and other non-execution metadata. It embeds the kernel tables in its database
-without exposing service state to the kernel.
+and other non-execution metadata. Kernel tables live in the remote coordinator's
+per-Run ledger, as specified by
+[ADR 0007](../adr/0007-api-jobs-use-remote-coordinators.md).
 
 ## App and workflow distinction
 
@@ -213,11 +214,11 @@ compatibility; they do not implement admission loops.
 Local Entrypoints remain thin. They parse workload arguments, stage local
 scientific inputs, construct the workload request, and call the Modal host.
 
-The API service does not use the Volume-backed CLI host. It uses the same
-provider-neutral definition and synchronous `ExecutionRuntime` behind its
-asynchronous service boundary, with its own database and process lifecycle. Its
-provider adapter uses `AsyncModalCallDriver` from
-`biomodals.execution.modal`.
+The API service uses `RemoteExecutionClient` to submit requests, observe Runs,
+and request cancellation or recovery from the exact deployed coordinator.
+CLI and API submissions use the same remote host and scientific definition.
+The remote coordinator owns scheduling and its Volume-backed execution ledger;
+the service stores Job metadata and bounded status projections.
 
 ## Source layout
 

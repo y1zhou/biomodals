@@ -65,8 +65,14 @@ def test_content_bound_file_set_rejects_incomplete_manifest(tmp_path: Path) -> N
         publication.write((ArtifactFile(path="other.txt"),))
 
 
+@pytest.mark.parametrize(
+    "content",
+    [b"", b"ok\n", b"0123456789\n" * 100_000],
+    ids=["empty", "small", "large"],
+)
 def test_materialize_inline_bytes_writes_one_result_artifact_copy(
     tmp_path: Path,
+    content: bytes,
 ) -> None:
     result = AppRunResult(
         status=AppRunStatus.SUCCEEDED,
@@ -74,7 +80,7 @@ def test_materialize_inline_bytes_writes_one_result_artifact_copy(
             AppOutput(
                 name="summary",
                 kind=ArtifactKind.REPORT,
-                storage=InlineBytes(data=b"ok\n", filename="summary.txt"),
+                storage=InlineBytes(data=content, filename="summary.txt"),
             )
         ],
     )
@@ -90,20 +96,36 @@ def test_materialize_inline_bytes_writes_one_result_artifact_copy(
 
     artifacts = materialized.artifacts
     output_path = (
-        tmp_path / "nodes" / "summary" / "result" / "summary-summary" / "summary.txt"
+        tmp_path
+        / "nodes"
+        / "summary"
+        / "result"
+        / materialized.artifacts[0].artifact_id
+        / "summary.txt"
     )
     assert not (tmp_path / "nodes" / "summary" / "result" / "raw_outputs").exists()
     assert not (
         tmp_path / "nodes" / "summary" / "result" / "materialized_outputs"
     ).exists()
-    assert output_path.read_bytes() == b"ok\n"
+    assert output_path.read_bytes() == content
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="nodes/summary/result/summary-summary/summary.txt",
+        path=f"nodes/summary/result/{materialized.artifacts[0].artifact_id}/summary.txt",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage
     assert artifacts[0].files[0].path == "summary.txt"
-    assert (tmp_path / "artifacts" / "summary-summary.json").exists()
+    manifest = ExecutionArtifact.model_validate_json(
+        (
+            tmp_path / "artifacts" / f"{materialized.artifacts[0].artifact_id}.json"
+        ).read_bytes()
+    )
+    assert manifest.files == [
+        ArtifactFile(
+            path="summary.txt",
+            size_bytes=len(content),
+            content_sha256=sha256(content).hexdigest(),
+        )
+    ]
 
 
 def test_task_scope_keeps_repeated_output_names_distinct(
@@ -139,8 +161,7 @@ def test_task_scope_keeps_repeated_output_names_distinct(
         volume_root=tmp_path,
     )
 
-    assert first.artifacts[0].artifact_id == "design-candidate-a-structure"
-    assert second.artifacts[0].artifact_id == "design-candidate-b-structure"
+    assert first.artifacts[0].artifact_id != second.artifacts[0].artifact_id
     assert first.artifacts[0].source_app_output_name == "structure"
     assert second.artifacts[0].source_app_output_name == "structure"
 
@@ -577,7 +598,9 @@ def test_materialized_inline_artifact_path_is_volume_relative(
 
     assert materialized.artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path=("demo/run-1/nodes/summary/result/summary-summary/summary.txt"),
+        path=(
+            f"demo/run-1/nodes/summary/result/{materialized.artifacts[0].artifact_id}/summary.txt"
+        ),
     )
 
 
@@ -633,7 +656,13 @@ def test_materialize_app_run_result_persists_log_outputs_under_result_logs(
         volume_root=tmp_path,
     )
 
-    log_path = tmp_path / "result" / "logs" / "node-logs-stderr" / "stderr.log"
+    log_path = (
+        tmp_path
+        / "result"
+        / "logs"
+        / materialized.artifacts[0].artifact_id
+        / "stderr.log"
+    )
     assert not (tmp_path / "result" / "logs" / "raw_outputs").exists()
     assert log_path.read_bytes() == b"warning\n"
     artifacts = materialized.artifacts
@@ -642,10 +671,12 @@ def test_materialize_app_run_result_persists_log_outputs_under_result_logs(
     assert artifacts[0].metadata == {"stream": "stderr"}
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="result/logs/node-logs-stderr/stderr.log",
+        path=f"result/logs/{materialized.artifacts[0].artifact_id}/stderr.log",
     )
     assert materialized.result.logs[0].storage == artifacts[0].storage
-    assert (tmp_path / "artifacts" / "node-logs-stderr.json").exists()
+    assert (
+        tmp_path / "artifacts" / f"{materialized.artifacts[0].artifact_id}.json"
+    ).exists()
 
 
 def test_materialize_volume_path_references_existing_remote_output(
@@ -678,7 +709,9 @@ def test_materialize_volume_path_references_existing_remote_output(
         path="run-1/af3score_metrics.csv",
     )
     assert materialized.result.outputs[0].storage == materialized.artifacts[0].storage
-    assert (tmp_path / "artifacts" / "score-scores.json").exists()
+    assert (
+        tmp_path / "artifacts" / f"{materialized.artifacts[0].artifact_id}.json"
+    ).exists()
 
 
 def test_artifact_volume_reference_records_content_identity(
@@ -996,12 +1029,18 @@ def test_materialize_volume_path_can_copy_from_mounted_volume(
         volume_roots={"AF3Score-outputs": source_root},
     )
 
-    copied_file = tmp_path / "workflow" / "result" / "score-scores" / "scores.csv"
+    copied_file = (
+        tmp_path
+        / "workflow"
+        / "result"
+        / materialized.artifacts[0].artifact_id
+        / "scores.csv"
+    )
     assert copied_file.read_text(encoding="utf-8") == "score\n1\n"
     artifacts = materialized.artifacts
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="result/score-scores",
+        path=f"result/{materialized.artifacts[0].artifact_id}",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage
     assert artifacts[0].files[0].path == "scores.csv"
@@ -1038,11 +1077,13 @@ def test_materialize_volume_path_copy_preserves_empty_directories(
         volume_roots={"AF3Score-outputs": source_root},
     )
 
-    materialized_dir = tmp_path / "workflow" / "result" / "score-scores"
+    materialized_dir = (
+        tmp_path / "workflow" / "result" / materialized.artifacts[0].artifact_id
+    )
     assert materialized_dir.is_dir()
     assert materialized.artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="result/score-scores",
+        path=f"result/{materialized.artifacts[0].artifact_id}",
     )
 
 
@@ -1206,7 +1247,9 @@ def test_materialize_inline_zstd_archive_preserves_binary_bytes(
         volume_root=tmp_path,
     )
 
-    output_path = tmp_path / "result" / "pack-archive" / "archive.tar.zst"
+    output_path = (
+        tmp_path / "result" / materialized.artifacts[0].artifact_id / "archive.tar.zst"
+    )
     assert not (tmp_path / "result" / "raw_outputs").exists()
     assert not (tmp_path / "result" / "materialized_outputs").exists()
     assert output_path.read_bytes() == b"\xff\x00"
@@ -1214,7 +1257,7 @@ def test_materialize_inline_zstd_archive_preserves_binary_bytes(
     assert artifacts[0].kind == ArtifactKind.ARCHIVE
     assert artifacts[0].storage == VolumePath(
         volume_name="Workflow-outputs",
-        path="result/pack-archive/archive.tar.zst",
+        path=f"result/{materialized.artifacts[0].artifact_id}/archive.tar.zst",
         media_type="application/zstd",
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage
@@ -1254,3 +1297,63 @@ def test_archive_outputs_use_volume_path_metadata(tmp_path: Path) -> None:
     )
     assert materialized.result.outputs[0].storage == artifacts[0].storage
     assert artifacts[0].metadata == {"archive_format": "tar.zst"}
+
+
+def test_artifact_names_preserve_raw_identity_and_namespaces(tmp_path):
+    identities = []
+    for index, (scope, name, log) in enumerate([
+        (None, "a/b", False),
+        (None, "a_b", False),
+        (None, "logs-result", False),
+        (None, "result", True),
+        ("task", "result", False),
+        (None, "task-result", False),
+    ]):
+        output = AppOutput(
+            name=name,
+            kind=ArtifactKind.REPORT,
+            storage=InlineBytes(data=str(index).encode(), filename="result.txt"),
+        )
+        result = AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[] if log else [output],
+            logs=[output] if log else [],
+        )
+        materialized = materialize_app_run_result(
+            result=result,
+            artifact_volume_name="outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="node",
+            artifact_id_scope=scope,
+            volume_root=tmp_path,
+        )
+        identities.append(materialized.artifacts[0])
+    assert len({item.artifact_id for item in identities}) == len(identities)
+    assert [(tmp_path / item.storage.path).read_text() for item in identities] == list(
+        map(str, range(6))
+    )
+
+
+def test_duplicate_output_names_reject_before_writing(tmp_path):
+    result = AppRunResult(
+        status=AppRunStatus.SUCCEEDED,
+        outputs=[
+            AppOutput(
+                name="same",
+                kind=ArtifactKind.REPORT,
+                storage=InlineBytes(data=value, filename="result.txt"),
+            )
+            for value in (b"one", b"two")
+        ],
+    )
+    with pytest.raises(ValueError, match="Duplicate"):
+        materialize_app_run_result(
+            result=result,
+            artifact_volume_name="outputs",
+            result_dir=tmp_path / "result",
+            artifact_dir=tmp_path / "artifacts",
+            producing_node_id="node",
+            volume_root=tmp_path,
+        )
+    assert list(tmp_path.iterdir()) == []

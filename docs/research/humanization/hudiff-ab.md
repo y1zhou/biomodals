@@ -251,15 +251,16 @@ CPU-only inspections of the validated image `im-08MH3kBTTZNGSTjyazY6EW`
 and rebuilt image `im-JFwigtdmTiUafDDFexn6CE` reproduced their respective
 fingerprints; all Conda inventory entries were identical.
 
-`runtime-constraints.txt` records Python distributions from `/opt/conda` in
-the validated image and constrains helper installation through
-[`UV_CONSTRAINT`](https://docs.astral.sh/uv/reference/environment/#uv_constraint).
-It excludes Modal's separately injected `/pkg` distributions. The original
-full-inventory fingerprint remains unchanged and is still enforced at build
-time. Conda build changes or injected-package changes therefore still fail
-closed; this is not a claim that every layer can be reconstructed indefinitely.
-Refresh constraints only after auditing a new environment and validating its
-scientific behavior, not by accepting a newly observed digest automatically.
+That investigation led to a full Python constraint snapshot and a fixed
+Conda/Python inventory hash. These were removed during the Modal 1.6 migration:
+shared Biomodals dependencies, including the Modal SDK and its transitive
+dependencies, now come from `patch_image_for_helper` and project package metadata.
+The image recipe retains its direct scientific package pins and source/checkpoint
+integrity checks. Shared dependencies are installed before the build-time patches
+so their imports are available. Wrapper protocol 4 distinguishes this environment
+policy from prior cached results; the earlier complete inventory fingerprint is
+no longer claimed or enforced. The historical validations above describe their
+original environments, not scientific validation of every future rebuild.
 
 ## Primary-source snapshot and reproducible pins
 

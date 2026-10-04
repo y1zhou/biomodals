@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -1094,6 +1095,25 @@ class ExecutionRuntime:
             observations: dict[UUID, tuple[ProviderCallObservation, Any]] = {}
             preparation_errors: dict[UUID, Exception] = {}
             abandoned_submissions: set[UUID] = set()
+            pollable = [
+                call
+                for call in originals
+                if not call.status.is_terminal
+                and call.status != ProviderCallStatus.SUBMITTING
+                and call.provider_call_handle_id is not None
+            ]
+            handles = [cast(str, call.provider_call_handle_id) for call in pollable]
+            # Only provider I/O runs in threads. Encoding, cleanup and durable
+            # transitions retain their coordinator-thread ordering below.
+            if len(handles) > 1:
+                with ThreadPoolExecutor(max_workers=min(8, len(handles))) as pool:
+                    observed = list(pool.map(self._driver.observe, handles))
+            else:
+                observed = [self._driver.observe(handle) for handle in handles]
+            by_call = {
+                call.provider_call_id: observation
+                for call, observation in zip(pollable, observed, strict=True)
+            }
             for call in originals:
                 if call.status.is_terminal:
                     continue
@@ -1102,7 +1122,7 @@ class ExecutionRuntime:
                     continue
                 if call.provider_call_handle_id is None:
                     continue
-                observation = self._driver.observe(call.provider_call_handle_id)
+                observation = by_call[call.provider_call_id]
                 prepared_result = None
                 if observation.kind == ProviderCallObservationKind.SUCCEEDED:
                     try:

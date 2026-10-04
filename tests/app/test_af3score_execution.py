@@ -400,7 +400,7 @@ def test_postprocess_validates_summaries_in_parallel(
     )
     monkeypatch.setattr(af3score_app, "run_command", run_command)
 
-    result = af3score_app.af3score_postprocess.get_raw_f()(
+    result = af3score_app.af3score_postprocess.local(
         run_name="scores",
         staged_input_key=af3score_staged_input_key((
             ("a.pdb", "a" * 64),
@@ -515,7 +515,7 @@ def test_gpu_batch_invalidates_publication_before_compute(
     )
     monkeypatch.setattr(af3score_app, "run_command", run_command)
 
-    af3score_app.af3score_run.get_raw_f()(
+    af3score_app.af3score_run.local(
         run_name="scores",
         batch_name="batch_0",
         batch_json_dir=str(batch_json),

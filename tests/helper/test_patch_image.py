@@ -45,7 +45,7 @@ def test_patch_image_can_ignore_dependency_versions(monkeypatch) -> None:
     )
 
     assert image.installed_deps == [
-        "modal",
+        "modal>=1.5.1",
         "polars[calamine,numpy]",
         "backports-strenum ; python_full_version < '3.11'",
         "custom @ https://example.invalid/custom.whl",

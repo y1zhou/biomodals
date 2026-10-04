@@ -1,7 +1,6 @@
 """Modal provider integration for the execution kernel."""
 
 from biomodals.execution.modal.driver import (
-    AsyncModalCallDriver,
     ModalCallDriver,
     deployed_function_handle,
     development_modal_call_driver,
@@ -10,15 +9,14 @@ from biomodals.execution.modal.host import (
     ExecutionCoordinatorLifecycle,
     ExecutionDefinitionCoordinatorLifecycle,
     ExecutionRequestFile,
-    ExecutionRuntimeLifecycle,
     ExecutionVolumeSync,
     OutputClaimExecutionCoordinatorLifecycle,
     OutputClaimExecutionDefinitionCoordinatorLifecycle,
-    StandardExecutionRuntimeLifecycle,
     execution_lineage_root,
     load_execution_launch,
     load_execution_provider_result,
     persist_execution_launch,
+    require_accepted_run_status,
     resolve_provider_call_limits,
     stage_execution_launch,
     submit_staged_execution_run,
@@ -39,12 +37,10 @@ from biomodals.execution.provider import (
 )
 
 __all__ = [
-    "AsyncModalCallDriver",
     "ModalCallDriver",
     "ExecutionCoordinatorLifecycle",
     "ExecutionDefinitionCoordinatorLifecycle",
     "ExecutionRequestFile",
-    "ExecutionRuntimeLifecycle",
     "ExecutionVolumeSync",
     "OutputClaimExecutionCoordinatorLifecycle",
     "OutputClaimExecutionDefinitionCoordinatorLifecycle",
@@ -53,7 +49,6 @@ __all__ = [
     "ProviderDefiniteSubmissionError",
     "ProviderDeploymentUnavailableError",
     "ProviderSubmissionOutcomeUnknownError",
-    "StandardExecutionRuntimeLifecycle",
     "deployed_execution_coordinator",
     "deployed_function_handle",
     "development_modal_call_driver",
@@ -65,6 +60,7 @@ __all__ = [
     "load_execution_launch",
     "load_execution_provider_result",
     "persist_execution_launch",
+    "require_accepted_run_status",
     "resolve_provider_call_limits",
     "stage_execution_launch",
     "submit_staged_execution_run",

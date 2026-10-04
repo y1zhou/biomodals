@@ -78,7 +78,7 @@ def test_af3score_prepare_uses_staged_inputs_without_copying(
 
     monkeypatch.setattr(af3score_app, "run_command", fake_run_command)
 
-    result = af3score_app.af3score_prepare.get_raw_f()(
+    result = af3score_app.af3score_prepare.local(
         run_name="demo",
         staged_input_key=staged_input_key,
         input_files=["target.pdb"],
@@ -110,7 +110,7 @@ def test_af3score_prepare_rejects_changed_staged_input(
     )
 
     with pytest.raises(ValueError, match="digest changed: target.pdb"):
-        af3score_app.af3score_prepare.get_raw_f()(
+        af3score_app.af3score_prepare.local(
             run_name="demo",
             staged_input_key=staged_input_key,
             input_files=["target.pdb"],
@@ -161,7 +161,7 @@ def test_af3score_run_binds_outputs_to_the_current_input(
     )
     monkeypatch.setattr(af3score_app, "run_command", fake_run_command)
 
-    af3score_app.af3score_run.get_raw_f()(
+    af3score_app.af3score_run.local(
         run_name="demo",
         batch_name="batch-0",
         batch_json_dir=str(batch_json_dir),

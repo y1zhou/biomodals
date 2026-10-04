@@ -155,7 +155,7 @@ def test_rosetta_worker_rejects_path_escaping_run_identity(
     )
 
     with pytest.raises(ValueError, match="safe filename component"):
-        rosetta_app.run_rosetta_worker.get_raw_f()(
+        rosetta_app.run_rosetta_worker.local(
             coordinator=SimpleNamespace(),
             provider_call_id=str(PROVIDER_CALL_ID),
             run_name="../escape",

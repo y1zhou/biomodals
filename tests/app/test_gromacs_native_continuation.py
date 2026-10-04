@@ -175,7 +175,7 @@ def test_real_native_copy_extend_append_and_completed_redelivery(
         ),
     )
     for _ in range(2):
-        app.production_run_cpu.get_raw_f()(
+        app.production_run_cpu.local(
             run_name="child",
             simulation_time_ns=2,
             file_stem="parent",

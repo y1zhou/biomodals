@@ -310,7 +310,7 @@ def test_scoring_operation_returns_summary_and_detail_archive(monkeypatch):
         return b"scores"
 
     monkeypatch.setattr(humanization, "package_outputs", package)
-    result = sapiens_app.sapiens_score.get_raw_f()(csv_bytes=VALID_CSV)
+    result = sapiens_app.sapiens_score.local(csv_bytes=VALID_CSV)
     assert result.status == AppRunStatus.SUCCEEDED
     assert result.outputs[0].name == "sapiens_scores"
     assert result.outputs[0].storage.data == b"scores"

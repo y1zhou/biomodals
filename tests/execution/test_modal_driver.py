@@ -2,7 +2,6 @@
 
 # ruff: noqa: D101, D102, D103, D107
 
-import asyncio
 from dataclasses import replace
 from threading import Thread
 from time import sleep
@@ -14,7 +13,6 @@ import pytest
 
 from biomodals.execution import DeploymentIdentity, ProviderBinding
 from biomodals.execution.modal import (
-    AsyncModalCallDriver,
     ModalCallDriver,
     ProviderCallObservationKind,
     ProviderDeploymentUnavailableError,
@@ -269,23 +267,6 @@ def test_driver_observes_timeout_as_running_and_retained_result_as_success() -> 
     assert observation.result == {"done": True}
 
 
-def test_async_cancel_returns_ack_only_after_successful_rpc() -> None:
-    async def cancel():
-        return None
-
-    call = SimpleNamespace(cancel=SimpleNamespace(aio=cancel))
-    driver = AsyncModalCallDriver(call_resolver=lambda _: call)
-    acknowledged = asyncio.run(driver.cancel("fc-123"))
-    assert acknowledged.kind == ProviderCallObservationKind.CANCELLED
-
-    async def uncertain_cancel():
-        raise TimeoutError("cancel response lost")
-
-    call.cancel.aio = uncertain_cancel
-    with pytest.raises(TimeoutError, match="response lost"):
-        asyncio.run(driver.cancel("fc-123"))
-
-
 def test_driver_observes_user_exception_as_failed() -> None:
     class Call:
         def get(self, timeout=0):
@@ -326,58 +307,69 @@ def test_driver_distinguishes_poll_failures_from_function_timeout(error, expecte
     assert observed.kind == expected
 
 
-def test_async_driver_uses_exact_deployment_and_retained_call_handle() -> None:
-    async def scenario() -> None:
-        resolved: list[tuple] = []
+@pytest.mark.parametrize(
+    "remote_error",
+    [
+        TimeoutError("work deadline"),
+        TimeoutError(),
+        ConnectionError("worker network"),
+        modal.exception.AuthError("worker credentials"),
+    ],
+)
+def test_native_sdk_failure_is_conclusive_despite_transport_exception_type(
+    remote_error,
+):
+    """Native decoding of a retained failure must not retain running ownership."""
+    from modal._functions import _Invocation
+    from modal._serialization import serialize
+    from modal._utils.async_utils import synchronize_api
+    from modal_proto import api_pb2
 
-        class AwaitableMethod:
-            def __init__(self, function):
-                self.aio = function
+    invocation = _Invocation(None, "fc-root", None)
 
-        class Function:
-            def __init__(self):
-                self.hydrate = AwaitableMethod(self._hydrate)
-                self.spawn = AwaitableMethod(self._spawn)
-                self.hydrated = False
-
-            async def _hydrate(self):
-                self.hydrated = True
-
-            async def _spawn(self, **kwargs):
-                assert kwargs == {"seed": 1}
-                return type("Call", (), {"object_id": "fc-async"})()
-
-        class Call:
-            def __init__(self):
-                self.get = AwaitableMethod(self._get)
-
-            async def _get(self, timeout=0):
-                assert timeout == 0
-                return {"done": True}
-
-        function = Function()
-
-        def resolve(*args, **kwargs):
-            resolved.append((args, kwargs))
-            return function
-
-        driver = AsyncModalCallDriver(
-            function_resolver=resolve,
-            call_resolver=lambda call_id: Call(),
+    async def outputs(**kwargs):
+        return api_pb2.FunctionGetOutputsResponse(
+            outputs=[
+                api_pb2.FunctionGetOutputsItem(
+                    result=api_pb2.GenericResult(
+                        status=api_pb2.GenericResult.GENERIC_STATUS_FAILURE,
+                        data=serialize(remote_error),
+                        exception=str(remote_error),
+                    ),
+                    data_format=api_pb2.DATA_FORMAT_PICKLE,
+                )
+            ]
         )
-        handle = await driver.resolve(GPU_BINDING)
-        call_id = await driver.spawn(handle, args=(), kwargs={"seed": 1})
-        observation = await driver.observe(call_id)
 
-        assert resolved == [
-            (
-                ("biomodals-alphafold3", "run_inference"),
-                {"environment_name": "production", "version": 23},
-            )
-        ]
-        assert function.hydrated
-        assert call_id == "fc-async"
-        assert observation.kind == ProviderCallObservationKind.SUCCEEDED
-        assert observation.result == {"done": True}
+    invocation.pop_function_call_outputs = outputs
 
-    asyncio.run(scenario())
+    async def get(**kwargs):
+        return await invocation.poll_function(**kwargs)
+
+    call = SimpleNamespace(get=synchronize_api(get))
+    observed = ModalCallDriver(call_resolver=lambda _: call).observe("fc-root")
+    assert observed.kind == ProviderCallObservationKind.FAILED
+    assert observed.message == str(remote_error)
+
+
+def test_native_sdk_unfinished_poll_preserves_ownership():
+    """A real empty native poll still means running, even though it raises TimeoutError."""
+    from modal._functions import _Invocation
+    from modal._utils.async_utils import synchronize_api
+    from modal_proto import api_pb2
+
+    invocation = _Invocation(None, "fc-root", None)
+
+    async def outputs(**kwargs):
+        return api_pb2.FunctionGetOutputsResponse(num_unfinished_inputs=1)
+
+    invocation.pop_function_call_outputs = outputs
+
+    async def get(**kwargs):
+        return await invocation.poll_function(**kwargs)
+
+    call = SimpleNamespace(get=synchronize_api(get))
+    assert (
+        ModalCallDriver(call_resolver=lambda _: call).observe("fc-root").kind
+        == ProviderCallObservationKind.RUNNING
+    )

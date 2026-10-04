@@ -30,6 +30,7 @@ from biomodals.execution import (
     ExecutionOverview,
     ProviderCallDiagnostic,
     ProviderCallPage,
+    RunStatus,
     republish_execution_artifact,
 )
 from biomodals.execution.modal import (
@@ -40,6 +41,7 @@ from biomodals.execution.modal import (
     execution_coordinator_identity,
     initialize_execution_coordinator_host,
     orchestrator,
+    require_accepted_run_status,
     resolve_provider_call_limits,
     stage_execution_launch,
 )
@@ -971,14 +973,18 @@ def submit_nanobody_humanization_workflow(
     print(f"Coordinator FunctionCall ID: {call.object_id}", flush=True)
     if wait:
         overview = call.get()
+        require_accepted_run_status(
+            overview,
+            workload_name=CONF.name,
+            accepted_statuses=(RunStatus.SUCCEEDED, RunStatus.PARTIAL),
+        )
         print(f"Nanobody humanization: {overview.run.status.value}", flush=True)
-        if overview.run.status.value in {"succeeded", "partial"}:
-            result = AppRunResult.model_validate(coordinator.result.remote())
-            for output in result.outputs:
-                if output.name == "nanobody_results" and isinstance(
-                    output.storage, VolumePath
-                ):
-                    print(
-                        f"Selection table: volume={output.storage.volume_name} path={output.storage.path}/selection.csv",
-                        flush=True,
-                    )
+        result = AppRunResult.model_validate(coordinator.result.remote())
+        for output in result.outputs:
+            if output.name == "nanobody_results" and isinstance(
+                output.storage, VolumePath
+            ):
+                print(
+                    f"Selection table: volume={output.storage.volume_name} path={output.storage.path}/selection.csv",
+                    flush=True,
+                )

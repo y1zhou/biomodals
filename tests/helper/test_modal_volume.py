@@ -58,3 +58,27 @@ def test_download_modal_volume_files_bounds_live_tasks(tmp_path: Path) -> None:
     download_modal_volume_files(Volume(), downloads, concurrency=4)
 
     assert maximum_tasks <= 5
+
+
+def test_download_failure_preserves_existing_results(tmp_path: Path) -> None:
+    """Exclusive-open collisions preserve prior output; owned partials are removed."""
+    import pytest
+
+    class DownloadMethod:
+        async def aio(self, path, handle, **kwargs):
+            handle.write(b"partial")
+            raise OSError("Provider download failed")
+
+    class Volume:
+        _read_file_into_fileobj = DownloadMethod()
+
+    prior = tmp_path / "prior.txt"
+    prior.write_bytes(b"previous scientific result")
+    partial = tmp_path / "partial.txt"
+    for destination in (prior, partial):
+        with pytest.raises(ExceptionGroup):
+            download_modal_volume_files(
+                Volume(), [("remote", destination)], concurrency=1
+            )
+    assert prior.read_bytes() == b"previous scientific result"
+    assert not partial.exists()

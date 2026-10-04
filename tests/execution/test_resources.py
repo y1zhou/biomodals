@@ -235,7 +235,6 @@ def test_node_call_counts_separate_active_from_selected_history() -> None:
     statements: list[str] = []
     connection.set_trace_callback(statements.append)
 
-    assert repository.active_provider_call_counts_by_node(RUN_ID) == {"inference": 1}
     assert repository.provider_call_counts_by_node(RUN_ID, ("inference",)) == {
         "inference": (2, 1)
     }

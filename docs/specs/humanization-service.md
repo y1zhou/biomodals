@@ -145,9 +145,10 @@ second scheduler or open remote execution ledgers.
 
 The staged request retains scientific versions from the submitting API's
 checkout; the coordinator requires them to match its own deployment. These
-versions include HuDiff's resolved runtime environment digest, imported from
-the app automatically, so a dependency update can change this identity without
-a workflow-code change. Update the API checkout and containing workflow
+versions include HuDiff's source/model pins, scientific runtime versions and
+wrapper protocol, imported from the app automatically. They do not freeze the
+shared Biomodals dependency inventory. A change to the app's declared scientific
+identity propagates without a workflow-code change. Update the API checkout and containing workflow
 together, pin the matching deployment, and restart the API. A mismatch error
 names the differing components; submit a new Job after aligning versions.
 Do not rewrite an older request's identities or bypass the check.

@@ -38,11 +38,15 @@ from uuid import UUID, uuid4
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.score.ensirna_contracts import (
+    EnsirnaPdbChunkSpec as EnsirnaPdbChunkSpec,
+)
+from biomodals.app.score.ensirna_contracts import (
+    EnsirnaPreparationPlan as EnsirnaPreparationPlan,
+)
 from biomodals.app.score.ensirna_execution import (
     EnsirnaExecutionCoordinator,
     EnsirnaExecutionRequest,
-    EnsirnaPdbChunkSpec,
-    EnsirnaPreparationPlan,
     load_execution_request,
     stage_execution_request,
 )
@@ -1229,7 +1233,12 @@ runtime_image = (
     .uv_pip_install(*APP_INFO.extra_pip_packages)
     # ENsiRNA requires Python 3.10; install only the shared modules it imports.
     .pipe(patch_image_for_helper, ignore_dep_versions=True, skip_deps=["uniaf3"])
-    .add_local_python_source("biomodals.app.score.ensirna_execution")
+    # The execution adapter imports the package-qualified app in file-mode runs.
+    .add_local_python_source(
+        "biomodals.app.score.ensirna_app",
+        "biomodals.app.score.ensirna_execution",
+        "biomodals.app.score.ensirna_contracts",
+    )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)
 ENSIRNA_OUTPUT_CLAIMS = modal.Dict.from_name(
@@ -1320,7 +1329,7 @@ def ensirna_prepare_inputs(
                     str(staging_dir),
                 ],
                 cwd=APP_INFO.ensirna_dir,
-                output_mode="capture",
+                output_mode="stream",
             )
             staged_facts = _candidate_csv_facts(staging_csv, reject_unsafe_ids=True)
             if staged_facts is None:

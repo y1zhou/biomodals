@@ -720,7 +720,7 @@ def test_inference_pipeline_marks_bare_sequences_as_single_sequence_inputs(
         lambda: reloads.append(None),
     )
 
-    result = alphafold3_app.run_inference_pipeline.get_raw_f()(
+    result = alphafold3_app.run_inference_pipeline.local(
         run_id="a" * 64,
         request_id="b" * 64,
         staged_input_record={
@@ -781,7 +781,7 @@ def test_inference_worker_revalidates_loaded_numeric_limits(
     )
 
     with pytest.raises(ValueError, match="between 0 and"):
-        alphafold3_app.run_inference_pipeline.get_raw_f()(
+        alphafold3_app.run_inference_pipeline.local(
             run_id="a" * 64,
             request_id="b" * 64,
             staged_input_record={
@@ -813,7 +813,7 @@ def test_inference_worker_fails_claim_when_staged_input_loading_fails(
     )
 
     with pytest.raises(ValueError, match="staged input is invalid"):
-        alphafold3_app.run_inference_pipeline.get_raw_f()(
+        alphafold3_app.run_inference_pipeline.local(
             run_id=run_id,
             request_id="b" * 64,
             staged_input_record={
@@ -926,7 +926,7 @@ def test_inference_worker_rejects_seed_outside_staged_request(
     monkeypatch.setattr(upstream_inference, "run_seed_prediction_worker", worker)
 
     with pytest.raises(ValueError, match="staged request"):
-        alphafold3_app.run_inference_pipeline.get_raw_f()(
+        alphafold3_app.run_inference_pipeline.local(
             run_id="a" * 64,
             request_id="b" * 64,
             staged_input_record={

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import cached_property
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -183,24 +183,8 @@ class PAbNatiV2ExecutionRequest:
         content = orjson.dumps(
             {
                 "schema_version": REQUEST_SCHEMA_VERSION,
-                "run_name": self.run_name,
+                **asdict(self),
                 "csv_bytes": b64encode(self.csv_bytes).decode("ascii"),
-                "mutate_cdrs": self.mutate_cdrs,
-                "fixed_vh_positions": self.fixed_vh_positions,
-                "fixed_vl_positions": self.fixed_vl_positions,
-                "residue_score_threshold": self.residue_score_threshold,
-                "rasa_threshold": self.rasa_threshold,
-                "max_relative_pairing_score_decrease": (
-                    self.max_relative_pairing_score_decrease
-                ),
-                "forbidden_residues": self.forbidden_residues,
-                "seed": self.seed,
-                "source_commit": self.source_commit,
-                "paired_model_md5": self.paired_model_md5,
-                "structure_archive_md5": self.structure_archive_md5,
-                "runtime_identity": self.runtime_identity,
-                "max_active_provider_calls": self.max_active_provider_calls,
-                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
             },
             option=orjson.OPT_SORT_KEYS,
         )

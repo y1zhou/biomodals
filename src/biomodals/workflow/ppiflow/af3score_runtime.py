@@ -69,7 +69,7 @@ def prepare_ppiflow_af3score_stage(
         )
         for record in staged
     }
-    task_spec = af3score_app.af3score_prepare.get_raw_f()(
+    task_spec = af3score_app.af3score_prepare.local(
         run_name=run_name,
         staged_input_key=staged_input_key,
         input_files=input_names,
@@ -141,7 +141,7 @@ def run_ppiflow_af3score_batch(
         raise ValueError(
             "AF3Score batch Task keys and inputs must be nonempty and align"
         )
-    af3score_app.af3score_run.get_raw_f()(
+    af3score_app.af3score_run.local(
         run_name=run_name,
         batch_name=batch_name,
         batch_json_dir=batch_json_dir,
@@ -240,7 +240,7 @@ def postprocess_ppiflow_af3score_stage(
             input_sha256=normalized_digests[Path(str(candidate["input_name"])).stem],
         )
     ]
-    metrics = af3score_app.af3score_postprocess.get_raw_f()(
+    metrics = af3score_app.af3score_postprocess.local(
         run_name=run_name,
         staged_input_key=staged_input_key,
         input_files=[str(value) for value in input_files],

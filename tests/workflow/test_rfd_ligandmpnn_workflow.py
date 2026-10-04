@@ -281,7 +281,7 @@ def test_select_rfdiffusion_design_reads_pdb_trb_and_infers_redesigned_residues(
         fake_volume,
     )
 
-    selected = select_rfdiffusion_design.get_raw_f()(
+    selected = select_rfdiffusion_design.local(
         rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
         rfd_run_name="demo-rfd001",
         design_index=0,
@@ -332,7 +332,7 @@ def test_select_rfdiffusion_design_uses_mask_1d_without_complex_metadata(
         FakeVolume(),
     )
 
-    selected = select_rfdiffusion_design.get_raw_f()(
+    selected = select_rfdiffusion_design.local(
         rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
         rfd_run_name="demo-rfd001",
         design_index=0,
@@ -372,7 +372,7 @@ def test_select_rfdiffusion_design_rejects_mask_length_mismatch(
     )
 
     with pytest.raises(ValueError, match="mask_1d length 2 does not match 3"):
-        select_rfdiffusion_design.get_raw_f()(
+        select_rfdiffusion_design.local(
             rfd_output_storage_path="demo-rfd001/outputs/rfd-scaffolds",
             rfd_run_name="demo-rfd001",
             design_index=0,

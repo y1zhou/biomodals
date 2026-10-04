@@ -448,20 +448,6 @@ def test_guarded_deletion_uses_an_idempotent_marker(tmp_path: Path) -> None:
     assert source.read_text(encoding="utf-8") == marker
 
 
-def test_runtime_fingerprint_rejects_dependency_drift(monkeypatch) -> None:
-    monkeypatch.setattr(
-        models, "runtime_environment_sha256", lambda: models.RUNTIME_ENVIRONMENT_SHA256
-    )
-    assert models.assert_runtime_environment() == models.RUNTIME_ENVIRONMENT_SHA256
-    monkeypatch.setattr(
-        models,
-        "runtime_environment_sha256",
-        lambda: "5b1e8520ea56c0928c1d9296b78db9b8852a38d5dd4c2a203809fd5dce31b608",
-    )
-    with pytest.raises(RuntimeError, match="resolved runtime changed"):
-        models.assert_runtime_environment()
-
-
 def test_bundle_handles_late_nullable_attempt_fields(monkeypatch) -> None:
     attempts = [
         {

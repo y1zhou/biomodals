@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import modal
+from modal._utils.function_utils import _process_result
 
 from biomodals.execution.model import DeploymentIdentity, ProviderBinding
 from biomodals.execution.provider import (
@@ -52,10 +53,31 @@ _DEPLOYMENT_UNAVAILABLE_ERRORS = (
 )
 
 
+def _is_retained_user_error(error: BaseException) -> bool:
+    # Modal 1.6 rethrows deserialized failures as their original exception type,
+    # including the same TimeoutError used for an unfinished poll. The public
+    # get() API does not expose the result status. Keep this private SDK seam
+    # here: only the decoder rethrowing this exact exception proves failure;
+    # a transport error while downloading its blob does not. Native SDK tests
+    # exercise this boundary, including Modal's synchronous wrapper.
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_code is _process_result.__code__
+            and frame.f_locals.get("exc") is error
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
 def _observation_from_error(
     error: Exception | modal.exception.InputCancellation,
 ) -> ProviderCallObservation:
-    if isinstance(error, modal.exception.FunctionTimeoutError):
+    if _is_retained_user_error(error):
+        kind = ProviderCallObservationKind.FAILED
+    elif isinstance(error, modal.exception.FunctionTimeoutError):
         kind = ProviderCallObservationKind.FAILED
     elif isinstance(error, modal.exception.InputCancellation):
         kind = ProviderCallObservationKind.CANCELLED
@@ -179,69 +201,3 @@ def development_modal_call_driver(
             ) from error
 
     return ModalCallDriver(function_resolver=resolve)
-
-
-class AsyncModalCallDriver:
-    """Adapt asynchronous Modal calls to the provider interface."""
-
-    def __init__(
-        self,
-        *,
-        function_resolver: Callable[..., Any] = modal.Function.from_name,
-        call_resolver: Callable[[str], Any] = modal.FunctionCall.from_id,
-    ) -> None:
-        self._function_resolver = function_resolver
-        self._call_resolver = call_resolver
-
-    async def resolve(self, binding: ProviderBinding) -> Any:
-        try:
-            function = self._function_resolver(
-                binding.app_name,
-                binding.function_name,
-                environment_name=binding.environment,
-                version=binding.app_version,
-            )
-            await function.hydrate.aio()
-        except _DEPLOYMENT_UNAVAILABLE_ERRORS as error:
-            raise ProviderDeploymentUnavailableError(
-                "Exact Modal deployment is unavailable: "
-                f"{binding.environment}/{binding.app_name}/"
-                f"v{binding.app_version}/{binding.function_name}"
-            ) from error
-        return function
-
-    async def spawn(
-        self,
-        operation: Any,
-        *,
-        args: tuple[Any, ...],
-        kwargs: Mapping[str, Any],
-    ) -> str:
-        try:
-            call = await operation.spawn.aio(*args, **dict(kwargs))
-            return str(call.object_id)
-        except _DEFINITE_SUBMISSION_ERRORS as error:
-            raise ProviderDefiniteSubmissionError(str(error)) from error
-        except Exception as error:
-            raise ProviderSubmissionOutcomeUnknownError(
-                "Modal did not return a durable Function Call ID"
-            ) from error
-
-    async def observe(
-        self,
-        provider_call_handle_id: str,
-    ) -> ProviderCallObservation:
-        call = self._call_resolver(provider_call_handle_id)
-        try:
-            result = await call.get.aio(timeout=0)
-        except (Exception, modal.exception.InputCancellation) as error:
-            return _observation_from_error(error)
-        return ProviderCallObservation(
-            ProviderCallObservationKind.SUCCEEDED,
-            result=result,
-        )
-
-    async def cancel(self, provider_call_handle_id: str) -> ProviderCallObservation:
-        call = self._call_resolver(provider_call_handle_id)
-        await call.cancel.aio()
-        return ProviderCallObservation(ProviderCallObservationKind.CANCELLED)

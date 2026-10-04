@@ -35,6 +35,7 @@ from biomodals.execution.modal import (
     execution_coordinator_identity,
     initialize_execution_coordinator_host,
     orchestrator,
+    require_accepted_run_status,
     resolve_provider_call_limits,
     stage_execution_launch,
 )
@@ -464,14 +465,17 @@ def submit_protein_optimization_workflow(
     print(f"Coordinator FunctionCall ID: {call.object_id}", flush=True)
     if wait:
         overview = call.get()
+        require_accepted_run_status(
+            overview,
+            workload_name=CONF.name,
+        )
         print(f"Protein optimization: {overview.run.status.value}", flush=True)
-        if overview.run.status.value == "succeeded":
-            result = AppRunResult.model_validate(coordinator.result.remote())
-            for output in result.outputs:
-                if output.name == "optimization_results" and isinstance(
-                    output.storage, VolumePath
-                ):
-                    print(
-                        f"Candidates CSV: volume={output.storage.volume_name} path={output.storage.path}/candidates.csv",
-                        flush=True,
-                    )
+        result = AppRunResult.model_validate(coordinator.result.remote())
+        for output in result.outputs:
+            if output.name == "optimization_results" and isinstance(
+                output.storage, VolumePath
+            ):
+                print(
+                    f"Candidates CSV: volume={output.storage.volume_name} path={output.storage.path}/candidates.csv",
+                    flush=True,
+                )

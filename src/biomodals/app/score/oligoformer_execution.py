@@ -12,6 +12,7 @@ from uuid import UUID
 
 import orjson
 
+from biomodals.app.score import oligoformer_contracts as contracts
 from biomodals.execution import (
     AvailabilityStatus,
     DeploymentIdentity,
@@ -167,8 +168,7 @@ class OligoformerExecutionRequest:
     @property
     def execution_config(self):
         """Build the workload-owned operational configuration lazily."""
-        app = _workload_module()
-        return app.OligoformerExecutionConfig(
+        return contracts.OligoformerExecutionConfig(
             off_target_nodes=self.off_target_nodes,
             off_target_workers=self.off_target_workers,
             off_target_process_slots=self.off_target_process_slots,
@@ -248,6 +248,7 @@ class OligoformerExecutionRequest:
         scientific_versions = {
             "oligoformer": self.app_version,
             "oligoformer.model": self.model_version,
+            "biomodals.oligoformer.efficacy": contracts.EFFICACY_POLICY_VERSION,
             "biomodals.oligoformer.execution_request": str(REQUEST_SCHEMA_VERSION),
         }
         if self.off_target and self.all_human and self.reference_version is not None:
@@ -1203,7 +1204,6 @@ def _targetscan_task_key(spec: Any) -> str:
 
 
 def _run_plan_from_value(value: object):
-    app = _workload_module()
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer run plan is invalid")
     value = cast(Mapping[str, Any], value)
@@ -1211,29 +1211,27 @@ def _run_plan_from_value(value: object):
     if not isinstance(config, Mapping):
         raise TypeError("OligoFormer run configuration is invalid")
     parsed = dict(value)
-    parsed["config"] = app.OligoformerRunConfig(**dict(config))
+    parsed["config"] = contracts.OligoformerRunConfig(**dict(config))
     parsed["output_stems"] = tuple(parsed["output_stems"])
-    return app.OligoformerRunPlan(**parsed)
+    return contracts.OligoformerRunPlan(**parsed)
 
 
 def _reference_plan_from_value(value: object):
-    app = _workload_module()
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer reference plan is invalid")
     value = cast(Mapping[str, Any], value)
     if not isinstance(value.get("shard_specs"), (list, tuple)):
         raise TypeError("OligoFormer reference plan is invalid")
     shard_specs = cast(list[dict[str, Any]], value["shard_specs"])
-    return app.OligoformerReferencePlan(
+    return contracts.OligoformerReferencePlan(
         record_count=value["record_count"],
         shard_specs=tuple(
-            app.TargetscanRnaPlfoldShardSpec(**spec) for spec in shard_specs
+            contracts.TargetscanRnaPlfoldShardSpec(**spec) for spec in shard_specs
         ),
     )
 
 
 def _evidence_stem_from_value(value: object):
-    app = _workload_module()
     if not isinstance(value, dict):
         raise TypeError("OligoFormer evidence stem is invalid")
     value = cast(dict[str, Any], value)
@@ -1246,33 +1244,32 @@ def _evidence_stem_from_value(value: object):
         or not isinstance(targetscan_specs, (list, tuple))
     ):
         raise TypeError("OligoFormer evidence stem fields are invalid")
-    return app.OligoformerEvidenceStemPlan(
+    return contracts.OligoformerEvidenceStemPlan(
         stem=stem,
         pita_specs=tuple(
-            app.OffTargetShardSpec(**cast(dict[str, Any], spec)) for spec in pita_specs
+            contracts.OffTargetShardSpec(**cast(dict[str, Any], spec))
+            for spec in pita_specs
         ),
         targetscan_specs=tuple(
-            app.TargetscanBatchSpec(**cast(dict[str, Any], spec))
+            contracts.TargetscanBatchSpec(**cast(dict[str, Any], spec))
             for spec in targetscan_specs
         ),
     )
 
 
 def _evidence_plan_from_value(value: object):
-    app = _workload_module()
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer evidence plan is invalid")
     value = cast(Mapping[str, Any], value)
     if not isinstance(value.get("stems"), (list, tuple)):
         raise TypeError("OligoFormer evidence plan is invalid")
     stems = cast(list[object], value["stems"])
-    return app.OligoformerEvidencePlan(
+    return contracts.OligoformerEvidencePlan(
         stems=tuple(_evidence_stem_from_value(stem) for stem in stems)
     )
 
 
 def _pita_reference_from_value(value: object):
-    app = _workload_module()
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer PITA reference is invalid")
     value = cast(Mapping[str, Any], value)
@@ -1282,14 +1279,13 @@ def _pita_reference_from_value(value: object):
         ext_utr_path, str
     ):
         raise TypeError("OligoFormer PITA reference fields are invalid")
-    return app.PitaReferencePlan(
+    return contracts.PitaReferencePlan(
         utr_shard_paths=tuple(cast(list[str], utr_shard_paths)),
         ext_utr_path=ext_utr_path,
     )
 
 
 def _off_target_result_from_value(value: object):
-    app = _workload_module()
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer PITA result is invalid")
     value = cast(Mapping[str, Any], value)
@@ -1297,7 +1293,7 @@ def _off_target_result_from_value(value: object):
     pita_path = value.get("pita_path")
     if type(index) is not int or not isinstance(pita_path, str):
         raise TypeError("OligoFormer PITA result fields are invalid")
-    return app.OffTargetShardResult(index=index, pita_path=pita_path)
+    return contracts.OffTargetShardResult(index=index, pita_path=pita_path)
 
 
 def _run_plan_from_context(context: NodeRunContext):
@@ -1367,7 +1363,7 @@ def _task_payload(task: TaskDefinition) -> Mapping[str, Any]:
 
 
 def _reference_shard_from_task(task: TaskDefinition):
-    return _workload_module().TargetscanRnaPlfoldShardSpec(
+    return contracts.TargetscanRnaPlfoldShardSpec(
         **cast(dict[str, Any], _task_payload(task)["spec"])
     )
 
@@ -1376,7 +1372,7 @@ def _reference_shard_from_metadata(metadata: Mapping[str, Any]):
     value = metadata.get("spec")
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer reference shard metadata is invalid")
-    return _workload_module().TargetscanRnaPlfoldShardSpec(**dict(value))
+    return contracts.TargetscanRnaPlfoldShardSpec(**dict(value))
 
 
 def _reference_shard_ready(spec: Any) -> bool:
@@ -1389,7 +1385,7 @@ def _reference_shard_ready(spec: Any) -> bool:
 
 
 def _pita_spec_from_task(task: TaskDefinition):
-    return _workload_module().OffTargetShardSpec(
+    return contracts.OffTargetShardSpec(
         **cast(dict[str, Any], _task_payload(task)["spec"])
     )
 
@@ -1398,11 +1394,11 @@ def _pita_spec_from_metadata(metadata: Mapping[str, Any]):
     value = metadata.get("spec")
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer PITA Task metadata is invalid")
-    return _workload_module().OffTargetShardSpec(**dict(value))
+    return contracts.OffTargetShardSpec(**dict(value))
 
 
 def _targetscan_spec_from_task(task: TaskDefinition):
-    return _workload_module().TargetscanBatchSpec(
+    return contracts.TargetscanBatchSpec(
         **cast(dict[str, Any], _task_payload(task)["spec"])
     )
 
@@ -1411,7 +1407,7 @@ def _targetscan_spec_from_metadata(metadata: Mapping[str, Any]):
     value = metadata.get("spec")
     if not isinstance(value, Mapping):
         raise TypeError("OligoFormer TargetScan Task metadata is invalid")
-    return _workload_module().TargetscanBatchSpec(**dict(value))
+    return contracts.TargetscanBatchSpec(**dict(value))
 
 
 def _pita_reference_result(stem: str, reference: Any) -> AppRunResult:

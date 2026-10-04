@@ -278,7 +278,7 @@ def analyze_shortmd_gromacs_run(
     make_figures: bool,
 ) -> AppRunResult:
     """Analyze one replicate and publish its content-bound final files."""
-    workdir = gromacs_app.collect_traj_stats.get_raw_f()(
+    workdir = gromacs_app.collect_traj_stats.local(
         traj_prefix=traj_prefix,
         run_name=run_name,
         save_processed_traj=True,

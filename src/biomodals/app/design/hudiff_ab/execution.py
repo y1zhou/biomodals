@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import cached_property
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -156,18 +156,8 @@ class HuDiffAbExecutionRequest:
         content = orjson.dumps(
             {
                 "schema_version": REQUEST_SCHEMA_VERSION,
-                "run_name": self.run_name,
+                **asdict(self),
                 "csv_bytes": b64encode(self.csv_bytes).decode("ascii"),
-                "candidate_count": self.candidate_count,
-                "seed": self.seed,
-                "sampling_order": self.sampling_order,
-                "upstream_inference_dropout": self.upstream_inference_dropout,
-                "source_commit": self.source_commit,
-                "checkpoint_sha256": self.checkpoint_sha256,
-                "patch_identity": self.patch_identity,
-                "runtime_identity": self.runtime_identity,
-                "max_active_provider_calls": self.max_active_provider_calls,
-                "max_active_gpu_provider_calls": (self.max_active_gpu_provider_calls),
             },
             option=orjson.OPT_SORT_KEYS,
         )

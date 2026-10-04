@@ -51,6 +51,7 @@ from biomodals.helper.artifacts import (
     replace_bytes_atomic,
 )
 from biomodals.helper.output_claim import register_output_claim_successor
+from biomodals.schema import AppRunResult
 
 from .identity import execution_coordinator_handle
 
@@ -1163,6 +1164,25 @@ class ExecutionDefinitionCoordinatorLifecycle(ExecutionCoordinatorLifecycle):
             lock=self._writer_lock,
             volume_io_lock=self._volume_io_lock,
         )
+
+    def _terminal_node_result(
+        self, node_key: str, *, unavailable_message: str
+    ) -> AppRunResult:
+        """Read a terminal publication without closing a live runtime's store."""
+        with self._volume_io_lock, self._writer_lock:
+            store = (
+                self._runtime.store if self._runtime is not None else self._run_store()
+            )
+            try:
+                overview = store.execution.overview(self.execution_run_id)
+                self._verify_overview(overview)
+                result = store.artifacts.load_node_result(node_key)
+                if not overview.run.status.is_terminal or result is None:
+                    raise LookupError(unavailable_message)
+                return result
+            finally:
+                if self._runtime is None:
+                    store.close()
 
     def _persist_successor_request(
         self,

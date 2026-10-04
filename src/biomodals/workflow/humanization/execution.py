@@ -200,17 +200,6 @@ class HumanizationExecutionCoordinator(ExecutionDefinitionCoordinatorLifecycle):
 
     def result(self) -> AppRunResult:
         """Read the final publication, including reused predecessor locations."""
-        with self._volume_io_lock, self._writer_lock:
-            store = (
-                self._runtime.store if self._runtime is not None else self._run_store()
-            )
-            try:
-                overview = store.execution.overview(self.execution_run_id)
-                self._verify_overview(overview)
-                result = store.artifacts.load_node_result("evaluate")
-                if not overview.run.status.is_terminal or result is None:
-                    raise LookupError("Humanization results are not available")
-                return result
-            finally:
-                if self._runtime is None:
-                    store.close()
+        return self._terminal_node_result(
+            "evaluate", unavailable_message="Humanization results are not available"
+        )

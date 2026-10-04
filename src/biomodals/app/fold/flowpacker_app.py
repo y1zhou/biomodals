@@ -37,16 +37,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import modal
+import orjson
 
 from biomodals.app.config import AppConfig
 from biomodals.helper import patch_image_for_helper
 from biomodals.helper.app_run import AppRunLayout, volume_app_output
+from biomodals.helper.artifacts import sha256_bytes, sha256_file
 from biomodals.helper.constant import MODEL_VOLUME
 from biomodals.helper.io import (
     build_local_output_path,
     resolve_local_output_dir,
     write_local_tarball,
 )
+from biomodals.helper.pdb import validate_pdb_content
 from biomodals.helper.shell import (
     copy_files,
     package_outputs,
@@ -229,13 +232,52 @@ def _write_flowpacker_config(
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
 
 
+def validate_flowpacker_outputs(
+    sample_dir: Path,
+    *,
+    input_stems: Sequence[str],
+    n_samples: int,
+    use_confidence: bool,
+) -> list[dict[str, object]]:
+    """Require every requested packed structure and confidence-selected copy."""
+    folders = [f"run_{index + 1}" for index in range(n_samples)]
+    if use_confidence:
+        folders.append("best_run")
+    records = []
+    for stem in input_stems:
+        sample_hashes = set()
+        for folder in folders:
+            path = sample_dir / folder / f"{stem}.pdb"
+            if not path.is_file() or path.is_symlink():
+                raise FileNotFoundError(f"Missing FlowPacker structure: {path}")
+            if path.stat().st_size > 128 * 1024 * 1024:
+                raise ValueError(f"FlowPacker structure is too large: {path}")
+            content = path.read_bytes()
+            validate_pdb_content(content, max_bytes=128 * 1024 * 1024)
+            digest = sha256_bytes(content)
+            if folder == "best_run" and digest not in sample_hashes:
+                raise ValueError(
+                    f"Confidence selection is not a sampled structure: {path}"
+                )
+            sample_hashes.add(digest)
+            records.append({
+                "path": str(path.relative_to(sample_dir)),
+                "size_bytes": len(content),
+                "sha256": digest,
+            })
+    metrics = sample_dir / "output_dict.pth"
+    if not metrics.is_file() or metrics.stat().st_size == 0:
+        raise FileNotFoundError("FlowPacker did not publish output_dict.pth")
+    return records
+
+
 @app.function(
     gpu=CONF.gpu,
     cpu=(0.125, 16.125),
     memory=(1024, 65536),
     timeout=CONF.timeout,
     # Cannot mount as read-only because FlowPacker runs mkdir for some reason
-    volumes=CONF.mounts(model_volume=True, model_ro=False),
+    volumes=CONF.mounts(output_volume=True, model_volume=True, model_ro=False),
 )
 def run_flowpacker(
     input_files: list[tuple[str, bytes]],
@@ -252,7 +294,7 @@ def run_flowpacker(
 ) -> bytes:
     """Run FlowPacker inference and return packaged outputs."""
     import sys
-    from tempfile import mkdtemp
+    from tempfile import TemporaryDirectory
 
     if model_name not in APP_INFO.supported_models:
         raise ValueError(
@@ -272,52 +314,107 @@ def run_flowpacker(
             f"FlowPacker confidence checkpoint is missing: {confidence_ckpt_path}"
         )
 
-    run_name = sanitize_filename(run_name)
-    input_dir = Path(mkdtemp(prefix="flowpacker_inputs_"))
-    sample_dir = CONF.git_clone_dir / "samples" / run_name
-    if sample_dir.exists():
-        shutil.rmtree(sample_dir)
-
-    for file_name, content in input_files:
-        dst = input_dir / Path(file_name).name
-        dst.write_bytes(content)
-
-    config_path = CONF.git_clone_dir / "config" / "inference" / "biomodals.yaml"
-    _write_flowpacker_config(
-        config_path,
-        input_dir=input_dir,
-        model_name=model_name,
-        use_confidence=use_confidence,
-        n_samples=n_samples,
-        num_steps=num_steps,
-        sample_coeff=sample_coeff,
-    )
-
-    cmd = [sys.executable, "sampler_pdb.py", "biomodals", run_name, "--seed", str(seed)]
-    if save_traj:
-        cmd.extend(["--save_traj", "True"])
-    if use_gt_masks:
-        cmd.extend(["--use_gt_masks", "True"])
-    if inpaint:
-        cmd.extend(["--inpaint", inpaint])
-
-    print(
-        f"💊 Running FlowPacker with model '{model_name}' on {len(input_files)} input(s)"
-    )
-    log_path = sample_dir / "flowpacker.log"
-    run_command(
-        cmd,
-        output_mode="tee",
-        log_file=log_path,
-        cwd=CONF.git_clone_dir,
-    )
-
-    if not sample_dir.exists():
-        raise RuntimeError(
-            f"FlowPacker did not create expected output directory: {sample_dir}"
+    if n_samples < 1 or num_steps < 1:
+        raise ValueError("FlowPacker sample and step counts must be positive")
+    names = [Path(name).name for name, _ in input_files]
+    stems = [Path(name).stem for name in names]
+    if not stems or len(set(stems)) != len(stems):
+        raise ValueError(
+            "FlowPacker requires nonempty inputs with unique structure stems"
         )
-    shutil.copy2(config_path, sample_dir / "biomodals_inference.yaml")
-    return package_outputs(sample_dir)
+    if any(Path(name).suffix not in {".pdb", ".cif"} for name in names):
+        raise ValueError("FlowPacker inputs must end in .pdb or .cif")
+    run_name = sanitize_filename(run_name)
+    layout = AppRunLayout.from_run_root(
+        Path(CONF.output_volume_mountpoint) / "workflow" / run_name
+    )
+    log_path = layout.logs_dir / "flowpacker.log"
+    with TemporaryDirectory(prefix="flowpacker_") as scratch:
+        input_dir = Path(scratch)
+        scratch_name = input_dir.name
+        sample_dir = CONF.git_clone_dir / "samples" / scratch_name
+        config_path = (
+            CONF.git_clone_dir / "config" / "inference" / f"{scratch_name}.yaml"
+        )
+        try:
+            for file_name, content in input_files:
+                dst = input_dir / Path(file_name).name
+                dst.write_bytes(content)
+
+            _write_flowpacker_config(
+                config_path,
+                input_dir=input_dir,
+                model_name=model_name,
+                use_confidence=use_confidence,
+                n_samples=n_samples,
+                num_steps=num_steps,
+                sample_coeff=sample_coeff,
+            )
+
+            cmd = [
+                sys.executable,
+                "sampler_pdb.py",
+                scratch_name,
+                scratch_name,
+                "--seed",
+                str(seed),
+            ]
+            if save_traj:
+                cmd.extend(["--save_traj", "True"])
+            if use_gt_masks:
+                cmd.extend(["--use_gt_masks", "True"])
+            if inpaint:
+                cmd.extend(["--inpaint", inpaint])
+
+            print(
+                f"💊 Running FlowPacker with model '{model_name}' on {len(input_files)} input(s)"
+            )
+            run_command(
+                cmd,
+                output_mode="tee",
+                log_file=log_path,
+                cwd=CONF.git_clone_dir,
+            )
+
+            structures = validate_flowpacker_outputs(
+                sample_dir,
+                input_stems=stems,
+                n_samples=n_samples,
+                use_confidence=use_confidence,
+            )
+            manifest = {
+                "upstream_commit": CONF.repo_commit_hash,
+                "inputs": [
+                    {"name": name, "sha256": sha256_bytes(content)}
+                    for name, content in input_files
+                ],
+                "structures": structures,
+                "checkpoint_sha256": sha256_file(ckpt_path),
+                "confidence_checkpoint_sha256": sha256_file(confidence_ckpt_path)
+                if use_confidence
+                else None,
+                "seed": seed,
+                "n_samples": n_samples,
+                "num_steps": num_steps,
+                "sample_coeff": sample_coeff,
+                "use_confidence": use_confidence,
+                "use_gt_masks": use_gt_masks,
+                "inpaint": inpaint,
+                "save_traj": save_traj,
+            }
+            (sample_dir / "validation.json").write_bytes(
+                orjson.dumps(manifest, option=orjson.OPT_INDENT_2)
+            )
+            shutil.copy2(log_path, sample_dir / "flowpacker.log")
+            shutil.copy2(config_path, sample_dir / "biomodals_inference.yaml")
+            return package_outputs(sample_dir)
+        finally:
+            # The log is volume-backed even when model execution/validation fails.
+            try:
+                CONF.output_volume.commit()
+            finally:
+                shutil.rmtree(sample_dir, ignore_errors=True)
+                config_path.unlink(missing_ok=True)
 
 
 @app.function(

@@ -5,67 +5,116 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from biomodals.app.fold import flowpacker_app
-from biomodals.schema import AppRunStatus, ArtifactKind, VolumePath
+from biomodals.schema import AppRunStatus
 
 
-def test_flowpacker_workflow_result_stores_archive_in_volume(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    seen_kwargs = {}
+@pytest.mark.parametrize(
+    "failure", [None, "empty", "partial", "corrupt", "confidence", "exit"]
+)
+def test_flowpacker_publishes_only_complete_structures(tmp_path, monkeypatch, failure):
+    """Exercise parsing, packaging, publication and cleanup; replace only the model."""
+    import io
+    import subprocess
+    import tarfile
 
-    class FakeRunFlowPacker:
-        def local(self, **kwargs):
-            seen_kwargs.update(kwargs)
-            return b"tarball"
+    import orjson
+    import zstandard
 
-    class FakeOutputVolume:
-        def __init__(self):
-            self.commit_count = 0
+    from biomodals.helper.shell import run_command
 
-        def commit(self):
-            self.commit_count += 1
-
-    output_volume = FakeOutputVolume()
-    output_volume_name = flowpacker_app.CONF.output_volume_name
-    monkeypatch.setattr(flowpacker_app, "run_flowpacker", FakeRunFlowPacker())
+    repo = tmp_path / "upstream"
+    repo.mkdir()
+    checkpoints = tmp_path / "models"
+    checkpoints.mkdir()
+    (repo / "checkpoints").symlink_to(checkpoints, target_is_directory=True)
+    for name in ("cluster", "confidence"):
+        (checkpoints / f"{name}.pth").write_bytes(b"fixture weights")
     monkeypatch.setattr(
         flowpacker_app,
         "CONF",
         SimpleNamespace(
-            output_volume=output_volume,
-            output_volume_mountpoint=str(tmp_path),
-            output_volume_name=output_volume_name,
+            git_clone_dir=repo,
+            model_volume_mountpoint=str(checkpoints),
+            output_volume_mountpoint=str(tmp_path / "volume"),
+            output_volume_name="test",
+            repo_commit_hash="pinned",
+            output_volume=SimpleNamespace(commit=lambda: None),
         ),
     )
+    staged = []
+    pdb = b"ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C\nEND\n"
 
-    result = flowpacker_app.run_flowpacker_workflow.local(
-        input_files=[("input.pdb", b"ATOM\n")],
-        run_name="../packed",
-    )
+    def model(cmd, **kwargs):
+        import sys
 
-    assert seen_kwargs["run_name"] == "packed"
-    assert result.status == AppRunStatus.SUCCEEDED
-    assert len(result.outputs) == 1
-    output = result.outputs[0]
-    assert output.name == "flowpacker_outputs"
-    assert output.kind == ArtifactKind.ARCHIVE
-    assert output.storage == VolumePath(
-        volume_name=output_volume_name,
-        path="workflow/packed/outputs/packed.tar.zst",
-        media_type="application/zstd",
+        config = yaml.safe_load(
+            (repo / "config/inference" / f"{cmd[2]}.yaml").read_text()
+        )
+        staged.append(Path(config["data"]["test_path"]))
+        run_command([sys.executable, "-c", "print('model diagnostic')"], **kwargs)
+        if failure == "exit":
+            raise subprocess.CalledProcessError(1, cmd)
+        output = repo / "samples" / cmd[3]
+        output.mkdir(parents=True)
+        (output / "output_dict.pth").write_bytes(b"fixture metrics")
+        for folder in ("run_1", "run_2", "best_run"):
+            if failure == "empty" or (failure == "confidence" and folder == "best_run"):
+                continue
+            (output / folder).mkdir(parents=True)
+            for stem in ("alpha", "beta"):
+                if failure == "partial" and stem == "beta":
+                    continue
+                (output / folder / f"{stem}.pdb").write_bytes(
+                    b"invalid" if failure == "corrupt" else pdb
+                )
+
+    monkeypatch.setattr(flowpacker_app, "run_command", model)
+    kwargs = dict(
+        input_files=[("alpha.pdb", pdb), ("beta.pdb", pdb)],
+        run_name="packed",
+        n_samples=2,
+        use_confidence=True,
     )
-    assert output.metadata == {
-        "archive_format": "tar.zst",
-        "filename": "packed.tar.zst",
-    }
+    archive = tmp_path / "volume/workflow/packed/outputs/packed.tar.zst"
+    if failure:
+        with pytest.raises((
+            ValueError,
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+        )):
+            flowpacker_app.run_flowpacker_workflow.local(**kwargs)
+        assert not archive.exists()
+    else:
+        result = flowpacker_app.run_flowpacker_workflow.local(**kwargs)
+        assert result.status == AppRunStatus.SUCCEEDED
+        with zstandard.ZstdDecompressor().stream_reader(
+            io.BytesIO(archive.read_bytes())
+        ) as stream:
+            with tarfile.open(fileobj=stream, mode="r|") as tar:
+                files = {
+                    member.name: tar.extractfile(member).read()
+                    for member in tar
+                    if member.isfile()
+                }
+        manifest = orjson.loads(
+            next(
+                data
+                for name, data in files.items()
+                if name.endswith("/validation.json")
+            )
+        )
+        assert len(manifest["structures"]) == 6
+        assert len([name for name in files if name.endswith(".pdb")]) == 6
+    assert staged and all(not path.exists() for path in staged)
+    assert not list((repo / "samples").glob("*"))
     assert (
-        Path(tmp_path) / "workflow" / "packed" / "outputs" / "packed.tar.zst"
-    ).read_bytes() == b"tarball"
-    assert output_volume.commit_count == 1
+        "model diagnostic"
+        in (tmp_path / "volume/workflow/packed/logs/flowpacker.log").read_text()
+    )
 
 
 def test_flowpacker_config_uses_volume_checkpoint_paths(tmp_path) -> None:

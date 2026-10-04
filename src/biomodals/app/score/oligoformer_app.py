@@ -215,6 +215,7 @@ class AppInfo:
         "targetscan-8.0-viennarna-2.7.2-semantic-topn-targetscan-polars-"
         "pita-ref-mount-v2"
     )
+    efficacy_cache_salt: str = "eval-inference-mode-v1"
     postprocess_cache_salt: str = "final-tables-v3"
     repo_rnafm_dir: Path = CONF.git_clone_dir / "RNA-FM"
     model_rnafm_dir: Path = Path(CONF.model_volume_mountpoint) / "RNA-FM"
@@ -1614,6 +1615,11 @@ runtime_image = (
         "zstd",
     )
     .env(CONF.default_env)
+    .add_local_file(
+        Path(__file__).with_name("oligoformer_inference.patch"),
+        "/opt/oligoformer-inference.patch",
+        copy=True,
+    )
     .run_commands(
         " && ".join((
             "tmpdir=$(mktemp -d)",
@@ -1633,6 +1639,8 @@ runtime_image = (
             f"git clone {CONF.repo_url} {CONF.git_clone_dir}",
             f"cd {CONF.git_clone_dir}",
             f"git checkout {CONF.repo_commit_hash}",
+            "git apply --check /opt/oligoformer-inference.patch",
+            "git apply /opt/oligoformer-inference.patch",
             "grep -q \"Args.orf = './off-target/ref/human_UTR.txt'\" scripts/infer.py",
             "sed -i \"s|Args.orf = './off-target/ref/human_UTR.txt'|Args.orf = './off-target/ref/human_ORF.txt'|\" scripts/infer.py",
             'grep -q "for i in range(Args.top_n):" scripts/infer.py',
@@ -2092,6 +2100,7 @@ def _efficacy_key_for_run(
             CONF.name,
             CONF.version or "",
             CONF.repo_commit_hash or "",
+            APP_INFO.efficacy_cache_salt,
             f"mrna:{_hash_bytes(mrna_fasta_bytes)}",
             f"sirna:{_hash_bytes(sirna_fasta_bytes)}",
             f"functionality_filter:{int(functionality_filter)}",

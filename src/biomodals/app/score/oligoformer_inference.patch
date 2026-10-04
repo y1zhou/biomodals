@@ -1,0 +1,17 @@
+--- a/scripts/infer.py
++++ b/scripts/infer.py
+@@ -161,12 +161,14 @@
+         label.append(0)
+     return label
+ 
++@torch.inference_mode()
+ def infer(Args):
+ 	random.seed(Args.seed)
+ 	os.environ['PYTHONHASHSEED']=str(Args.seed)
+ 	np.random.seed(Args.seed)
+ 	best_model = Oligo(vocab_size = Args.vocab_size, embedding_dim = Args.embedding_dim, lstm_dim = Args.lstm_dim,  n_head = Args.n_head, n_layers = Args.n_layers, lm1 = Args.lm1, lm2 = Args.lm2).to(device)
+ 	best_model.load_state_dict(torch.load("model/best_model.pth",map_location=device))
++	best_model.eval()
+ 	print('-----------------Start inferring!-----------------')
+ 	a = datetime.now() #获得当前时间
+ 	if Args.all_human:

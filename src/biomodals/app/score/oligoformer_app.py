@@ -5288,7 +5288,8 @@ def _parse_oligoformer_result_publication(
         return None
     if not (
         isinstance(value, dict)
-        and value.get("version") == 2
+        # Version 3 archives include custom-reference input digests.
+        and value.get("version") == 3
         and value.get("publication_key") == publication_key
         and isinstance(value.get("result_path"), str)
         and isinstance(value.get("size_bytes"), int)
@@ -5332,7 +5333,7 @@ def _publish_oligoformer_result_record(
     try:
         tmp_path.write_bytes(
             orjson.dumps({
-                "version": 2,
+                "version": 3,
                 "publication_key": publication_key,
                 "model_identity": model_identity,
                 "reference_identity": reference_identity,
@@ -5432,6 +5433,10 @@ def publish_oligoformer_outputs(
         raise FileNotFoundError("OligoFormer final outputs are incomplete")
     if refreshed.model_identity is None:
         raise FileNotFoundError("OligoFormer model identity is unavailable")
+    inputs_dir = AppRunLayout.from_run_root(refreshed.run_root).inputs_dir
+    input_paths = list(inputs_dir.glob("*.fa"))
+    if refreshed.config.off_target and not refreshed.config.all_human:
+        input_paths.extend((inputs_dir / "utr.txt", inputs_dir / "orf.txt"))
     archive_path = _oligoformer_result_archive_path(refreshed)
     archive_bytes = _package_output_tables(
         Path(refreshed.output_dir),
@@ -5447,12 +5452,7 @@ def publish_oligoformer_outputs(
             "reference_identity": refreshed.reference_identity,
             "config": asdict(refreshed.config),
             "seed": 42,
-            "inputs": {
-                path.name: _hash_path(path)
-                for path in AppRunLayout.from_run_root(
-                    refreshed.run_root
-                ).inputs_dir.glob("*.fa")
-            },
+            "inputs": {path.name: _hash_path(path) for path in input_paths},
         },
     )
     tmp_path = _unique_tmp_path(archive_path)

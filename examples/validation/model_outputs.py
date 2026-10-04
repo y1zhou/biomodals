@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import io
 import math
+import re
 import tarfile
 from pathlib import Path, PurePosixPath
 
@@ -114,6 +115,33 @@ def compare_tables(left, right, *, efficacy_only: bool, atol: float) -> float:
     return maximum
 
 
+def oligoformer_provenance(files: dict[str, bytes]) -> dict:
+    """Verify table digests and require content identities for custom references."""
+    provenance = orjson.loads(
+        next(
+            content
+            for name, content in files.items()
+            if name.endswith("/provenance.json")
+        )
+    )
+    if provenance["tables"] != {
+        Path(name).name: sha256_bytes(content)
+        for name, content in files.items()
+        if name.endswith(".txt")
+    }:
+        raise ValueError("Table digest mismatch")
+    config = provenance["config"]
+    if config["off_target"] and not config["all_human"]:
+        for name in ("utr.txt", "orf.txt"):
+            digest = provenance["inputs"].get(name)
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ValueError(f"Missing or invalid custom-reference digest: {name}")
+    return provenance
+
+
 def main() -> None:
     """Write an acceptance report even when validation fails."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -163,38 +191,11 @@ def main() -> None:
             report["provenance"] = manifest
         else:
             tables = oligoformer_tables(files)
-            provenance = orjson.loads(
-                next(
-                    content
-                    for name, content in files.items()
-                    if name.endswith("/provenance.json")
-                )
-            )
-            table_contents = {
-                Path(name).name: content
-                for name, content in files.items()
-                if name.endswith(".txt")
-            }
-            if provenance["tables"] != {
-                name: sha256_bytes(content) for name, content in table_contents.items()
-            }:
-                raise ValueError("Table digest mismatch")
+            provenance = oligoformer_provenance(files)
             report["provenance"] = provenance
             if args.repeat:
                 repeated = archive_files(args.repeat)
-                second_provenance = orjson.loads(
-                    next(
-                        content
-                        for name, content in repeated.items()
-                        if name.endswith("/provenance.json")
-                    )
-                )
-                if second_provenance["tables"] != {
-                    Path(name).name: sha256_bytes(content)
-                    for name, content in repeated.items()
-                    if name.endswith(".txt")
-                }:
-                    raise ValueError("Repeated table digest mismatch")
+                second_provenance = oligoformer_provenance(repeated)
                 if provenance["efficacy_key"] == second_provenance["efficacy_key"]:
                     raise ValueError(
                         "Repeat reused the efficacy cache; run both with --force"

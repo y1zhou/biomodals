@@ -26,6 +26,11 @@ evaluation policy, model identity, efficacy checkpoint digest, input digests,
 settings, efficacy cache key, and table digests. The report checks finite scores,
 unique candidate positions, descending ranking, and the filtered candidate set.
 A single run reports `scientific_comparison: not_run`.
+For custom off-target references, `inputs` also records the SHA-256 digests of
+the staged `utr.txt` and `orf.txt`. Acceptance rejects either archive if those
+digests are missing, and repeat comparisons require them to match.
+Older result publications are repackaged from validated cached tables; this
+provenance update does not invalidate scientific computations.
 
 For the numerical acceptance gate, independently clone upstream commit
 `e2f53ad63387bbe166bf123949151e2bc9bf6ec3`, use the same RNA-FM and efficacy

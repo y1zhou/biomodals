@@ -28,6 +28,7 @@ from biomodals.execution import (
     NodeRunContext,
     ProviderCallDiagnostic,
     ProviderCallPage,
+    RunStatus,
 )
 from biomodals.execution.modal import (
     ModalCallDriver,
@@ -37,6 +38,7 @@ from biomodals.execution.modal import (
     execution_coordinator_identity,
     initialize_execution_coordinator_host,
     orchestrator,
+    require_accepted_run_status,
     resolve_provider_call_limits,
     stage_execution_launch,
 )
@@ -1004,15 +1006,19 @@ def submit_humanization_workflow(
     print(f"Coordinator FunctionCall ID: {call.object_id}", flush=True)
     if wait:
         overview = call.get()
+        require_accepted_run_status(
+            overview,
+            workload_name=CONF.name,
+            accepted_statuses=(RunStatus.SUCCEEDED, RunStatus.PARTIAL),
+        )
         print(f"Humanization completed: {overview.run.status.value}", flush=True)
-        if overview.run.status.value in {"succeeded", "partial"}:
-            result = AppRunResult.model_validate(coordinator.result.remote())
-            for output in result.outputs:
-                if output.name == "humanization_results" and isinstance(
-                    output.storage, VolumePath
-                ):
-                    print(
-                        f"humanization_results: volume={output.storage.volume_name} path={output.storage.path}\n"
-                        f"Selection table: {output.storage.path}/selection.csv",
-                        flush=True,
-                    )
+        result = AppRunResult.model_validate(coordinator.result.remote())
+        for output in result.outputs:
+            if output.name == "humanization_results" and isinstance(
+                output.storage, VolumePath
+            ):
+                print(
+                    f"humanization_results: volume={output.storage.volume_name} path={output.storage.path}\n"
+                    f"Selection table: {output.storage.path}/selection.csv",
+                    flush=True,
+                )

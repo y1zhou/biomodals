@@ -232,6 +232,19 @@ def submit_staged_execution_run(
     print(f"Execution Run ID: {execution_run_id}")
     print(f"Coordinator FunctionCall ID: {getattr(call, 'object_id', call)}")
     overview = call.get()
+    require_accepted_run_status(
+        overview, workload_name=workload_name, accepted_statuses=accepted_statuses
+    )
+    return overview
+
+
+def require_accepted_run_status(
+    overview: ExecutionOverview,
+    *,
+    workload_name: str,
+    accepted_statuses: Collection[RunStatus] = (RunStatus.SUCCEEDED,),
+) -> None:
+    """Fail waited CLI invocations when the Run did not produce an accepted outcome."""
     if overview.run.status not in accepted_statuses:
         diagnostic = overview.run.status_message or (
             overview.run.status_reason.value
@@ -242,7 +255,6 @@ def submit_staged_execution_run(
             f"{workload_name} Execution Run ended as "
             f"{overview.run.status.value}: {diagnostic}"
         )
-    return overview
 
 
 def load_execution_provider_result(

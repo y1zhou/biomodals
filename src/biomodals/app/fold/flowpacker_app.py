@@ -328,10 +328,10 @@ def run_flowpacker(
     layout = AppRunLayout.from_run_root(
         Path(CONF.output_volume_mountpoint) / "workflow" / run_name
     )
-    log_path = layout.logs_dir / "flowpacker.log"
     with TemporaryDirectory(prefix="flowpacker_") as scratch:
         input_dir = Path(scratch)
         scratch_name = input_dir.name
+        log_path = layout.logs_dir / scratch_name / "flowpacker.log"
         sample_dir = CONF.git_clone_dir / "samples" / scratch_name
         config_path = (
             CONF.git_clone_dir / "config" / "inference" / f"{scratch_name}.yaml"

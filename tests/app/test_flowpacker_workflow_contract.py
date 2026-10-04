@@ -55,7 +55,10 @@ def test_flowpacker_publishes_only_complete_structures(tmp_path, monkeypatch, fa
             (repo / "config/inference" / f"{cmd[2]}.yaml").read_text()
         )
         staged.append(Path(config["data"]["test_path"]))
-        run_command([sys.executable, "-c", "print('model diagnostic')"], **kwargs)
+        run_command(
+            [sys.executable, "-c", f"print('model diagnostic {len(staged)}')"],
+            **kwargs,
+        )
         if failure == "exit":
             raise subprocess.CalledProcessError(1, cmd)
         output = repo / "samples" / cmd[3]
@@ -89,32 +92,50 @@ def test_flowpacker_publishes_only_complete_structures(tmp_path, monkeypatch, fa
             flowpacker_app.run_flowpacker_workflow.local(**kwargs)
         assert not archive.exists()
     else:
-        result = flowpacker_app.run_flowpacker_workflow.local(**kwargs)
-        assert result.status == AppRunStatus.SUCCEEDED
-        with zstandard.ZstdDecompressor().stream_reader(
-            io.BytesIO(archive.read_bytes())
-        ) as stream:
-            with tarfile.open(fileobj=stream, mode="r|") as tar:
-                files = {
-                    member.name: tar.extractfile(member).read()
-                    for member in tar
-                    if member.isfile()
-                }
-        manifest = orjson.loads(
-            next(
-                data
-                for name, data in files.items()
-                if name.endswith("/validation.json")
+        for attempt in (1, 2):
+            result = flowpacker_app.run_flowpacker_workflow.local(**kwargs)
+            assert result.status == AppRunStatus.SUCCEEDED
+            retained_archive = tmp_path / f"attempt-{attempt}.tar.zst"
+            retained_archive.write_bytes(archive.read_bytes())
+            with zstandard.ZstdDecompressor().stream_reader(
+                io.BytesIO(retained_archive.read_bytes())
+            ) as stream:
+                with tarfile.open(fileobj=stream, mode="r|") as tar:
+                    files = {
+                        member.name: tar.extractfile(member).read()
+                        for member in tar
+                        if member.isfile()
+                    }
+            manifest = orjson.loads(
+                next(
+                    data
+                    for name, data in files.items()
+                    if name.endswith("/validation.json")
+                )
             )
-        )
-        assert len(manifest["structures"]) == 6
-        assert len([name for name in files if name.endswith(".pdb")]) == 6
+            assert len(manifest["structures"]) == 6
+            assert len([name for name in files if name.endswith(".pdb")]) == 6
+            archived_log = next(
+                data for name, data in files.items() if name.endswith("/flowpacker.log")
+            )
+            assert [
+                line
+                for line in archived_log.decode().splitlines()
+                if line.startswith("model diagnostic")
+            ] == [f"model diagnostic {attempt}"]
     assert staged and all(not path.exists() for path in staged)
     assert not list((repo / "samples").glob("*"))
-    assert (
-        "model diagnostic"
-        in (tmp_path / "volume/workflow/packed/logs/flowpacker.log").read_text()
-    )
+    assert not list((repo / "config/inference").glob("*.yaml"))
+    logs = list((tmp_path / "volume/workflow/packed/logs").glob("*/flowpacker.log"))
+    assert len(logs) == len(staged)
+    assert {
+        tuple(
+            line
+            for line in path.read_text().splitlines()
+            if line.startswith("model diagnostic")
+        )
+        for path in logs
+    } == {(f"model diagnostic {attempt}",) for attempt in range(1, len(staged) + 1)}
 
 
 def test_flowpacker_config_uses_volume_checkpoint_paths(tmp_path) -> None:

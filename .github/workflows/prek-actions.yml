@@ -34,19 +34,39 @@ jobs:
         run: uv lock --check
       - name: Run tests
         run: uv run --frozen pytest -q
+      - name: Export inherited image requirements and declared RNA sources
+        run: |
+          uv run --frozen python examples/validation/runtime_requirements.py > "$RUNNER_TEMP/runtime-requirements.txt"
+          uv run --frozen python examples/validation/runtime_requirements.py --relax-versions > "$RUNNER_TEMP/rna-requirements.txt"
+          uv run --frozen python examples/validation/stage_rna_runtime.py "$RUNNER_TEMP/rna-sources"
+      - name: Verify Python 3.10 RNA request and plan transport
+        run: |
+          for app in oligoformer ensirna; do
+            PYTHONPATH="$RUNNER_TEMP/rna-sources/$app" \
+              uv run --no-project --python 3.10 \
+              --with-requirements "$RUNNER_TEMP/rna-requirements.txt" \
+              python examples/validation/rna_runtime.py "$app" "runtime-evidence/python310/$app"
+          done
       - name: Verify Python 3.11 task-image imports
         run: >-
           PYTHONPATH=src uv run --no-project --python 3.11
-          --with 'modal~=1.6.0'
-          --with 'orjson>=3.11.8'
-          --with 'pydantic>=2.12.5'
-          --with 'polars[calamine,numpy,pandas,xlsxwriter]>=1.44.2'
-          --with 'niquests>=3.18.4'
-          --with 'python-dotenv>=1.2.1,<2'
-          --with 'pyyaml>=6.0.3'
-          --with 'rich>=14.2.0'
-          --with 'tqdm>=4.67.3'
-          --with 'typer>=0.20.0'
+          --with-requirements "$RUNNER_TEMP/runtime-requirements.txt"
           python -c
           'import biomodals.app.design.ligandmpnn_app;
-          import biomodals.workflow.ppiflow.ligandmpnn_runtime'
+          import biomodals.workflow.ppiflow.ligandmpnn_runtime;
+          import biomodals.app.fold.flowpacker_app'
+      - name: Verify Python 3.11 RNA request and plan transport
+        run: |
+          for app in oligoformer ensirna; do
+            PYTHONPATH="$RUNNER_TEMP/rna-sources/$app" \
+              uv run --no-project --python 3.11 \
+              --with-requirements "$RUNNER_TEMP/runtime-requirements.txt" \
+              python examples/validation/rna_runtime.py "$app" "runtime-evidence/python311/$app"
+          done
+      - name: Retain runtime verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-verification
+          path: runtime-evidence/
+          if-no-files-found: warn

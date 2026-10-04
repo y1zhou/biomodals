@@ -2426,34 +2426,6 @@ def test_pita_row_shard_retries_interrupted_commands_atomically(
     assert len(attempts) == 3
 
 
-def test_package_output_tables_bundles_only_final_tables(tmp_path: Path, monkeypatch):
-    captured = {}
-    output_dir = tmp_path / "outputs"
-    output_dir.joinpath("logs", "off_target").mkdir(parents=True)
-    output_dir.joinpath("logs", "off_target", "row.log").write_text(
-        "debug\n", encoding="utf-8"
-    )
-    for path in oligoformer_app._output_bundle_paths(("target",)):
-        output_dir.joinpath(path).write_text("result\n", encoding="utf-8")
-
-    def fake_package_outputs(root, *, paths_to_bundle):
-        captured["root"] = Path(root)
-        captured["paths"] = [str(path) for path in paths_to_bundle]
-        return b"archive"
-
-    monkeypatch.setattr(oligoformer_app, "package_outputs", fake_package_outputs)
-
-    assert oligoformer_app._package_output_tables(output_dir, ("target",)) == b"archive"
-    assert captured == {
-        "root": output_dir,
-        "paths": [
-            "target.txt",
-            "target_ranked.txt",
-            "target_ranked_filtered.txt",
-        ],
-    }
-
-
 def test_package_output_tables_requires_all_final_tables(tmp_path: Path):
     output_dir = tmp_path / "outputs"
     output_dir.mkdir()

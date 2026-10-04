@@ -98,7 +98,7 @@ import shlex
 import shutil
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import count, islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -688,8 +688,10 @@ def _output_bundle_paths(output_stems: tuple[str, ...]) -> tuple[Path, ...]:
     )
 
 
-def _package_output_tables(output_dir: Path, output_stems: tuple[str, ...]) -> bytes:
-    """Package only final OligoFormer result tables, excluding diagnostic logs."""
+def _package_output_tables(
+    output_dir: Path, output_stems: tuple[str, ...], *, provenance: dict | None = None
+) -> bytes:
+    """Package final tables and optional scientific provenance, excluding logs."""
     bundle_paths = _output_bundle_paths(output_stems)
     missing = [
         str(output_dir / path)
@@ -700,6 +702,16 @@ def _package_output_tables(output_dir: Path, output_stems: tuple[str, ...]) -> b
         raise FileNotFoundError(
             "OligoFormer final output tables are incomplete: " + ", ".join(missing)
         )
+    if provenance is not None:
+        provenance = provenance | {
+            "tables": {
+                str(path): _hash_path(output_dir / path) for path in bundle_paths
+            }
+        }
+        (output_dir / "provenance.json").write_bytes(
+            orjson.dumps(provenance, option=orjson.OPT_INDENT_2)
+        )
+        bundle_paths = (*bundle_paths, Path("provenance.json"))
     return package_outputs(output_dir, paths_to_bundle=bundle_paths)
 
 
@@ -5404,7 +5416,7 @@ def publish_oligoformer_outputs(
     plan: OligoformerRunPlan,
     publication_key: str,
 ) -> dict[str, object]:
-    """Publish the final standalone archive for Volume API download."""
+    """Publish final tables and scientific provenance for Volume API download."""
     CONF.output_volume.reload()
     refreshed = _build_plan(
         plan.cache_key,
@@ -5424,6 +5436,24 @@ def publish_oligoformer_outputs(
     archive_bytes = _package_output_tables(
         Path(refreshed.output_dir),
         refreshed.output_stems,
+        provenance={
+            "upstream_commit": CONF.repo_commit_hash,
+            "efficacy_policy": EFFICACY_POLICY_VERSION,
+            "efficacy_key": refreshed.efficacy_key,
+            "model_identity": refreshed.model_identity,
+            "efficacy_checkpoint_sha256": _hash_path(
+                CONF.git_clone_dir / "model/best_model.pth"
+            ),
+            "reference_identity": refreshed.reference_identity,
+            "config": asdict(refreshed.config),
+            "seed": 42,
+            "inputs": {
+                path.name: _hash_path(path)
+                for path in AppRunLayout.from_run_root(
+                    refreshed.run_root
+                ).inputs_dir.glob("*.fa")
+            },
+        },
     )
     tmp_path = _unique_tmp_path(archive_path)
     try:

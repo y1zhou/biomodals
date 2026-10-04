@@ -36,16 +36,6 @@ def patch_image_for_helper(
             the pinned/latest dependency versions require newer Python versions.
             The Modal SDK requirement is always retained from package metadata.
     """
-    # This is a bit hacky, but because Modal's .add_local_python_source()
-    # does not install the package, the metadata.requires call would not work
-    # in the runtime, so we make sure dependencies are installed here.
-    from importlib import metadata
-
-    try:
-        helper_deps = metadata.requires("biomodals") or []
-    except metadata.PackageNotFoundError:
-        helper_deps = []
-
     mods = [
         "biomodals.helper",
         "biomodals.app.config",
@@ -59,6 +49,32 @@ def patch_image_for_helper(
         mods.extend(("biomodals.workflow", "biomodals.app"))
 
     new_image = image.apt_install("zstd", "fd-find")
+    helper_deps = helper_dependencies(
+        skip_deps=skip_deps, ignore_dep_versions=ignore_dep_versions
+    )
+    if helper_deps:
+        new_image = new_image.uv_pip_install(helper_deps)
+
+    return new_image.add_local_python_source(*mods, copy=copy_patch_files)
+
+
+def helper_dependencies(
+    *, skip_deps: Iterable[str] | None = None, ignore_dep_versions: bool = False
+) -> list[str]:
+    """Read image requirements from project metadata, also used by runtime CI.
+
+    Preserve environment markers and the Modal SDK version when relaxing
+    requirements for older interpreters. No image or package install is performed.
+    """
+    # Resolve metadata locally: source injection does not install the package's
+    # distribution metadata in remote images.
+    from importlib import metadata
+
+    try:
+        helper_deps = metadata.requires("biomodals") or []
+    except metadata.PackageNotFoundError:
+        helper_deps = []
+
     if ignore_dep_versions:
         import re
 
@@ -90,10 +106,7 @@ def patch_image_for_helper(
             for dep in helper_deps
             if next(package_name_pattern.finditer(dep)).group(0) not in skip_deps_set
         ]
-    if helper_deps:
-        new_image = new_image.uv_pip_install(helper_deps)
-
-    return new_image.add_local_python_source(*mods, copy=copy_patch_files)
+    return helper_deps
 
 
 def hash_string(s: str) -> str:

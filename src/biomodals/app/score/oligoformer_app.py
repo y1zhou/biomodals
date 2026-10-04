@@ -5185,7 +5185,7 @@ def run_oligoformer_efficacy(
         if not functionality_filter:
             cmd.append("--no_func")
 
-        run_command(cmd, cwd=CONF.git_clone_dir)
+        run_command(cmd, cwd=CONF.git_clone_dir, output_mode="stream")
         _publish_output_bundle_marker(
             _marker_path(efficacy_layout, "efficacy.done"),
             output_dir=efficacy_dir,

@@ -1324,7 +1324,7 @@ def ensirna_prepare_inputs(
                     str(staging_dir),
                 ],
                 cwd=APP_INFO.ensirna_dir,
-                output_mode="capture",
+                output_mode="stream",
             )
             staged_facts = _candidate_csv_facts(staging_csv, reject_unsafe_ids=True)
             if staged_facts is None:

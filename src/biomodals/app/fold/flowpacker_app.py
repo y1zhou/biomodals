@@ -371,7 +371,7 @@ def run_flowpacker(
             )
             run_command(
                 cmd,
-                output_mode="tee",
+                output_mode="stream",
                 log_file=log_path,
                 cwd=CONF.git_clone_dir,
             )

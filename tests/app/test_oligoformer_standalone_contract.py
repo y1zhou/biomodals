@@ -754,7 +754,7 @@ def test_run_oligoformer_efficacy_builds_gpu_stage_command(tmp_path: Path, monke
         model_identity="model-v1",
     )
 
-    def fake_run_command(cmd, *, cwd):
+    def fake_run_command(cmd, *, cwd, **_kwargs):
         captured["cmd"] = cmd
         captured["cwd"] = cwd
         out_dir = Path(cmd[cmd.index("--output_dir") + 1])

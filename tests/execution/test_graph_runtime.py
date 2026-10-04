@@ -1173,12 +1173,8 @@ def test_local_dag_uses_kernel_state_and_standard_paths(tmp_path: Path) -> None:
     assert first_node.seen[0].execution_run_id == RUN_ID
     assert [artifact.artifact_id for artifact in second_node.seen[0].inputs["upstream"]]
     assert (
-        runtime.store.output_root.joinpath(
-            "nodes",
-            "second",
-            "result",
-            "second-text",
-            "result.txt",
+        tmp_path.joinpath(
+            runtime.store.artifacts.load_node_output_artifacts("second")[0].storage.path
         ).read_text()
         == "second"
     )
@@ -3237,3 +3233,89 @@ def test_unchecked_external_publication_suspends_instead_of_authorizing_work(
     assert run.status_reason is not None
     assert run.status_reason.value == "result_validation_unknown"
     assert node.seen == []
+
+
+@dataclass
+class NamedOutputNode(CoordinatorNode):
+    name: str
+    value: str
+
+    def run(self, context):
+        return AppRunResult(
+            status=AppRunStatus.SUCCEEDED,
+            outputs=[
+                AppOutput(
+                    name=self.name,
+                    kind=ArtifactKind.REPORT,
+                    storage=InlineBytes(
+                        data=self.value.encode(), filename="result.txt"
+                    ),
+                )
+            ],
+        )
+
+
+def test_ambiguous_display_names_publish_and_reopen_distinct_artifacts(tmp_path):
+    graph = ExecutionGraph("artifact identities")
+    graph.add_node(NamedOutputNode("c", "first"), id="a-b")
+    graph.add_node(NamedOutputNode("b-c", "second"), id="a")
+    for _ in range(2):
+        runtime = ExecutionGraphRuntime(
+            graph=graph,
+            execution_run_id=RUN_ID,
+            deployment=DEPLOYMENT,
+            volume_root=tmp_path,
+            artifact_volume_name="outputs",
+            workload_run_key="same",
+        )
+        try:
+            assert runtime.run().status == AppRunStatus.SUCCEEDED
+            artifacts = [
+                runtime.store.artifacts.load_node_output_artifacts(key)[0]
+                for key in ("a-b", "a")
+            ]
+            assert len({item.artifact_id for item in artifacts}) == 2
+            assert [
+                (tmp_path / item.storage.path).read_text() for item in artifacts
+            ] == ["first", "second"]
+        finally:
+            runtime.close()
+
+
+@dataclass
+class PayloadNode(TaskProviderNode):
+    configuration: object
+    discovered: object = field(metadata={"dag_hash": False})
+
+    def discover_remote_tasks(self, context):
+        return (
+            TaskDefinition(
+                "candidate", {"value": self.discovered}, {"value": self.discovered}
+            ),
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_graph_and_discovered_payloads_fail_before_admission(tmp_path, value):
+    from biomodals.execution.definition_plan import execution_plan
+
+    graph = ExecutionGraph("nonfinite")
+    graph.add_node(PayloadNode({"nested": [value]}, None), id="node")
+    with pytest.raises(ValueError, match="JSON compliant"):
+        execution_plan(graph.validate(), workload_run_key="same")
+    graph = ExecutionGraph("nonfinite tasks")
+    graph.add_node(PayloadNode(None, {"nested": [value]}), id="node")
+    runtime = ExecutionGraphRuntime(
+        graph=graph,
+        execution_run_id=RUN_ID,
+        deployment=DEPLOYMENT,
+        volume_root=tmp_path,
+        artifact_volume_name="outputs",
+        workload_run_key="same",
+    )
+    try:
+        runtime.run()
+        assert runtime.store.execution.list_tasks(RUN_ID, "node") == ()
+        assert runtime.store.execution.get_run(RUN_ID).status == RunStatus.FAILED
+    finally:
+        runtime.close()

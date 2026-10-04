@@ -50,6 +50,7 @@ from biomodals.execution.artifact_availability import (
 from biomodals.execution.artifacts import materialize_app_run_result
 from biomodals.execution.definition import ExecutionDefinition, ExecutionGraph
 from biomodals.execution.definition_plan import execution_plan, node_task_plan
+from biomodals.execution.model import canonical_json_bytes
 from biomodals.execution.nodes import (
     NodeRunContext,
     PreparedTaskBatch,
@@ -2743,7 +2744,7 @@ def _remote_metadata(payload: object) -> dict[str, Any]:
 
 
 def _json_value(value: object) -> Any:
-    return orjson.loads(orjson.dumps(value))
+    return orjson.loads(canonical_json_bytes(value))
 
 
 def _node_error_message(result: AppRunResult) -> str:

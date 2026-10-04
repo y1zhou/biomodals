@@ -12,6 +12,7 @@ import orjson
 from pydantic import BaseModel
 
 from biomodals.execution.definition import ExecutionDefinition
+from biomodals.execution.model import canonical_json_bytes
 from biomodals.execution.nodes import ExecutionNode
 
 
@@ -32,7 +33,7 @@ def dag_hash(definition: ExecutionDefinition) -> str:
             for node_id, spec in sorted(definition.nodes.items())
         },
     }
-    encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
+    encoded = canonical_json_bytes(payload)
     return hashlib.sha256(encoded).hexdigest()
 
 

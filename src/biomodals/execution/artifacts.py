@@ -30,11 +30,20 @@ _MAX_ARTIFACT_ID_BYTES = 200
 _MAX_FILENAME_BYTES = 255
 
 
-def _artifact_id(producing_node_id: str, output_name: str) -> str:
-    artifact_id = sanitize_filename(f"{producing_node_id}-{output_name}")
+def _artifact_id(
+    producing_node_id: str,
+    output_name: str,
+    *,
+    scope: str | None = None,
+    namespace: str = "outputs",
+) -> str:
+    identity = orjson.dumps((producing_node_id, scope, namespace, output_name))
+    digest = hashlib.sha256(identity).hexdigest()
+    label = sanitize_filename(f"{producing_node_id}-{output_name}")
+    artifact_id = f"{label}-{digest}"
     if len(artifact_id.encode("utf-8")) <= _MAX_ARTIFACT_ID_BYTES:
         return artifact_id
-    return f"artifact-{hashlib.sha256(artifact_id.encode('utf-8')).hexdigest()}"
+    return f"artifact-{digest}"
 
 
 @dataclass(frozen=True)
@@ -334,6 +343,7 @@ def _validate_inline_text_bytes(
 
 def _materialize_inline_bytes(
     *,
+    artifact_id: str,
     storage: InlineBytes,
     output_name: str,
     output_kind: ArtifactKind,
@@ -342,14 +352,9 @@ def _materialize_inline_bytes(
     volume_root: Path | None,
     producing_node_id: str,
     metadata: dict[str, Any] | None = None,
-    artifact_output_name: str | None = None,
     source_app_output_name: str | None = None,
     artifact_parent: Path | None = None,
 ) -> ExecutionArtifact:
-    artifact_id = _artifact_id(
-        producing_node_id,
-        artifact_output_name or output_name,
-    )
     _validate_inline_text_bytes(storage, output_kind)
     safe_filename = sanitize_filename(storage.filename)
     if len(safe_filename.encode("utf-8")) > _MAX_FILENAME_BYTES:
@@ -573,6 +578,7 @@ def _copy_volume_path_tree(
 
 def _materialize_volume_path_copy(
     *,
+    artifact_id: str,
     storage: VolumePath,
     output_name: str,
     output_kind: ArtifactKind,
@@ -582,14 +588,9 @@ def _materialize_volume_path_copy(
     producing_node_id: str,
     metadata: dict[str, Any],
     volume_roots: Mapping[str, Path],
-    artifact_output_name: str | None = None,
     source_app_output_name: str | None = None,
     artifact_parent: Path | None = None,
 ) -> ExecutionArtifact:
-    artifact_id = _artifact_id(
-        producing_node_id,
-        artifact_output_name or output_name,
-    )
     source_root = volume_roots.get(storage.volume_name)
     if source_root is None:
         raise ValueError(
@@ -639,25 +640,27 @@ def materialize_app_run_result(
     persisted_outputs: list[AppOutput] = []
     persisted_logs: list[AppOutput] = []
 
-    def scoped_output_name(output_name: str) -> str:
-        if artifact_id_scope is None:
-            return output_name
-        return f"{artifact_id_scope}-{output_name}"
+    for namespace, outputs in (("outputs", result.outputs), ("logs", result.logs)):
+        names = [output.name for output in outputs]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Duplicate {namespace} names in AppRunResult")
 
     def materialize_output(
         output,
         *,
-        artifact_output_name: str | None = None,
+        namespace: str = "outputs",
         source_app_output_name: str | None = None,
         artifact_parent: Path | None = None,
     ) -> tuple[ExecutionArtifact, AppOutput]:
-        artifact_output_name = scoped_output_name(artifact_output_name or output.name)
         artifact_id = _artifact_id(
             producing_node_id,
-            artifact_output_name,
+            output.name,
+            scope=artifact_id_scope,
+            namespace=namespace,
         )
         if isinstance(output.storage, InlineBytes):
             artifact = _materialize_inline_bytes(
+                artifact_id=artifact_id,
                 storage=output.storage,
                 output_name=output.name,
                 output_kind=output.kind,
@@ -666,7 +669,6 @@ def materialize_app_run_result(
                 volume_root=volume_root,
                 producing_node_id=producing_node_id,
                 metadata=output.metadata,
-                artifact_output_name=artifact_output_name,
                 source_app_output_name=source_app_output_name,
                 artifact_parent=artifact_parent,
             )
@@ -674,6 +676,7 @@ def materialize_app_run_result(
 
         if volume_path_mode == "copy":
             artifact = _materialize_volume_path_copy(
+                artifact_id=artifact_id,
                 storage=output.storage,
                 output_name=output.name,
                 output_kind=output.kind,
@@ -683,7 +686,6 @@ def materialize_app_run_result(
                 producing_node_id=producing_node_id,
                 metadata=output.metadata,
                 volume_roots=volume_roots or {},
-                artifact_output_name=artifact_output_name,
                 source_app_output_name=source_app_output_name,
                 artifact_parent=artifact_parent,
             )
@@ -731,7 +733,7 @@ def materialize_app_run_result(
     for log_output in result.logs:
         artifact, persisted_log = materialize_output(
             log_output,
-            artifact_output_name=f"logs-{log_output.name}",
+            namespace="logs",
             source_app_output_name=log_output.name,
             artifact_parent=result_dir / "logs",
         )

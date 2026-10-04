@@ -12,6 +12,7 @@ from fastapi.responses import Response, StreamingResponse
 from biomodals.service.artifacts import ArtifactCache, ArtifactLease, run_blocking_io
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
+    ClosingStreamingResponse,
     CodedAPIError,
     CodedErrorResponse,
     ErrorResponse,
@@ -321,19 +322,20 @@ def _response(
 
     async def content():
         remaining = length
-        try:
-            await run_blocking_io(lease.seek, first)
-            while remaining:
-                chunk = await run_blocking_io(lease.read, min(1024 * 1024, remaining))
-                if not chunk:
-                    raise RuntimeError("Cached Result ended unexpectedly")
-                remaining -= len(chunk)
-                yield chunk
-        finally:
-            await run_blocking_io(lease.close)
+        await run_blocking_io(lease.seek, first)
+        while remaining:
+            chunk = await run_blocking_io(lease.read, min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("Cached Result ended unexpectedly")
+            remaining -= len(chunk)
+            yield chunk
 
-    return StreamingResponse(
+    async def close() -> None:
+        await run_blocking_io(lease.close)
+
+    return ClosingStreamingResponse(
         content(),
+        close=close,
         status_code=response_status,
         media_type=media_type,
         headers=headers,

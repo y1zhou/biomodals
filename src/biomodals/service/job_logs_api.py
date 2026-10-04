@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable
+from contextlib import aclosing
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Protocol, runtime_checkable
 from uuid import UUID
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict
 from biomodals.execution import ProviderCallDiagnostic
 from biomodals.service.auth import AuthenticatedSession
 from biomodals.service.http_contract import (
+    ClosingStreamingResponse,
     CodedAPIError,
     CodedErrorResponse,
     require_session,
@@ -221,13 +223,10 @@ def create_job_logs_router() -> APIRouter:
             raise
 
         async def content():
-            try:
-                async for entry in remote.log_entries(
-                    handle,
-                    live=live,
-                    since=since,
-                    until=until,
-                ):
+            async with aclosing(
+                remote.log_entries(handle, live=live, since=since, until=until)
+            ) as entries:
+                async for entry in entries:
                     yield orjson.dumps(
                         {
                             "timestamp": entry.timestamp.isoformat(),
@@ -236,11 +235,13 @@ def create_job_logs_router() -> APIRouter:
                         },
                         option=orjson.OPT_APPEND_NEWLINE,
                     )
-            finally:
-                await streams.release(user_id, job_id)
 
-        return StreamingResponse(
+        async def close() -> None:
+            await streams.release(user_id, job_id)
+
+        return ClosingStreamingResponse(
             _redact_provider_call_id(content(), handle),
+            close=close,
             media_type="application/x-ndjson",
             headers={
                 "Cache-Control": "private, no-store",
@@ -255,7 +256,7 @@ def create_job_logs_router() -> APIRouter:
 async def _redact_provider_call_id(
     stream: AsyncIterable[bytes],
     provider_call_id: str,
-) -> AsyncIterator[bytes]:
+) -> AsyncGenerator[bytes, None]:
     """Remove a private provider identifier, including across chunk edges."""
     secret = provider_call_id.encode()
     replacement = b"[function-call-id-redacted]"

@@ -48,10 +48,11 @@ async def _download_modal_volume_files(
     pending = iter(downloads)
 
     async def download(remote_path: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        handle = destination.open("xb")
         complete = False
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("xb") as handle:
+            with handle:
                 await read_file(
                     remote_path,
                     handle,

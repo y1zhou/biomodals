@@ -336,3 +336,41 @@ def test_cache_rejects_invalid_metadata(
                 sha256=sha256,
             )
         )
+
+
+def test_cancelled_acquisition_releases_undelivered_lease(tmp_path, monkeypatch):
+    """Cancelling verification drains hashing and leaves the archive removable."""
+
+    async def scenario():
+        cache = ArtifactCache(tmp_path)
+        job_id = "11111111-1111-4111-8111-111111111111"
+        content = b"verified result archive"
+        (tmp_path / f"{job_id}.result").write_bytes(content)
+        started, release = Event(), Event()
+        matches = cache._matches
+
+        def blocked(*args, **kwargs):
+            started.set()
+            assert release.wait(5)
+            return matches(*args, **kwargs)
+
+        monkeypatch.setattr(cache, "_matches", blocked)
+        task = asyncio.create_task(
+            cache.acquire_async(job_id, size_bytes=len(content), sha256=digest(content))
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert cache.remove_job_files(job_id)
+            assert not (tmp_path / f"{job_id}.result").exists()
+        finally:
+            release.set()
+            await cache.shutdown()
+
+    asyncio.run(scenario())

@@ -237,12 +237,19 @@ class ArtifactCache:
         )
         if known:
             return lease
-        return await self.run_bounded(
-            self.acquire,
-            job_id,
-            size_bytes=size_bytes,
-            sha256=sha256,
-        )
+
+        def acquire() -> ArtifactLease | None:
+            nonlocal lease
+            lease = self.acquire(job_id, size_bytes=size_bytes, sha256=sha256)
+            return lease
+
+        try:
+            return await self.run_bounded(acquire)
+        except BaseException:
+            # run_bounded drains the worker even when the awaiting task is cancelled.
+            if lease is not None:
+                lease.close()
+            raise
 
     def _acquire_verified(
         self,

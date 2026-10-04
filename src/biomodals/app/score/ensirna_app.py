@@ -38,11 +38,15 @@ from uuid import UUID, uuid4
 import modal
 
 from biomodals.app.config import AppConfig
+from biomodals.app.score.ensirna_contracts import (
+    EnsirnaPdbChunkSpec as EnsirnaPdbChunkSpec,
+)
+from biomodals.app.score.ensirna_contracts import (
+    EnsirnaPreparationPlan as EnsirnaPreparationPlan,
+)
 from biomodals.app.score.ensirna_execution import (
     EnsirnaExecutionCoordinator,
     EnsirnaExecutionRequest,
-    EnsirnaPdbChunkSpec,
-    EnsirnaPreparationPlan,
     load_execution_request,
     stage_execution_request,
 )
@@ -1233,6 +1237,7 @@ runtime_image = (
     .add_local_python_source(
         "biomodals.app.score.ensirna_app",
         "biomodals.app.score.ensirna_execution",
+        "biomodals.app.score.ensirna_contracts",
     )
 )
 app = modal.App(CONF.name, image=runtime_image, tags=CONF.tags)

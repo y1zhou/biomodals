@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Collection, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Collection, Mapping
 from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
@@ -405,18 +404,6 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
-_SCHEMA_DROP_ORDER = (
-    "execution_task_completion_requests",
-    "execution_worker_assignments",
-    "execution_task_claim_requests",
-    "execution_tasks",
-    "execution_provider_calls",
-    "execution_dispatch_batches",
-    "execution_node_dependencies",
-    "execution_nodes",
-    "execution_runs",
-    "execution_schema",
-)
 _READY_NODE_QUERY_CHUNK_SIZE = 100
 
 
@@ -428,19 +415,6 @@ class SqliteExecutionRepository:
         self._connection = connection
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
-
-    @contextmanager
-    def savepoint(self) -> Iterator[None]:
-        """Make one compound transition atomic without owning the transaction."""
-        self._connection.execute("SAVEPOINT execution_runtime")
-        try:
-            yield
-        except BaseException:
-            self._connection.execute("ROLLBACK TO execution_runtime")
-            self._connection.execute("RELEASE execution_runtime")
-            raise
-        else:
-            self._connection.execute("RELEASE execution_runtime")
 
     def initialize_schema(self) -> None:
         """Create the current schema or reject another recorded version."""
@@ -474,24 +448,6 @@ class SqliteExecutionRepository:
             "INSERT INTO execution_schema (singleton, version) VALUES (1, ?)",
             (EXECUTION_SCHEMA_VERSION,),
         )
-
-    def replace_schema(self) -> None:
-        """Explicitly discard a known execution schema and create the current one."""
-        tables = {
-            str(row["name"])
-            for row in self._connection.execute(
-                """
-                SELECT name FROM sqlite_master
-                WHERE type = 'table' AND name GLOB 'execution_*'
-                """
-            ).fetchall()
-        }
-        expected = set(_SCHEMA_DROP_ORDER)
-        if tables != expected:
-            raise RuntimeError("Execution database schema is unexpected")
-        for table in _SCHEMA_DROP_ORDER:
-            self._connection.execute(f"DROP TABLE {table}")  # noqa: S608
-        self.initialize_schema()
 
     def create_run(
         self,
@@ -2857,51 +2813,6 @@ class SqliteExecutionRepository:
             ),
         )
 
-    def succeeded_provider_call(
-        self,
-        execution_run_id: UUID,
-        node_key: str,
-        *,
-        task_key: str | None = None,
-    ) -> ProviderCallRecord | None:
-        """Load the first successful call for one Node or owned Task."""
-        parameters: tuple[object, ...] = (
-            str(execution_run_id),
-            node_key,
-            ProviderCallStatus.SUCCEEDED.value,
-        )
-        task_join = ""
-        task_filter = ""
-        if task_key is not None:
-            task_join = """
-                JOIN execution_tasks AS task
-                    ON task.execution_run_id = call.execution_run_id
-                    AND task.node_key = call.node_key
-                    AND (
-                        task.provider_call_id = call.provider_call_id
-                        OR task.worker_provider_call_id = call.provider_call_id
-                    )
-            """
-            task_filter = "AND task.task_key = ?"
-            parameters = (*parameters, task_key)
-        row = self._connection.execute(
-            f"""
-            SELECT call.*
-            FROM execution_provider_calls AS call
-            {task_join}
-            WHERE call.execution_run_id = ?
-                AND call.node_key = ?
-                AND call.status = ?
-                {task_filter}
-            ORDER BY call.created_at, call.rowid
-            LIMIT 1
-            """,  # noqa: S608 - clauses are closed internal literals
-            parameters,
-        ).fetchone()
-        if row is None:
-            return None
-        return self._provider_call_from_row(row, task_keys=())
-
     def list_provider_calls_requiring_reconciliation(
         self,
         execution_run_id: UUID,
@@ -3349,21 +3260,6 @@ class SqliteExecutionRepository:
         ).fetchall()
         return tuple(_task_from_row(row) for row in rows)
 
-    def node_has_tasks(self, execution_run_id: UUID, node_key: str) -> bool:
-        """Return whether a Node has at least one discovered Task."""
-        return (
-            self._connection.execute(
-                """
-                SELECT 1
-                FROM execution_tasks
-                WHERE execution_run_id = ? AND node_key = ?
-                LIMIT 1
-                """,
-                (str(execution_run_id), node_key),
-            ).fetchone()
-            is not None
-        )
-
     def list_tasks_requiring_publication_recovery(
         self,
         execution_run_id: UUID,
@@ -3466,27 +3362,6 @@ class SqliteExecutionRepository:
                 ).fetchall()
             )
         return {row["node_key"]: (row["total"], row["nonterminal"]) for row in rows}
-
-    def active_provider_call_counts_by_node(
-        self,
-        execution_run_id: UUID,
-    ) -> dict[str, int]:
-        """Return nonterminal Provider Call counts grouped by Node."""
-        active = tuple(
-            status.value for status in ProviderCallStatus if not status.is_terminal
-        )
-        active_placeholders = ", ".join("?" for _ in active)
-        rows = self._connection.execute(
-            f"""
-            SELECT node_key, COUNT(*) AS active
-            FROM execution_provider_calls
-            WHERE execution_run_id = ?
-                AND status IN ({active_placeholders})
-            GROUP BY node_key
-            """,  # noqa: S608 - generated placeholders
-            (str(execution_run_id), *active),
-        ).fetchall()
-        return {row["node_key"]: row["active"] for row in rows}
 
     def list_unplanned_ready_tasks(
         self,

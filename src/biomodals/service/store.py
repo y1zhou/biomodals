@@ -167,13 +167,6 @@ ON jobs(tool, publication_scope_digest, created_at);
 """
 
 
-def _create_job_tables(connection: sqlite3.Connection) -> None:
-    """Create the fixed service Job schema inside the caller's transaction."""
-    for statement in _JOB_TABLES_SQL.split(";"):
-        if statement.strip():
-            connection.execute(statement)
-
-
 class UserStatus(StrEnum):
     """Explicit account lifecycle independent of Administrator role."""
 
@@ -551,18 +544,6 @@ class ServiceStore:
                 (JobState.STATE_UNKNOWN.value,),
             ).fetchall()
             return [_job_from_row(row) for row in rows]
-
-    def set_result_cached(self, job_id: UUID, *, cached: bool) -> None:
-        """Persist whether the rebuildable local archive is currently present."""
-        with self._transaction(job_id=job_id) as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET cache_cleared_at = CASE WHEN ? THEN NULL ELSE unixepoch() END
-                WHERE job_id = ?
-                """,
-                (int(cached), str(job_id)),
-            )
 
     def restore_result_cached(self, job_id: UUID, *, now: int) -> JobRecord:
         """Restore exact cached bytes and any prior completed Job state."""

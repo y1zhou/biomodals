@@ -291,54 +291,6 @@ class AppInfo:
     human_ref_filenames: tuple[str, ...] = ("human_UTR.txt", "human_ORF.txt")
     default_top_n: int = 20
     prepared_marker_name: str = "oligoformer.json"
-    default_off_target_nodes: int = DEFAULT_EXECUTION_CONFIG.off_target_nodes
-    default_off_target_workers_per_node: int = (
-        DEFAULT_EXECUTION_CONFIG.off_target_workers
-    )
-    default_off_target_process_slots: int = (
-        DEFAULT_EXECUTION_CONFIG.off_target_process_slots
-    )
-    max_off_target_process_slots: int = 64
-    default_off_target_prep_workers: int = (
-        DEFAULT_EXECUTION_CONFIG.off_target_prep_workers
-    )
-    default_pita_prepare_nodes: int = DEFAULT_EXECUTION_CONFIG.pita_prepare_nodes
-    default_pita_prepare_workers: int = DEFAULT_EXECUTION_CONFIG.pita_prepare_workers
-    default_pita_prepare_utr_shard_size: int = (
-        DEFAULT_EXECUTION_CONFIG.pita_prepare_utr_shard_size
-    )
-    default_pita_row_shard_size: int = DEFAULT_EXECUTION_CONFIG.pita_row_shard_size
-    default_pita_row_attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts
-    default_targetscan_rnaplfold_nodes: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_nodes
-    )
-    default_targetscan_rnaplfold_workers: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_workers
-    )
-    default_targetscan_rnaplfold_shard_size: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_shard_size
-    )
-    default_targetscan_prepare_nodes: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes
-    )
-    default_targetscan_candidate_shard_size: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_candidate_shard_size
-    )
-    default_targetscan_context_nodes: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_context_nodes
-    )
-    default_targetscan_context_workers: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_context_workers
-    )
-    default_targetscan_context_shard_size: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_context_shard_size
-    )
-    default_targetscan_context_attempts: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts
-    )
-    default_targetscan_merge_nodes: int = (
-        DEFAULT_EXECUTION_CONFIG.targetscan_merge_nodes
-    )
     cache_lock_dict_name: str = f"{CONF.package_name}-cache-locks"
     cache_lock_poll_seconds: float = 5.0
     cache_lock_stale_seconds: float = MAX_TIMEOUT + 600
@@ -1737,7 +1689,7 @@ def _run_rnaplfold_for_record(
 )
 def run_oligoformer_targetscan_rnaplfold_shard(
     spec: TargetscanRnaPlfoldShardSpec,
-    local_workers: int = APP_INFO.default_targetscan_rnaplfold_workers,
+    local_workers: int = DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_workers,
 ) -> int:
     """Populate one shard of cached TargetScan RNAplfold outputs."""
     CONF.output_volume.reload()
@@ -2083,7 +2035,7 @@ def _targetscan_ref_shard_size(
     utr_count: int,
     configured_size: int | None = None,
     *,
-    prepare_nodes: int = APP_INFO.default_targetscan_prepare_nodes,
+    prepare_nodes: int = DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes,
 ) -> int:
     """Choose a TargetScan reference shard size from explicit tuning or fanout."""
     if utr_count < 1:
@@ -2268,7 +2220,7 @@ def _targetscan_reference_shards(
     utr_path: str,
     orf_path: str,
     ref_shard_size: int | None = None,
-    prepare_nodes: int = APP_INFO.default_targetscan_prepare_nodes,
+    prepare_nodes: int = DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes,
 ) -> list[TargetscanReferenceShard]:
     """Persist transcript-aligned TargetScan reference shards once per run."""
     layout = AppRunLayout.from_run_root(run_root)
@@ -2610,7 +2562,7 @@ def _cached_pita_prepare_utr_shard_specs(
 
 def _run_pita_prepare_utr_shard(
     spec: PitaPrepareUtrShardSpec,
-    attempts: int = APP_INFO.default_pita_row_attempts,
+    attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts,
 ) -> str:
     """Run one local UTR STAB shard through PITA potential-target discovery."""
     import subprocess as sp
@@ -3249,7 +3201,7 @@ def _targetscan_context_shard_specs(
 
 def _run_targetscan_context_shard(
     spec: TargetscanContextShardSpec,
-    attempts: int = APP_INFO.default_targetscan_context_attempts,
+    attempts: int = DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts,
 ) -> str:
     """Run one TargetScan context-score shard on a CPU node."""
     import shutil
@@ -4105,7 +4057,7 @@ def _cleanup_off_target_transients(raw_off_target_dir: Path) -> None:
 
 def _run_pita_row_shard(
     spec: PitaRowShardSpec,
-    attempts: int = APP_INFO.default_pita_row_attempts,
+    attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts,
 ) -> str:
     """Run or reuse one cached PITA row-shard score table."""
     import subprocess as sp
@@ -5673,26 +5625,26 @@ def submit_oligoformer_task(
     pita_threshold: float = -10.0,
     targetscan_threshold: float = 1.0,
     toxicity_threshold: float = 50.0,
-    off_target_workers: int = APP_INFO.default_off_target_workers_per_node,
-    off_target_process_slots: int = APP_INFO.default_off_target_process_slots,
-    off_target_prep_workers: int = APP_INFO.default_off_target_prep_workers,
-    pita_prepare_workers: int = APP_INFO.default_pita_prepare_workers,
-    pita_prepare_utr_shard_size: int = APP_INFO.default_pita_prepare_utr_shard_size,
-    pita_row_shard_size: int = APP_INFO.default_pita_row_shard_size,
-    pita_row_attempts: int = APP_INFO.default_pita_row_attempts,
-    targetscan_rnaplfold_workers: int = APP_INFO.default_targetscan_rnaplfold_workers,
+    off_target_workers: int = DEFAULT_EXECUTION_CONFIG.off_target_workers,
+    off_target_process_slots: int = DEFAULT_EXECUTION_CONFIG.off_target_process_slots,
+    off_target_prep_workers: int = DEFAULT_EXECUTION_CONFIG.off_target_prep_workers,
+    pita_prepare_workers: int = DEFAULT_EXECUTION_CONFIG.pita_prepare_workers,
+    pita_prepare_utr_shard_size: int = DEFAULT_EXECUTION_CONFIG.pita_prepare_utr_shard_size,
+    pita_row_shard_size: int = DEFAULT_EXECUTION_CONFIG.pita_row_shard_size,
+    pita_row_attempts: int = DEFAULT_EXECUTION_CONFIG.pita_row_attempts,
+    targetscan_rnaplfold_workers: int = DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_workers,
     targetscan_rnaplfold_shard_size: int = (
-        APP_INFO.default_targetscan_rnaplfold_shard_size
+        DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_shard_size
     ),
     targetscan_ref_shard_size: int | None = None,
     targetscan_candidate_shard_size: int = (
-        APP_INFO.default_targetscan_candidate_shard_size
+        DEFAULT_EXECUTION_CONFIG.targetscan_candidate_shard_size
     ),
-    targetscan_context_workers: int = APP_INFO.default_targetscan_context_workers,
+    targetscan_context_workers: int = DEFAULT_EXECUTION_CONFIG.targetscan_context_workers,
     targetscan_context_shard_size: int = (
-        APP_INFO.default_targetscan_context_shard_size
+        DEFAULT_EXECUTION_CONFIG.targetscan_context_shard_size
     ),
-    targetscan_context_attempts: int = APP_INFO.default_targetscan_context_attempts,
+    targetscan_context_attempts: int = DEFAULT_EXECUTION_CONFIG.targetscan_context_attempts,
     max_containers: int | None = None,
     max_gpu_containers: int | None = None,
     force: bool = False,
@@ -5761,7 +5713,7 @@ def submit_oligoformer_task(
         default_max_containers=max(
             2,
             off_target_process_slots,
-            APP_INFO.default_targetscan_rnaplfold_nodes,
+            DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_nodes,
         ),
         default_max_gpu_containers=1,
         max_containers=max_containers,
@@ -5781,26 +5733,26 @@ def submit_oligoformer_task(
         pita_threshold=pita_threshold,
         targetscan_threshold=targetscan_threshold,
         toxicity_threshold=toxicity_threshold,
-        off_target_nodes=APP_INFO.default_off_target_nodes,
+        off_target_nodes=DEFAULT_EXECUTION_CONFIG.off_target_nodes,
         off_target_workers=off_target_workers,
         off_target_process_slots=off_target_process_slots,
         off_target_prep_workers=off_target_prep_workers,
-        pita_prepare_nodes=APP_INFO.default_pita_prepare_nodes,
+        pita_prepare_nodes=DEFAULT_EXECUTION_CONFIG.pita_prepare_nodes,
         pita_prepare_workers=pita_prepare_workers,
         pita_prepare_utr_shard_size=pita_prepare_utr_shard_size,
         pita_row_shard_size=pita_row_shard_size,
         pita_row_attempts=pita_row_attempts,
-        targetscan_rnaplfold_nodes=APP_INFO.default_targetscan_rnaplfold_nodes,
+        targetscan_rnaplfold_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_rnaplfold_nodes,
         targetscan_rnaplfold_workers=targetscan_rnaplfold_workers,
         targetscan_rnaplfold_shard_size=targetscan_rnaplfold_shard_size,
-        targetscan_prepare_nodes=APP_INFO.default_targetscan_prepare_nodes,
+        targetscan_prepare_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_prepare_nodes,
         targetscan_ref_shard_size=targetscan_ref_shard_size,
         targetscan_candidate_shard_size=targetscan_candidate_shard_size,
-        targetscan_context_nodes=APP_INFO.default_targetscan_context_nodes,
+        targetscan_context_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_context_nodes,
         targetscan_context_workers=targetscan_context_workers,
         targetscan_context_shard_size=targetscan_context_shard_size,
         targetscan_context_attempts=targetscan_context_attempts,
-        targetscan_merge_nodes=APP_INFO.default_targetscan_merge_nodes,
+        targetscan_merge_nodes=DEFAULT_EXECUTION_CONFIG.targetscan_merge_nodes,
         force=force,
         force_generation=uuid4().hex if force else None,
         app_version=CONF.repo_commit_hash or CONF.version or "unknown",

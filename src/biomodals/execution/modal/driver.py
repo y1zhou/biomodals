@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import modal
+from modal._utils.function_utils import _process_result
 
 from biomodals.execution.model import DeploymentIdentity, ProviderBinding
 from biomodals.execution.provider import (
@@ -52,10 +53,31 @@ _DEPLOYMENT_UNAVAILABLE_ERRORS = (
 )
 
 
+def _is_retained_user_error(error: BaseException) -> bool:
+    # Modal 1.6 rethrows deserialized failures as their original exception type,
+    # including the same TimeoutError used for an unfinished poll. The public
+    # get() API does not expose the result status. Keep this private SDK seam
+    # here: only the decoder rethrowing this exact exception proves failure;
+    # a transport error while downloading its blob does not. Native SDK tests
+    # exercise this boundary, including Modal's synchronous wrapper.
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_code is _process_result.__code__
+            and frame.f_locals.get("exc") is error
+        ):
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
 def _observation_from_error(
     error: Exception | modal.exception.InputCancellation,
 ) -> ProviderCallObservation:
-    if isinstance(error, modal.exception.FunctionTimeoutError):
+    if _is_retained_user_error(error):
+        kind = ProviderCallObservationKind.FAILED
+    elif isinstance(error, modal.exception.FunctionTimeoutError):
         kind = ProviderCallObservationKind.FAILED
     elif isinstance(error, modal.exception.InputCancellation):
         kind = ProviderCallObservationKind.CANCELLED

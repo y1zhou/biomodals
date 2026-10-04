@@ -381,3 +381,71 @@ def test_async_driver_uses_exact_deployment_and_retained_call_handle() -> None:
         assert observation.result == {"done": True}
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "remote_error",
+    [
+        TimeoutError("work deadline"),
+        TimeoutError(),
+        ConnectionError("worker network"),
+        modal.exception.AuthError("worker credentials"),
+    ],
+)
+def test_native_sdk_failure_is_conclusive_despite_transport_exception_type(
+    remote_error,
+):
+    """Native decoding of a retained failure must not retain running ownership."""
+    from modal._functions import _Invocation
+    from modal._serialization import serialize
+    from modal._utils.async_utils import synchronize_api
+    from modal_proto import api_pb2
+
+    invocation = _Invocation(None, "fc-root", None)
+
+    async def outputs(**kwargs):
+        return api_pb2.FunctionGetOutputsResponse(
+            outputs=[
+                api_pb2.FunctionGetOutputsItem(
+                    result=api_pb2.GenericResult(
+                        status=api_pb2.GenericResult.GENERIC_STATUS_FAILURE,
+                        data=serialize(remote_error),
+                        exception=str(remote_error),
+                    ),
+                    data_format=api_pb2.DATA_FORMAT_PICKLE,
+                )
+            ]
+        )
+
+    invocation.pop_function_call_outputs = outputs
+
+    async def get(**kwargs):
+        return await invocation.poll_function(**kwargs)
+
+    call = SimpleNamespace(get=synchronize_api(get))
+    observed = ModalCallDriver(call_resolver=lambda _: call).observe("fc-root")
+    assert observed.kind == ProviderCallObservationKind.FAILED
+    assert observed.message == str(remote_error)
+
+
+def test_native_sdk_unfinished_poll_preserves_ownership():
+    """A real empty native poll still means running, even though it raises TimeoutError."""
+    from modal._functions import _Invocation
+    from modal._utils.async_utils import synchronize_api
+    from modal_proto import api_pb2
+
+    invocation = _Invocation(None, "fc-root", None)
+
+    async def outputs(**kwargs):
+        return api_pb2.FunctionGetOutputsResponse(num_unfinished_inputs=1)
+
+    invocation.pop_function_call_outputs = outputs
+
+    async def get(**kwargs):
+        return await invocation.poll_function(**kwargs)
+
+    call = SimpleNamespace(get=synchronize_api(get))
+    assert (
+        ModalCallDriver(call_resolver=lambda _: call).observe("fc-root").kind
+        == ProviderCallObservationKind.RUNNING
+    )

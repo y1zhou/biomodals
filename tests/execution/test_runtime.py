@@ -223,6 +223,79 @@ def _transaction(connection: sqlite3.Connection):
     return transaction
 
 
+@pytest.mark.parametrize("observation_error", [False, True])
+def test_reconciliation_bounds_parallel_observation_and_keeps_encoding_on_writer_thread(
+    observation_error,
+):
+    """Real SQLite ownership survives parallel RPCs, including provider failure."""
+    from threading import Barrier, Lock, get_ident
+
+    count = 32
+    repository = create_repository(
+        task_count=count,
+        max_active_provider_calls=count,
+        max_active_gpu_provider_calls=count,
+    )
+    persist_fixed_policy(
+        repository,
+        tuple(f"seed-{i}" for i in range(count)),
+        binding=GPU_BINDING,
+        compatibility_key="af3",
+    )
+    coordinator_thread = get_ident()
+    barrier = Barrier(8, timeout=5)
+    lock = Lock()
+    active = peak = 0
+
+    class ConcurrentDriver(FakeModalDriver):
+        def observe(self, handle):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait()
+                if observation_error:
+                    raise RuntimeError("observation unavailable")
+                return ProviderCallObservation(
+                    ProviderCallObservationKind.SUCCEEDED, result=handle
+                )
+            finally:
+                with lock:
+                    active -= 1
+
+    driver = ConcurrentDriver()
+    runtime = ExecutionRuntime(
+        repository, provider_driver=driver, checkpoint=lambda: None
+    )
+    for index in range(count):
+        assert (
+            _submit_fixed(
+                runtime, _candidate(index), submission_token=f"batch-{index}", now=110
+            )
+            is not None
+        )
+
+    encoded = []
+
+    def encode(result):
+        assert get_ident() == coordinator_thread
+        encoded.append(result)
+        return {"result": result}
+
+    kwargs = dict(required_node_keys={"inference"}, encode_result=encode, now=111)
+    if observation_error:
+        with pytest.raises(RuntimeError, match="observation unavailable"):
+            runtime.reconcile_provider_calls(RUN_ID, **kwargs)
+        assert not encoded
+    else:
+        pairs = runtime.reconcile_provider_calls(RUN_ID, **kwargs)
+        assert len(pairs) == len(encoded) == count
+    assert peak == 8
+    assert active == 0
+    assert driver.spawn_count == count
+
+
 def test_runtime_creates_or_verifies_one_run_identity() -> None:
     connection = sqlite3.connect(":memory:")
     repository = SqliteExecutionRepository(connection)

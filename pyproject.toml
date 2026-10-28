@@ -63,7 +63,7 @@ line-length = 88
 uniaf3 = { index = "pypi" }
 
 [tool.uv]
-required-version = ">=0.12,<0.13"
+required-version = ">=0.12,<1.0"
 
 [[tool.uv.index]]
 name = "pypi"

@@ -334,19 +334,13 @@ class ServiceSettings:
         """Enable remote work only with a complete startup credential pair."""
         return self.modal_token_id is not None and self.modal_token_secret is not None
 
-    def require_modal_credentials(self) -> None:
-        """Require both service-user credentials before enabling remote work."""
-        if not self.remote_execution_enabled:
-            raise ValueError(
-                "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must be set for remote execution"
-            )
-
     def install_modal_credentials(self) -> None:
         """Expose file-sourced credentials to the Modal SDK without overriding env."""
         token_id = self.modal_token_id
         token_secret = self.modal_token_secret
         if token_id is None or token_secret is None:
-            self.require_modal_credentials()
-            raise RuntimeError("Modal credential validation returned unexpectedly")
+            raise ValueError(
+                "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must be set for remote execution"
+            )
         os.environ.setdefault("MODAL_TOKEN_ID", token_id)
         os.environ.setdefault("MODAL_TOKEN_SECRET", token_secret)

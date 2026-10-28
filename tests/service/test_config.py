@@ -243,15 +243,6 @@ def test_public_urls_reject_non_origins(value: str):
         ServiceSettings.from_environment({"BIOMODALS_PUBLIC_URL": value})
 
 
-def test_modal_credentials_are_required_for_remote_execution(monkeypatch) -> None:
-    for key in ENVIRONMENT_KEYS:
-        monkeypatch.delenv(key, raising=False)
-    settings = ServiceSettings.from_environment()
-
-    with pytest.raises(ValueError, match="MODAL_TOKEN_ID.*MODAL_TOKEN_SECRET"):
-        settings.require_modal_credentials()
-
-
 @pytest.mark.parametrize(
     ("name", "value"),
     [

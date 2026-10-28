@@ -108,17 +108,16 @@ def create_app(
                 )
         await cache.check_ready_async()
         store.reconcile_result_cache(await cache.cached_job_ids_async())
-        task = None
-        if remote_execution_enabled:
-            task = asyncio.create_task(
-                reconciliation_loop(
-                    lifecycle,
-                    interval_seconds=reconcile_interval_seconds,
-                    stop=stop,
-                    wake=reconcile_wakeup,
-                ),
-                name="biomodals-job-reconciler",
-            )
+        task = asyncio.create_task(
+            reconciliation_loop(
+                lifecycle,
+                interval_seconds=reconcile_interval_seconds,
+                stop=stop,
+                wake=reconcile_wakeup,
+                remote_execution_enabled=remote_execution_enabled,
+            ),
+            name="biomodals-job-reconciler",
+        )
         app.state.reconciler_task = task
         app.state.ready = True
         try:
@@ -127,8 +126,7 @@ def create_app(
             app.state.ready = False
             stop.set()
             reconcile_wakeup.set()
-            if task is not None:
-                await task
+            await task
             await password_executor.shutdown()
             await analysis.shutdown()
             await cache.shutdown()

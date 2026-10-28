@@ -630,8 +630,9 @@ async def reconciliation_loop(
     interval_seconds: float,
     stop: asyncio.Event,
     wake: asyncio.Event,
+    remote_execution_enabled: bool = True,
 ) -> None:
-    """Keep slow Jobs in their own bounded slots across admission wakeups."""
+    """Bound cleanup and optional remote advancement across admission wakeups."""
     active: dict[UUID, asyncio.Task[None]] = {}
     pending: deque[JobRecord] = deque()
     loop = asyncio.get_running_loop()
@@ -655,14 +656,12 @@ async def reconciliation_loop(
                 wake.clear()
                 if wake_task.done():
                     wake_task = asyncio.create_task(wake.wait())
-                pending = deque(
-                    job
-                    for job in lifecycle.store.list_pending_deletions(
-                        now=int(time.time())
+                jobs = lifecycle.store.list_pending_deletions(now=int(time.time()))
+                if remote_execution_enabled:
+                    jobs.extend(
+                        lifecycle.store.list_reconcilable_jobs(now=int(time.time()))
                     )
-                    + lifecycle.store.list_reconcilable_jobs(now=int(time.time()))
-                    if job.job_id not in active
-                )
+                pending = deque(job for job in jobs if job.job_id not in active)
                 next_scan = loop.time() + interval_seconds
             while pending and len(active) < _RECONCILIATION_CONCURRENCY:
                 job = pending.popleft()

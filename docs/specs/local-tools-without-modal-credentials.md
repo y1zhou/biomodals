@@ -65,7 +65,8 @@ end-to-end local Tool.
    reconciliation, and hide/block Jobs and Modal administration while
    credentials are absent. Already-running remote computations are not
    cancelled by this change. Restore access and normal reconciliation after
-   credentials return and the API restarts.
+   credentials return and the API restarts. Local deletion cleanup continues
+   in both modes.
 4. **Capability contract and discovery.** A public
    `GET /api/v1/capabilities` returns `remote_execution_enabled: boolean`.
    Expose no credentials. Keep frontend metadata static and use its existing
@@ -119,8 +120,10 @@ the Admin router or changing its response types merely to represent absence
 of a Modal token ID.
 
 The implementation retains existing remote registrations and
-configuration, conditions credential installation/preflight/reconciliation on
-one startup capability, and gates remote API routes and frontend routes.
+configuration, conditions credential installation, preflight and remote Job
+advancement on one startup capability, and gates remote API routes and frontend
+routes. The bounded reconciliation loop retains local deletion cleanup in both
+modes.
 It does not require a backend-owned Tool Catalog or a database schema change.
 
 ## Implementation sequence

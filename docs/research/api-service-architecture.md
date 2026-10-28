@@ -602,8 +602,9 @@ service-wide intermediate-cleanup setting.
 
 The service exposes separate unauthenticated operational probes. `/api/v1/health`
 is event-loop liveness only. `/api/v1/ready` reports success only after startup
-and while SQLite, configured cache storage, the bounded artifact worker, and the
-reconciler remain usable. A failed readiness response contains no path or
+and while SQLite, configured cache storage and the bounded artifact worker
+remain usable. It also checks the reconciler when remote execution is enabled.
+Public `/api/v1/capabilities` reports that startup capability. A failed readiness response contains no path or
 configuration detail. Neither probe contacts Modal; startup and Admin setting
 preflight own deployed-resource validation. Both stable operations appear in
 OpenAPI, and deployment waits for readiness before admitting Users.
@@ -652,8 +653,8 @@ The application factory reads these settings:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BIOMODALS_API_CONF_ENV` | unset | Optional path to a dotenv file; explicit process variables override file values |
-| `MODAL_TOKEN_ID` | required | Dedicated Modal service-user token identifier |
-| `MODAL_TOKEN_SECRET` | required | Dedicated Modal service-user token secret; never returned by the API or stored in SQLite |
+| `MODAL_TOKEN_ID` | unset | Dedicated Modal service-user token identifier; both credentials enable remote Tools, otherwise local mode |
+| `MODAL_TOKEN_SECRET` | unset | Dedicated Modal service-user token secret; never returned by the API or stored in SQLite |
 | `BIOMODALS_STATE_DIR` | `.biomodals/state` | Durable SQLite directory |
 | `BIOMODALS_CACHE_DIR` | `.biomodals/cache` | Rebuildable Result-archive cache directory |
 | `BIOMODALS_CACHE_WARNING_BYTES` | `1099511627776` | Soft warning threshold for local Result staging and cache usage (1 TiB) |

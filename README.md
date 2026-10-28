@@ -233,8 +233,8 @@ It uses same-origin `/api` requests and generated OpenAPI types.
 
 ### Local API development
 
-Install the API dependencies and deploy the registered Tools in the Modal Environment
-selected by the development configuration:
+Install the API dependencies. For remote Tools, also deploy them in the Modal
+Environment selected by the development configuration:
 
 ```bash
 uv sync --extra api
@@ -244,8 +244,9 @@ uv run biomodals workflow deploy humanization --env production
 uv run biomodals workflow deploy nanobody_humanization --env production
 ```
 
-Copy [`.env.example`](.env.example), replace both Modal token placeholders,
-and set each Tool's exact deployed version to match this checkout. Example
+Copy [`.env.example`](.env.example). For local tools, leave both Modal token
+values empty. For remote Tools, supply both tokens and set each Tool's exact
+deployed version to match this checkout. Example
 version numbers are placeholders, not compatibility guarantees. Keep the
 private copy out of Git:
 
@@ -255,9 +256,18 @@ export BIOMODALS_API_CONF_ENV="$PWD/.env"
 uv run biomodals api serve
 ```
 
-The backend refuses to start unless `MODAL_TOKEN_ID` and
-`MODAL_TOKEN_SECRET` are present. The secret remains process-only and is never
-stored in SQLite or returned by the API.
+An absent, blank or incomplete `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` pair
+starts the API in local mode. Antibody Sequence Analysis, accounts and local
+Storage administration remain available. Remote Tools, Jobs and Modal
+administration return `503 remote_execution_unavailable`, and remote Job
+reconciliation is suspended without discarding Jobs. The frontend displays
+only local Tools using public `GET /api/v1/capabilities`.
+
+A complete token pair enables remote execution and retains strict deployment
+preflight: rejected credentials or unavailable deployments still stop startup.
+Restart after changing credentials. The secret remains process-only and is
+never stored in SQLite or returned by the API. BioModals login and browser
+Origin/CSRF requirements apply in both modes.
 
 Relative state and cache paths are resolved from the directory containing the
 configured `.env` file. The development example keeps them under the

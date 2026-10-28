@@ -20,7 +20,8 @@ are:
 
 The tracked files under `deploy/` are production examples, not live
 configuration. Copy the selected systemd or Quadlet definition through an
-administrator-approved path, replace its credential placeholders, and restrict
+administrator-approved path, replace its credential placeholders (or empty
+them for local tools only), and restrict
 the installed file to root. Docker Compose receives credentials from its
 invoking environment. The top-level `.env.example` is only for local
 development.
@@ -80,9 +81,13 @@ curl --fail http://127.0.0.1:4144/api/v1/ready
 ```
 
 Liveness only proves that the event loop responds. Readiness additionally
-proves that startup preflight finished and local SQLite, cache storage, the
-artifact worker, and reconciliation are usable. Readiness does not contact
-Modal on each request.
+checks local SQLite, cache storage and the artifact worker. With a complete
+Modal credential pair it also requires completed startup preflight and a
+running reconciler. An absent or incomplete pair starts local mode without
+provider calls; existing remote Jobs remain stored but cannot be accessed or
+reconciled until credentials are restored and the API restarts. Inspect public
+`GET /api/v1/capabilities` for `remote_execution_enabled`. Readiness does not
+contact Modal on each request.
 
 Use `journalctl -u <unit-name>` to inspect startup failures and request IDs.
 Never paste Password Links, cookies, PDB data, or Modal secrets into a support

@@ -37,9 +37,11 @@ values. Setup documentation must create a private file directly, for example
 with `install -m 600`, rather than copying the public example with default
 permissions.
 
-Full service startup through `biomodals api serve` requires both Modal token
-variables and performs the configured deployed-resource preflight before
-accepting traffic. Offline `biomodals api admin` account commands instead load
+Service startup through `biomodals api serve` accepts an absent or incomplete
+Modal token pair in local mode. A complete pair enables remote Tools and
+requires the configured deployed-resource preflight before accepting traffic.
+See the [local capability contract](local-tools-without-modal-credentials.md).
+Offline `biomodals api admin` account commands instead load
 only the shared configuration needed by that command. They use the same state
 path and transactional account invariants but do not require Modal credentials,
 construct a Modal client, start reconciliation, or run deployed-resource
@@ -48,7 +50,8 @@ preflight. Password Link creation still requires the configured public URL.
 The service reads the selected configuration file and process environment once
 at startup; it does not watch or hot-reload them. Editing a file-controlled
 value or credential requires an API restart. The restarted process repeats all
-startup validation and deployed-resource preflight before readiness returns.
+startup validation and, when remote execution is enabled, deployed-resource
+preflight before readiness returns.
 Database-backed Administrator Runtime Settings remain live. Administrator
 responses report values loaded by the running process, never newer contents
 that merely exist on disk.
@@ -154,8 +157,9 @@ deploying the production frontend.
 `GET /api/v1/health` is a minimal liveness probe: it returns `200` when the API
 event loop can serve a request and performs no database, filesystem, or Modal
 work. `GET /api/v1/ready` returns `200` only after startup has completed and a
-local SQLite check, configured cache-storage check, bounded artifact worker,
-and Job reconciler are usable; otherwise it returns `503`.
+local SQLite check, configured cache-storage check and bounded artifact worker
+are usable. It also checks the Job reconciler when remote execution is enabled;
+otherwise no reconciler is started. Failed readiness returns `503`.
 
 Readiness never contacts Modal. Startup and Administrator configuration
 preflight own that validation, avoiding an external-provider flap on every

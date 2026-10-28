@@ -22,12 +22,18 @@ AlphaFold3 Result archives from the remote output Volume. The included
 `Containerfile` installs both; native systemd deployments must install them
 through the host package manager.
 
-Replace every Modal token placeholder before starting a service. The backend
-refuses to start when either credential is missing.
+For remote Tools, replace every Modal token placeholder before starting a
+service. For local Tools, remove or empty both values. An absent, blank or
+incomplete pair starts local mode: no remote preflight or reconciliation;
+remote Tool, Job and Modal administration requests return
+`503 remote_execution_unavailable`. Local analysis, Users and Storage remain
+available. Existing Jobs are retained. Restart after changing credentials;
+a complete pair still requires successful provider preflight.
 
 A fresh database initially uses `Gromacs`, `AlphaFold3`, `HumanizationWorkflow`,
 and `NanobodyHumanizationWorkflow` at version `1`. These are defaults, not a
-guarantee that those historical deployments support the current API. Startup resolves the
+guarantee that those historical deployments support the current API. With a
+complete credential pair, startup resolves the
 exact configured deployments of all registered Tools before reporting ready.
 Identify deployments built from the matching backend release, then save
 their positive versions in Admin → Modal → Tools:
@@ -173,7 +179,7 @@ Create the `biomodals` user and the two configured data directories first.
 ## Docker Compose
 
 `compose.yaml` builds `Containerfile` from the repository root and uses
-named volumes for state and cache. Supply the two Modal credentials in the
+named volumes for state and cache. To enable remote Tools, supply both Modal credentials in the
 invoking environment:
 
 ```console

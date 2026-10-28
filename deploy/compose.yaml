@@ -4,8 +4,8 @@ services:
       context: ..
       dockerfile: deploy/Containerfile
     environment:
-      MODAL_TOKEN_ID: ${MODAL_TOKEN_ID:?MODAL_TOKEN_ID must be set}
-      MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET:?MODAL_TOKEN_SECRET must be set}
+      MODAL_TOKEN_ID: ${MODAL_TOKEN_ID:-}
+      MODAL_TOKEN_SECRET: ${MODAL_TOKEN_SECRET:-}
       BIOMODALS_PUBLIC_URL: https://biomodals.example.com
       BIOMODALS_SECURE_COOKIES: "true"
       BIOMODALS_STATE_DIR: /var/lib/biomodals/state

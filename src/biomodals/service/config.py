@@ -329,11 +329,16 @@ class ServiceSettings:
         """Return the durable SQLite path, separate from the artifact cache."""
         return self.state_dir / "service.sqlite3"
 
+    @property
+    def remote_execution_enabled(self) -> bool:
+        """Enable remote work only with a complete startup credential pair."""
+        return self.modal_token_id is not None and self.modal_token_secret is not None
+
     def require_modal_credentials(self) -> None:
-        """Fail backend startup unless both service-user credentials exist."""
-        if self.modal_token_id is None or self.modal_token_secret is None:
+        """Require both service-user credentials before enabling remote work."""
+        if not self.remote_execution_enabled:
             raise ValueError(
-                "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must be set to start the API"
+                "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET must be set for remote execution"
             )
 
     def install_modal_credentials(self) -> None:

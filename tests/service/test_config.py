@@ -243,25 +243,13 @@ def test_public_urls_reject_non_origins(value: str):
         ServiceSettings.from_environment({"BIOMODALS_PUBLIC_URL": value})
 
 
-def test_modal_credentials_are_required_for_backend_startup(monkeypatch) -> None:
+def test_modal_credentials_are_required_for_remote_execution(monkeypatch) -> None:
     for key in ENVIRONMENT_KEYS:
         monkeypatch.delenv(key, raising=False)
     settings = ServiceSettings.from_environment()
 
     with pytest.raises(ValueError, match="MODAL_TOKEN_ID.*MODAL_TOKEN_SECRET"):
         settings.require_modal_credentials()
-
-
-def test_deployed_backend_refuses_to_start_without_modal_credentials(
-    monkeypatch,
-) -> None:
-    from biomodals.service.api import create_deployed_app
-
-    for key in ENVIRONMENT_KEYS:
-        monkeypatch.delenv(key, raising=False)
-
-    with pytest.raises(ValueError, match="MODAL_TOKEN_ID.*MODAL_TOKEN_SECRET"):
-        create_deployed_app()
 
 
 @pytest.mark.parametrize(

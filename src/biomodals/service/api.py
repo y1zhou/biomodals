@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI, status
+from fastapi import APIRouter, Depends, FastAPI, status
 
 from biomodals.service.antibody_sequence_analysis.analysis import AnalysisService
 from biomodals.service.antibody_sequence_analysis.contracts import MAX_REQUEST_BYTES
@@ -23,10 +23,12 @@ from biomodals.service.billing import BillingService
 from biomodals.service.http_contract import (
     SECURE_SESSION_COOKIE,
     SESSION_COOKIE,
+    CodedErrorResponse,
     ErrorResponse,
     PayloadTooLargeResponse,
     document_contract_headers,
     install_http_contract,
+    require_remote_execution,
 )
 from biomodals.service.jobs_api import create_jobs_router
 from biomodals.service.operations_api import create_operations_router
@@ -87,32 +89,36 @@ def create_app(
         )
     )
     reconcile_wakeup = asyncio.Event()
+    remote_execution_enabled = configuration.settings.remote_execution_enabled
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stop = asyncio.Event()
-        for registration in registrations:
-            effective = configuration.tool(registration.definition.key)
-            from biomodals.execution import DeploymentIdentity
+        if remote_execution_enabled:
+            for registration in registrations:
+                effective = configuration.tool(registration.definition.key)
+                from biomodals.execution import DeploymentIdentity
 
-            await remote.preflight(
-                DeploymentIdentity(
-                    configuration.modal_environment().value,
-                    effective.modal_app_name,
-                    effective.modal_app_version.value,
+                await remote.preflight(
+                    DeploymentIdentity(
+                        configuration.modal_environment().value,
+                        effective.modal_app_name,
+                        effective.modal_app_version.value,
+                    )
                 )
-            )
         await cache.check_ready_async()
         store.reconcile_result_cache(await cache.cached_job_ids_async())
-        task = asyncio.create_task(
-            reconciliation_loop(
-                lifecycle,
-                interval_seconds=reconcile_interval_seconds,
-                stop=stop,
-                wake=reconcile_wakeup,
-            ),
-            name="biomodals-job-reconciler",
-        )
+        task = None
+        if remote_execution_enabled:
+            task = asyncio.create_task(
+                reconciliation_loop(
+                    lifecycle,
+                    interval_seconds=reconcile_interval_seconds,
+                    stop=stop,
+                    wake=reconcile_wakeup,
+                ),
+                name="biomodals-job-reconciler",
+            )
         app.state.reconciler_task = task
         app.state.ready = True
         try:
@@ -121,7 +127,8 @@ def create_app(
             app.state.ready = False
             stop.set()
             reconcile_wakeup.set()
-            await task
+            if task is not None:
+                await task
             await password_executor.shutdown()
             await analysis.shutdown()
             await cache.shutdown()
@@ -147,6 +154,7 @@ def create_app(
     app.state.remote_execution = remote
     app.state.lifecycle = lifecycle
     app.state.reconcile_wakeup = reconcile_wakeup
+    app.state.reconciler_task = None
     app.state.cache = cache
     app.state.antibody_analysis = analysis
     app.state.billing = BillingService()
@@ -169,7 +177,11 @@ def create_app(
         },
     )
     app.include_router(analysis_router(analysis))
-    app.include_router(protein_optimization_review_router())
+    remote_router = APIRouter(
+        dependencies=[Depends(require_remote_execution)],
+        responses={503: {"model": CodedErrorResponse}},
+    )
+    remote_router.include_router(protein_optimization_review_router())
     app.include_router(create_operations_router(store=store, cache=cache))
     app.include_router(
         create_auth_router(
@@ -179,7 +191,7 @@ def create_app(
             session_cookie_name=session_cookie_name,
         )
     )
-    app.include_router(
+    remote_router.include_router(
         create_jobs_router(
             store=store,
             configuration=configuration,
@@ -188,13 +200,14 @@ def create_app(
         )
     )
     for router in tool_routers:
-        app.include_router(router)
+        remote_router.include_router(router)
 
     from biomodals.service.admin_api import create_admin_router
     from biomodals.service.job_logs_api import create_job_logs_router
 
     app.include_router(create_admin_router())
-    app.include_router(create_job_logs_router())
+    remote_router.include_router(create_job_logs_router())
+    app.include_router(remote_router)
     document_contract_headers(app, session_cookie_name=session_cookie_name)
     return app
 
@@ -230,7 +243,12 @@ def create_deployed_app() -> FastAPI:
     )
 
     settings = ServiceSettings.from_environment()
-    settings.install_modal_credentials()
+    if settings.remote_execution_enabled:
+        settings.install_modal_credentials()
+    else:
+        LOGGER.info(
+            "Modal credentials are incomplete or absent; remote execution is disabled"
+        )
     store = ServiceStore(settings.database_path)
     store.initialize()
     auth = AuthService(store, frontend_urls=settings.public_urls)

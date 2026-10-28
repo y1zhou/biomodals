@@ -103,6 +103,16 @@ def request_id_from(request: Request) -> str:
     return str(getattr(request.state, "request_id", "unavailable"))
 
 
+async def require_remote_execution(request: Request) -> None:
+    """Reject remote Tool operations before their handlers can mutate state."""
+    if not request.app.state.configuration.settings.remote_execution_enabled:
+        raise CodedAPIError(
+            503,
+            "remote_execution_unavailable",
+            "Remote tools are unavailable on this service",
+        )
+
+
 class _RequestSizeMiddleware:
     """Reject oversized bodies before FastAPI parses multipart content."""
 
@@ -315,6 +325,7 @@ def document_contract_headers(app: FastAPI, *, session_cookie_name: str) -> None
         "description": "Opaque BioModals browser session cookie.",
     }
     public_operations = {
+        ("/api/v1/capabilities", "get"),
         ("/api/v1/health", "get"),
         ("/api/v1/ready", "get"),
         ("/api/v1/auth/login", "post"),

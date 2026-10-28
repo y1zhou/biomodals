@@ -24,6 +24,7 @@ from biomodals.service.http_contract import (
     CodedErrorResponse,
     ErrorResponse,
     request_id_from,
+    require_remote_execution,
     require_session,
     require_unsafe_session,
 )
@@ -653,7 +654,8 @@ def create_admin_router() -> APIRouter:
     @router.get(
         "/modal",
         response_model=AdminModalView,
-        responses=read_responses,
+        dependencies=[Depends(require_remote_execution)],
+        responses={**read_responses, 503: {"model": CodedErrorResponse}},
     )
     async def modal_configuration(
         request: Request,
@@ -674,7 +676,12 @@ def create_admin_router() -> APIRouter:
     ) -> AdminStorageView:
         return await _storage_view(request)
 
-    @router.get("/modal/costs", response_model=AdminCostsView)
+    @router.get(
+        "/modal/costs",
+        response_model=AdminCostsView,
+        dependencies=[Depends(require_remote_execution)],
+        responses={503: {"model": CodedErrorResponse}},
+    )
     async def modal_costs(
         request: Request,
         _session: Annotated[AuthenticatedSession, Depends(require_admin)],
@@ -747,8 +754,10 @@ def create_admin_router() -> APIRouter:
     @router.post(
         "/modal/state-unknown-jobs/{job_id}/resolve",
         response_model=AdminModalView,
+        dependencies=[Depends(require_remote_execution)],
         responses={
             **mutation_responses,
+            503: {"model": CodedErrorResponse},
             404: {"model": ErrorResponse},
             409: {"model": AdminJobStateConflictResponse},
         },
@@ -794,9 +803,13 @@ def create_admin_router() -> APIRouter:
     @router.patch(
         "/modal/environment",
         response_model=AdminModalEnvironmentView,
-        dependencies=[Depends(serialize_runtime_configuration_mutation)],
+        dependencies=[
+            Depends(require_remote_execution),
+            Depends(serialize_runtime_configuration_mutation),
+        ],
         responses={
             **mutation_responses,
+            503: {"model": CodedErrorResponse},
             400: {"model": AdminSettingInvalidResponse},
             409: {"model": AdminSettingConflictResponse},
         },
@@ -867,9 +880,13 @@ def create_admin_router() -> APIRouter:
     @router.patch(
         "/modal/tools/{tool}",
         response_model=AdminModalToolView,
-        dependencies=[Depends(serialize_runtime_configuration_mutation)],
+        dependencies=[
+            Depends(require_remote_execution),
+            Depends(serialize_runtime_configuration_mutation),
+        ],
         responses={
             **mutation_responses,
+            503: {"model": CodedErrorResponse},
             400: {"model": AdminSettingInvalidResponse},
             404: {"model": ErrorResponse},
             409: {"model": AdminSettingConflictResponse},

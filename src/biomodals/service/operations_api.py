@@ -1,11 +1,11 @@
-"""Liveness and readiness routes for the Biomodals API process."""
+"""Public capabilities, liveness and readiness for the Biomodals API process."""
 
 from __future__ import annotations
 
 import asyncio
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from biomodals.service.artifacts import ArtifactCache
@@ -19,13 +19,28 @@ class HealthView(BaseModel):
     status: Literal["ok"]
 
 
+class CapabilitiesView(BaseModel):
+    """Public startup capabilities; no provider credentials or Tool metadata."""
+
+    remote_execution_enabled: bool
+
+
 def create_operations_router(
     *,
     store: ServiceStore,
     cache: ArtifactCache | None,
 ) -> APIRouter:
-    """Create process health routes around explicit readiness dependencies."""
+    """Create public service routes around explicit readiness dependencies."""
     router = APIRouter(prefix="/api/v1", tags=["operations"])
+
+    @router.get("/capabilities", response_model=CapabilitiesView)
+    async def capabilities(request: Request, response: Response) -> CapabilitiesView:
+        response.headers["Cache-Control"] = "no-store"
+        return CapabilitiesView(
+            remote_execution_enabled=(
+                request.app.state.configuration.settings.remote_execution_enabled
+            )
+        )
 
     @router.get("/health", response_model=HealthView)
     async def health() -> HealthView:
